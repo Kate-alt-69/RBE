@@ -1,9 +1,9 @@
 {
   "ok": true,
   "service": "error-reporter",
-  "pid": 14068,
-  "started_at_ms": 1786537586532,
-  "updated_at_ms": 1786537591545,
+  "pid": 8592,
+  "started_at_ms": 1786538037583,
+  "updated_at_ms": 1786538957591,
   "processed_count": 0,
   "dropped_count": 0,
   "last_error_message": null

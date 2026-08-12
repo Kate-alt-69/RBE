@@ -1,2 +1,4 @@
 **.exe
 **/target/**
+**.log
+**/error-reporter-status.json
