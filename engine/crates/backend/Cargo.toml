@@ -1,0 +1,23 @@
+[package]
+name = "backend"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "backend"
+path = "src/main.rs"
+
+[dependencies]
+api = { path = "../api" }
+core-lib = { path = "../core" }
+config = { path = "../config" }
+supervisor = { path = "../supervisor" }
+logging = { path = "../logging" }
+vault = { path = "../../../vault" }
+atomic-io = { path = "../../../atomic-io" }
+route-engine = { path = "../route-engine" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sandbox-primitives",
+    "crates/resource-limits",
+    "crates/execution-engine",
+    "crates/ipc-protocol",
+    "crates/container-runtime-core",
+    "crates/container-bin",
+    "crates/environments",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This is a genuinely separate Cargo workspace from ../Cargo.toml — see
+# migration-plan §3's non-negotiable exception and §5.1. Phase 0 only
+# stands up the crate boundaries (empty stub bodies below); real
+# implementation is Phase 2 (§12).

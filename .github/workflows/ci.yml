@@ -1,0 +1,100 @@
+name: CI
+
+# Lives at the true repo root (project-root/.github/workflows) — this
+# only works here, not nested inside engine/, since GitHub Actions
+# only discovers workflows at the repository root. (Was briefly
+# misplaced under engine/.github during an earlier restructure; fixed
+# once the top-level layout with vault/, atomic-io/, and
+# container-runtime/ as siblings was settled.)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  main-workspace:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: fmt check
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: build (release)
+        run: cargo build --workspace --release
+
+  # Standalone crates, not members of any workspace — shared between
+  # engine/ and container-runtime/ via relative path (see each crate's
+  # README for why). Tested independently since `cargo test --workspace`
+  # from either workspace won't reach them.
+  shared-crates:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [atomic-io, vault]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+
+      - name: fmt check
+        working-directory: ${{ matrix.crate }}
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        working-directory: ${{ matrix.crate }}
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        working-directory: ${{ matrix.crate }}
+        run: cargo test
+
+  # Separate workspace, separate job — see migration-plan §3's
+  # non-negotiable exception: the container runtime is never built as
+  # part of the main workspace's pipeline. Depends on vault/atomic-io
+  # passing first since it wouldn't build otherwise.
+  container-runtime-workspace:
+    needs: shared-crates
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: container-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+
+      - name: fmt check
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: build (release)
+        run: cargo build --workspace --release

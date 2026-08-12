@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/backend",
+    "crates/api",
+    "crates/core",
+    "crates/security",
+    "crates/config",
+    "crates/supervisor",
+    "crates/logging",
+    "crates/route-engine",
+]
+# `vault` used to be a workspace member here; it's now a standalone
+# shared crate at ../vault (project root), depended on via relative
+# path from crates/core and crates/backend — see vault/Cargo.toml's
+# doc comment for why (the container runtime's payment environment
+# needs it too, and a separate Cargo workspace can't share a member
+# crate directly).
+# The container runtime is intentionally its own separate Cargo workspace
+# (container-runtime/), not a member of this one. See the migration plan
+# §3 "non-negotiable exception" — it stays a fully separate executable,
+# never merged into the API process, and gets its own build/versioning
+# lifecycle from day one.
+exclude = ["container-runtime"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# Release profile tuned per migration-plan §9.1: this is the cheap final
+# pass, not where the performance budget goes. Apply once there's
+# something worth profiling — measure before leaning on this further.
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

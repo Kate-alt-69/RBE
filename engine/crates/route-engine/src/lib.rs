@@ -1,0 +1,201 @@
+//! Parses and runs `.route` files from `/api/` — the "write route
+//! handlers in a small JS-flavored file, Rust handles the rest" system
+//! from this turn's design discussion.
+//!
+//! **`/api/` and `/module/` are siblings of the compiled binary, never
+//! compiled into it.** All path resolution here goes through
+//! [`paths::binary_dir`] — never the current working directory — so
+//! the binary finds them regardless of where it's launched from. See
+//! `paths`'s doc comment.
+//!
+//! **v1 scope, explicit and deliberate:**
+//! - `.route` files only. `.module` files (reusable, imported-by-path
+//!   code) are recognized at the import-syntax level but not
+//!   implemented — see `modules`'s doc comment.
+//! - Import syntax, three forms: `:import[net]` (bare identifier -> a
+//!   curated built-in Rust capability); `:import[module&name]` (the
+//!   `module&` shorthand -> desugars to looking up `name` in the
+//!   default `/module/` folder, i.e. `:import["./module/name"]`);
+//!   `:import["./module/storage"]` (explicit string path, for modules
+//!   outside the default folder — `./` = [`paths::binary_dir`]).
+//!   Only `net` and `env` builtins exist right now — see
+//!   `modules::ModuleRegistry`.
+//! - A `.route` file's body is one `class` with methods named after
+//!   HTTP verbs (`get`, `post`, `put`, `delete`, `patch`, `head`,
+//!   `options`). Only methods you actually write get registered — an
+//!   undeclared verb on a path is simply a 404/405 from Axum, which is
+//!   the real mechanism behind "default GET blocking" from the
+//!   Node backend's Permission Manager: nothing extra to build there,
+//!   it falls out of file-based method registration for free.
+//! - Statement/expression grammar: `const`, `return`, bare expression
+//!   statements; string/number/bool/null/object/array literals,
+//!   identifiers, member access, and `module.function(args)` calls.
+//!   No `if`/`else`, no loops, no `try`/`catch` yet — full `.module`
+//!   support (where real control flow presumably lives) is explicitly
+//!   deferred to a later turn.
+//! - **Execution model: this is a tree-walking interpreter, not a
+//!   compiler.** Parsed `.route` files are cached by content hash
+//!   (`discovery::RouteCache`) so unchanged files aren't re-parsed, but
+//!   at request time the AST is evaluated directly — it is not
+//!   transpiled to Rust source and compiled by `rustc`. That's the
+//!   natural v2 (real "only compiles the RUST file" per the design
+//!   discussion) once this grammar's proven out against real routes.
+//!
+//! Entry point: [`build_routes`], called once from `main.rs`'s
+//! `boot()` (see backend crate) with the `/api/` directory path,
+//! merged into the rest of the Axum router alongside the Rust-native
+//! route groups in the `api` crate.
+
+mod ast;
+mod discovery;
+mod interpreter;
+mod lexer;
+mod modules;
+mod parser;
+mod paths;
+
+pub use ast::{Expr, ImportTarget, MethodDef, RouteFile, Statement, Value};
+pub use discovery::{build_routes, RouteCache};
+pub use interpreter::{EvalError, Interpreter, RequestContext};
+pub use modules::{binding_name, ModuleError, ModuleRegistry};
+pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+    use std::collections::HashMap;
+
+    fn parse(source: &str) -> RouteFile {
+        let tokens = Lexer::new(source).tokenize().expect("lex failed");
+        Parser::new(tokens).parse_file().expect("parse failed")
+    }
+
+    #[test]
+    fn parses_imports_and_verb_methods() {
+        let source = r#"
+            :import[net]
+            :import["./module/storage"]
+
+            class Route {
+                async get(req) {
+                    const pong = net.ping();
+                    return { ok: true, pong: pong };
+                }
+            }
+        "#;
+
+        let file = parse(source);
+        assert_eq!(file.imports.len(), 2);
+        assert!(matches!(&file.imports[0], ImportTarget::Builtin(n) if n == "net"));
+        assert!(matches!(&file.imports[1], ImportTarget::Custom(p) if p == "./module/storage"));
+        assert_eq!(file.class_name, "Route");
+        assert_eq!(file.methods.len(), 1);
+        assert_eq!(file.methods[0].verb, "get");
+    }
+
+    #[test]
+    fn rejects_unknown_verb_method_name() {
+        let source = r#"
+            class Route {
+                fetchStuff(req) {
+                    return true;
+                }
+            }
+        "#;
+        let tokens = Lexer::new(source).tokenize().unwrap();
+        let result = Parser::new(tokens).parse_file();
+        assert!(result.is_err(), "non-verb method name should fail to parse");
+    }
+
+    #[test]
+    fn interprets_builtin_module_call_and_object_literal() {
+        let file = parse(
+            r#"
+            :import[net]
+            class Route {
+                async get(req) {
+                    const pong = net.ping();
+                    return { ok: pong.ok, path: req.path };
+                }
+            }
+        "#,
+        );
+
+        let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
+        let modules = ModuleRegistry::from_imports(&file.imports);
+        let req = RequestContext {
+            method: "GET".to_string(),
+            path: "/api/health-check".to_string(),
+            params: HashMap::new(),
+            query: HashMap::new(),
+        };
+
+        let mut interpreter = Interpreter::new(&modules);
+        let result = interpreter
+            .run(&file.methods[0], &req, &module_names)
+            .expect("evaluation failed");
+
+        let Value::Object(map) = result else {
+            panic!("expected an object result");
+        };
+        assert!(matches!(map.get("ok"), Some(Value::Bool(true))));
+        assert!(matches!(map.get("path"), Some(Value::String(p)) if p == "/api/health-check"));
+    }
+
+    #[test]
+    fn calling_unimported_module_is_a_clear_error_not_a_panic() {
+        let file = parse(
+            r#"
+            class Route {
+                get(req) {
+                    return storage.get("x");
+                }
+            }
+        "#,
+        );
+
+        let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
+        let modules = ModuleRegistry::from_imports(&file.imports);
+        let req = RequestContext {
+            method: "GET".to_string(),
+            path: "/api/whatever".to_string(),
+            params: HashMap::new(),
+            query: HashMap::new(),
+        };
+
+        let mut interpreter = Interpreter::new(&modules);
+        let result = interpreter.run(&file.methods[0], &req, &module_names);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn custom_module_import_parses_but_call_errors_clearly() {
+        let file = parse(
+            r#"
+            :import["./module/storage"]
+            class Route {
+                get(req) {
+                    return storage.get("x");
+                }
+            }
+        "#,
+        );
+
+        let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
+        let modules = ModuleRegistry::from_imports(&file.imports);
+        let req = RequestContext {
+            method: "GET".to_string(),
+            path: "/api/whatever".to_string(),
+            params: HashMap::new(),
+            query: HashMap::new(),
+        };
+
+        let mut interpreter = Interpreter::new(&modules);
+        let err = interpreter
+            .run(&file.methods[0], &req, &module_names)
+            .expect_err("custom module calls should error until .module is implemented");
+        assert!(err.message.contains("not implemented"));
+    }
+}

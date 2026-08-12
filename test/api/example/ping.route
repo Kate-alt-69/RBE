@@ -1,0 +1,8 @@
+:import[net]
+
+class Route {
+    async get(req) {
+        const pong = net.ping();
+        return { ok: true, pong: pong, path: req.path };
+    }
+}

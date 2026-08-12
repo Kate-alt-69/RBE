@@ -1,0 +1,15 @@
+boot: start
+boot: settings loaded
+boot: logging initialized
+boot: configuration log emitted
+boot: error reporter future created
+boot: error reporter spawned
+boot: vault initializing
+boot: vault initialized
+boot: supervisor initialized
+boot: supervisor spawned
+boot: app state created
+boot: building router
+boot: router built
+boot: binding listener
+boot: listener bound

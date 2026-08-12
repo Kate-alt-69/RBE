@@ -1,0 +1,18 @@
+[package]
+name = "container-bin"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "container"
+path = "src/main.rs"
+
+[dependencies]
+container-runtime-core = { path = "../container-runtime-core" }
+environments = { path = "../environments" }
+atomic-io = { path = "../../../atomic-io" }
+vault = { path = "../../../vault" }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"

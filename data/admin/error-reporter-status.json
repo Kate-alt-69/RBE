@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "service": "error-reporter",
+  "pid": 5064,
+  "started_at_ms": 1786535731831,
+  "updated_at_ms": 1786537076884,
+  "processed_count": 0,
+  "dropped_count": 0,
+  "last_error_message": null
+}

@@ -1,0 +1,17 @@
+[package]
+name = "core-lib"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "core_lib"
+path = "src/lib.rs"
+
+[dependencies]
+config = { path = "../config" }
+supervisor = { path = "../supervisor" }
+security = { path = "../security" }
+vault = { path = "../../../vault" }
+tracing = { workspace = true }
+tokio = { workspace = true }
