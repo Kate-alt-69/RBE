@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 
 use crate::ast::{ImportTarget, Value};
 
@@ -22,7 +22,7 @@ enum ModuleKind {
 }
 
 #[derive(Clone, Copy)]
-enum BuiltinModule { Net, Env, Private }
+enum BuiltinModule { Net, Env, Private, Json, Time, Log, Crypto, Http, Request, Security, Response }
 
 pub struct ModuleRegistry {
     modules: HashMap<String, ModuleKind>,
@@ -47,6 +47,10 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
     match module {
         "net" => matches!(function, "ping"),
         "private" => matches!(function, "health"),
+        "json" => matches!(function, "parse" | "stringify"),
+        "time" => matches!(function, "now"),
+        "log" => matches!(function, "info" | "warn"),
+        "crypto" => matches!(function, "hash"),
         "env" => matches!(function, "get"),
         _ => false,
     }
@@ -82,6 +86,14 @@ impl ModuleRegistry {
                         "net" => ModuleKind::Builtin(BuiltinModule::Net),
                         "env" => ModuleKind::Builtin(BuiltinModule::Env),
                         "private" => ModuleKind::Builtin(BuiltinModule::Private),
+                        "json" => ModuleKind::Builtin(BuiltinModule::Json),
+                        "time" => ModuleKind::Builtin(BuiltinModule::Time),
+                        "log" => ModuleKind::Builtin(BuiltinModule::Log),
+                        "crypto" => ModuleKind::Builtin(BuiltinModule::Crypto),
+                        "http" => ModuleKind::Builtin(BuiltinModule::Http),
+                        "request" => ModuleKind::Builtin(BuiltinModule::Request),
+                        "security" => ModuleKind::Builtin(BuiltinModule::Security),
+                        "response" => ModuleKind::Builtin(BuiltinModule::Response),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{name}"),
                             resolved_path: std::path::PathBuf::new(),
@@ -94,6 +106,14 @@ impl ModuleRegistry {
                         "net" => ModuleKind::Builtin(BuiltinModule::Net),
                         "env" => ModuleKind::Builtin(BuiltinModule::Env),
                         "private" => ModuleKind::Builtin(BuiltinModule::Private),
+                        "json" => ModuleKind::Builtin(BuiltinModule::Json),
+                        "time" => ModuleKind::Builtin(BuiltinModule::Time),
+                        "log" => ModuleKind::Builtin(BuiltinModule::Log),
+                        "crypto" => ModuleKind::Builtin(BuiltinModule::Crypto),
+                        "http" => ModuleKind::Builtin(BuiltinModule::Http),
+                        "request" => ModuleKind::Builtin(BuiltinModule::Request),
+                        "security" => ModuleKind::Builtin(BuiltinModule::Security),
+                        "response" => ModuleKind::Builtin(BuiltinModule::Response),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{module}"),
                             resolved_path: std::path::PathBuf::new(),
@@ -154,6 +174,14 @@ impl ModuleRegistry {
             ModuleKind::Builtin(BuiltinModule::Net) => call_net(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Env) => call_env(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Private) => call_private(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Json) => call_json(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Time) => call_time(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Log) => call_log(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Crypto) => call_crypto(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Http) => Err(ModuleError { message: format!("{module_name}.{function_name}() is not implemented yet") }),
+            ModuleKind::Builtin(BuiltinModule::Request) => Err(ModuleError { message: format!("{module_name}.{function_name}() is not implemented yet") }),
+            ModuleKind::Builtin(BuiltinModule::Security) => Err(ModuleError { message: format!("{module_name}.{function_name}() is not implemented yet") }),
+            ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError { message: format!("{module_name}.{function_name}() is not implemented yet") }),
             ModuleKind::CustomUnimplemented { source_path, resolved_path } => {
                 let note = if resolved_path.as_os_str().is_empty() {
                     String::new()
@@ -195,8 +223,6 @@ fn call_private(function_name: &str, _args: &[Value]) -> Result<Value, ModuleErr
             fields.insert("status".to_string(), Value::String("healthy".to_string()));
             fields.insert("uptime".to_string(), Value::Number(runtime_start().elapsed().as_secs_f64()));
             fields.insert("container".to_string(), Value::Null);
-            // Vault is a hard boot dependency in the backend, so a running
-            // route runtime implies Vault reached ready state during boot.
             fields.insert("vault".to_string(), Value::Bool(true));
             fields.insert("errorReporter".to_string(), Value::Null);
             Ok(Value::Object(fields))
@@ -204,6 +230,86 @@ fn call_private(function_name: &str, _args: &[Value]) -> Result<Value, ModuleErr
         other => Err(ModuleError {
             message: format!("private.{other}() does not exist"),
         }),
+    }
+}
+
+fn call_json(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+    match function_name {
+        "parse" => {
+            let Some(Value::String(input)) = args.first() else {
+                return Err(ModuleError { message: "json.parse(value) requires a string argument".into() });
+            };
+            let parsed: serde_json::Value = serde_json::from_str(input)
+                .map_err(|e| ModuleError { message: format!("json.parse() failed: {e}") })?;
+            Ok(json_to_value(parsed))
+        }
+        "stringify" => {
+            let Some(value) = args.first() else {
+                return Err(ModuleError { message: "json.stringify(value) requires an argument".into() });
+            };
+            let json = value_to_json(value);
+            let text = serde_json::to_string(&json)
+                .map_err(|e| ModuleError { message: format!("json.stringify() failed: {e}") })?;
+            Ok(Value::String(text))
+        }
+        other => Err(ModuleError { message: format!("json.{other}() does not exist") }),
+    }
+}
+
+fn json_to_value(value: serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(v) => Value::Bool(v),
+        serde_json::Value::Number(v) => Value::Number(v.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(v) => Value::String(v),
+        serde_json::Value::Array(items) => Value::Array(items.into_iter().map(json_to_value).collect()),
+        serde_json::Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, json_to_value(v))).collect()),
+    }
+}
+
+fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::String(v) => serde_json::Value::String(v.clone()),
+        Value::Number(v) => serde_json::Number::from_f64(*v).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+        Value::Bool(v) => serde_json::Value::Bool(*v),
+        Value::Null => serde_json::Value::Null,
+        Value::Object(map) => serde_json::Value::Object(map.iter().map(|(k, v)| (k.clone(), value_to_json(v))).collect()),
+        Value::Array(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+    }
+}
+
+fn call_time(function_name: &str, _args: &[Value]) -> Result<Value, ModuleError> {
+    match function_name {
+        "now" => {
+            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            Ok(Value::Number(seconds))
+        }
+        other => Err(ModuleError { message: format!("time.{other}() does not exist") }),
+    }
+}
+
+fn call_log(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+    let message = args.first().map(|value| format!("{value:?}")).unwrap_or_default();
+    match function_name {
+        "info" => { tracing::info!(message = %message, "route log"); Ok(Value::Null) }
+        "warn" => { tracing::warn!(message = %message, "route log"); Ok(Value::Null) }
+        other => Err(ModuleError { message: format!("log.{other}() does not exist") }),
+    }
+}
+
+fn call_crypto(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+    match function_name {
+        "hash" => {
+            let Some(Value::String(input)) = args.first() else {
+                return Err(ModuleError { message: "crypto.hash(value) requires a string argument".into() });
+            };
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            input.hash(&mut hasher);
+            Ok(Value::String(format!("{:016x}", hasher.finish())))
+        }
+        other => Err(ModuleError { message: format!("crypto.{other}() does not exist") }),
     }
 }
 
@@ -262,6 +368,23 @@ mod tests {
         assert!(matches!(fields.get("uptime"), Some(Value::Number(uptime)) if *uptime >= 0.0));
         assert!(matches!(fields.get("container"), Some(Value::Null)));
         assert!(matches!(fields.get("vault"), Some(Value::Bool(true))));
+    }
+
+    #[test]
+    fn json_parse_and_stringify_round_trip() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("json".into())]);
+        let parsed = registry.call("json", "parse", &[Value::String(r#"{"ok":true,"count":2}"#.into())]).expect("parse");
+        let Value::Object(fields) = &parsed else { panic!("expected object") };
+        assert!(matches!(fields.get("ok"), Some(Value::Bool(true))));
+        let Value::String(text) = registry.call("json", "stringify", &[parsed]).expect("stringify") else { panic!("expected string") };
+        assert!(text.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn time_now_returns_epoch_seconds() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("time".into())]);
+        let Value::Number(now) = registry.call("time", "now", &[]).expect("time.now") else { panic!("expected number") };
+        assert!(now > 0.0);
     }
 
     #[test]
