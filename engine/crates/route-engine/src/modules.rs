@@ -40,11 +40,19 @@ pub fn route_capability_allowed(name: &str) -> bool {
 
 pub fn binding_name(target: &ImportTarget) -> String {
     match target {
+        ImportTarget::Aliased { alias, .. } => alias.clone(),
         ImportTarget::Builtin(name) => name.clone(),
         ImportTarget::BuiltinFunction { function, .. } => function.clone(),
         ImportTarget::Custom(path) => std::path::Path::new(path)
             .file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string(),
         ImportTarget::CustomFunction { function, .. } => function.clone(),
+    }
+}
+
+fn base_target(target: &ImportTarget) -> &ImportTarget {
+    match target {
+        ImportTarget::Aliased { target, .. } => target.as_ref(),
+        _ => target,
     }
 }
 
@@ -54,7 +62,7 @@ impl ModuleRegistry {
         let mut direct_functions = HashMap::new();
 
         for target in imports {
-            match target {
+            match base_target(target) {
                 ImportTarget::Builtin(name) => {
                     let kind = match name.as_str() {
                         "net" => ModuleKind::Builtin(BuiltinModule::Net),
@@ -64,7 +72,7 @@ impl ModuleRegistry {
                             resolved_path: std::path::PathBuf::new(),
                         },
                     };
-                    modules.insert(name.clone(), kind);
+                    modules.insert(binding_name(target), kind);
                 }
                 ImportTarget::BuiltinFunction { module, function } => {
                     let kind = match module.as_str() {
@@ -76,7 +84,7 @@ impl ModuleRegistry {
                         },
                     };
                     modules.entry(module.clone()).or_insert(kind);
-                    direct_functions.insert(function.clone(), (module.clone(), function.clone()));
+                    direct_functions.insert(binding_name(target), (module.clone(), function.clone()));
                 }
                 ImportTarget::Custom(path) => {
                     let resolved = crate::paths::resolve_custom_import(&crate::paths::binary_dir(), path);
@@ -92,8 +100,9 @@ impl ModuleRegistry {
                     modules.entry(module_name.clone()).or_insert(ModuleKind::CustomUnimplemented {
                         source_path: path.clone(), resolved_path: resolved,
                     });
-                    direct_functions.insert(function.clone(), (module_name, function.clone()));
+                    direct_functions.insert(binding_name(target), (module_name, function.clone()));
                 }
+                ImportTarget::Aliased { .. } => unreachable!("base_target removes aliased import wrappers"),
             }
         }
 
