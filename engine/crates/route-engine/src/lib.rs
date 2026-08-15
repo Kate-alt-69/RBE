@@ -13,6 +13,7 @@ mod lexer;
 mod modules;
 mod parser;
 mod paths;
+mod terminal;
 
 pub mod cache;
 pub mod transpiled_support;
