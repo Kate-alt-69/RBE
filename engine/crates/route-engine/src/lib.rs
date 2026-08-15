@@ -23,7 +23,7 @@ pub use analyzer::{analyze, Diagnostic, Severity};
 pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement, Value};
 pub use discovery::{build_routes, RouteCache};
 pub use interpreter::{EvalError, Interpreter, RequestContext};
-pub use modules::{binding_name, ModuleError, ModuleRegistry};
+pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
 
 #[cfg(test)]
