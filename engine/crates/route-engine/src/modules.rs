@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::ast::{ImportTarget, Value};
 
@@ -145,13 +147,18 @@ impl ModuleRegistry {
                 };
                 Err(ModuleError {
                     message: format!(
-                        "{module_name}.{function_name}(...) — \"{source_path}\"{note} \
+                        "{module_name}.{function_name}(...) — \\"{source_path}\\"{note} \
                          is not implemented yet; this .route file parses, but the call cannot run until the module lands"
                     ),
                 })
             }
         }
     }
+}
+
+fn runtime_start() -> &'static Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now)
 }
 
 fn call_net(function_name: &str, _args: &[Value]) -> Result<Value, ModuleError> {
@@ -161,8 +168,14 @@ fn call_net(function_name: &str, _args: &[Value]) -> Result<Value, ModuleError> 
             fields.insert("ok".to_string(), Value::Bool(true));
             Ok(Value::Object(fields))
         }
+        "health" => {
+            let mut fields = HashMap::new();
+            fields.insert("status".to_string(), Value::String("healthy".to_string()));
+            fields.insert("uptime".to_string(), Value::Number(runtime_start().elapsed().as_secs_f64()));
+            Ok(Value::Object(fields))
+        }
         other => Err(ModuleError {
-            message: format!("net.{other} is not implemented — only net.ping() exists"),
+            message: format!("net.{other} is not implemented — only net.ping() and net.health() exist"),
         }),
     }
 }
@@ -209,5 +222,15 @@ mod tests {
         assert!(!route_capability_allowed("vault"));
         assert!(!route_capability_allowed("storage"));
         assert!(!route_capability_allowed("cache"));
+    }
+
+    #[test]
+    fn net_health_reports_runtime_status() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("net".into())]);
+        let Value::Object(fields) = registry.call("net", "health", &[]).expect("health call") else {
+            panic!("expected health object");
+        };
+        assert!(matches!(fields.get("status"), Some(Value::String(status)) if status == "healthy"));
+        assert!(matches!(fields.get("uptime"), Some(Value::Number(uptime)) if *uptime >= 0.0));
     }
 }
