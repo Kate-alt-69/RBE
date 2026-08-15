@@ -392,34 +392,44 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
             }
         };
 
-        let file = match Parser::new(tokens).parse_file() {
-            Ok(file) => Arc::new(file),
-            Err(error) => {
-                report.errors = 1;
-                let detail = frame_diagnostic_with_symbol(
-                    path,
-                    &source,
-                    error.line,
-                    error.column,
-                    &error.message,
-                    None,
-                    terminal_width,
-                );
-                report.details.push(detail.clone());
-                report.error_details.push(detail);
-                done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
-                reports.push(report);
-                continue;
-            }
-        };
-
+        let (file_opt, parse_errors) = Parser::new(tokens).parse_file_collecting();
         done += 1;
         terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+
+        for error in &parse_errors {
+            let detail = frame_diagnostic_with_symbol(
+                path,
+                &source,
+                error.line,
+                error.column,
+                &error.message,
+                None,
+                terminal_width,
+            );
+            report.errors += 1;
+            report.details.push(detail.clone());
+            report.error_details.push(detail);
+        }
+
+        let Some(file) = file_opt else {
+            done += 2;
+            terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+            reports.push(report);
+            continue;
+        };
+
+        if report.errors > 0 {
+            done += 2;
+            terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+            reports.push(report);
+            continue;
+        }
+
+        let file = Arc::new(file);
         terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
 
         let diagnostics = analyze(&file);
-        report.errors = diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
+        report.errors += diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
         report.warnings = diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
 
         for diagnostic in &diagnostics {
@@ -438,13 +448,15 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
             }
         }
 
+        done += 1;
+        terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
+
         if report.errors > 0 {
-            done += 2;
+            done += 1;
             terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
             reports.push(report);
             continue;
         }
-        done += 1;
 
         terminal.render(files.len(), Some(&display_path), "Generating", done, total_units);
         let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
