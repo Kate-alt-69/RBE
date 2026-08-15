@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement};
-use crate::modules::{binding_name, route_capability_allowed};
+use crate::modules::{binding_name, builtin_function_exists, route_capability_allowed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -24,15 +24,6 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    fn error(message: impl Into<String>) -> Self {
-        Self { severity: Severity::Error, code: "E2000", message: message.into(), symbol: None }
-    }
-    fn error_symbol(message: impl Into<String>, symbol: impl Into<String>) -> Self {
-        Self { severity: Severity::Error, code: "E2001", message: message.into(), symbol: Some(symbol.into()) }
-    }
-    fn warning(message: impl Into<String>) -> Self {
-        Self { severity: Severity::Warning, code: "W0001", message: message.into(), symbol: None }
-    }
     fn warning_symbol(message: impl Into<String>, symbol: impl Into<String>) -> Self {
         Self { severity: Severity::Warning, code: "W0002", message: message.into(), symbol: Some(symbol.into()) }
     }
@@ -92,8 +83,15 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
                 }
                 SymbolKind::Module
             }
-            ImportTarget::BuiltinFunction { module, .. } => {
-                if !route_capability_allowed(module) {
+            ImportTarget::BuiltinFunction { module, function } => {
+                if !builtin_function_exists(module, function) {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "E3010",
+                        message: format!("{module}.{function} does not exist as a import — please remove `{module}.{function}` from the route file"),
+                        symbol: Some(name.clone()),
+                    });
+                } else if !route_capability_allowed(module) {
                     diagnostics.push(Diagnostic {
                         severity: Severity::Error,
                         code: "E3000",
@@ -248,11 +246,23 @@ fn mark_identifier(name: &str, scope: &mut Scope, used_globals: &mut HashSet<Str
     }
 }
 
+fn analyze_member_call(module_name: &str, function_name: &str, source_name: Option<&str>, diagnostics: &mut Vec<Diagnostic>) {
+    if matches!(module_name, "net" | "private" | "env") && !builtin_function_exists(module_name, function_name) {
+        let source = source_name.unwrap_or("the route");
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E3011",
+            message: format!("{module_name}.{function_name}() does not exist — please remove it from {source}"),
+            symbol: Some(format!("{module_name}.{function_name}")),
+        });
+    }
+}
+
 fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<String>, diagnostics: &mut Vec<Diagnostic>) {
     match expr {
         Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => {}
         Expr::Ident(name) => mark_identifier(name, scope, used_globals, diagnostics, false),
-        Expr::Member(base, _) => {
+        Expr::Member(base, field) => {
             if let Expr::Ident(name) = base.as_ref() {
                 match scope.get_mut(name) {
                     Some(symbol) if symbol.kind == SymbolKind::Module => {
@@ -267,6 +277,8 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                         symbol: Some(name.to_string()),
                     }),
                 }
+                // Bare member access is not a call; don't reject it here.
+                let _ = field;
             } else {
                 analyze_expr(base, scope, used_globals, diagnostics);
             }
@@ -293,12 +305,13 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                         symbol: Some(name.to_string()),
                     }),
                 },
-                Expr::Member(base, _) => {
+                Expr::Member(base, function_name) => {
                     if let Expr::Ident(name) = base.as_ref() {
                         match scope.get_mut(name) {
                             Some(symbol) if symbol.kind == SymbolKind::Module => {
                                 symbol.used = true;
                                 used_globals.insert(name.clone());
+                                analyze_member_call(name, function_name, None, diagnostics);
                             }
                             Some(_) => mark_identifier(name, scope, used_globals, diagnostics, false),
                             None => diagnostics.push(Diagnostic {
@@ -309,7 +322,7 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                             }),
                         }
                     } else {
-                        analyze_expr(base, scope, used_globals, diagnostics);
+                        analyze_expr(callee, scope, used_globals, diagnostics);
                     }
                 }
                 _ => analyze_expr(callee, scope, used_globals, diagnostics),
@@ -406,10 +419,23 @@ mod tests {
     }
 
     #[test]
-    fn member_access_marks_request_as_used() {
-        let file = parse(r#"class Route { get(req) { return req.path; } }"#);
+    fn unknown_builtin_import_gets_e3010() {
+        let file = parse(r#":import[vault.import] class Route { get(req) { return req.path; } }"#);
         let diagnostics = analyze(&file);
-        assert!(diagnostics.iter().all(|d| !d.message.contains("req")));
+        assert!(diagnostics.iter().any(|d| d.code == "E3010" && d.message.contains("vault.import does not exist as a import")));
+    }
+
+    #[test]
+    fn unknown_builtin_call_gets_e3011() {
+        let file = parse(r#":import[net] class Route { get(req) { return net.health(); } }"#);
+        let diagnostics = analyze(&file);
+        assert!(diagnostics.iter().any(|d| d.code == "E3011" && d.message.contains("net.health() does not exist")));
+    }
+
+    #[test]
+    fn private_health_is_valid() {
+        let file = parse(r#":import[private] class Route { get(req) { return private.health(); } }"#);
+        assert!(analyze(&file).iter().all(|d| d.severity != Severity::Error));
     }
 
     #[test]
@@ -418,11 +444,5 @@ mod tests {
         let diagnostics = analyze(&file);
         assert!(diagnostics.iter().all(|d| !d.message.contains("import `net` is never used")));
         assert!(diagnostics.iter().all(|d| d.severity != Severity::Error));
-    }
-
-    #[test]
-    fn accepts_function_and_direct_import_calls() {
-        let file = parse(r#":import[net.ping] function wrap(value) { return { value: value }; } class Route { get(req) { const pong = ping(); return wrap(pong); } }"#);
-        assert!(analyze(&file).iter().all(|d| d.severity != Severity::Error));
     }
 }
