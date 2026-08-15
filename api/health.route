@@ -2,13 +2,12 @@
 
 class Route {
     async get(req) {
-        const health = net.health();
+        const engine = net.ping();
         return {
-            ok: health.ok ?? true,
-            status: health.status ?? "ok",
+            ok: true,
+            status: "ok",
             security: true,
-            services: health.services ?? {},
-            uptime: health.uptime ?? null,
+            engine: engine
         };
     }
 }
