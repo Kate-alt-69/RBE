@@ -30,35 +30,59 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-struct CacheEntry { hash: u64, file: Arc<RouteFile> }
+struct CacheEntry {
+    hash: u64,
+    file: Arc<RouteFile>,
+}
 
 #[derive(Default)]
-pub struct RouteCache { entries: Mutex<HashMap<PathBuf, CacheEntry>> }
+pub struct RouteCache {
+    entries: Mutex<HashMap<PathBuf, CacheEntry>>,
+}
 
 impl RouteCache {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     fn load(&self, path: &Path) -> anyhow::Result<Arc<RouteFile>> {
-        let bytes = fs::read(path).map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+        let bytes = fs::read(path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
         let hash = hash_bytes(&bytes);
         if let Some(entry) = self.entries.lock().unwrap().get(path) {
-            if entry.hash == hash { return Ok(entry.file.clone()); }
+            if entry.hash == hash {
+                return Ok(entry.file.clone());
+            }
         }
 
         let source = String::from_utf8(bytes)
             .map_err(|e| anyhow::anyhow!("{}: not valid UTF-8: {e}", path.display()))?;
-        let tokens = Lexer::new(&source).tokenize()
-            .map_err(|e| anyhow::anyhow!("{}:{}:{}: {}", path.display(), e.line, e.column, e.message))?;
-        let file = Parser::new(tokens).parse_file()
-            .map_err(|e| anyhow::anyhow!("{}:{}:{}: {}", path.display(), e.line, e.column, e.message))?;
+        let tokens = Lexer::new(&source).tokenize().map_err(|e| {
+            anyhow::anyhow!("{}:{}:{}: {}", path.display(), e.line, e.column, e.message)
+        })?;
+        let file = Parser::new(tokens).parse_file().map_err(|e| {
+            anyhow::anyhow!("{}:{}:{}: {}", path.display(), e.line, e.column, e.message)
+        })?;
         let file = Arc::new(file);
-        self.entries.lock().unwrap().insert(path.to_path_buf(), CacheEntry { hash, file: file.clone() });
+        self.entries.lock().unwrap().insert(
+            path.to_path_buf(),
+            CacheEntry {
+                hash,
+                file: file.clone(),
+            },
+        );
         Ok(file)
     }
 }
 
-pub(crate) fn collect_files(dir: &Path, extension: &str, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    if !dir.exists() { return Ok(()); }
+pub(crate) fn collect_files(
+    dir: &Path,
+    extension: &str,
+    out: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
@@ -77,23 +101,34 @@ pub(crate) fn collect_route_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow:
 pub(crate) fn url_path_for(api_dir: &Path, file_path: &Path) -> String {
     let relative = file_path.strip_prefix(api_dir).unwrap_or(file_path);
     let without_ext = relative.with_extension("");
-    let mut segments: Vec<String> = without_ext.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
-    if segments.last().map(|s| s == "index").unwrap_or(false) { segments.pop(); }
+    let mut segments: Vec<String> = without_ext
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    if segments.last().map(|s| s == "index").unwrap_or(false) {
+        segments.pop();
+    }
     format!("/api/{}", segments.join("/"))
 }
 
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Number(n) => serde_json::Number::from_f64(*n).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+        Value::Number(n) => serde_json::Number::from_f64(*n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Null => serde_json::Value::Null,
         Value::Object(map) => {
             let mut obj = serde_json::Map::new();
-            for (k, v) in map { obj.insert(k.clone(), value_to_json(v)); }
+            for (k, v) in map {
+                obj.insert(k.clone(), value_to_json(v));
+            }
             serde_json::Value::Object(obj)
         }
-        Value::Array(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(value_to_json).collect())
+        }
     }
 }
 
@@ -105,7 +140,12 @@ async fn execute(
     http_method: String,
     path: String,
 ) -> axum::response::Response {
-    let req_ctx = RequestContext { method: http_method, path, params: HashMap::new(), query: HashMap::new() };
+    let req_ctx = RequestContext {
+        method: http_method,
+        path,
+        params: HashMap::new(),
+        query: HashMap::new(),
+    };
     let mut interpreter = Interpreter::new(&modules).with_functions(functions.as_ref());
 
     match interpreter.run(&method_def, &req_ctx, &module_names) {
@@ -115,7 +155,8 @@ async fn execute(
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": err.to_string() })),
-            ).into_response()
+            )
+                .into_response()
         }
     }
 }
@@ -136,6 +177,7 @@ fn build_method_router(
         let functions = functions.clone();
         let url_path = url_path.clone();
         let verb = method_def.verb.clone();
+        let handler_verb = verb.clone();
 
         let handler = move || {
             let method_def = method_def.clone();
@@ -143,7 +185,17 @@ fn build_method_router(
             let module_names = module_names.clone();
             let functions = functions.clone();
             let path = url_path.clone();
-            async move { execute(method_def, functions, modules, module_names, verb.to_uppercase(), path).await }
+            async move {
+                execute(
+                    method_def,
+                    functions,
+                    modules,
+                    module_names,
+                    handler_verb.to_uppercase(),
+                    path,
+                )
+                .await
+            }
         };
 
         router = match verb.as_str() {
@@ -166,7 +218,9 @@ fn compiler_error_path() -> PathBuf {
 }
 
 fn find_symbol_location(source: &str, symbol: Option<&str>) -> (usize, usize) {
-    let Some(symbol) = symbol.filter(|value| !value.is_empty()) else { return (1, 1); };
+    let Some(symbol) = symbol.filter(|value| !value.is_empty()) else {
+        return (1, 1);
+    };
     for (line_idx, line) in source.lines().enumerate() {
         if let Some(byte_idx) = line.find(symbol) {
             let column = line[..byte_idx].chars().count() + 1;
@@ -198,24 +252,62 @@ fn frame_diagnostic_with_symbol(
     let border = "#".repeat(content_width + line_numbers + 7);
     let mut out = String::new();
 
-    out.push_str(&format!("{path}\n{border}\n"));
+    out.push_str(&format!("{}\n{}\n", path.display(), border));
     for (idx, text) in lines.iter().enumerate().take(end).skip(start) {
         let number = idx + 1;
         let clipped: String = text.chars().take(content_width).collect();
         let marker = if number == line {
-            let used = format!("|{number:>width$}| {clipped}", width = line_numbers).chars().count();
+            let used = format!("|{number:>width$}| {clipped}", width = line_numbers)
+                .chars()
+                .count();
             let remaining = border.len().saturating_sub(used + 1);
             format!(" {}", "<".repeat(remaining.max(2)))
         } else {
             String::new()
         };
-        out.push_str(&format!("|{number:>width$}| {clipped}{marker}\n", width = line_numbers));
+        out.push_str(&format!(
+            "|{number:>width$}| {clipped}{marker}\n",
+            width = line_numbers
+        ));
     }
-    out.push_str(&format!("{border}\n"));
+    out.push_str(&format!("{}\n", border));
 
     let pointer_indent = line_numbers + 4 + column.saturating_sub(1);
-    out.push_str(&format!("{}^\n{}\nline {}, column {}\n\n", " ".repeat(pointer_indent), message, line, column));
+    out.push_str(&format!(
+        "{}^\n{}\nline {}, column {}\n\n",
+        " ".repeat(pointer_indent),
+        message,
+        line,
+        column
+    ));
     out
+}
+
+struct FileDiagnosticReport {
+    path: PathBuf,
+    errors: usize,
+    warnings: usize,
+    details: Vec<String>,
+}
+
+fn render_diagnostic_reports(reports: &[FileDiagnosticReport]) {
+    if reports.is_empty() {
+        return;
+    }
+
+    for report in reports {
+        println!(
+            "{} error{}, {} warning{} in file {}",
+            report.errors,
+            if report.errors == 1 { "" } else { "s" },
+            report.warnings,
+            if report.warnings == 1 { "" } else { "s" },
+            report.path.display()
+        );
+        for detail in &report.details {
+            println!("{}", detail);
+        }
+    }
 }
 
 /// Run the route compiler as a boot-owned terminal session. Every file gets
@@ -224,7 +316,9 @@ fn frame_diagnostic_with_symbol(
 /// to `data/admin/compiler-error.txt` before boot is allowed to continue.
 fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Arc<RouteFile>)>> {
     let error_path = compiler_error_path();
-    if let Some(parent) = error_path.parent() { fs::create_dir_all(parent)?; }
+    if let Some(parent) = error_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut error_file = fs::File::create(&error_path)?;
 
     let terminal = Terminal::new();
@@ -232,28 +326,60 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
     let total_units = files.len().saturating_mul(3);
     let mut done = 0usize;
     let mut valid = Vec::with_capacity(files.len());
-    let mut errors = Vec::new();
+    let mut reports = Vec::new();
 
     terminal.begin_boot();
     terminal.render(files.len(), None, "Parsing", 0, total_units);
 
     for path in files {
         let display_path = path.to_string_lossy();
+        let mut report = FileDiagnosticReport {
+            path: path.clone(),
+            errors: 0,
+            warnings: 0,
+            details: Vec::new(),
+        };
+
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                errors.push(format!("{}: failed to read file: {error}\n", path.display()));
+                report.errors = 1;
+                report.details.push(format!(
+                    "{}: failed to read file: {}",
+                    path.display(),
+                    error
+                ));
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
+                reports.push(report);
                 continue;
             }
         };
+
         let source = match String::from_utf8(bytes) {
             Ok(source) => source,
             Err(error) => {
-                errors.push(format!("{}: invalid UTF-8: {error}\n", path.display()));
+                report.errors = 1;
+                report.details.push(format!(
+                    "{}: invalid UTF-8: {}",
+                    path.display(),
+                    error
+                ));
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
+                reports.push(report);
                 continue;
             }
         };
@@ -261,9 +387,25 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
         let tokens = match Lexer::new(&source).tokenize() {
             Ok(tokens) => tokens,
             Err(error) => {
-                errors.push(frame_diagnostic_with_symbol(path, &source, error.line, error.column, &error.message, None, terminal_width));
+                report.errors = 1;
+                report.details.push(frame_diagnostic_with_symbol(
+                    path,
+                    &source,
+                    error.line,
+                    error.column,
+                    &error.message,
+                    None,
+                    terminal_width,
+                ));
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
+                reports.push(report);
                 continue;
             }
         };
@@ -271,28 +413,89 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
         let file = match Parser::new(tokens).parse_file() {
             Ok(file) => Arc::new(file),
             Err(error) => {
-                errors.push(frame_diagnostic_with_symbol(path, &source, error.line, error.column, &error.message, None, terminal_width));
+                report.errors = 1;
+                report.details.push(frame_diagnostic_with_symbol(
+                    path,
+                    &source,
+                    error.line,
+                    error.column,
+                    &error.message,
+                    None,
+                    terminal_width,
+                ));
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
+                reports.push(report);
                 continue;
             }
         };
+
         done += 1;
-        terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
-        terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Parsing",
+            done,
+            total_units,
+        );
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Semantic",
+            done,
+            total_units,
+        );
 
         let diagnostics = analyze(&file);
-        for diagnostic in diagnostics.iter().filter(|d| d.severity == Severity::Error) {
-            errors.push(frame_diagnostic_with_symbol(path, &source, 1, 1, &diagnostic.message, diagnostic.symbol.as_deref(), terminal_width));
+        report.errors = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        report.warnings = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
+
+        for diagnostic in &diagnostics {
+            let detail = frame_diagnostic_with_symbol(
+                path,
+                &source,
+                1,
+                1,
+                &diagnostic.message,
+                diagnostic.symbol.as_deref(),
+                terminal_width,
+            );
+            report.details.push(detail);
         }
-        if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+
+        if report.errors > 0 {
             done += 2;
-            terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
+            terminal.render(
+                files.len(),
+                Some(&display_path),
+                "Semantic",
+                done,
+                total_units,
+            );
+            reports.push(report);
             continue;
         }
         done += 1;
 
-        terminal.render(files.len(), Some(&display_path), "Generating", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Generating",
+            done,
+            total_units,
+        );
         let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
         match transpile_file(&file, &path.to_string_lossy(), &module_names) {
             Ok(_) => {
@@ -300,17 +503,45 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 valid.push((path.clone(), file));
             }
             Err(error) => {
-                errors.push(frame_diagnostic_with_symbol(path, &source, 1, 1, &error.message, None, terminal_width));
+                report.errors += 1;
+                report.details.push(frame_diagnostic_with_symbol(
+                    path,
+                    &source,
+                    1,
+                    1,
+                    &error.message,
+                    None,
+                    terminal_width,
+                ));
                 done += 1;
             }
         }
-        terminal.render(files.len(), Some(&display_path), "Generating", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Generating",
+            done,
+            total_units,
+        );
+
+        if report.errors > 0 || report.warnings > 0 {
+            reports.push(report);
+        }
     }
 
-    if !errors.is_empty() {
-        for diagnostic in &errors { error_file.write_all(diagnostic.as_bytes())?; }
+    if !reports.is_empty() {
+        for report in &reports {
+            for detail in &report.details {
+                error_file.write_all(detail.as_bytes())?;
+            }
+        }
         terminal.end_boot();
-        return Err(anyhow::anyhow!("route compiler found {} error(s); see {}", errors.len(), error_path.display()));
+        render_diagnostic_reports(&reports);
+        return Err(anyhow::anyhow!(
+            "route compiler found {} error(s); see {}",
+            reports.iter().map(|report| report.errors).sum::<usize>(),
+            error_path.display()
+        ));
     }
 
     terminal.render(files.len(), None, "Ready", total_units, total_units);
@@ -331,7 +562,13 @@ pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
 
     for (path, route_file) in compiled {
         let url_path = url_path_for(api_dir, &path);
-        let module_names: Arc<Vec<String>> = Arc::new(route_file.imports.iter().map(binding_name).collect());
+        let module_names: Arc<Vec<String>> = Arc::new(
+            route_file
+                .imports
+                .iter()
+                .map(binding_name)
+                .collect(),
+        );
         let modules = Arc::new(ModuleRegistry::from_imports(&route_file.imports));
 
         tracing::info!(
@@ -341,7 +578,10 @@ pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
             "registered .route file"
         );
 
-        router = router.route(&url_path, build_method_router(&route_file, modules, module_names, url_path));
+        router = router.route(
+            &url_path,
+            build_method_router(&route_file, modules, module_names, url_path.clone()),
+        );
     }
 
     Ok(router)
