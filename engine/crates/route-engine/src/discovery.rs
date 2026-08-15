@@ -6,7 +6,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +15,7 @@ use axum::routing::MethodRouter;
 use axum::Router;
 use core_lib::AppState;
 
+use crate::analyzer::{analyze, Severity};
 use crate::ast::{FunctionDef, MethodDef, RouteFile, Value};
 use crate::interpreter::{Interpreter, RequestContext};
 use crate::lexer::Lexer;
@@ -163,91 +164,158 @@ fn compiler_error_path() -> PathBuf {
     PathBuf::from("data").join("admin").join("compiler-error.txt")
 }
 
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 40)
+        .unwrap_or(80)
+}
+
 fn frame_diagnostic(path: &Path, source: &str, line: usize, column: usize, message: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let start = line.saturating_sub(1);
     let end = (start + 4).min(lines.len());
-    let width = lines.iter().map(|l| l.len()).max().unwrap_or(1).max(20) + 4;
-    let border = "#".repeat(width.max(24));
+    let line_numbers = if end > start { end.to_string().len() } else { 1 };
+    let content_width = terminal_width().saturating_sub(line_numbers + 8).max(24);
+    let border = "#".repeat(content_width + line_numbers + 7);
     let mut out = String::new();
-    out.push_str(&format!("{}\n", path.display()));
-    out.push_str(&format!("{}\n", border));
+
+    out.push_str(&format!("{path}\n{border}\n"));
     for (idx, text) in lines.iter().enumerate().take(end).skip(start) {
-        let marker = if idx + 1 == line { " <<<<<<<<<<" } else { "" };
-        out.push_str(&format!("|{}| {}{}\n", idx + 1, text, marker));
+        let number = idx + 1;
+        let clipped: String = text.chars().take(content_width).collect();
+        let marker = if number == line {
+            let used = format!("|{number:>width$}| {clipped}", width = line_numbers).chars().count();
+            let remaining = border.len().saturating_sub(used + 1);
+            format!(" {}", "<".repeat(remaining.max(2)))
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("|{number:>width$}| {clipped}{marker}\n", width = line_numbers));
     }
-    out.push_str(&format!("{}\n", border));
-    out.push_str(&format!("{}^^\n{}\nline {}, column {}\n\n", " ".repeat(column.saturating_add(2)), message, line, column));
+    out.push_str(&format!("{border}\n"));
+
+    let pointer_indent = line_numbers + 4 + column.saturating_sub(1);
+    out.push_str(&format!("{}^\n{}\nline {}, column {}\n\n", " ".repeat(pointer_indent), message, line, column));
     out
 }
 
 fn render_progress(state: &str, current: usize, total: usize) {
-    let width = std::env::var("COLUMNS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(80);
-    let bar_width = width.saturating_sub(state.len() + 16).clamp(12, width.saturating_sub(8).max(12));
+    let width = terminal_width();
+    let counter = format!("{}/{}", current, total);
+    let label = format!("{state} {counter}");
+    let bar_width = width.saturating_sub(label.chars().count() + 3).max(12).min(width.saturating_sub(2));
     let filled = if total == 0 { bar_width } else { (current.saturating_mul(bar_width) / total).min(bar_width) };
     let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(bar_width - filled));
-    print!("\r\x1b[2K{} {}/{}\n{}\r\x1b[2K", state, current, total, bar);
-    let _ = std::io::stdout().flush();
+
+    print!("\x1b[2K\r{label}\n\x1b[2K\r{bar}");
+    let _ = io::stdout().flush();
 }
 
+fn print_compiler_header(route_count: usize) {
+    println!("\x1b[2J\x1b[H");
+    println!("RBE Route Compiler");
+    println!("Scanning ./api...");
+    println!("Found {route_count} route files");
+    println!();
+}
+
+/// Run the route compiler as a boot-owned terminal session. Every file gets
+/// three work units: parse, semantic analysis, and Rust artifact generation.
+/// Syntax/semantic errors are accumulated across the entire tree and written
+/// to `data/admin/compiler-error.txt` before boot is allowed to continue.
 fn boot_compile(api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Arc<RouteFile>)>> {
     let error_path = compiler_error_path();
     if let Some(parent) = error_path.parent() { fs::create_dir_all(parent)?; }
     let mut error_file = fs::File::create(&error_path)?;
 
-    let total_units = files.len().saturating_mul(3).max(1);
+    let total_units = files.len().saturating_mul(3);
     let mut done = 0usize;
     let mut valid = Vec::with_capacity(files.len());
     let mut errors = Vec::new();
 
-    println!("RBE Route Compiler");
-    println!("Scanning ./api...");
-    println!("Found {} route files", files.len());
-
-    let cache = RouteCache::new();
+    print_compiler_header(files.len());
+    render_progress("Parsing", 0, total_units);
 
     for path in files {
-        render_progress("Parsing", done, total_units);
-        let bytes = fs::read(path)?;
-        let source = String::from_utf8(bytes)
-            .map_err(|e| anyhow::anyhow!("{}: invalid UTF-8: {e}", path.display()))?;
-        let tokens = match Lexer::new(&source).tokenize() {
-            Ok(v) => { done += 1; v }
-            Err(e) => {
-                done += 1;
-                errors.push(frame_diagnostic(path, &source, e.line, e.column, &e.message));
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                errors.push(format!("{}: failed to read file: {error}\n", path.display()));
+                done += 3;
                 continue;
             }
         };
+        let source = match String::from_utf8(bytes) {
+            Ok(source) => source,
+            Err(error) => {
+                errors.push(format!("{}: invalid UTF-8: {error}\n", path.display()));
+                done += 3;
+                continue;
+            }
+        };
+
+        let tokens = match Lexer::new(&source).tokenize() {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                errors.push(frame_diagnostic(path, &source, error.line, error.column, &error.message));
+                done += 1;
+                continue;
+            }
+        };
+        done += 1;
+        render_progress("Parsing", done, total_units);
 
         let file = match Parser::new(tokens).parse_file() {
-            Ok(v) => { done += 1; Arc::new(v) }
-            Err(e) => {
+            Ok(file) => Arc::new(file),
+            Err(error) => {
+                errors.push(frame_diagnostic(path, &source, error.line, error.column, &error.message));
                 done += 2;
-                errors.push(frame_diagnostic(path, &source, e.line, e.column, &e.message));
                 continue;
             }
         };
+        done += 0;
+        render_progress("Semantic", done, total_units);
 
-        render_progress("Semantic analysis", done, total_units);
-
-        let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
-        if let Err(e) = transpile_file(&file, &path.to_string_lossy(), &module_names) {
-            done += 1;
-            errors.push(frame_diagnostic(path, &source, 1, 1, &e.message));
+        let diagnostics = analyze(&file);
+        for diagnostic in diagnostics.iter().filter(|d| d.severity == Severity::Error) {
+            errors.push(frame_diagnostic(path, &source, 1, 1, &diagnostic.message));
+        }
+        if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+            done += 2;
             continue;
         }
+
+        // Warnings stay in the boot UI as a compact count. The detailed
+        // compiler-error file is reserved for errors so it remains useful.
         done += 1;
-        valid.push((path.clone(), file));
-        render_progress("Generating artifacts", done, total_units);
-        let _ = cache.entries.lock().unwrap();
+        render_progress("Generating", done, total_units);
+
+        let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
+        match transpile_file(&file, &path.to_string_lossy(), &module_names) {
+            Ok(_) => {
+                done += 1;
+                valid.push((path.clone(), file));
+            }
+            Err(error) => {
+                errors.push(frame_diagnostic(path, &source, 1, 1, &error.message));
+                done += 1;
+            }
+        }
+        render_progress("Generating", done, total_units);
     }
 
     println!();
     if !errors.is_empty() {
-        for diagnostic in &errors { writeln!(error_file, "{}", diagnostic)?; }
+        for diagnostic in &errors { error_file.write_all(diagnostic.as_bytes())?; }
         return Err(anyhow::anyhow!("route compiler found {} error(s); see {}", errors.len(), error_path.display()));
     }
+
+    // One final redraw gives a deterministic full bar before terminal control
+    // is returned to the normal backend logger.
+    render_progress("Ready", total_units, total_units);
+    println!();
 
     Ok(valid)
 }
