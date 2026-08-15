@@ -6,7 +6,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +21,7 @@ use crate::interpreter::{Interpreter, RequestContext};
 use crate::lexer::Lexer;
 use crate::modules::{binding_name, ModuleRegistry};
 use crate::parser::Parser;
+use crate::terminal::Terminal;
 use crate::transpiler::transpile_file;
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -164,14 +165,6 @@ fn compiler_error_path() -> PathBuf {
     PathBuf::from("data").join("admin").join("compiler-error.txt")
 }
 
-fn terminal_width() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value >= 40)
-        .unwrap_or(80)
-}
-
 fn find_symbol_location(source: &str, symbol: Option<&str>) -> (usize, usize) {
     let Some(symbol) = symbol.filter(|value| !value.is_empty()) else { return (1, 1); };
     for (line_idx, line) in source.lines().enumerate() {
@@ -183,11 +176,19 @@ fn find_symbol_location(source: &str, symbol: Option<&str>) -> (usize, usize) {
     (1, 1)
 }
 
-fn frame_diagnostic(path: &Path, source: &str, line: usize, column: usize, message: &str) -> String {
-    frame_diagnostic_with_symbol(path, source, line, column, message, None)
+fn frame_diagnostic(path: &Path, source: &str, line: usize, column: usize, message: &str, terminal_width: usize) -> String {
+    frame_diagnostic_with_symbol(path, source, line, column, message, None, terminal_width)
 }
 
-fn frame_diagnostic_with_symbol(path: &Path, source: &str, fallback_line: usize, fallback_column: usize, message: &str, symbol: Option<&str>) -> String {
+fn frame_diagnostic_with_symbol(
+    path: &Path,
+    source: &str,
+    fallback_line: usize,
+    fallback_column: usize,
+    message: &str,
+    symbol: Option<&str>,
+    terminal_width: usize,
+) -> String {
     let (line, column) = if symbol.is_some() {
         find_symbol_location(source, symbol)
     } else {
@@ -197,7 +198,7 @@ fn frame_diagnostic_with_symbol(path: &Path, source: &str, fallback_line: usize,
     let start = line.saturating_sub(1);
     let end = (start + 4).min(lines.len());
     let line_numbers = if end > start { end.to_string().len() } else { 1 };
-    let content_width = terminal_width().saturating_sub(line_numbers + 8).max(24);
+    let content_width = terminal_width.saturating_sub(line_numbers + 8).max(24);
     let border = "#".repeat(content_width + line_numbers + 7);
     let mut out = String::new();
 
@@ -221,32 +222,6 @@ fn frame_diagnostic_with_symbol(path: &Path, source: &str, fallback_line: usize,
     out
 }
 
-fn render_progress(state: &str, current: usize, total: usize) {
-    if !io::stdout().is_terminal() { return; }
-
-    let width = terminal_width();
-    let counter = format!("{}/{}", current, total);
-    let label = format!("\x1b[1m{state}\x1b[0m {counter}");
-    let plain_label_width = state.chars().count() + 1 + counter.chars().count();
-    let bar_width = width.saturating_sub(plain_label_width + 3).max(12).min(width.saturating_sub(2));
-    let filled = if total == 0 { bar_width } else { (current.saturating_mul(bar_width) / total).min(bar_width) };
-    let bar = format!("[\x1b[36m{}\x1b[90m{}\x1b[0m]", "█".repeat(filled), "░".repeat(bar_width - filled));
-
-    print!("\x1b[2K\r{label}\n\x1b[2K\r{bar}");
-    let _ = io::stdout().flush();
-}
-
-fn print_compiler_header(route_count: usize) {
-    if io::stdout().is_terminal() {
-        println!("\x1b[2J\x1b[H\x1b[1;36mRBE Route Compiler\x1b[0m");
-        println!("Scanning ./api...");
-        println!("Found {route_count} route files");
-        println!();
-    } else {
-        println!("RBE Route Compiler — scanning ./api ({route_count} route files)");
-    }
-}
-
 /// Run the route compiler as a boot-owned terminal session. Every file gets
 /// three work units: parse, semantic analysis, and Rust artifact generation.
 /// Syntax/semantic errors are accumulated across the entire tree and written
@@ -256,13 +231,16 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
     if let Some(parent) = error_path.parent() { fs::create_dir_all(parent)?; }
     let mut error_file = fs::File::create(&error_path)?;
 
+    let terminal = Terminal::new();
+    let terminal_width = terminal.width();
     let total_units = files.len().saturating_mul(3);
     let mut done = 0usize;
     let mut valid = Vec::with_capacity(files.len());
     let mut errors = Vec::new();
 
-    print_compiler_header(files.len());
-    render_progress("Parsing", 0, total_units);
+    terminal.begin_boot();
+    terminal.header(files.len());
+    terminal.progress("Parsing", 0, total_units);
 
     for path in files {
         let bytes = match fs::read(path) {
@@ -285,7 +263,7 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
         let tokens = match Lexer::new(&source).tokenize() {
             Ok(tokens) => tokens,
             Err(error) => {
-                errors.push(frame_diagnostic(path, &source, error.line, error.column, &error.message));
+                errors.push(frame_diagnostic(path, &source, error.line, error.column, &error.message, terminal_width));
                 done += 3;
                 continue;
             }
@@ -294,18 +272,18 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
         let file = match Parser::new(tokens).parse_file() {
             Ok(file) => Arc::new(file),
             Err(error) => {
-                errors.push(frame_diagnostic(path, &source, error.line, error.column, &error.message));
+                errors.push(frame_diagnostic(path, &source, error.line, error.column, &error.message, terminal_width));
                 done += 3;
                 continue;
             }
         };
         done += 1;
-        render_progress("Parsing", done, total_units);
-        render_progress("Semantic", done, total_units);
+        terminal.progress("Parsing", done, total_units);
+        terminal.progress("Semantic", done, total_units);
 
         let diagnostics = analyze(&file);
         for diagnostic in diagnostics.iter().filter(|d| d.severity == Severity::Error) {
-            errors.push(frame_diagnostic_with_symbol(path, &source, 1, 1, &diagnostic.message, diagnostic.symbol.as_deref()));
+            errors.push(frame_diagnostic_with_symbol(path, &source, 1, 1, &diagnostic.message, diagnostic.symbol.as_deref(), terminal_width));
         }
         if diagnostics.iter().any(|d| d.severity == Severity::Error) {
             done += 2;
@@ -313,7 +291,7 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
         }
         done += 1;
 
-        render_progress("Generating", done, total_units);
+        terminal.progress("Generating", done, total_units);
         let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
         match transpile_file(&file, &path.to_string_lossy(), &module_names) {
             Ok(_) => {
@@ -321,22 +299,21 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 valid.push((path.clone(), file));
             }
             Err(error) => {
-                errors.push(frame_diagnostic(path, &source, 1, 1, &error.message));
+                errors.push(frame_diagnostic(path, &source, 1, 1, &error.message, terminal_width));
                 done += 1;
             }
         }
-        render_progress("Generating", done, total_units);
+        terminal.progress("Generating", done, total_units);
     }
 
-    println!();
     if !errors.is_empty() {
         for diagnostic in &errors { error_file.write_all(diagnostic.as_bytes())?; }
+        terminal.end_boot();
         return Err(anyhow::anyhow!("route compiler found {} error(s); see {}", errors.len(), error_path.display()));
     }
 
-    render_progress("Ready", total_units, total_units);
-    println!();
-
+    terminal.progress("Ready", total_units, total_units);
+    terminal.end_boot();
     Ok(valid)
 }
 
