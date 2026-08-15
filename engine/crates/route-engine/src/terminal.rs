@@ -64,7 +64,7 @@ impl Terminal {
             .max(12)
             .min(width.saturating_sub(2));
         let filled = if total == 0 {
-            bar_width
+            0
         } else {
             current.saturating_mul(bar_width).checked_div(total).unwrap_or(0).min(bar_width)
         };
@@ -280,6 +280,14 @@ fn windows_console_size() -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zero_work_starts_with_an_empty_bar() {
+        let total = 0usize;
+        let width = 30usize;
+        let filled = if total == 0 { 0 } else { 1usize.saturating_mul(width) / total };
+        assert_eq!(filled, 0);
+    }
+
     #[test]
     fn progress_bar_fills_left_to_right() {
         let total = 100;
