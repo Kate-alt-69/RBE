@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 config = { path = "../config" }
+atomic-io = { path = "../../../atomic-io" }
 tower = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
