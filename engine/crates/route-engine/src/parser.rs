@@ -23,11 +23,12 @@ impl Parser {
 
     pub fn parse_file(mut self) -> Result<RouteFile, ParseError> {
         let mut imports = Vec::new();
+        let mut functions = Vec::new();
+
         while self.check(&TokenKind::Colon) {
             imports.push(self.parse_import()?);
         }
 
-        let mut functions = Vec::new();
         while self.check(&TokenKind::Function) {
             functions.push(self.parse_function()?);
         }
@@ -145,7 +146,14 @@ impl Parser {
         self.expect(TokenKind::LBrace)?;
         let mut body = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            body.push(self.parse_statement()?);
+            match self.parse_statement() {
+                Ok(statement) => body.push(statement),
+                Err(error) => {
+                    let recovery = error.clone();
+                    self.recover_statement();
+                    return Err(recovery);
+                }
+            }
         }
         self.expect(TokenKind::RBrace)?;
         Ok(body)
@@ -361,6 +369,28 @@ impl Parser {
         }
         self.expect(TokenKind::RBracket)?;
         Ok(Expr::Array(items))
+    }
+
+    fn recover_statement(&mut self) {
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+
+        while !self.check(&TokenKind::Eof) {
+            match self.peek_kind() {
+                TokenKind::LParen => { paren_depth += 1; self.advance(); }
+                TokenKind::RParen if paren_depth > 0 => { paren_depth -= 1; self.advance(); }
+                TokenKind::LBracket => { bracket_depth += 1; self.advance(); }
+                TokenKind::RBracket if bracket_depth > 0 => { bracket_depth -= 1; self.advance(); }
+                TokenKind::LBrace => { brace_depth += 1; self.advance(); }
+                TokenKind::RBrace if brace_depth > 0 => { brace_depth -= 1; self.advance(); }
+                TokenKind::Semicolon if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => { self.advance(); break; }
+                TokenKind::RBrace if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
+                TokenKind::Const | TokenKind::Let | TokenKind::Return | TokenKind::If | TokenKind::Function
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
+                _ => { self.advance(); }
+            }
+        }
     }
 
     fn peek_kind(&self) -> TokenKind {
