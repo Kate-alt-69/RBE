@@ -13,6 +13,7 @@ pub enum ImportTarget {
     BuiltinFunction { module: String, function: String },
     Custom(String),
     CustomFunction { path: String, function: String },
+    Aliased { target: Box<ImportTarget>, alias: String },
 }
 
 #[derive(Debug, Clone)]
