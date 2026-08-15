@@ -224,3 +224,32 @@ impl<'a> Lexer<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_byte_and_line_spans() {
+        let tokens = Lexer::new("const value = 1;\nreturn value;").tokenize().unwrap();
+        let const_token = &tokens[0];
+        assert_eq!(const_token.line, 1);
+        assert_eq!(const_token.column, 1);
+        assert_eq!(const_token.end_line, 1);
+        assert_eq!(const_token.end_column, 6);
+        assert_eq!(const_token.start, 0);
+        assert_eq!(const_token.end, 5);
+
+        let return_token = &tokens[5];
+        assert_eq!(return_token.line, 2);
+        assert_eq!(return_token.column, 1);
+        assert_eq!(return_token.start, "const value = 1;\n".len());
+    }
+
+    #[test]
+    fn tracks_multibyte_offsets_as_bytes() {
+        let tokens = Lexer::new("const café = 1;").tokenize().unwrap();
+        let ident = tokens.iter().find(|token| matches!(&token.kind, TokenKind::Ident(name) if name == "café")).unwrap();
+        assert_eq!(&"const café = 1;"[ident.start..ident.end], "café");
+    }
+}
