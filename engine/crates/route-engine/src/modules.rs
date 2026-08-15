@@ -27,6 +27,17 @@ pub struct ModuleRegistry {
     direct_functions: HashMap<String, (String, String)>,
 }
 
+/// Capabilities that are permitted to be imported by a `.route` file.
+///
+/// This is intentionally a whitelist. Privileged capabilities remain
+/// module-only until the language explicitly grows a route-safe surface.
+pub fn route_capability_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "net" | "json" | "crypto" | "time" | "http" | "request" | "log" | "security" | "response"
+    )
+}
+
 pub fn binding_name(target: &ImportTarget) -> String {
     match target {
         ImportTarget::Builtin(name) => name.clone(),
@@ -161,5 +172,33 @@ fn call_env(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
         other => Err(ModuleError {
             message: format!("env.{other} is not implemented — only env.get(key) exists"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_capability_whitelist_matches_the_language_boundary() {
+        assert!(route_capability_allowed("net"));
+        assert!(route_capability_allowed("json"));
+        assert!(route_capability_allowed("crypto"));
+        assert!(route_capability_allowed("time"));
+        assert!(route_capability_allowed("http"));
+        assert!(route_capability_allowed("request"));
+        assert!(route_capability_allowed("log"));
+        assert!(route_capability_allowed("security"));
+        assert!(route_capability_allowed("response"));
+    }
+
+    #[test]
+    fn privileged_capabilities_are_not_route_capabilities() {
+        assert!(!route_capability_allowed("env"));
+        assert!(!route_capability_allowed("encoding"));
+        assert!(!route_capability_allowed("auth"));
+        assert!(!route_capability_allowed("vault"));
+        assert!(!route_capability_allowed("storage"));
+        assert!(!route_capability_allowed("cache"));
     }
 }
