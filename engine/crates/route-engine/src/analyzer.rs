@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement};
-use crate::modules::binding_name;
+use crate::modules::{binding_name, route_capability_allowed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -48,8 +48,25 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
     for import in &file.imports {
         let name = binding_name(import);
         let kind = match import {
-            ImportTarget::Builtin(_) | ImportTarget::Custom(_) => SymbolKind::Module,
-            ImportTarget::BuiltinFunction { .. } | ImportTarget::CustomFunction { .. } => SymbolKind::DirectFunction,
+            ImportTarget::Builtin(module) => {
+                if !route_capability_allowed(module) {
+                    diagnostics.push(Diagnostic::error_symbol(
+                        format!("capability `{module}` is not available to `.route` files"),
+                        name.clone(),
+                    ));
+                }
+                SymbolKind::Module
+            }
+            ImportTarget::BuiltinFunction { module, .. } => {
+                if !route_capability_allowed(module) {
+                    diagnostics.push(Diagnostic::error_symbol(
+                        format!("capability `{module}` is not available to `.route` files"),
+                        name.clone(),
+                    ));
+                }
+                SymbolKind::DirectFunction
+            }
+            ImportTarget::Custom(_) | ImportTarget::CustomFunction { .. } => SymbolKind::Module,
         };
         if globals.insert(name.clone(), Symbol { kind, used: false }).is_some() {
             diagnostics.push(Diagnostic::error_symbol(format!("duplicate import binding `{name}`"), name));
@@ -244,6 +261,17 @@ mod tests {
         assert!(diagnostics.iter().any(|d| d.severity == Severity::Error && d.message.contains("missing")));
         assert!(diagnostics.iter().any(|d| d.severity == Severity::Warning && d.message.contains("net")));
         assert!(diagnostics.iter().any(|d| d.symbol.as_deref() == Some("missing")));
+    }
+
+    #[test]
+    fn rejects_module_only_route_capability() {
+        let file = parse(r#":import[env] class Route { get(req) { return req.path; } }"#);
+        let diagnostics = analyze(&file);
+        assert!(diagnostics.iter().any(|d| {
+            d.severity == Severity::Error
+                && d.symbol.as_deref() == Some("env")
+                && d.message.contains("not available to `.route` files")
+        }));
     }
 
     #[test]
