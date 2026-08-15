@@ -1,10 +1,11 @@
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread;
 use std::time::Duration;
 
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -107,12 +108,12 @@ struct Worker {
     exe: PathBuf,
     service_name: String,
     data_dir: PathBuf,
-    ready_tx: Option<Sender<anyhow::Result<()>>>,
+    ready_tx: Option<SyncSender<anyhow::Result<()>>>,
     connection: Option<Connection>,
 }
 
 impl Worker {
-    fn new(exe: PathBuf, service_name: String, data_dir: PathBuf, ready_tx: Sender<anyhow::Result<()>>) -> Self {
+    fn new(exe: PathBuf, service_name: String, data_dir: PathBuf, ready_tx: SyncSender<anyhow::Result<()>>) -> Self {
         Self { exe, service_name, data_dir, ready_tx: Some(ready_tx), connection: None }
     }
 
