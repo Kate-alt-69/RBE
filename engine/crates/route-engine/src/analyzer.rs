@@ -48,12 +48,31 @@ fn import_base(import: &ImportTarget) -> &ImportTarget {
     }
 }
 
+fn import_source_key(import: &ImportTarget) -> String {
+    match import_base(import) {
+        ImportTarget::Builtin(module) => format!("builtin:{module}"),
+        ImportTarget::BuiltinFunction { module, function } => format!("builtin:{module}.{function}"),
+        ImportTarget::Custom(path) => format!("custom:{path}"),
+        ImportTarget::CustomFunction { path, function } => format!("custom:{path}.{function}"),
+        ImportTarget::Aliased { .. } => unreachable!("import_base removes aliased import wrappers"),
+    }
+}
+
 pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut globals = Scope::new();
+    let mut imported_sources = HashSet::new();
 
     for import in &file.imports {
         let name = binding_name(import);
+        let source_key = import_source_key(import);
+        if !imported_sources.insert(source_key.clone()) {
+            diagnostics.push(Diagnostic::error_symbol(
+                format!("duplicate import source `{source_key}`; a capability may only be imported once per file"),
+                name.clone(),
+            ));
+        }
+
         let kind = match import_base(import) {
             ImportTarget::Builtin(module) => {
                 if !route_capability_allowed(module) {
@@ -279,6 +298,17 @@ mod tests {
             d.severity == Severity::Error
                 && d.symbol.as_deref() == Some("env")
                 && d.message.contains("not available to `.route` files")
+        }));
+    }
+
+    #[test]
+    fn rejects_duplicate_import_source_even_with_aliases() {
+        let file = parse(r#":import[net as first, net as second] class Route { get(req) { return first.ping(); } }"#);
+        let diagnostics = analyze(&file);
+        assert!(diagnostics.iter().any(|d| {
+            d.severity == Severity::Error
+                && d.message.contains("duplicate import source")
+                && d.symbol.as_deref() == Some("second")
         }));
     }
 
