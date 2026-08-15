@@ -2,25 +2,6 @@
 //! from-scratch secret store. `vault.credential(name, caller)` — ACL
 //! check, then fetch from whichever backend this process is actually
 //! using, every access audit-logged.
-//!
-//! **Backend selection happens once, at [`Vault::new`], not per-call.**
-//! Windows/macOS are assumed to always have a working OS credential
-//! store (DPAPI/Keychain are part of the OS, not an optional daemon).
-//! Linux is probed once at startup — no Secret Service daemon running
-//! (common on a bare VPS) falls back to the local encrypted file store
-//! in [`file_store`] for the rest of this process's lifetime. Splitting
-//! reads/writes across backends mid-run would be a real correctness
-//! hazard (write goes to the store that happened to be probed
-//! successfully that call, read checks a different one) — probing once
-//! and committing to a backend avoids that entirely.
-//!
-//! **Memory-dump mitigation status, honestly:** credentials are
-//! returned wrapped in [`secrecy::SecretString`], which zeroizes on
-//! drop and refuses `Debug`/`Display` — that's the layer-1 mitigation
-//! from §8.2 (never let the key/value sit around in an un-zeroized,
-//! accidentally-loggable form). `mlock`/hardware-backed keys (§8.2's
-//! layers 2–3) are NOT implemented here — flagged, not silently
-//! skipped.
 
 mod acl;
 mod file_store;
@@ -124,10 +105,6 @@ impl Vault {
 fn probe_keyring(service_name: &str) -> bool {
     const PROBE_KEY: &str = "__vault_startup_probe__";
 
-    // On headless Linux, keyring v2's Secret Service backend needs an
-    // actual D-Bus session and a running gnome-keyring secrets component.
-    // Installing the packages alone does not create either one. Bootstrap
-    // them here when possible, then do the real round-trip probe.
     if ensure_linux_secret_service().is_err() {
         return false;
     }
@@ -143,11 +120,6 @@ fn probe_keyring(service_name: &str) -> bool {
     ok
 }
 
-/// Ensure a usable Secret Service session exists for the current process.
-/// On ordinary desktop Linux, the login/session manager normally provides
-/// D-Bus and starts GNOME Keyring. On headless systems (containers, VPSes,
-/// Codespaces), there may be neither, so we create a private per-process
-/// D-Bus session and start only the `secrets` component of gnome-keyring.
 #[cfg(target_os = "linux")]
 fn ensure_linux_secret_service() -> Result<(), String> {
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
@@ -170,14 +142,13 @@ fn ensure_linux_secret_service() -> Result<(), String> {
         ));
     }
 
-    let address = String::from_utf8_lossy(&output.stdout)
+    let output_text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let address = output_text
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .ok_or_else(|| "session D-Bus did not print a bus address".to_string())?;
 
-    // vault is a single-process startup subsystem; this environment is
-    // inherited by the keyring crate for every subsequent operation.
     std::env::set_var("DBUS_SESSION_BUS_ADDRESS", address);
 
     start_gnome_keyring_secrets()
@@ -198,10 +169,6 @@ fn start_gnome_keyring_secrets() -> Result<(), String> {
         ));
     }
 
-    // gnome-keyring-daemon prints shell-compatible environment assignments
-    // for the control socket when started/restarted. Import the variables
-    // into this process so subsequent Secret Service calls use the same
-    // daemon/session. Ignore unrelated output and never print secret values.
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Some((name, value)) = line.split_once('=') else {
             continue;
