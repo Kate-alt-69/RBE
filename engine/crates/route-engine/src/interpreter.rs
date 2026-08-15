@@ -1,6 +1,4 @@
 //! Runtime interpreter for `.route` files.
-//! This remains the development/runtime fallback while AOT Rust generation
-//! is being expanded.
 
 use std::collections::HashMap;
 
@@ -9,10 +7,7 @@ use crate::modules::ModuleRegistry;
 
 #[derive(Debug, Clone)]
 pub struct EvalError { pub message: String }
-
-impl EvalError {
-    pub(crate) fn new(message: impl Into<String>) -> Self { Self { message: message.into() } }
-}
+impl EvalError { pub(crate) fn new(message: impl Into<String>) -> Self { Self { message: message.into() } } }
 impl std::fmt::Display for EvalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.message) }
 }
@@ -36,7 +31,6 @@ impl RequestContext {
 }
 
 enum Binding { Value(Value), Module }
-
 enum Flow { Continue, Return(Value) }
 
 pub struct Interpreter<'a> {
@@ -57,12 +51,7 @@ impl<'a> Interpreter<'a> {
         self
     }
 
-    pub fn run(
-        &mut self,
-        method: &MethodDef,
-        req: &RequestContext,
-        module_names: &[String],
-    ) -> Result<Value, EvalError> {
+    pub fn run(&mut self, method: &MethodDef, req: &RequestContext, module_names: &[String]) -> Result<Value, EvalError> {
         self.scope.clear();
         if let Some(param_name) = &method.param_name {
             self.scope.insert(param_name.clone(), Binding::Value(req.as_value()));
@@ -90,12 +79,12 @@ impl<'a> Interpreter<'a> {
             )));
         }
 
-        let mut child = Interpreter::new(self.modules).with_functions(
-            &self.functions.values().cloned().collect::<Vec<_>>()
-        );
+        let all_functions: Vec<FunctionDef> = self.functions.values().cloned().collect();
+        let mut child = Interpreter::new(self.modules).with_functions(&all_functions);
         for (param, value) in function.params.iter().zip(args) {
             child.scope.insert(param.clone(), Binding::Value(value));
         }
+
         match child.exec_block(&function.body)? {
             Flow::Continue => Ok(Value::Null),
             Flow::Return(value) => Ok(value),
@@ -131,15 +120,9 @@ impl<'a> Interpreter<'a> {
             Expr::Null => Ok(Value::Null),
             Expr::Ident(name) => match self.scope.get(name) {
                 Some(Binding::Value(v)) => Ok(v.clone()),
-                Some(Binding::Module) => Err(EvalError::new(format!(
-                    "{name} is a module, not a value — call one of its functions"
-                ))),
-                None if self.functions.contains_key(name) => Err(EvalError::new(format!(
-                    "function {name} must be called, not used as a value"
-                ))),
-                None if self.modules.is_direct_function(name) => Err(EvalError::new(format!(
-                    "{name} is an imported function, not a value — call it"
-                ))),
+                Some(Binding::Module) => Err(EvalError::new(format!("{name} is a module, not a value — call one of its functions"))),
+                None if self.functions.contains_key(name) => Err(EvalError::new(format!("function {name} must be called, not used as a value"))),
+                None if self.modules.is_direct_function(name) => Err(EvalError::new(format!("{name} is an imported function, not a value — call it"))),
                 None => Err(EvalError::new(format!("{name} is not defined"))),
             },
             Expr::Object(fields) => {
@@ -202,7 +185,6 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => {}
                 }
-
                 let left = self.eval(left)?;
                 let right = self.eval(right)?;
                 self.binary(op, left, right)
@@ -215,27 +197,26 @@ impl<'a> Interpreter<'a> {
             BinaryOp::Equal | BinaryOp::StrictEqual => Ok(Value::Bool(value_eq(&left, &right))),
             BinaryOp::NotEqual | BinaryOp::StrictNotEqual => Ok(Value::Bool(!value_eq(&left, &right))),
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
-                let (a, b) = match (&left, &right) {
-                    (Value::Number(a), Value::Number(b)) => (*a, *b),
+                match (&left, &right) {
+                    (Value::Number(a), Value::Number(b)) => Ok(Value::Bool(match op {
+                        BinaryOp::Less => a < b,
+                        BinaryOp::LessEqual => a <= b,
+                        BinaryOp::Greater => a > b,
+                        BinaryOp::GreaterEqual => a >= b,
+                        _ => unreachable!(),
+                    })),
                     (Value::String(a), Value::String(b)) => {
                         let ord = a.cmp(b);
-                        return Ok(Value::Bool(match op {
+                        Ok(Value::Bool(match op {
                             BinaryOp::Less => ord.is_lt(),
                             BinaryOp::LessEqual => ord.is_le(),
                             BinaryOp::Greater => ord.is_gt(),
                             BinaryOp::GreaterEqual => ord.is_ge(),
-                            _ => false,
-                        }));
+                            _ => unreachable!(),
+                        }))
                     }
-                    _ => return Err(EvalError::new("comparison requires matching numbers or strings")),
-                };
-                Ok(Value::Bool(match op {
-                    BinaryOp::Less => a < b,
-                    BinaryOp::LessEqual => a <= b,
-                    BinaryOp::Greater => a > b,
-                    BinaryOp::GreaterEqual => a >= b,
-                    _ => false,
-                }))
+                    _ => Err(EvalError::new("comparison requires matching numbers or strings")),
+                }
             }
             BinaryOp::Add => match (left, right) {
                 (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
