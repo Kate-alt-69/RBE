@@ -225,7 +225,7 @@ fn print_compiler_header(route_count: usize) {
 /// three work units: parse, semantic analysis, and Rust artifact generation.
 /// Syntax/semantic errors are accumulated across the entire tree and written
 /// to `data/admin/compiler-error.txt` before boot is allowed to continue.
-fn boot_compile(api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Arc<RouteFile>)>> {
+fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Arc<RouteFile>)>> {
     let error_path = compiler_error_path();
     if let Some(parent) = error_path.parent() { fs::create_dir_all(parent)?; }
     let mut error_file = fs::File::create(&error_path)?;
@@ -260,22 +260,21 @@ fn boot_compile(api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathBu
             Ok(tokens) => tokens,
             Err(error) => {
                 errors.push(frame_diagnostic(path, &source, error.line, error.column, &error.message));
-                done += 1;
+                done += 3;
                 continue;
             }
         };
-        done += 1;
-        render_progress("Parsing", done, total_units);
 
         let file = match Parser::new(tokens).parse_file() {
             Ok(file) => Arc::new(file),
             Err(error) => {
                 errors.push(frame_diagnostic(path, &source, error.line, error.column, &error.message));
-                done += 2;
+                done += 3;
                 continue;
             }
         };
-        done += 0;
+        done += 1;
+        render_progress("Parsing", done, total_units);
         render_progress("Semantic", done, total_units);
 
         let diagnostics = analyze(&file);
@@ -286,12 +285,9 @@ fn boot_compile(api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathBu
             done += 2;
             continue;
         }
-
-        // Warnings stay in the boot UI as a compact count. The detailed
-        // compiler-error file is reserved for errors so it remains useful.
         done += 1;
-        render_progress("Generating", done, total_units);
 
+        render_progress("Generating", done, total_units);
         let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
         match transpile_file(&file, &path.to_string_lossy(), &module_names) {
             Ok(_) => {
@@ -312,8 +308,6 @@ fn boot_compile(api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathBu
         return Err(anyhow::anyhow!("route compiler found {} error(s); see {}", errors.len(), error_path.display()));
     }
 
-    // One final redraw gives a deterministic full bar before terminal control
-    // is returned to the normal backend logger.
     render_progress("Ready", total_units, total_units);
     println!();
 
