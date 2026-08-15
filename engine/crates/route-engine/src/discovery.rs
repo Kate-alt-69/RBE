@@ -4,7 +4,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -132,6 +132,16 @@ fn value_to_json(value: &Value) -> serde_json::Value {
     }
 }
 
+fn append_runtime_error(path: &str, error: &str) {
+    let error_path = compiler_error_path();
+    if let Some(parent) = error_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&error_path) {
+        let _ = writeln!(file, "E4000: route evaluation failed at {path}: {error}");
+    }
+}
+
 async fn execute(
     method_def: Arc<MethodDef>,
     functions: Arc<Vec<FunctionDef>>,
@@ -152,6 +162,7 @@ async fn execute(
         Ok(value) => Json(value_to_json(&value)).into_response(),
         Err(err) => {
             tracing::error!(error = %err, path = %req_ctx.path, "route evaluation failed");
+            append_runtime_error(&req_ctx.path, &err.to_string());
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": err.to_string() })),
@@ -433,12 +444,17 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
         report.warnings = diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
 
         for diagnostic in &diagnostics {
+            let message = if matches!(diagnostic.code, "E3010" | "E3011") {
+                diagnostic.message.replace("from the route file", &format!("from {}", path.display()))
+            } else {
+                diagnostic.message.clone()
+            };
             let detail = frame_diagnostic_with_symbol(
                 path,
                 &source,
                 1,
                 1,
-                &diagnostic.message,
+                &message,
                 diagnostic.symbol.as_deref(),
                 terminal_width,
             );
