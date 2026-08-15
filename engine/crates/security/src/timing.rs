@@ -4,11 +4,10 @@
 //! smaller metadata stream: useful request identity, timing, client IP,
 //! and only the proxy/geo/CORS metadata that actually exists.
 //!
-//! Repeated 404s are deduplicated so a bot probing thousands of missing
-//! paths cannot turn the audit file into a storage bomb. The first miss
-//! for a `(client, method, path)` bucket is recorded immediately; repeats
-//! inside the suppression window are counted in memory and emitted as a
-//! compact summary when the bucket becomes eligible again.
+//! Repeated HTTP error responses are deduplicated so a bot repeatedly
+//! probing or triggering errors cannot turn the audit file into a storage
+//! bomb. 4xx responses use a longer suppression window; 5xx responses use
+//! a shorter window so server-side failures remain more visible.
 
 use atomic_io::AtomicIo;
 use axum::extract::{ConnectInfo, Request, State};
@@ -25,24 +24,32 @@ use tracing::info;
 
 use crate::real_ip::extract_real_ip;
 
-const NOT_FOUND_SUPPRESSION: Duration = Duration::from_secs(10);
-const NOT_FOUND_STATE_TTL: Duration = Duration::from_secs(60);
-const MAX_NOT_FOUND_BUCKETS: usize = 16_384;
+const CLIENT_ERROR_SUPPRESSION: Duration = Duration::from_secs(10);
+const SERVER_ERROR_SUPPRESSION: Duration = Duration::from_secs(3);
+const ERROR_STATE_TTL: Duration = Duration::from_secs(60);
+const MAX_ERROR_BUCKETS: usize = 16_384;
 
 static REQUEST_AUDIT_IO: OnceLock<AtomicIo> = OnceLock::new();
-static NOT_FOUND_STATE: OnceLock<Mutex<HashMap<NotFoundKey, NotFoundBucket>>> = OnceLock::new();
+static ERROR_STATUS_STATE: OnceLock<Mutex<HashMap<ErrorStatusKey, ErrorStatusBucket>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct NotFoundKey {
+struct ErrorStatusKey {
     client_ip: String,
     method: String,
     path: String,
+    status: u16,
 }
 
 #[derive(Debug)]
-struct NotFoundBucket {
+struct ErrorStatusBucket {
     last_logged: Instant,
     suppressed: u64,
+}
+
+enum ErrorAuditDecision {
+    Log { suppressed: u64 },
+    Suppress,
+    NotApplicable,
 }
 
 pub async fn request_timing(
@@ -117,30 +124,56 @@ pub async fn request_timing(
         );
     }
 
-    let should_audit = status != 404 || should_log_not_found(&client_ip.to_string(), method.as_str(), &path);
-
-    if should_audit {
-        write_request_audit(
-            &config,
-            &headers,
-            response.headers(),
-            &method.to_string(),
-            &path,
-            &query,
-            peer,
-            client_ip.to_string(),
-            duration_ms,
-            status,
-            origin,
-            preflight,
-            request_cors_method,
-            request_cors_headers,
-            response_cors_origin,
-            response_cors_methods,
-            response_cors_headers,
-            response_cors_credentials,
-            cors_blocked,
-        );
+    match error_audit_decision(&client_ip.to_string(), method.as_str(), &path, status) {
+        ErrorAuditDecision::Suppress => {}
+        ErrorAuditDecision::Log { suppressed } => {
+            write_request_audit(
+                &config,
+                &headers,
+                response.headers(),
+                &method.to_string(),
+                &path,
+                &query,
+                peer,
+                client_ip.to_string(),
+                duration_ms,
+                status,
+                origin,
+                preflight,
+                request_cors_method,
+                request_cors_headers,
+                response_cors_origin,
+                response_cors_methods,
+                response_cors_headers,
+                response_cors_credentials,
+                cors_blocked,
+                suppressed,
+            );
+        }
+        ErrorAuditDecision::NotApplicable => {
+            write_request_audit(
+                &config,
+                &headers,
+                response.headers(),
+                &method.to_string(),
+                &path,
+                &query,
+                peer,
+                client_ip.to_string(),
+                duration_ms,
+                status,
+                origin,
+                preflight,
+                request_cors_method,
+                request_cors_headers,
+                response_cors_origin,
+                response_cors_methods,
+                response_cors_headers,
+                response_cors_credentials,
+                cors_blocked,
+                0,
+            );
+        }
     }
 
     if let Ok(value) = HeaderValue::from_str(&format!("total;dur={duration_ms:.3}")) {
@@ -171,25 +204,40 @@ fn collect_optional_headers(headers: &HeaderMap, names: &[&str]) -> Map<String, 
     result
 }
 
-fn should_log_not_found(client_ip: &str, method: &str, path: &str) -> bool {
-    let state = NOT_FOUND_STATE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = NotFoundKey {
+fn suppression_window(status: u16) -> Option<Duration> {
+    match status {
+        400..=499 => Some(CLIENT_ERROR_SUPPRESSION),
+        500..=599 => Some(SERVER_ERROR_SUPPRESSION),
+        _ => None,
+    }
+}
+
+fn error_audit_decision(
+    client_ip: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+) -> ErrorAuditDecision {
+    let Some(window) = suppression_window(status) else {
+        return ErrorAuditDecision::NotApplicable;
+    };
+
+    let state = ERROR_STATUS_STATE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = ErrorStatusKey {
         client_ip: client_ip.to_string(),
         method: method.to_string(),
         path: path.to_string(),
+        status,
     };
 
     let now = Instant::now();
     let Ok(mut buckets) = state.lock() else {
-        return true;
+        return ErrorAuditDecision::Log { suppressed: 0 };
     };
 
-    buckets.retain(|_, bucket| now.duration_since(bucket.last_logged) <= NOT_FOUND_STATE_TTL);
+    buckets.retain(|_, bucket| now.duration_since(bucket.last_logged) <= ERROR_STATE_TTL);
 
-    if buckets.len() >= MAX_NOT_FOUND_BUCKETS && !buckets.contains_key(&key) {
-        // Bound memory during a path-randomizing scan. The durable audit
-        // file is the important artifact; the suppression cache is only
-        // a traffic-control optimization.
+    if buckets.len() >= MAX_ERROR_BUCKETS && !buckets.contains_key(&key) {
         buckets.clear();
     }
 
@@ -197,40 +245,22 @@ fn should_log_not_found(client_ip: &str, method: &str, path: &str) -> bool {
         None => {
             buckets.insert(
                 key,
-                NotFoundBucket {
+                ErrorStatusBucket {
                     last_logged: now,
                     suppressed: 0,
                 },
             );
-            true
+            ErrorAuditDecision::Log { suppressed: 0 }
         }
-        Some(bucket) if now.duration_since(bucket.last_logged) < NOT_FOUND_SUPPRESSION => {
+        Some(bucket) if now.duration_since(bucket.last_logged) < window => {
             bucket.suppressed = bucket.suppressed.saturating_add(1);
-            false
+            ErrorAuditDecision::Suppress
         }
         Some(bucket) => {
             let suppressed = bucket.suppressed;
             bucket.last_logged = now;
             bucket.suppressed = 0;
-
-            if suppressed > 0 {
-                // Emit the summary in a separate compact record before the
-                // next 404 detail record. Returning false here would lose
-                // the summary, so write it directly while we have the key.
-                let summary = json!({
-                    "ts_ms": now_ms(),
-                    "kind": "404_summary",
-                    "method": method,
-                    "path": path,
-                    "status": 404,
-                    "client_ip": client_ip,
-                    "suppressed": suppressed,
-                    "window_ms": NOT_FOUND_SUPPRESSION.as_millis() as u64,
-                });
-                append_audit_value(&summary);
-            }
-
-            true
+            ErrorAuditDecision::Log { suppressed }
         }
     }
 }
@@ -262,6 +292,7 @@ fn write_request_audit(
     response_cors_headers: Option<String>,
     response_cors_credentials: Option<String>,
     cors_blocked: bool,
+    suppressed: u64,
 ) {
     let mut entry = Map::new();
     entry.insert("ts_ms".into(), json!(now_ms()));
@@ -272,12 +303,9 @@ fn write_request_audit(
     }
     entry.insert("status".into(), json!(status));
     entry.insert("duration_ms".into(), json!(format!("{duration_ms:.3}")));
-    entry.insert("client_ip".into(), json!(client_ip));
+    entry.insert("client_ip".into(), json!(client_ip.clone()));
 
-    // `client_ip` is the actual remote peer identity after trusted-proxy
-    // extraction. A local browser talking to a local server will correctly
-    // appear as 127.0.0.1/::1; that is not the server's LAN address.
-    if peer.ip().to_string() != entry["client_ip"].as_str().unwrap_or_default() {
+    if peer.ip().to_string() != client_ip {
         entry.insert("peer_ip".into(), json!(peer.ip().to_string()));
     }
 
@@ -295,6 +323,35 @@ fn write_request_audit(
     }
     if let Some(accept_language) = header(request_headers, "accept-language") {
         entry.insert("accept_language".into(), json!(accept_language));
+    }
+
+    if let Some(suppression_window) = suppression_window(status) {
+        if suppressed > 0 {
+            entry.insert("kind".into(), json!("status_summary"));
+            entry.insert("suppressed".into(), json!(suppressed));
+            entry.insert(
+                "suppression_window_ms".into(),
+                json!(suppression_window.as_millis() as u64),
+            );
+        } else {
+            entry.insert("kind".into(), json!(
+                if status >= 500 { "5xx" } else { "4xx" }
+            ));
+        }
+
+        // Error-status records intentionally stay compact. No raw request
+        // headers, response headers, geo bundles, or proxy bundles are
+        // persisted unless they provide a concrete extra debugging signal
+        // below.
+        if let Some(correlation_id) = header(response_headers, "x-correlation-id") {
+            entry.insert("correlation_id".into(), json!(correlation_id));
+        }
+        if let Some(server_timing) = header(response_headers, "server-timing") {
+            entry.insert("server_timing".into(), json!(server_timing));
+        }
+
+        append_audit_value(&Value::Object(entry));
+        return;
     }
 
     let forwarded_chain = collect_optional_headers(
@@ -378,25 +435,6 @@ fn write_request_audit(
         );
     }
 
-    // 404s intentionally stay compact; the hot path above suppresses
-    // repeated identical misses. Other statuses keep the useful request
-    // metadata, with no raw headers/body/cookies/authorization material.
-    if status == 404 {
-        let compact = json!({
-            "ts_ms": entry.remove("ts_ms").unwrap_or_default(),
-            "kind": "404",
-            "method": method,
-            "path": path,
-            "status": 404,
-            "duration_ms": format!("{duration_ms:.3}"),
-            "client_ip": client_ip,
-            "host": entry.remove("host").unwrap_or(Value::Null),
-            "user_agent": entry.remove("user_agent").unwrap_or(Value::Null),
-        });
-        append_audit_value(&compact);
-        return;
-    }
-
     if config.security.trusted_proxy_headers {
         entry.insert("trusted_proxy_headers".into(), json!(true));
     }
@@ -405,13 +443,11 @@ fn write_request_audit(
 }
 
 fn append_audit_value(value: &Value) {
-    let line = match serde_json::to_vec(value) {
-        Ok(mut bytes) => {
-            bytes.push(b'\n');
-            bytes
-        }
+    let mut line = match serde_json::to_vec(value) {
+        Ok(bytes) => bytes,
         Err(_) => return,
     };
+    line.push(b'\n');
 
     let path = std::path::Path::new("./data/admin/request.queue.log");
     let io = REQUEST_AUDIT_IO.get_or_init(AtomicIo::new);
