@@ -133,6 +133,7 @@ The first planned capability boundary is:
 | `log` | Yes | Yes | Same usage in both file types |
 | `security` | Yes | Yes | Capability is configurable and policy-controlled |
 | `response` | Via `net` | Via `net` | Planned namespace such as `net:response` |
+| `private` | Yes | N/A | Read-only backend runtime health information |
 
 This table is a **design contract**, not permission to expose all listed functions immediately.
 
@@ -221,6 +222,28 @@ The response capability is conceptually part of the network/HTTP boundary and ma
 
 This provides an explicit namespace for response construction without making `response` an ambient global.
 
+### `private`
+
+`private` is a backend-owned, read-only health capability. It is intentionally **not** a general host/runtime escape hatch.
+
+The currently exposed operation is:
+
+```text
+private.health()
+```
+
+It returns:
+
+```text
+status          -> backend health state
+uptime          -> backend runtime uptime in seconds
+container       -> null until container health is exposed here
+vault           -> true when the backend's required Vault process is ready
+errorReporter   -> null until reporter state is exposed here
+```
+
+Routes cannot use `private` to read environment variables, secrets, arbitrary processes, or filesystem state.
+
 ---
 
 ## 7. Route structure
@@ -238,6 +261,29 @@ class Route {
             ok: true,
             engine: engine,
             path: req.path
+        };
+    }
+}
+```
+
+A health route can use the internal runtime capability:
+
+```js
+:import[private, net]
+
+class Route {
+    async get(req) {
+        const health = private.health();
+        const engine = net.ping();
+
+        return {
+            ok: true,
+            status: health.status,
+            uptime: health.uptime,
+            container: health.container,
+            vault: health.vault,
+            errorReporter: health.errorReporter,
+            engine: engine
         };
     }
 }
@@ -316,6 +362,7 @@ Diagnostics are divided into:
 - semantic/name-resolution errors
 - import/capability errors
 - artifact-generation errors
+- runtime route evaluation errors
 - warnings
 
 Warnings do not abort backend boot. Errors do.
@@ -327,6 +374,28 @@ The compiler writes detailed **errors** to:
 ```
 
 That file is cleared at backend boot so stale diagnostics cannot survive into a new run.
+
+### Diagnostic codes
+
+```text
+E3000  capability unavailable in `.route`
+E3001  duplicate import source
+E3010  built-in import/function name does not exist as an import
+E3011  built-in member call does not exist
+E4000  route evaluation failed at runtime
+```
+
+Unknown built-in imports are compiler errors, not request-time errors:
+
+```text
+error[E3010]: vault.import does not exist as a import — please remove `vault.import` from api/health.route
+```
+
+Unknown built-in calls are also compiler errors:
+
+```text
+error[E3011]: net.health() does not exist — please remove it from api/health.route
+```
 
 ---
 
