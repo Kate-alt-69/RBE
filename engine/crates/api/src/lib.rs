@@ -33,33 +33,21 @@ pub fn build_router(state: AppState, api_dir: &Path) -> anyhow::Result<Router> {
     let cors = build_cors_layer(&state);
     let dot_route_routes = route_engine::build_routes(api_dir)?;
 
-    // Built with `ServiceBuilder` rather than chained `Router::layer()`
-    // calls on purpose: `ServiceBuilder` composes top-to-bottom (first
-    // `.layer()` added is outermost, runs first on the request) — the
-    // intuitive reading. Chained `Router::layer()` calls do the
-    // opposite (last added is outermost), which is a well-known axum
-    // footgun not worth relying on getting right by hand here. Ban
-    // check goes first/outermost — a banned IP shouldn't pay the cost
-    // of any layer below it, same reasoning as the Node backend
-    // escalating straight to 403 rather than running the rest of the
-    // pipeline. Correlation ID next, so every later layer's logs
-    // (including TraceLayer's own request span, and request_timing's
-    // completion log) can be correlated. request_timing sits right
-    // after correlation_id/TraceLayer specifically so its measured
-    // duration covers every layer below it (rate limiting, body-size
-    // enforcement, security headers, CORS, and the actual handler) —
-    // the honest end-to-end number, not just handler time.
+    // request_timing is intentionally outermost so even requests rejected
+    // by the ban layer are audited in request.queue.log. It still measures
+    // the complete request lifecycle, including the security layers and
+    // handler below it.
     let middleware = ServiceBuilder::new()
+        .layer(axum::middleware::from_fn_with_state(
+            state.config.clone(),
+            security::request_timing,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security::ban_check::<AppState>,
         ))
         .layer(axum::middleware::from_fn(security::correlation_id))
         .layer(TraceLayer::new_for_http())
-        .layer(axum::middleware::from_fn_with_state(
-            state.config.clone(),
-            security::request_timing,
-        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security::global_rate_limit::<AppState>,
