@@ -132,19 +132,28 @@ fn analyze_statements(statements: &[Statement], scope: &mut Scope, used_globals:
     }
 }
 
-fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<String>, diagnostics: &mut Vec<Diagnostic>) {
-    match expr {
-        Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => {}
-        Expr::Ident(name) => match scope.get_mut(name) {
-            Some(symbol) => {
-                symbol.used = true;
-                if symbol.kind != SymbolKind::Local {
-                    used_globals.insert(name.clone());
+fn mark_identifier(name: &str, scope: &mut Scope, used_globals: &mut HashSet<String>, diagnostics: &mut Vec<Diagnostic>, allow_module_value: bool) {
+    match scope.get_mut(name) {
+        Some(symbol) => {
+            symbol.used = true;
+            match symbol.kind {
+                SymbolKind::Local => {}
+                SymbolKind::Module if allow_module_value => { used_globals.insert(name.to_string()); }
+                SymbolKind::Module => diagnostics.push(Diagnostic::error(format!("`{name}` is a module and must be accessed through an exported capability"))),
+                SymbolKind::DirectFunction | SymbolKind::Function => {
+                    used_globals.insert(name.to_string());
                     diagnostics.push(Diagnostic::error(format!("`{name}` is callable metadata, not a value; call it instead")));
                 }
             }
-            None => diagnostics.push(Diagnostic::error(format!("`{name}` is not defined"))),
-        },
+        }
+        None => diagnostics.push(Diagnostic::error(format!("`{name}` is not defined"))),
+    }
+}
+
+fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<String>, diagnostics: &mut Vec<Diagnostic>) {
+    match expr {
+        Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => {}
+        Expr::Ident(name) => mark_identifier(name, scope, used_globals, diagnostics, false),
         Expr::Member(base, _) => {
             if let Expr::Ident(name) = base.as_ref() {
                 match scope.get_mut(name) {
@@ -152,7 +161,7 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                         symbol.used = true;
                         used_globals.insert(name.clone());
                     }
-                    Some(_) => {}
+                    Some(_) => mark_identifier(name, scope, used_globals, diagnostics, false),
                     None => diagnostics.push(Diagnostic::error(format!("module `{name}` is not imported"))),
                 }
             } else {
@@ -178,7 +187,7 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                                 symbol.used = true;
                                 used_globals.insert(name.clone());
                             }
-                            Some(_) => diagnostics.push(Diagnostic::error(format!("`{name}` is not a module"))),
+                            Some(_) => mark_identifier(name, scope, used_globals, diagnostics, false),
                             None => diagnostics.push(Diagnostic::error(format!("module `{name}` is not imported"))),
                         }
                     } else {
@@ -231,6 +240,13 @@ mod tests {
         let diagnostics = analyze(&file);
         assert!(diagnostics.iter().any(|d| d.severity == Severity::Error && d.message.contains("missing")));
         assert!(diagnostics.iter().any(|d| d.severity == Severity::Warning && d.message.contains("net")));
+    }
+
+    #[test]
+    fn member_access_marks_request_as_used() {
+        let file = parse(r#"class Route { get(req) { return req.path; } }"#);
+        let diagnostics = analyze(&file);
+        assert!(diagnostics.iter().all(|d| !d.message.contains("req")));
     }
 
     #[test]
