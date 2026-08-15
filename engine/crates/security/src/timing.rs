@@ -7,7 +7,7 @@ use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, Request, State};
@@ -22,7 +22,7 @@ use crate::real_ip::extract_real_ip;
 static REQUEST_AUDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub async fn request_timing(
-    State(config): State<ArcConfig>,
+    State(config): State<Arc<Config>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -42,7 +42,7 @@ pub async fn request_timing(
     let client_ip = extract_real_ip(
         &headers,
         peer,
-        config.0.security.trusted_proxy_headers,
+        config.security.trusted_proxy_headers,
     );
 
     let origin = header(&headers, "origin");
@@ -67,8 +67,6 @@ pub async fn request_timing(
             .map(|value| value != origin.as_deref().unwrap_or_default() && value != "*")
             .unwrap_or(true);
 
-    // This is intentionally the same compact terminal event as before.
-    // Debug mode adds CORS diagnostics without changing normal output.
     if debug_enabled() {
         tracing::info!(
             method = %method,
@@ -96,7 +94,7 @@ pub async fn request_timing(
     }
 
     write_request_audit(
-        &config.0,
+        &config,
         &headers,
         response.headers(),
         &method.to_string(),
@@ -123,10 +121,6 @@ pub async fn request_timing(
 
     response
 }
-
-// Keep the public state type small while avoiding a clone-heavy signature.
-#[derive(Clone)]
-pub struct ArcConfig(pub std::sync::Arc<Config>);
 
 fn debug_enabled() -> bool {
     std::env::args().any(|arg| arg == "-debug" || arg == "--debug")
