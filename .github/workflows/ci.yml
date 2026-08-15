@@ -1,11 +1,9 @@
 name: CI
 
-# Lives at the true repo root (project-root/.github/workflows) — this
-# only works here, not nested inside engine/, since GitHub Actions
-# only discovers workflows at the repository root. (Was briefly
-# misplaced under engine/.github during an earlier restructure; fixed
-# once the top-level layout with vault/, atomic-io/, and
-# container-runtime/ as siblings was settled.)
+# Lives at the true repo root (project-root/.github/workflows).
+# CI validates both the Rust workspaces and the same build entrypoints
+# developers use locally, so a green CI run means the distributable build
+# scripts can actually compile RBE on their native CI platforms.
 
 on:
   push:
@@ -37,6 +35,36 @@ jobs:
 
       - name: build (release)
         run: cargo build --workspace --release
+
+  # Run the actual repository build entrypoint on Linux. This is intentionally
+  # separate from the direct cargo build above: build.sh is the supported
+  # distributable build path and performs the same container embedding and
+  # output preparation used by local builds.
+  build-script-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: build.sh (host debug build)
+        run: ./build.sh --debug
+
+  # Validate the PowerShell build entrypoint on its native platform as well.
+  # build.ps1 requires PowerShell 7+, which is preinstalled on GitHub's
+  # Windows runners.
+  build-script-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: build.ps1 (host debug build)
+        shell: pwsh
+        run: ./build.ps1 --debug
 
   # Standalone crates, not members of any workspace — shared between
   # engine/ and container-runtime/ via relative path (see each crate's
