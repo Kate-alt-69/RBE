@@ -1,26 +1,22 @@
 //! Wires up `tracing-subscriber` so output looks like the Node
 //! backend's colored terminal format when `logging.format = "pretty"`,
-//! or structured JSON when `logging.format = "json"` — same switch the
-//! handbook's Logging Architecture described, just backed by
-//! `tracing-subscriber`'s built-in formatters rather than a hand-rolled
-//! ANSI formatter. Output format: `[TIMESTAMP] LEVEL [MODULE] message`
-//! where MODULE comes from the structured `module` field in Logger,
-//! not the Rust file path target.
+//! or structured JSON when `logging.format = "json"`.
 //!
-//! Call this once, at the very start of `boot()` in `main.rs` — before
-//! config loading, per §3.2 — so failures before config even loads are
-//! still visible.
+//! Output format: `[TIMESTAMP] LEVEL [MODULE] message` where MODULE
+//! comes from the structured `module` field in Logger, not the Rust
+//! file path target.
 
 use config::LoggingConfig;
 use std::fmt;
+use std::io::IsTerminal;
 use tracing::{Event, Subscriber};
-use tracing_subscriber::fmt::{FormatEvent, FmtContext};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
 
-/// Custom event formatter that shows the `module` field from Logger
-/// instead of the Rust file target path.
-struct CustomFormatter;
+struct CustomFormatter {
+    ansi: bool,
+}
 
 impl<S> FormatEvent<S, tracing_subscriber::fmt::format::DefaultFields> for CustomFormatter
 where
@@ -33,50 +29,39 @@ where
         event: &Event<'_>,
     ) -> fmt::Result {
         use tracing::Level;
-        
-        let metadata = event.metadata();
-        let level = metadata.level();
-        
-        // Format the timestamp
-        let now = chrono::Local::now();
-        write!(writer, "{}", now.format("%Y-%m-%dT%H:%M:%S%.6fZ"))?;
-        
-        // Format the level with color
-        let level_str = match *level {
-            Level::ERROR => "\x1b[91mERROR\x1b[0m",  // Bright red
-            Level::WARN => "\x1b[93mWARN\x1b[0m",    // Bright yellow
-            Level::INFO => "\x1b[92mINFO\x1b[0m",    // Bright green
-            Level::DEBUG => "\x1b[94mDEBUG\x1b[0m",  // Bright blue
-            Level::TRACE => "\x1b[95mTRACE\x1b[0m",  // Bright magenta
-        };
-        write!(writer, "  {}", level_str)?;
-        
-        // Try to get the module field from the event
-        let mut module = None;
-        let mut visitor = ModuleVisitor { module: &mut module };
-        event.record(&mut visitor);
-        
-        // Write module name if available
-        if let Some(m) = module {
-            write!(writer, " \x1b[36m[{}]\x1b[0m", m)?;  // Cyan
+
+        write!(writer, "{}", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6fZ"))?;
+
+        if self.ansi {
+            let level = match *event.metadata().level() {
+                Level::ERROR => "\x1b[91mERROR\x1b[0m",
+                Level::WARN => "\x1b[93mWARN\x1b[0m",
+                Level::INFO => "\x1b[92mINFO\x1b[0m",
+                Level::DEBUG => "\x1b[94mDEBUG\x1b[0m",
+                Level::TRACE => "\x1b[95mTRACE\x1b[0m",
+            };
+            write!(writer, "  {level}")?;
+        } else {
+            write!(writer, "  {}", event.metadata().level())?;
         }
-        
-        // Write the message
+
+        let mut module = None;
+        event.record(&mut ModuleVisitor { module: &mut module });
+        if let Some(module) = module {
+            if self.ansi {
+                write!(writer, " \x1b[36m[{module}]\x1b[0m")?;
+            } else {
+                write!(writer, " [{module}]")?;
+            }
+        }
+
         write!(writer, ": ")?;
-        
-        // Get the message field
         let mut message = String::new();
-        let mut msg_visitor = MessageVisitor { message: &mut message };
-        event.record(&mut msg_visitor);
-        write!(writer, "{}", message)?;
-        
-        writeln!(writer)?;
-        
-        Ok(())
+        event.record(&mut MessageVisitor { message: &mut message });
+        writeln!(writer, "{message}")
     }
 }
 
-/// Visitor to extract the `module` field from a tracing Event
 struct ModuleVisitor<'a> {
     module: &'a mut Option<String>,
 }
@@ -89,7 +74,6 @@ impl<'a> tracing::field::Visit for ModuleVisitor<'a> {
     }
 }
 
-/// Visitor to extract the message from a tracing Event
 struct MessageVisitor<'a> {
     message: &'a mut String,
 }
@@ -102,18 +86,12 @@ impl<'a> tracing::field::Visit for MessageVisitor<'a> {
     }
 }
 
-/// Initializes the global `tracing` subscriber. Call exactly once.
 pub fn init(cfg: &LoggingConfig) -> anyhow::Result<()> {
-    // `RUST_LOG` env var wins if set (standard tracing convention and
-    // useful for one-off debugging without editing settings.json);
-    // otherwise fall back to `logging.level` from config.
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&cfg.level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let is_json = cfg.format == "json";
-
-    if is_json {
+    if cfg.format == "json" {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
@@ -122,11 +100,12 @@ pub fn init(cfg: &LoggingConfig) -> anyhow::Result<()> {
             .flatten_event(true)
             .init();
     } else {
+        let ansi = std::io::stderr().is_terminal();
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
-            .with_ansi(true)
-            .event_format(CustomFormatter)
+            .with_ansi(ansi)
+            .event_format(CustomFormatter { ansi })
             .with_writer(std::io::stderr)
             .init();
     }
