@@ -2,9 +2,11 @@
 //! backend's colored terminal format when `logging.format = "pretty"`,
 //! or structured JSON when `logging.format = "json"`.
 //!
-//! Output format: `[TIMESTAMP] LEVEL [MODULE] message` where MODULE
-//! comes from the structured `module` field in Logger, not the Rust
-//! file path target.
+//! Output format: `[TIMESTAMP] LEVEL [MODULE] message key=value ...`.
+//! The formatter collects the actual event message and every structured
+//! field directly from the tracing event before rendering. Fields are not
+//! discarded just because they were variables rather than part of the
+//! message string.
 
 use config::LoggingConfig;
 use std::fmt;
@@ -45,9 +47,10 @@ where
             write!(writer, "  {}", event.metadata().level())?;
         }
 
-        let mut module = None;
-        event.record(&mut ModuleVisitor { module: &mut module });
-        if let Some(module) = module {
+        let mut fields = EventFields::default();
+        event.record(&mut fields);
+
+        if let Some(module) = fields.module.as_deref() {
             if self.ansi {
                 write!(writer, " \x1b[36m[{module}]\x1b[0m")?;
             } else {
@@ -55,34 +58,72 @@ where
             }
         }
 
-        write!(writer, ": ")?;
-        let mut message = String::new();
-        event.record(&mut MessageVisitor { message: &mut message });
-        writeln!(writer, "{message}")
-    }
-}
-
-struct ModuleVisitor<'a> {
-    module: &'a mut Option<String>,
-}
-
-impl<'a> tracing::field::Visit for ModuleVisitor<'a> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "module" {
-            *self.module = Some(format!("{:?}", value).trim_matches('"').to_string());
+        if fields.message.is_empty() {
+            if fields.fields.is_empty() {
+                writeln!(writer)
+            } else {
+                writeln!(writer, ": {}", fields.fields.join(" "))
+            }
+        } else if fields.fields.is_empty() {
+            writeln!(writer, ": {}", fields.message)
+        } else {
+            writeln!(writer, ": {} {}", fields.message, fields.fields.join(" "))
         }
     }
 }
 
-struct MessageVisitor<'a> {
-    message: &'a mut String,
+#[derive(Default)]
+struct EventFields {
+    module: Option<String>,
+    message: String,
+    fields: Vec<String>,
 }
 
-impl<'a> tracing::field::Visit for MessageVisitor<'a> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            *self.message = format!("{:?}", value).trim_matches('"').to_string();
+impl EventFields {
+    fn record_named(&mut self, field: &tracing::field::Field, value: String) {
+        match field.name() {
+            "message" => self.message = value,
+            "module" => self.module = Some(value),
+            _ => self.fields.push(format!("{}={}", field.name(), value)),
         }
+    }
+
+    fn push_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        self.record_named(field, format!("{value:?}"));
+    }
+}
+
+impl tracing::field::Visit for EventFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.record_named(field, value.to_owned());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.record_named(field, value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.record_named(field, value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.record_named(field, value.to_string());
+    }
+
+    fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+        self.record_named(field, value.to_string());
+    }
+
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        self.record_named(field, value.to_string());
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.record_named(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        self.push_debug(field, value);
     }
 }
 
