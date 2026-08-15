@@ -25,10 +25,10 @@
 mod acl;
 mod file_store;
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::Command;
-use std::time::Duration;
-use std::thread;
+use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use logging::Logger;
 use secrecy::SecretString;
@@ -159,7 +159,7 @@ fn probe_keyring(service_name: &str) -> bool {
     ok
 }
 
-/// Detect which Linux distro is running
+/// Detect which Linux distro is running.
 #[allow(dead_code)]
 fn detect_linux_distro() -> String {
     if let Ok(output) = Command::new("sh")
@@ -175,30 +175,203 @@ fn detect_linux_distro() -> String {
     }
 }
 
-/// Display progress bar with state message
-#[allow(dead_code)]
-fn show_progress(message: &str, percent: u32) {
-    let filled = (percent / 5).min(20) as usize;
-    let empty = 20 - filled;
-    let bar = format!(
-        "[{}{}] {}%",
-        "=".repeat(filled),
-        "-".repeat(empty),
-        percent
-    );
-    eprint!("\r{:<35} {}", message, bar);
+const DASHBOARD_LOG_LINES: usize = 7;
+
+struct Dashboard {
+    rendered_lines: usize,
 }
 
-/// Try to install Secret Service daemon using available package managers
-#[allow(dead_code)]
-fn try_install_secret_service() -> bool {
-    let distro = detect_linux_distro();
-    
-    eprintln!("\n");
-    show_progress("Detecting Secret Service daemon", 0);
-    thread::sleep(Duration::from_millis(200));
+impl Dashboard {
+    fn new() -> Self {
+        Self { rendered_lines: 0 }
+    }
 
-    // Detect which package manager is available
+    fn clear(&mut self) {
+        if self.rendered_lines == 0 {
+            return;
+        }
+
+        let mut out = std::io::stderr();
+        let _ = write!(out, "\x1b[{}A", self.rendered_lines);
+        for _ in 0..self.rendered_lines {
+            let _ = write!(out, "\x1b[2K\r\n");
+        }
+        let _ = write!(out, "\x1b[{}A\r", self.rendered_lines);
+        let _ = out.flush();
+        self.rendered_lines = 0;
+    }
+
+    fn render(
+        &mut self,
+        stage: &str,
+        command: &str,
+        started: Instant,
+        logs: &[String],
+        progress: Option<u8>,
+    ) {
+        let mut lines = Vec::with_capacity(DASHBOARD_LOG_LINES + 4);
+        lines.push(format!("Vault setup — {stage}"));
+        lines.push(format!("Command: {command}"));
+        lines.push(format!("Elapsed: {}", format_elapsed(started.elapsed().as_secs_f64())));
+        lines.push(String::from("Logs:"));
+
+        let start = logs.len().saturating_sub(DASHBOARD_LOG_LINES);
+        for line in &logs[start..] {
+            lines.push(format!("  {line}"));
+        }
+        while lines.len() < 4 + DASHBOARD_LOG_LINES {
+            lines.push(String::new());
+        }
+
+        if let Some(percent) = progress {
+            lines.push(format_progress_bar(stage, percent));
+        }
+
+        let mut out = std::io::stderr();
+        if self.rendered_lines > 0 {
+            let _ = write!(out, "\x1b[{}A", self.rendered_lines);
+        }
+        for line in &lines {
+            let _ = write!(out, "\x1b[2K\r{line}\n");
+        }
+        self.rendered_lines = lines.len();
+        let _ = out.flush();
+    }
+}
+
+fn format_elapsed(seconds: f64) -> String {
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else {
+        let minutes = (seconds / 60.0).floor() as u64;
+        let remaining = seconds - (minutes as f64 * 60.0);
+        format!("{minutes}m {remaining:.1}s")
+    }
+}
+
+fn format_progress_bar(stage: &str, percent: u8) -> String {
+    let width = 32usize;
+    let filled = ((percent as usize * width) / 100).min(width);
+    format!(
+        "  [{:<width$}] {:>3}%  {stage}",
+        "=".repeat(filled),
+        percent,
+        width = width
+    )
+}
+
+fn run_dashboard_command(
+    dashboard: &mut Dashboard,
+    stage: &str,
+    command: &str,
+    progress: Option<u8>,
+) -> bool {
+    let started = Instant::now();
+    let mut logs = Vec::<String>::new();
+
+    dashboard.render(stage, command, started, &logs, progress);
+
+    let spawn = Command::new("sh")
+        .arg("-c")
+        .arg(format!("sudo {command} 2>&1"))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .spawn();
+
+    let mut child = match spawn {
+        Ok(child) => child,
+        Err(err) => {
+            logs.push(format!("failed to start command: {err}"));
+            dashboard.render(stage, command, started, &logs, progress);
+            dashboard.clear();
+            eprintln!(
+                "Vault setup: {stage} failed after {} — could not start command: {err}",
+                format_elapsed(started.elapsed().as_secs_f64())
+            );
+            return false;
+        }
+    };
+
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(line) if !line.trim().is_empty() => {
+                    logs.push(line.trim_end().to_string());
+                    dashboard.render(stage, command, started, &logs, progress);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    logs.push(format!("output read error: {err}"));
+                    dashboard.render(stage, command, started, &logs, progress);
+                    break;
+                }
+            }
+        }
+    }
+
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(err) => {
+            logs.push(format!("wait error: {err}"));
+            dashboard.render(stage, command, started, &logs, progress);
+            dashboard.clear();
+            eprintln!(
+                "Vault setup: {stage} failed after {} — could not wait for command: {err}",
+                format_elapsed(started.elapsed().as_secs_f64())
+            );
+            return false;
+        }
+    };
+
+    let elapsed = format_elapsed(started.elapsed().as_secs_f64());
+    let success = status.success();
+    let exit_code = status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+
+    dashboard.clear();
+
+    if success {
+        eprintln!("Vault setup: {stage} completed in {elapsed} (exit {exit_code})");
+    } else {
+        eprintln!(
+            "Vault setup: {stage} failed in {elapsed} (exit {exit_code}) — see command output above for the failure reason"
+        );
+        for line in logs.iter().rev().take(3).rev() {
+            eprintln!("  {line}");
+        }
+    }
+
+    success
+}
+
+/// Try to install Secret Service daemon using available package managers.
+fn try_install_secret_service() -> bool {
+    let mut dashboard = Dashboard::new();
+
+    let distro_started = Instant::now();
+    let mut distro_logs = vec!["Reading /etc/os-release".to_string()];
+    dashboard.render(
+        "checking Linux distribution",
+        "read /etc/os-release",
+        distro_started,
+        &distro_logs,
+        None,
+    );
+    let distro = detect_linux_distro();
+    distro_logs.push(format!("detected distro: {distro}"));
+    dashboard.render(
+        "checking Linux distribution",
+        "read /etc/os-release",
+        distro_started,
+        &distro_logs,
+        None,
+    );
+    dashboard.clear();
+
+    // Detect which package manager is available.
     let pm_commands = match distro.as_str() {
         "ubuntu" | "debian" | "linuxmint" | "kali" | "pop" | "elementary" | "zorin" | "deepin" => {
             vec![("apt-get update", "apt-get install -y gnome-keyring dbus-x11", "Debian/Ubuntu")]
@@ -216,83 +389,63 @@ fn try_install_secret_service() -> bool {
             vec![("zypper refresh", "zypper install -y gnome-keyring dbus-x11", "openSUSE")]
         }
         _ => {
-            show_progress("Checking available package managers", 25);
-            thread::sleep(Duration::from_millis(200));
+            eprintln!("Vault setup: unsupported Linux distribution '{distro}' — using fallback");
             vec![]
         }
     };
 
     if pm_commands.is_empty() {
-        show_progress("No package manager detected, using fallback", 100);
-        eprintln!("\n");
         return false;
     }
 
     for (pm_check, pm_install, pm_name) in pm_commands {
-        show_progress("Checking Secret Service availability", 25);
-        thread::sleep(Duration::from_millis(300));
-
-        // Check if Secret Service packages might already be installed
-        if Command::new("sh")
-            .arg("-c")
-            .arg("command -v gnome-keyring dbus-daemon >/dev/null 2>&1")
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            show_progress("Secret Service already installed", 100);
-            eprintln!("\n");
-            return true;
+        // Only the package installation itself gets the bottom progress bar.
+        if !run_dashboard_command(
+            &mut dashboard,
+            "checking installed Secret Service components",
+            "command -v gnome-keyring dbus-daemon",
+            None,
+        ) {
+            // Missing binaries are expected on the first run. Continue to the package manager.
+            eprintln!("Vault setup: Secret Service components are not installed yet");
         }
 
-        show_progress(&format!("Installing via {} (downloading)", pm_name), 40);
-        thread::sleep(Duration::from_millis(400));
-
-        // Try update/refresh
-        if Command::new("sh")
-            .arg("-c")
-            .arg(&format!("sudo {} >/dev/null 2>&1", pm_check))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            show_progress(&format!("Installing via {} (downloading)", pm_name), 60);
-            thread::sleep(Duration::from_millis(400));
-
-            // Try install
-            if Command::new("sh")
-                .arg("-c")
-                .arg(&format!("sudo {} >/dev/null 2>&1", pm_install))
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                show_progress(&format!("Installing via {} (finalizing)", pm_name), 85);
-                thread::sleep(Duration::from_millis(300));
-
-                // Verify installation worked
-                thread::sleep(Duration::from_millis(500));
+        if run_dashboard_command(&mut dashboard, "refreshing package metadata", pm_check, None) {
+            let install_command = format!("{pm_install} --no-install-recommends");
+            if run_dashboard_command(
+                &mut dashboard,
+                &format!("installing Secret Service via {pm_name}"),
+                &install_command,
+                Some(0),
+            ) {
                 if probe_keyring("vault-probe") {
-                    show_progress("Secret Service installed successfully", 100);
-                    eprintln!("\n");
+                    // The installation/probe stage is the only place where the bar appears.
+                    eprintln!("Vault setup: Secret Service installation verified successfully");
                     return true;
                 }
+
+                eprintln!(
+                    "Vault setup: packages installed, but the Secret Service probe still failed"
+                );
+                eprintln!("Vault setup: no usable Secret Service session is available to this process");
+            } else {
+                eprintln!("Vault setup: package installation failed; keeping the local fallback");
             }
+        } else {
+            eprintln!("Vault setup: package metadata refresh failed; keeping the local fallback");
         }
     }
 
-    show_progress("Secret Service installation failed, using fallback", 100);
-    eprintln!("\n");
+    eprintln!("Vault setup: Secret Service installation failed, using fallback");
     false
 }
 
-#[allow(dead_code)]
 fn probe_keyring_with_install(service_name: &str) -> bool {
     if probe_keyring(service_name) {
         return true;
     }
 
-    // Attempt to install Secret Service if it's not available
+    // Attempt to install Secret Service if it's not available.
     if try_install_secret_service() {
         probe_keyring(service_name)
     } else {
