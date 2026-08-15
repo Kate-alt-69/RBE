@@ -261,6 +261,104 @@ function Get-TargetsForDistro {
     }
 }
 
+function Get-HostArch {
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+
+    switch ($arch) {
+        "X64"   { return "x64" }
+        "X86"   { return "x86" }
+        "Arm64" { return "arm64" }
+        "Arm"   { return "armv7" }
+        default { return "x64" }
+    }
+}
+
+function Get-RequestedArches {
+    $arches = @()
+
+    if ($ArchX64)   { $arches += "x64" }
+    if ($ArchX86)   { $arches += "x86" }
+    if ($ArchArm64) { $arches += "arm64" }
+    if ($ArchArmv7) { $arches += "armv7" }
+
+    if ($arches.Count -eq 0) {
+        $arches += Get-HostArch
+    }
+
+    return $arches
+}
+
+function Resolve-Target {
+    param(
+        [string]$Os,
+        [string]$Arch,
+        [bool]$UseMusl
+    )
+
+    switch ($Os) {
+        "windows" {
+            switch ($Arch) {
+                "x64"   { return "x86_64-pc-windows-msvc" }
+                "x86"   { return "i686-pc-windows-msvc" }
+                "arm64" { return "aarch64-pc-windows-msvc" }
+                default {
+                    throw "windows: no target triple for architecture '$Arch'"
+                }
+            }
+        }
+
+        "linux" {
+            $libc = if ($UseMusl) { "musl" } else { "gnu" }
+
+            switch ($Arch) {
+                "x64" {
+                    return "x86_64-unknown-linux-$libc"
+                }
+
+                "x86" {
+                    return "i686-unknown-linux-$libc"
+                }
+
+                "arm64" {
+                    return "aarch64-unknown-linux-$libc"
+                }
+
+                "armv7" {
+                    if ($UseMusl) {
+                        return "armv7-unknown-linux-musleabihf"
+                    }
+
+                    return "armv7-unknown-linux-gnueabihf"
+                }
+
+                default {
+                    throw "linux: no target triple for architecture '$Arch'"
+                }
+            }
+        }
+
+        "macos" {
+            switch ($Arch) {
+                "x64" {
+                    return "x86_64-apple-darwin"
+                }
+
+                "arm64" {
+                    return "aarch64-apple-darwin"
+                }
+
+                default {
+                    throw "macos: no target triple for architecture '$Arch'"
+                }
+            }
+        }
+
+        default {
+            throw "unknown OS '$Os'"
+        }
+    }
+}
+
 $targets = New-Object System.Collections.Generic.List[string]
 
 if ($CustomTarget) {

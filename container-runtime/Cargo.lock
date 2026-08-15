@@ -1686,6 +1686,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "atomic-io",
+ "error-client",
  "hex",
  "keyring",
  "logging",
