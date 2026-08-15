@@ -61,6 +61,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_multiple_import_entries_and_aliases() {
+        let file = parse(r#"
+            :import[response as resp, net, net.ping as ping]
+            class Route {
+                get(req) {
+                    const pong = ping();
+                    return resp.status(pong);
+                }
+            }
+        "#);
+
+        assert_eq!(file.imports.len(), 3);
+        assert_eq!(binding_name(&file.imports[0]), "resp");
+        assert_eq!(binding_name(&file.imports[1]), "net");
+        assert_eq!(binding_name(&file.imports[2]), "ping");
+    }
+
+    #[test]
+    fn rejects_trailing_import_comma() {
+        let tokens = Lexer::new(":import[net,]").tokenize().expect("lex failed");
+        let error = Parser::new(tokens).parse_file().expect_err("trailing comma should fail");
+        assert!(error.message.contains("trailing commas"));
+    }
+
+    #[test]
+    fn rejects_missing_import_comma() {
+        let tokens = Lexer::new(":import[net json]").tokenize().expect("lex failed");
+        let error = Parser::new(tokens).parse_file().expect_err("missing comma should fail");
+        assert!(error.message.contains("expected `,`"));
+    }
+
+    #[test]
     fn parses_conditionals_and_operators() {
         let file = parse(r#"
             class Route {
