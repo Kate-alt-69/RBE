@@ -1,8 +1,9 @@
-//! Per-request timing and verbose structured logging. The normal terminal
-//! line intentionally stays compact. A second, local-only request audit
-//! queue receives richer metadata for later inspection without dumping
-//! sensitive request contents into the terminal.
+//! Per-request timing and structured logging. The normal terminal line
+//! stays compact. The local request audit queue records only useful
+//! request metadata, omitting empty/duplicated fields so long-running
+//! services do not turn routine traffic into a multi-GB log explosion.
 
+use std::collections::BTreeMap;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -15,7 +16,7 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 use config::Config;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::real_ip::extract_real_ip;
 
@@ -127,15 +128,28 @@ fn debug_enabled() -> bool {
 }
 
 fn header(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers.get(name).and_then(|value| value.to_str().ok()).map(str::to_string)
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
-fn header_list(headers: &HeaderMap, names: &[&str]) -> serde_json::Map<String, Value> {
-    let mut result = serde_json::Map::new();
+fn insert_if_some(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        map.insert(key.to_string(), Value::String(value));
+    }
+}
+
+fn insert_if_string_map_nonempty(target: &mut Map<String, Value>, key: &str, value: Map<String, Value>) {
+    if !value.is_empty() {
+        target.insert(key.to_string(), Value::Object(value));
+    }
+}
+
+fn selected_headers(headers: &HeaderMap, names: &[&str]) -> Map<String, Value> {
+    let mut result = Map::new();
     for name in names {
-        if let Some(value) = header(headers, name) {
-            result.insert((*name).to_string(), Value::String(value));
-        }
+        insert_if_some(&mut result, name, header(headers, name));
     }
     result
 }
@@ -166,15 +180,58 @@ fn write_request_audit(
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default();
 
-    let forwarded_chain = json!({
-        "forwarded": header(request_headers, "forwarded"),
-        "x_forwarded_for": header(request_headers, "x-forwarded-for"),
-        "via": header(request_headers, "via"),
-        "x_forwarded_host": header(request_headers, "x-forwarded-host"),
-        "x_forwarded_proto": header(request_headers, "x-forwarded-proto"),
-        "x_forwarded_port": header(request_headers, "x-forwarded-port"),
-        "cf_ray": header(request_headers, "cf-ray"),
-    });
+    let peer_ip = peer.ip().to_string();
+
+    let mut entry = Map::new();
+    entry.insert("ts_ms".into(), json!(now_ms));
+    entry.insert("method".into(), json!(method));
+    entry.insert("path".into(), json!(path));
+    if !query.is_empty() {
+        entry.insert("query".into(), json!(query));
+    }
+    entry.insert("status".into(), json!(status));
+    entry.insert("duration_ms".into(), json!(duration_ms));
+    entry.insert("client_ip".into(), json!(client_ip));
+    if peer_ip != client_ip {
+        entry.insert("peer_ip".into(), json!(peer_ip));
+    }
+
+    let mut request = Map::new();
+    insert_if_some(&mut request, "host", header(request_headers, "host"));
+    insert_if_some(&mut request, "user_agent", header(request_headers, "user-agent"));
+    insert_if_some(&mut request, "referer", header(request_headers, "referer"));
+    insert_if_some(&mut request, "origin", origin.clone());
+
+    let mut proxy = BTreeMap::<String, Value>::new();
+    for name in [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "via",
+        "cf-ray",
+    ] {
+        if let Some(value) = header(request_headers, name) {
+            proxy.insert(name.replace('-', "_"), Value::String(value));
+        }
+    }
+    if !proxy.is_empty() {
+        request.insert("proxy".into(), Value::Object(proxy.into_iter().collect()));
+    }
+
+    let mut provider = selected_headers(
+        request_headers,
+        &[
+            "cf-connecting-ip",
+            "cf-connecting-ipv6",
+            "true-client-ip",
+            "x-real-ip",
+            "x-azure-clientip",
+            "fastly-client-ip",
+        ],
+    );
+    insert_if_string_map_nonempty(&mut request, "provider", std::mem::take(&mut provider));
 
     let geo_country = header(request_headers, "cf-ipcountry")
         .or_else(|| header(request_headers, "cloudfront-viewer-country"))
@@ -190,95 +247,67 @@ fn write_request_audit(
     } else {
         None
     };
+    let mut geo = Map::new();
+    insert_if_some(&mut geo, "country", geo_country);
+    insert_if_some(&mut geo, "region", geo_region);
+    insert_if_some(&mut geo, "city", geo_city);
+    insert_if_some(&mut geo, "source", geo_source.map(str::to_string));
+    insert_if_string_map_nonempty(&mut request, "geo", geo);
 
-    let request_meta = json!({
-        "method": method,
-        "path": path,
-        "query": query,
-        "peer_ip": peer.ip().to_string(),
-        "client_ip": client_ip,
-        "user_agent": header(request_headers, "user-agent"),
-        "referer": header(request_headers, "referer"),
-        "host": header(request_headers, "host"),
-        "accept": header(request_headers, "accept"),
-        "accept_language": header(request_headers, "accept-language"),
-        "content_type": header(request_headers, "content-type"),
-        "origin": origin,
-        "forwarded_chain": forwarded_chain,
-        "geo": {
-            "country": geo_country,
-            "region": geo_region,
-            "city": geo_city,
-            "source": geo_source,
-        },
-        "provider_identity": header_list(
-            request_headers,
-            &[
-                "cf-connecting-ip",
-                "cf-connecting-ipv6",
-                "true-client-ip",
-                "x-real-ip",
-                "x-azure-clientip",
-                "fastly-client-ip",
-            ],
-        ),
-        "request_headers": header_list(
-            request_headers,
-            &[
-                "forwarded",
-                "x-forwarded-for",
-                "x-forwarded-host",
-                "x-forwarded-proto",
-                "x-forwarded-port",
-                "via",
-                "cf-ray",
-                "cf-visitor",
-                "cf-ipcountry",
-                "origin",
-                "referer",
-                "user-agent",
-                "accept",
-                "accept-language",
-                "content-type",
-                "access-control-request-method",
-                "access-control-request-headers",
-            ],
-        ),
-    });
+    // Keep only headers that materially help diagnose request routing or CORS.
+    let diagnostic_headers = selected_headers(
+        request_headers,
+        &[
+            "accept",
+            "accept-language",
+            "content-type",
+            "access-control-request-method",
+            "access-control-request-headers",
+        ],
+    );
+    insert_if_string_map_nonempty(&mut request, "headers", diagnostic_headers);
 
-    let cors = json!({
-        "origin": origin,
-        "preflight": preflight,
-        "blocked": cors_blocked,
-        "request_method": request_cors_method,
-        "request_headers": request_cors_headers,
-        "response_allow_origin": response_cors_origin,
-        "response_allow_methods": response_cors_methods,
-        "response_allow_headers": response_cors_headers,
-        "response_allow_credentials": response_cors_credentials,
-    });
+    if !request.is_empty() {
+        entry.insert("request".into(), Value::Object(request));
+    }
 
-    let response_meta = json!({
-        "content_length": header(response_headers, "content-length"),
-        "content_type": header(response_headers, "content-type"),
-        "cache_control": header(response_headers, "cache-control"),
-        "server": header(response_headers, "server"),
-        "x_correlation_id": header(response_headers, "x-correlation-id"),
-        "server_timing": header(response_headers, "server-timing"),
-    });
+    let mut response = Map::new();
+    insert_if_some(&mut response, "content_length", header(response_headers, "content-length"));
+    insert_if_some(&mut response, "content_type", header(response_headers, "content-type"));
+    insert_if_some(&mut response, "x_correlation_id", header(response_headers, "x-correlation-id"));
+    insert_if_some(&mut response, "server_timing", header(response_headers, "server-timing"));
+    insert_if_string_map_nonempty(&mut entry, "response", response);
 
-    let entry = json!({
-        "ts_ms": now_ms,
-        "method": method,
-        "path": path,
-        "query": query,
-        "status": status,
-        "duration_ms": format!("{duration_ms:.3}"),
-        "request": request_meta,
-        "response": response_meta,
-        "cors": cors,
-        "trusted_proxy_headers": config.security.trusted_proxy_headers,
-    });
+    // CORS is omitted entirely for ordinary requests with no CORS signal.
+    if origin.is_some()
+        || preflight
+        || request_cors_method.is_some()
+        || request_cors_headers.is_some()
+        || response_cors_origin.is_some()
+        || response_cors_methods.is_some()
+        || response_cors_headers.is_some()
+        || response_cors_credentials.is_some()
+        || cors_blocked
+    {
+        let mut cors = Map::new();
+        insert_if_some(&mut cors, "origin", origin);
+        if preflight {
+            cors.insert("preflight".into(), json!(true));
+        }
+        cors.insert("blocked".into(), json!(cors_blocked));
+        insert_if_some(&mut cors, "request_method", request_cors_method);
+        insert_if_some(&mut cors, "request_headers", request_cors_headers);
+        insert_if_some(&mut cors, "allow_origin", response_cors_origin);
+        insert_if_some(&mut cors, "allow_methods", response_cors_methods);
+        insert_if_some(&mut cors, "allow_headers", response_cors_headers);
+        insert_if_some(&mut cors, "allow_credentials", response_cors_credentials);
+        entry.insert("cors".into(), Value::Object(cors));
+    }
+
+    // Preserve whether proxy-derived identity was trusted; useful during incident review.
+    if config.security.trusted_proxy_headers {
+        entry.insert("trusted_proxy_headers".into(), json!(true));
+    }
 
     let path = PathBuf::from("./data/admin/request.queue.log");
     if let Some(parent) = path.parent() {
@@ -296,8 +325,7 @@ fn write_request_audit(
         return;
     };
 
-    if let Ok(line) = serde_json::to_string(&entry) {
+    if let Ok(line) = serde_json::to_string(&Value::Object(entry)) {
         let _ = writeln!(file, "{line}");
-        let _ = file.flush();
     }
 }
