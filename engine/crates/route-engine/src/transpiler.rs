@@ -30,11 +30,15 @@ fn rust_ident(name: &str) -> String {
 #[derive(Clone, Copy)]
 enum NameKind { Local, Module, DirectFunction, Function }
 
-struct Scope { names: HashMap<String, NameKind> }
+struct Scope {
+    names: HashMap<String, NameKind>,
+    function_arity: HashMap<String, usize>,
+}
 
 impl Scope {
     fn new(param: Option<&str>, imports: &[ImportTarget], functions: &[FunctionDef]) -> Self {
         let mut names = HashMap::new();
+        let mut function_arity = HashMap::new();
         if let Some(param) = param { names.insert(param.to_string(), NameKind::Local); }
         for import in imports {
             match import {
@@ -46,8 +50,11 @@ impl Scope {
                 }
             }
         }
-        for function in functions { names.insert(function.name.clone(), NameKind::Function); }
-        Self { names }
+        for function in functions {
+            names.insert(function.name.clone(), NameKind::Function);
+            function_arity.insert(function.name.clone(), function.params.len());
+        }
+        Self { names, function_arity }
     }
 
     fn declare(&mut self, name: &str) { self.names.insert(name.to_string(), NameKind::Local); }
@@ -62,14 +69,14 @@ fn expr_code(expr: &Expr, scope: &Scope) -> Result<String, TranspileError> {
         Expr::Null => Ok("Value::Null".into()),
         Expr::Ident(name) => match scope.kind(name) {
             Some(NameKind::Local) => Ok(format!("{}.clone()", rust_ident(name))),
-            Some(NameKind::Module) => Err(err(format!("{name} is a module and must be called"))),
+            Some(NameKind::Module) => Err(err(format!("{name} is a module and must be called through a capability"))),
             Some(NameKind::DirectFunction) | Some(NameKind::Function) => Err(err(format!("{name} is a function and must be called"))),
             None => Err(err(format!("{name} is not defined"))),
         },
         Expr::Member(base, field) => {
             if let Expr::Ident(name) = base.as_ref() {
                 if matches!(scope.kind(name), Some(NameKind::Module)) {
-                    return Err(err(format!("{name}.{field} must be called")));
+                    return Err(err(format!("{name}.{field} is a capability and must be called")));
                 }
             }
             Ok(format!("transpiled_support::member_get(&{}, {:?})?", expr_code(base, scope)?, field))
@@ -82,9 +89,18 @@ fn expr_code(expr: &Expr, scope: &Scope) -> Result<String, TranspileError> {
                     Some(NameKind::DirectFunction) => return Ok(format!(
                         "transpiled_support::call_direct(modules, {:?}, vec![{}])?", name, arg_code.join(", ")
                     )),
-                    Some(NameKind::Function) => return Ok(format!(
-                        "{}(modules, vec![{}])?", rust_ident(name), arg_code.join(", ")
-                    )),
+                    Some(NameKind::Function) => {
+                        let expected = scope.function_arity.get(name).copied().unwrap_or_default();
+                        if expected != arg_code.len() {
+                            return Err(err(format!("function `{name}` expects {expected} argument(s), got {}", arg_code.len())));
+                        }
+                        let args = if arg_code.is_empty() {
+                            "modules".to_string()
+                        } else {
+                            format!("modules, {}", arg_code.join(", "))
+                        };
+                        return Ok(format!("{}({args})?", rust_ident(name)));
+                    }
                     _ => {}
                 }
             }
@@ -132,11 +148,11 @@ fn emit_statements(body: &[Statement], scope: &mut Scope, out: &mut String) -> R
             Statement::Expr(expr) => writeln!(out, "    {};", expr_code(expr, scope)?).unwrap(),
             Statement::If { condition, then_body, else_body } => {
                 writeln!(out, "    if transpiled_support::truthy(&{}) {{", expr_code(condition, scope)?).unwrap();
-                let mut then_scope = Scope { names: scope.names.clone() };
+                let mut then_scope = Scope { names: scope.names.clone(), function_arity: scope.function_arity.clone() };
                 emit_statements(then_body, &mut then_scope, out)?;
                 if !else_body.is_empty() {
                     out.push_str("    } else {\n");
-                    let mut else_scope = Scope { names: scope.names.clone() };
+                    let mut else_scope = Scope { names: scope.names.clone(), function_arity: scope.function_arity.clone() };
                     emit_statements(else_body, &mut else_scope, out)?;
                 }
                 out.push_str("    }\n");
