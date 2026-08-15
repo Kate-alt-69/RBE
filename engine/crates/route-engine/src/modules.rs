@@ -1,6 +1,6 @@
 //! Curated capability/import registry for `.route` files.
 //! Direct imports are resolved to a single callable binding; namespace
-//! imports keep the older `net.ping()` form for compatibility.
+//! imports keep the `module.function()` form for compatibility.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -22,7 +22,7 @@ enum ModuleKind {
 }
 
 #[derive(Clone, Copy)]
-enum BuiltinModule { Net, Env }
+enum BuiltinModule { Net, Env, Private }
 
 pub struct ModuleRegistry {
     modules: HashMap<String, ModuleKind>,
@@ -31,13 +31,25 @@ pub struct ModuleRegistry {
 
 /// Capabilities that are permitted to be imported by a `.route` file.
 ///
-/// This is intentionally a whitelist. Privileged capabilities remain
-/// module-only until the language explicitly grows a route-safe surface.
+/// `private` is deliberately restricted to server-owned, read-only runtime
+/// health information. It is not a general host/runtime escape hatch.
 pub fn route_capability_allowed(name: &str) -> bool {
     matches!(
         name,
-        "net" | "json" | "crypto" | "time" | "http" | "request" | "log" | "security" | "response"
+        "net" | "json" | "crypto" | "time" | "http" | "request" | "log" | "security" | "response" | "private"
     )
+}
+
+/// Return whether a known built-in module exports a particular function.
+/// This is used by semantic analysis so unknown built-in calls fail during
+/// boot instead of becoming request-time 500s.
+pub fn builtin_function_exists(module: &str, function: &str) -> bool {
+    match module {
+        "net" => matches!(function, "ping"),
+        "private" => matches!(function, "health"),
+        "env" => matches!(function, "get"),
+        _ => false,
+    }
 }
 
 pub fn binding_name(target: &ImportTarget) -> String {
@@ -69,6 +81,7 @@ impl ModuleRegistry {
                     let kind = match name.as_str() {
                         "net" => ModuleKind::Builtin(BuiltinModule::Net),
                         "env" => ModuleKind::Builtin(BuiltinModule::Env),
+                        "private" => ModuleKind::Builtin(BuiltinModule::Private),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{name}"),
                             resolved_path: std::path::PathBuf::new(),
@@ -80,6 +93,7 @@ impl ModuleRegistry {
                     let kind = match module.as_str() {
                         "net" => ModuleKind::Builtin(BuiltinModule::Net),
                         "env" => ModuleKind::Builtin(BuiltinModule::Env),
+                        "private" => ModuleKind::Builtin(BuiltinModule::Private),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{module}"),
                             resolved_path: std::path::PathBuf::new(),
@@ -132,13 +146,14 @@ impl ModuleRegistry {
     ) -> Result<Value, ModuleError> {
         let Some(kind) = self.modules.get(module_name) else {
             return Err(ModuleError {
-                message: format!("{module_name} was not imported"),
+                message: format!("{module_name}.{function_name} does not exist — please remove it from the route"),
             });
         };
 
         match kind {
             ModuleKind::Builtin(BuiltinModule::Net) => call_net(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Env) => call_env(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Private) => call_private(function_name, args),
             ModuleKind::CustomUnimplemented { source_path, resolved_path } => {
                 let note = if resolved_path.as_os_str().is_empty() {
                     String::new()
@@ -147,8 +162,7 @@ impl ModuleRegistry {
                 };
                 Err(ModuleError {
                     message: format!(
-                        "{module_name}.{function_name}(...) — \\"{source_path}\\"{note} \
-                         is not implemented yet; this .route file parses, but the call cannot run until the module lands"
+                        "{module_name}.{function_name}(...) — \"{source_path}\"{note} is not implemented yet; this .route file parses, but the call cannot run until the module lands"
                     ),
                 })
             }
@@ -168,14 +182,27 @@ fn call_net(function_name: &str, _args: &[Value]) -> Result<Value, ModuleError> 
             fields.insert("ok".to_string(), Value::Bool(true));
             Ok(Value::Object(fields))
         }
+        other => Err(ModuleError {
+            message: format!("net.{other}() does not exist"),
+        }),
+    }
+}
+
+fn call_private(function_name: &str, _args: &[Value]) -> Result<Value, ModuleError> {
+    match function_name {
         "health" => {
             let mut fields = HashMap::new();
             fields.insert("status".to_string(), Value::String("healthy".to_string()));
             fields.insert("uptime".to_string(), Value::Number(runtime_start().elapsed().as_secs_f64()));
+            fields.insert("container".to_string(), Value::Null);
+            // Vault is a hard boot dependency in the backend, so a running
+            // route runtime implies Vault reached ready state during boot.
+            fields.insert("vault".to_string(), Value::Bool(true));
+            fields.insert("errorReporter".to_string(), Value::Null);
             Ok(Value::Object(fields))
         }
         other => Err(ModuleError {
-            message: format!("net.{other} is not implemented — only net.ping() and net.health() exist"),
+            message: format!("private.{other}() does not exist"),
         }),
     }
 }
@@ -192,7 +219,7 @@ fn call_env(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
             })
         }
         other => Err(ModuleError {
-            message: format!("env.{other} is not implemented — only env.get(key) exists"),
+            message: format!("env.{other}() does not exist"),
         }),
     }
 }
@@ -212,6 +239,7 @@ mod tests {
         assert!(route_capability_allowed("log"));
         assert!(route_capability_allowed("security"));
         assert!(route_capability_allowed("response"));
+        assert!(route_capability_allowed("private"));
     }
 
     #[test]
@@ -225,12 +253,21 @@ mod tests {
     }
 
     #[test]
-    fn net_health_reports_runtime_status() {
-        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("net".into())]);
-        let Value::Object(fields) = registry.call("net", "health", &[]).expect("health call") else {
+    fn private_health_reports_runtime_status() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("private".into())]);
+        let Value::Object(fields) = registry.call("private", "health", &[]).expect("health call") else {
             panic!("expected health object");
         };
         assert!(matches!(fields.get("status"), Some(Value::String(status)) if status == "healthy"));
         assert!(matches!(fields.get("uptime"), Some(Value::Number(uptime)) if *uptime >= 0.0));
+        assert!(matches!(fields.get("container"), Some(Value::Null)));
+        assert!(matches!(fields.get("vault"), Some(Value::Bool(true))));
+    }
+
+    #[test]
+    fn unknown_private_function_is_reported() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("private".into())]);
+        let error = registry.call("private", "missing", &[]).expect_err("missing function should fail");
+        assert!(error.message.contains("private.missing() does not exist"));
     }
 }
