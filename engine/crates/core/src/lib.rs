@@ -6,7 +6,7 @@
 //! [`AppState`] rather than the other way around.
 //!
 //! What's coming, by phase (see rust-migration-plan.md §12):
-//! - Phase 1: vault is wired (see `vault` crate + `AppState::vault`);
+//! - Phase 1: vault is wired (see `vault-process` + `AppState::vault`);
 //!   still TODO here: a `storage` module wrapping the `sqlx` pool.
 //! - Phase 2: a `container_client` module — the IPC client talking to
 //!   the *separate* container-runtime process (§5). Never merges that
@@ -29,22 +29,16 @@ pub struct AppState {
     state_rx: watch::Receiver<BackendState>,
     pub rate_limiters: Arc<RateLimiters>,
     pub ip_strikes: Arc<IpStrikeTracker>,
-    pub vault: Arc<vault::Vault>,
+    pub vault: Arc<vault_process::VaultClient>,
     // TODO(phase 1): pub storage: sqlx::AnyPool  (or SqlitePool/PgPool per config.storage.driver)
     // TODO(phase 2): pub container_client: Arc<container_client::Client>
 }
 
 impl AppState {
-    /// `vault` is constructed separately in `main.rs`'s boot sequence
-    /// (§3.2 step 3, before this — step 9) rather than built inside
-    /// this constructor, since vault construction is fallible
-    /// (filesystem/OS-keyring I/O) and that failure needs to surface
-    /// at its own boot step, not be swallowed into an otherwise-
-    /// infallible `AppState::new`.
     pub fn new(
         config: Arc<Config>,
         state_rx: watch::Receiver<BackendState>,
-        vault: Arc<vault::Vault>,
+        vault: Arc<vault_process::VaultClient>,
     ) -> Self {
         let rate_limiters = Arc::new(RateLimiters::new(&config.security));
         let ip_strikes = Arc::new(IpStrikeTracker::new(&config.security.ip_ban));
