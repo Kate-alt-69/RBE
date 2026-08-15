@@ -12,6 +12,6 @@ path = "src/lib.rs"
 config = { path = "../config" }
 supervisor = { path = "../supervisor" }
 security = { path = "../security" }
-vault = { path = "../../../vault" }
+vault-process = { path = "../../../vault-process" }
 tracing = { workspace = true }
 tokio = { workspace = true }
