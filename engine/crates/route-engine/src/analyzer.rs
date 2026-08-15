@@ -18,18 +18,23 @@ pub enum Severity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub severity: Severity,
+    pub code: &'static str,
     pub message: String,
     pub symbol: Option<String>,
 }
 
 impl Diagnostic {
-    fn error(message: impl Into<String>) -> Self { Self { severity: Severity::Error, message: message.into(), symbol: None } }
-    fn error_symbol(message: impl Into<String>, symbol: impl Into<String>) -> Self {
-        Self { severity: Severity::Error, message: message.into(), symbol: Some(symbol.into()) }
+    fn error(message: impl Into<String>) -> Self {
+        Self { severity: Severity::Error, code: "E2000", message: message.into(), symbol: None }
     }
-    fn warning(message: impl Into<String>) -> Self { Self { severity: Severity::Warning, message: message.into(), symbol: None } }
+    fn error_symbol(message: impl Into<String>, symbol: impl Into<String>) -> Self {
+        Self { severity: Severity::Error, code: "E2001", message: message.into(), symbol: Some(symbol.into()) }
+    }
+    fn warning(message: impl Into<String>) -> Self {
+        Self { severity: Severity::Warning, code: "W0001", message: message.into(), symbol: None }
+    }
     fn warning_symbol(message: impl Into<String>, symbol: impl Into<String>) -> Self {
-        Self { severity: Severity::Warning, message: message.into(), symbol: Some(symbol.into()) }
+        Self { severity: Severity::Warning, code: "W0002", message: message.into(), symbol: Some(symbol.into()) }
     }
 }
 
@@ -67,28 +72,34 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
         let name = binding_name(import);
         let source_key = import_source_key(import);
         if !imported_sources.insert(source_key.clone()) {
-            diagnostics.push(Diagnostic::error_symbol(
-                format!("duplicate import source `{source_key}`; a capability may only be imported once per file"),
-                name.clone(),
-            ));
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E3001",
+                message: format!("duplicate import source `{source_key}`; a capability may only be imported once per file"),
+                symbol: Some(name.clone()),
+            });
         }
 
         let kind = match import_base(import) {
             ImportTarget::Builtin(module) => {
                 if !route_capability_allowed(module) {
-                    diagnostics.push(Diagnostic::error_symbol(
-                        format!("capability `{module}` is not available to `.route` files"),
-                        name.clone(),
-                    ));
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "E3000",
+                        message: format!("capability `{module}` is not available to `.route` files"),
+                        symbol: Some(name.clone()),
+                    });
                 }
                 SymbolKind::Module
             }
             ImportTarget::BuiltinFunction { module, .. } => {
                 if !route_capability_allowed(module) {
-                    diagnostics.push(Diagnostic::error_symbol(
-                        format!("capability `{module}` is not available to `.route` files"),
-                        name.clone(),
-                    ));
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "E3000",
+                        message: format!("capability `{module}` is not available to `.route` files"),
+                        symbol: Some(name.clone()),
+                    });
                 }
                 SymbolKind::DirectFunction
             }
@@ -96,13 +107,23 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
             ImportTarget::Aliased { .. } => unreachable!("import_base removes aliased import wrappers"),
         };
         if globals.insert(name.clone(), Symbol { kind, used: false }).is_some() {
-            diagnostics.push(Diagnostic::error_symbol(format!("duplicate import binding `{name}`"), name));
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E2002",
+                message: format!("duplicate import binding `{name}`"),
+                symbol: Some(name),
+            });
         }
     }
 
     for function in &file.functions {
         if globals.insert(function.name.clone(), Symbol { kind: SymbolKind::Function, used: false }).is_some() {
-            diagnostics.push(Diagnostic::error_symbol(format!("duplicate top-level function `{}`", function.name), function.name.clone()));
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E2002",
+                message: format!("duplicate top-level function `{}`", function.name),
+                symbol: Some(function.name.clone()),
+            });
         }
     }
 
@@ -134,7 +155,12 @@ fn analyze_function(function: &FunctionDef, globals: &Scope, used_globals: &mut 
     let mut scope = globals.clone();
     for param in &function.params {
         if scope.contains_key(param) {
-            diagnostics.push(Diagnostic::error_symbol(format!("function `{}` parameter `{param}` shadows an imported or top-level symbol", function.name), param));
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E2003",
+                message: format!("function `{}` parameter `{param}` shadows an imported or top-level symbol", function.name),
+                symbol: Some(param.clone()),
+            });
         } else {
             scope.insert(param.clone(), Symbol { kind: SymbolKind::Local, used: false });
         }
@@ -147,7 +173,12 @@ fn analyze_method(method: &MethodDef, globals: &Scope, used_globals: &mut HashSe
     let mut scope = globals.clone();
     if let Some(param) = &method.param_name {
         if scope.contains_key(param) {
-            diagnostics.push(Diagnostic::error_symbol(format!("route `{}` parameter `{param}` shadows an imported or top-level symbol", method.verb), param));
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E2003",
+                message: format!("route `{}` parameter `{param}` shadows an imported or top-level symbol", method.verb),
+                symbol: Some(param.clone()),
+            });
         } else {
             scope.insert(param.clone(), Symbol { kind: SymbolKind::Local, used: false });
         }
@@ -162,7 +193,12 @@ fn analyze_statements(statements: &[Statement], scope: &mut Scope, used_globals:
             Statement::Const { name, value } => {
                 analyze_expr(value, scope, used_globals, diagnostics);
                 if scope.contains_key(name) {
-                    diagnostics.push(Diagnostic::error_symbol(format!("`{owner}` redeclares `{name}` in the same scope"), name));
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "E2004",
+                        message: format!("`{owner}` redeclares `{name}` in the same scope"),
+                        symbol: Some(name.clone()),
+                    });
                 } else {
                     scope.insert(name.clone(), Symbol { kind: SymbolKind::Local, used: false });
                 }
@@ -186,14 +222,29 @@ fn mark_identifier(name: &str, scope: &mut Scope, used_globals: &mut HashSet<Str
             match symbol.kind {
                 SymbolKind::Local => {}
                 SymbolKind::Module if allow_module_value => { used_globals.insert(name.to_string()); }
-                SymbolKind::Module => diagnostics.push(Diagnostic::error_symbol(format!("`{name}` is a module and must be accessed through an exported capability"), name)),
+                SymbolKind::Module => diagnostics.push(Diagnostic {
+                    severity: Severity::Error,
+                    code: "E2005",
+                    message: format!("`{name}` is a module and must be accessed through an exported capability"),
+                    symbol: Some(name.to_string()),
+                }),
                 SymbolKind::DirectFunction | SymbolKind::Function => {
                     used_globals.insert(name.to_string());
-                    diagnostics.push(Diagnostic::error_symbol(format!("`{name}` is callable metadata, not a value; call it instead"), name));
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "E2006",
+                        message: format!("`{name}` is callable metadata, not a value; call it instead"),
+                        symbol: Some(name.to_string()),
+                    });
                 }
             }
         }
-        None => diagnostics.push(Diagnostic::error_symbol(format!("`{name}` is not defined"), name)),
+        None => diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E2001",
+            message: format!("`{name}` is not defined"),
+            symbol: Some(name.to_string()),
+        }),
     }
 }
 
@@ -209,7 +260,12 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                         used_globals.insert(name.clone());
                     }
                     Some(_) => mark_identifier(name, scope, used_globals, diagnostics, false),
-                    None => diagnostics.push(Diagnostic::error_symbol(format!("module `{name}` is not imported"), name)),
+                    None => diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "E2007",
+                        message: format!("module `{name}` is not imported"),
+                        symbol: Some(name.to_string()),
+                    }),
                 }
             } else {
                 analyze_expr(base, scope, used_globals, diagnostics);
@@ -222,10 +278,20 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                         symbol.used = true;
                         match symbol.kind {
                             SymbolKind::Function | SymbolKind::DirectFunction => { used_globals.insert(name.clone()); }
-                            SymbolKind::Local | SymbolKind::Module => diagnostics.push(Diagnostic::error_symbol(format!("`{name}` is not callable"), name)),
+                            SymbolKind::Local | SymbolKind::Module => diagnostics.push(Diagnostic {
+                                severity: Severity::Error,
+                                code: "E2008",
+                                message: format!("`{name}` is not callable"),
+                                symbol: Some(name.to_string()),
+                            }),
                         }
                     }
-                    None => diagnostics.push(Diagnostic::error_symbol(format!("function `{name}` is not defined"), name)),
+                    None => diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "E2009",
+                        message: format!("function `{name}` is not defined"),
+                        symbol: Some(name.to_string()),
+                    }),
                 },
                 Expr::Member(base, _) => {
                     if let Expr::Ident(name) = base.as_ref() {
@@ -235,7 +301,12 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                                 used_globals.insert(name.clone());
                             }
                             Some(_) => mark_identifier(name, scope, used_globals, diagnostics, false),
-                            None => diagnostics.push(Diagnostic::error_symbol(format!("module `{name}` is not imported"), name)),
+                            None => diagnostics.push(Diagnostic {
+                                severity: Severity::Error,
+                                code: "E2007",
+                                message: format!("module `{name}` is not imported"),
+                                symbol: Some(name.to_string()),
+                            }),
                         }
                     } else {
                         analyze_expr(base, scope, used_globals, diagnostics);
@@ -285,8 +356,8 @@ mod tests {
             }}
         "#);
         let diagnostics = analyze(&file);
-        assert!(diagnostics.iter().any(|d| d.severity == Severity::Error && d.message.contains("missing")));
-        assert!(diagnostics.iter().any(|d| d.severity == Severity::Warning && d.message.contains("net")));
+        assert!(diagnostics.iter().any(|d| d.code == "E2001" && d.message.contains("missing")));
+        assert!(diagnostics.iter().any(|d| d.code == "W0002" && d.message.contains("net")));
         assert!(diagnostics.iter().any(|d| d.symbol.as_deref() == Some("missing")));
     }
 
@@ -295,7 +366,7 @@ mod tests {
         let file = parse(r#":import[env] class Route { get(req) { return req.path; } }"#);
         let diagnostics = analyze(&file);
         assert!(diagnostics.iter().any(|d| {
-            d.severity == Severity::Error
+            d.code == "E3000"
                 && d.symbol.as_deref() == Some("env")
                 && d.message.contains("not available to `.route` files")
         }));
@@ -306,7 +377,7 @@ mod tests {
         let file = parse(r#":import[net as first, net as second] class Route { get(req) { return first.ping(); } }"#);
         let diagnostics = analyze(&file);
         assert!(diagnostics.iter().any(|d| {
-            d.severity == Severity::Error
+            d.code == "E3001"
                 && d.message.contains("duplicate import source")
                 && d.symbol.as_deref() == Some("second")
         }));
