@@ -288,6 +288,7 @@ struct FileDiagnosticReport {
     errors: usize,
     warnings: usize,
     details: Vec<String>,
+    error_details: Vec<String>,
 }
 
 fn render_diagnostic_reports(reports: &[FileDiagnosticReport]) {
@@ -338,25 +339,18 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
             errors: 0,
             warnings: 0,
             details: Vec::new(),
+            error_details: Vec::new(),
         };
 
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) => {
                 report.errors = 1;
-                report.details.push(format!(
-                    "{}: failed to read file: {}",
-                    path.display(),
-                    error
-                ));
+                let detail = format!("{}: failed to read file: {}\n", path.display(), error);
+                report.details.push(detail.clone());
+                report.error_details.push(detail);
                 done += 3;
-                terminal.render(
-                    files.len(),
-                    Some(&display_path),
-                    "Parsing",
-                    done,
-                    total_units,
-                );
+                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
                 reports.push(report);
                 continue;
             }
@@ -366,19 +360,11 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
             Ok(source) => source,
             Err(error) => {
                 report.errors = 1;
-                report.details.push(format!(
-                    "{}: invalid UTF-8: {}",
-                    path.display(),
-                    error
-                ));
+                let detail = format!("{}: invalid UTF-8: {}\n", path.display(), error);
+                report.details.push(detail.clone());
+                report.error_details.push(detail);
                 done += 3;
-                terminal.render(
-                    files.len(),
-                    Some(&display_path),
-                    "Parsing",
-                    done,
-                    total_units,
-                );
+                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
                 reports.push(report);
                 continue;
             }
@@ -388,7 +374,7 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
             Ok(tokens) => tokens,
             Err(error) => {
                 report.errors = 1;
-                report.details.push(frame_diagnostic_with_symbol(
+                let detail = frame_diagnostic_with_symbol(
                     path,
                     &source,
                     error.line,
@@ -396,15 +382,11 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                     &error.message,
                     None,
                     terminal_width,
-                ));
-                done += 3;
-                terminal.render(
-                    files.len(),
-                    Some(&display_path),
-                    "Parsing",
-                    done,
-                    total_units,
                 );
+                report.details.push(detail.clone());
+                report.error_details.push(detail);
+                done += 3;
+                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
                 reports.push(report);
                 continue;
             }
@@ -414,7 +396,7 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
             Ok(file) => Arc::new(file),
             Err(error) => {
                 report.errors = 1;
-                report.details.push(frame_diagnostic_with_symbol(
+                let detail = frame_diagnostic_with_symbol(
                     path,
                     &source,
                     error.line,
@@ -422,45 +404,23 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                     &error.message,
                     None,
                     terminal_width,
-                ));
-                done += 3;
-                terminal.render(
-                    files.len(),
-                    Some(&display_path),
-                    "Parsing",
-                    done,
-                    total_units,
                 );
+                report.details.push(detail.clone());
+                report.error_details.push(detail);
+                done += 3;
+                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
                 reports.push(report);
                 continue;
             }
         };
 
         done += 1;
-        terminal.render(
-            files.len(),
-            Some(&display_path),
-            "Parsing",
-            done,
-            total_units,
-        );
-        terminal.render(
-            files.len(),
-            Some(&display_path),
-            "Semantic",
-            done,
-            total_units,
-        );
+        terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+        terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
 
         let diagnostics = analyze(&file);
-        report.errors = diagnostics
-            .iter()
-            .filter(|d| d.severity == Severity::Error)
-            .count();
-        report.warnings = diagnostics
-            .iter()
-            .filter(|d| d.severity == Severity::Warning)
-            .count();
+        report.errors = diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
+        report.warnings = diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
 
         for diagnostic in &diagnostics {
             let detail = frame_diagnostic_with_symbol(
@@ -472,30 +432,21 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 diagnostic.symbol.as_deref(),
                 terminal_width,
             );
-            report.details.push(detail);
+            report.details.push(detail.clone());
+            if diagnostic.severity == Severity::Error {
+                report.error_details.push(detail);
+            }
         }
 
         if report.errors > 0 {
             done += 2;
-            terminal.render(
-                files.len(),
-                Some(&display_path),
-                "Semantic",
-                done,
-                total_units,
-            );
+            terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
             reports.push(report);
             continue;
         }
         done += 1;
 
-        terminal.render(
-            files.len(),
-            Some(&display_path),
-            "Generating",
-            done,
-            total_units,
-        );
+        terminal.render(files.len(), Some(&display_path), "Generating", done, total_units);
         let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
         match transpile_file(&file, &path.to_string_lossy(), &module_names) {
             Ok(_) => {
@@ -504,7 +455,7 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
             }
             Err(error) => {
                 report.errors += 1;
-                report.details.push(frame_diagnostic_with_symbol(
+                let detail = frame_diagnostic_with_symbol(
                     path,
                     &source,
                     1,
@@ -512,36 +463,37 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                     &error.message,
                     None,
                     terminal_width,
-                ));
+                );
+                report.details.push(detail.clone());
+                report.error_details.push(detail);
                 done += 1;
             }
         }
-        terminal.render(
-            files.len(),
-            Some(&display_path),
-            "Generating",
-            done,
-            total_units,
-        );
+        terminal.render(files.len(), Some(&display_path), "Generating", done, total_units);
 
         if report.errors > 0 || report.warnings > 0 {
             reports.push(report);
         }
     }
 
-    if !reports.is_empty() {
+    let total_errors: usize = reports.iter().map(|report| report.errors).sum();
+    if total_errors > 0 {
         for report in &reports {
-            for detail in &report.details {
+            for detail in &report.error_details {
                 error_file.write_all(detail.as_bytes())?;
             }
         }
-        terminal.end_boot();
         render_diagnostic_reports(&reports);
+        terminal.end_boot();
         return Err(anyhow::anyhow!(
             "route compiler found {} error(s); see {}",
-            reports.iter().map(|report| report.errors).sum::<usize>(),
+            total_errors,
             error_path.display()
         ));
+    }
+
+    if !reports.is_empty() {
+        render_diagnostic_reports(&reports);
     }
 
     terminal.render(files.len(), None, "Ready", total_units, total_units);
