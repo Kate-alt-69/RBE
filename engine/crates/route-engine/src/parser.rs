@@ -23,14 +23,14 @@ impl Parser {
 
     pub fn parse_file(self) -> Result<RouteFile, ParseError> {
         let (file, errors) = self.parse_file_collecting();
-        match errors.into_iter().next() {
-            Some(error) => Err(error),
-            None => file.ok_or_else(|| ParseError {
-                message: "route file did not produce an AST".to_string(),
-                line: 0,
-                column: 0,
-            }),
+        if let Some(error) = errors.into_iter().next() {
+            return Err(error);
         }
+        file.ok_or_else(|| ParseError {
+            message: "route file did not produce an AST".to_string(),
+            line: 0,
+            column: 0,
+        })
     }
 
     /// Parse a route while retaining recoverable statement errors. A valid
@@ -140,10 +140,7 @@ impl Parser {
                 return None;
             }
         };
-        let body = match self.parse_block_collecting(errors) {
-            Some(body) => body,
-            None => return None,
-        };
+        let body = self.parse_block_collecting(errors)?;
         Some(FunctionDef { name, params, body })
     }
 
@@ -265,14 +262,21 @@ impl Parser {
 
     fn parse_block(&mut self) -> Result<Vec<Statement>, ParseError> {
         let mut errors = Vec::new();
-        let body = self.parse_block_collecting(&mut errors).ok_or_else(|| {
-            errors.into_iter().next().unwrap_or(ParseError {
-                message: "failed to parse block".to_string(),
-                line: 0,
-                column: 0,
-            })
-        })?;
-        if errors.is_empty() { Ok(body) } else { Err(errors.into_iter().next().unwrap()) }
+        let body = match self.parse_block_collecting(&mut errors) {
+            Some(body) => body,
+            None => {
+                return Err(errors.into_iter().next().unwrap_or(ParseError {
+                    message: "failed to parse block".to_string(),
+                    line: 0,
+                    column: 0,
+                }));
+            }
+        };
+        if let Some(error) = errors.into_iter().next() {
+            Err(error)
+        } else {
+            Ok(body)
+        }
     }
 
     fn parse_block_collecting(&mut self, errors: &mut Vec<ParseError>) -> Option<Vec<Statement>> {
@@ -545,15 +549,16 @@ impl Parser {
 
     fn recover_class_member(&mut self) {
         while !self.check(&TokenKind::Eof) && !self.check(&TokenKind::RBrace) {
-            if self.check(&TokenKind::Async) || self.is_identifier() {
+            if self.check(&TokenKind::Async) || self.is_identifier_followed_by_lparen() {
                 return;
             }
             self.advance();
         }
     }
 
-    fn is_identifier(&self) -> bool {
-        matches!(self.peek_kind(), TokenKind::Ident(_))
+    fn is_identifier_followed_by_lparen(&self) -> bool {
+        matches!(self.tokens.get(self.pos).map(|token| &token.kind), Some(TokenKind::Ident(_)))
+            && matches!(self.tokens.get(self.pos + 1).map(|token| &token.kind), Some(TokenKind::LParen))
     }
 
     fn peek_kind(&self) -> TokenKind {
