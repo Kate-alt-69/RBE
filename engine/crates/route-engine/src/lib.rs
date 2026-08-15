@@ -5,6 +5,7 @@
 //! interpreter is retained as a fallback while the AOT Rust artifact
 //! pipeline is developed.
 
+mod analyzer;
 mod ast;
 mod discovery;
 mod interpreter;
@@ -17,9 +18,8 @@ pub mod cache;
 pub mod transpiled_support;
 pub mod transpiler;
 
-pub use ast::{
-    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement, Value,
-};
+pub use analyzer::{analyze, Diagnostic, Severity};
+pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement, Value};
 pub use discovery::{build_routes, RouteCache};
 pub use interpreter::{EvalError, Interpreter, RequestContext};
 pub use modules::{binding_name, ModuleError, ModuleRegistry};
@@ -41,11 +41,9 @@ mod tests {
     fn parses_functions_and_direct_imports() {
         let file = parse(r#"
             :import[net.ping]
-
             function makeResponse($[value]) {
                 return { ok: true, value: $[value] };
             }
-
             class Route {
                 async get($[req]) {
                     const pong = ping();
@@ -78,14 +76,12 @@ mod tests {
     }
 
     #[test]
-    fn interprets_function_and_direct_import() {
+    fn interpreter_and_analyzer_agree_on_a_valid_route() {
         let file = parse(r#"
             :import[net.ping]
-
             function makeResponse($[value]) {
                 return { ok: true, value: $[value] };
             }
-
             class Route {
                 get($[req]) {
                     const pong = ping();
@@ -93,6 +89,8 @@ mod tests {
                 }
             }
         "#);
+
+        assert!(analyze(&file).iter().all(|diagnostic| diagnostic.severity != Severity::Error));
 
         let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
         let modules = ModuleRegistry::from_imports(&file.imports);
@@ -102,10 +100,8 @@ mod tests {
             params: HashMap::new(),
             query: HashMap::new(),
         };
-
         let mut interpreter = Interpreter::new(&modules).with_functions(&file.functions);
         let result = interpreter.run(&file.methods[0], &req, &module_names).expect("run failed");
-
         let Value::Object(map) = result else { panic!("expected object"); };
         assert!(matches!(map.get("ok"), Some(Value::Bool(true))));
     }
@@ -119,6 +115,8 @@ mod tests {
                 }
             }
         "#);
+        assert!(analyze(&file).iter().any(|diagnostic| diagnostic.severity == Severity::Error));
+
         let modules = ModuleRegistry::from_imports(&file.imports);
         let req = RequestContext {
             method: "GET".into(),
