@@ -14,7 +14,7 @@
 use config::LoggingConfig;
 use std::fmt;
 use tracing::{Event, Subscriber};
-use tracing_subscriber::fmt::format::{FormatEvent, FmtContext};
+use tracing_subscriber::fmt::{FormatEvent, FmtContext};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
 
