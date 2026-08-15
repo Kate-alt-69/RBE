@@ -41,13 +41,20 @@ struct Symbol { kind: SymbolKind, used: bool }
 
 type Scope = HashMap<String, Symbol>;
 
+fn import_base(import: &ImportTarget) -> &ImportTarget {
+    match import {
+        ImportTarget::Aliased { target, .. } => target.as_ref(),
+        _ => import,
+    }
+}
+
 pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut globals = Scope::new();
 
     for import in &file.imports {
         let name = binding_name(import);
-        let kind = match import {
+        let kind = match import_base(import) {
             ImportTarget::Builtin(module) => {
                 if !route_capability_allowed(module) {
                     diagnostics.push(Diagnostic::error_symbol(
@@ -67,6 +74,7 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
                 SymbolKind::DirectFunction
             }
             ImportTarget::Custom(_) | ImportTarget::CustomFunction { .. } => SymbolKind::Module,
+            ImportTarget::Aliased { .. } => unreachable!("import_base removes aliased import wrappers"),
         };
         if globals.insert(name.clone(), Symbol { kind, used: false }).is_some() {
             diagnostics.push(Diagnostic::error_symbol(format!("duplicate import binding `{name}`"), name));
@@ -272,6 +280,28 @@ mod tests {
                 && d.symbol.as_deref() == Some("env")
                 && d.message.contains("not available to `.route` files")
         }));
+    }
+
+    #[test]
+    fn aliased_capability_preserves_local_binding() {
+        let target = ImportTarget::Aliased {
+            target: Box::new(ImportTarget::Builtin("net".into())),
+            alias: "network".into(),
+        };
+        let file = RouteFile {
+            imports: vec![target],
+            functions: Vec::new(),
+            class_name: "Route".into(),
+            methods: vec![MethodDef {
+                verb: "get".into(),
+                param_name: Some("req".into()),
+                body: vec![Statement::Return(Expr::Call(
+                    Box::new(Expr::Member(Box::new(Expr::Ident("network".into())), "ping".into())),
+                    Vec::new(),
+                ))],
+            }],
+        };
+        assert!(analyze(&file).iter().all(|d| d.severity != Severity::Error));
     }
 
     #[test]
