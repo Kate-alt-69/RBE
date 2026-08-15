@@ -21,24 +21,54 @@ pub struct Parser {
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self { Self { tokens, pos: 0 } }
 
-    pub fn parse_file(mut self) -> Result<RouteFile, ParseError> {
+    pub fn parse_file(self) -> Result<RouteFile, ParseError> {
+        let (file, errors) = self.parse_file_collecting();
+        match errors.into_iter().next() {
+            Some(error) => Err(error),
+            None => file.ok_or_else(|| ParseError {
+                message: "route file did not produce an AST".to_string(),
+                line: 0,
+                column: 0,
+            }),
+        }
+    }
+
+    /// Parse a route while retaining recoverable statement errors. A valid
+    /// AST is returned when the file structure can still be reconstructed;
+    /// callers can render every recovered diagnostic instead of stopping at
+    /// the first broken statement.
+    pub fn parse_file_collecting(mut self) -> (Option<RouteFile>, Vec<ParseError>) {
+        let mut errors = Vec::new();
         let mut imports = Vec::new();
         let mut functions = Vec::new();
 
         while self.check(&TokenKind::Colon) {
-            imports.push(self.parse_import()?);
+            match self.parse_import() {
+                Ok(import) => imports.push(import),
+                Err(error) => {
+                    errors.push(error);
+                    self.recover_top_level();
+                }
+            }
         }
 
         while self.check(&TokenKind::Function) {
-            functions.push(self.parse_function()?);
+            match self.parse_function_collecting(&mut errors) {
+                Some(function) => functions.push(function),
+                None => self.recover_top_level(),
+            }
         }
 
-        let (class_name, methods) = self.parse_class()?;
+        let class_result = self.parse_class_collecting(&mut errors);
+        let Some((class_name, methods)) = class_result else {
+            return (None, errors);
+        };
+
         if !self.check(&TokenKind::Eof) {
-            return Err(self.error_here("unexpected content after Route class"));
+            errors.push(self.error_here("unexpected content after Route class"));
         }
 
-        Ok(RouteFile { imports, functions, class_name, methods })
+        (Some(RouteFile { imports, functions, class_name, methods }), errors)
     }
 
     fn parse_import(&mut self) -> Result<ImportTarget, ParseError> {
@@ -90,6 +120,33 @@ impl Parser {
         Ok(FunctionDef { name, params, body })
     }
 
+    fn parse_function_collecting(&mut self, errors: &mut Vec<ParseError>) -> Option<FunctionDef> {
+        if let Err(error) = self.expect(TokenKind::Function) {
+            errors.push(error);
+            return None;
+        }
+        let name = match self.expect_ident() {
+            Ok(name) => name,
+            Err(error) => {
+                errors.push(error);
+                return None;
+            }
+        };
+        let params = match self.parse_params() {
+            Ok(params) => params,
+            Err(error) => {
+                errors.push(error);
+                self.recover_top_level();
+                return None;
+            }
+        };
+        let body = match self.parse_block_collecting(errors) {
+            Some(body) => body,
+            None => return None,
+        };
+        Some(FunctionDef { name, params, body })
+    }
+
     fn parse_class(&mut self) -> Result<(String, Vec<MethodDef>), ParseError> {
         self.expect(TokenKind::Class)?;
         let name = self.expect_ident()?;
@@ -115,6 +172,70 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace)?;
         Ok((name, methods))
+    }
+
+    fn parse_class_collecting(&mut self, errors: &mut Vec<ParseError>) -> Option<(String, Vec<MethodDef>)> {
+        if let Err(error) = self.expect(TokenKind::Class) {
+            errors.push(error);
+            return None;
+        }
+        let name = match self.expect_ident() {
+            Ok(name) => name,
+            Err(error) => {
+                errors.push(error);
+                return None;
+            }
+        };
+        if let Err(error) = self.expect(TokenKind::LBrace) {
+            errors.push(error);
+            return None;
+        }
+
+        let mut methods = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::Async) { self.advance(); }
+            let method_name = match self.expect_ident() {
+                Ok(name) => name,
+                Err(error) => {
+                    errors.push(error);
+                    self.recover_class_member();
+                    continue;
+                }
+            };
+            let verb = method_name.to_lowercase();
+            if !KNOWN_VERBS.contains(&verb.as_str()) {
+                errors.push(self.error_here(&format!(
+                    "method {method_name:?} is not an HTTP verb; expected one of {KNOWN_VERBS:?}"
+                )));
+                self.recover_class_member();
+                continue;
+            }
+
+            let params = match self.parse_params() {
+                Ok(params) => params,
+                Err(error) => {
+                    errors.push(error);
+                    self.recover_class_member();
+                    continue;
+                }
+            };
+            if params.len() > 1 {
+                errors.push(self.error_here("route methods currently accept zero or one request parameter"));
+                self.recover_class_member();
+                continue;
+            }
+            let Some(body) = self.parse_block_collecting(errors) else {
+                self.recover_class_member();
+                continue;
+            };
+            methods.push(MethodDef { verb, param_name: params.into_iter().next(), body });
+        }
+
+        if let Err(error) = self.expect(TokenKind::RBrace) {
+            errors.push(error);
+            return None;
+        }
+        Some((name, methods))
     }
 
     fn parse_params(&mut self) -> Result<Vec<String>, ParseError> {
@@ -143,20 +264,39 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Result<Vec<Statement>, ParseError> {
-        self.expect(TokenKind::LBrace)?;
+        let mut errors = Vec::new();
+        let body = self.parse_block_collecting(&mut errors).ok_or_else(|| {
+            errors.into_iter().next().unwrap_or(ParseError {
+                message: "failed to parse block".to_string(),
+                line: 0,
+                column: 0,
+            })
+        })?;
+        if errors.is_empty() { Ok(body) } else { Err(errors.into_iter().next().unwrap()) }
+    }
+
+    fn parse_block_collecting(&mut self, errors: &mut Vec<ParseError>) -> Option<Vec<Statement>> {
+        if let Err(error) = self.expect(TokenKind::LBrace) {
+            errors.push(error);
+            return None;
+        }
+
         let mut body = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
             match self.parse_statement() {
                 Ok(statement) => body.push(statement),
                 Err(error) => {
-                    let recovery = error.clone();
+                    errors.push(error);
                     self.recover_statement();
-                    return Err(recovery);
                 }
             }
         }
-        self.expect(TokenKind::RBrace)?;
-        Ok(body)
+
+        if let Err(error) = self.expect(TokenKind::RBrace) {
+            errors.push(error);
+            return None;
+        }
+        Some(body)
     }
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
@@ -386,11 +526,34 @@ impl Parser {
                 TokenKind::RBrace if brace_depth > 0 => { brace_depth -= 1; self.advance(); }
                 TokenKind::Semicolon if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => { self.advance(); break; }
                 TokenKind::RBrace if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
-                TokenKind::Const | TokenKind::Let | TokenKind::Return | TokenKind::If | TokenKind::Function
+                TokenKind::Const | TokenKind::Let | TokenKind::Return | TokenKind::If | TokenKind::Else
                     if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
                 _ => { self.advance(); }
             }
         }
+    }
+
+    fn recover_top_level(&mut self) {
+        while !self.check(&TokenKind::Eof)
+            && !self.check(&TokenKind::Colon)
+            && !self.check(&TokenKind::Function)
+            && !self.check(&TokenKind::Class)
+        {
+            self.advance();
+        }
+    }
+
+    fn recover_class_member(&mut self) {
+        while !self.check(&TokenKind::Eof) && !self.check(&TokenKind::RBrace) {
+            if self.check(&TokenKind::Async) || self.is_identifier() {
+                return;
+            }
+            self.advance();
+        }
+    }
+
+    fn is_identifier(&self) -> bool {
+        matches!(self.peek_kind(), TokenKind::Ident(_))
     }
 
     fn peek_kind(&self) -> TokenKind {
