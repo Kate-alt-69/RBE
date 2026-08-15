@@ -1,31 +1,16 @@
-//! Recursive-descent parser over the token stream from `lexer`. Grammar
-//! (informal — matches the crate root doc comment):
-//!
-//! ```text
-//! file       := import_line* class_decl
-//! import_line:= ":" "import" "[" (IDENT | STRING) "]"
-//! class_decl := "class" IDENT "{" method* "}"
-//! method     := ["async"] IDENT "(" [IDENT] ")" "{" statement* "}"
-//! statement  := "const" IDENT "=" expr ";"
-//!             | "return" expr ";"
-//!             | expr ";"
-//! expr       := object | array | call | member | literal
-//! object     := "{" [IDENT ":" expr ("," IDENT ":" expr)*] "}"
-//! array      := "[" [expr ("," expr)*] "]"
-//! ```
-//!
-//! `call` and `member` share a left-recursive-looking shape
-//! (`a.b.c(x)`), handled here by parsing a primary identifier then
-//! repeatedly consuming `.ident` / `(args)` suffixes.
+//! Recursive-descent / precedence parser for the RBE `.route` language.
+//! The parser is intentionally strict and reports line/column information.
 
-use crate::ast::{Expr, ImportTarget, MethodDef, RouteFile, Statement};
-use crate::lexer::Token;
+use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement};
+use crate::lexer::{Token, TokenKind};
 
 const KNOWN_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParseError {
     pub message: String,
+    pub line: usize,
+    pub column: usize,
 }
 
 pub struct Parser {
@@ -34,268 +19,386 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
-    }
+    pub fn new(tokens: Vec<Token>) -> Self { Self { tokens, pos: 0 } }
 
     pub fn parse_file(mut self) -> Result<RouteFile, ParseError> {
         let mut imports = Vec::new();
-        while self.check(&Token::Colon) {
-            imports.push(self.parse_import_line()?);
+        while self.check(&TokenKind::Colon) {
+            imports.push(self.parse_import()?);
         }
 
-        let class = self.parse_class()?;
+        let mut functions = Vec::new();
+        while self.check(&TokenKind::Function) {
+            functions.push(self.parse_function()?);
+        }
 
-        Ok(RouteFile {
-            imports,
-            class_name: class.0,
-            methods: class.1,
-        })
+        let (class_name, methods) = self.parse_class()?;
+        if !self.check(&TokenKind::Eof) {
+            return Err(self.error_here("unexpected content after Route class"));
+        }
+
+        Ok(RouteFile { imports, functions, class_name, methods })
     }
 
-    fn parse_import_line(&mut self) -> Result<ImportTarget, ParseError> {
-        self.expect(Token::Colon)?;
-        self.expect(Token::Import)?;
-        self.expect(Token::LBracket)?;
+    fn parse_import(&mut self) -> Result<ImportTarget, ParseError> {
+        self.expect(TokenKind::Colon)?;
+        self.expect(TokenKind::Import)?;
+        self.expect(TokenKind::LBracket)?;
 
-        let target = match self.advance() {
-            Token::Ident(name) => Self::classify_bareword_import(&name)?,
-            Token::String(path) => ImportTarget::Custom(path),
+        let target = match self.advance().kind {
+            TokenKind::Ident(name) => {
+                if self.check(&TokenKind::Dot) {
+                    self.advance();
+                    let function = self.expect_ident()?;
+                    ImportTarget::BuiltinFunction { module: name, function }
+                } else if let Some((prefix, module_name)) = name.split_once('&') {
+                    if prefix != "module" {
+                        return Err(self.error_here("only module&name shorthand is supported"));
+                    }
+                    ImportTarget::Custom(format!("./module/{module_name}"))
+                } else {
+                    ImportTarget::Builtin(name)
+                }
+            }
+            TokenKind::String(path) => {
+                if self.check(&TokenKind::RBracket) {
+                    ImportTarget::Custom(path)
+                } else {
+                    self.expect(TokenKind::RBracket)?;
+                    self.expect(TokenKind::Dot)?;
+                    let function = self.expect_ident()?;
+                    return Ok(ImportTarget::CustomFunction { path, function });
+                }
+            }
             other => {
-                return Err(ParseError {
-                    message: format!(
-                        "expected an identifier (builtin) or string (custom path) inside :import[...], got {other:?}"
-                    ),
-                })
+                return Err(self.error_here(&format!(
+                    "expected builtin identifier or string path inside :import[...], got {other:?}"
+                )));
             }
         };
 
-        self.expect(Token::RBracket)?;
+        self.expect(TokenKind::RBracket)?;
         Ok(target)
     }
 
-    /// A bareword import target is either a true builtin (`net`,
-    /// `env`, ...) or the `module&name` shorthand for "look up `name`
-    /// in the default `/module/` folder — a sibling of the compiled
-    /// binary, not the current working directory (see
-    /// `crate::paths::binary_dir`)." Desugars directly to the same
-    /// `ImportTarget::Custom` a string-path import produces, so
-    /// everything downstream (resolution, caching, the "not
-    /// implemented yet" error) is one code path regardless of which
-    /// syntax was used to write it.
-    fn classify_bareword_import(name: &str) -> Result<ImportTarget, ParseError> {
-        if let Some((prefix, module_name)) = name.split_once('&') {
-            if prefix != "module" {
-                return Err(ParseError {
-                    message: format!(
-                        "unknown import shorthand {prefix:?} in {name:?} — only \"module&name\" \
-                         is a recognized shorthand (resolves to the default /module/ folder \
-                         next to the compiled binary)"
-                    ),
-                });
-            }
-            if module_name.is_empty() {
-                return Err(ParseError {
-                    message: format!("{name:?} is missing a module name after \"module&\""),
-                });
-            }
-            return Ok(ImportTarget::Custom(format!("./module/{module_name}")));
-        }
-
-        Ok(ImportTarget::Builtin(name.to_string()))
+    fn parse_function(&mut self) -> Result<FunctionDef, ParseError> {
+        self.expect(TokenKind::Function)?;
+        let name = self.expect_ident()?;
+        let params = self.parse_params()?;
+        let body = self.parse_block()?;
+        Ok(FunctionDef { name, params, body })
     }
 
     fn parse_class(&mut self) -> Result<(String, Vec<MethodDef>), ParseError> {
-        self.expect(Token::Class)?;
+        self.expect(TokenKind::Class)?;
         let name = self.expect_ident()?;
-        self.expect(Token::LBrace)?;
+        self.expect(TokenKind::LBrace)?;
 
         let mut methods = Vec::new();
-        while !self.check(&Token::RBrace) {
-            methods.push(self.parse_method()?);
-        }
-        self.expect(Token::RBrace)?;
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::Async) { self.advance(); }
+            let method_name = self.expect_ident()?;
+            let verb = method_name.to_lowercase();
+            if !KNOWN_VERBS.contains(&verb.as_str()) {
+                return Err(self.error_here(&format!(
+                    "method {method_name:?} is not an HTTP verb; expected one of {KNOWN_VERBS:?}"
+                )));
+            }
 
+            let params = self.parse_params()?;
+            if params.len() > 1 {
+                return Err(self.error_here("route methods currently accept zero or one request parameter"));
+            }
+            let body = self.parse_block()?;
+            methods.push(MethodDef { verb, param_name: params.into_iter().next(), body });
+        }
+        self.expect(TokenKind::RBrace)?;
         Ok((name, methods))
     }
 
-    fn parse_method(&mut self) -> Result<MethodDef, ParseError> {
-        // `async` is accepted and ignored in v1 — every route method is
-        // effectively async already (the whole request pipeline is),
-        // so the keyword doesn't change evaluation here. Kept in the
-        // grammar purely so real-looking JS class syntax parses.
-        if self.check(&Token::Async) {
+    fn parse_params(&mut self) -> Result<Vec<String>, ParseError> {
+        self.expect(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                params.push(self.parse_identifier_spelling()?);
+                if !self.check(&TokenKind::Comma) { break; }
+                self.advance();
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(params)
+    }
+
+    fn parse_identifier_spelling(&mut self) -> Result<String, ParseError> {
+        if self.check(&TokenKind::Dollar) {
             self.advance();
+            self.expect(TokenKind::LBracket)?;
+            let name = self.expect_ident()?;
+            self.expect(TokenKind::RBracket)?;
+            return Ok(name);
         }
+        self.expect_ident()
+    }
 
-        let name = self.expect_ident()?;
-        let verb = name.to_lowercase();
-        if !KNOWN_VERBS.contains(&verb.as_str()) {
-            return Err(ParseError {
-                message: format!(
-                    "method name {name:?} is not a known HTTP verb (expected one of {KNOWN_VERBS:?}) — v1 .route files only support one method per verb"
-                ),
-            });
-        }
-
-        self.expect(Token::LParen)?;
-        let param_name = if !self.check(&Token::RParen) {
-            Some(self.expect_ident()?)
-        } else {
-            None
-        };
-        self.expect(Token::RParen)?;
-
-        self.expect(Token::LBrace)?;
+    fn parse_block(&mut self) -> Result<Vec<Statement>, ParseError> {
+        self.expect(TokenKind::LBrace)?;
         let mut body = Vec::new();
-        while !self.check(&Token::RBrace) {
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
             body.push(self.parse_statement()?);
         }
-        self.expect(Token::RBrace)?;
-
-        Ok(MethodDef {
-            verb,
-            param_name,
-            body,
-        })
+        self.expect(TokenKind::RBrace)?;
+        Ok(body)
     }
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
-        if self.check(&Token::Const) {
-            self.advance();
-            let name = self.expect_ident()?;
-            self.expect(Token::Eq)?;
-            let value = self.parse_expr()?;
-            self.expect(Token::Semicolon)?;
-            return Ok(Statement::Const { name, value });
-        }
-
-        if self.check(&Token::Return) {
-            self.advance();
-            let value = self.parse_expr()?;
-            self.expect(Token::Semicolon)?;
-            return Ok(Statement::Return(value));
-        }
-
-        let expr = self.parse_expr()?;
-        self.expect(Token::Semicolon)?;
-        Ok(Statement::Expr(expr))
-    }
-
-    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_primary()?;
-
-        loop {
-            if self.check(&Token::Dot) {
+        match self.peek_kind() {
+            TokenKind::Const | TokenKind::Let => {
                 self.advance();
-                let field = self.expect_ident()?;
-                expr = Expr::Member(Box::new(expr), field);
-            } else if self.check(&Token::LParen) {
+                let name = self.parse_identifier_spelling()?;
+                self.expect(TokenKind::Eq)?;
+                let value = self.parse_expression()?;
+                self.expect(TokenKind::Semicolon)?;
+                Ok(Statement::Const { name, value })
+            }
+            TokenKind::Return => {
                 self.advance();
-                let mut args = Vec::new();
-                if !self.check(&Token::RParen) {
-                    args.push(self.parse_expr()?);
-                    while self.check(&Token::Comma) {
-                        self.advance();
-                        args.push(self.parse_expr()?);
-                    }
-                }
-                self.expect(Token::RParen)?;
-                expr = Expr::Call(Box::new(expr), args);
-            } else {
-                break;
+                let value = self.parse_expression()?;
+                self.expect(TokenKind::Semicolon)?;
+                Ok(Statement::Return(value))
+            }
+            TokenKind::If => self.parse_if(),
+            _ => {
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::Semicolon)?;
+                Ok(Statement::Expr(expr))
             }
         }
+    }
 
+    fn parse_if(&mut self) -> Result<Statement, ParseError> {
+        self.expect(TokenKind::If)?;
+        self.expect(TokenKind::LParen)?;
+        let condition = self.parse_expression()?;
+        self.expect(TokenKind::RParen)?;
+        let then_body = self.parse_block()?;
+        let else_body = if self.check(&TokenKind::Else) {
+            self.advance();
+            self.parse_block()?
+        } else {
+            Vec::new()
+        };
+        Ok(Statement::If { condition, then_body, else_body })
+    }
+
+    fn parse_expression(&mut self) -> Result<Expr, ParseError> { self.parse_or() }
+
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_and()?;
+        while self.check(&TokenKind::OrOr) {
+            self.advance();
+            expr = Expr::Binary { left: Box::new(expr), op: BinaryOp::Or, right: Box::new(self.parse_and()?) };
+        }
+        Ok(expr)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_equality()?;
+        while self.check(&TokenKind::AndAnd) {
+            self.advance();
+            expr = Expr::Binary { left: Box::new(expr), op: BinaryOp::And, right: Box::new(self.parse_equality()?) };
+        }
+        Ok(expr)
+    }
+
+    fn parse_equality(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_comparison()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::EqEq => Some(BinaryOp::Equal),
+                TokenKind::EqEqEq => Some(BinaryOp::StrictEqual),
+                TokenKind::NotEq => Some(BinaryOp::NotEqual),
+                TokenKind::NotEqEq => Some(BinaryOp::StrictNotEqual),
+                _ => None,
+            };
+            let Some(op) = op else { break };
+            self.advance();
+            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_comparison()?) };
+        }
+        Ok(expr)
+    }
+
+    fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_term()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Lt => Some(BinaryOp::Less),
+                TokenKind::LtEq => Some(BinaryOp::LessEqual),
+                TokenKind::Gt => Some(BinaryOp::Greater),
+                TokenKind::GtEq => Some(BinaryOp::GreaterEqual),
+                _ => None,
+            };
+            let Some(op) = op else { break };
+            self.advance();
+            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_term()?) };
+        }
+        Ok(expr)
+    }
+
+    fn parse_term(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_factor()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Plus => Some(BinaryOp::Add),
+                TokenKind::Minus => Some(BinaryOp::Subtract),
+                _ => None,
+            };
+            let Some(op) = op else { break };
+            self.advance();
+            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_factor()?) };
+        }
+        Ok(expr)
+    }
+
+    fn parse_factor(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_unary()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Star => Some(BinaryOp::Multiply),
+                TokenKind::Slash => Some(BinaryOp::Divide),
+                TokenKind::Percent => Some(BinaryOp::Modulo),
+                _ => None,
+            };
+            let Some(op) = op else { break };
+            self.advance();
+            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_unary()?) };
+        }
+        Ok(expr)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        if self.check(&TokenKind::Not) {
+            self.advance();
+            return Ok(Expr::UnaryNot(Box::new(self.parse_unary()?)));
+        }
+        self.parse_postfix()
+    }
+
+    fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            match self.peek_kind() {
+                TokenKind::Dot => {
+                    self.advance();
+                    let field = self.expect_ident()?;
+                    expr = Expr::Member(Box::new(expr), field);
+                }
+                TokenKind::LParen => {
+                    self.advance();
+                    let mut args = Vec::new();
+                    if !self.check(&TokenKind::RParen) {
+                        loop {
+                            args.push(self.parse_expression()?);
+                            if !self.check(&TokenKind::Comma) { break; }
+                            self.advance();
+                        }
+                    }
+                    self.expect(TokenKind::RParen)?;
+                    expr = Expr::Call(Box::new(expr), args);
+                }
+                _ => break,
+            }
+        }
         Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
-        match self.advance() {
-            Token::String(s) => Ok(Expr::String(s)),
-            Token::Number(n) => Ok(Expr::Number(n)),
-            Token::True => Ok(Expr::Bool(true)),
-            Token::False => Ok(Expr::Bool(false)),
-            Token::Null => Ok(Expr::Null),
-            Token::Ident(name) => Ok(Expr::Ident(name)),
-            Token::LBrace => self.parse_object_tail(),
-            Token::LBracket => self.parse_array_tail(),
-            other => Err(ParseError {
-                message: format!("unexpected token in expression: {other:?}"),
-            }),
+        match self.advance().kind {
+            TokenKind::String(s) => Ok(Expr::String(s)),
+            TokenKind::Number(n) => Ok(Expr::Number(n)),
+            TokenKind::True => Ok(Expr::Bool(true)),
+            TokenKind::False => Ok(Expr::Bool(false)),
+            TokenKind::Null => Ok(Expr::Null),
+            TokenKind::Ident(name) => Ok(Expr::Ident(name)),
+            TokenKind::Dollar => {
+                self.expect(TokenKind::LBracket)?;
+                let name = self.expect_ident()?;
+                self.expect(TokenKind::RBracket)?;
+                Ok(Expr::Ident(name))
+            }
+            TokenKind::LBrace => self.parse_object_tail(),
+            TokenKind::LBracket => self.parse_array_tail(),
+            other => Err(self.error_here(&format!("unexpected token in expression: {other:?}"))),
         }
     }
 
     fn parse_object_tail(&mut self) -> Result<Expr, ParseError> {
         let mut fields = Vec::new();
-        if !self.check(&Token::RBrace) {
-            fields.push(self.parse_object_field()?);
-            while self.check(&Token::Comma) {
+        if !self.check(&TokenKind::RBrace) {
+            loop {
+                let key = self.expect_ident()?;
+                self.expect(TokenKind::Colon)?;
+                let value = self.parse_expression()?;
+                fields.push((key, value));
+                if !self.check(&TokenKind::Comma) { break; }
                 self.advance();
-                if self.check(&Token::RBrace) {
-                    break; // trailing comma
-                }
-                fields.push(self.parse_object_field()?);
+                if self.check(&TokenKind::RBrace) { break; }
             }
         }
-        self.expect(Token::RBrace)?;
+        self.expect(TokenKind::RBrace)?;
         Ok(Expr::Object(fields))
-    }
-
-    fn parse_object_field(&mut self) -> Result<(String, Expr), ParseError> {
-        let key = self.expect_ident()?;
-        self.expect(Token::Colon)?;
-        let value = self.parse_expr()?;
-        Ok((key, value))
     }
 
     fn parse_array_tail(&mut self) -> Result<Expr, ParseError> {
         let mut items = Vec::new();
-        if !self.check(&Token::RBracket) {
-            items.push(self.parse_expr()?);
-            while self.check(&Token::Comma) {
+        if !self.check(&TokenKind::RBracket) {
+            loop {
+                items.push(self.parse_expression()?);
+                if !self.check(&TokenKind::Comma) { break; }
                 self.advance();
-                if self.check(&Token::RBracket) {
-                    break;
-                }
-                items.push(self.parse_expr()?);
+                if self.check(&TokenKind::RBracket) { break; }
             }
         }
-        self.expect(Token::RBracket)?;
+        self.expect(TokenKind::RBracket)?;
         Ok(Expr::Array(items))
     }
 
-    // --- token stream helpers ---
+    fn peek_kind(&self) -> TokenKind {
+        self.tokens.get(self.pos).map(|t| t.kind.clone()).unwrap_or(TokenKind::Eof)
+    }
 
-    fn check(&self, expected: &Token) -> bool {
-        matches!(self.tokens.get(self.pos), Some(t) if std::mem::discriminant(t) == std::mem::discriminant(expected))
+    fn check(&self, expected: &TokenKind) -> bool {
+        self.tokens.get(self.pos).map(|t| &t.kind == expected).unwrap_or(false)
     }
 
     fn advance(&mut self) -> Token {
-        let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
-        if self.pos < self.tokens.len() {
-            self.pos += 1;
-        }
+        let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token { kind: TokenKind::Eof, line: 0, column: 0 });
+        if self.pos < self.tokens.len() { self.pos += 1; }
         tok
     }
 
-    fn expect(&mut self, expected: Token) -> Result<(), ParseError> {
+    fn expect(&mut self, expected: TokenKind) -> Result<(), ParseError> {
         if self.check(&expected) {
             self.advance();
             Ok(())
         } else {
-            Err(ParseError {
-                message: format!("expected {expected:?}, got {:?}", self.tokens.get(self.pos)),
-            })
+            Err(self.error_here(&format!("expected {expected:?}, got {:?}", self.peek_kind())))
         }
     }
 
     fn expect_ident(&mut self) -> Result<String, ParseError> {
-        match self.advance() {
-            Token::Ident(name) => Ok(name),
-            other => Err(ParseError {
-                message: format!("expected identifier, got {other:?}"),
-            }),
+        match self.advance().kind {
+            TokenKind::Ident(name) => Ok(name),
+            other => Err(self.error_here(&format!("expected identifier, got {other:?}"))),
+        }
+    }
+
+    fn error_here(&self, message: &str) -> ParseError {
+        let token = self.tokens.get(self.pos);
+        ParseError {
+            message: message.to_string(),
+            line: token.map(|t| t.line).unwrap_or(0),
+            column: token.map(|t| t.column).unwrap_or(0),
         }
     }
 }
