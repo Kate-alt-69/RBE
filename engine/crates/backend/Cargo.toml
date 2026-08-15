@@ -15,6 +15,7 @@ config = { path = "../config" }
 supervisor = { path = "../supervisor" }
 logging = { path = "../logging" }
 vault = { path = "../../../vault" }
+vault-process = { path = "../../../vault-process" }
 atomic-io = { path = "../../../atomic-io" }
 error-client = { path = "../../../error-client" }
 route-engine = { path = "../route-engine" }
