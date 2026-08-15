@@ -26,6 +26,9 @@ mod acl;
 mod file_store;
 
 use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+use std::thread;
 
 use logging::Logger;
 use secrecy::SecretString;
@@ -65,7 +68,7 @@ impl Vault {
 
         let backend = if cfg!(any(target_os = "windows", target_os = "macos")) {
             Backend::Keyring { service_name }
-        } else if probe_keyring(&service_name) {
+        } else if probe_keyring_with_install(&service_name) {
             Backend::Keyring { service_name }
         } else {
             log.warn(
@@ -154,4 +157,145 @@ fn probe_keyring(service_name: &str) -> bool {
     let ok = entry.get_password().is_ok();
     let _ = entry.delete_password();
     ok
+}
+
+/// Detect which Linux distro is running
+#[allow(dead_code)]
+fn detect_linux_distro() -> String {
+    if let Ok(output) = Command::new("sh")
+        .arg("-c")
+        .arg(". /etc/os-release 2>/dev/null && echo \"$ID\" || echo linux")
+        .output()
+    {
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_lowercase()
+    } else {
+        "linux".to_string()
+    }
+}
+
+/// Display progress bar with state message
+#[allow(dead_code)]
+fn show_progress(message: &str, percent: u32) {
+    let filled = (percent / 5).min(20) as usize;
+    let empty = 20 - filled;
+    let bar = format!(
+        "[{}{}] {}%",
+        "=".repeat(filled),
+        "-".repeat(empty),
+        percent
+    );
+    eprint!("\r{:<35} {}", message, bar);
+}
+
+/// Try to install Secret Service daemon using available package managers
+#[allow(dead_code)]
+fn try_install_secret_service() -> bool {
+    let distro = detect_linux_distro();
+    
+    eprintln!("\n");
+    show_progress("Detecting Secret Service daemon", 0);
+    thread::sleep(Duration::from_millis(200));
+
+    // Detect which package manager is available
+    let pm_commands = match distro.as_str() {
+        "ubuntu" | "debian" | "linuxmint" | "kali" | "pop" | "elementary" | "zorin" | "deepin" => {
+            vec![("apt-get update", "apt-get install -y gnome-keyring dbus-x11", "Debian/Ubuntu")]
+        }
+        "fedora" | "rhel" | "centos" | "amazonlinux" | "oraclelinux" | "almalinux" | "rocky" => {
+            vec![("dnf check-update", "dnf install -y gnome-keyring dbus-x11", "Fedora/RHEL")]
+        }
+        "arch" | "manjaro" | "artix" => {
+            vec![("pacman -Sy", "pacman -S --noconfirm gnome-keyring dbus", "Arch/Manjaro")]
+        }
+        "alpine" => {
+            vec![("apk update", "apk add gnome-keyring dbus-x11", "Alpine")]
+        }
+        "opensuse" | "suse" | "tumbleweed" | "sles" => {
+            vec![("zypper refresh", "zypper install -y gnome-keyring dbus-x11", "openSUSE")]
+        }
+        _ => {
+            show_progress("Checking available package managers", 25);
+            thread::sleep(Duration::from_millis(200));
+            vec![]
+        }
+    };
+
+    if pm_commands.is_empty() {
+        show_progress("No package manager detected, using fallback", 100);
+        eprintln!("\n");
+        return false;
+    }
+
+    for (pm_check, pm_install, pm_name) in pm_commands {
+        show_progress("Checking Secret Service availability", 25);
+        thread::sleep(Duration::from_millis(300));
+
+        // Check if Secret Service packages might already be installed
+        if Command::new("sh")
+            .arg("-c")
+            .arg("command -v gnome-keyring dbus-daemon >/dev/null 2>&1")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            show_progress("Secret Service already installed", 100);
+            eprintln!("\n");
+            return true;
+        }
+
+        show_progress(&format!("Installing via {} (downloading)", pm_name), 40);
+        thread::sleep(Duration::from_millis(400));
+
+        // Try update/refresh
+        if Command::new("sh")
+            .arg("-c")
+            .arg(&format!("sudo {} >/dev/null 2>&1", pm_check))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            show_progress(&format!("Installing via {} (downloading)", pm_name), 60);
+            thread::sleep(Duration::from_millis(400));
+
+            // Try install
+            if Command::new("sh")
+                .arg("-c")
+                .arg(&format!("sudo {} >/dev/null 2>&1", pm_install))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                show_progress(&format!("Installing via {} (finalizing)", pm_name), 85);
+                thread::sleep(Duration::from_millis(300));
+
+                // Verify installation worked
+                thread::sleep(Duration::from_millis(500));
+                if probe_keyring("vault-probe") {
+                    show_progress("Secret Service installed successfully", 100);
+                    eprintln!("\n");
+                    return true;
+                }
+            }
+        }
+    }
+
+    show_progress("Secret Service installation failed, using fallback", 100);
+    eprintln!("\n");
+    false
+}
+
+#[allow(dead_code)]
+fn probe_keyring_with_install(service_name: &str) -> bool {
+    if probe_keyring(service_name) {
+        return true;
+    }
+
+    // Attempt to install Secret Service if it's not available
+    if try_install_secret_service() {
+        probe_keyring(service_name)
+    } else {
+        false
+    }
 }
