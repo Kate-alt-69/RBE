@@ -19,14 +19,17 @@ pub enum Severity {
 pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
+    pub symbol: Option<String>,
 }
 
 impl Diagnostic {
-    fn error(message: impl Into<String>) -> Self {
-        Self { severity: Severity::Error, message: message.into() }
+    fn error(message: impl Into<String>) -> Self { Self { severity: Severity::Error, message: message.into(), symbol: None } }
+    fn error_symbol(message: impl Into<String>, symbol: impl Into<String>) -> Self {
+        Self { severity: Severity::Error, message: message.into(), symbol: Some(symbol.into()) }
     }
-    fn warning(message: impl Into<String>) -> Self {
-        Self { severity: Severity::Warning, message: message.into() }
+    fn warning(message: impl Into<String>) -> Self { Self { severity: Severity::Warning, message: message.into(), symbol: None } }
+    fn warning_symbol(message: impl Into<String>, symbol: impl Into<String>) -> Self {
+        Self { severity: Severity::Warning, message: message.into(), symbol: Some(symbol.into()) }
     }
 }
 
@@ -49,13 +52,13 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
             ImportTarget::BuiltinFunction { .. } | ImportTarget::CustomFunction { .. } => SymbolKind::DirectFunction,
         };
         if globals.insert(name.clone(), Symbol { kind, used: false }).is_some() {
-            diagnostics.push(Diagnostic::error(format!("duplicate import binding `{name}`")));
+            diagnostics.push(Diagnostic::error_symbol(format!("duplicate import binding `{name}`"), name));
         }
     }
 
     for function in &file.functions {
         if globals.insert(function.name.clone(), Symbol { kind: SymbolKind::Function, used: false }).is_some() {
-            diagnostics.push(Diagnostic::error(format!("duplicate top-level function `{}`", function.name)));
+            diagnostics.push(Diagnostic::error_symbol(format!("duplicate top-level function `{}`", function.name), function.name.clone()));
         }
     }
 
@@ -71,10 +74,10 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
         if used_globals.contains(&name) { continue; }
         match symbol.kind {
             SymbolKind::Module | SymbolKind::DirectFunction => {
-                diagnostics.push(Diagnostic::warning(format!("import `{name}` is never used")));
+                diagnostics.push(Diagnostic::warning_symbol(format!("import `{name}` is never used"), name));
             }
             SymbolKind::Function => {
-                diagnostics.push(Diagnostic::warning(format!("function `{name}` is never called")));
+                diagnostics.push(Diagnostic::warning_symbol(format!("function `{name}` is never called"), name));
             }
             SymbolKind::Local => {}
         }
@@ -87,7 +90,7 @@ fn analyze_function(function: &FunctionDef, globals: &Scope, used_globals: &mut 
     let mut scope = globals.clone();
     for param in &function.params {
         if scope.contains_key(param) {
-            diagnostics.push(Diagnostic::error(format!("function `{}` parameter `{param}` shadows an imported or top-level symbol", function.name)));
+            diagnostics.push(Diagnostic::error_symbol(format!("function `{}` parameter `{param}` shadows an imported or top-level symbol", function.name), param));
         } else {
             scope.insert(param.clone(), Symbol { kind: SymbolKind::Local, used: false });
         }
@@ -100,7 +103,7 @@ fn analyze_method(method: &MethodDef, globals: &Scope, used_globals: &mut HashSe
     let mut scope = globals.clone();
     if let Some(param) = &method.param_name {
         if scope.contains_key(param) {
-            diagnostics.push(Diagnostic::error(format!("route `{}` parameter `{param}` shadows an imported or top-level symbol", method.verb)));
+            diagnostics.push(Diagnostic::error_symbol(format!("route `{}` parameter `{param}` shadows an imported or top-level symbol", method.verb), param));
         } else {
             scope.insert(param.clone(), Symbol { kind: SymbolKind::Local, used: false });
         }
@@ -115,7 +118,7 @@ fn analyze_statements(statements: &[Statement], scope: &mut Scope, used_globals:
             Statement::Const { name, value } => {
                 analyze_expr(value, scope, used_globals, diagnostics);
                 if scope.contains_key(name) {
-                    diagnostics.push(Diagnostic::error(format!("`{owner}` redeclares `{name}` in the same scope")));
+                    diagnostics.push(Diagnostic::error_symbol(format!("`{owner}` redeclares `{name}` in the same scope"), name));
                 } else {
                     scope.insert(name.clone(), Symbol { kind: SymbolKind::Local, used: false });
                 }
@@ -139,14 +142,14 @@ fn mark_identifier(name: &str, scope: &mut Scope, used_globals: &mut HashSet<Str
             match symbol.kind {
                 SymbolKind::Local => {}
                 SymbolKind::Module if allow_module_value => { used_globals.insert(name.to_string()); }
-                SymbolKind::Module => diagnostics.push(Diagnostic::error(format!("`{name}` is a module and must be accessed through an exported capability"))),
+                SymbolKind::Module => diagnostics.push(Diagnostic::error_symbol(format!("`{name}` is a module and must be accessed through an exported capability"), name)),
                 SymbolKind::DirectFunction | SymbolKind::Function => {
                     used_globals.insert(name.to_string());
-                    diagnostics.push(Diagnostic::error(format!("`{name}` is callable metadata, not a value; call it instead")));
+                    diagnostics.push(Diagnostic::error_symbol(format!("`{name}` is callable metadata, not a value; call it instead"), name));
                 }
             }
         }
-        None => diagnostics.push(Diagnostic::error(format!("`{name}` is not defined"))),
+        None => diagnostics.push(Diagnostic::error_symbol(format!("`{name}` is not defined"), name)),
     }
 }
 
@@ -162,7 +165,7 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                         used_globals.insert(name.clone());
                     }
                     Some(_) => mark_identifier(name, scope, used_globals, diagnostics, false),
-                    None => diagnostics.push(Diagnostic::error(format!("module `{name}` is not imported"))),
+                    None => diagnostics.push(Diagnostic::error_symbol(format!("module `{name}` is not imported"), name)),
                 }
             } else {
                 analyze_expr(base, scope, used_globals, diagnostics);
@@ -175,10 +178,10 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                         symbol.used = true;
                         match symbol.kind {
                             SymbolKind::Function | SymbolKind::DirectFunction => { used_globals.insert(name.clone()); }
-                            SymbolKind::Local | SymbolKind::Module => diagnostics.push(Diagnostic::error(format!("`{name}` is not callable"))),
+                            SymbolKind::Local | SymbolKind::Module => diagnostics.push(Diagnostic::error_symbol(format!("`{name}` is not callable"), name)),
                         }
                     }
-                    None => diagnostics.push(Diagnostic::error(format!("function `{name}` is not defined"))),
+                    None => diagnostics.push(Diagnostic::error_symbol(format!("function `{name}` is not defined"), name)),
                 },
                 Expr::Member(base, _) => {
                     if let Expr::Ident(name) = base.as_ref() {
@@ -188,7 +191,7 @@ fn analyze_expr(expr: &Expr, scope: &mut Scope, used_globals: &mut HashSet<Strin
                                 used_globals.insert(name.clone());
                             }
                             Some(_) => mark_identifier(name, scope, used_globals, diagnostics, false),
-                            None => diagnostics.push(Diagnostic::error(format!("module `{name}` is not imported"))),
+                            None => diagnostics.push(Diagnostic::error_symbol(format!("module `{name}` is not imported"), name)),
                         }
                     } else {
                         analyze_expr(base, scope, used_globals, diagnostics);
@@ -212,7 +215,7 @@ fn warn_unused_locals(scope: &Scope, diagnostics: &mut Vec<Diagnostic>, owner: O
     for (name, symbol) in scope {
         if symbol.kind == SymbolKind::Local && !symbol.used && name != "_req" {
             let owner = owner.map(|value| format!(" in `{value}`")).unwrap_or_default();
-            diagnostics.push(Diagnostic::warning(format!("local `{name}` is never used{owner}")));
+            diagnostics.push(Diagnostic::warning_symbol(format!("local `{name}` is never used{owner}"), name));
         }
     }
 }
@@ -240,6 +243,7 @@ mod tests {
         let diagnostics = analyze(&file);
         assert!(diagnostics.iter().any(|d| d.severity == Severity::Error && d.message.contains("missing")));
         assert!(diagnostics.iter().any(|d| d.severity == Severity::Warning && d.message.contains("net")));
+        assert!(diagnostics.iter().any(|d| d.symbol.as_deref() == Some("missing")));
     }
 
     #[test]
