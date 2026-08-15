@@ -43,7 +43,12 @@ pub fn build_router(state: AppState, api_dir: &Path) -> anyhow::Result<Router> {
     // of any layer below it, same reasoning as the Node backend
     // escalating straight to 403 rather than running the rest of the
     // pipeline. Correlation ID next, so every later layer's logs
-    // (including TraceLayer's own request span) can be correlated.
+    // (including TraceLayer's own request span, and request_timing's
+    // completion log) can be correlated. request_timing sits right
+    // after correlation_id/TraceLayer specifically so its measured
+    // duration covers every layer below it (rate limiting, body-size
+    // enforcement, security headers, CORS, and the actual handler) —
+    // the honest end-to-end number, not just handler time.
     let middleware = ServiceBuilder::new()
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -51,6 +56,10 @@ pub fn build_router(state: AppState, api_dir: &Path) -> anyhow::Result<Router> {
         ))
         .layer(axum::middleware::from_fn(security::correlation_id))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            state.config.clone(),
+            security::request_timing,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security::global_rate_limit::<AppState>,

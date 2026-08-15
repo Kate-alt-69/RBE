@@ -10,10 +10,43 @@ use std::sync::Arc;
 use core_lib::AppState;
 use supervisor::{BackendState, RestartPolicy, Supervisor};
 
+mod container_embed;
+mod error_reporter_daemon;
 mod port_guard;
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+
+    // `--er` selects error-reporter-daemon mode instead of the normal
+    // engine boot — see error_reporter_daemon's doc comment for what
+    // that mode actually does. `--launch` is deliberately a SEPARATE,
+    // required flag rather than `--er` alone being enough: a safety
+    // gate against accidentally landing in daemon mode from a typo or
+    // a stray flag, since daemon mode does something meaningfully
+    // different from what running `backend.exe` normally does.
+    // `--separate-process` (or the literal `--saperate-process`) is
+    // informational — it's what the normal boot path passes when IT
+    // spawns this as a child (see `spawn_error_reporter_daemon_process`
+    // below) so the daemon process can log that context; it has no
+    // effect on the daemon's actual behavior.
+    if has("--er") {
+        if !has("--launch") {
+            eprintln!(
+                "backend.exe --er requires --launch as well (e.g. `backend.exe --er --launch`) — \
+                 this is a deliberate safety gate, not a missing feature."
+            );
+            std::process::exit(2);
+        }
+        let separate = has("--separate-process") || has("--saperate-process");
+        if let Err(err) = run_error_reporter_daemon(separate).await {
+            eprintln!("fatal error-reporter-daemon error: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Nothing is logged yet at this point by design — see boot() step 1.
     // If boot() itself fails, print plainly and exit non-zero rather
     // than panicking through main, matching §3.2's "fail fast and loud
@@ -22,6 +55,103 @@ async fn main() {
         eprintln!("fatal boot error: {err:#}");
         std::process::exit(1);
     }
+}
+
+/// Runs ONLY the error-reporter daemon — no HTTP server, no routes, no
+/// vault, nothing else from the normal boot sequence. Kept deliberately
+/// minimal: just enough setup (atomic I/O, logging) for
+/// `error_reporter_daemon::run` to do its job.
+async fn run_error_reporter_daemon(separate_process: bool) -> anyhow::Result<()> {
+    // A bare-bones tracing setup — the daemon doesn't have (and
+    // shouldn't need) the full engine's `settings.json`-driven config
+    // just to decide its own log format. `RUST_LOG` env var still
+    // works for anyone who wants to adjust verbosity.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).with_target(true).init();
+
+    tracing::info!(
+        pid = std::process::id(),
+        separate_process,
+        "backend.exe running in --er (error-reporter-daemon) mode"
+    );
+
+    let io = atomic_io::AtomicIo::new();
+    let admin_dir = PathBuf::from("./data/admin");
+    error_reporter_daemon::run(io, admin_dir, separate_process).await
+}
+
+/// Spawns `backend.exe --er --separate-process --launch` as a genuine
+/// child OS process (not a `tokio::spawn`ed in-process task) — see
+/// `error_client`'s crate doc comment for why this changed from an
+/// earlier in-process version. A crash in the error-reporter no longer
+/// takes down the engine, and vice versa; that's the whole point of
+/// the split.
+///
+/// Includes basic crash monitoring: if the child exits unexpectedly,
+/// logs it and retries with a fixed backoff, up to a bounded number of
+/// attempts — simpler than `supervisor::Supervisor`'s exponential
+/// backoff (that's designed for in-process async tasks, not child
+/// processes, and reusing it here for something this different would
+/// be forcing an abstraction where a much smaller one does the job).
+/// Giving up after repeated failures (rather than restarting forever)
+/// is deliberate: a daemon that can't start at all (e.g. permission
+/// error on `data/admin`) shouldn't spin retrying indefinitely in the
+/// background — see the loop's own comment for the exact bound.
+fn spawn_error_reporter_daemon_process() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("could not resolve current_exe to spawn the error-reporter daemon: {e}"))?;
+
+    tokio::spawn(async move {
+        const MAX_ATTEMPTS: u32 = 5;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let spawn_result = tokio::process::Command::new(&exe)
+                .args(["--er", "--separate-process", "--launch"])
+                .kill_on_drop(false) // outlive this task/handle deliberately — it's a daemon, not a subtask
+                .spawn();
+
+            let mut child = match spawn_result {
+                Ok(child) => child,
+                Err(err) => {
+                    tracing::error!(attempt, error = %err, "failed to spawn error-reporter daemon process");
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            tracing::info!(pid = child.id(), attempt, "error-reporter daemon process spawned");
+
+            match child.wait().await {
+                Ok(status) if status.success() => {
+                    // Clean exit (e.g. someone sent it a graceful
+                    // shutdown signal directly) — don't restart, that
+                    // would fight an intentional stop.
+                    tracing::info!("error-reporter daemon process exited cleanly — not restarting");
+                    return;
+                }
+                Ok(status) => {
+                    tracing::warn!(attempt, %status, "error-reporter daemon process exited unexpectedly");
+                }
+                Err(err) => {
+                    tracing::warn!(attempt, error = %err, "error watching error-reporter daemon process");
+                }
+            }
+
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+
+        tracing::error!(
+            "error-reporter daemon process failed to stay up after {MAX_ATTEMPTS} attempts — giving up. \
+             The engine will keep running; issues will just accumulate unsigned in the queue file until \
+             the daemon is started again (manually, or by restarting the engine)."
+        );
+    });
+
+    Ok(())
 }
 
 async fn boot_and_run() -> anyhow::Result<()> {
@@ -58,55 +188,81 @@ async fn boot_and_run() -> anyhow::Result<()> {
     logging::terminal::init(&config.logging)?;
     boot_trace("logging initialized");
 
-    // --- Global error hooks (this turn's ask): the "Terminal" is what
-    // `terminal::init` just set up; this is the "global error logger"
-    // half — Rust's equivalent of `uncaughtExceptionMonitor`.
-    logging::install_panic_hook();
-
-    tracing::info!(path = %settings_path, "configuration loaded");
-    boot_trace("configuration log emitted");
-
     // Global atomic I/O gate — constructed once, shared (cheap Clone,
     // an Arc underneath) by everything in this process that touches
-    // disk: the error reporter, the vault, and eventually the
+    // disk: the error-reporter client, the vault, and eventually the
     // container runtime's environments. See atomic-io's doc comment
     // for exactly what "atomic" does and doesn't mean here.
     let io = atomic_io::AtomicIo::new();
 
-    // --- Start the error-reporter task. See the long comment on
-    // `logging::spawn_error_reporter` for why this is a plain
-    // `tokio::spawn`, not a `Supervisor`-registered service like
-    // everything from step 6 onward.
+    // --- Global error hooks. `error_client::init` sets up the
+    // process-wide state `report_issue`/the panic hook write through —
+    // must happen BEFORE `install_panic_hook`, so the hook can safely
+    // report immediately if something goes wrong right after. See
+    // `error_client`'s crate doc comment for the full two-process
+    // design (this process only ever WRITES to the queue file; a
+    // separate `backend.exe --er --launch` process, spawned below,
+    // reads/signs/processes it).
     let admin_dir = PathBuf::from("./data/admin");
-    boot_trace(format!("error reporter admin dir={}", admin_dir.display()));
-    let error_reporter_task = logging::spawn_error_reporter(io.clone(), admin_dir)?;
-    boot_trace("error reporter future created");
-    tokio::spawn(async move {
-        if let Err(err) = error_reporter_task.await {
-            // This log call itself goes through `report_runtime_issue`'s
-            // fallback path if the reporter is what just died — see that
-            // function's doc comment.
-            tracing::error!(error = %err, "error-reporter task exited unexpectedly");
-        }
-    });
-    boot_trace("error reporter spawned");
+    error_client::init(io.clone(), &admin_dir);
+    error_client::install_panic_hook();
+    boot_trace("error-client initialized, panic hook installed");
+
+    tracing::info!(path = %settings_path, "configuration loaded");
+    boot_trace("configuration log emitted");
+
+    // --- Spawn the error-reporter daemon as a genuinely separate OS
+    // process (not an in-process task) — see
+    // `spawn_error_reporter_daemon_process`'s doc comment for exactly
+    // what that buys and how crash monitoring works. If this fails to
+    // even START (e.g. can't resolve current_exe), that's worth
+    // logging loudly but NOT worth failing boot over — the engine can
+    // run without it, issues just accumulate unsigned in the queue
+    // file until it's available.
+    if let Err(err) = spawn_error_reporter_daemon_process() {
+        tracing::error!(error = %err, "failed to spawn error-reporter daemon process — continuing boot without it");
+    }
+    boot_trace("error-reporter daemon process spawn requested");
 
     // --- 3. Init Vault (§8) — gatekeeper over the OS credential store,
     // with a local encrypted-file fallback if that's unavailable (see
     // vault crate's doc comment). Fallible, and deliberately its own
     // boot step: a vault that fails to initialize should stop boot
     // here, not surface as a confusing failure later when something
-    // tries to read a credential.
-    let vault_data_dir = PathBuf::from("./data/admin");
-    boot_trace(format!(
-        "vault initializing data dir={}",
-        vault_data_dir.display()
-    ));
+    // tries to read a credential. Same `admin_dir` the error-reporter
+    // client/daemon use above — one shared admin directory, not a
+    // separate one per subsystem.
+    boot_trace(format!("vault initializing data dir={}", admin_dir.display()));
     let vault_instance = Arc::new(
-        vault::Vault::new(io.clone(), "backend-rs", &vault_data_dir)
+        vault::Vault::new(io.clone(), "backend-rs", &admin_dir)
             .map_err(|err| anyhow::anyhow!("failed to initialize vault: {err}"))?,
     );
     boot_trace("vault initialized");
+
+    // --- Extract the embedded container binary, if `build.ps1` built
+    // one in (see `container_embed`'s doc comment). Only extraction —
+    // nothing spawns it yet; that needs the IPC protocol, still a
+    // stub. A plain dev build with no embedded container is expected
+    // and fine, logged at debug level, not a warning.
+    let container_cache_dir = PathBuf::from("./.cache/service");
+    match container_embed::extract_if_needed(&io, &container_cache_dir) {
+        Ok(Some(path)) => {
+            boot_trace(format!("embedded container binary ready at {}", path.display()));
+            tracing::info!(path = %path.display(), "container binary extracted and ready");
+        }
+        Ok(None) => {
+            boot_trace("no embedded container binary (standalone build)");
+            tracing::debug!("no embedded container binary — this backend was built without build.ps1's combined mode");
+        }
+        Err(err) => {
+            // Not fatal to boot — the engine can run without the
+            // container binary available; whatever eventually spawns
+            // it (once ipc-protocol exists) will surface a clearer
+            // error at that point if it's actually needed.
+            boot_trace(format!("container binary extraction failed: {err:#}"));
+            tracing::warn!(error = %err, "failed to extract embedded container binary");
+        }
+    }
 
     // --- 4/5. Config is already loaded + validated (step 1 — validation
     // happens inside `Config::load`, matching §3.2's ordering intent:
@@ -163,6 +319,47 @@ async fn boot_and_run() -> anyhow::Result<()> {
     // `/module/` are siblings of the binary, never compiled into it.
     let api_dir = route_engine::default_api_dir();
     boot_trace(format!("building router api dir={}", api_dir.display()));
+
+    // --- RBE Upgrade Plan §2 (Phase 1): best-effort AOT transpiler
+    // sync — mirrors each .route file into a generated Rust artifact
+    // under .cache/backend/artifact/. Deliberately NOT allowed to fail
+    // boot: this is inspectable tooling ahead of the real WASM
+    // pipeline (later phases), not on the request-serving critical
+    // path yet — routes are still served by the interpreter via
+    // build_router below, unchanged. A transpile failure for one route
+    // is logged and skipped; it doesn't affect that route's actual
+    // (interpreted) serving at all.
+    let cache_dir = PathBuf::from("./.cache/backend");
+    match route_engine::cache::sync(&io, &api_dir, &cache_dir) {
+        Ok(outcomes) => {
+            let regenerated = outcomes
+                .iter()
+                .filter(|o| matches!(o.result, Ok(route_engine::cache::SyncAction::Regenerated)))
+                .count();
+            let failed: Vec<_> = outcomes.iter().filter(|o| o.result.is_err()).collect();
+            boot_trace(format!(
+                "transpiler cache sync: {} file(s), {regenerated} regenerated, {} failed",
+                outcomes.len(),
+                failed.len()
+            ));
+            for outcome in &failed {
+                let message = outcome.result.as_ref().unwrap_err();
+                tracing::warn!(
+                    route = %outcome.route_path.display(),
+                    error = %message,
+                    "transpiler: failed to generate Rust artifact for this route (interpreted serving is unaffected)"
+                );
+            }
+        }
+        Err(err) => {
+            // Couldn't even list api_dir, or similar — still not fatal
+            // to boot, but worth a real warning since it means NO
+            // artifacts got a chance to sync this run.
+            boot_trace(format!("transpiler cache sync failed entirely: {err:#}"));
+            tracing::warn!(error = %err, "transpiler cache sync failed — continuing boot without it");
+        }
+    }
+
     let router = api::build_router(app_state, &api_dir)?;
     boot_trace("router built");
 

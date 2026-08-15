@@ -15,6 +15,7 @@ mod headers;
 mod ip_strikes;
 mod rate_limit;
 mod real_ip;
+mod timing;
 
 use axum::extract::Request;
 use axum::middleware::Next;
@@ -25,6 +26,7 @@ pub use headers::security_headers;
 pub use ip_strikes::{ban_check, HasIpStrikes, IpStrikeTracker, StrikeCategory};
 pub use rate_limit::{api_rate_limit, global_rate_limit, HasRateLimiters, RateLimiters};
 pub use real_ip::{extract_real_ip, normalize_key};
+pub use timing::request_timing;
 
 /// Request header/extension key used to carry the correlation ID.
 pub const CORRELATION_ID_HEADER: &str = "x-correlation-id";

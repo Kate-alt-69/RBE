@@ -1,0 +1,22 @@
+[package]
+name = "error-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate — like vault/atomic-io, NOT a member of either the
+# engine or container-runtime workspace. This is the WRITER side of
+# the issue-reporting system: "integrated basically everywhere" means
+# any process (main engine, container-runtime's environments,
+# eventually the WASM sandbox) can depend on this via relative path
+# and call report_issue() with nothing more than an AtomicIo and an
+# admin dir — no shared channel, no shared state across processes,
+# just a file both sides agree on. See this crate's lib.rs doc comment
+# for the full design and how it maps to the original Node backend's
+# errorReporterClient.ts.
+
+[dependencies]
+atomic-io = { path = "../atomic-io" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

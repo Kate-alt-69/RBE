@@ -16,8 +16,17 @@ supervisor = { path = "../supervisor" }
 logging = { path = "../logging" }
 vault = { path = "../../../vault" }
 atomic-io = { path = "../../../atomic-io" }
+error-client = { path = "../../../error-client" }
 route-engine = { path = "../route-engine" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"

@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [atomic-io, vault]
+        crate: [atomic-io, vault, error-client]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

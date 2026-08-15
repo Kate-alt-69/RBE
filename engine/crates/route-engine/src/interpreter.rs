@@ -15,7 +15,7 @@ pub struct EvalError {
 }
 
 impl EvalError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -56,7 +56,7 @@ impl RequestContext {
 /// method on a data value").
 enum Binding {
     Value(Value),
-    Module(String),
+    Module,
 }
 
 pub struct Interpreter<'a> {
@@ -89,7 +89,7 @@ impl<'a> Interpreter<'a> {
         }
         for name in module_names {
             self.scope
-                .insert(name.clone(), Binding::Module(name.clone()));
+                .insert(name.clone(), Binding::Module);
         }
 
         for stmt in &method.body {
@@ -119,7 +119,7 @@ impl<'a> Interpreter<'a> {
 
             Expr::Ident(name) => match self.scope.get(name) {
                 Some(Binding::Value(v)) => Ok(v.clone()),
-                Some(Binding::Module(_)) => Err(EvalError::new(format!(
+                Some(Binding::Module) => Err(EvalError::new(format!(
                     "{name} is a module, not a value — did you mean to call one of its functions?"
                 ))),
                 None => Err(EvalError::new(format!("{name} is not defined"))),
@@ -148,7 +148,7 @@ impl<'a> Interpreter<'a> {
                 // handled in the `Call` arm below. Bare member access on
                 // a module (no call) is an error.
                 if let Expr::Ident(name) = base.as_ref() {
-                    if matches!(self.scope.get(name), Some(Binding::Module(_))) {
+                    if matches!(self.scope.get(name), Some(Binding::Module)) {
                         return Err(EvalError::new(format!(
                             "{name}.{field} — accessing a module field without calling it isn't supported in v1"
                         )));
@@ -169,7 +169,7 @@ impl<'a> Interpreter<'a> {
                 // modules — the one real form of "call" v1 supports.
                 if let Expr::Member(base, function_name) = callee.as_ref() {
                     if let Expr::Ident(module_name) = base.as_ref() {
-                        if matches!(self.scope.get(module_name), Some(Binding::Module(_))) {
+                        if matches!(self.scope.get(module_name), Some(Binding::Module)) {
                             let mut args = Vec::with_capacity(arg_exprs.len());
                             for a in arg_exprs {
                                 args.push(self.eval(a)?);

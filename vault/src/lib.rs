@@ -53,8 +53,7 @@ impl Vault {
     /// application's entries of the same credential name). `data_dir`
     /// is where the ACL file and, if needed, the fallback encrypted
     /// store live — pass the same `./data/admin`-style directory used
-    /// elsewhere (see `logging::spawn_error_reporter` for the sibling
-    /// convention).
+    /// elsewhere (see `error_client::init` for the sibling convention).
     pub fn new(
         io: atomic_io::AtomicIo,
         service_name: impl Into<String>,

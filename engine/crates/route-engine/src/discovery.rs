@@ -25,7 +25,7 @@ use crate::lexer::Lexer;
 use crate::modules::{binding_name, ModuleRegistry};
 use crate::parser::Parser;
 
-fn hash_bytes(bytes: &[u8]) -> u64 {
+pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
@@ -84,7 +84,7 @@ impl RouteCache {
     }
 }
 
-fn collect_route_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+pub(crate) fn collect_route_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     if !dir.exists() {
         return Ok(());
     }
@@ -100,7 +100,7 @@ fn collect_route_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()>
     Ok(())
 }
 
-fn url_path_for(api_dir: &Path, file_path: &Path) -> String {
+pub(crate) fn url_path_for(api_dir: &Path, file_path: &Path) -> String {
     let relative = file_path.strip_prefix(api_dir).unwrap_or(file_path);
     let without_ext = relative.with_extension("");
     let mut segments: Vec<String> = without_ext

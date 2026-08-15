@@ -318,11 +318,20 @@ dependencies = [
  "axum",
  "config",
  "core-lib",
+ "error-client",
+ "hex",
+ "hmac",
  "logging",
+ "rand",
  "route-engine",
+ "serde",
+ "serde_json",
+ "sha2",
  "supervisor",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
  "vault",
 ]
 
@@ -552,6 +561,16 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "error-client"
+version = "0.1.0"
+dependencies = [
+ "atomic-io",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -998,19 +1017,9 @@ name = "logging"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "atomic-io",
  "config",
- "hex",
- "hmac",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "supervisor",
- "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1394,6 +1403,7 @@ name = "route-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atomic-io",
  "axum",
  "core-lib",
  "serde_json",
