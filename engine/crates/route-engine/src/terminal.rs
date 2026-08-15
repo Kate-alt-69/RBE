@@ -1,8 +1,7 @@
 //! Cross-platform boot-terminal rendering for the `.route` compiler.
 //!
-//! The compiler itself stays terminal-agnostic. This module only decides
-//! whether an interactive terminal is available, what its width is, and
-//! whether ANSI cursor/color control can safely be used.
+//! The compiler stays terminal-agnostic. This module owns only the temporary
+//! boot terminal session, capability detection, terminal sizing, and rendering.
 
 use std::io::{self, IsTerminal, Write};
 use std::process::Command;
@@ -20,21 +19,19 @@ impl Terminal {
         Self { interactive, ansi }
     }
 
-    pub fn interactive(&self) -> bool {
-        self.interactive
-    }
-
-    pub fn ansi(&self) -> bool {
-        self.ansi
-    }
-
     pub fn width(&self) -> usize {
-        terminal_width().clamp(40, 512)
+        terminal_size().map(|(width, _)| width).unwrap_or(80).clamp(40, 512)
+    }
+
+    pub fn height(&self) -> usize {
+        terminal_size().map(|(_, height)| height).unwrap_or(24).clamp(12, 256)
     }
 
     pub fn begin_boot(&self) {
         if self.ansi {
-            print!("\x1b[2J\x1b[H");
+            // Alternate screen keeps the normal RBE log screen intact. The
+            // compiler owns this temporary screen until end_boot().
+            print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
         } else if self.interactive {
             println!();
             println!("RBE Route Compiler");
@@ -45,35 +42,25 @@ impl Terminal {
 
     pub fn end_boot(&self) {
         if self.ansi {
-            print!("\x1b[2J\x1b[H");
+            print!("\x1b[?25h\x1b[?1049l");
         } else if self.interactive {
             println!();
         }
         let _ = io::stdout().flush();
     }
 
-    pub fn header(&self, route_count: usize) {
-        if !self.interactive {
-            println!("RBE Route Compiler — scanning ./api ({route_count} route files)");
-            return;
-        }
-
-        if self.ansi {
-            println!("\x1b[1;36mRBE Route Compiler\x1b[0m");
-        } else {
-            println!("RBE Route Compiler");
-        }
-        println!("Scanning ./api...");
-        println!("Found {route_count} route files");
-        println!();
-    }
-
-    pub fn progress(&self, state: &str, current: usize, total: usize) {
+    pub fn render(
+        &self,
+        route_count: usize,
+        current_file: Option<&str>,
+        state: &str,
+        current: usize,
+        total: usize,
+    ) {
         let width = self.width();
         let counter = format!("{current}/{total}");
-        let plain_label_width = state.chars().count() + 1 + counter.chars().count();
         let bar_width = width
-            .saturating_sub(plain_label_width + 3)
+            .saturating_sub(state.chars().count() + counter.chars().count() + 4)
             .max(12)
             .min(width.saturating_sub(2));
         let filled = if total == 0 {
@@ -81,20 +68,44 @@ impl Terminal {
         } else {
             current.saturating_mul(bar_width).checked_div(total).unwrap_or(0).min(bar_width)
         };
+        let filled_bar = "█".repeat(filled);
+        let empty_bar = "░".repeat(bar_width - filled);
 
         if !self.interactive {
-            println!("{state} {counter}");
+            println!("RBE Route Compiler — {state} {counter}");
+            if let Some(file) = current_file {
+                println!("  {file}");
+            }
             return;
         }
 
         if self.ansi {
-            print!(
-                "\x1b[2K\r\x1b[1m{state}\x1b[0m {counter}\n\x1b[2K\r[\x1b[36m{}\x1b[90m{}\x1b[0m]",
-                "█".repeat(filled),
-                "░".repeat(bar_width - filled),
-            );
+            let height = self.height();
+            let mut output = String::new();
+            output.push_str("\x1b[2J\x1b[H");
+            output.push_str("\x1b[1;36mRBE Route Compiler\x1b[0m\n");
+            output.push_str("Scanning ./api...\n");
+            output.push_str(&format!("Found {route_count} route files\n\n"));
+            output.push_str(&format!("\x1b[1m{state}\x1b[0m {counter}\n"));
+            if let Some(file) = current_file {
+                output.push_str(&format!("\x1b[90m{file}\x1b[0m\n"));
+            }
+
+            // Leave the progress bar on the final terminal row.
+            let used_lines = 6 + usize::from(current_file.is_some());
+            let blank_lines = height.saturating_sub(used_lines + 1);
+            output.push_str(&"\n".repeat(blank_lines));
+            output.push_str(&format!(
+                "[\x1b[36m{filled_bar}\x1b[90m{empty_bar}\x1b[0m]"
+            ));
+            print!("{output}");
         } else {
-            print!("\r{state} {counter}\n[{}/{}]", "#".repeat(filled), "-".repeat(bar_width - filled),); 
+            print!("\rRBE Route Compiler — {state} {counter}");
+            if let Some(file) = current_file {
+                print!(" — {file}");
+            }
+            println!();
+            println!("[{}{}]", "#".repeat(filled), "-".repeat(bar_width - filled));
         }
         let _ = io::stdout().flush();
     }
@@ -104,8 +115,10 @@ fn ansi_supported() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
-
-    if std::env::var("TERM").map(|value| value.eq_ignore_ascii_case("dumb")).unwrap_or(false) {
+    if std::env::var("TERM")
+        .map(|value| value.eq_ignore_ascii_case("dumb"))
+        .unwrap_or(false)
+    {
         return false;
     }
 
@@ -120,57 +133,57 @@ fn ansi_supported() -> bool {
     }
 }
 
-fn terminal_width() -> usize {
-    if let Ok(columns) = std::env::var("COLUMNS") {
-        if let Ok(width) = columns.parse::<usize>() {
-            if width >= 40 {
-                return width;
+fn terminal_size() -> Option<(usize, usize)> {
+    if let (Ok(columns), Ok(lines)) = (std::env::var("COLUMNS"), std::env::var("LINES")) {
+        if let (Ok(width), Ok(height)) = (columns.parse::<usize>(), lines.parse::<usize>()) {
+            if width > 0 && height > 0 {
+                return Some((width, height));
             }
         }
     }
 
     #[cfg(windows)]
     {
-        if let Some(width) = windows_console_width() {
-            return width;
+        if let Some(size) = windows_console_size() {
+            return Some(size);
         }
-        if let Some(width) = command_width("cmd", &["/C", "mode con"]) {
-            return width;
+        if let Some(width) = command_columns("cmd", &["/C", "mode con"]) {
+            return Some((width, 24));
         }
     }
 
     #[cfg(not(windows))]
     {
-        if let Some(width) = command_width("stty", &["size"]) {
-            return width;
+        if let Some(size) = command_terminal_size("stty", &["size"]) {
+            return Some(size);
         }
     }
 
-    80
+    None
 }
 
-fn command_width(program: &str, args: &[&str]) -> Option<usize> {
+#[cfg(not(windows))]
+fn command_terminal_size(program: &str, args: &[&str]) -> Option<(usize, usize)> {
     let output = Command::new(program).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let mut values = String::from_utf8_lossy(&output.stdout).split_whitespace();
+    let height = values.next()?.parse::<usize>().ok()?;
+    let width = values.next()?.parse::<usize>().ok()?;
+    Some((width, height))
+}
 
-    if program == "stty" {
-        return text
-            .split_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse::<usize>().ok());
+#[cfg(windows)]
+fn command_columns(program: &str, args: &[&str]) -> Option<usize> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
     }
-
-    for line in text.lines() {
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut parts = line.split(':');
-        let key = parts.next()?.trim();
-        let value = parts.next()?.trim();
-        if key.eq_ignore_ascii_case("columns") {
-            if let Ok(width) = value.parse::<usize>() {
-                return Some(width);
-            }
+        if parts.next()?.trim().eq_ignore_ascii_case("columns") {
+            return parts.next()?.trim().parse::<usize>().ok();
         }
     }
     None
@@ -183,6 +196,7 @@ fn enable_windows_vt() -> bool {
 
     const STD_OUTPUT_HANDLE: Dword = (-11i32) as Dword;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: Dword = 0x0004;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
     extern "system" {
         fn GetStdHandle(n_std_handle: Dword) -> Handle;
@@ -192,7 +206,7 @@ fn enable_windows_vt() -> bool {
 
     unsafe {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        if handle.is_null() {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return false;
         }
 
@@ -200,27 +214,22 @@ fn enable_windows_vt() -> bool {
         if GetConsoleMode(handle, &mut mode) == 0 {
             return false;
         }
-
         if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
             return true;
         }
-
         SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
     }
 }
 
 #[cfg(windows)]
-fn windows_console_width() -> Option<usize> {
+fn windows_console_size() -> Option<(usize, usize)> {
     type Handle = *mut core::ffi::c_void;
     type SmallInt = i16;
     type Word = u16;
     type Dword = u32;
 
     #[repr(C)]
-    struct Coord {
-        x: SmallInt,
-        y: SmallInt,
-    }
+    struct Coord { x: SmallInt, y: SmallInt }
 
     #[repr(C)]
     struct SmallRect {
@@ -240,6 +249,7 @@ fn windows_console_width() -> Option<usize> {
     }
 
     const STD_OUTPUT_HANDLE: Dword = (-11i32) as Dword;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
     extern "system" {
         fn GetStdHandle(n_std_handle: Dword) -> Handle;
@@ -248,7 +258,7 @@ fn windows_console_width() -> Option<usize> {
 
     unsafe {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        if handle.is_null() {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return None;
         }
         let mut info = ConsoleScreenBufferInfo {
@@ -261,14 +271,16 @@ fn windows_console_width() -> Option<usize> {
         if GetConsoleScreenBufferInfo(handle, &mut info) == 0 {
             return None;
         }
-        Some((info.window.right - info.window.left + 1).max(1) as usize)
+        let width = (info.window.right - info.window.left + 1).max(1) as usize;
+        let height = (info.window.bottom - info.window.top + 1).max(1) as usize;
+        Some((width, height))
     }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn progress_bar_width_is_deterministic() {
+    fn progress_bar_fills_left_to_right() {
         let total = 100;
         let width = 30usize;
         let filled = 50usize.saturating_mul(width) / total;
