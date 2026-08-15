@@ -1,6 +1,6 @@
 //! Hand-written lexer for the JavaScript-shaped `.route` language.
-//! Every token carries line/column information so compiler diagnostics can
-//! point at the exact source location.
+//! Every token carries precise source information so compiler diagnostics can
+//! point at the exact source range.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
@@ -21,6 +21,10 @@ pub struct Token {
     pub kind: TokenKind,
     pub line: usize,
     pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -34,11 +38,17 @@ pub struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     line: usize,
     column: usize,
+    offset: usize,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(source: &'a str) -> Self {
-        Self { chars: source.chars().peekable(), line: 1, column: 1 }
+        Self {
+            chars: source.chars().peekable(),
+            line: 1,
+            column: 1,
+            offset: 0,
+        }
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Token>, LexError> {
@@ -48,8 +58,17 @@ impl<'a> Lexer<'a> {
             self.skip_ws_comments();
             let line = self.line;
             let column = self.column;
+            let start = self.offset;
             let Some(&c) = self.chars.peek() else {
-                tokens.push(Token { kind: TokenKind::Eof, line, column });
+                tokens.push(Token {
+                    kind: TokenKind::Eof,
+                    line,
+                    column,
+                    end_line: line,
+                    end_column: column,
+                    start,
+                    end: start,
+                });
                 return Ok(tokens);
             };
 
@@ -114,13 +133,23 @@ impl<'a> Lexer<'a> {
                     });
                 }
             };
-            tokens.push(Token { kind, line, column });
+
+            let end_line = self.line;
+            let end_column = self.column;
+            let end = self.offset;
+            tokens.push(Token { kind, line, column, end_line, end_column, start, end });
         }
     }
 
     fn bump(&mut self) -> Option<char> {
         let c = self.chars.next()?;
-        if c == '\n' { self.line += 1; self.column = 1; } else { self.column += 1; }
+        self.offset += c.len_utf8();
+        if c == '\n' {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
+        }
         Some(c)
     }
 
