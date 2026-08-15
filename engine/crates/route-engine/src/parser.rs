@@ -43,8 +43,8 @@ impl Parser {
         let mut functions = Vec::new();
 
         while self.check(&TokenKind::Colon) {
-            match self.parse_import() {
-                Ok(import) => imports.push(import),
+            match self.parse_imports() {
+                Ok(entries) => imports.extend(entries),
                 Err(error) => {
                     errors.push(error);
                     self.recover_top_level();
@@ -71,45 +71,79 @@ impl Parser {
         (Some(RouteFile { imports, functions, class_name, methods }), errors)
     }
 
-    fn parse_import(&mut self) -> Result<ImportTarget, ParseError> {
+    fn parse_imports(&mut self) -> Result<Vec<ImportTarget>, ParseError> {
         self.expect(TokenKind::Colon)?;
         self.expect(TokenKind::Import)?;
         self.expect(TokenKind::LBracket)?;
 
-        let target = match self.advance().kind {
+        let mut entries = Vec::new();
+        loop {
+            if self.check(&TokenKind::RBracket) {
+                if entries.is_empty() {
+                    return Err(self.error_here("expected at least one import entry inside :import[...]"));
+                }
+                self.advance();
+                break;
+            }
+
+            let target = self.parse_import_target()?;
+            let target = if self.is_as_keyword() {
+                self.advance();
+                let alias = self.expect_ident()?;
+                ImportTarget::Aliased { target: Box::new(target), alias }
+            } else {
+                target
+            };
+            entries.push(target);
+
+            if self.check(&TokenKind::Comma) {
+                self.advance();
+                if self.check(&TokenKind::RBracket) {
+                    return Err(self.error_here("trailing commas are not allowed in :import[...]"));
+                }
+                continue;
+            }
+
+            if !self.check(&TokenKind::RBracket) {
+                return Err(self.error_here("expected `,` between import entries"));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn parse_import_target(&mut self) -> Result<ImportTarget, ParseError> {
+        match self.advance().kind {
             TokenKind::Ident(name) => {
                 if self.check(&TokenKind::Dot) {
                     self.advance();
                     let function = self.expect_ident()?;
-                    ImportTarget::BuiltinFunction { module: name, function }
+                    Ok(ImportTarget::BuiltinFunction { module: name, function })
                 } else if let Some((prefix, module_name)) = name.split_once('&') {
                     if prefix != "module" {
                         return Err(self.error_here("only module&name shorthand is supported"));
                     }
-                    ImportTarget::Custom(format!("./module/{module_name}"))
+                    Ok(ImportTarget::Custom(format!("./module/{module_name}")))
                 } else {
-                    ImportTarget::Builtin(name)
+                    Ok(ImportTarget::Builtin(name))
                 }
             }
             TokenKind::String(path) => {
-                if self.check(&TokenKind::RBracket) {
-                    ImportTarget::Custom(path)
+                if self.check(&TokenKind::RBracket) || self.check(&TokenKind::Comma) || self.is_as_keyword() {
+                    Ok(ImportTarget::Custom(path))
                 } else {
-                    self.expect(TokenKind::RBracket)?;
                     self.expect(TokenKind::Dot)?;
                     let function = self.expect_ident()?;
-                    return Ok(ImportTarget::CustomFunction { path, function });
+                    Ok(ImportTarget::CustomFunction { path, function })
                 }
             }
-            other => {
-                return Err(self.error_here(&format!(
-                    "expected builtin identifier or string path inside :import[...], got {other:?}"
-                )));
-            }
-        };
+            other => Err(self.error_here(&format!(
+                "expected builtin identifier or string path inside :import[...], got {other:?}"
+            ))),
+        }
+    }
 
-        self.expect(TokenKind::RBracket)?;
-        Ok(target)
+    fn is_as_keyword(&self) -> bool {
+        matches!(self.tokens.get(self.pos).map(|token| &token.kind), Some(TokenKind::Ident(name)) if name == "as")
     }
 
     fn parse_function(&mut self) -> Result<FunctionDef, ParseError> {
@@ -570,7 +604,15 @@ impl Parser {
     }
 
     fn advance(&mut self) -> Token {
-        let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token { kind: TokenKind::Eof, line: 0, column: 0 });
+        let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token {
+            kind: TokenKind::Eof,
+            line: 0,
+            column: 0,
+            end_line: 0,
+            end_column: 0,
+            start: 0,
+            end: 0,
+        });
         if self.pos < self.tokens.len() { self.pos += 1; }
         tok
     }
