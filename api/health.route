@@ -1,0 +1,14 @@
+:import[net]
+
+class Route {
+    async get(req) {
+        const health = net.health();
+        return {
+            ok: health.ok ?? true,
+            status: health.status ?? "ok",
+            security: true,
+            services: health.services ?? {},
+            uptime: health.uptime ?? null,
+        };
+    }
+}
