@@ -168,7 +168,8 @@ fn command_terminal_size(program: &str, args: &[&str]) -> Option<(usize, usize)>
     if !output.status.success() {
         return None;
     }
-    let mut values = String::from_utf8_lossy(&output.stdout).split_whitespace();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut values = stdout.split_whitespace();
     let height = values.next()?.parse::<usize>().ok()?;
     let width = values.next()?.parse::<usize>().ok()?;
     Some((width, height))
