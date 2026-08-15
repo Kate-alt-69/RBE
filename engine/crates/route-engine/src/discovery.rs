@@ -6,7 +6,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -172,7 +172,27 @@ fn terminal_width() -> usize {
         .unwrap_or(80)
 }
 
+fn find_symbol_location(source: &str, symbol: Option<&str>) -> (usize, usize) {
+    let Some(symbol) = symbol.filter(|value| !value.is_empty()) else { return (1, 1); };
+    for (line_idx, line) in source.lines().enumerate() {
+        if let Some(byte_idx) = line.find(symbol) {
+            let column = line[..byte_idx].chars().count() + 1;
+            return (line_idx + 1, column);
+        }
+    }
+    (1, 1)
+}
+
 fn frame_diagnostic(path: &Path, source: &str, line: usize, column: usize, message: &str) -> String {
+    frame_diagnostic_with_symbol(path, source, line, column, message, None)
+}
+
+fn frame_diagnostic_with_symbol(path: &Path, source: &str, fallback_line: usize, fallback_column: usize, message: &str, symbol: Option<&str>) -> String {
+    let (line, column) = if symbol.is_some() {
+        find_symbol_location(source, symbol)
+    } else {
+        (fallback_line, fallback_column)
+    };
     let lines: Vec<&str> = source.lines().collect();
     let start = line.saturating_sub(1);
     let end = (start + 4).min(lines.len());
@@ -202,23 +222,29 @@ fn frame_diagnostic(path: &Path, source: &str, line: usize, column: usize, messa
 }
 
 fn render_progress(state: &str, current: usize, total: usize) {
+    if !io::stdout().is_terminal() { return; }
+
     let width = terminal_width();
     let counter = format!("{}/{}", current, total);
-    let label = format!("{state} {counter}");
-    let bar_width = width.saturating_sub(label.chars().count() + 3).max(12).min(width.saturating_sub(2));
+    let label = format!("\x1b[1m{state}\x1b[0m {counter}");
+    let plain_label_width = state.chars().count() + 1 + counter.chars().count();
+    let bar_width = width.saturating_sub(plain_label_width + 3).max(12).min(width.saturating_sub(2));
     let filled = if total == 0 { bar_width } else { (current.saturating_mul(bar_width) / total).min(bar_width) };
-    let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(bar_width - filled));
+    let bar = format!("[\x1b[36m{}\x1b[90m{}\x1b[0m]", "█".repeat(filled), "░".repeat(bar_width - filled));
 
     print!("\x1b[2K\r{label}\n\x1b[2K\r{bar}");
     let _ = io::stdout().flush();
 }
 
 fn print_compiler_header(route_count: usize) {
-    println!("\x1b[2J\x1b[H");
-    println!("RBE Route Compiler");
-    println!("Scanning ./api...");
-    println!("Found {route_count} route files");
-    println!();
+    if io::stdout().is_terminal() {
+        println!("\x1b[2J\x1b[H\x1b[1;36mRBE Route Compiler\x1b[0m");
+        println!("Scanning ./api...");
+        println!("Found {route_count} route files");
+        println!();
+    } else {
+        println!("RBE Route Compiler — scanning ./api ({route_count} route files)");
+    }
 }
 
 /// Run the route compiler as a boot-owned terminal session. Every file gets
@@ -279,7 +305,7 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
 
         let diagnostics = analyze(&file);
         for diagnostic in diagnostics.iter().filter(|d| d.severity == Severity::Error) {
-            errors.push(frame_diagnostic(path, &source, 1, 1, &diagnostic.message));
+            errors.push(frame_diagnostic_with_symbol(path, &source, 1, 1, &diagnostic.message, diagnostic.symbol.as_deref()));
         }
         if diagnostics.iter().any(|d| d.severity == Severity::Error) {
             done += 2;
