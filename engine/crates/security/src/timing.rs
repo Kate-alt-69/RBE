@@ -1,29 +1,52 @@
-//! Per-request timing and structured logging. The normal terminal line
-//! stays compact. The local request audit queue records only useful
-//! request metadata, omitting empty/duplicated fields so long-running
-//! services do not turn routine traffic into a multi-GB log explosion.
+//! Per-request timing and smart structured request auditing.
+//!
+//! The terminal log stays compact. `request.queue.log` is a deliberately
+//! smaller metadata stream: useful request identity, timing, client IP,
+//! and only the proxy/geo/CORS metadata that actually exists.
+//!
+//! Repeated 404s are deduplicated so a bot probing thousands of missing
+//! paths cannot turn the audit file into a storage bomb. The first miss
+//! for a `(client, method, path)` bucket is recorded immediately; repeats
+//! inside the suppression window are counted in memory and emitted as a
+//! compact summary when the bucket becomes eligible again.
 
-use std::collections::BTreeMap;
-use std::fs::{create_dir_all, OpenOptions};
-use std::io::Write;
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
+use atomic_io::AtomicIo;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 use config::Config;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::info;
 
 use crate::real_ip::extract_real_ip;
 
-static REQUEST_AUDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const NOT_FOUND_SUPPRESSION: Duration = Duration::from_secs(10);
+const NOT_FOUND_STATE_TTL: Duration = Duration::from_secs(60);
+const MAX_NOT_FOUND_BUCKETS: usize = 16_384;
+
+static REQUEST_AUDIT_IO: OnceLock<AtomicIo> = OnceLock::new();
+static NOT_FOUND_STATE: OnceLock<Mutex<HashMap<NotFoundKey, NotFoundBucket>>> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NotFoundKey {
+    client_ip: String,
+    method: String,
+    path: String,
+}
+
+#[derive(Debug)]
+struct NotFoundBucket {
+    last_logged: Instant,
+    suppressed: u64,
+}
 
 pub async fn request_timing(
-    State(config): State<Arc<Config>>,
+    State(config): State<std::sync::Arc<Config>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -69,7 +92,7 @@ pub async fn request_timing(
             .unwrap_or(true);
 
     if debug_enabled() {
-        tracing::info!(
+        info!(
             method = %method,
             path = %path,
             query = %query,
@@ -83,7 +106,7 @@ pub async fn request_timing(
             "request completed"
         );
     } else {
-        tracing::info!(
+        info!(
             method = %method,
             path = %path,
             query = %query,
@@ -94,27 +117,31 @@ pub async fn request_timing(
         );
     }
 
-    write_request_audit(
-        &config,
-        &headers,
-        response.headers(),
-        &method.to_string(),
-        &path,
-        &query,
-        peer,
-        client_ip.to_string(),
-        duration_ms,
-        status,
-        origin,
-        preflight,
-        request_cors_method,
-        request_cors_headers,
-        response_cors_origin,
-        response_cors_methods,
-        response_cors_headers,
-        response_cors_credentials,
-        cors_blocked,
-    );
+    let should_audit = status != 404 || should_log_not_found(&client_ip.to_string(), method.as_str(), &path);
+
+    if should_audit {
+        write_request_audit(
+            &config,
+            &headers,
+            response.headers(),
+            &method.to_string(),
+            &path,
+            &query,
+            peer,
+            client_ip.to_string(),
+            duration_ms,
+            status,
+            origin,
+            preflight,
+            request_cors_method,
+            request_cors_headers,
+            response_cors_origin,
+            response_cors_methods,
+            response_cors_headers,
+            response_cors_credentials,
+            cors_blocked,
+        );
+    }
 
     if let Ok(value) = HeaderValue::from_str(&format!("total;dur={duration_ms:.3}")) {
         response.headers_mut().insert("server-timing", value);
@@ -134,24 +161,85 @@ fn header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn insert_if_some(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
-    if let Some(value) = value.filter(|value| !value.is_empty()) {
-        map.insert(key.to_string(), Value::String(value));
-    }
-}
-
-fn insert_if_string_map_nonempty(target: &mut Map<String, Value>, key: &str, value: Map<String, Value>) {
-    if !value.is_empty() {
-        target.insert(key.to_string(), Value::Object(value));
-    }
-}
-
-fn selected_headers(headers: &HeaderMap, names: &[&str]) -> Map<String, Value> {
+fn collect_optional_headers(headers: &HeaderMap, names: &[&str]) -> Map<String, Value> {
     let mut result = Map::new();
     for name in names {
-        insert_if_some(&mut result, name, header(headers, name));
+        if let Some(value) = header(headers, name) {
+            result.insert((*name).to_string(), Value::String(value));
+        }
     }
     result
+}
+
+fn should_log_not_found(client_ip: &str, method: &str, path: &str) -> bool {
+    let state = NOT_FOUND_STATE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = NotFoundKey {
+        client_ip: client_ip.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+    };
+
+    let now = Instant::now();
+    let Ok(mut buckets) = state.lock() else {
+        return true;
+    };
+
+    buckets.retain(|_, bucket| now.duration_since(bucket.last_logged) <= NOT_FOUND_STATE_TTL);
+
+    if buckets.len() >= MAX_NOT_FOUND_BUCKETS && !buckets.contains_key(&key) {
+        // Bound memory during a path-randomizing scan. The durable audit
+        // file is the important artifact; the suppression cache is only
+        // a traffic-control optimization.
+        buckets.clear();
+    }
+
+    match buckets.get_mut(&key) {
+        None => {
+            buckets.insert(
+                key,
+                NotFoundBucket {
+                    last_logged: now,
+                    suppressed: 0,
+                },
+            );
+            true
+        }
+        Some(bucket) if now.duration_since(bucket.last_logged) < NOT_FOUND_SUPPRESSION => {
+            bucket.suppressed = bucket.suppressed.saturating_add(1);
+            false
+        }
+        Some(bucket) => {
+            let suppressed = bucket.suppressed;
+            bucket.last_logged = now;
+            bucket.suppressed = 0;
+
+            if suppressed > 0 {
+                // Emit the summary in a separate compact record before the
+                // next 404 detail record. Returning false here would lose
+                // the summary, so write it directly while we have the key.
+                let summary = json!({
+                    "ts_ms": now_ms(),
+                    "kind": "404_summary",
+                    "method": method,
+                    "path": path,
+                    "status": 404,
+                    "client_ip": client_ip,
+                    "suppressed": suppressed,
+                    "window_ms": NOT_FOUND_SUPPRESSION.as_millis() as u64,
+                });
+                append_audit_value(&summary);
+            }
+
+            true
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn write_request_audit(
@@ -175,52 +263,57 @@ fn write_request_audit(
     response_cors_credentials: Option<String>,
     cors_blocked: bool,
 ) {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default();
-
-    let peer_ip = peer.ip().to_string();
-
     let mut entry = Map::new();
-    entry.insert("ts_ms".into(), json!(now_ms));
+    entry.insert("ts_ms".into(), json!(now_ms()));
     entry.insert("method".into(), json!(method));
     entry.insert("path".into(), json!(path));
     if !query.is_empty() {
         entry.insert("query".into(), json!(query));
     }
     entry.insert("status".into(), json!(status));
-    entry.insert("duration_ms".into(), json!(duration_ms));
+    entry.insert("duration_ms".into(), json!(format!("{duration_ms:.3}")));
     entry.insert("client_ip".into(), json!(client_ip));
-    if peer_ip != client_ip {
-        entry.insert("peer_ip".into(), json!(peer_ip));
+
+    // `client_ip` is the actual remote peer identity after trusted-proxy
+    // extraction. A local browser talking to a local server will correctly
+    // appear as 127.0.0.1/::1; that is not the server's LAN address.
+    if peer.ip().to_string() != entry["client_ip"].as_str().unwrap_or_default() {
+        entry.insert("peer_ip".into(), json!(peer.ip().to_string()));
     }
 
-    let mut request = Map::new();
-    insert_if_some(&mut request, "host", header(request_headers, "host"));
-    insert_if_some(&mut request, "user_agent", header(request_headers, "user-agent"));
-    insert_if_some(&mut request, "referer", header(request_headers, "referer"));
-    insert_if_some(&mut request, "origin", origin.clone());
-
-    let mut proxy = BTreeMap::<String, Value>::new();
-    for name in [
-        "forwarded",
-        "x-forwarded-for",
-        "x-forwarded-host",
-        "x-forwarded-proto",
-        "x-forwarded-port",
-        "via",
-        "cf-ray",
-    ] {
-        if let Some(value) = header(request_headers, name) {
-            proxy.insert(name.replace('-', "_"), Value::String(value));
-        }
+    if let Some(host) = header(request_headers, "host") {
+        entry.insert("host".into(), json!(host));
     }
-    if !proxy.is_empty() {
-        request.insert("proxy".into(), Value::Object(proxy.into_iter().collect()));
+    if let Some(user_agent) = header(request_headers, "user-agent") {
+        entry.insert("user_agent".into(), json!(user_agent));
+    }
+    if let Some(referer) = header(request_headers, "referer") {
+        entry.insert("referer".into(), json!(referer));
+    }
+    if let Some(accept) = header(request_headers, "accept") {
+        entry.insert("accept".into(), json!(accept));
+    }
+    if let Some(accept_language) = header(request_headers, "accept-language") {
+        entry.insert("accept_language".into(), json!(accept_language));
     }
 
-    let mut provider = selected_headers(
+    let forwarded_chain = collect_optional_headers(
+        request_headers,
+        &[
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "via",
+            "cf-ray",
+        ],
+    );
+    if !forwarded_chain.is_empty() {
+        entry.insert("proxy".into(), Value::Object(forwarded_chain));
+    }
+
+    let provider_identity = collect_optional_headers(
         request_headers,
         &[
             "cf-connecting-ip",
@@ -231,55 +324,34 @@ fn write_request_audit(
             "fastly-client-ip",
         ],
     );
-    insert_if_string_map_nonempty(&mut request, "provider", std::mem::take(&mut provider));
+    if !provider_identity.is_empty() {
+        entry.insert("provider".into(), Value::Object(provider_identity));
+    }
 
     let geo_country = header(request_headers, "cf-ipcountry")
         .or_else(|| header(request_headers, "cloudfront-viewer-country"))
         .or_else(|| header(request_headers, "x-geo-country"));
     let geo_region = header(request_headers, "x-geo-region");
     let geo_city = header(request_headers, "x-geo-city");
-    let geo_source = if request_headers.contains_key("cf-ipcountry") {
-        Some("cloudflare")
-    } else if request_headers.contains_key("cloudfront-viewer-country") {
-        Some("cloudfront")
-    } else if request_headers.contains_key("x-geo-country") {
-        Some("upstream-proxy")
-    } else {
-        None
-    };
-    let mut geo = Map::new();
-    insert_if_some(&mut geo, "country", geo_country);
-    insert_if_some(&mut geo, "region", geo_region);
-    insert_if_some(&mut geo, "city", geo_city);
-    insert_if_some(&mut geo, "source", geo_source.map(str::to_string));
-    insert_if_string_map_nonempty(&mut request, "geo", geo);
-
-    // Keep only headers that materially help diagnose request routing or CORS.
-    let diagnostic_headers = selected_headers(
-        request_headers,
-        &[
-            "accept",
-            "accept-language",
-            "content-type",
-            "access-control-request-method",
-            "access-control-request-headers",
-        ],
-    );
-    insert_if_string_map_nonempty(&mut request, "headers", diagnostic_headers);
-
-    if !request.is_empty() {
-        entry.insert("request".into(), Value::Object(request));
+    if geo_country.is_some() || geo_region.is_some() || geo_city.is_some() {
+        entry.insert(
+            "geo".into(),
+            json!({
+                "country": geo_country,
+                "region": geo_region,
+                "city": geo_city,
+            }),
+        );
     }
 
-    let mut response = Map::new();
-    insert_if_some(&mut response, "content_length", header(response_headers, "content-length"));
-    insert_if_some(&mut response, "content_type", header(response_headers, "content-type"));
-    insert_if_some(&mut response, "x_correlation_id", header(response_headers, "x-correlation-id"));
-    insert_if_some(&mut response, "server_timing", header(response_headers, "server-timing"));
-    insert_if_string_map_nonempty(&mut entry, "response", response);
+    if let Some(correlation_id) = header(response_headers, "x-correlation-id") {
+        entry.insert("correlation_id".into(), json!(correlation_id));
+    }
+    if let Some(server_timing) = header(response_headers, "server-timing") {
+        entry.insert("server_timing".into(), json!(server_timing));
+    }
 
-    // CORS is omitted entirely for ordinary requests with no CORS signal.
-    if origin.is_some()
+    let cors_has_data = origin.is_some()
         || preflight
         || request_cors_method.is_some()
         || request_cors_headers.is_some()
@@ -287,45 +359,61 @@ fn write_request_audit(
         || response_cors_methods.is_some()
         || response_cors_headers.is_some()
         || response_cors_credentials.is_some()
-        || cors_blocked
-    {
-        let mut cors = Map::new();
-        insert_if_some(&mut cors, "origin", origin);
-        if preflight {
-            cors.insert("preflight".into(), json!(true));
-        }
-        cors.insert("blocked".into(), json!(cors_blocked));
-        insert_if_some(&mut cors, "request_method", request_cors_method);
-        insert_if_some(&mut cors, "request_headers", request_cors_headers);
-        insert_if_some(&mut cors, "allow_origin", response_cors_origin);
-        insert_if_some(&mut cors, "allow_methods", response_cors_methods);
-        insert_if_some(&mut cors, "allow_headers", response_cors_headers);
-        insert_if_some(&mut cors, "allow_credentials", response_cors_credentials);
-        entry.insert("cors".into(), Value::Object(cors));
+        || cors_blocked;
+
+    if cors_has_data {
+        entry.insert(
+            "cors".into(),
+            json!({
+                "origin": origin,
+                "preflight": preflight,
+                "blocked": cors_blocked,
+                "request_method": request_cors_method,
+                "request_headers": request_cors_headers,
+                "response_allow_origin": response_cors_origin,
+                "response_allow_methods": response_cors_methods,
+                "response_allow_headers": response_cors_headers,
+                "response_allow_credentials": response_cors_credentials,
+            }),
+        );
     }
 
-    // Preserve whether proxy-derived identity was trusted; useful during incident review.
+    // 404s intentionally stay compact; the hot path above suppresses
+    // repeated identical misses. Other statuses keep the useful request
+    // metadata, with no raw headers/body/cookies/authorization material.
+    if status == 404 {
+        let compact = json!({
+            "ts_ms": entry.remove("ts_ms").unwrap_or_default(),
+            "kind": "404",
+            "method": method,
+            "path": path,
+            "status": 404,
+            "duration_ms": format!("{duration_ms:.3}"),
+            "client_ip": client_ip,
+            "host": entry.remove("host").unwrap_or(Value::Null),
+            "user_agent": entry.remove("user_agent").unwrap_or(Value::Null),
+        });
+        append_audit_value(&compact);
+        return;
+    }
+
     if config.security.trusted_proxy_headers {
         entry.insert("trusted_proxy_headers".into(), json!(true));
     }
 
-    let path = PathBuf::from("./data/admin/request.queue.log");
-    if let Some(parent) = path.parent() {
-        if create_dir_all(parent).is_err() {
-            return;
+    append_audit_value(&Value::Object(entry));
+}
+
+fn append_audit_value(value: &Value) {
+    let line = match serde_json::to_vec(value) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            bytes
         }
-    }
-
-    let lock = REQUEST_AUDIT_LOCK.get_or_init(|| Mutex::new(()));
-    let Ok(_guard) = lock.lock() else {
-        return;
+        Err(_) => return,
     };
 
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-        return;
-    };
-
-    if let Ok(line) = serde_json::to_string(&Value::Object(entry)) {
-        let _ = writeln!(file, "{line}");
-    }
+    let path = std::path::Path::new("./data/admin/request.queue.log");
+    let io = REQUEST_AUDIT_IO.get_or_init(AtomicIo::new);
+    let _ = io.append_locked(path, &line);
 }
