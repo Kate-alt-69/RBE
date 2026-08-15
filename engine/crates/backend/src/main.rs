@@ -78,7 +78,7 @@ fn spawn_error_reporter_daemon_process() -> anyhow::Result<()> {
         for attempt in 1..=MAX_ATTEMPTS {
             let spawn_result = tokio::process::Command::new(&exe)
                 .args(["--er", "--separate-process", "--launch"])
-                .kill_on_drop(false)
+                .kill_on_drop(true)
                 .spawn();
             let mut child = match spawn_result {
                 Ok(child) => child,
@@ -131,21 +131,34 @@ async fn boot_and_run() -> anyhow::Result<()> {
         tracing::error!(error = %err, "failed to spawn error-reporter daemon process — continuing boot without it");
     }
 
-    // Vault is a hard boot dependency. `VaultClient::spawn` blocks only until
-    // the child completes its startup handshake (normally <= 2s), then all
-    // credential traffic stays on the dedicated local IPC worker thread.
+    // Vault is a hard boot dependency. The client owns a bounded restart
+    // loop for the child. If that loop cannot produce a ready Vault, this is
+    // a controlled boot shutdown: report the failure, never start the HTTP
+    // server, and return cleanly from boot instead of treating Vault failure
+    // as a Rust panic/fatal crash.
     boot_trace(format!("vault starting as separate process data dir={}", admin_dir.display()));
-    let vault_instance = Arc::new(
-        vault_process::VaultClient::spawn("backend-rs", &admin_dir)
-            .map_err(|err| anyhow::anyhow!("failed to start Vault process: {err:#}"))?,
-    );
+    let vault_instance = match vault_process::VaultClient::spawn("backend-rs", &admin_dir) {
+        Ok(vault) => Arc::new(vault),
+        Err(err) => {
+            let details = format!("{err:#}");
+            error_client::report_issue(error_client::IssueInput {
+                source: "backend.vault.startup",
+                level: Some(error_client::IssueLevel::Error),
+                category: None,
+                message: "Vault failed to become ready after restart attempts; backend is shutting down gracefully",
+                stack: Some(&details),
+            });
+            tracing::error!(error = %err, "Vault failed to become ready after restart attempts; backend shutting down gracefully");
+            return Ok(());
+        }
+    };
     boot_trace("vault process ready");
 
     let container_cache_dir = PathBuf::from("./.cache/service");
     match container_embed::extract_if_needed(&io, &container_cache_dir) {
         Ok(Some(path)) => {
             boot_trace(format!("embedded container binary ready at {}", path.display()));
-            tracing::info!(path = %path.display(), "container binary extracted and ready");
+            tracing::info!(path = %path.display(), "embedded container binary extracted and ready");
         }
         Ok(None) => tracing::debug!("no embedded container binary — standalone build"),
         Err(err) => tracing::warn!(error = %err, "failed to extract embedded container binary"),
