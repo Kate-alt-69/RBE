@@ -35,19 +35,27 @@ struct Scope {
     function_arity: HashMap<String, usize>,
 }
 
+fn base_import(import: &ImportTarget) -> &ImportTarget {
+    match import {
+        ImportTarget::Aliased { target, .. } => target.as_ref(),
+        _ => import,
+    }
+}
+
 impl Scope {
     fn new(param: Option<&str>, imports: &[ImportTarget], functions: &[FunctionDef]) -> Self {
         let mut names = HashMap::new();
         let mut function_arity = HashMap::new();
         if let Some(param) = param { names.insert(param.to_string(), NameKind::Local); }
         for import in imports {
-            match import {
+            match base_import(import) {
                 ImportTarget::Builtin(_) | ImportTarget::Custom(_) => {
                     names.insert(crate::modules::binding_name(import), NameKind::Module);
                 }
                 ImportTarget::BuiltinFunction { .. } | ImportTarget::CustomFunction { .. } => {
                     names.insert(crate::modules::binding_name(import), NameKind::DirectFunction);
                 }
+                ImportTarget::Aliased { .. } => unreachable!("base_import removes aliased import wrappers"),
             }
         }
         for function in functions {
