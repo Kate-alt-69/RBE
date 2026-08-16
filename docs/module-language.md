@@ -1,14 +1,36 @@
+# `.module`
+
+> # 🚨 `.module` IS NOT IMPLEMENTED 🚨
+>
+> **Actual `.module` files are NOT implemented.**
+>
+> RBE currently does **not**:
+> - parse `.module` files as executable source files;
+> - discover `.module` files during boot;
+> - compile `.module` files;
+> - interpret or execute `.module` files;
+> - generate `.module` artifacts;
+> - load `.module` files as executable modules;
+> - export functions from `.module` files;
+> - import/export executable `.module` dependencies;
+> - build or execute a `.module` dependency graph;
+> - perform recursive `.module` loading or cycle detection.
+>
+> References to `.module` currently describe **planned/reserved language design, import/export syntax, capability boundaries, and future interoperability only**. An existing `.module` file must **not** be treated as a working executable module.
+>
+> **Do not confuse a parsed/planned module import reference with an implemented `.module` file system.**
+>
+---
+
 # RBE Module Language Specification
 
-Status: **planned / design specification**
+**Status:** **PLANNED / RESERVED — NOT IMPLEMENTED**
 
-This document defines the intended `.module` language and its relationship to `.route`. It is deliberately explicit about what is designed versus what is currently runnable.
-
-> **Important:** `.module` execution is not currently implemented end-to-end. Syntax/path resolution may exist in the route engine, but a module import must not be described as a working executable module until loading, interpretation, capability enforcement, recursion protection, and tests are complete.
+This document defines the intended `.module` language and its relationship to `.route`. It deliberately separates the future language design from the current runtime.
 
 ## 1. Purpose
 
-`.module` is RBE's reusable logic layer. It exists for work that should not live directly in an HTTP route: reusable functions, multiple parameters, privileged capabilities, persistent storage, advanced networking, and heavier computation.
+`.module` is intended to become RBE's reusable higher-power logic layer. It is designed for work that should not live directly inside an HTTP route: reusable functions, multiple parameters, privileged capabilities, persistent storage, advanced networking, and heavier computation.
 
 `.route` remains the constrained HTTP entrypoint layer.
 
@@ -22,6 +44,8 @@ The intended relationship is:
 built-in capabilities / other modules
 ```
 
+**This relationship is design-only today.** No executable `.module` call path currently exists end-to-end.
+
 ## 2. What makes `.module` different from `.route`
 
 ### `.route`
@@ -33,6 +57,8 @@ built-in capabilities / other modules
 
 ### `.module`
 
+Planned behavior:
+
 - Function names are arbitrary identifiers.
 - Functions may accept zero or more named parameters.
 - Functions are reusable from routes and other modules.
@@ -40,21 +66,21 @@ built-in capabilities / other modules
 - Modules may import other modules.
 - Recursive dependency loading requires cycle detection.
 
-Example intended module:
+Example **planned** module syntax:
 
 ```js
 :import[json]
 
 function findUser(id) {
-    // module implementation
+    // planned module implementation
 }
 
 function formatUser(user, includePrivate) {
-    // module implementation
+    // planned module implementation
 }
 ```
 
-A route could eventually call:
+A route could **eventually** call:
 
 ```js
 :import["./module/users"]
@@ -66,11 +92,13 @@ class Route {
 }
 ```
 
+That example is **not runnable today** because `.module` execution is not implemented.
+
 ## 3. Parameters
 
-Unlike a route HTTP handler, a module function is not restricted to one request parameter.
+Unlike a route HTTP handler, a module function is intended to support multiple named parameters.
 
-The intended syntax is ordinary function parameters:
+Planned syntax:
 
 ```js
 function get(id) {
@@ -86,18 +114,18 @@ function findByEmail(email, includePrivate) {
 }
 ```
 
-Arguments are passed positionally by the caller:
+Arguments are intended to be passed positionally:
 
 ```js
 storage.get(id)
 storage.set(key, value)
 ```
 
-Arity and argument compatibility should be validated during semantic analysis once module execution exists.
+Arity and argument compatibility should eventually be validated during semantic analysis.
 
-## 4. Imports
+## 4. Imports and exports
 
-Modules use the same import directive as routes:
+The future `.module` system is intended to use the same import directive style as `.route`:
 
 ```text
 :import[net]
@@ -106,33 +134,13 @@ Modules use the same import directive as routes:
 :import[module&storage]
 ```
 
-### Built-in imports
+Quoted paths and `module&name` shorthand are **reserved/planned module references**. They do not currently cause a `.module` file to be loaded and executed.
 
-Unquoted names refer to curated RBE capabilities. The module capability matrix is broader than the route matrix, but importing a name alone must not bypass the actual capability implementation or security policy.
-
-### Module-path imports
-
-Quoted paths identify another `.module` file. The `module&name` shorthand identifies a module under the default `/module/` directory.
-
-The intended resolution rules are:
-
-```text
-module&storage
-    ↓
-/module/storage.module
-
-"./module/storage"
-    ↓
-/module/storage.module
-```
-
-The backend binary's directory is the root for module resolution; resolution must not depend on the process current working directory.
+When module execution is implemented, exported functions will form the callable surface of a module. The exact explicit `export` syntax is **reserved for the future implementation** and must not be assumed to work today.
 
 ## 5. Module binding names
 
-A module import binds to the module's file stem unless an explicit alias is added by the import grammar.
-
-For example:
+The intended default binding behavior is:
 
 ```text
 :import[module&storage]
@@ -144,13 +152,15 @@ binds the module as:
 storage
 ```
 
-and a caller uses:
+so a future caller can write:
 
 ```text
 storage.get(id)
 ```
 
-The same resolved module can eventually be imported through a quoted path.
+Explicit aliases are intended to follow the same import-grammar rules already established for `.route`.
+
+Again: **binding syntax being documented does not mean a `.module` file is currently executable.**
 
 ## 6. Capability boundary
 
@@ -176,19 +186,19 @@ The intended module capability surface is:
 
 ## 7. Function calls
 
-Once module execution is implemented, a caller will use:
+Once module execution is implemented, a caller is intended to use:
 
 ```text
 moduleName.functionName(arg1, arg2)
 ```
 
-The compiler should reject:
+The future compiler should reject:
 
-- unknown module functions
-- incorrect argument counts
-- invalid argument forms
-- module values used as ordinary values when only a callable export exists
-- calls to capabilities unavailable under the current policy
+- unknown module functions;
+- incorrect argument counts;
+- invalid argument forms;
+- module values used as ordinary values when only a callable export exists;
+- calls to capabilities unavailable under the current policy.
 
 Unknown module members should produce a source-aware diagnostic rather than a silent runtime failure.
 
@@ -204,7 +214,7 @@ module B
 module C
 ```
 
-The loader must maintain a dependency graph and detect cycles:
+The future loader must maintain a dependency graph and detect cycles:
 
 ```text
 A → B → C → A
@@ -214,7 +224,7 @@ A cycle must become a deterministic compiler/load error. The loader must not rec
 
 ## 9. Execution model
 
-The first module implementation should use the same interpreter infrastructure as `.route` where practical. The module function is parsed, semantically analyzed, and evaluated against a local parameter environment.
+The planned first implementation should reuse the existing route interpreter infrastructure where practical. A module function would be parsed, semantically analyzed, and evaluated against a local parameter environment.
 
 The intended call sequence is:
 
@@ -240,31 +250,31 @@ evaluate function body
 return value to route
 ```
 
-Modules must not become an uncontrolled escape hatch into the Rust host process.
+**None of that execution pipeline is currently implemented end-to-end.**
 
 ## 10. Caching
 
-Modules should participate in the same content-hash caching model used by routes once loading is implemented.
+Modules are intended to participate in the same content-hash caching model used by routes once module loading exists.
 
-The cache key must change when the module's own source changes. A module dependency graph must also invalidate callers when an imported module changes, otherwise routes could execute stale dependency code.
+The eventual cache key must change when the module's own source changes. The dependency graph must also invalidate callers when an imported module changes, otherwise routes could execute stale dependency code.
 
 ## 11. Security
 
 Module capabilities are privileged by design. In particular:
 
-- `env` must not become ambient access for routes.
-- `vault` must continue to respect Vault ACLs.
-- `storage` and `cache` must be scoped by backend policy.
-- filesystem/process access must not be exposed simply because a module is more powerful than a route.
+- `env` must not become ambient access for routes;
+- `vault` must continue to respect Vault ACLs;
+- `storage` and `cache` must be scoped by backend policy;
+- filesystem/process access must not be exposed simply because a module is more powerful than a route;
 - capability imports must remain explicit and auditable.
 
-The existence of a `.module` file must never grant it arbitrary Rust or operating-system access.
+The existence of a `.module` file must never grant arbitrary Rust or operating-system access.
 
 ## 12. Diagnostics
 
-Module diagnostics use the same compiler diagnostic system as routes.
+When `.module` execution is eventually implemented, module diagnostics should use the same compiler diagnostic system as routes.
 
-Examples:
+Planned examples:
 
 ```text
 error[E3010]: vault.import does not exist as a import — please remove `vault.import` from module/uac/status.module
@@ -282,7 +292,7 @@ Module errors must be collected without hiding unrelated route/module errors.
 
 A broken module must not silently become a valid route artifact.
 
-The intended compiler behavior is:
+The intended future compiler behavior is:
 
 ```text
 scan route/module files
@@ -318,27 +328,30 @@ The intended project layout is:
         └── status.module
 ```
 
-The `/module/` directory is a sibling of the compiled backend binary, not an embedded JavaScript package directory.
+The `/module/` directory is intended to be a sibling of the compiled backend binary, not an embedded JavaScript package directory.
 
 ## 15. Implementation status
 
-The following are **planned**, not claims of current end-to-end support:
+The following are **PLANNED / RESERVED**, not claims of current end-to-end support:
 
-- full `.module` parsing as a separate executable file type
-- arbitrary module function parameters
-- module function execution
-- module-to-module recursive loading
-- dependency graph construction
-- cycle detection
-- module content-hash dependency invalidation
-- module capability enforcement at runtime
-- module-specific tests
-- complete module diagnostics
+- actual `.module` file discovery;
+- actual `.module` source parsing as a separate executable file type;
+- arbitrary module function parameters;
+- module function execution;
+- module exports;
+- module-to-module recursive loading;
+- dependency graph construction;
+- cycle detection;
+- module content-hash dependency invalidation;
+- module capability enforcement at runtime;
+- module-specific tests;
+- complete module diagnostics;
+- module artifact generation.
 
-Path resolution/desugaring infrastructure may already exist in the route engine. That does **not** mean module execution is implemented.
+Some route-engine infrastructure may already recognize or resolve module-like import references. **That does not mean the referenced `.module` file is parsed, loaded, exported, executed, or compiled.**
 
 ## 16. Relationship to the route specification
 
-The route specification remains the authority for HTTP entrypoints and route-only restrictions. This document is the authority for the planned reusable module layer.
+The route specification remains the authority for HTTP entrypoints and route-only restrictions. This document is the authority for the **planned** reusable module layer.
 
-When module execution is actually implemented, both documents must be updated together, along with `api/README.md` and `route-error-book.md`, so the documented capability matrix and real runtime behavior remain synchronized.
+When `.module` execution is actually implemented, this document must be updated together with `docs/route-language.md`, `docs/route-error-book.md`, and `api/README.md` so the documented capability matrix and actual runtime behavior remain synchronized.
