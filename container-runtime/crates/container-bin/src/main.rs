@@ -44,15 +44,26 @@ fn main() -> anyhow::Result<()> {
     };
 
     let registry = EnvironmentRegistry::new(io, vault, &vault_data_dir);
+    let swamps_per_environment = value_after(&args, "--swamps-per-environment")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
+    let workers_per_swamp = value_after(&args, "--workers-per-swamp")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let runtime = Runtime::new(RuntimeConfig {
+        swamps_per_environment,
+        workers_per_swamp,
+        rebalance_interval_ms: 25,
+    });
 
     if debug {
-        run_debug(&args)?;
+        run_debug(&args, &runtime)?;
     }
 
     if let Some(address) = listen {
         let token = env::var("RBE_CONTAINER_TOKEN")
             .map_err(|_| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
-        run_control_server(&address, token, registry)?;
+        run_control_server(&address, token, runtime.clone(), registry)?;
     } else if !debug {
         println!("container: no control socket requested; exiting after initialization");
     }
@@ -60,19 +71,22 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_control_server(address: &str, token: String, _registry: EnvironmentRegistry) -> anyhow::Result<()> {
+fn run_control_server(
+    address: &str,
+    token: String,
+    runtime: Arc<Runtime>,
+    registry: EnvironmentRegistry,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
     println!("container: control socket listening on {}", listener.local_addr()?);
 
-    // The socket is intentionally loopback-only in normal backend use. The
-    // authentication token is still mandatory because another local process
-    // must not gain control merely by discovering the port.
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let token = token.clone();
+                let runtime = Arc::clone(&runtime);
                 thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &token) {
+                    if let Err(err) = handle_connection(stream, &token, &runtime, &registry) {
                         tracing::warn!(%err, "container control connection closed with error");
                     }
                 });
@@ -83,7 +97,12 @@ fn run_control_server(address: &str, token: String, _registry: EnvironmentRegist
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, token: &str) -> anyhow::Result<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    token: &str,
+    runtime: &Runtime,
+    registry: &EnvironmentRegistry,
+) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let bytes = read_frame(&mut reader)?;
     let request = decode_request(&bytes)?;
@@ -108,12 +127,12 @@ fn handle_connection(mut stream: TcpStream, token: &str) -> anyhow::Result<()> {
                     message: "container control authentication failed".into(),
                 }
             } else {
-                // Execution dispatch is owned by the runtime process. The
-                // actual WASM engine and OS sandbox are deliberately behind
-                // the execution-engine/sandbox-primitives contracts.
-                Response::Accepted {
-                    request_id: request.request_id,
-                    execution_id: "pending-runtime-wiring".into(),
+                let Some(environment) = parse_environment(&request.environment) else {
+                    Response::Error {
+                        request_id: Some(request.request_id),
+                        code: "INVALID_ENVIRONMENT".into(),
+                        message: format!("unknown container environment: {}", request.environment),
+                    }
                 }
             }
         }
@@ -130,8 +149,11 @@ fn handle_connection(mut stream: TcpStream, token: &str) -> anyhow::Result<()> {
                     body: serde_json::json!({
                         "protocol": PROTOCOL_VERSION,
                         "process": "container",
-                        "sandbox": "policy-bound",
-                        "wasm": "pending-execution-engine"
+                        "environments": registry.health_snapshot().len(),
+                        "queue": runtime.global_queue_len(),
+                        "runtime": runtime.snapshots().len(),
+                        "sandbox_policy": "deny-by-default",
+                        "wasm_engine": "pending-execution-engine"
                     }),
                 }
             }
@@ -139,17 +161,36 @@ fn handle_connection(mut stream: TcpStream, token: &str) -> anyhow::Result<()> {
         Request::Cancel(request) => Response::Error {
             request_id: Some(request.request_id),
             code: "NOT_IMPLEMENTED".into(),
-            message: "execution cancellation requires the execution engine wiring".into(),
+            message: "execution cancellation requires the execution control table".into(),
         },
-        Request::Inspect(request) => Response::Error {
-            request_id: Some(request.request_id),
-            code: "NOT_IMPLEMENTED".into(),
-            message: "live inspection requires the runtime handle".into(),
-        },
+        Request::Inspect(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else {
+                let environments = runtime.snapshots();
+                Response::Inspection {
+                    request_id: request.request_id,
+                    body: serde_json::json!({
+                        "execution_id": request.execution_id,
+                        "environments": environments.len(),
+                        "state": environments.iter().map(|env| serde_json::json!({
+                            "id": env.id.to_string(),
+                            "queued": env.queued,
+                            "queued_cost": env.queued_cost,
+                            "swamps": env.swamps.len()
+                        })).collect::<Vec<_>>()
+                    }),
+                }
+            }
+        }
         Request::RestartEnvironment(request) => Response::Error {
             request_id: Some(request.request_id),
             code: "NOT_IMPLEMENTED".into(),
-            message: "environment restart requires the supervisor lifecycle wiring".into(),
+            message: "environment restart requires the supervisor lifecycle layer".into(),
         },
     };
 
@@ -157,23 +198,22 @@ fn handle_connection(mut stream: TcpStream, token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_debug(args: &[String]) -> anyhow::Result<()> {
-    let swamps_per_environment = value_after(args, "--swamps-per-environment")
-        .or_else(|| value_after(args, "--swamps"))
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
-    let workers = value_after(args, "--workers-per-swamp")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
+fn parse_environment(value: &str) -> Option<EnvironmentId> {
+    match value {
+        "general-1" => Some(EnvironmentId::General1),
+        "general-2" => Some(EnvironmentId::General2),
+        "general-3" => Some(EnvironmentId::General3),
+        "general-4" => Some(EnvironmentId::General4),
+        "general-5" => Some(EnvironmentId::General5),
+        "payment" => Some(EnvironmentId::Payment),
+        _ => None,
+    }
+}
+
+fn run_debug(args: &[String], runtime: &Runtime) -> anyhow::Result<()> {
     let demo_count = value_after(args, "--demo")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
-
-    let runtime = Runtime::new(RuntimeConfig {
-        swamps_per_environment,
-        workers_per_swamp: workers,
-        rebalance_interval_ms: 25,
-    });
 
     for index in 0..demo_count {
         let cost = if index % 5 == 0 {
@@ -194,7 +234,7 @@ fn run_debug(args: &[String]) -> anyhow::Result<()> {
         runtime.config().workers_per_swamp, runtime.global_queue_len(), runtime.cache().len());
 
     for _ in 0..10 {
-        print_snapshot(&runtime);
+        print_snapshot(runtime);
         if demo_count == 0 { break; }
         thread::sleep(Duration::from_millis(250));
         runtime.rebalance_once();
