@@ -20,7 +20,7 @@ pub struct WorkerSnapshot {
 
 struct WorkerCommand { task: ExecutionTask }
 
-type Runner = Arc<dyn Fn(&ExecutionTask) -> Result<(), String> + Send + Sync + 'static>;
+pub type Runner = Arc<dyn Fn(&ExecutionTask) -> Result<(), String> + Send + Sync + 'static>;
 type Completion = Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>;
 
 pub struct Worker {
