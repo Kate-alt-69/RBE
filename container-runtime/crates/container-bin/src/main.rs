@@ -20,7 +20,6 @@ use sandbox_primitives::SandboxPolicy;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-
     let args = env::args().skip(1).collect::<Vec<_>>();
     let debug = args.iter().any(|arg| arg == "--debug");
     let listen = value_after(&args, "--listen");
@@ -46,42 +45,24 @@ fn main() -> anyhow::Result<()> {
     };
 
     let registry = Arc::new(EnvironmentRegistry::new(io, vault, &vault_data_dir));
-    let swamps_per_environment = value_after(&args, "--swamps-per-environment")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
-    let workers_per_swamp = value_after(&args, "--workers-per-swamp")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
-    let runtime = Runtime::new(RuntimeConfig {
-        swamps_per_environment,
-        workers_per_swamp,
-        rebalance_interval_ms: 25,
-    });
+    let swamps_per_environment = value_after(&args, "--swamps-per-environment").and_then(|value| value.parse::<usize>().ok()).unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
+    let workers_per_swamp = value_after(&args, "--workers-per-swamp").and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
+    let runtime = Runtime::new(RuntimeConfig { swamps_per_environment, workers_per_swamp, rebalance_interval_ms: 25 });
 
-    if debug {
-        run_debug(&args, &runtime)?;
-    }
+    if debug { run_debug(&args, &runtime)?; }
 
     if let Some(address) = listen {
-        let token = env::var("RBE_CONTAINER_TOKEN")
-            .map_err(|_| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
+        let token = env::var("RBE_CONTAINER_TOKEN").map_err(|_| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
         run_control_server(&address, token, runtime.clone(), registry)?;
     } else if !debug {
         println!("container: no control socket requested; exiting after initialization");
     }
-
     Ok(())
 }
 
-fn run_control_server(
-    address: &str,
-    token: String,
-    runtime: Arc<Runtime>,
-    registry: Arc<EnvironmentRegistry>,
-) -> anyhow::Result<()> {
+fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>, registry: Arc<EnvironmentRegistry>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
     println!("container: control socket listening on {}", listener.local_addr()?);
-
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -100,70 +81,31 @@ fn run_control_server(
     Ok(())
 }
 
-fn handle_connection(
-    mut stream: TcpStream,
-    token: &str,
-    runtime: &Runtime,
-    registry: &EnvironmentRegistry,
-) -> anyhow::Result<()> {
+fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, registry: &EnvironmentRegistry) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let bytes = read_frame(&mut reader)?;
-    let request = decode_request(&bytes)?;
-
+    let request = decode_request(&read_frame(&mut reader)?)?;
     let response = match request {
         Request::Hello(hello) => {
             if hello.version != PROTOCOL_VERSION || hello.auth_token != token {
-                Response::Error {
-                    request_id: None,
-                    code: "AUTH_FAILED".into(),
-                    message: "container control authentication failed".into(),
-                }
+                Response::Error { request_id: None, code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
             } else {
                 Response::HelloAccepted { version: PROTOCOL_VERSION }
             }
         }
         Request::Execute(request) => {
             if request.auth_token != token {
-                Response::Error {
-                    request_id: Some(request.request_id),
-                    code: "AUTH_FAILED".into(),
-                    message: "container control authentication failed".into(),
-                }
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
             } else if let Some(environment) = parse_environment(&request.environment) {
-                let cost = WorkCost {
-                    cpu: request.declared_cost.cpu,
-                    memory: request.declared_cost.memory,
-                    io: request.declared_cost.io,
-                    network: request.declared_cost.network,
-                };
-                let execution_id = runtime.submit_with_policy(
-                    environment,
-                    request.artifact_hash,
-                    cost,
-                    ResourceLimits::default(),
-                    SandboxPolicy::default(),
-                    0,
-                    request.payload,
-                );
-                Response::Accepted {
-                    request_id: request.request_id,
-                    execution_id: execution_id.to_string(),
-                }
+                let cost = WorkCost { cpu: request.declared_cost.cpu, memory: request.declared_cost.memory, io: request.declared_cost.io, network: request.declared_cost.network };
+                let execution_id = runtime.submit_with_policy(environment, request.artifact_hash, cost, ResourceLimits::default(), SandboxPolicy::default(), 0, request.payload);
+                Response::Accepted { request_id: request.request_id, execution_id: execution_id.to_string() }
             } else {
-                Response::Error {
-                    request_id: Some(request.request_id),
-                    code: "INVALID_ENVIRONMENT".into(),
-                    message: format!("unknown container environment: {}", request.environment),
-                }
+                Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("unknown container environment: {}", request.environment) }
             }
         }
         Request::Health(request) => {
             if request.auth_token != token {
-                Response::Error {
-                    request_id: Some(request.request_id),
-                    code: "AUTH_FAILED".into(),
-                    message: "container control authentication failed".into(),
-                }
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
             } else {
                 Response::Health {
                     request_id: request.request_id,
@@ -173,23 +115,24 @@ fn handle_connection(
                         "environments": registry.health_snapshot().len(),
                         "queue": runtime.global_queue_len(),
                         "sandbox_policy": "deny-by-default",
-                        "wasm_engine": "pending-execution-engine"
+                        "wasm_engine": "wasmtime",
+                        "artifact_cache": runtime.cache().artifact_count()
                     }),
                 }
             }
         }
-        Request::Cancel(request) => Response::Error {
-            request_id: Some(request.request_id),
-            code: "NOT_IMPLEMENTED".into(),
-            message: "execution cancellation requires the execution control table".into(),
-        },
+        Request::Cancel(request) => {
+            if request.auth_token != token {
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else {
+                let accepted = runtime.cancel(&request.execution_id);
+                if accepted { Response::Cancelled { request_id: request.request_id } }
+                else { Response::Error { request_id: Some(request.request_id), code: "NOT_FOUND".into(), message: "execution ID was not found".into() } }
+            }
+        }
         Request::Inspect(request) => {
             if request.auth_token != token {
-                Response::Error {
-                    request_id: Some(request.request_id),
-                    code: "AUTH_FAILED".into(),
-                    message: "container control authentication failed".into(),
-                }
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
             } else {
                 let environments = runtime.snapshots();
                 Response::Inspection {
@@ -198,21 +141,28 @@ fn handle_connection(
                         "execution_id": request.execution_id,
                         "environments": environments.iter().map(|env| serde_json::json!({
                             "id": env.id.to_string(),
+                            "generation": env.generation,
                             "queued": env.queued,
                             "queued_cost": env.queued_cost,
-                            "swamps": env.swamps.len()
+                            "swamps": env.swamps.len(),
+                            "workers": env.swamps.iter().map(|s| s.workers.len()).sum::<usize>(),
+                            "failed": env.swamps.iter().map(|s| s.failed).sum::<u64>()
                         })).collect::<Vec<_>>()
                     }),
                 }
             }
         }
-        Request::RestartEnvironment(request) => Response::Error {
-            request_id: Some(request.request_id),
-            code: "NOT_IMPLEMENTED".into(),
-            message: "environment restart requires the supervisor lifecycle layer".into(),
-        },
+        Request::RestartEnvironment(request) => {
+            if request.auth_token != token {
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else if let Some(environment) = parse_environment(&request.environment) {
+                let requeued = runtime.restart_environment(environment);
+                Response::Restarted { request_id: request.request_id, environment: format!("{} ({} executions requeued)", environment, requeued) }
+            } else {
+                Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("unknown container environment: {}", request.environment) }
+            }
+        }
     };
-
     write_frame(&mut stream, &response)?;
     Ok(())
 }
@@ -230,28 +180,17 @@ fn parse_environment(value: &str) -> Option<EnvironmentId> {
 }
 
 fn run_debug(args: &[String], runtime: &Runtime) -> anyhow::Result<()> {
-    let demo_count = value_after(args, "--demo")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-
+    let demo_count = value_after(args, "--demo").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
     for index in 0..demo_count {
-        let cost = if index % 5 == 0 {
-            WorkCost { cpu: 100, memory: 20, io: 5, network: 0 }
-        } else {
-            WorkCost { cpu: 10, memory: 2, io: 1, network: 0 }
-        };
+        let cost = if index % 5 == 0 { WorkCost { cpu: 100, memory: 20, io: 5, network: 0 } } else { WorkCost { cpu: 10, memory: 2, io: 1, network: 0 } };
         let work_ms = if index % 5 == 0 { 40 } else { 5 };
         let environment = if index % 11 == 0 { EnvironmentId::Payment } else { EnvironmentId::General1 };
         let id = runtime.submit(environment, format!("demo-artifact-{}", index % 3), cost, work_ms);
         println!("queued {id} -> {environment}");
     }
-
     runtime.rebalance_once();
     println!("\nRBE CONTAINER RUNTIME — DEBUG");
-    println!("environments={} swamps_per_environment={} workers_per_swamp={} global_queue={} cache_profiles={}",
-        runtime.snapshots().len(), runtime.config().swamps_per_environment,
-        runtime.config().workers_per_swamp, runtime.global_queue_len(), runtime.cache().len());
-
+    println!("environments={} swamps_per_environment={} workers_per_swamp={} global_queue={} cache_profiles={} artifacts={}", runtime.snapshots().len(), runtime.config().swamps_per_environment, runtime.config().workers_per_swamp, runtime.global_queue_len(), runtime.cache().len(), runtime.cache().artifact_count());
     for _ in 0..10 {
         print_snapshot(runtime);
         if demo_count == 0 { break; }
@@ -263,19 +202,17 @@ fn run_debug(args: &[String], runtime: &Runtime) -> anyhow::Result<()> {
 
 fn print_snapshot(runtime: &Runtime) {
     for environment in runtime.snapshots() {
-        println!("\nENVIRONMENT {:<9} queue={:<5} cost={:<6} swamps={}", environment.id, environment.queued, environment.queued_cost, environment.swamps.len());
+        println!("\nENVIRONMENT {:<9} gen={} queue={:<5} cost={:<6} swamps={}", environment.id, environment.generation, environment.queued, environment.queued_cost, environment.swamps.len());
         for swamp in environment.swamps {
-            println!("  SWAMP {:03} queue={:<5} cost={:<6} throughput={:>8.1}/s completed={:<5}", swamp.id, swamp.queued, swamp.queued_cost, swamp.throughput_per_sec, swamp.completed);
+            println!("  SWAMP {:03} queue={:<5} cost={:<6} throughput={:>8.1}/s completed={:<5} failed={:<5}", swamp.id, swamp.queued, swamp.queued_cost, swamp.throughput_per_sec, swamp.completed, swamp.failed);
             for worker in swamp.workers {
                 let execution = worker.current.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
                 let avg_ms = if worker.completed == 0 { 0.0 } else { worker.total_ms as f64 / worker.completed as f64 };
-                println!("    worker-{:<3} {:<7} current={:<36} completed={} avg_ms={:.1}", worker.id, format!("{:?}", worker.state), execution, worker.completed, avg_ms);
+                println!("    worker-{:<3} {:<7} current={:<40} completed={} failed={} avg_ms={:.1}", worker.id, format!("{:?}", worker.state), execution, worker.completed, worker.failed, avg_ms);
             }
         }
     }
-    println!("CACHE profiles={}", runtime.cache().len());
+    println!("CACHE profiles={} artifacts={}", runtime.cache().len(), runtime.cache().artifact_count());
 }
 
-fn value_after(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone())
-}
+fn value_after(args: &[String], flag: &str) -> Option<String> { args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone()) }
