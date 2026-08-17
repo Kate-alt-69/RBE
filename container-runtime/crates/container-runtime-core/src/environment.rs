@@ -27,44 +27,25 @@ pub struct EnvironmentSnapshot {
 }
 
 impl EnvironmentRuntime {
-    pub fn new(
-        id: EnvironmentId,
-        swamp_count: usize,
-        workers_per_swamp: usize,
-        runner: Runner,
-        on_complete: Completion,
-    ) -> Self {
+    pub fn new(id: EnvironmentId, swamp_count: usize, workers_per_swamp: usize, runner: Runner, on_complete: Completion) -> Self {
         let swamp_count = swamp_count.max(1);
         let workers_per_swamp = workers_per_swamp.max(1);
         let swamps = Self::build_swamps(swamp_count, workers_per_swamp, &runner, &on_complete);
-        Self {
-            id,
-            swamp_count,
-            workers_per_swamp,
-            runner,
-            on_complete,
-            swamps: Mutex::new(swamps),
-        }
+        Self { id, swamp_count, workers_per_swamp, runner, on_complete, swamps: Mutex::new(swamps) }
     }
 
     fn build_swamps(swamp_count: usize, workers_per_swamp: usize, runner: &Runner, on_complete: &Completion) -> Vec<Arc<Swamp>> {
-        (0..swamp_count)
-            .map(|swamp_id| Swamp::new(swamp_id, workers_per_swamp, Arc::clone(runner), Arc::clone(on_complete)))
-            .collect()
+        (0..swamp_count).map(|swamp_id| Swamp::new(swamp_id, workers_per_swamp, Arc::clone(runner), Arc::clone(on_complete))).collect()
     }
 
     pub fn enqueue(&self, task: ExecutionTask) {
         let swamps = self.swamps.lock().expect("environment swamps poisoned");
-        let target = swamps.iter().min_by_key(|swamp| swamp.queued_cost()).expect("environment has no Swamps");
-        target.enqueue(task);
+        swamps.iter().min_by_key(|swamp| swamp.queued_cost()).expect("environment has no Swamps").enqueue(task);
     }
 
-    pub fn cancel_queued(&self, id: crate::execution::ExecutionId) -> bool {
+    pub fn cancel_queued_by_string(&self, id: &str) -> bool {
         let swamps = self.swamps.lock().expect("environment swamps poisoned");
-        for swamp in swamps.iter() {
-            if swamp.remove_execution(id) { return true; }
-        }
-        false
+        swamps.iter().any(|swamp| swamp.remove_execution_string(id))
     }
 
     pub fn restart(&self) -> Vec<ExecutionTask> {
