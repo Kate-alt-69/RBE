@@ -99,9 +99,9 @@ async fn boot_and_run() -> anyhow::Result<()> {
         Ok(vault) => Arc::new(vault),
         Err(err) => {
             let details = format!("{err:#}");
-            error_client::report_issue(error_client::IssueInput { source: "backend.vault.startup", level: Some(error_client::IssueLevel::Error), category: None, message: "Vault failed to become ready after restart attempts; backend is shutting down gracefully", stack: Some(&details) });
-            tracing::error!(error = %err, "Vault failed to become ready after restart attempts; backend shutting down gracefully");
-            return Ok(());
+            error_client::report_issue(error_client::IssueInput { source: "backend.vault.startup", level: Some(error_client::IssueLevel::Error), category: None, message: "Vault failed to become ready; backend startup is aborted", stack: Some(&details) });
+            tracing::error!(error = %err, "Vault failed to become ready; backend startup aborted");
+            return Err(anyhow::anyhow!("Vault bootstrap failed: {details}"));
         }
     };
     boot_trace("vault process ready");
