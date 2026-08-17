@@ -23,7 +23,7 @@ container
        └── payment   → physical-core Swamps → 1 Worker thread/Swamp
 ```
 
-By default the runtime creates **one lightweight Swamp per physical CPU core per Environment** and **one Worker thread per Swamp**. A 128-physical-core host therefore gets 128 Swamps + 128 Worker threads in each Environment: 640 Swamps and 640 Worker threads across the six configured Environment identities. Swamps are scheduler objects/threads, not 640 separate OS processes; only the disposable untrusted execution worker is a separate sandbox process.
+By default the runtime creates **one lightweight Swamp per physical CPU core per Environment** and **one Worker thread per Swamp**. A 128-physical-core host therefore gets 128 Swamps + 128 Worker threads in each Environment: 768 Swamps and 768 Worker threads across the six configured Environment identities. Swamps are scheduler objects/threads, not 768 separate OS processes; only the disposable untrusted execution worker is a separate sandbox process.
 
 Every execution receives a unique `ExecutionId` and carries an explicit resource policy and deny-by-default sandbox policy.
 
@@ -59,7 +59,7 @@ It writes its own audit trail to:
 ./data/container-runtime/container-monitor.log
 ```
 
-The monitor is intentionally narrow: it does not own execution policy and cannot submit jobs. Its role is observation and crash/event visibility.
+The monitor is intentionally narrow: it does not own execution policy and cannot submit jobs.
 
 ## Cache and cost learning
 
@@ -87,33 +87,31 @@ Each execution carries:
 - deny-by-default network policy;
 - restricted filesystem policy;
 - no-extra-capability policy;
-- isolated PID/mount/IPC/UTS/network/**cgroup** namespaces;
+- isolated PID/mount/IPC/UTS/network/cgroup namespaces;
 - restricted syscall policy;
 - CPU, memory, disk, network, process, file-descriptor, and wall-time limits.
 
-On **Linux**, real artifact execution is refused unless the execution can be placed in:
-
-- PID/mount/IPC/UTS/network/cgroup namespaces;
-- `PR_SET_NO_NEW_PRIVS`;
-- an x86_64 seccomp deny-list for host-control/privilege syscalls;
-- cgroup-v2 CPU, memory and PID limits;
-- a hard wall-clock timeout.
+On **Linux**, real artifact execution is refused unless the execution can be placed in the required namespaces, `PR_SET_NO_NEW_PRIVS`, seccomp, cgroup-v2 limits, and hard wall-clock timeout.
 
 The actual WASM code runs in the disposable worker process with Wasmtime fuel and memory policy in addition to the OS boundary.
 
 ### Wasmtime security policy
 
-The runtime is pinned to **Wasmtime 45.0.3**. This is deliberate rather than simply taking the first “newer” release: Wasmtime's 2026 advisories include a high-severity WASI `path_open(TRUNCATE)` permissions bypass, a WASIp1 `fd_renumber` resource leak affecting 45.0.0/45.0.1, and a hard-link/rename permissions bypass affecting 45.0.0 through 45.0.2. The patched 45.x baseline for these issues is 45.0.3. citeturn602002search3turn430448view1turn430448view0
+The runtime is pinned to **Wasmtime 45.0.3**. The executor deliberately disables Wasmtime's unused default cache/optional features and enables only `runtime` + `cranelift`, which are the features required here to execute and JIT-compile incoming WASM modules. This also removes an unnecessary `zstd-sys` build path from the container execution engine.
 
-The branch also runs `cargo audit` in CI so future dependency advisories are caught automatically.
+The branch runs `cargo audit` in CI so future dependency advisories are caught automatically.
 
-On **Windows/non-Linux**, the policy contracts and portable scheduler remain buildable, but the runtime deliberately refuses to claim a secure OS sandbox until a native enforcement backend (for example Job Objects/AppContainer or an equivalent hardened design) exists.
+On **Windows/non-Linux**, the policy contracts and portable scheduler remain buildable, but the runtime deliberately refuses to claim a secure OS sandbox until a native enforcement backend exists.
 
-The current Vault implementation uses a separate `backend-rs-container` namespace, but application ACLs are not an OS security boundary by themselves. Real host-secret isolation comes from the OS sandbox and process identity boundary.
+## Build platforms
+
+**Native Windows builds:** use the `container-runtime-windows` CI job or run `cargo build --workspace --release` from a real Windows/MSVC environment.
+
+**Linux → Windows cross-builds:** the branch does not require or configure a Zig/MSVC cross toolchain. A Linux Codespace targeting `x86_64-pc-windows-msvc` through `cargo-zigbuild` must have a complete Windows MSVC CRT sysroot available; otherwise C dependencies can fail with missing headers such as `stdlib.h` and `string.h`. That failure is a cross-toolchain/sysroot problem, not a Rust container-runtime source error.
 
 ## Restart, cancellation and recovery
 
-The runtime keeps an append-only execution journal. Unresolved `queued` executions are replayed after a container-process restart using their original execution IDs. Approved WASM artifacts are persistent in the artifact cache, so recovery does not require the backend to resend the artifact.
+The runtime keeps an append-only execution journal. Unresolved `queued` executions are replayed after a container-process restart using their original execution IDs and original submitted resource limits. Approved WASM artifacts are persistent in the artifact cache, so recovery does not require the backend to resend the artifact.
 
 Environment restart rebuilds its Swamp/Worker pool, wipes the Environment's ephemeral workspace, and requeues work that has not started. Cancellation removes queued work and marks running work for cooperative termination; wall-time expiry can forcibly kill the isolated worker process.
 
