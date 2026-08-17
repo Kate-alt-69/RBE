@@ -103,7 +103,9 @@ The actual WASM code runs in the disposable worker process with Wasmtime fuel an
 
 ### Wasmtime security policy
 
-The runtime was upgraded from the older 36.x line to **Wasmtime 45.0.0**. This is a deliberate security update: Wasmtime published multiple 2026 advisories affecting older releases, including a high-severity WASI `path_open(TRUNCATE)` permissions bypass and later WASI filesystem issues. Patched releases include 45.0.0 for the former advisory. The branch also adds `cargo audit` CI coverage so future dependency advisories are caught automatically.
+The runtime is pinned to **Wasmtime 45.0.3**. This is deliberate rather than simply taking the first “newer” release: Wasmtime's 2026 advisories include a high-severity WASI `path_open(TRUNCATE)` permissions bypass, a WASIp1 `fd_renumber` resource leak affecting 45.0.0/45.0.1, and a hard-link/rename permissions bypass affecting 45.0.0 through 45.0.2. The patched 45.x baseline for these issues is 45.0.3. citeturn602002search3turn430448view1turn430448view0
+
+The branch also runs `cargo audit` in CI so future dependency advisories are caught automatically.
 
 On **Windows/non-Linux**, the policy contracts and portable scheduler remain buildable, but the runtime deliberately refuses to claim a secure OS sandbox until a native enforcement backend (for example Job Objects/AppContainer or an equivalent hardened design) exists.
 
