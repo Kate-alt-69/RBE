@@ -3,15 +3,15 @@
 //! The backend launches this binary as a separate process. The service owns
 //! Environment → Swamp → Worker scheduling and exposes a local authenticated
 //! control socket. `--debug` renders the live topology without requiring the
-//! backend process. `--worker` is a disposable child execution mode used by
-//! the sandbox boundary and never starts the control plane. `--monitor` is a
+//! backend process. `--worker` is a disposable child execution mode used by the
+//! sandbox boundary and never starts the control plane. `--monitor` is a
 //! small sibling process that watches the container supervisor and its event log.
 
 mod dashboard;
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,8 +40,7 @@ fn main() -> anyhow::Result<()> {
     let dashboard_disabled = args.iter().any(|arg| arg == "--no-dashboard");
     let dashboard_address = value_after(&args, "--dashboard-listen")
         .unwrap_or_else(|| DEFAULT_DASHBOARD_ADDRESS.to_string());
-    emit_event("container_start", &format!("pid={}")
-        .replace("{}", &std::process::id().to_string()));
+    emit_event("container_start", &format!("pid={}", std::process::id()));
 
     if let Err(err) = spawn_monitor_process() {
         tracing::warn!(error = %err, "container monitor process could not be started");
@@ -176,7 +175,6 @@ fn process_exists(pid: u32) -> bool {
 fn append_monitor_log(path: &PathBuf, line: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    use std::io::Write;
     writeln!(file, "{line}")?;
     Ok(())
 }
@@ -267,7 +265,7 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, regi
 fn parse_environment(value: &str) -> Option<EnvironmentId> { match value { "general-1" => Some(EnvironmentId::General1), "general-2" => Some(EnvironmentId::General2), "general-3" => Some(EnvironmentId::General3), "general-4" => Some(EnvironmentId::General4), "general-5" => Some(EnvironmentId::General5), "payment" => Some(EnvironmentId::Payment), _ => None } }
 
 fn run_debug(args: &[String], runtime: &Runtime) -> anyhow::Result<()> {
-    let demo_count = value_after(&args, "--demo").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+    let demo_count = value_after(args, "--demo").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
     for index in 0..demo_count {
         let cost = if index % 5 == 0 { WorkCost { cpu: 100, memory: 20, io: 5, network: 0 } } else { WorkCost { cpu: 10, memory: 2, io: 1, network: 0 } };
         let work_ms = if index % 5 == 0 { 40 } else { 5 };
