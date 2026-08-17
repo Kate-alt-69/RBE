@@ -1,5 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use resource_limits::ResourceLimits;
+use sandbox_primitives::SandboxPolicy;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExecutionId {
     epoch_ns: u64,
@@ -61,15 +64,21 @@ pub enum ExecutionState {
     Completed,
     Failed,
     Cancelled,
+    TimedOut,
     SecurityTerminated,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExecutionTask {
     pub id: ExecutionId,
+    pub environment: String,
     pub artifact_hash: String,
     pub declared_cost: WorkCost,
+    pub limits: ResourceLimits,
+    pub sandbox: SandboxPolicy,
+    /// Test hook used until the real execution-engine/WASM backend is wired.
     pub work_ms: u64,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
