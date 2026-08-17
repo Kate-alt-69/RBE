@@ -190,7 +190,8 @@ fn run_isolated_worker(task: &ExecutionTask) -> anyhow::Result<()> {
     {
         let cgroup = CgroupHandle::create(PathBuf::from("/sys/fs/cgroup/rbe").as_path(), &task.id.to_string(), task.limits)?;
         let program = std::env::current_exe()?;
-        let args = vec!["--worker".to_string(), "--artifact".to_string(), task.artifact_hash.clone()];
+        let fuel = task.limits.cpu_millis.max(1).saturating_mul(10_000);
+        let args = vec!["--worker".to_string(), "--artifact".to_string(), task.artifact_hash.clone(), "--fuel".to_string(), fuel.to_string(), "--memory".to_string(), task.limits.memory_bytes.to_string()];
         let mut command = SandboxLauncher::command(&task.sandbox, program.to_string_lossy().as_ref(), &args).map_err(anyhow::anyhow)?;
         command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
@@ -202,7 +203,7 @@ fn run_isolated_worker(task: &ExecutionTask) -> anyhow::Result<()> {
             thread::sleep(Duration::from_millis(2));
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(target_os = "linux")]
     {
         let _ = task;
         Err(anyhow::anyhow!("secure container execution is currently Linux-only; refusing to execute without an OS sandbox"))
