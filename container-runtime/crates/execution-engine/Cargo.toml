@@ -6,7 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1"
-# Wasmtime 45.0.0 is the current supported stable release on the branch's
-# security review date. The older 36.x line had later security fixes applied
-# in 36.0.10 and subsequent releases.
-wasmtime = "45.0.0"
+# Security-reviewed 45.x baseline. 45.0.2 fixes the WASIp1 fd_renumber
+# resource leak; 45.0.3 additionally fixes the WASI hard-link/rename
+# permission bypass disclosed in June 2026.
+wasmtime = "45.0.3"
