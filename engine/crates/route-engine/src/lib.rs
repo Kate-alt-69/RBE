@@ -5,6 +5,11 @@
 //! interpreter is retained as a fallback while the AOT Rust artifact
 //! pipeline is developed.
 
+// The route cache and direct parser helpers are retained as internal building
+// blocks for the AOT/diagnostic pipeline even when a particular build path does
+// not currently call them directly.
+#![allow(dead_code)]
+
 mod analyzer;
 mod ast;
 mod discovery;
