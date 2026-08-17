@@ -65,18 +65,27 @@ fn state_json(runtime: &Runtime) -> String {
                 "avg_ms": if w.completed == 0 { 0.0 } else { w.total_ms as f64 / w.completed as f64 },
             })).collect::<Vec<_>>();
             serde_json::json!({
-                "id": s.id, "queued": s.queued, "cost": s.queued_cost,
-                "throughput": s.throughput_per_sec, "completed": s.completed,
-                "failed": s.failed, "workers": workers
+                "id": s.id,
+                "queued": s.queued,
+                "cost": s.queued_cost,
+                "throughput": s.throughput_per_sec,
+                "completed": s.completed,
+                "failed": s.failed,
+                "workers": workers
             })
         }).collect::<Vec<_>>();
         serde_json::json!({
-            "id": e.id.to_string(), "generation": e.generation, "queued": e.queued,
-            "cost": e.queued_cost, "workers": e.worker_count,
+            "id": e.id.to_string(),
+            "generation": e.generation,
+            "queued": e.queued,
+            "cost": e.queued_cost,
+            "workers": e.worker_count,
             "storage_mib": e.storage_limit_bytes / (1024 * 1024),
-            "ephemeral": e.storage_ephemeral, "swamps": swamps
+            "ephemeral": e.storage_ephemeral,
+            "swamps": swamps
         })
     }).collect::<Vec<_>>();
+
     serde_json::json!({
         "pid": std::process::id(),
         "queue": runtime.global_queue_len(),
@@ -101,19 +110,55 @@ fn events_json() -> String {
 
 fn html(token: &str) -> String {
     let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".into());
-    format!(r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RBE Container</title><style>
-body{{margin:0;padding:20px;background:#0b1020;color:#e7edf7;font:14px system-ui}}h1{{margin-top:0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}}.card,.panel{{background:#11182b;border:1px solid #26324a;border-radius:10px;padding:15px;margin-bottom:15px}}.big{{font-size:24px;font-weight:700}}.ok{{color:#63e6be}}table{{width:100%;border-collapse:collapse}}td,th{{padding:8px;border-bottom:1px solid #24304a;text-align:left}}th{{color:#8ea0bb}}pre{{white-space:pre-wrap;max-height:400px;overflow:auto;color:#cdd8e9}}
-</style></head><body><h1>RBE Container Runtime</h1><div class="muted">Live scheduler + security telemetry</div><div class="grid" id="cards"></div><div class="panel"><h2>Environments / Swamps / Workers</h2><div id="envs">Loading...</div></div><div class="panel"><h2>Recent Events</h2><pre id="events">Loading...</pre></div><script>
-const token=TOKEN_PLACEHOLDER;const H={{Authorization:'Bearer '+token}};
-async function get(p){{const r=await fetch(p,{{headers:H}});if(!r.ok)throw Error(r.status);return r.json()}}
-function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
-function render(s){{document.querySelector('#cards').innerHTML=`<div class=card><b>PID</b><div class=big>${{esc(s.pid)}}</div></div><div class=card><b>Queue</b><div class=big>${{esc(s.queue)}}</div></div><div class=card><b>Artifacts</b><div class=big>${{esc(s.cache_artifacts)}}</div><small>${{esc(s.cache_profiles)}} profiles</small></div><div class=card><b>Sandbox</b><div class="big ok">DENY-BY-DEFAULT</div><small>${{esc(s.security.linux)}}</small></div>`;let h='<table><tr><th>Environment</th><th>Queue</th><th>Swamps</th><th>Workers</th><th>Storage</th></tr>';for(const e of s.environments){{h+=`<tr><td>${{esc(e.id)}} gen=${{esc(e.generation)}}</td><td>${{esc(e.queued)}} / ${{esc(e.cost)}}</td><td>${{esc(e.swamps.length)}}</td><td>${{esc(e.workers)}}</td><td>${{esc(e.storage_mib)}} MiB ${{esc(e.ephemeral)}}</td></tr>`;for(const sw of e.swamps){{h+=`<tr><td colspan=5><small>Swamp ${{esc(sw.id)}} · queue=${{esc(sw.queued)}} · throughput=${{Number(sw.throughput).toFixed(1)}}/s · done=${{esc(sw.completed)}} · failed=${{esc(sw.failed)}}</small>`;for(const w of sw.workers)h+=`<div style="padding-left:20px">Worker-${{esc(w.id)}} · ${{esc(w.state)}} · ${{esc(w.current||'-')}} · avg=${{Number(w.avg_ms).toFixed(1)}}ms · done=${{esc(w.completed)}} · failed=${{esc(w.failed)}}</div>`;h+='</td></tr>'}}}}document.querySelector('#envs').innerHTML=h+'</table>'}}
-async function refresh(){{try{{render(await get('/api/state'));const e=await get('/api/events');document.querySelector('#events').textContent=e.events.map(x=>JSON.stringify(x)).join('\\n')||'No events yet.'}}catch(e){{document.querySelector('#events').textContent='Dashboard error: '+e}}}}refresh();setInterval(refresh,1000);
-</script></body></html>"#, token_json).replace("TOKEN_PLACEHOLDER", &token_json)
+    let template = r#"<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RBE Container</title>
+<style>
+body{margin:0;padding:20px;background:#0b1020;color:#e7edf7;font:14px system-ui}
+h1{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.card,.panel{background:#11182b;border:1px solid #26324a;border-radius:10px;padding:15px;margin-bottom:15px}
+.big{font-size:24px;font-weight:700}.ok{color:#63e6be}table{width:100%;border-collapse:collapse}
+td,th{padding:8px;border-bottom:1px solid #24304a;text-align:left}th{color:#8ea0bb}
+pre{white-space:pre-wrap;max-height:400px;overflow:auto;color:#cdd8e9}
+</style></head>
+<body><h1>RBE Container Runtime</h1>
+<div>Live scheduler + security telemetry · refresh 1s</div>
+<div class="grid" id="cards"></div>
+<div class="panel"><h2>Environments / Swamps / Workers</h2><div id="envs">Loading...</div></div>
+<div class="panel"><h2>Recent Events</h2><pre id="events">Loading...</pre></div>
+<script>
+const token=TOKEN_PLACEHOLDER;
+const H={Authorization:'Bearer '+token};
+async function get(p){const r=await fetch(p,{headers:H});if(!r.ok)throw Error(r.status);return r.json()}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function render(s){
+ document.querySelector('#cards').innerHTML=`
+ <div class=card><b>PID</b><div class=big>${esc(s.pid)}</div></div>
+ <div class=card><b>Queue</b><div class=big>${esc(s.queue)}</div></div>
+ <div class=card><b>Artifacts</b><div class=big>${esc(s.cache_artifacts)}</div><small>${esc(s.cache_profiles)} profiles</small></div>
+ <div class=card><b>Sandbox</b><div class="big ok">DENY-BY-DEFAULT</div><small>${esc(s.security.linux)}</small></div>`;
+ let h='<table><tr><th>Environment</th><th>Queue</th><th>Swamps</th><th>Workers</th><th>Storage</th></tr>';
+ for(const e of s.environments){
+   h+=`<tr><td>${esc(e.id)} gen=${esc(e.generation)}</td><td>${esc(e.queued)} / ${esc(e.cost)}</td><td>${esc(e.swamps.length)}</td><td>${esc(e.workers)}</td><td>${esc(e.storage_mib)} MiB ${esc(e.ephemeral)}</td></tr>`;
+   for(const sw of e.swamps){
+     h+=`<tr><td colspan=5><small>Swamp ${esc(sw.id)} · queue=${esc(sw.queued)} · throughput=${Number(sw.throughput).toFixed(1)}/s · done=${esc(sw.completed)} · failed=${esc(sw.failed)}</small>`;
+     for(const w of sw.workers) h+=`<div style="padding-left:20px">Worker-${esc(w.id)} · ${esc(w.state)} · ${esc(w.current||'-')} · avg=${Number(w.avg_ms).toFixed(1)}ms · done=${esc(w.completed)} · failed=${esc(w.failed)}</div>`;
+     h+='</td></tr>';
+   }
+ }
+ document.querySelector('#envs').innerHTML=h+'</table>';
+}
+async function refresh(){try{render(await get('/api/state'));const e=await get('/api/events');document.querySelector('#events').textContent=e.events.map(x=>JSON.stringify(x)).join('\\n')||'No events yet.'}catch(e){document.querySelector('#events').textContent='Dashboard error: '+e}}
+refresh();setInterval(refresh,1000);
+</script></body></html>"#;
+    template.replace("TOKEN_PLACEHOLDER", &token_json)
 }
 
 fn respond(stream: &mut TcpStream, status: u16, reason: &str, content_type: &str, body: &str) -> anyhow::Result<()> {
-    let header = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len());
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.as_bytes().len()
+    );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body.as_bytes())?;
     Ok(())
