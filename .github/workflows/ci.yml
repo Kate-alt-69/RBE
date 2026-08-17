@@ -1,10 +1,5 @@
 name: CI
 
-# Lives at the true repo root (project-root/.github/workflows).
-# CI validates both the Rust workspaces and the same build entrypoints
-# developers use locally, so a green CI run means the distributable build
-# scripts can actually compile RBE on their native CI platforms.
-
 on:
   push:
   pull_request:
@@ -23,23 +18,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-
       - name: fmt check
         run: cargo fmt --all -- --check
-
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-
       - name: test
         run: cargo test --workspace
-
       - name: build (release)
         run: cargo build --workspace --release
 
-  # Run the actual repository build entrypoint on Linux. This is intentionally
-  # separate from the direct cargo build above: build.sh is the supported
-  # distributable build path and performs the same container embedding and
-  # output preparation used by local builds.
   build-script-linux:
     runs-on: ubuntu-latest
     steps:
@@ -51,9 +38,6 @@ jobs:
       - name: build.sh (host debug build)
         run: ./build.sh --debug
 
-  # Validate the PowerShell build entrypoint on its native platform as well.
-  # build.ps1 requires PowerShell 7+, which is preinstalled on GitHub's
-  # Windows runners.
   build-script-windows:
     runs-on: windows-latest
     steps:
@@ -66,10 +50,6 @@ jobs:
         shell: pwsh
         run: ./build.ps1 --debug
 
-  # Standalone crates, not members of any workspace — shared between
-  # engine/ and container-runtime/ via relative path (see each crate's
-  # README for why). Tested independently since `cargo test --workspace`
-  # from either workspace won't reach them.
   shared-crates:
     runs-on: ubuntu-latest
     strategy:
@@ -83,23 +63,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ matrix.crate }}
-
       - name: fmt check
         working-directory: ${{ matrix.crate }}
         run: cargo fmt --all -- --check
-
       - name: clippy
         working-directory: ${{ matrix.crate }}
         run: cargo clippy --all-targets -- -D warnings
-
       - name: test
         working-directory: ${{ matrix.crate }}
         run: cargo test
 
-  # Separate workspace, separate job — see migration-plan §3's
-  # non-negotiable exception: the container runtime is never built as
-  # part of the main workspace's pipeline. Depends on vault/atomic-io
-  # passing first since it wouldn't build otherwise.
   container-runtime-workspace:
     needs: shared-crates
     runs-on: ubuntu-latest
@@ -114,15 +87,47 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: container-runtime
-
       - name: fmt check
         run: cargo fmt --all -- --check
-
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-
       - name: test
         run: cargo test --workspace
-
       - name: build (release)
         run: cargo build --workspace --release
+
+  container-runtime-windows:
+    needs: shared-crates
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: container-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+      - name: test (portable runtime contracts)
+        run: cargo test --workspace
+      - name: build (release)
+        run: cargo build --workspace --release
+
+  container-security-smoke:
+    needs: container-runtime-workspace
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: container-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+      - name: sandbox primitives tests
+        run: cargo test -p sandbox-primitives
+      - name: resource limits tests
+        run: cargo test -p resource-limits
+      - name: execution engine tests
+        run: cargo test -p execution-engine
