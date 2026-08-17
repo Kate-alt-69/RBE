@@ -4,6 +4,7 @@ use environments::EnvironmentId;
 
 use crate::execution::{ExecutionTask, WorkCost};
 use crate::swamp::{Swamp, SwampSnapshot};
+use crate::worker::Runner;
 
 pub struct EnvironmentRuntime {
     pub id: EnvironmentId,
@@ -23,22 +24,17 @@ impl EnvironmentRuntime {
         id: EnvironmentId,
         swamp_count: usize,
         workers_per_swamp: usize,
-        on_complete: Arc<dyn Fn(&ExecutionTask, u64) + Send + Sync + 'static>,
+        runner: Runner,
+        on_complete: Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>,
     ) -> Self {
         let swamps = (0..swamp_count.max(1))
-            .map(|swamp_id| {
-                Swamp::new(swamp_id, workers_per_swamp, Arc::clone(&on_complete))
-            })
+            .map(|swamp_id| Swamp::new(swamp_id, workers_per_swamp, Arc::clone(&runner), Arc::clone(&on_complete)))
             .collect();
         Self { id, swamps }
     }
 
     pub fn enqueue(&self, task: ExecutionTask) {
-        let target = self
-            .swamps
-            .iter()
-            .min_by_key(|swamp| swamp.queued_cost())
-            .expect("environment has no Swamps");
+        let target = self.swamps.iter().min_by_key(|swamp| swamp.queued_cost()).expect("environment has no Swamps");
         target.enqueue(task);
     }
 
@@ -63,10 +59,7 @@ impl EnvironmentRuntime {
         }
     }
 
-    pub fn worker_count(&self) -> usize {
-        self.swamps.iter().map(|swamp| swamp.worker_count()).sum()
-    }
-
+    pub fn worker_count(&self) -> usize { self.swamps.iter().map(|swamp| swamp.worker_count()).sum() }
     pub fn swamp_count(&self) -> usize { self.swamps.len() }
 }
 
