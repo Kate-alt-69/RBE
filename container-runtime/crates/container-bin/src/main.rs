@@ -1,9 +1,10 @@
 //! Container runtime entrypoint.
 //!
 //! Normal mode keeps the existing health/registry wiring. `--debug` starts
-//! the testable Swamp runtime and renders live Environment/Swamp/Worker/cache
-//! state. This is scheduler/debug infrastructure only; kernel sandboxing,
-//! real WASM execution, and authenticated IPC remain future layers.
+//! the testable Environment → Swamp → Worker runtime and renders live cache
+//! and scheduler state. This is scheduler/debug infrastructure only;
+//! kernel sandboxing, real WASM execution, and authenticated IPC remain
+//! future layers.
 
 use std::env;
 use std::path::PathBuf;
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use container_runtime_core::{EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost};
+use container_runtime_core::{EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -55,7 +56,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_debug(args: &[String]) -> anyhow::Result<()> {
-    let swamps = value_after(args, "--swamps")
+    let swamps_per_environment = value_after(args, "--swamps-per-environment")
+        .or_else(|| value_after(args, "--swamps"))
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
     let workers = value_after(args, "--workers-per-swamp")
@@ -66,7 +68,7 @@ fn run_debug(args: &[String]) -> anyhow::Result<()> {
         .unwrap_or(0);
 
     let runtime = Runtime::new(RuntimeConfig {
-        swamps,
+        swamps_per_environment,
         workers_per_swamp: workers,
         rebalance_interval_ms: 25,
     });
@@ -78,14 +80,16 @@ fn run_debug(args: &[String]) -> anyhow::Result<()> {
             WorkCost { cpu: 10, memory: 2, io: 1, network: 0 }
         };
         let work_ms = if index % 5 == 0 { 40 } else { 5 };
-        let id = runtime.submit(format!("demo-artifact-{}", index % 3), cost, work_ms);
-        println!("queued {id}");
+        let environment = if index % 11 == 0 { EnvironmentId::Payment } else { EnvironmentId::General1 };
+        let id = runtime.submit(environment, format!("demo-artifact-{}", index % 3), cost, work_ms);
+        println!("queued {id} -> {environment}");
     }
 
     runtime.rebalance_once();
     println!("\nRBE CONTAINER RUNTIME — DEBUG");
-    println!("swamps={} workers_per_swamp={} global_queue={} cache_profiles={}",
-        runtime.config().swamps,
+    println!("environments={} swamps_per_environment={} workers_per_swamp={} global_queue={} cache_profiles={}",
+        runtime.snapshots().len(),
+        runtime.config().swamps_per_environment,
         runtime.config().workers_per_swamp,
         runtime.global_queue_len(),
         runtime.cache().len());
@@ -103,30 +107,34 @@ fn run_debug(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn print_snapshot(runtime: &Runtime) {
-    println!("\nENVIRONMENT  debug-environment");
-    for swamp in runtime.snapshots() {
+    for environment in runtime.snapshots() {
         println!(
-            "  SWAMP {:03} queue={:<5} cost={:<6} throughput={:>8.1}/s completed={:<5}",
-            swamp.id, swamp.queued, swamp.queued_cost, swamp.throughput_per_sec, swamp.completed
+            "\nENVIRONMENT {:<9} queue={:<5} cost={:<6} swamps={}",
+            environment.id,
+            environment.queued,
+            environment.queued_cost,
+            environment.swamps.len()
         );
-        for worker in swamp.workers {
-            let execution = worker.current.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
-            let avg_ms = if worker.completed == 0 {
-                0.0
-            } else {
-                worker.total_ms as f64 / worker.completed as f64
-            };
+        for swamp in environment.swamps {
             println!(
-                "    worker-{:<3} {:<7} current={:<36} completed={} avg_ms={:.1}",
-                worker.id,
-                format!("{:?}", worker.state),
-                execution,
-                worker.completed,
-                avg_ms
+                "  SWAMP {:03} queue={:<5} cost={:<6} throughput={:>8.1}/s completed={:<5}",
+                swamp.id, swamp.queued, swamp.queued_cost, swamp.throughput_per_sec, swamp.completed
             );
+            for worker in swamp.workers {
+                let execution = worker.current.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
+                let avg_ms = if worker.completed == 0 { 0.0 } else { worker.total_ms as f64 / worker.completed as f64 };
+                println!(
+                    "    worker-{:<3} {:<7} current={:<36} completed={} avg_ms={:.1}",
+                    worker.id,
+                    format!("{:?}", worker.state),
+                    execution,
+                    worker.completed,
+                    avg_ms
+                );
+            }
         }
     }
-    println!("  CACHE profiles={}", runtime.cache().len());
+    println!("CACHE profiles={}", runtime.cache().len());
 }
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {
