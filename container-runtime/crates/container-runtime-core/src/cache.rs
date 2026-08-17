@@ -29,6 +29,7 @@ impl ExecutionProfile {
 #[derive(Debug, Default)]
 pub struct ArtifactCache {
     profiles: Mutex<HashMap<String, ExecutionProfile>>,
+    artifacts: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl ArtifactCache {
@@ -41,7 +42,19 @@ impl ArtifactCache {
         self.profiles.lock().expect("artifact cache poisoned").get(artifact_hash).cloned()
     }
 
+    pub fn put_artifact(&self, artifact_hash: impl Into<String>, wasm: Vec<u8>) {
+        self.artifacts.lock().expect("artifact cache poisoned").insert(artifact_hash.into(), wasm);
+    }
+
+    pub fn artifact(&self, artifact_hash: &str) -> Option<Vec<u8>> {
+        self.artifacts.lock().expect("artifact cache poisoned").get(artifact_hash).cloned()
+    }
+
     pub fn len(&self) -> usize {
         self.profiles.lock().expect("artifact cache poisoned").len()
+    }
+
+    pub fn artifact_count(&self) -> usize {
+        self.artifacts.lock().expect("artifact cache poisoned").len()
     }
 }
