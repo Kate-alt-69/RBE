@@ -5,3 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+wasmtime = "36"
+wasmtime-wasi = "36"
