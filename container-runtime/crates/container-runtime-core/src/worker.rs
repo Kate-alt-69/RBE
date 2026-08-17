@@ -1,29 +1,27 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::execution::{ExecutionId, ExecutionTask};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerState {
-    Idle,
-    Running,
-    Stopped,
-}
+pub enum WorkerState { Idle, Running, Stopped }
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerSnapshot {
     pub id: usize,
     pub state: WorkerState,
     pub completed: u64,
+    pub failed: u64,
     pub total_ms: u64,
     pub current: Option<ExecutionId>,
 }
 
-struct WorkerCommand {
-    task: ExecutionTask,
-}
+struct WorkerCommand { task: ExecutionTask }
+
+type Runner = Arc<dyn Fn(&ExecutionTask) -> Result<(), String> + Send + Sync + 'static>;
+type Completion = Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>;
 
 pub struct Worker {
     id: usize,
@@ -31,20 +29,23 @@ pub struct Worker {
     state: Arc<Mutex<WorkerState>>,
     current: Arc<Mutex<Option<ExecutionId>>>,
     completed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
     total_ms: Arc<AtomicU64>,
 }
 
 impl Worker {
-    pub fn new(id: usize, on_complete: Arc<dyn Fn(&ExecutionTask, u64) + Send + Sync + 'static>) -> Self {
+    pub fn new(id: usize, runner: Runner, on_complete: Completion) -> Self {
         let (tx, rx) = mpsc::channel::<WorkerCommand>();
         let state = Arc::new(Mutex::new(WorkerState::Idle));
         let current = Arc::new(Mutex::new(None));
         let completed = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
         let total_ms = Arc::new(AtomicU64::new(0));
 
         let thread_state = Arc::clone(&state);
         let thread_current = Arc::clone(&current);
         let thread_completed = Arc::clone(&completed);
+        let thread_failed = Arc::clone(&failed);
         let thread_total_ms = Arc::clone(&total_ms);
 
         thread::Builder::new()
@@ -55,14 +56,16 @@ impl Worker {
                     *thread_current.lock().expect("worker current poisoned") = Some(command.task.id);
 
                     let started = Instant::now();
-                    if command.task.work_ms > 0 {
-                        thread::sleep(std::time::Duration::from_millis(command.task.work_ms));
-                    }
+                    let result = runner(&command.task);
                     let elapsed_ms = started.elapsed().as_millis() as u64;
 
-                    thread_completed.fetch_add(1, Ordering::Relaxed);
+                    if result.is_ok() {
+                        thread_completed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        thread_failed.fetch_add(1, Ordering::Relaxed);
+                    }
                     thread_total_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
-                    on_complete(&command.task, elapsed_ms);
+                    on_complete(&command.task, elapsed_ms, result);
 
                     *thread_current.lock().expect("worker current poisoned") = None;
                     *thread_state.lock().expect("worker state poisoned") = WorkerState::Idle;
@@ -72,7 +75,7 @@ impl Worker {
             })
             .expect("failed to start worker thread");
 
-        Self { id, tx, state, current, completed, total_ms }
+        Self { id, tx, state, current, completed, failed, total_ms }
     }
 
     pub fn id(&self) -> usize { self.id }
@@ -82,9 +85,7 @@ impl Worker {
     }
 
     pub fn try_send(&self, task: ExecutionTask) -> bool {
-        if !self.is_idle() {
-            return false;
-        }
+        if !self.is_idle() { return false; }
         self.tx.send(WorkerCommand { task }).is_ok()
     }
 
@@ -93,8 +94,19 @@ impl Worker {
             id: self.id,
             state: *self.state.lock().expect("worker state poisoned"),
             completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
             total_ms: self.total_ms.load(Ordering::Relaxed),
             current: *self.current.lock().expect("worker current poisoned"),
         }
     }
+}
+
+/// Default runner retained for queue tests and debug simulation when an
+/// artifact is not present in the cache. Real WASM runners are injected by
+/// `Runtime`.
+pub fn simulated_runner() -> Runner {
+    Arc::new(|task| {
+        if task.work_ms > 0 { thread::sleep(Duration::from_millis(task.work_ms)); }
+        Ok(())
+    })
 }
