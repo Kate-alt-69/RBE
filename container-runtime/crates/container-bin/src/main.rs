@@ -1,56 +1,30 @@
-//! **This is a wiring demonstration, not the real container runtime
-//! yet.** It proves `environments` + `vault` + `atomic-io` actually
-//! connect and run — constructs the six-environment registry, prints
-//! a health snapshot, exits. The real long-running process (an IPC
-//! listener accepting execution requests from the main engine, per
-//! migration-plan §5) needs `ipc-protocol` and `execution-engine`,
-//! neither of which exist yet — still Phase 2 proper, not part of
-//! this change. See `container-runtime-core`'s doc comment.
+//! Container runtime entrypoint.
 //!
-//! **Deliberately uses its own vault namespace**, separate from the
-//! engine's (`backend-rs-container` service name, `data/container-admin`
-//! directory, not `backend-rs`/`data/admin`) — worth being honest
-//! about why this matters and what it doesn't solve on its own: the
-//! ACL in `vault` is enforced by *our own code*, not the OS credential
-//! store itself. Any process running as the same OS user could bypass
-//! our `Vault` API entirely and read OS-keyring entries directly if it
-//! wanted to — the ACL is a well-behaved-caller boundary and an audit
-//! trail, not a hard security guarantee against a fully malicious
-//! process. Real enforcement that the container genuinely can't reach
-//! the engine's secrets needs OS-level sandboxing (restricted process
-//! permissions) once `sandbox-primitives` exists. A separate namespace
-//! now is real, cheap hygiene in the meantime — not a claim that this
-//! alone makes the boundary airtight.
+//! Normal mode keeps the existing health/registry wiring. `--debug` starts
+//! the testable Swamp runtime and renders live Environment/Swamp/Worker/cache
+//! state. This is scheduler/debug infrastructure only; kernel sandboxing,
+//! real WASM execution, and authenticated IPC remain future layers.
 
-//! **Reports issues into the SAME shared queue the main engine uses**
-//! (`./data/admin`, via `error_client`) even though its VAULT
-//! namespace is deliberately separate (see below) — these are
-//! independent decisions for independent reasons. Vault isolation is
-//! about limiting what secrets a compromised container could reach;
-//! error reporting is about having ONE unified, centralized signed log
-//! across every process in the system, which is the whole point of
-//! `error_client`/the `--er` daemon existing as a shared, standalone
-//! crate in the first place — see that crate's doc comment.
-
+use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
-use container_runtime_core::EnvironmentRegistry;
+use container_runtime_core::{Runtime, RuntimeConfig, WorkCost, EnvironmentRegistry};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    // Shared with the main engine — where error-reports go, NOT where
-    // this process's own vault secrets live (see `vault_data_dir`
-    // below, and this file's doc comment for why those are two
-    // different directories for two different reasons).
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let debug = args.iter().any(|arg| arg == "--debug");
+
     let admin_dir = PathBuf::from("./data/admin");
     let io = atomic_io::AtomicIo::new();
     error_client::init(io.clone(), &admin_dir);
     error_client::install_panic_hook();
 
     let vault_data_dir = PathBuf::from("./data/container-admin");
-
     let vault = match vault::Vault::new(io.clone(), "backend-rs-container", &vault_data_dir) {
         Ok(v) => Arc::new(v),
         Err(e) => {
@@ -67,15 +41,91 @@ fn main() -> anyhow::Result<()> {
 
     let registry = EnvironmentRegistry::new(io, vault, &vault_data_dir);
 
-    println!("container-bin: environment registry constructed. Health snapshot:");
+    println!("container-bin: environment health snapshot:");
     for (id, status) in registry.health_snapshot() {
         println!("  {id:<10} {status:?}");
     }
 
-    println!(
-        "\ncontainer-bin: this is a wiring demonstration only — no IPC listener, no real \
-         sandboxed execution yet. See this file's doc comment."
-    );
+    if debug {
+        return run_debug(&args);
+    }
+
+    println!("container-bin: normal mode — Swamp debug scheduler disabled; no OS sandbox/IPC yet.");
+    Ok(())
+}
+
+fn run_debug(args: &[String]) -> anyhow::Result<()> {
+    let swamps = value_after(args, "--swamps")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
+    let workers = value_after(args, "--workers-per-swamp")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let demo_count = value_after(args, "--demo")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let runtime = Runtime::new(RuntimeConfig {
+        swamps,
+        workers_per_swamp: workers,
+        rebalance_interval_ms: 25,
+    });
+
+    for index in 0..demo_count {
+        let cost = if index % 5 == 0 {
+            WorkCost { cpu: 100, memory: 20, io: 5, network: 0 }
+        } else {
+            WorkCost { cpu: 10, memory: 2, io: 1, network: 0 }
+        };
+        let work_ms = if index % 5 == 0 { 40 } else { 5 };
+        let id = runtime.submit(format!("demo-artifact-{}", index % 3), cost, work_ms);
+        println!("queued execution exec-{:016x}", id.get());
+    }
+
+    runtime.rebalance_once();
+    println!("\nRBE CONTAINER RUNTIME — DEBUG");
+    println!("swamps={} workers_per_swamp={} global_queue={} cache_profiles={}",
+        runtime.config().swamps,
+        runtime.config().workers_per_swamp,
+        runtime.global_queue_len(),
+        runtime.cache().len());
+
+    for _ in 0..10 {
+        print_snapshot(&runtime);
+        if demo_count == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+        runtime.rebalance_once();
+    }
 
     Ok(())
+}
+
+fn print_snapshot(runtime: &Runtime) {
+    println!("\nENVIRONMENT  debug-environment");
+    for swamp in runtime.snapshots() {
+        println!(
+            "  SWAMP {:03} queue={:<5} throughput={:>8.1}/s completed={:<5}",
+            swamp.id, swamp.queued, swamp.throughput_per_sec, swamp.completed
+        );
+        for worker in swamp.workers {
+            let execution = worker.current.map(|id| format!("exec-{:016x}", id.get())).unwrap_or_else(|| "-".to_string());
+            println!(
+                "    worker-{:<3} {:<7} current={:<19} completed={} avg_ms={:.1}",
+                worker.id,
+                format!("{:?}", worker.state),
+                execution,
+                worker.completed,
+                if worker.completed == 0 { 0.0 } else { worker.total_ms as f64 / worker.completed as f64 }
+            );
+        }
+    }
+    println!("  CACHE profiles={}", runtime.cache().len());
+}
+
+fn value_after(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
 }
