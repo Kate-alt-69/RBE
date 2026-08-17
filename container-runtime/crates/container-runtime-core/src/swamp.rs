@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::execution::{ExecutionId, ExecutionTask};
+use crate::execution::ExecutionTask;
 use crate::worker::{Runner, Worker, WorkerSnapshot};
 
 #[derive(Debug, Clone)]
@@ -37,7 +37,6 @@ impl Swamp {
         swamp
     }
 
-    pub fn id(&self) -> usize { self.id }
     pub fn enqueue(&self, task: ExecutionTask) { self.queue.lock().expect("swamp queue poisoned").push_back(task); }
     pub fn drain(&self, count: usize) -> Vec<ExecutionTask> {
         let mut queue = self.queue.lock().expect("swamp queue poisoned");
@@ -53,7 +52,6 @@ impl Swamp {
         before != queue.len()
     }
 
-    pub fn remove_execution(&self, id: ExecutionId) -> bool { self.remove_execution_string(&id.to_string()) }
     pub fn queued(&self) -> usize { self.queue.lock().expect("swamp queue poisoned").len() }
     pub fn queued_cost(&self) -> u64 { self.queue.lock().expect("swamp queue poisoned").iter().map(|task| task.declared_cost.scalar()).sum() }
 
@@ -81,5 +79,4 @@ impl Swamp {
     }
 
     pub fn worker_count(&self) -> usize { self.workers.len() }
-    pub fn has_execution(&self, id: ExecutionId) -> bool { self.workers.iter().any(|worker| worker.snapshot().current == Some(id)) || self.queue.lock().expect("swamp queue poisoned").iter().any(|task| task.id == id) }
 }
