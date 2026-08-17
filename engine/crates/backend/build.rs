@@ -1,70 +1,79 @@
-//! Build script: optionally embeds a pre-built `container-bin` binary
-//! into this crate at compile time, so `build.ps1`'s combined build can
-//! ship ONE distributable `backend(.exe)` file that contains both the
-//! main engine AND the sandboxed container binary's bytes — while
-//! still keeping the container as a genuinely separate OS process at
-//! *runtime* (see `engine/README.md`'s "non-negotiable exception" —
-//! this embeds bytes at build time, it does not merge the processes).
-//! `container_embed.rs` is what extracts those bytes back out to disk
-//! and spawns them as a real child process later.
+//! Build-time integrity binding for the standalone `container` dependency.
 //!
-//! Looks for a pre-built container binary at the path in the
-//! `RBE_CONTAINER_BIN_PATH` environment variable, which `build.ps1`
-//! sets when doing a combined build (see that script's comments for
-//! the required build order: `container-bin` must be compiled BEFORE
-//! this crate, since its output is what gets embedded here). If the
-//! env var isn't set, or doesn't point at a real file, this writes an
-//! empty placeholder instead of failing the build — plain `cargo build
-//! -p backend` (normal day-to-day engine development, no PowerShell
-//! orchestration involved) still works fine with no container
-//! embedded. `container_embed::is_available()` checks the embedded
-//! length at runtime and `main.rs` degrades gracefully either way.
+//! The combined build compiles `container-bin` first and passes its exact
+//! output through `RBE_CONTAINER_BIN_PATH`. This build script SHA-256 hashes
+//! those exact bytes and generates a Rust constant inside `backend.exe`.
+//!
+//! Runtime startup then requires `dep/container(.exe)` to exist and to match
+//! that compiled-in digest. No editable sidecar hash file is trusted.
 
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_BIN_PATH");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts");
-    let dest = Path::new(&out_dir).join("embedded_container_bin");
-
+    let embedded_dest = Path::new(&out_dir).join("embedded_container_bin");
+    let integrity_dest = Path::new(&out_dir).join("container_integrity.rs");
     let source = std::env::var("RBE_CONTAINER_BIN_PATH").ok().map(PathBuf::from);
 
-    match source {
+    let expected_hash = match source {
         Some(path) if path.is_file() => {
             println!("cargo:rerun-if-changed={}", path.display());
-            std::fs::copy(&path, &dest).unwrap_or_else(|e| {
+
+            // Keep the existing embedded artifact available to old build tooling,
+            // but runtime startup no longer falls back to it.
+            fs::copy(&path, &embedded_dest).unwrap_or_else(|err| {
                 panic!(
-                    "backend/build.rs: RBE_CONTAINER_BIN_PATH was set to {} but copying it into \
-                     OUT_DIR failed: {e}",
+                    "backend/build.rs: failed to copy container binary {} into OUT_DIR: {err}",
                     path.display()
                 )
             });
-            println!("cargo:warning=backend: embedding container binary from {}", path.display());
+
+            let hash = sha256_file(&path).unwrap_or_else(|err| {
+                panic!(
+                    "backend/build.rs: failed to SHA-256 container binary {}: {err}",
+                    path.display()
+                )
+            });
+            println!("cargo:warning=backend: binding container dependency SHA-256 {hash}");
+            hash
         }
         Some(path) => {
-            // Env var set but doesn't point at a real file — almost
-            // certainly a build.ps1 orchestration mistake (wrong path,
-            // or container-bin wasn't actually built first). Warn
-            // loudly rather than silently shipping an engine binary
-            // with no container support and no explanation why.
-            println!(
-                "cargo:warning=backend: RBE_CONTAINER_BIN_PATH={} does not exist — building \
-                 WITHOUT an embedded container binary",
+            panic!(
+                "backend/build.rs: RBE_CONTAINER_BIN_PATH was set to {} but the file does not exist — container dependency is required",
                 path.display()
             );
-            write_placeholder(&dest);
         }
         None => {
-            // Normal standalone `cargo build -p backend` — expected,
-            // not a warning.
-            write_placeholder(&dest);
+            // Plain `cargo build -p backend` can still compile, but the resulting
+            // backend will fail closed at startup because it has no bound container.
+            String::new()
         }
-    }
+    };
+
+    let source_literal = format!("pub const EXPECTED_CONTAINER_SHA256: &str = \"{expected_hash}\";\n");
+    fs::write(&integrity_dest, source_literal).unwrap_or_else(|err| {
+        panic!("backend/build.rs: failed to write generated container integrity source: {err}")
+    });
 }
 
-fn write_placeholder(dest: &Path) {
-    std::fs::write(dest, []).unwrap_or_else(|e| {
-        panic!("backend/build.rs: failed to write embedded-container placeholder: {e}")
-    });
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hex::encode(hasher.finalize()))
 }
