@@ -3,3 +3,7 @@
 **.log
 **/error-reporter-status.json
 /dist/**
+/tmp
+**.lock
+**/Cargo.lock
+container-runtime/Cargo.lock
