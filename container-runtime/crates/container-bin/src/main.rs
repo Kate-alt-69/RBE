@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use container_runtime_core::{Runtime, RuntimeConfig, WorkCost, EnvironmentRegistry};
+use container_runtime_core::{EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -79,7 +79,7 @@ fn run_debug(args: &[String]) -> anyhow::Result<()> {
         };
         let work_ms = if index % 5 == 0 { 40 } else { 5 };
         let id = runtime.submit(format!("demo-artifact-{}", index % 3), cost, work_ms);
-        println!("queued execution exec-{:016x}", id.get());
+        println!("queued {id}");
     }
 
     runtime.rebalance_once();
@@ -106,18 +106,23 @@ fn print_snapshot(runtime: &Runtime) {
     println!("\nENVIRONMENT  debug-environment");
     for swamp in runtime.snapshots() {
         println!(
-            "  SWAMP {:03} queue={:<5} throughput={:>8.1}/s completed={:<5}",
-            swamp.id, swamp.queued, swamp.throughput_per_sec, swamp.completed
+            "  SWAMP {:03} queue={:<5} cost={:<6} throughput={:>8.1}/s completed={:<5}",
+            swamp.id, swamp.queued, swamp.queued_cost, swamp.throughput_per_sec, swamp.completed
         );
         for worker in swamp.workers {
-            let execution = worker.current.map(|id| format!("exec-{:016x}", id.get())).unwrap_or_else(|| "-".to_string());
+            let execution = worker.current.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
+            let avg_ms = if worker.completed == 0 {
+                0.0
+            } else {
+                worker.total_ms as f64 / worker.completed as f64
+            };
             println!(
-                "    worker-{:<3} {:<7} current={:<19} completed={} avg_ms={:.1}",
+                "    worker-{:<3} {:<7} current={:<36} completed={} avg_ms={:.1}",
                 worker.id,
                 format!("{:?}", worker.state),
                 execution,
                 worker.completed,
-                if worker.completed == 0 { 0.0 } else { worker.total_ms as f64 / worker.completed as f64 }
+                avg_ms
             );
         }
     }
@@ -125,7 +130,5 @@ fn print_snapshot(runtime: &Runtime) {
 }
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|pair| pair[0] == flag)
-        .map(|pair| pair[1].clone())
+    args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone())
 }
