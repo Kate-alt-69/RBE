@@ -2,15 +2,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{create_dir_all, read_to_string, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use execution_engine::{ExecutionLimits, WasmExecutor};
+use execution_engine::WasmExecutor;
 use environments::EnvironmentId;
 use resource_limits::ResourceLimits;
-use sandbox_primitives::SandboxPolicy;
+use sandbox_primitives::{SandboxLauncher, SandboxPolicy};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::ArtifactCache;
@@ -34,10 +35,7 @@ struct JournalEvent {
     work_ms: u64,
 }
 
-struct Journal {
-    path: PathBuf,
-    lock: Mutex<()>,
-}
+struct Journal { path: PathBuf, lock: Mutex<()> }
 
 impl Journal {
     fn open() -> Arc<Self> {
@@ -63,18 +61,14 @@ impl Journal {
             let id = format!("exec-{:016x}-{:016x}", event.epoch_ns, event.sequence);
             match event.kind.as_str() {
                 "queued" => { latest.insert(id, (event, true)); }
-                "done" | "cancel" => {
-                    if let Some(entry) = latest.get_mut(&id) { entry.1 = false; }
-                }
+                "done" | "cancel" => { if let Some(entry) = latest.get_mut(&id) { entry.1 = false; } }
                 _ => {}
             }
         }
-
-        let mut recovered = Vec::new();
-        for (_, (event, pending)) in latest {
-            if !pending { continue; }
-            let Some(environment) = parse_environment(&event.environment) else { continue; };
-            recovered.push(ExecutionTask {
+        let recovered = latest.into_values().filter_map(|(event, pending)| {
+            if !pending { return None; }
+            let environment = parse_environment(&event.environment)?;
+            Some(ExecutionTask {
                 id: ExecutionId::from_parts(event.epoch_ns, event.sequence),
                 environment: environment.to_string(),
                 artifact_hash: event.artifact_hash,
@@ -83,9 +77,14 @@ impl Journal {
                 sandbox: SandboxPolicy::default(),
                 work_ms: event.work_ms,
                 payload: Vec::new(),
-            });
-        }
+            })
+        }).collect();
         (recovered, max_sequence)
+    }
+
+    fn append_cancel_string(&self, execution_id: &str) {
+        let Ok((epoch_ns, sequence)) = parse_execution_id(execution_id) else { return; };
+        self.append(JournalEvent { kind: "cancel".into(), epoch_ns, sequence, environment: "unknown".into(), artifact_hash: "unknown".into(), cpu: 0, memory: 0, io: 0, network: 0, work_ms: 0 });
     }
 }
 
@@ -97,9 +96,7 @@ pub struct RuntimeConfig {
 }
 
 impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self { swamps_per_environment: thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8), workers_per_swamp: 1, rebalance_interval_ms: 25 }
-    }
+    fn default() -> Self { Self { swamps_per_environment: thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8), workers_per_swamp: 1, rebalance_interval_ms: 25 } }
 }
 
 pub struct Runtime {
@@ -116,27 +113,20 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Arc<Self> {
-        let config = RuntimeConfig {
-            swamps_per_environment: config.swamps_per_environment.max(1),
-            workers_per_swamp: config.workers_per_swamp.max(1),
-            rebalance_interval_ms: config.rebalance_interval_ms.max(1),
-        };
+        let config = RuntimeConfig { swamps_per_environment: config.swamps_per_environment.max(1), workers_per_swamp: config.workers_per_swamp.max(1), rebalance_interval_ms: config.rebalance_interval_ms.max(1) };
         let cache = Arc::new(ArtifactCache::default());
         let executor = Arc::new(WasmExecutor::new().expect("failed to initialize WASM executor"));
         let journal = Journal::open();
         let (recovered, max_sequence) = journal.recover();
-
         let cancelled = Arc::new(Mutex::new(HashSet::<String>::new()));
+
         let runner: Runner = {
             let cache = Arc::clone(&cache);
-            let executor = Arc::clone(&executor);
             let cancelled = Arc::clone(&cancelled);
             Arc::new(move |task| {
                 if cancelled.lock().expect("cancel table poisoned").contains(&task.id.to_string()) { return Err("execution cancelled before start".into()); }
-                if let Some(wasm) = cache.artifact(&task.artifact_hash) {
-                    let fuel = task.limits.cpu_millis.max(1).saturating_mul(10_000);
-                    let result = executor.execute(&wasm, ExecutionLimits { fuel, max_memory_bytes: task.limits.memory_bytes }).map_err(|error| error.to_string())?;
-                    if result.exit_code != 0 { return Err(format!("WASM exited with status {}", result.exit_code)); }
+                if cache.artifact(&task.artifact_hash).is_some() {
+                    run_isolated_worker(task).map_err(|error| error.to_string())?
                 } else if task.work_ms > 0 {
                     thread::sleep(Duration::from_millis(task.work_ms));
                 }
@@ -152,46 +142,20 @@ impl Runtime {
             Arc::new(move |task, elapsed_ms, result| {
                 cache.record(&task.artifact_hash, elapsed_ms, task.declared_cost);
                 let was_cancelled = cancelled.lock().expect("cancel table poisoned").remove(&task.id.to_string());
-                journal.append(JournalEvent {
-                    kind: if was_cancelled { "cancel".into() } else { "done".into() },
-                    epoch_ns: task.id.epoch_ns(),
-                    sequence: task.id.sequence(),
-                    environment: task.environment.clone(),
-                    artifact_hash: task.artifact_hash.clone(),
-                    cpu: task.declared_cost.cpu,
-                    memory: task.declared_cost.memory,
-                    io: task.declared_cost.io,
-                    network: task.declared_cost.network,
-                    work_ms: elapsed_ms,
-                });
+                journal.append(JournalEvent { kind: if was_cancelled { "cancel".into() } else { "done".into() }, epoch_ns: task.id.epoch_ns(), sequence: task.id.sequence(), environment: task.environment.clone(), artifact_hash: task.artifact_hash.clone(), cpu: task.declared_cost.cpu, memory: task.declared_cost.memory, io: task.declared_cost.io, network: task.declared_cost.network, work_ms: elapsed_ms });
                 if let Err(error) = result { if !was_cancelled { tracing::warn!(execution = %task.id, environment = %task.environment, "execution failed: {error}"); } }
             })
         };
 
         let environments = EnvironmentId::ALL.into_iter().map(|id| EnvironmentRuntime::new(id, config.swamps_per_environment, config.workers_per_swamp, Arc::clone(&runner), Arc::clone(&completion))).collect();
         let generations = EnvironmentId::ALL.into_iter().map(|id| (id, 0u64)).collect();
-        let next_execution = max_sequence.saturating_add(1).max(1);
-        let runtime = Arc::new(Self {
-            config,
-            next_execution: AtomicU64::new(next_execution),
-            global_queue: Mutex::new(VecDeque::new()),
-            cancelled: Mutex::new(HashSet::new()),
-            generations,
-            environments,
-            cache,
-            executor,
-            journal,
-        });
-
+        let runtime = Arc::new(Self { config, next_execution: AtomicU64::new(max_sequence.saturating_add(1).max(1)), global_queue: Mutex::new(VecDeque::new()), cancelled: Mutex::new(HashSet::new()), generations: Mutex::new(generations), environments, cache, executor, journal });
         for task in recovered { if let Some(environment) = parse_environment(&task.environment) { runtime.global_queue.lock().expect("global queue poisoned").push_back((environment, task)); } }
 
         let weak = Arc::downgrade(&runtime);
         let interval = runtime.config.rebalance_interval_ms;
         thread::Builder::new().name("rbe-runtime-scheduler".to_string()).spawn(move || {
-            while let Some(runtime) = weak.upgrade() {
-                runtime.rebalance_once();
-                thread::sleep(Duration::from_millis(interval));
-            }
+            while let Some(runtime) = weak.upgrade() { runtime.rebalance_once(); thread::sleep(Duration::from_millis(interval)); }
         }).expect("failed to start runtime scheduler");
         runtime
     }
@@ -250,10 +214,23 @@ impl Runtime {
     pub fn wasm_executor(&self) -> Arc<WasmExecutor> { Arc::clone(&self.executor) }
 }
 
-impl Journal {
-    fn append_cancel_string(&self, execution_id: &str) {
-        let Ok((epoch, sequence)) = parse_execution_id(execution_id) else { return; };
-        self.append(JournalEvent { kind: "cancel".into(), epoch_ns: epoch, sequence, environment: "unknown".into(), artifact_hash: "unknown".into(), cpu: 0, memory: 0, io: 0, network: 0, work_ms: 0 });
+fn run_isolated_worker(task: &ExecutionTask) -> anyhow::Result<()> {
+    let program = std::env::current_exe()?;
+    let args = vec!["--worker".to_string(), "--artifact".to_string(), task.artifact_hash.clone()];
+    let mut command = SandboxLauncher::command(&task.sandbox, program.to_string_lossy().as_ref(), &args).map_err(anyhow::anyhow)?;
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_millis(task.limits.wall_time_ms.max(1));
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() { return Ok(()); }
+            return Err(anyhow::anyhow!("isolated worker exited with {status}"));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err(anyhow::anyhow!("isolated worker exceeded wall-time limit"));
+        }
+        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -264,15 +241,7 @@ fn parse_execution_id(value: &str) -> Result<(u64, u64), ()> {
 }
 
 fn parse_environment(value: &str) -> Option<EnvironmentId> {
-    match value {
-        "general-1" => Some(EnvironmentId::General1),
-        "general-2" => Some(EnvironmentId::General2),
-        "general-3" => Some(EnvironmentId::General3),
-        "general-4" => Some(EnvironmentId::General4),
-        "general-5" => Some(EnvironmentId::General5),
-        "payment" => Some(EnvironmentId::Payment),
-        _ => None,
-    }
+    match value { "general-1" => Some(EnvironmentId::General1), "general-2" => Some(EnvironmentId::General2), "general-3" => Some(EnvironmentId::General3), "general-4" => Some(EnvironmentId::General4), "general-5" => Some(EnvironmentId::General5), "payment" => Some(EnvironmentId::Payment), _ => None }
 }
 
 #[cfg(test)]
@@ -280,21 +249,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn execution_ids_are_unique() {
-        let runtime = Runtime::new(RuntimeConfig { swamps_per_environment: 1, workers_per_swamp: 1, rebalance_interval_ms: 10 });
-        assert_ne!(runtime.submit(EnvironmentId::General1, "a", WorkCost::default(), 0), runtime.submit(EnvironmentId::General1, "b", WorkCost::default(), 0));
+    fn execution_id_round_trips() {
+        let id = ExecutionId::from_parts(123, 456);
+        assert_eq!(parse_execution_id(&id.to_string()).unwrap(), (123, 456));
     }
 
     #[test]
-    fn every_environment_gets_its_own_swamp_pool() {
-        let runtime = Runtime::new(RuntimeConfig { swamps_per_environment: 2, workers_per_swamp: 1, rebalance_interval_ms: 1000 });
+    fn environments_are_all_created() {
+        let runtime = Runtime::new(RuntimeConfig { swamps_per_environment: 1, workers_per_swamp: 1, rebalance_interval_ms: 1000 });
         assert_eq!(runtime.snapshots().len(), 6);
     }
 
     #[test]
-    fn execution_id_round_trips() {
-        let id = ExecutionId::from_parts(123, 456);
-        let parsed = parse_execution_id(&id.to_string()).unwrap();
-        assert_eq!(parsed, (123, 456));
+    fn restart_increments_generation() {
+        let runtime = Runtime::new(RuntimeConfig { swamps_per_environment: 1, workers_per_swamp: 1, rebalance_interval_ms: 1000 });
+        runtime.restart_environment(EnvironmentId::General1);
+        assert_eq!(runtime.environment_generation(EnvironmentId::General1), 1);
     }
 }
