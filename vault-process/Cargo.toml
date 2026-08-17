@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lints.rust]
+# force_dbus is intentionally Linux-only at runtime; keep Windows/MSVC builds clean.
+unused_variables = "allow"
+
 [dependencies]
 vault = { path = "../vault" }
 error-client = { path = "../error-client" }
