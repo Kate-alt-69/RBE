@@ -34,27 +34,29 @@ impl Swamp {
         let workers = (0..worker_count.max(1))
             .map(|worker_id| Worker::new(worker_id, Arc::clone(&runner), Arc::clone(&on_complete)))
             .collect::<Vec<_>>();
-
-        let swamp = Arc::new(Self {
-            id,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
-            started: Instant::now(),
-            workers,
-        });
+        let swamp = Arc::new(Self { id, queue: Arc::new(Mutex::new(VecDeque::new())), started: Instant::now(), workers });
         Self::start_dispatcher(&swamp);
         swamp
     }
 
     pub fn id(&self) -> usize { self.id }
-
-    pub fn enqueue(&self, task: ExecutionTask) {
-        self.queue.lock().expect("swamp queue poisoned").push_back(task);
-    }
+    pub fn enqueue(&self, task: ExecutionTask) { self.queue.lock().expect("swamp queue poisoned").push_back(task); }
 
     pub fn drain(&self, count: usize) -> Vec<ExecutionTask> {
         let mut queue = self.queue.lock().expect("swamp queue poisoned");
-        let amount = count.min(queue.len());
-        queue.drain(..amount).collect()
+        queue.drain(..count.min(queue.len())).collect()
+    }
+
+    pub fn drain_all(&self) -> Vec<ExecutionTask> {
+        let mut queue = self.queue.lock().expect("swamp queue poisoned");
+        queue.drain(..).collect()
+    }
+
+    pub fn remove_execution(&self, id: ExecutionId) -> bool {
+        let mut queue = self.queue.lock().expect("swamp queue poisoned");
+        let before = queue.len();
+        queue.retain(|task| task.id != id);
+        before != queue.len()
     }
 
     pub fn queued(&self) -> usize { self.queue.lock().expect("swamp queue poisoned").len() }
@@ -68,37 +70,23 @@ impl Swamp {
         let completed = workers.iter().map(|worker| worker.completed).sum::<u64>();
         let failed = workers.iter().map(|worker| worker.failed).sum::<u64>();
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
-        SwampSnapshot {
-            id: self.id,
-            queued: self.queued(),
-            queued_cost: self.queued_cost(),
-            completed,
-            failed,
-            throughput_per_sec: completed as f64 / elapsed,
-            workers,
-        }
+        SwampSnapshot { id: self.id, queued: self.queued(), queued_cost: self.queued_cost(), completed, failed, throughput_per_sec: completed as f64 / elapsed, workers }
     }
 
     fn start_dispatcher(swamp: &Arc<Self>) {
         let weak = Arc::downgrade(swamp);
-        thread::Builder::new()
-            .name(format!("rbe-swamp-{}", swamp.id))
-            .spawn(move || loop {
-                let Some(swamp) = weak.upgrade() else { break };
-                let mut progressed = false;
-                for worker in &swamp.workers {
-                    if !worker.is_idle() { continue; }
-                    let task = swamp.queue.lock().expect("swamp queue poisoned").pop_front();
-                    let Some(task) = task else { break; };
-                    if worker.try_send(task.clone()) {
-                        progressed = true;
-                    } else {
-                        swamp.queue.lock().expect("swamp queue poisoned").push_front(task);
-                    }
-                }
-                if !progressed { thread::sleep(Duration::from_millis(1)); }
-            })
-            .expect("failed to start Swamp dispatcher");
+        thread::Builder::new().name(format!("rbe-swamp-{}", swamp.id)).spawn(move || loop {
+            let Some(swamp) = weak.upgrade() else { break };
+            let mut progressed = false;
+            for worker in &swamp.workers {
+                if !worker.is_idle() { continue; }
+                let task = swamp.queue.lock().expect("swamp queue poisoned").pop_front();
+                let Some(task) = task else { break; };
+                if worker.try_send(task.clone()) { progressed = true; }
+                else { swamp.queue.lock().expect("swamp queue poisoned").push_front(task); }
+            }
+            if !progressed { thread::sleep(Duration::from_millis(1)); }
+        }).expect("failed to start Swamp dispatcher");
     }
 
     pub fn worker_count(&self) -> usize { self.workers.len() }
