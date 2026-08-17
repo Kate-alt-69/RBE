@@ -107,23 +107,13 @@ async fn boot_and_run() -> anyhow::Result<()> {
     };
     boot_trace("vault process ready");
 
-    let container_cache_dir = PathBuf::from("./.cache/service");
-    let container_process = match container_embed::extract_if_needed(&io, &container_cache_dir) {
-        Ok(Some(path)) => {
-            boot_trace(format!("embedded container binary ready at {}", path.display()));
-            tracing::info!(path = %path.display(), "embedded container binary extracted and ready");
-            Some(container_process::ContainerProcess::spawn(&path).await?)
-        }
-        Ok(None) => {
-            tracing::debug!("no embedded container binary — standalone build; container process not auto-started");
-            None
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "failed to extract embedded container binary");
-            return Err(err);
-        }
-    };
-    if let Some(process) = &container_process { boot_trace(format!("container process ready pid={:?} address={}", process.pid(), process.address)); }
+    let container_path = container_process::ContainerProcess::packaged_path()?;
+    boot_trace(format!("checking required container dependency at {}", container_path.display()));
+    if !container_path.is_file() {
+        anyhow::bail!("required container dependency is missing: {}", container_path.display());
+    }
+    let container_process = container_process::ContainerProcess::spawn(&container_path).await?;
+    boot_trace(format!("verified container process ready pid={:?} address={}", container_process.pid(), container_process.address));
 
     let mut supervisor = Supervisor::new(RestartPolicy::default());
     supervisor.set_state(BackendState::Initializing);
