@@ -6,4 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1"
-wasmtime = "36"
+# Wasmtime 45.0.0 is the current supported stable release on the branch's
+# security review date. The older 36.x line had later security fixes applied
+# in 36.0.10 and subsequent releases.
+wasmtime = "45.0.0"
