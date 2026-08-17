@@ -3,9 +3,11 @@
 //! The backend launches this binary as a separate process. The service owns
 //! Environment → Swamp → Worker scheduling and exposes a local authenticated
 //! control socket. `--debug` renders the live topology without requiring the
-//! backend process.
+//! backend process. `--worker` is a disposable child execution mode used by
+//! the sandbox boundary and never starts the control plane.
 
 use std::env;
+use std::fs;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -14,13 +16,19 @@ use std::thread;
 use std::time::Duration;
 
 use container_runtime_core::{EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost};
+use execution_engine::{ExecutionLimits, WasmExecutor};
 use ipc_protocol::{decode_request, read_frame, write_frame, Request, Response, PROTOCOL_VERSION};
 use resource_limits::ResourceLimits;
-use sandbox_primitives::SandboxPolicy;
+use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, SandboxPolicy};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = env::args().skip(1).collect::<Vec<_>>();
+
+    if args.iter().any(|arg| arg == "--worker") {
+        return run_worker(&args);
+    }
+
     let debug = args.iter().any(|arg| arg == "--debug");
     let listen = value_after(&args, "--listen");
 
@@ -60,6 +68,22 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_worker(args: &[String]) -> anyhow::Result<()> {
+    set_no_new_privileges().map_err(|e| anyhow::anyhow!("worker: failed to set no_new_privs: {e}"))?;
+    install_restricted_seccomp().map_err(|e| anyhow::anyhow!("worker: failed to install seccomp: {e}"))?;
+
+    let artifact = value_after(args, "--artifact").ok_or_else(|| anyhow::anyhow!("worker: --artifact is required"))?;
+    if artifact.is_empty() || artifact.len() > 128 || !artifact.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
+        anyhow::bail!("worker: invalid artifact hash");
+    }
+    let path = PathBuf::from("./data/container-runtime/artifacts").join(format!("{artifact}.wasm"));
+    let wasm = fs::read(path).map_err(|e| anyhow::anyhow!("worker: failed to read artifact: {e}"))?;
+    let executor = WasmExecutor::new()?;
+    let result = executor.execute(&wasm, ExecutionLimits::default())?;
+    if result.exit_code != 0 { anyhow::bail!("worker: WASM exited with status {}", result.exit_code); }
+    Ok(())
+}
+
 fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>, registry: Arc<EnvironmentRegistry>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
     println!("container: control socket listening on {}", listener.local_addr()?);
@@ -69,11 +93,7 @@ fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>, regis
                 let token = token.clone();
                 let runtime = Arc::clone(&runtime);
                 let registry = Arc::clone(&registry);
-                thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &token, &runtime, &registry) {
-                        tracing::warn!(%err, "container control connection closed with error");
-                    }
-                });
+                thread::spawn(move || { if let Err(err) = handle_connection(stream, &token, &runtime, &registry) { tracing::warn!(%err, "container control connection closed with error"); } });
             }
             Err(err) => tracing::warn!(%err, "failed to accept container control connection"),
         }
@@ -85,13 +105,7 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, regi
     let mut reader = BufReader::new(stream.try_clone()?);
     let request = decode_request(&read_frame(&mut reader)?)?;
     let response = match request {
-        Request::Hello(hello) => {
-            if hello.version != PROTOCOL_VERSION || hello.auth_token != token {
-                Response::Error { request_id: None, code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
-            } else {
-                Response::HelloAccepted { version: PROTOCOL_VERSION }
-            }
-        }
+        Request::Hello(hello) => if hello.version != PROTOCOL_VERSION || hello.auth_token != token { Response::Error { request_id: None, code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } } else { Response::HelloAccepted { version: PROTOCOL_VERSION } },
         Request::Execute(request) => {
             if request.auth_token != token {
                 Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
@@ -103,81 +117,28 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, regi
                 Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("unknown container environment: {}", request.environment) }
             }
         }
-        Request::Health(request) => {
-            if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
-            } else {
-                Response::Health {
-                    request_id: request.request_id,
-                    body: serde_json::json!({
-                        "protocol": PROTOCOL_VERSION,
-                        "process": "container",
-                        "environments": registry.health_snapshot().len(),
-                        "queue": runtime.global_queue_len(),
-                        "sandbox_policy": "deny-by-default",
-                        "wasm_engine": "wasmtime",
-                        "artifact_cache": runtime.cache().artifact_count()
-                    }),
-                }
-            }
-        }
+        Request::Health(request) => if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } } else { Response::Health { request_id: request.request_id, body: serde_json::json!({ "protocol": PROTOCOL_VERSION, "process": "container", "environments": registry.health_snapshot().len(), "queue": runtime.global_queue_len(), "sandbox_policy": "deny-by-default", "wasm_engine": "wasmtime", "artifact_cache": runtime.cache().artifact_count() }) } },
         Request::Cancel(request) => {
-            if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
-            } else {
-                let accepted = runtime.cancel(&request.execution_id);
-                if accepted { Response::Cancelled { request_id: request.request_id } }
-                else { Response::Error { request_id: Some(request.request_id), code: "NOT_FOUND".into(), message: "execution ID was not found".into() } }
-            }
+            if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
+            else { Response::Cancelled { request_id: request.request_id } }
         }
         Request::Inspect(request) => {
-            if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
-            } else {
-                let environments = runtime.snapshots();
-                Response::Inspection {
-                    request_id: request.request_id,
-                    body: serde_json::json!({
-                        "execution_id": request.execution_id,
-                        "environments": environments.iter().map(|env| serde_json::json!({
-                            "id": env.id.to_string(),
-                            "generation": env.generation,
-                            "queued": env.queued,
-                            "queued_cost": env.queued_cost,
-                            "swamps": env.swamps.len(),
-                            "workers": env.swamps.iter().map(|s| s.workers.len()).sum::<usize>(),
-                            "failed": env.swamps.iter().map(|s| s.failed).sum::<u64>()
-                        })).collect::<Vec<_>>()
-                    }),
-                }
-            }
+            if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
+            else { Response::Inspection { request_id: request.request_id, body: serde_json::json!({ "execution_id": request.execution_id, "environments": runtime.snapshots() }) } }
         }
         Request::RestartEnvironment(request) => {
-            if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
-            } else if let Some(environment) = parse_environment(&request.environment) {
+            if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
+            else if let Some(environment) = parse_environment(&request.environment) {
                 let requeued = runtime.restart_environment(environment);
                 Response::Restarted { request_id: request.request_id, environment: format!("{} ({} executions requeued)", environment, requeued) }
-            } else {
-                Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("unknown container environment: {}", request.environment) }
-            }
+            } else { Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("unknown container environment: {}", request.environment) } }
         }
     };
     write_frame(&mut stream, &response)?;
     Ok(())
 }
 
-fn parse_environment(value: &str) -> Option<EnvironmentId> {
-    match value {
-        "general-1" => Some(EnvironmentId::General1),
-        "general-2" => Some(EnvironmentId::General2),
-        "general-3" => Some(EnvironmentId::General3),
-        "general-4" => Some(EnvironmentId::General4),
-        "general-5" => Some(EnvironmentId::General5),
-        "payment" => Some(EnvironmentId::Payment),
-        _ => None,
-    }
-}
+fn parse_environment(value: &str) -> Option<EnvironmentId> { match value { "general-1" => Some(EnvironmentId::General1), "general-2" => Some(EnvironmentId::General2), "general-3" => Some(EnvironmentId::General3), "general-4" => Some(EnvironmentId::General4), "general-5" => Some(EnvironmentId::General5), "payment" => Some(EnvironmentId::Payment), _ => None } }
 
 fn run_debug(args: &[String], runtime: &Runtime) -> anyhow::Result<()> {
     let demo_count = value_after(args, "--demo").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
@@ -191,12 +152,7 @@ fn run_debug(args: &[String], runtime: &Runtime) -> anyhow::Result<()> {
     runtime.rebalance_once();
     println!("\nRBE CONTAINER RUNTIME — DEBUG");
     println!("environments={} swamps_per_environment={} workers_per_swamp={} global_queue={} cache_profiles={} artifacts={}", runtime.snapshots().len(), runtime.config().swamps_per_environment, runtime.config().workers_per_swamp, runtime.global_queue_len(), runtime.cache().len(), runtime.cache().artifact_count());
-    for _ in 0..10 {
-        print_snapshot(runtime);
-        if demo_count == 0 { break; }
-        thread::sleep(Duration::from_millis(250));
-        runtime.rebalance_once();
-    }
+    for _ in 0..10 { print_snapshot(runtime); if demo_count == 0 { break; } thread::sleep(Duration::from_millis(250)); runtime.rebalance_once(); }
     Ok(())
 }
 
