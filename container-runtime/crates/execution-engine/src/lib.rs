@@ -4,7 +4,7 @@
 //! `run() -> i32`. Resource limits are applied through Wasmtime fuel here and
 //! through the OS sandbox/resource layer around the worker process.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use wasmtime::{Config, Engine, Instance, Module, Store};
 
 #[derive(Debug, Clone, Copy)]
@@ -34,20 +34,27 @@ impl WasmExecutor {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.cranelift_nan_canonicalization(true);
-        Ok(Self { engine: Engine::new(&config)? })
+        let engine = Engine::new(&config)
+            .map_err(|error| anyhow::anyhow!("initialize Wasmtime engine: {error}"))?;
+        Ok(Self { engine })
     }
 
     pub fn execute(&self, wasm: &[u8], limits: ExecutionLimits) -> Result<ExecutionResult> {
-        let module = Module::new(&self.engine, wasm).context("compile WASM artifact")?;
+        let module = Module::new(&self.engine, wasm)
+            .map_err(|error| anyhow::anyhow!("compile WASM artifact: {error}"))?;
         let mut store = Store::new(&self.engine, ());
-        store.set_fuel(limits.fuel).context("configure WASM fuel limit")?;
+        store
+            .set_fuel(limits.fuel)
+            .map_err(|error| anyhow::anyhow!("configure WASM fuel limit: {error}"))?;
 
         let instance = Instance::new(&mut store, &module, &[])
-            .context("instantiate WASM artifact")?;
+            .map_err(|error| anyhow::anyhow!("instantiate WASM artifact: {error}"))?;
         let run = instance
             .get_typed_func::<(), i32>(&mut store, "run")
-            .context("WASM artifact must export run() -> i32")?;
-        let exit_code = run.call(&mut store, ()).context("execute WASM run()")?;
+            .map_err(|error| anyhow::anyhow!("WASM artifact must export run() -> i32: {error}"))?;
+        let exit_code = run
+            .call(&mut store, ())
+            .map_err(|error| anyhow::anyhow!("execute WASM run(): {error}"))?;
         let remaining = store.get_fuel().unwrap_or(0);
 
         Ok(ExecutionResult {
