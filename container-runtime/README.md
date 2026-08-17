@@ -1,6 +1,6 @@
 # container-runtime
 
-**Standalone execution service.** This is a separate Cargo workspace and a separate `container` executable. The main `backend` process launches and controls it over authenticated IPC; the container runtime is not merged into the backend process. This separation is a deliberate security boundary.
+**Standalone execution service.** This is a separate Cargo workspace and a separate `container` executable. The main `backend` process is expected to launch and control it over authenticated IPC; the container runtime is not merged into the backend process. This separation is a deliberate security boundary.
 
 ## Runtime topology
 
@@ -10,9 +10,9 @@ backend
   ▼
 container
   │
-  ├── global queue
+  ├── global queue + durable execution journal
   ├── scheduler
-  ├── cache / execution profiles
+  ├── persistent WASM artifact cache + learned profiles
   └── environments
        ├── general-1 → Swamps → Workers
        ├── general-2 → Swamps → Workers
@@ -28,28 +28,21 @@ Every execution receives a unique `ExecutionId` and carries an explicit resource
 
 A **Swamp** is an Environment-local execution workshop. It owns a local queue, reusable workers, queue-cost accounting, throughput measurements, and local rebalancing.
 
-A **Worker** is a reusable execution slot. Workers transition through `Idle → Running → Idle`; future sandbox failures must be able to destroy/recreate workers without giving the workload access to the trusted supervisor.
+A **Worker** is a reusable execution slot. Workers transition through `Idle → Running → Idle`. Real WASM artifacts are executed in a separate disposable `container --worker` child process so the scheduler/control plane does not become the workload boundary.
 
-Global scheduling assigns work to an Environment. The Environment distributes it across Swamps, and Swamps rebalance backlog toward higher-throughput Swamps using bounded task batches.
+Global scheduling assigns work to an Environment. The Environment distributes it across Swamps, and Swamps rebalance backlog toward higher-capacity Swamps using bounded queue chunks.
 
 ## Cache and cost learning
 
-The first scheduler slice contains an in-memory artifact/profile cache. Static `WorkCost` is a hint, not a security control. Actual execution duration is recorded into an execution profile so the scheduler can learn observed workload behavior instead of relying on source length or a fake millisecond cost.
+`ArtifactCache` stores approved WASM artifacts and execution profiles. Static `WorkCost` is only a scheduling hint, never a security control. Actual execution duration is recorded so workload behavior can be learned from reality instead of source length or a fake millisecond score.
 
-The intended future cache structure is:
-
-```text
-artifact hash
-  ├── WASM artifact
-  ├── declared cost profile
-  └── learned execution profile (p50/p95/p99, resource dimensions)
-```
+Artifacts are persisted under the container-owned runtime data directory and lazily restored after a process restart.
 
 ## Control IPC
 
-`ipc-protocol` defines versioned length-prefixed JSON messages for the standalone container process. The current control service binds to an explicitly supplied address and requires `RBE_CONTAINER_TOKEN` for request authentication.
+`ipc-protocol` defines versioned length-prefixed JSON messages for the standalone container process. The control service binds only when explicitly requested and requires `RBE_CONTAINER_TOKEN` for request authentication.
 
-Supported protocol categories include:
+The current control surface includes:
 
 - hello/authentication
 - execute submission
@@ -58,7 +51,7 @@ Supported protocol categories include:
 - cancellation
 - environment restart
 
-The current branch wires authenticated execute submission into the live scheduler. Cancellation and environment restart remain lifecycle work to be completed before they can be advertised as fully operational.
+The backend-side launcher/client is still a separate integration task; the container server itself is operational on the branch.
 
 ## Security boundary
 
@@ -71,13 +64,27 @@ Each execution carries:
 - restricted syscall policy;
 - CPU, memory, disk, network, process, file-descriptor, and wall-time limits.
 
-These are currently **policy contracts**. They are not a claim that the OS already enforces every restriction. The kernel-level implementation belongs in `sandbox-primitives` and the execution backend.
+On **Linux**, real artifact execution is refused unless the execution can be placed in:
 
-The current Vault implementation uses a separate `backend-rs-container` namespace, but application ACLs are not an OS security boundary by themselves. A process running with the same OS identity can bypass the Vault API. Real host-secret isolation therefore still requires OS-level sandboxing.
+- PID/mount/IPC/UTS/network namespaces;
+- `PR_SET_NO_NEW_PRIVS`;
+- an x86_64 seccomp deny-list for host-control/privilege syscalls;
+- cgroup-v2 CPU, memory and PID limits;
+- a hard wall-clock timeout.
 
-## Payment environment
+The actual WASM code runs in the disposable worker process with Wasmtime fuel and memory policy in addition to the OS boundary.
 
-The payment environment remains a dedicated fixed environment with tighter abuse thresholds and its existing encrypted processing boundary. Its encryption/payment code is still subject to the warnings in `payment.rs`; the presence of the container scheduler does not make payment integration production-ready.
+On **Windows/non-Linux**, the policy contracts and portable scheduler remain buildable, but the runtime deliberately refuses to claim a secure OS sandbox until a native enforcement backend (for example Job Objects/AppContainer or an equivalent hardened design) exists.
+
+The current Vault implementation uses a separate `backend-rs-container` namespace, but application ACLs are not an OS security boundary by themselves. Real host-secret isolation comes from the OS sandbox and process identity boundary.
+
+## Restart, cancellation and recovery
+
+The runtime keeps an append-only execution journal. Unresolved `queued` executions are replayed after a container-process restart using their original execution IDs. Approved WASM artifacts are persistent in the artifact cache, so recovery does not require the backend to resend the artifact.
+
+Environment restart rebuilds its Swamp/Worker pool and requeues work that has not started. Cancellation removes queued work and marks running work for cooperative termination; wall-time expiry can forcibly kill the isolated worker process.
+
+The current queue model is **at-least-once** across crashes: a crash between execution and the final `done` journal event can cause a replay. Exactly-once external side effects are intentionally not promised by the runtime.
 
 ## Debug mode
 
@@ -87,21 +94,23 @@ The standalone binary exposes live scheduler state:
 cargo run -p container -- --debug --swamps-per-environment 2 --workers-per-swamp 2 --demo 100
 ```
 
-The output shows Environment → Swamp → Worker topology, execution IDs, queue depth/cost, throughput, worker state, and cache profiles.
+The output shows Environment → Swamp → Worker topology, execution IDs, generation, queue depth/cost, throughput, worker state, failures, and cache/artifact counts.
 
-## What is still not implemented
+## Security test status
 
-The following remain required before calling this a production container sandbox:
+The branch contains automated unit/smoke coverage for sandbox policy validation, resource-limit checks, real Wasm executor rejection of invalid artifacts, IPC framing, cache persistence logic, and Linux security-layer jobs in CI.
 
-- real WASM execution in `execution-engine`;
-- OS-enforced namespaces / process isolation;
-- cgroup or Windows Job Object resource enforcement;
-- seccomp / platform syscall restrictions;
-- capability dropping and dedicated OS identities;
-- durable queue checkpoint/recovery;
-- full worker cancellation and environment restart semantics;
-- authenticated control IPC integrated with the main backend launcher;
-- complete sandbox escape/stress-test suite;
-- persistent cache invalidation and dependency-aware artifact reuse.
+A **full hostile-workload escape suite is still required** before production security sign-off. That suite should exercise filesystem exposure, process visibility, namespace creation, ptrace, mount, BPF, key management, device access, network escape, fork/resource exhaustion, and runtime-control-socket access from inside the worker boundary.
 
-Do not describe the current scheduler as a secure OS sandbox yet. The current branch is the execution-control foundation that those enforcement layers plug into.
+## Remaining production work
+
+The major remaining pieces are:
+
+- backend-side launcher/client integration for the standalone `container` process;
+- native Windows OS-enforcement backend;
+- stronger filesystem-root isolation (the current Linux namespace layer does not yet build a dedicated chroot/rootfs image);
+- a complete hostile-workload escape/stress suite;
+- dependency-aware cache invalidation and richer multi-dimensional p50/p95/p99 profiles;
+- immediate cancellation signalling to an already-running worker rather than only cooperative cancellation/timeout;
+- production-grade sandbox identity/capability dropping and dedicated OS user management;
+- full execution-state persistence beyond the queue-recovery journal.
