@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use container_runtime_core::{EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost};
 use ipc_protocol::{decode_request, read_frame, write_frame, Request, Response, PROTOCOL_VERSION};
+use resource_limits::ResourceLimits;
+use sandbox_primitives::SandboxPolicy;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -43,7 +45,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let registry = EnvironmentRegistry::new(io, vault, &vault_data_dir);
+    let registry = Arc::new(EnvironmentRegistry::new(io, vault, &vault_data_dir));
     let swamps_per_environment = value_after(&args, "--swamps-per-environment")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
@@ -75,7 +77,7 @@ fn run_control_server(
     address: &str,
     token: String,
     runtime: Arc<Runtime>,
-    registry: EnvironmentRegistry,
+    registry: Arc<EnvironmentRegistry>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
     println!("container: control socket listening on {}", listener.local_addr()?);
@@ -85,6 +87,7 @@ fn run_control_server(
             Ok(stream) => {
                 let token = token.clone();
                 let runtime = Arc::clone(&runtime);
+                let registry = Arc::clone(&registry);
                 thread::spawn(move || {
                     if let Err(err) = handle_connection(stream, &token, &runtime, &registry) {
                         tracing::warn!(%err, "container control connection closed with error");
@@ -126,13 +129,31 @@ fn handle_connection(
                     code: "AUTH_FAILED".into(),
                     message: "container control authentication failed".into(),
                 }
+            } else if let Some(environment) = parse_environment(&request.environment) {
+                let cost = WorkCost {
+                    cpu: request.declared_cost.cpu,
+                    memory: request.declared_cost.memory,
+                    io: request.declared_cost.io,
+                    network: request.declared_cost.network,
+                };
+                let execution_id = runtime.submit_with_policy(
+                    environment,
+                    request.artifact_hash,
+                    cost,
+                    ResourceLimits::default(),
+                    SandboxPolicy::default(),
+                    0,
+                    request.payload,
+                );
+                Response::Accepted {
+                    request_id: request.request_id,
+                    execution_id: execution_id.to_string(),
+                }
             } else {
-                let Some(environment) = parse_environment(&request.environment) else {
-                    Response::Error {
-                        request_id: Some(request.request_id),
-                        code: "INVALID_ENVIRONMENT".into(),
-                        message: format!("unknown container environment: {}", request.environment),
-                    }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "INVALID_ENVIRONMENT".into(),
+                    message: format!("unknown container environment: {}", request.environment),
                 }
             }
         }
@@ -151,7 +172,6 @@ fn handle_connection(
                         "process": "container",
                         "environments": registry.health_snapshot().len(),
                         "queue": runtime.global_queue_len(),
-                        "runtime": runtime.snapshots().len(),
                         "sandbox_policy": "deny-by-default",
                         "wasm_engine": "pending-execution-engine"
                     }),
@@ -176,8 +196,7 @@ fn handle_connection(
                     request_id: request.request_id,
                     body: serde_json::json!({
                         "execution_id": request.execution_id,
-                        "environments": environments.len(),
-                        "state": environments.iter().map(|env| serde_json::json!({
+                        "environments": environments.iter().map(|env| serde_json::json!({
                             "id": env.id.to_string(),
                             "queued": env.queued,
                             "queued_cost": env.queued_cost,
