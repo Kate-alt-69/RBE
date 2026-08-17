@@ -8,7 +8,6 @@ use std::sync::Arc;
 use core_lib::AppState;
 use supervisor::{BackendState, RestartPolicy, Supervisor};
 
-mod container_embed;
 mod container_process;
 mod error_reporter_daemon;
 mod port_guard;
