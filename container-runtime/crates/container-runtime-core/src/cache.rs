@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::execution::WorkCost;
+
+const ARTIFACT_DIR: &str = "./data/container-runtime/artifacts";
 
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionProfile {
@@ -21,9 +25,7 @@ impl ExecutionProfile {
         self.declared_cost = declared_cost;
     }
 
-    pub fn average_ms(&self) -> f64 {
-        if self.samples == 0 { 0.0 } else { self.total_ms as f64 / self.samples as f64 }
-    }
+    pub fn average_ms(&self) -> f64 { if self.samples == 0 { 0.0 } else { self.total_ms as f64 / self.samples as f64 } }
 }
 
 #[derive(Debug, Default)]
@@ -43,18 +45,30 @@ impl ArtifactCache {
     }
 
     pub fn put_artifact(&self, artifact_hash: impl Into<String>, wasm: Vec<u8>) {
-        self.artifacts.lock().expect("artifact cache poisoned").insert(artifact_hash.into(), wasm);
+        let artifact_hash = artifact_hash.into();
+        self.artifacts.lock().expect("artifact cache poisoned").insert(artifact_hash.clone(), wasm.clone());
+        if valid_artifact_name(&artifact_hash) {
+            let dir = PathBuf::from(ARTIFACT_DIR);
+            if fs::create_dir_all(&dir).is_ok() {
+                let _ = fs::write(dir.join(format!("{artifact_hash}.wasm")), &wasm);
+            }
+        }
     }
 
     pub fn artifact(&self, artifact_hash: &str) -> Option<Vec<u8>> {
-        self.artifacts.lock().expect("artifact cache poisoned").get(artifact_hash).cloned()
+        if let Some(bytes) = self.artifacts.lock().expect("artifact cache poisoned").get(artifact_hash).cloned() {
+            return Some(bytes);
+        }
+        if !valid_artifact_name(artifact_hash) { return None; }
+        let bytes = fs::read(PathBuf::from(ARTIFACT_DIR).join(format!("{artifact_hash}.wasm"))).ok()?;
+        self.artifacts.lock().expect("artifact cache poisoned").insert(artifact_hash.to_string(), bytes.clone());
+        Some(bytes)
     }
 
-    pub fn len(&self) -> usize {
-        self.profiles.lock().expect("artifact cache poisoned").len()
-    }
+    pub fn len(&self) -> usize { self.profiles.lock().expect("artifact cache poisoned").len() }
+    pub fn artifact_count(&self) -> usize { self.artifacts.lock().expect("artifact cache poisoned").len() }
+}
 
-    pub fn artifact_count(&self) -> usize {
-        self.artifacts.lock().expect("artifact cache poisoned").len()
-    }
+fn valid_artifact_name(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
