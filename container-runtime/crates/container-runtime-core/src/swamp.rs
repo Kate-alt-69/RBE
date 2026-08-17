@@ -39,7 +39,11 @@ impl Swamp {
 
     pub fn id(&self) -> usize { self.id }
     pub fn enqueue(&self, task: ExecutionTask) { self.queue.lock().expect("swamp queue poisoned").push_back(task); }
-    pub fn drain(&self, count: usize) -> Vec<ExecutionTask> { let mut queue = self.queue.lock().expect("swamp queue poisoned"); queue.drain(..count.min(queue.len())).collect() }
+    pub fn drain(&self, count: usize) -> Vec<ExecutionTask> {
+        let mut queue = self.queue.lock().expect("swamp queue poisoned");
+        let drain_count = count.min(queue.len());
+        queue.drain(..drain_count).collect()
+    }
     pub fn drain_all(&self) -> Vec<ExecutionTask> { self.queue.lock().expect("swamp queue poisoned").drain(..).collect() }
 
     pub fn remove_execution_string(&self, id: &str) -> bool {
