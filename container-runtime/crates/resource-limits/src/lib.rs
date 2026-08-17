@@ -1,5 +1,6 @@
 //! Resource policy and Linux cgroup-v2 enforcement.
 
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
