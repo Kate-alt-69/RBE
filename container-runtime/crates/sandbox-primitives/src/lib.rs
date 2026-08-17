@@ -81,9 +81,6 @@ impl SandboxLauncher {
         #[cfg(target_os = "linux")]
         {
             let mut command = Command::new("unshare");
-            // Keep the cgroup namespace isolated as well. Without it a guest can
-            // observe the host cgroup path through /proc even when the worker is
-            // attached to a dedicated cgroup-v2 leaf.
             command.args([
                 "--fork", "--pid", "--mount", "--ipc", "--uts", "--cgroup",
                 "--mount-proc",
@@ -142,22 +139,22 @@ pub fn install_restricted_seccomp() -> std::io::Result<()> {
     ];
 
     let mut filter = Vec::with_capacity(blocked.len() * 2 + 4);
-    filter.push(libc::sock_filter { code: libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, jt: 0, jf: 0, k: 4 });
-    filter.push(libc::sock_filter { code: libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, jt: 1, jf: 0, k: ARCH_X86_64 });
-    filter.push(libc::sock_filter { code: libc::BPF_RET | libc::BPF_K, jt: 0, jf: 0, k: libc::SECCOMP_RET_KILL_PROCESS });
-    filter.push(libc::sock_filter { code: libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, jt: 0, jf: 0, k: 0 });
+    filter.push(libc::sock_filter { code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, jt: 0, jf: 0, k: 4 });
+    filter.push(libc::sock_filter { code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16, jt: 1, jf: 0, k: ARCH_X86_64 });
+    filter.push(libc::sock_filter { code: (libc::BPF_RET | libc::BPF_K) as u16, jt: 0, jf: 0, k: libc::SECCOMP_RET_KILL_PROCESS });
+    filter.push(libc::sock_filter { code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, jt: 0, jf: 0, k: 0 });
 
     for syscall in blocked {
         filter.push(libc::sock_filter {
-            code: libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
             jt: 0,
             jf: 1,
             k: *syscall as u32,
         });
-        filter.push(libc::sock_filter { code: libc::BPF_RET | libc::BPF_K, jt: 0, jf: 0, k: libc::SECCOMP_RET_KILL_PROCESS });
+        filter.push(libc::sock_filter { code: (libc::BPF_RET | libc::BPF_K) as u16, jt: 0, jf: 0, k: libc::SECCOMP_RET_KILL_PROCESS });
     }
 
-    filter.push(libc::sock_filter { code: libc::BPF_RET | libc::BPF_K, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW });
+    filter.push(libc::sock_filter { code: (libc::BPF_RET | libc::BPF_K) as u16, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW });
     let mut program = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_mut_ptr() };
     let rc = unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &mut program as *mut libc::sock_fprog) };
     if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
