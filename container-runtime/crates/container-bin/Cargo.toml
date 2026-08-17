@@ -13,6 +13,7 @@ container-runtime-core = { path = "../container-runtime-core" }
 environments = { path = "../environments" }
 ipc-protocol = { path = "../ipc-protocol" }
 execution-engine = { path = "../execution-engine" }
+resource-limits = { path = "../resource-limits" }
 sandbox-primitives = { path = "../sandbox-primitives" }
 atomic-io = { path = "../../../atomic-io" }
 vault = { path = "../../../vault" }
