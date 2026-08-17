@@ -5,6 +5,8 @@ use std::thread;
 use std::time::Duration;
 
 use environments::EnvironmentId;
+use resource_limits::ResourceLimits;
+use sandbox_primitives::SandboxPolicy;
 
 use crate::cache::ArtifactCache;
 use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot};
@@ -86,14 +88,39 @@ impl Runtime {
         cost: WorkCost,
         work_ms: u64,
     ) -> ExecutionId {
+        self.submit_with_policy(
+            environment,
+            artifact_hash,
+            cost,
+            ResourceLimits::default(),
+            SandboxPolicy::default(),
+            work_ms,
+            Vec::new(),
+        )
+    }
+
+    pub fn submit_with_policy(
+        &self,
+        environment: EnvironmentId,
+        artifact_hash: impl Into<String>,
+        cost: WorkCost,
+        limits: ResourceLimits,
+        sandbox: SandboxPolicy,
+        work_ms: u64,
+        payload: Vec<u8>,
+    ) -> ExecutionId {
         let id = ExecutionId::new(self.next_execution.fetch_add(1, Ordering::Relaxed));
         self.global_queue.lock().expect("global queue poisoned").push_back((
             environment,
             ExecutionTask {
                 id,
+                environment: environment.to_string(),
                 artifact_hash: artifact_hash.into(),
                 declared_cost: cost,
+                limits,
+                sandbox,
                 work_ms,
+                payload,
             },
         ));
         id
@@ -164,5 +191,20 @@ mod tests {
         let snapshots = runtime.snapshots();
         assert_eq!(snapshots.len(), 6);
         assert!(snapshots.iter().all(|snapshot| snapshot.swamps.len() == 2));
+    }
+
+    #[test]
+    fn policy_is_attached_to_execution() {
+        let runtime = Runtime::new(RuntimeConfig { swamps_per_environment: 1, workers_per_swamp: 1, rebalance_interval_ms: 1000 });
+        let id = runtime.submit_with_policy(
+            EnvironmentId::General1,
+            "secure-artifact",
+            WorkCost { cpu: 10, ..Default::default() },
+            ResourceLimits::default(),
+            SandboxPolicy::default(),
+            0,
+            b"payload".to_vec(),
+        );
+        assert!(id.to_string().starts_with("exec-"));
     }
 }
