@@ -9,6 +9,7 @@ use core_lib::AppState;
 use supervisor::{BackendState, RestartPolicy, Supervisor};
 
 mod container_embed;
+mod container_process;
 mod error_reporter_daemon;
 mod port_guard;
 
@@ -36,9 +37,7 @@ async fn main() {
             std::process::exit(2);
         }
         let value = |flag: &str, default: &str| {
-            args.windows(2).find(|pair| pair[0] == flag)
-                .map(|pair| pair[1].clone())
-                .unwrap_or_else(|| default.to_string())
+            args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone()).unwrap_or_else(|| default.to_string())
         };
         let service_name = value("--service-name", "backend-rs");
         let data_dir = PathBuf::from(value("--data-dir", "./data/admin"));
@@ -57,43 +56,28 @@ async fn main() {
 }
 
 async fn run_error_reporter_daemon(separate_process: bool) -> anyhow::Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).with_target(true).init();
-    tracing::info!(
-        pid = std::process::id(), separate_process,
-        "backend.exe running in --er (error-reporter-daemon) mode"
-    );
+    tracing::info!(pid = std::process::id(), separate_process, "backend.exe running in --er (error-reporter-daemon) mode");
     let io = atomic_io::AtomicIo::new();
     let admin_dir = PathBuf::from("./data/admin");
     error_reporter_daemon::run(io, admin_dir, separate_process).await
 }
 
 fn spawn_error_reporter_daemon_process() -> anyhow::Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("could not resolve current_exe to spawn the error-reporter daemon: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| anyhow::anyhow!("could not resolve current_exe to spawn the error-reporter daemon: {e}"))?;
     tokio::spawn(async move {
         const MAX_ATTEMPTS: u32 = 5;
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
         for attempt in 1..=MAX_ATTEMPTS {
-            let spawn_result = tokio::process::Command::new(&exe)
-                .args(["--er", "--separate-process", "--launch"])
-                .kill_on_drop(true)
-                .spawn();
+            let spawn_result = tokio::process::Command::new(&exe).args(["--er", "--separate-process", "--launch"]).kill_on_drop(true).spawn();
             let mut child = match spawn_result {
                 Ok(child) => child,
-                Err(err) => {
-                    tracing::error!(attempt, error = %err, "failed to spawn error-reporter daemon process");
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                }
+                Err(err) => { tracing::error!(attempt, error = %err, "failed to spawn error-reporter daemon process"); tokio::time::sleep(RETRY_DELAY).await; continue; }
             };
             tracing::info!(pid = child.id(), attempt, "error-reporter daemon process spawned");
             match child.wait().await {
-                Ok(status) if status.success() => {
-                    tracing::info!("error-reporter daemon process exited cleanly — not restarting");
-                    return;
-                }
+                Ok(status) if status.success() => { tracing::info!("error-reporter daemon process exited cleanly — not restarting"); return; }
                 Ok(status) => tracing::warn!(attempt, %status, "error-reporter daemon process exited unexpectedly"),
                 Err(err) => tracing::warn!(attempt, error = %err, "error watching error-reporter daemon process"),
             }
@@ -111,8 +95,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
 
     let settings_path = std::env::var("SETTINGS_PATH").unwrap_or_else(|_| "settings.json".to_string());
     boot_trace(format!("settings path={settings_path}"));
-    let config = config::Config::load(&settings_path)
-        .map_err(|err| anyhow::anyhow!("failed to load {settings_path}: {err}"))?;
+    let config = config::Config::load(&settings_path).map_err(|err| anyhow::anyhow!("failed to load {settings_path}: {err}"))?;
     let config = Arc::new(config);
     boot_trace("settings loaded");
     boot_trace(format!("effective api bind={}:{}", config.api.host, config.api.port));
@@ -127,27 +110,14 @@ async fn boot_and_run() -> anyhow::Result<()> {
     boot_trace("error-client initialized, panic hook installed");
     tracing::info!(path = %settings_path, "configuration loaded");
 
-    if let Err(err) = spawn_error_reporter_daemon_process() {
-        tracing::error!(error = %err, "failed to spawn error-reporter daemon process — continuing boot without it");
-    }
+    if let Err(err) = spawn_error_reporter_daemon_process() { tracing::error!(error = %err, "failed to spawn error-reporter daemon process — continuing boot without it"); }
 
-    // Vault is a hard boot dependency. The client owns a bounded restart
-    // loop for the child. If that loop cannot produce a ready Vault, this is
-    // a controlled boot shutdown: report the failure, never start the HTTP
-    // server, and return cleanly from boot instead of treating Vault failure
-    // as a Rust panic/fatal crash.
     boot_trace(format!("vault starting as separate process data dir={}", admin_dir.display()));
     let vault_instance = match vault_process::VaultClient::spawn("backend-rs", &admin_dir) {
         Ok(vault) => Arc::new(vault),
         Err(err) => {
             let details = format!("{err:#}");
-            error_client::report_issue(error_client::IssueInput {
-                source: "backend.vault.startup",
-                level: Some(error_client::IssueLevel::Error),
-                category: None,
-                message: "Vault failed to become ready after restart attempts; backend is shutting down gracefully",
-                stack: Some(&details),
-            });
+            error_client::report_issue(error_client::IssueInput { source: "backend.vault.startup", level: Some(error_client::IssueLevel::Error), category: None, message: "Vault failed to become ready after restart attempts; backend is shutting down gracefully", stack: Some(&details) });
             tracing::error!(error = %err, "Vault failed to become ready after restart attempts; backend shutting down gracefully");
             return Ok(());
         }
@@ -155,14 +125,22 @@ async fn boot_and_run() -> anyhow::Result<()> {
     boot_trace("vault process ready");
 
     let container_cache_dir = PathBuf::from("./.cache/service");
-    match container_embed::extract_if_needed(&io, &container_cache_dir) {
+    let container_process = match container_embed::extract_if_needed(&io, &container_cache_dir) {
         Ok(Some(path)) => {
             boot_trace(format!("embedded container binary ready at {}", path.display()));
             tracing::info!(path = %path.display(), "embedded container binary extracted and ready");
+            Some(container_process::ContainerProcess::spawn(&path).await?)
         }
-        Ok(None) => tracing::debug!("no embedded container binary — standalone build"),
-        Err(err) => tracing::warn!(error = %err, "failed to extract embedded container binary"),
-    }
+        Ok(None) => {
+            tracing::debug!("no embedded container binary — standalone build; container process not auto-started");
+            None
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to extract embedded container binary");
+            return Err(err);
+        }
+    };
+    if let Some(process) = &container_process { boot_trace(format!("container process ready pid={:?} address={}", process.pid(), process.address)); }
 
     let mut supervisor = Supervisor::new(RestartPolicy::default());
     supervisor.set_state(BackendState::Initializing);
@@ -178,11 +156,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
         let ip_strikes = app_state.ip_strikes.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                rate_limiters.sweep();
-                ip_strikes.sweep();
-            }
+            loop { interval.tick().await; rate_limiters.sweep(); ip_strikes.sweep(); }
         });
     }
 
@@ -194,10 +168,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
             let regenerated = outcomes.iter().filter(|o| matches!(o.result, Ok(route_engine::cache::SyncAction::Regenerated))).count();
             let failed: Vec<_> = outcomes.iter().filter(|o| o.result.is_err()).collect();
             boot_trace(format!("transpiler cache sync: {} file(s), {regenerated} regenerated, {} failed", outcomes.len(), failed.len()));
-            for outcome in &failed {
-                let message = outcome.result.as_ref().unwrap_err();
-                tracing::warn!(route = %outcome.route_path.display(), error = %message, "transpiler: failed to generate Rust artifact for this route (interpreted serving is unaffected)");
-            }
+            for outcome in &failed { let message = outcome.result.as_ref().unwrap_err(); tracing::warn!(route = %outcome.route_path.display(), error = %message, "transpiler: failed to generate Rust artifact for this route (interpreted serving is unaffected)"); }
         }
         Err(err) => tracing::warn!(error = %err, "transpiler cache sync failed — continuing boot without it"),
     }
@@ -207,14 +178,12 @@ async fn boot_and_run() -> anyhow::Result<()> {
 
     let addr = format!("{}:{}", config.api.host, config.api.port);
     if config.runtime.reclaim_port { port_guard::reclaim_port_if_needed(config.api.port); }
-    let listener = tokio::net::TcpListener::bind(addr.as_str()).await
-        .map_err(|err| anyhow::anyhow!("failed to bind {addr}: {err}"))?;
+    let listener = tokio::net::TcpListener::bind(addr.as_str()).await.map_err(|err| anyhow::anyhow!("failed to bind {addr}: {err}"))?;
 
     tracing::info!(%addr, "backend ready");
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|err| anyhow::anyhow!("server error: {err}"))?;
+    let result = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await;
+    drop(container_process);
+    result.map_err(|err| anyhow::anyhow!("server error: {err}"))?;
     Ok(())
 }
 
@@ -224,9 +193,7 @@ fn boot_trace(message: impl AsRef<str>) {
     eprintln!("{line}");
     let path = boot_debug_log_path();
     if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "[pid={}] {line}", std::process::id());
-    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) { let _ = writeln!(file, "[pid={}] {line}", std::process::id()); }
 }
 
 fn boot_debug_enabled() -> bool {
@@ -239,28 +206,4 @@ fn boot_debug_enabled() -> bool {
         if arg == "-debug" { return args.get(index + 1).map(|value| truthy(value)).unwrap_or(true); }
     }
     false
-}
-
-fn boot_debug_log_path() -> PathBuf {
-    std::env::var_os("RBE_BOOT_LOG").map(PathBuf::from).unwrap_or_else(|| route_engine::binary_dir().join("boot.log"))
-}
-
-fn truthy_env(name: &str) -> bool {
-    std::env::var(name).map(|value| truthy(&value)).unwrap_or(false)
-}
-
-fn truthy(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async { tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler"); };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("failed to install SIGTERM handler").recv().await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
-    tracing::info!("shutdown signal received");
 }
