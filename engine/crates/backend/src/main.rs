@@ -19,40 +19,23 @@ async fn main() {
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
     if has("--er") {
-        if !has("--launch") {
-            eprintln!("backend.exe --er requires --launch as well");
-            std::process::exit(2);
-        }
+        if !has("--launch") { eprintln!("backend.exe --er requires --launch as well"); std::process::exit(2); }
         let separate = has("--separate-process") || has("--saperate-process");
-        if let Err(err) = run_error_reporter_daemon(separate).await {
-            eprintln!("fatal error-reporter-daemon error: {err:#}");
-            std::process::exit(1);
-        }
+        if let Err(err) = run_error_reporter_daemon(separate).await { eprintln!("fatal error-reporter-daemon error: {err:#}"); std::process::exit(1); }
         return;
     }
 
     if has("--vault") {
-        if !has("--separate-process") && !has("--saperate-process") {
-            eprintln!("backend.exe --vault requires --separate-process");
-            std::process::exit(2);
-        }
-        let value = |flag: &str, default: &str| {
-            args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone()).unwrap_or_else(|| default.to_string())
-        };
+        if !has("--separate-process") && !has("--saperate-process") { eprintln!("backend.exe --vault requires --separate-process"); std::process::exit(2); }
+        let value = |flag: &str, default: &str| args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone()).unwrap_or_else(|| default.to_string());
         let service_name = value("--service-name", "backend-rs");
         let data_dir = PathBuf::from(value("--data-dir", "./data/admin"));
         let force_dbus = has("--dbus");
-        if let Err(err) = vault_process::run_vault_daemon(service_name, data_dir, force_dbus) {
-            eprintln!("fatal Vault daemon error: {err:#}");
-            std::process::exit(1);
-        }
+        if let Err(err) = vault_process::run_vault_daemon(service_name, data_dir, force_dbus) { eprintln!("fatal Vault daemon error: {err:#}"); std::process::exit(1); }
         return;
     }
 
-    if let Err(err) = boot_and_run().await {
-        eprintln!("fatal boot error: {err:#}");
-        std::process::exit(1);
-    }
+    if let Err(err) = boot_and_run().await { eprintln!("fatal boot error: {err:#}"); std::process::exit(1); }
 }
 
 async fn run_error_reporter_daemon(separate_process: bool) -> anyhow::Result<()> {
@@ -150,7 +133,6 @@ async fn boot_and_run() -> anyhow::Result<()> {
 
     let app_state = AppState::new(config.clone(), state_rx, vault_instance);
     boot_trace("app state created");
-
     {
         let rate_limiters = app_state.rate_limiters.clone();
         let ip_strikes = app_state.ip_strikes.clone();
@@ -175,11 +157,9 @@ async fn boot_and_run() -> anyhow::Result<()> {
 
     let router = api::build_router(app_state, &api_dir)?;
     boot_trace("router built");
-
     let addr = format!("{}:{}", config.api.host, config.api.port);
     if config.runtime.reclaim_port { port_guard::reclaim_port_if_needed(config.api.port); }
     let listener = tokio::net::TcpListener::bind(addr.as_str()).await.map_err(|err| anyhow::anyhow!("failed to bind {addr}: {err}"))?;
-
     tracing::info!(%addr, "backend ready");
     let result = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await;
     drop(container_process);
@@ -206,4 +186,18 @@ fn boot_debug_enabled() -> bool {
         if arg == "-debug" { return args.get(index + 1).map(|value| truthy(value)).unwrap_or(true); }
     }
     false
+}
+
+fn boot_debug_log_path() -> PathBuf { std::env::var_os("RBE_BOOT_LOG").map(PathBuf::from).unwrap_or_else(|| route_engine::binary_dir().join("boot.log")) }
+fn truthy_env(name: &str) -> bool { std::env::var(name).map(|value| truthy(&value)).unwrap_or(false) }
+fn truthy(value: &str) -> bool { matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") }
+
+async fn shutdown_signal() {
+    let ctrl_c = async { tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler"); };
+    #[cfg(unix)]
+    let terminate = async { tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("failed to install SIGTERM handler").recv().await; };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+    tracing::info!("shutdown signal received");
 }
