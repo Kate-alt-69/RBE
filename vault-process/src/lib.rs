@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 // Normal Vault startup should be around two seconds or less. Linux can
 // legitimately exceed that on a first boot when apt/D-Bus/Secret Service
-// needs to be bootstrapped, so we give that one-time path a larger hard
-// ceiling instead of killing the child while it is still installing.
+// needs to be bootstrapped, so allow a generous provisioning window instead
+// of abandoning the child while it is still installing.
 const STARTUP_TARGET: Duration = Duration::from_secs(2);
-const STARTUP_MAX: Duration = Duration::from_secs(15);
+const STARTUP_MAX: Duration = Duration::from_secs(300);
 const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
 const RESTART_DELAY: Duration = Duration::from_millis(200);
 const MAX_RESTARTS: u32 = 5;
