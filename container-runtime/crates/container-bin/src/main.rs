@@ -7,6 +7,8 @@
 //! the sandbox boundary and never starts the control plane. `--monitor` is a
 //! small sibling process that watches the container supervisor and its event log.
 
+mod dashboard;
+
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -24,6 +26,7 @@ use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, Sand
 
 const EVENT_LOG: &str = "./data/container-runtime/container-events.jsonl";
 const MONITOR_LOG: &str = "./data/container-runtime/container-monitor.log";
+const DEFAULT_DASHBOARD_ADDRESS: &str = "127.0.0.1:8787";
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -34,6 +37,9 @@ fn main() -> anyhow::Result<()> {
 
     let debug = args.iter().any(|arg| arg == "--debug");
     let listen = value_after(&args, "--listen");
+    let dashboard_disabled = args.iter().any(|arg| arg == "--no-dashboard");
+    let dashboard_address = value_after(&args, "--dashboard-listen")
+        .unwrap_or_else(|| DEFAULT_DASHBOARD_ADDRESS.to_string());
     emit_event("container_start", &format!("pid={}")
         .replace("{}", &std::process::id().to_string()));
 
@@ -76,9 +82,27 @@ fn main() -> anyhow::Result<()> {
         ..RuntimeConfig::default()
     });
 
+    let token = env::var("RBE_CONTAINER_TOKEN").ok();
+    if !dashboard_disabled {
+        match token.as_ref() {
+            Some(token) => {
+                if let Err(error) = dashboard::spawn(dashboard_address.clone(), token.clone(), runtime.clone()) {
+                    emit_event("dashboard_start_failed", &error.to_string());
+                    tracing::warn!(error = %error, address = %dashboard_address, "container dashboard could not be started");
+                } else {
+                    emit_event("dashboard_listening", &dashboard_address);
+                }
+            }
+            None => {
+                emit_event("dashboard_disabled_no_token", "RBE_CONTAINER_TOKEN is not set");
+                tracing::warn!("container dashboard disabled because RBE_CONTAINER_TOKEN is not set");
+            }
+        }
+    }
+
     if debug { run_debug(&args, &runtime)?; }
     if let Some(address) = listen {
-        let token = env::var("RBE_CONTAINER_TOKEN").map_err(|_| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
+        let token = token.ok_or_else(|| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
         run_control_server(&address, token, runtime.clone(), registry)?;
     } else if !debug {
         println!("container: no control socket requested; exiting after initialization");
@@ -243,7 +267,7 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, regi
 fn parse_environment(value: &str) -> Option<EnvironmentId> { match value { "general-1" => Some(EnvironmentId::General1), "general-2" => Some(EnvironmentId::General2), "general-3" => Some(EnvironmentId::General3), "general-4" => Some(EnvironmentId::General4), "general-5" => Some(EnvironmentId::General5), "payment" => Some(EnvironmentId::Payment), _ => None } }
 
 fn run_debug(args: &[String], runtime: &Runtime) -> anyhow::Result<()> {
-    let demo_count = value_after(args, "--demo").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+    let demo_count = value_after(&args, "--demo").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
     for index in 0..demo_count {
         let cost = if index % 5 == 0 { WorkCost { cpu: 100, memory: 20, io: 5, network: 0 } } else { WorkCost { cpu: 10, memory: 2, io: 1, network: 0 } };
         let work_ms = if index % 5 == 0 { 40 } else { 5 };
