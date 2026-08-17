@@ -31,3 +31,7 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
+
+[build-dependencies]
+sha2 = "0.10"
+hex = "0.4"
