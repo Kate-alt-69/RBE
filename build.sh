@@ -4,6 +4,9 @@
 # The full build implementation lives in build-core.sh. On Linux, Windows/MSVC
 # cross-builds use cargo-xwin instead of cargo-zigbuild so the Windows SDK/CRT
 # headers and libraries are available to C dependencies such as zstd-sys.
+#
+# After the core build succeeds, this wrapper packages the exact container-bin
+# artifact that was embedded into backend.exe under dist/<target>/dep/.
 set -e
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,9 +33,6 @@ exec "$REAL_CARGO" "\$@"
 EOF
         chmod +x "$SHIM_DIR/cargo"
 
-        # The core script detects cargo-zigbuild by name. Provide a tiny marker
-        # so its existing selection logic enters the cargo-zigbuild code path;
-        # our cargo shim above transparently converts that subcommand to xwin.
         cat > "$SHIM_DIR/cargo-zigbuild" <<'EOF'
 #!/bin/sh
 exit 0
@@ -43,4 +43,46 @@ EOF
     fi
 fi
 
-exec "$REPO_ROOT/build-core.sh" "$@"
+"$REPO_ROOT/build-core.sh" "$@"
+
+PROFILE="release"
+if [[ " ${*} " == *" --debug "* ]]; then
+    PROFILE="debug"
+fi
+
+CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/container-runtime/target}"
+PACKAGED_ANY=false
+
+for OUT_DIR in "$REPO_ROOT"/dist/*; do
+    [ -d "$OUT_DIR" ] || continue
+    TARGET="$(basename "$OUT_DIR")"
+    BACKEND="$OUT_DIR/backend"
+    [ -f "$OUT_DIR/backend.exe" ] && BACKEND="$OUT_DIR/backend.exe"
+    [ -f "$BACKEND" ] || continue
+
+    case "$TARGET" in
+        *windows*) CONTAINER_NAME="container.exe" ;;
+        *) CONTAINER_NAME="container" ;;
+    esac
+
+    CONTAINER_SOURCE="$CARGO_TARGET_ROOT/$TARGET/$PROFILE/container-bin"
+    [ "$CONTAINER_NAME" = "container.exe" ] && CONTAINER_SOURCE="$CARGO_TARGET_ROOT/$TARGET/$PROFILE/container-bin.exe"
+
+    if [ ! -f "$CONTAINER_SOURCE" ]; then
+        echo "ERROR: packaged backend exists for $TARGET but matching container binary is missing: $CONTAINER_SOURCE" >&2
+        exit 1
+    fi
+
+    DEP_DIR="$OUT_DIR/dep"
+    mkdir -p "$DEP_DIR"
+    cp "$CONTAINER_SOURCE" "$DEP_DIR/$CONTAINER_NAME"
+    PACKAGED_ANY=true
+    echo "  -> $DEP_DIR/$CONTAINER_NAME" >&2
+done
+
+if [ "$PACKAGED_ANY" = false ]; then
+    echo "ERROR: no backend target was produced; refusing to report a packaged build" >&2
+    exit 1
+fi
+
+echo "Container dependencies packaged under dist/*/dep/" >&2
