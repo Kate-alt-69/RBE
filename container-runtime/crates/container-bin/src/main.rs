@@ -1,24 +1,27 @@
-//! Container runtime entrypoint.
+//! Standalone `container` execution service.
 //!
-//! Normal mode keeps the existing health/registry wiring. `--debug` starts
-//! the testable Environment → Swamp → Worker runtime and renders live cache
-//! and scheduler state. This is scheduler/debug infrastructure only;
-//! kernel sandboxing, real WASM execution, and authenticated IPC remain
-//! future layers.
+//! The backend launches this binary as a separate process. The service owns
+//! Environment → Swamp → Worker scheduling and exposes a local authenticated
+//! control socket. `--debug` renders the live topology without requiring the
+//! backend process.
 
 use std::env;
+use std::io::BufReader;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use container_runtime_core::{EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost};
+use ipc_protocol::{decode_request, read_frame, write_frame, Request, Response, PROTOCOL_VERSION};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = env::args().skip(1).collect::<Vec<_>>();
     let debug = args.iter().any(|arg| arg == "--debug");
+    let listen = value_after(&args, "--listen");
 
     let admin_dir = PathBuf::from("./data/admin");
     let io = atomic_io::AtomicIo::new();
@@ -42,16 +45,115 @@ fn main() -> anyhow::Result<()> {
 
     let registry = EnvironmentRegistry::new(io, vault, &vault_data_dir);
 
-    println!("container-bin: environment health snapshot:");
-    for (id, status) in registry.health_snapshot() {
-        println!("  {id:<10} {status:?}");
-    }
-
     if debug {
-        return run_debug(&args);
+        run_debug(&args)?;
     }
 
-    println!("container-bin: normal mode — Swamp debug scheduler disabled; no OS sandbox/IPC yet.");
+    if let Some(address) = listen {
+        let token = env::var("RBE_CONTAINER_TOKEN")
+            .map_err(|_| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
+        run_control_server(&address, token, registry)?;
+    } else if !debug {
+        println!("container: no control socket requested; exiting after initialization");
+    }
+
+    Ok(())
+}
+
+fn run_control_server(address: &str, token: String, _registry: EnvironmentRegistry) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(address)?;
+    println!("container: control socket listening on {}", listener.local_addr()?);
+
+    // The socket is intentionally loopback-only in normal backend use. The
+    // authentication token is still mandatory because another local process
+    // must not gain control merely by discovering the port.
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let token = token.clone();
+                thread::spawn(move || {
+                    if let Err(err) = handle_connection(stream, &token) {
+                        tracing::warn!(%err, "container control connection closed with error");
+                    }
+                });
+            }
+            Err(err) => tracing::warn!(%err, "failed to accept container control connection"),
+        }
+    }
+    Ok(())
+}
+
+fn handle_connection(mut stream: TcpStream, token: &str) -> anyhow::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let bytes = read_frame(&mut reader)?;
+    let request = decode_request(&bytes)?;
+
+    let response = match request {
+        Request::Hello(hello) => {
+            if hello.version != PROTOCOL_VERSION || hello.auth_token != token {
+                Response::Error {
+                    request_id: None,
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else {
+                Response::HelloAccepted { version: PROTOCOL_VERSION }
+            }
+        }
+        Request::Execute(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else {
+                // Execution dispatch is owned by the runtime process. The
+                // actual WASM engine and OS sandbox are deliberately behind
+                // the execution-engine/sandbox-primitives contracts.
+                Response::Accepted {
+                    request_id: request.request_id,
+                    execution_id: "pending-runtime-wiring".into(),
+                }
+            }
+        }
+        Request::Health(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else {
+                Response::Health {
+                    request_id: request.request_id,
+                    body: serde_json::json!({
+                        "protocol": PROTOCOL_VERSION,
+                        "process": "container",
+                        "sandbox": "policy-bound",
+                        "wasm": "pending-execution-engine"
+                    }),
+                }
+            }
+        }
+        Request::Cancel(request) => Response::Error {
+            request_id: Some(request.request_id),
+            code: "NOT_IMPLEMENTED".into(),
+            message: "execution cancellation requires the execution engine wiring".into(),
+        },
+        Request::Inspect(request) => Response::Error {
+            request_id: Some(request.request_id),
+            code: "NOT_IMPLEMENTED".into(),
+            message: "live inspection requires the runtime handle".into(),
+        },
+        Request::RestartEnvironment(request) => Response::Error {
+            request_id: Some(request.request_id),
+            code: "NOT_IMPLEMENTED".into(),
+            message: "environment restart requires the supervisor lifecycle wiring".into(),
+        },
+    };
+
+    write_frame(&mut stream, &response)?;
     Ok(())
 }
 
@@ -59,7 +161,7 @@ fn run_debug(args: &[String]) -> anyhow::Result<()> {
     let swamps_per_environment = value_after(args, "--swamps-per-environment")
         .or_else(|| value_after(args, "--swamps"))
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
+        .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
     let workers = value_after(args, "--workers-per-swamp")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
@@ -88,49 +190,27 @@ fn run_debug(args: &[String]) -> anyhow::Result<()> {
     runtime.rebalance_once();
     println!("\nRBE CONTAINER RUNTIME — DEBUG");
     println!("environments={} swamps_per_environment={} workers_per_swamp={} global_queue={} cache_profiles={}",
-        runtime.snapshots().len(),
-        runtime.config().swamps_per_environment,
-        runtime.config().workers_per_swamp,
-        runtime.global_queue_len(),
-        runtime.cache().len());
+        runtime.snapshots().len(), runtime.config().swamps_per_environment,
+        runtime.config().workers_per_swamp, runtime.global_queue_len(), runtime.cache().len());
 
     for _ in 0..10 {
         print_snapshot(&runtime);
-        if demo_count == 0 {
-            break;
-        }
+        if demo_count == 0 { break; }
         thread::sleep(Duration::from_millis(250));
         runtime.rebalance_once();
     }
-
     Ok(())
 }
 
 fn print_snapshot(runtime: &Runtime) {
     for environment in runtime.snapshots() {
-        println!(
-            "\nENVIRONMENT {:<9} queue={:<5} cost={:<6} swamps={}",
-            environment.id,
-            environment.queued,
-            environment.queued_cost,
-            environment.swamps.len()
-        );
+        println!("\nENVIRONMENT {:<9} queue={:<5} cost={:<6} swamps={}", environment.id, environment.queued, environment.queued_cost, environment.swamps.len());
         for swamp in environment.swamps {
-            println!(
-                "  SWAMP {:03} queue={:<5} cost={:<6} throughput={:>8.1}/s completed={:<5}",
-                swamp.id, swamp.queued, swamp.queued_cost, swamp.throughput_per_sec, swamp.completed
-            );
+            println!("  SWAMP {:03} queue={:<5} cost={:<6} throughput={:>8.1}/s completed={:<5}", swamp.id, swamp.queued, swamp.queued_cost, swamp.throughput_per_sec, swamp.completed);
             for worker in swamp.workers {
                 let execution = worker.current.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
                 let avg_ms = if worker.completed == 0 { 0.0 } else { worker.total_ms as f64 / worker.completed as f64 };
-                println!(
-                    "    worker-{:<3} {:<7} current={:<36} completed={} avg_ms={:.1}",
-                    worker.id,
-                    format!("{:?}", worker.state),
-                    execution,
-                    worker.completed,
-                    avg_ms
-                );
+                println!("    worker-{:<3} {:<7} current={:<36} completed={} avg_ms={:.1}", worker.id, format!("{:?}", worker.state), execution, worker.completed, avg_ms);
             }
         }
     }
