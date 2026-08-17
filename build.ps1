@@ -6,7 +6,7 @@
   The container is a mandatory runtime dependency. For every target this script:
     1. builds container-bin first;
     2. exposes that exact artifact as RBE_CONTAINER_BIN_PATH;
-    3. supplies RBE_BUILD_ID and requires RBE_CONTAINER_SIGNING_PRIVATE_KEY;
+    3. supplies RBE_BUILD_ID and a persistent local Ed25519 signing key (or a CI-provided key);
     4. builds backend.exe with the container SHA-256/build-id/target and Ed25519
        signature compiled into the backend;
     5. packages the exact same container artifact at dist\<target>\dep\container.exe
@@ -15,6 +15,10 @@
   There is no editable .sha256 sidecar and no embedded fallback container copy.
   The backend fails closed when dep\container.exe is missing or fails integrity
   verification.
+
+  Local developer builds automatically create/reuse the signing key at:
+    %LOCALAPPDATA%\RBE\container-signing.key
+  CI/release builds can override it with RBE_CONTAINER_SIGNING_PRIVATE_KEY.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +28,44 @@ $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ContainerDir = Join-Path $RepoRoot 'container-runtime'
 $EngineDir = Join-Path $RepoRoot 'engine'
 $DistRoot = Join-Path $RepoRoot 'dist'
+
+function Ensure-ContainerSigningKey {
+    if (-not [string]::IsNullOrWhiteSpace($env:RBE_CONTAINER_SIGNING_PRIVATE_KEY)) {
+        return
+    }
+
+    $keyDir = if ($env:RBE_CONFIG_HOME) { $env:RBE_CONFIG_HOME } else { Join-Path $env:LOCALAPPDATA 'RBE' }
+    $keyPath = Join-Path $keyDir 'container-signing.key'
+
+    if (Test-Path -LiteralPath $keyPath) {
+        $existing = (Get-Content -LiteralPath $keyPath -Raw).Trim()
+        if ($existing -match '^[0-9a-fA-F]{64}$') {
+            $env:RBE_CONTAINER_SIGNING_PRIVATE_KEY = $existing
+            Write-Host "Using existing local RBE container signing key: $keyPath" -ForegroundColor DarkGray
+            return
+        }
+
+        Write-Warning "Local RBE container signing key is invalid; regenerating it."
+        Remove-Item -LiteralPath $keyPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+    if (-not $openssl) {
+        throw "OpenSSL is required to generate the local RBE container signing key. Install OpenSSL or set RBE_CONTAINER_SIGNING_PRIVATE_KEY explicitly."
+    }
+
+    New-Item -ItemType Directory -Force -Path $keyDir | Out-Null
+    $key = (& $openssl.Source rand -hex 32 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0 -or $key -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'OpenSSL failed to generate a valid 32-byte container signing key.'
+    }
+
+    Set-Content -LiteralPath $keyPath -Value $key -NoNewline -Encoding ascii
+    $env:RBE_CONTAINER_SIGNING_PRIVATE_KEY = $key
+    Write-Host "Generated and saved local RBE container signing key: $keyPath" -ForegroundColor Green
+}
+
+Ensure-ContainerSigningKey
 
 $BuildWin = $false; $BuildLinux = $false; $BuildMacos = $false; $BuildAll = $false
 $Musl = $false; $NoEmbed = $false; $DevContent = $false; $Release = $true
@@ -51,10 +93,6 @@ foreach ($arg in $args) {
     }
 }
 if ($ShowHelp) { Get-Help $MyInvocation.MyCommand.Path -Full; exit 0 }
-
-if ([string]::IsNullOrWhiteSpace($env:RBE_CONTAINER_SIGNING_PRIVATE_KEY)) {
-    throw 'RBE_CONTAINER_SIGNING_PRIVATE_KEY is required for packaged builds. For a temporary local key use: $env:RBE_CONTAINER_SIGNING_PRIVATE_KEY = [Convert]::ToHexString((1..32 | ForEach-Object { Get-Random -Maximum 256 }))'
-}
 
 $hostOs = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
 $hostArch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
