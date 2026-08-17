@@ -24,14 +24,10 @@ use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, Sand
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = env::args().skip(1).collect::<Vec<_>>();
-
-    if args.iter().any(|arg| arg == "--worker") {
-        return run_worker(&args);
-    }
+    if args.iter().any(|arg| arg == "--worker") { return run_worker(&args); }
 
     let debug = args.iter().any(|arg| arg == "--debug");
     let listen = value_after(&args, "--listen");
-
     let admin_dir = PathBuf::from("./data/admin");
     let io = atomic_io::AtomicIo::new();
     error_client::init(io.clone(), &admin_dir);
@@ -58,28 +54,24 @@ fn main() -> anyhow::Result<()> {
     let runtime = Runtime::new(RuntimeConfig { swamps_per_environment, workers_per_swamp, rebalance_interval_ms: 25 });
 
     if debug { run_debug(&args, &runtime)?; }
-
     if let Some(address) = listen {
         let token = env::var("RBE_CONTAINER_TOKEN").map_err(|_| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
         run_control_server(&address, token, runtime.clone(), registry)?;
-    } else if !debug {
-        println!("container: no control socket requested; exiting after initialization");
-    }
+    } else if !debug { println!("container: no control socket requested; exiting after initialization"); }
     Ok(())
 }
 
 fn run_worker(args: &[String]) -> anyhow::Result<()> {
     set_no_new_privileges().map_err(|e| anyhow::anyhow!("worker: failed to set no_new_privs: {e}"))?;
     install_restricted_seccomp().map_err(|e| anyhow::anyhow!("worker: failed to install seccomp: {e}"))?;
-
     let artifact = value_after(args, "--artifact").ok_or_else(|| anyhow::anyhow!("worker: --artifact is required"))?;
-    if artifact.is_empty() || artifact.len() > 128 || !artifact.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
-        anyhow::bail!("worker: invalid artifact hash");
-    }
+    if artifact.is_empty() || artifact.len() > 128 || !artifact.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') { anyhow::bail!("worker: invalid artifact hash"); }
     let path = PathBuf::from("./data/container-runtime/artifacts").join(format!("{artifact}.wasm"));
     let wasm = fs::read(path).map_err(|e| anyhow::anyhow!("worker: failed to read artifact: {e}"))?;
+    let fuel = value_after(args, "--fuel").and_then(|value| value.parse::<u64>().ok()).unwrap_or(10_000_000);
+    let max_memory_bytes = value_after(args, "--memory").and_then(|value| value.parse::<u64>().ok()).unwrap_or(64 * 1024 * 1024);
     let executor = WasmExecutor::new()?;
-    let result = executor.execute(&wasm, ExecutionLimits::default())?;
+    let result = executor.execute(&wasm, ExecutionLimits { fuel, max_memory_bytes })?;
     if result.exit_code != 0 { anyhow::bail!("worker: WASM exited with status {}", result.exit_code); }
     Ok(())
 }
@@ -107,24 +99,26 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, regi
     let response = match request {
         Request::Hello(hello) => if hello.version != PROTOCOL_VERSION || hello.auth_token != token { Response::Error { request_id: None, code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } } else { Response::HelloAccepted { version: PROTOCOL_VERSION } },
         Request::Execute(request) => {
-            if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
-            } else if let Some(environment) = parse_environment(&request.environment) {
+            if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
+            else if let Some(environment) = parse_environment(&request.environment) {
                 let cost = WorkCost { cpu: request.declared_cost.cpu, memory: request.declared_cost.memory, io: request.declared_cost.io, network: request.declared_cost.network };
                 let execution_id = runtime.submit_with_policy(environment, request.artifact_hash, cost, ResourceLimits::default(), SandboxPolicy::default(), 0, request.payload);
                 Response::Accepted { request_id: request.request_id, execution_id: execution_id.to_string() }
-            } else {
-                Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("unknown container environment: {}", request.environment) }
-            }
+            } else { Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("unknown container environment: {}", request.environment) } }
         }
         Request::Health(request) => if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } } else { Response::Health { request_id: request.request_id, body: serde_json::json!({ "protocol": PROTOCOL_VERSION, "process": "container", "environments": registry.health_snapshot().len(), "queue": runtime.global_queue_len(), "sandbox_policy": "deny-by-default", "wasm_engine": "wasmtime", "artifact_cache": runtime.cache().artifact_count() }) } },
         Request::Cancel(request) => {
             if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
-            else { Response::Cancelled { request_id: request.request_id } }
+            else if runtime.cancel(&request.execution_id) { Response::Cancelled { request_id: request.request_id } }
+            else { Response::Error { request_id: Some(request.request_id), code: "NOT_FOUND".into(), message: "execution ID was not found".into() } }
         }
         Request::Inspect(request) => {
             if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
-            else { Response::Inspection { request_id: request.request_id, body: serde_json::json!({ "execution_id": request.execution_id, "environments": runtime.snapshots() }) } }
+            else {
+                let environments = runtime.snapshots();
+                let body = environments.iter().map(|environment| serde_json::json!({ "id": environment.id.to_string(), "generation": environment.generation, "queued": environment.queued, "queued_cost": environment.queued_cost, "swamps": environment.swamps.len(), "workers": environment.swamps.iter().map(|swamp| swamp.workers.len()).sum::<usize>(), "failed": environment.swamps.iter().map(|swamp| swamp.failed).sum::<u64>() })).collect::<Vec<_>>();
+                Response::Inspection { request_id: request.request_id, body: serde_json::json!({ "execution_id": request.execution_id, "environments": body }) }
+            }
         }
         Request::RestartEnvironment(request) => {
             if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
