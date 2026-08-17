@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use environments::EnvironmentId;
 
-use crate::execution::{ExecutionTask, WorkCost};
+use crate::execution::ExecutionTask;
 use crate::swamp::{Swamp, SwampSnapshot};
 use crate::worker::Runner;
 
@@ -107,10 +107,4 @@ impl EnvironmentRuntime {
             storage_path: self.storage_path.display().to_string(),
         }
     }
-
-    pub fn worker_count(&self) -> usize { self.swamps.lock().expect("environment swamps poisoned").iter().map(|swamp| swamp.worker_count()).sum() }
-    pub fn swamp_count(&self) -> usize { self.swamp_count }
 }
-
-#[allow(dead_code)]
-fn _cost_hint(cost: WorkCost) -> u64 { cost.scalar() }
