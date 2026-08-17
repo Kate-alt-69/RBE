@@ -6,3 +6,6 @@ publish.workspace = true
 
 [dependencies]
 environments = { path = "../environments" }
+resource-limits = { path = "../resource-limits" }
+sandbox-primitives = { path = "../sandbox-primitives" }
+ipc-protocol = { path = "../ipc-protocol" }
