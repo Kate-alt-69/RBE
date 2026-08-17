@@ -1,9 +1,8 @@
-//! Kernel-facing resource policy model.
-//!
-//! This crate deliberately separates *policy* from enforcement. The container
-//! supervisor can validate and carry these limits today; `sandbox-primitives`
-//! and the future execution backend are responsible for translating them into
-//! OS-enforced controls (cgroups/job objects, process limits, timeouts, etc.).
+//! Resource policy and Linux cgroup-v2 enforcement.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -30,7 +29,7 @@ impl Default for ResourceLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResourceUsage {
     pub cpu_millis: u64,
     pub memory_peak_bytes: u64,
@@ -62,5 +61,71 @@ impl ResourceLimits {
         if usage.file_descriptors > self.max_file_descriptors { return Some(LimitViolation::FileDescriptors); }
         if usage.wall_time_ms > self.wall_time_ms { return Some(LimitViolation::WallTime); }
         None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CgroupHandle {
+    path: PathBuf,
+}
+
+impl CgroupHandle {
+    pub fn create(root: &Path, execution_id: &str, limits: ResourceLimits) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let path = root.join(execution_id);
+            fs::create_dir_all(&path)?;
+            write_file(&path, "memory.max", limits.memory_bytes.to_string())?;
+            write_file(&path, "pids.max", limits.max_processes.to_string())?;
+            let quota = limits.cpu_millis.saturating_mul(100);
+            write_file(&path, "cpu.max", format!("{quota} 100000"))?;
+            return Ok(Self { path });
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root, execution_id, limits);
+            Err(io::Error::new(io::ErrorKind::Unsupported, "cgroup-v2 enforcement is Linux-only"))
+        }
+    }
+
+    pub fn attach_pid(&self, pid: u32) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            write_file(&self.path, "cgroup.procs", pid.to_string())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            Err(io::Error::new(io::ErrorKind::Unsupported, "cgroup-v2 enforcement is Linux-only"))
+        }
+    }
+
+    pub fn path(&self) -> &Path { &self.path }
+}
+
+impl Drop for CgroupHandle {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_file(dir: &Path, name: &str, value: impl AsRef<[u8]>) -> io::Result<()> {
+    fs::write(dir.join(name), value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limit_check_detects_wall_time() {
+        let limits = ResourceLimits::default();
+        let usage = ResourceUsage { wall_time_ms: limits.wall_time_ms + 1, ..Default::default() };
+        assert_eq!(limits.check(usage), Some(LimitViolation::WallTime));
     }
 }
