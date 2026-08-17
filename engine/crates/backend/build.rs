@@ -7,7 +7,7 @@
 //!
 //! The resulting digest, build ID, target, public key and signature are
 //! compiled into backend.exe. Runtime startup never trusts an editable
-//! sidecar integrity file.
+//! sidecar integrity file and does not embed a second copy of container.exe.
 
 use std::fs;
 use std::io::Read;
@@ -22,7 +22,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_SIGNING_PRIVATE_KEY");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts");
-    let embedded_dest = Path::new(&out_dir).join("embedded_container_bin");
     let integrity_dest = Path::new(&out_dir).join("container_integrity.rs");
     let source = std::env::var("RBE_CONTAINER_BIN_PATH").ok().map(PathBuf::from);
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
@@ -31,10 +30,6 @@ fn main() {
     let (expected_hash, public_key, signature) = match source {
         Some(path) if path.is_file() => {
             println!("cargo:rerun-if-changed={}", path.display());
-
-            fs::copy(&path, &embedded_dest).unwrap_or_else(|err| {
-                panic!("backend/build.rs: failed to copy container binary {} into OUT_DIR: {err}", path.display())
-            });
 
             let hash = sha256_file(&path).unwrap_or_else(|err| {
                 panic!("backend/build.rs: failed to SHA-256 container binary {}: {err}", path.display())
