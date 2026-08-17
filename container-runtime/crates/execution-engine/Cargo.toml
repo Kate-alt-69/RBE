@@ -8,6 +8,6 @@ publish.workspace = true
 anyhow = "1"
 # Security-reviewed 45.x baseline.
 # default-features=false removes unused Wasmtime cache/optional layers that
-# pull zstd-sys into cross-builds; this executor only needs the runtime and
-# Cranelift JIT to compile and execute incoming WASM modules.
-wasmtime = { version = "45.0.3", default-features = false, features = ["runtime", "cranelift"] }
+# pull zstd-sys into cross-builds; this executor only needs standard errors,
+# the runtime, and Cranelift JIT to compile and execute incoming WASM modules.
+wasmtime = { version = "45.0.3", default-features = false, features = ["std", "runtime", "cranelift"] }
