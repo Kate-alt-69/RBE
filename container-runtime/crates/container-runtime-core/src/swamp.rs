@@ -31,9 +31,7 @@ impl Swamp {
         runner: Runner,
         on_complete: Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>,
     ) -> Arc<Self> {
-        let workers = (0..worker_count.max(1))
-            .map(|worker_id| Worker::new(worker_id, Arc::clone(&runner), Arc::clone(&on_complete)))
-            .collect::<Vec<_>>();
+        let workers = (0..worker_count.max(1)).map(|worker_id| Worker::new(worker_id, Arc::clone(&runner), Arc::clone(&on_complete))).collect::<Vec<_>>();
         let swamp = Arc::new(Self { id, queue: Arc::new(Mutex::new(VecDeque::new())), started: Instant::now(), workers });
         Self::start_dispatcher(&swamp);
         swamp
@@ -41,29 +39,19 @@ impl Swamp {
 
     pub fn id(&self) -> usize { self.id }
     pub fn enqueue(&self, task: ExecutionTask) { self.queue.lock().expect("swamp queue poisoned").push_back(task); }
+    pub fn drain(&self, count: usize) -> Vec<ExecutionTask> { let mut queue = self.queue.lock().expect("swamp queue poisoned"); queue.drain(..count.min(queue.len())).collect() }
+    pub fn drain_all(&self) -> Vec<ExecutionTask> { self.queue.lock().expect("swamp queue poisoned").drain(..).collect() }
 
-    pub fn drain(&self, count: usize) -> Vec<ExecutionTask> {
-        let mut queue = self.queue.lock().expect("swamp queue poisoned");
-        queue.drain(..count.min(queue.len())).collect()
-    }
-
-    pub fn drain_all(&self) -> Vec<ExecutionTask> {
-        let mut queue = self.queue.lock().expect("swamp queue poisoned");
-        queue.drain(..).collect()
-    }
-
-    pub fn remove_execution(&self, id: ExecutionId) -> bool {
+    pub fn remove_execution_string(&self, id: &str) -> bool {
         let mut queue = self.queue.lock().expect("swamp queue poisoned");
         let before = queue.len();
-        queue.retain(|task| task.id != id);
+        queue.retain(|task| task.id.to_string() != id);
         before != queue.len()
     }
 
+    pub fn remove_execution(&self, id: ExecutionId) -> bool { self.remove_execution_string(&id.to_string()) }
     pub fn queued(&self) -> usize { self.queue.lock().expect("swamp queue poisoned").len() }
-
-    pub fn queued_cost(&self) -> u64 {
-        self.queue.lock().expect("swamp queue poisoned").iter().map(|task| task.declared_cost.scalar()).sum()
-    }
+    pub fn queued_cost(&self) -> u64 { self.queue.lock().expect("swamp queue poisoned").iter().map(|task| task.declared_cost.scalar()).sum() }
 
     pub fn snapshot(&self) -> SwampSnapshot {
         let workers = self.workers.iter().map(Worker::snapshot).collect::<Vec<_>>();
@@ -82,17 +70,12 @@ impl Swamp {
                 if !worker.is_idle() { continue; }
                 let task = swamp.queue.lock().expect("swamp queue poisoned").pop_front();
                 let Some(task) = task else { break; };
-                if worker.try_send(task.clone()) { progressed = true; }
-                else { swamp.queue.lock().expect("swamp queue poisoned").push_front(task); }
+                if worker.try_send(task.clone()) { progressed = true; } else { swamp.queue.lock().expect("swamp queue poisoned").push_front(task); }
             }
             if !progressed { thread::sleep(Duration::from_millis(1)); }
         }).expect("failed to start Swamp dispatcher");
     }
 
     pub fn worker_count(&self) -> usize { self.workers.len() }
-
-    pub fn has_execution(&self, id: ExecutionId) -> bool {
-        self.workers.iter().any(|worker| worker.snapshot().current == Some(id))
-            || self.queue.lock().expect("swamp queue poisoned").iter().any(|task| task.id == id)
-    }
+    pub fn has_execution(&self, id: ExecutionId) -> bool { self.workers.iter().any(|worker| worker.snapshot().current == Some(id)) || self.queue.lock().expect("swamp queue poisoned").iter().any(|task| task.id == id) }
 }
