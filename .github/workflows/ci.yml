@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   main-workspace:
@@ -131,3 +132,19 @@ jobs:
         run: cargo test -p resource-limits
       - name: execution engine tests
         run: cargo test -p execution-engine
+
+  container-security-hostile:
+    if: github.event_name == 'workflow_dispatch'
+    needs: container-runtime-workspace
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: container-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+      - name: hostile Linux sandbox tests
+        run: cargo test -p sandbox-primitives --test security -- --ignored --nocapture
