@@ -11,9 +11,11 @@ path = "src/main.rs"
 [dependencies]
 container-runtime-core = { path = "../container-runtime-core" }
 environments = { path = "../environments" }
+ipc-protocol = { path = "../ipc-protocol" }
 atomic-io = { path = "../../../atomic-io" }
 vault = { path = "../../../vault" }
 error-client = { path = "../../../error-client" }
 anyhow = "1"
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
