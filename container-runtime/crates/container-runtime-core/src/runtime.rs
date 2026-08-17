@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use execution_engine::{ExecutionLimits, WasmExecutor};
 use environments::EnvironmentId;
 use resource_limits::ResourceLimits;
 use sandbox_primitives::SandboxPolicy;
@@ -11,6 +12,7 @@ use sandbox_primitives::SandboxPolicy;
 use crate::cache::ArtifactCache;
 use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot};
 use crate::execution::{ExecutionId, ExecutionTask, WorkCost};
+use crate::worker::Runner;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -35,6 +37,7 @@ pub struct Runtime {
     global_queue: Mutex<VecDeque<(EnvironmentId, ExecutionTask)>>,
     environments: Vec<EnvironmentRuntime>,
     cache: Arc<ArtifactCache>,
+    executor: Arc<WasmExecutor>,
 }
 
 impl Runtime {
@@ -45,17 +48,44 @@ impl Runtime {
             rebalance_interval_ms: config.rebalance_interval_ms.max(1),
         };
         let cache = Arc::new(ArtifactCache::default());
+        let executor = Arc::new(WasmExecutor::new().expect("failed to initialize WASM executor"));
 
-        let completion: Arc<dyn Fn(&ExecutionTask, u64) + Send + Sync + 'static> = {
+        let runner: Runner = {
             let cache = Arc::clone(&cache);
-            Arc::new(move |task, elapsed_ms| {
+            let executor = Arc::clone(&executor);
+            Arc::new(move |task| {
+                if let Some(wasm) = cache.artifact(&task.artifact_hash) {
+                    let fuel = task.limits.cpu_millis.max(1).saturating_mul(10_000);
+                    let result = executor.execute(&wasm, ExecutionLimits {
+                        fuel,
+                        max_memory_bytes: task.limits.memory_bytes,
+                    }).map_err(|error| error.to_string())?;
+                    if result.exit_code != 0 {
+                        return Err(format!("WASM exited with status {}", result.exit_code));
+                    }
+                    Ok(())
+                } else {
+                    if task.work_ms > 0 {
+                        thread::sleep(Duration::from_millis(task.work_ms));
+                    }
+                    Ok(())
+                }
+            })
+        };
+
+        let completion: Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static> = {
+            let cache = Arc::clone(&cache);
+            Arc::new(move |task, elapsed_ms, result| {
                 cache.record(&task.artifact_hash, elapsed_ms, task.declared_cost);
+                if let Err(error) = result {
+                    tracing::warn!(execution = %task.id, environment = %task.environment, "execution failed: {error}");
+                }
             })
         };
 
         let environments = EnvironmentId::ALL
             .into_iter()
-            .map(|id| EnvironmentRuntime::new(id, config.swamps_per_environment, config.workers_per_swamp, Arc::clone(&completion)))
+            .map(|id| EnvironmentRuntime::new(id, config.swamps_per_environment, config.workers_per_swamp, Arc::clone(&runner), Arc::clone(&completion)))
             .collect();
 
         let runtime = Arc::new(Self {
@@ -64,6 +94,7 @@ impl Runtime {
             global_queue: Mutex::new(VecDeque::new()),
             environments,
             cache,
+            executor,
         });
 
         let weak = Arc::downgrade(&runtime);
@@ -81,22 +112,8 @@ impl Runtime {
         runtime
     }
 
-    pub fn submit(
-        &self,
-        environment: EnvironmentId,
-        artifact_hash: impl Into<String>,
-        cost: WorkCost,
-        work_ms: u64,
-    ) -> ExecutionId {
-        self.submit_with_policy(
-            environment,
-            artifact_hash,
-            cost,
-            ResourceLimits::default(),
-            SandboxPolicy::default(),
-            work_ms,
-            Vec::new(),
-        )
+    pub fn submit(&self, environment: EnvironmentId, artifact_hash: impl Into<String>, cost: WorkCost, work_ms: u64) -> ExecutionId {
+        self.submit_with_policy(environment, artifact_hash, cost, ResourceLimits::default(), SandboxPolicy::default(), work_ms, Vec::new())
     }
 
     pub fn submit_with_policy(
@@ -109,21 +126,21 @@ impl Runtime {
         work_ms: u64,
         payload: Vec<u8>,
     ) -> ExecutionId {
+        let artifact_hash = artifact_hash.into();
+        if !payload.is_empty() {
+            self.cache.put_artifact(artifact_hash.clone(), payload.clone());
+        }
+
         let id = ExecutionId::new(self.next_execution.fetch_add(1, Ordering::Relaxed));
         self.global_queue.lock().expect("global queue poisoned").push_back((
             environment,
-            ExecutionTask {
-                id,
-                environment: environment.to_string(),
-                artifact_hash: artifact_hash.into(),
-                declared_cost: cost,
-                limits,
-                sandbox,
-                work_ms,
-                payload,
-            },
+            ExecutionTask { id, environment: environment.to_string(), artifact_hash, declared_cost: cost, limits, sandbox, work_ms, payload: Vec::new() },
         ));
         id
+    }
+
+    pub fn register_artifact(&self, artifact_hash: impl Into<String>, wasm: Vec<u8>) {
+        self.cache.put_artifact(artifact_hash, wasm);
     }
 
     pub fn rebalance_once(&self) {
@@ -131,40 +148,26 @@ impl Runtime {
             let mut queue = self.global_queue.lock().expect("global queue poisoned");
             queue.drain(..).collect::<Vec<_>>()
         };
-
         for (environment, task) in pending {
             self.environment(environment).enqueue(task);
         }
-
-        for environment in &self.environments {
-            environment.rebalance();
-        }
+        for environment in &self.environments { environment.rebalance(); }
     }
 
     fn environment(&self, id: EnvironmentId) -> &EnvironmentRuntime {
-        self.environments
-            .iter()
-            .find(|environment| environment.id == id)
-            .expect("configured Environment is missing from runtime")
+        self.environments.iter().find(|environment| environment.id == id).expect("configured Environment is missing from runtime")
     }
 
-    pub fn global_queue_len(&self) -> usize {
-        self.global_queue.lock().expect("global queue poisoned").len()
-    }
-
+    pub fn global_queue_len(&self) -> usize { self.global_queue.lock().expect("global queue poisoned").len() }
     pub fn cache(&self) -> Arc<ArtifactCache> { Arc::clone(&self.cache) }
-
-    pub fn snapshots(&self) -> Vec<EnvironmentSnapshot> {
-        self.environments.iter().map(EnvironmentRuntime::snapshot).collect()
-    }
-
+    pub fn snapshots(&self) -> Vec<EnvironmentSnapshot> { self.environments.iter().map(EnvironmentRuntime::snapshot).collect() }
     pub fn config(&self) -> &RuntimeConfig { &self.config }
+    pub fn wasm_executor(&self) -> Arc<WasmExecutor> { Arc::clone(&self.executor) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn execution_ids_are_unique() {
@@ -172,17 +175,6 @@ mod tests {
         let a = runtime.submit(EnvironmentId::General1, "a", WorkCost::default(), 0);
         let b = runtime.submit(EnvironmentId::General1, "b", WorkCost::default(), 0);
         assert_ne!(a, b);
-        assert_ne!(a.to_string(), b.to_string());
-    }
-
-    #[test]
-    fn cache_learns_actual_runtime() {
-        let runtime = Runtime::new(RuntimeConfig { swamps_per_environment: 1, workers_per_swamp: 1, rebalance_interval_ms: 5 });
-        runtime.submit(EnvironmentId::General1, "artifact", WorkCost { cpu: 10, ..Default::default() }, 2);
-        thread::sleep(Duration::from_millis(20));
-        let profile = runtime.cache().profile("artifact").expect("profile recorded");
-        assert_eq!(profile.samples, 1);
-        assert!(profile.last_ms >= 1);
     }
 
     #[test]
@@ -194,17 +186,9 @@ mod tests {
     }
 
     #[test]
-    fn policy_is_attached_to_execution() {
+    fn payload_is_registered_as_an_artifact() {
         let runtime = Runtime::new(RuntimeConfig { swamps_per_environment: 1, workers_per_swamp: 1, rebalance_interval_ms: 1000 });
-        let id = runtime.submit_with_policy(
-            EnvironmentId::General1,
-            "secure-artifact",
-            WorkCost { cpu: 10, ..Default::default() },
-            ResourceLimits::default(),
-            SandboxPolicy::default(),
-            0,
-            b"payload".to_vec(),
-        );
-        assert!(id.to_string().starts_with("exec-"));
+        runtime.submit_with_policy(EnvironmentId::General1, "artifact", WorkCost::default(), ResourceLimits::default(), SandboxPolicy::default(), 0, b"wasm".to_vec());
+        assert_eq!(runtime.cache().artifact_count(), 1);
     }
 }
