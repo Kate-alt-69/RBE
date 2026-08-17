@@ -1,5 +1,10 @@
 name: CI
 
+# Lives at the true repo root (project-root/.github/workflows).
+# CI validates both the Rust workspaces and the same build entrypoints
+# developers use locally, so a green CI run means the distributable build
+# scripts can actually compile RBE on their native CI platforms.
+
 on:
   push:
   pull_request:
@@ -97,8 +102,23 @@ jobs:
       - name: build (release)
         run: cargo build --workspace --release
 
+  container-runtime-audit:
+    needs: container-runtime-workspace
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: container-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: generate lockfile
+        run: cargo generate-lockfile
+      - name: dependency security audit
+        run: cargo audit
+
   container-runtime-windows:
-    needs: shared-crates
     runs-on: windows-latest
     defaults:
       run:
@@ -109,29 +129,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: container-runtime
-      - name: test (portable runtime contracts)
-        run: cargo test --workspace
-      - name: build (release)
+      - name: build container runtime on Windows
         run: cargo build --workspace --release
-
-  container-security-smoke:
-    needs: container-runtime-workspace
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: container-runtime
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: container-runtime
-      - name: sandbox primitives tests
-        run: cargo test -p sandbox-primitives
-      - name: resource limits tests
-        run: cargo test -p resource-limits
-      - name: execution engine tests
-        run: cargo test -p execution-engine
+      - name: test portable container contracts on Windows
+        run: cargo test --workspace
 
   container-security-hostile:
     if: github.event_name == 'workflow_dispatch'
