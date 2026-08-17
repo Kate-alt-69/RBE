@@ -10,12 +10,14 @@
 //! and authenticated control IPC will land.
 
 mod cache;
+mod environment;
 mod execution;
 mod runtime;
 mod swamp;
 mod worker;
 
 pub use cache::{ArtifactCache, ExecutionProfile};
+pub use environment::EnvironmentSnapshot;
 pub use execution::{ExecutionId, ExecutionRecord, ExecutionState, ExecutionTask, WorkCost};
 pub use runtime::{Runtime, RuntimeConfig};
 pub use swamp::SwampSnapshot;
