@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::execution::{ExecutionId, ExecutionTask};
 
@@ -78,8 +78,6 @@ impl Worker {
         Self { id, tx, state, current, completed, failed, total_ms }
     }
 
-    pub fn id(&self) -> usize { self.id }
-
     pub fn is_idle(&self) -> bool {
         *self.state.lock().expect("worker state poisoned") == WorkerState::Idle
     }
@@ -99,14 +97,4 @@ impl Worker {
             current: *self.current.lock().expect("worker current poisoned"),
         }
     }
-}
-
-/// Default runner retained for queue tests and debug simulation when an
-/// artifact is not present in the cache. Real WASM runners are injected by
-/// `Runtime`.
-pub fn simulated_runner() -> Runner {
-    Arc::new(|task| {
-        if task.work_ms > 0 { thread::sleep(Duration::from_millis(task.work_ms)); }
-        Ok(())
-    })
 }
