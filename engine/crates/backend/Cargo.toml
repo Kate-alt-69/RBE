@@ -18,6 +18,7 @@ vault-process = { path = "../../../vault-process" }
 atomic-io = { path = "../../../atomic-io" }
 error-client = { path = "../../../error-client" }
 route-engine = { path = "../route-engine" }
+ipc-protocol = { path = "../../../container-runtime/crates/ipc-protocol" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
