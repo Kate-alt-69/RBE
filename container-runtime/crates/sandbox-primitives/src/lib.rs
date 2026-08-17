@@ -41,14 +41,19 @@ impl Default for SandboxPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPolicy { DenyAll, AllowList(Vec<HostRule>) }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRule { pub host: String, pub ports: Vec<u16> }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesystemPolicy { WorkspaceOnly, ReadOnlyRootWithWorkspace }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrivilegePolicy { NoExtraCapabilities }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespacePolicy { FullyIsolated }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyscallPolicy { Restricted }
 
@@ -76,7 +81,13 @@ impl SandboxLauncher {
         #[cfg(target_os = "linux")]
         {
             let mut command = Command::new("unshare");
-            command.args(["--fork", "--pid", "--mount", "--ipc", "--uts", "--mount-proc"]);
+            // Keep the cgroup namespace isolated as well. Without it a guest can
+            // observe the host cgroup path through /proc even when the worker is
+            // attached to a dedicated cgroup-v2 leaf.
+            command.args([
+                "--fork", "--pid", "--mount", "--ipc", "--uts", "--cgroup",
+                "--mount-proc",
+            ]);
             if matches!(policy.network, NetworkPolicy::DenyAll) { command.arg("--net"); }
             command.arg("--").arg(program).args(args);
             return Ok(command);
@@ -100,26 +111,52 @@ pub fn set_no_new_privileges() -> std::io::Result<()> {
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no_new_privs is Linux-only"))
 }
 
+/// Installs a conservative syscall deny-list. It deliberately blocks host /
+/// privilege-control primitives while leaving ordinary file, memory, thread,
+/// socket and WASM-runtime syscalls available. The list is architecture-
+/// specific today; unsupported Linux architectures return an explicit error.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn install_restricted_seccomp() -> std::io::Result<()> {
     const ARCH_X86_64: u32 = 0xC000_003E;
     let blocked: &[i64] = &[
-        libc::SYS_mount, libc::SYS_umount2, libc::SYS_ptrace, libc::SYS_kexec_load,
-        libc::SYS_init_module, libc::SYS_finit_module, libc::SYS_delete_module,
-        libc::SYS_reboot, libc::SYS_swapon, libc::SYS_swapoff, libc::SYS_pivot_root,
-        libc::SYS_setns, libc::SYS_unshare, libc::SYS_bpf, libc::SYS_perf_event_open,
-        libc::SYS_userfaultfd, libc::SYS_open_by_handle_at, libc::SYS_keyctl,
-        libc::SYS_add_key, libc::SYS_request_key,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_ptrace,
+        libc::SYS_kexec_load,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_reboot,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_pivot_root,
+        libc::SYS_setns,
+        libc::SYS_unshare,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_userfaultfd,
+        libc::SYS_open_by_handle_at,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
     ];
+
     let mut filter = Vec::with_capacity(blocked.len() * 2 + 4);
     filter.push(libc::sock_filter { code: libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, jt: 0, jf: 0, k: 4 });
     filter.push(libc::sock_filter { code: libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, jt: 1, jf: 0, k: ARCH_X86_64 });
     filter.push(libc::sock_filter { code: libc::BPF_RET | libc::BPF_K, jt: 0, jf: 0, k: libc::SECCOMP_RET_KILL_PROCESS });
     filter.push(libc::sock_filter { code: libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, jt: 0, jf: 0, k: 0 });
+
     for syscall in blocked {
-        filter.push(libc::sock_filter { code: libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, jt: 0, jf: 1, k: *syscall as u32 });
+        filter.push(libc::sock_filter {
+            code: libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            jt: 0,
+            jf: 1,
+            k: *syscall as u32,
+        });
         filter.push(libc::sock_filter { code: libc::BPF_RET | libc::BPF_K, jt: 0, jf: 0, k: libc::SECCOMP_RET_KILL_PROCESS });
     }
+
     filter.push(libc::sock_filter { code: libc::BPF_RET | libc::BPF_K, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW });
     let mut program = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_mut_ptr() };
     let rc = unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &mut program as *mut libc::sock_fprog) };
