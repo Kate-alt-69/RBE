@@ -207,12 +207,14 @@ jobs:
           $env:RBE_BOOT_TRACE = '1'
           $env:RBE_BOOT_LOG = $bootLog
 
-          $proc = Start-Process \
-            -FilePath $backend \
-            -WorkingDirectory $appDir \
-            -RedirectStandardOutput $stdout \
-            -RedirectStandardError $stderr \
-            -PassThru
+          $startArgs = @{
+            FilePath = $backend
+            WorkingDirectory = $appDir
+            RedirectStandardOutput = $stdout
+            RedirectStandardError = $stderr
+            PassThru = $true
+          }
+          $proc = Start-Process @startArgs
 
           try {
             $ready = $false
