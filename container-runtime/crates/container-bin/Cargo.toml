@@ -16,6 +16,7 @@ execution-engine = { path = "../execution-engine" }
 resource-limits = { path = "../resource-limits" }
 sandbox-primitives = { path = "../sandbox-primitives" }
 atomic-io = { path = "../../../atomic-io" }
+runtime-paths = { path = "../../../runtime-paths" }
 vault = { path = "../../../vault" }
 error-client = { path = "../../../error-client" }
 anyhow = "1"

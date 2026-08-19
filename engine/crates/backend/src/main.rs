@@ -28,7 +28,7 @@ async fn main() {
         if !has("--separate-process") && !has("--saperate-process") { eprintln!("backend.exe --vault requires --separate-process"); std::process::exit(2); }
         let value = |flag: &str, default: &str| args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone()).unwrap_or_else(|| default.to_string());
         let service_name = value("--service-name", "backend-rs");
-        let data_dir = PathBuf::from(value("--data-dir", "./data/admin"));
+        let data_dir = PathBuf::from(value("--data-dir", &runtime_paths::default_admin_dir().to_string_lossy()));
         let force_dbus = has("--dbus");
         if let Err(err) = vault_process::run_vault_daemon(service_name, data_dir, force_dbus) { eprintln!("fatal Vault daemon error: {err:#}"); std::process::exit(1); }
         return;
@@ -42,7 +42,7 @@ async fn run_error_reporter_daemon(separate_process: bool) -> anyhow::Result<()>
     tracing_subscriber::fmt().with_env_filter(filter).with_target(true).init();
     tracing::info!(pid = std::process::id(), separate_process, "backend.exe running in --er (error-reporter-daemon) mode");
     let io = atomic_io::AtomicIo::new();
-    let admin_dir = PathBuf::from("./data/admin");
+    let admin_dir = runtime_paths::default_admin_dir();
     error_reporter_daemon::run(io, admin_dir, separate_process).await
 }
 
@@ -86,7 +86,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
     boot_trace("logging initialized");
 
     let io = atomic_io::AtomicIo::new();
-    let admin_dir = PathBuf::from("./data/admin");
+    let admin_dir = runtime_paths::default_admin_dir();
     error_client::init(io.clone(), &admin_dir);
     error_client::install_panic_hook();
     boot_trace("error-client initialized, panic hook installed");
@@ -133,7 +133,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
 
     let api_dir = route_engine::default_api_dir();
     boot_trace(format!("building router api dir={}", api_dir.display()));
-    let cache_dir = PathBuf::from("./.cache/backend");
+    let cache_dir = runtime_paths::binary_dir().join(".cache").join("backend");
     match route_engine::cache::sync(&io, &api_dir, &cache_dir) {
         Ok(outcomes) => {
             let regenerated = outcomes.iter().filter(|o| matches!(o.result, Ok(route_engine::cache::SyncAction::Regenerated))).count();

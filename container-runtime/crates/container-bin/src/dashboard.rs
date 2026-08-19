@@ -6,8 +6,6 @@ use std::thread;
 
 use container_runtime_core::Runtime;
 
-const EVENT_LOG: &str = "./data/container-runtime/container-events.jsonl";
-
 pub fn spawn(address: String, token: String, runtime: Arc<Runtime>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&address)?;
     println!("container: dashboard listening on http://{}/", listener.local_addr()?);
@@ -210,7 +208,7 @@ fn state_json(runtime: &Runtime) -> String {
 }
 
 fn events_json() -> String {
-    let content = fs::read_to_string(EVENT_LOG).unwrap_or_default();
+    let content = fs::read_to_string(crate::event_log_path()).unwrap_or_default();
     let events = content.lines().rev().take(250)
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .collect::<Vec<_>>();

@@ -24,8 +24,19 @@ use ipc_protocol::{decode_request, read_frame, write_frame, Request, Response, P
 use resource_limits::ResourceLimits;
 use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, SandboxPolicy};
 
-const EVENT_LOG: &str = "./data/container-runtime/container-events.jsonl";
-const MONITOR_LOG: &str = "./data/container-runtime/container-monitor.log";
+// Resolved relative to THIS binary's own directory, not the CWD — see
+// `runtime_paths`'s crate doc comment for why bare "./..." string
+// literals here are exactly the bug that made the transpiler cache
+// (and, separately, the shared error-reporter queue) silently break
+// depending on process launch directory. Functions, not `const`s,
+// since `runtime_paths::binary_dir()` calls `current_exe()` and can't
+// be evaluated at compile time.
+pub(crate) fn event_log_path() -> PathBuf {
+    runtime_paths::binary_dir().join("data").join("container-runtime").join("container-events.jsonl")
+}
+pub(crate) fn monitor_log_path() -> PathBuf {
+    runtime_paths::binary_dir().join("data").join("container-runtime").join("container-monitor.log")
+}
 const DEFAULT_DASHBOARD_ADDRESS: &str = "127.0.0.1:8787";
 
 fn main() -> anyhow::Result<()> {
@@ -46,12 +57,12 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %err, "container monitor process could not be started");
     }
 
-    let admin_dir = PathBuf::from("./data/admin");
+    let admin_dir = runtime_paths::default_admin_dir();
     let io = atomic_io::AtomicIo::new();
     error_client::init(io.clone(), &admin_dir);
     error_client::install_panic_hook();
 
-    let vault_data_dir = PathBuf::from("./data/container-admin");
+    let vault_data_dir = runtime_paths::binary_dir().join("data").join("container-admin");
     let vault = match vault::Vault::new(io.clone(), "backend-rs-container", &vault_data_dir) {
         Ok(v) => Arc::new(v),
         Err(e) => {
@@ -117,9 +128,9 @@ fn spawn_monitor_process() -> anyhow::Result<()> {
         .arg("--pid")
         .arg(pid.to_string())
         .arg("--events")
-        .arg(EVENT_LOG)
+        .arg(event_log_path())
         .arg("--log")
-        .arg(MONITOR_LOG)
+        .arg(monitor_log_path())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -132,8 +143,8 @@ fn run_monitor(args: &[String]) -> anyhow::Result<()> {
     let watched_pid = value_after(args, "--pid")
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(|| anyhow::anyhow!("monitor: --pid is required"))?;
-    let event_path = PathBuf::from(value_after(args, "--events").unwrap_or_else(|| EVENT_LOG.to_string()));
-    let monitor_path = PathBuf::from(value_after(args, "--log").unwrap_or_else(|| MONITOR_LOG.to_string()));
+    let event_path = value_after(args, "--events").map(PathBuf::from).unwrap_or_else(event_log_path);
+    let monitor_path = value_after(args, "--log").map(PathBuf::from).unwrap_or_else(monitor_log_path);
     if let Some(parent) = monitor_path.parent() { fs::create_dir_all(parent)?; }
 
     let mut last_event_len = 0_u64;
@@ -180,8 +191,8 @@ fn append_monitor_log(path: &PathBuf, line: &str) -> anyhow::Result<()> {
 }
 
 fn emit_event(kind: &str, detail: &str) {
-    if let Some(parent) = PathBuf::from(EVENT_LOG).parent() { let _ = fs::create_dir_all(parent); }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(EVENT_LOG) {
+    if let Some(parent) = event_log_path().parent() { let _ = fs::create_dir_all(parent); }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(event_log_path()) {
         let _ = writeln!(file, "{{\"ts\":{},\"pid\":{},\"kind\":{:?},\"detail\":{:?}}}", now_ms(), std::process::id(), kind, detail);
     }
 }
@@ -193,7 +204,7 @@ fn run_worker(args: &[String]) -> anyhow::Result<()> {
     install_restricted_seccomp().map_err(|e| anyhow::anyhow!("worker: failed to install seccomp: {e}"))?;
     let artifact = value_after(args, "--artifact").ok_or_else(|| anyhow::anyhow!("worker: --artifact is required"))?;
     if artifact.is_empty() || artifact.len() > 128 || !artifact.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') { anyhow::bail!("worker: invalid artifact hash"); }
-    let path = PathBuf::from("./data/container-runtime/artifacts").join(format!("{artifact}.wasm"));
+    let path = runtime_paths::binary_dir().join("data").join("container-runtime").join("artifacts").join(format!("{artifact}.wasm"));
     let wasm = fs::read(path).map_err(|e| anyhow::anyhow!("worker: failed to read artifact: {e}"))?;
     let fuel = value_after(args, "--fuel").and_then(|value| value.parse::<u64>().ok()).unwrap_or(10_000_000);
     let max_memory_bytes = value_after(args, "--memory").and_then(|value| value.parse::<u64>().ok()).unwrap_or(64 * 1024 * 1024);

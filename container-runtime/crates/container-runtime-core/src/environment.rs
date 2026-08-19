@@ -44,7 +44,9 @@ impl EnvironmentRuntime {
     pub fn new(id: EnvironmentId, swamp_count: usize, workers_per_swamp: usize, storage: EnvironmentStorage, runner: Runner, on_complete: Completion) -> Self {
         let swamp_count = swamp_count.max(1);
         let workers_per_swamp = workers_per_swamp.max(1);
-        let storage_path = PathBuf::from("./data/container-runtime/environments").join(id.to_string());
+        // Resolved relative to the binary's own directory, not the CWD
+        // — see `runtime_paths`'s crate doc comment.
+        let storage_path = runtime_paths::binary_dir().join("data").join("container-runtime").join("environments").join(id.to_string());
         Self::prepare_ephemeral_storage(&storage_path);
         let swamps = Self::build_swamps(swamp_count, workers_per_swamp, &runner, &on_complete);
         Self { id, swamp_count, workers_per_swamp, runner, on_complete, swamps: Mutex::new(swamps), storage, storage_path }

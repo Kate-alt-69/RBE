@@ -5,7 +5,11 @@ use std::sync::Mutex;
 
 use crate::execution::WorkCost;
 
-const ARTIFACT_DIR: &str = "./data/container-runtime/artifacts";
+// Resolved relative to the binary's own directory, not the CWD — see
+// `runtime_paths`'s crate doc comment.
+fn artifact_dir() -> PathBuf {
+    runtime_paths::binary_dir().join("data").join("container-runtime").join("artifacts")
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionProfile {
@@ -48,7 +52,7 @@ impl ArtifactCache {
         let artifact_hash = artifact_hash.into();
         self.artifacts.lock().expect("artifact cache poisoned").insert(artifact_hash.clone(), wasm.clone());
         if valid_artifact_name(&artifact_hash) {
-            let dir = PathBuf::from(ARTIFACT_DIR);
+            let dir = artifact_dir();
             if fs::create_dir_all(&dir).is_ok() {
                 let _ = fs::write(dir.join(format!("{artifact_hash}.wasm")), &wasm);
             }
@@ -60,7 +64,7 @@ impl ArtifactCache {
             return Some(bytes);
         }
         if !valid_artifact_name(artifact_hash) { return None; }
-        let bytes = fs::read(PathBuf::from(ARTIFACT_DIR).join(format!("{artifact_hash}.wasm"))).ok()?;
+        let bytes = fs::read(artifact_dir().join(format!("{artifact_hash}.wasm"))).ok()?;
         self.artifacts.lock().expect("artifact cache poisoned").insert(artifact_hash.to_string(), bytes.clone());
         Some(bytes)
     }

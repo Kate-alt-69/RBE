@@ -30,28 +30,58 @@ impl ContainerProcess {
     pub async fn spawn(binary: &Path) -> anyhow::Result<Self> {
         verify_container(binary)?;
 
-        let port = reserve_loopback_port()?;
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
-        let token = generate_token();
+        // `reserve_loopback_port` binds a socket just to learn a free
+        // port number, then immediately releases it so the CHILD
+        // process can bind that same port itself — a real, if usually
+        // narrow, TOCTOU race: something else on the machine could
+        // grab that exact port in the gap between "we released it" and
+        // "the child tried to bind it." A bounded retry (fresh port
+        // each attempt) is the pragmatic fix here — the fully robust
+        // one would be binding once in THIS process and handing the
+        // already-bound socket to the child via fd/handle inheritance,
+        // which is real, separate, platform-specific work (a different
+        // mechanism entirely on Windows vs. Unix) not worth taking on
+        // blind in the same pass as fixing an actual crash.
+        const MAX_SPAWN_ATTEMPTS: u32 = 3;
+        let mut last_err = None;
 
-        let child = Command::new(binary)
-            .arg("--listen")
-            .arg(address.to_string())
-            .env("RBE_CONTAINER_TOKEN", &token)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|err| anyhow::anyhow!("failed to spawn verified container process {}: {err}", binary.display()))?;
+        for attempt in 1..=MAX_SPAWN_ATTEMPTS {
+            let port = reserve_loopback_port()?;
+            let address = SocketAddr::from(([127, 0, 0, 1], port));
+            let token = generate_token();
 
-        let mut process = Self { child, address };
-        process.wait_for_control_socket().await?;
-        tracing::info!(
-            pid = process.child.id(),
-            address = %address,
-            build_id = container_integrity::CONTAINER_BUILD_ID,
-            target = container_integrity::CONTAINER_TARGET,
-            "verified container process is ready"
-        );
-        Ok(process)
+            let child = Command::new(binary)
+                .arg("--listen")
+                .arg(address.to_string())
+                .env("RBE_CONTAINER_TOKEN", &token)
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|err| anyhow::anyhow!("failed to spawn verified container process {}: {err}", binary.display()))?;
+
+            let mut process = Self { child, address };
+            match process.wait_for_control_socket().await {
+                Ok(()) => {
+                    tracing::info!(
+                        pid = process.child.id(),
+                        address = %address,
+                        attempt,
+                        build_id = container_integrity::CONTAINER_BUILD_ID,
+                        target = container_integrity::CONTAINER_TARGET,
+                        "verified container process is ready"
+                    );
+                    return Ok(process);
+                }
+                Err(err) => {
+                    tracing::warn!(attempt, address = %address, error = %err, "container process failed to become ready on this port, retrying with a fresh port");
+                    last_err = Some(err);
+                    // process (and its Child) drops here, which — since
+                    // `kill_on_drop(true)` was set — kills the failed
+                    // attempt's process rather than leaking it.
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("failed to start container process after {MAX_SPAWN_ATTEMPTS} attempts")))
     }
 
     pub fn packaged_path() -> anyhow::Result<PathBuf> {
@@ -130,7 +160,13 @@ fn verify_container(binary: &Path) -> anyhow::Result<()> {
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    // 64 KiB — NOT the 1 MiB this used to be. Same fix, same reasoning
+    // as build.rs's sha256_file: a 1 MiB stack-local array reliably
+    // blows the default thread stack on Windows (1 MiB default) and
+    // is a real risk even on Linux for anything running on a smaller-
+    // than-main-thread stack (a tokio worker thread, for instance).
+    // This was the STATUS_STACK_OVERFLOW crash — not something else.
+    let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 { break; }

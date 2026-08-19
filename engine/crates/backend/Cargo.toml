@@ -16,6 +16,7 @@ supervisor = { path = "../supervisor" }
 logging = { path = "../logging" }
 vault-process = { path = "../../../vault-process" }
 atomic-io = { path = "../../../atomic-io" }
+runtime-paths = { path = "../../../runtime-paths" }
 error-client = { path = "../../../error-client" }
 route-engine = { path = "../route-engine" }
 ipc-protocol = { path = "../../../container-runtime/crates/ipc-protocol" }

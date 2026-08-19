@@ -1,0 +1,14 @@
+[package]
+name = "runtime-paths"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate — like vault/atomic-io/error-client, not a member of
+# either workspace. One tiny, correctness-critical function
+# (binary_dir()) that kept getting duplicated (route-engine had its
+# own copy, container-bin had its own copy, and security::timing was
+# about to need a fourth) — see this crate's lib.rs doc comment for
+# why that duplication stopped being worth it.
+
+[dependencies]

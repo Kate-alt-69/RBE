@@ -105,7 +105,14 @@ fn signing_statement(hash: &str, build_id: &str, target: &str) -> String {
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    // 64 KiB — NOT the 1 MiB this used to be. A 1 MiB LOCAL ARRAY
+    // reliably blows the default thread stack (Windows threads default
+    // to a 1 MiB stack, so a single such buffer consumed the entire
+    // budget on its own; this was the actual STATUS_STACK_OVERFLOW
+    // crash during the build). 64 KiB needs no heap allocation at all
+    // and is already plenty efficient for sequential file hashing —
+    // the bottleneck is disk I/O either way, not read() call count.
+    let mut buffer = [0u8; 64 * 1024];
 
     loop {
         let read = file.read(&mut buffer)?;

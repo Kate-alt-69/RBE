@@ -18,7 +18,13 @@ use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot, EnvironmentSto
 use crate::execution::{ExecutionId, ExecutionTask, WorkCost};
 use crate::worker::Runner;
 
-const JOURNAL_PATH: &str = "./data/container-runtime/execution.journal";
+// Resolved relative to the binary's own directory, not the CWD — see
+// `runtime_paths`'s crate doc comment for why a bare "./..." literal
+// here is exactly the bug class that made shared state scatter across
+// different locations depending on process launch directory.
+fn journal_path() -> PathBuf {
+    runtime_paths::binary_dir().join("data").join("container-runtime").join("execution.journal")
+}
 const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,7 +55,7 @@ struct Journal {
 
 impl Journal {
     fn open() -> Arc<Self> {
-        let path = PathBuf::from(JOURNAL_PATH);
+        let path = journal_path();
         if let Some(parent) = path.parent() {
             let _ = create_dir_all(parent);
         }

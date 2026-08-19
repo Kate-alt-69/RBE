@@ -449,7 +449,7 @@ fn append_audit_value(value: &Value) {
     };
     line.push(b'\n');
 
-    let path = std::path::Path::new("./data/admin/request.queue.log");
+    let path = runtime_paths::default_admin_dir().join("request.queue.log");
     let io = REQUEST_AUDIT_IO.get_or_init(AtomicIo::new);
-    let _ = io.append_locked(path, &line);
+    let _ = io.append_locked(&path, &line);
 }
