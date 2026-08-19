@@ -2,13 +2,16 @@ name: CI
 
 # Lives at the true repo root (project-root/.github/workflows).
 # CI validates both the Rust workspaces and the same build entrypoints
-# developers use locally, so a green CI run means the distributable build
-# scripts can actually compile RBE on their native CI platforms.
+# developers use locally. The native build-script jobs also launch the
+# packaged RBE and require it to become healthy without reporting errors.
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   main-workspace:
@@ -26,7 +29,7 @@ jobs:
           workspaces: engine
       - name: fmt check
         run: cargo fmt --all -- --check
-      - name: clippy
+      - name: clippy (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
@@ -35,32 +38,267 @@ jobs:
 
   build-script-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RBE_CONFIG_HOME: ${{ runner.temp }}/rbe-config
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: engine
-      - name: build.sh (host debug build)
-        run: ./build.sh --debug
+          workspaces: |
+            engine
+            container-runtime
+      - name: install Linux runtime smoke-test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring dbus-x11
+      - name: build.sh (host debug packaged build)
+        run: ./build.sh --debug --dev-content
+      - name: smoke test packaged RBE on Linux
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          APP_DIR="$GITHUB_WORKSPACE/dist/x86_64-unknown-linux-gnu"
+          LOG_DIR="$RUNNER_TEMP/rbe-smoke-linux"
+          mkdir -p "$LOG_DIR"
+
+          test -x "$APP_DIR/backend"
+          test -x "$APP_DIR/dep/container"
+          test -f "$APP_DIR/settings.json"
+          test -f "$APP_DIR/api/health.route"
+
+          # Give Vault a real session bus on the headless runner so this checks
+          # normal Secret Service startup rather than package-install fallback.
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/rbe-xdg-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          export DBUS_SESSION_BUS_ADDRESS="$(dbus-daemon --session --fork --print-address)"
+
+          cd "$APP_DIR"
+          RBE_BOOT_TRACE=1 RBE_BOOT_LOG="$LOG_DIR/boot.log" \
+            ./backend >"$LOG_DIR/backend.stdout.log" 2>"$LOG_DIR/backend.stderr.log" &
+          BACKEND_PID=$!
+
+          cleanup() {
+            if kill -0 "$BACKEND_PID" 2>/dev/null; then
+              kill -TERM "$BACKEND_PID" 2>/dev/null || true
+              wait "$BACKEND_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          READY=0
+          for _ in $(seq 1 120); do
+            if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+              echo "RBE exited before becoming healthy." >&2
+              cat "$LOG_DIR/backend.stdout.log" 2>/dev/null || true
+              cat "$LOG_DIR/backend.stderr.log" 2>/dev/null || true
+              exit 1
+            fi
+
+            if curl --fail --silent --show-error --max-time 2 \
+              http://127.0.0.1:8080/health -o "$LOG_DIR/health.json"; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "RBE did not become healthy within 120 seconds." >&2
+            cat "$LOG_DIR/backend.stdout.log" 2>/dev/null || true
+            cat "$LOG_DIR/backend.stderr.log" 2>/dev/null || true
+            exit 1
+          fi
+
+          python3 - "$LOG_DIR/health.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "r", encoding="utf-8") as f:
+              health = json.load(f)
+          if health.get("ok") is not True:
+              raise SystemExit(f"/health did not report ok=true: {health!r}")
+          print("RBE health check:", json.dumps(health, sort_keys=True))
+          PY
+
+          # Give the error-reporter daemon time to drain anything queued during boot.
+          sleep 2
+
+          for report in \
+            "$APP_DIR/data/admin/error-report.queue.log" \
+            "$APP_DIR/data/admin/error-reports.log"; do
+            if [ -f "$report" ] && grep -Eq '"level"[[:space:]]*:[[:space:]]*"error"' "$report"; then
+              echo "RBE reported an error during startup: $report" >&2
+              cat "$report" >&2
+              exit 1
+            fi
+          done
+
+          if grep -Eqi 'panicked at|stack overflow|fatal (boot|vault|error-reporter).*error' \
+            "$LOG_DIR/backend.stdout.log" "$LOG_DIR/backend.stderr.log"; then
+            echo "Fatal/panic output detected during RBE startup." >&2
+            cat "$LOG_DIR/backend.stdout.log" 2>/dev/null || true
+            cat "$LOG_DIR/backend.stderr.log" 2>/dev/null || true
+            exit 1
+          fi
+
+          # Linux supports SIGTERM through backend::shutdown_signal(), so require
+          # the smoke-test process to shut down cleanly as well.
+          kill -TERM "$BACKEND_PID"
+          if ! wait "$BACKEND_PID"; then
+            echo "RBE returned a failure status during graceful shutdown." >&2
+            exit 1
+          fi
+          trap - EXIT
+
+      - name: upload Linux RBE smoke-test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbe-smoke-linux
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/rbe-smoke-linux
+            dist/x86_64-unknown-linux-gnu/data/admin/error-report.queue.log
+            dist/x86_64-unknown-linux-gnu/data/admin/error-reports.log
+            dist/x86_64-unknown-linux-gnu/data/admin/error-reporter-status.json
 
   build-script-windows:
     runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      RBE_CONFIG_HOME: ${{ runner.temp }}/rbe-config
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: engine
-      - name: build.ps1 (host debug build)
+          workspaces: |
+            engine
+            container-runtime
+      - name: build.ps1 (host debug packaged build)
         shell: pwsh
-        run: ./build.ps1 --debug
+        run: ./build.ps1 --debug --dev-content
+      - name: smoke test packaged RBE on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $appDir = Join-Path $env:GITHUB_WORKSPACE 'dist\x86_64-pc-windows-msvc'
+          $logDir = Join-Path $env:RUNNER_TEMP 'rbe-smoke-windows'
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+          $backend = Join-Path $appDir 'backend.exe'
+          $container = Join-Path $appDir 'dep\container.exe'
+          $settings = Join-Path $appDir 'settings.json'
+          $healthRoute = Join-Path $appDir 'api\health.route'
+          foreach ($required in @($backend, $container, $settings, $healthRoute)) {
+            if (-not (Test-Path -LiteralPath $required)) {
+              throw "Packaged RBE file is missing: $required"
+            }
+          }
+
+          $stdout = Join-Path $logDir 'backend.stdout.log'
+          $stderr = Join-Path $logDir 'backend.stderr.log'
+          $bootLog = Join-Path $logDir 'boot.log'
+          $healthJson = Join-Path $logDir 'health.json'
+
+          $env:RBE_BOOT_TRACE = '1'
+          $env:RBE_BOOT_LOG = $bootLog
+
+          $proc = Start-Process \
+            -FilePath $backend \
+            -WorkingDirectory $appDir \
+            -RedirectStandardOutput $stdout \
+            -RedirectStandardError $stderr \
+            -PassThru
+
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 120; $i++) {
+              $proc.Refresh()
+              if ($proc.HasExited) {
+                Write-Host 'RBE exited before becoming healthy.'
+                if (Test-Path $stdout) { Get-Content $stdout }
+                if (Test-Path $stderr) { Get-Content $stderr }
+                throw "backend.exe exited early with code $($proc.ExitCode)"
+              }
+
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8080/health' -TimeoutSec 2
+                if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                  $response.Content | Set-Content -LiteralPath $healthJson -Encoding utf8
+                  $health = $response.Content | ConvertFrom-Json
+                  if ($health.ok -eq $true) {
+                    $ready = $true
+                    break
+                  }
+                }
+              } catch {
+                # Expected while the backend is still booting.
+              }
+              Start-Sleep -Seconds 1
+            }
+
+            if (-not $ready) {
+              if (Test-Path $stdout) { Get-Content $stdout }
+              if (Test-Path $stderr) { Get-Content $stderr }
+              throw 'RBE did not become healthy within 120 seconds.'
+            }
+
+            Write-Host "RBE health check: $((Get-Content $healthJson -Raw).Trim())"
+            Start-Sleep -Seconds 2
+
+            $adminDir = Join-Path $appDir 'data\admin'
+            foreach ($reportName in @('error-report.queue.log', 'error-reports.log')) {
+              $report = Join-Path $adminDir $reportName
+              if (Test-Path -LiteralPath $report) {
+                $reportText = Get-Content -LiteralPath $report -Raw
+                if ($reportText -match '"level"\s*:\s*"error"') {
+                  Write-Host $reportText
+                  throw "RBE reported an error during startup: $report"
+                }
+              }
+            }
+
+            $combined = ''
+            if (Test-Path $stdout) { $combined += (Get-Content $stdout -Raw) }
+            if (Test-Path $stderr) { $combined += "`n" + (Get-Content $stderr -Raw) }
+            if ($combined -match '(?i)panicked at|stack overflow|fatal (boot|vault|error-reporter).*error') {
+              Write-Host $combined
+              throw 'Fatal/panic output detected during RBE startup.'
+            }
+          }
+          finally {
+            $proc.Refresh()
+            if (-not $proc.HasExited) {
+              # Windows has no portable way to inject the console Ctrl+C event
+              # into a Start-Process child from Actions, so terminate it after
+              # the successful live-health/error-report checks.
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              $proc.WaitForExit()
+            }
+          }
+
+      - name: upload Windows RBE smoke-test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbe-smoke-windows
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/rbe-smoke-windows
+            dist/x86_64-pc-windows-msvc/data/admin/error-report.queue.log
+            dist/x86_64-pc-windows-msvc/data/admin/error-reports.log
+            dist/x86_64-pc-windows-msvc/data/admin/error-reporter-status.json
 
   shared-crates:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        crate: [atomic-io, vault, error-client]
+        crate: [atomic-io, vault, error-client, vault-process, runtime-paths]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -72,7 +310,7 @@ jobs:
       - name: fmt check
         working-directory: ${{ matrix.crate }}
         run: cargo fmt --all -- --check
-      - name: clippy
+      - name: clippy (warnings are errors)
         working-directory: ${{ matrix.crate }}
         run: cargo clippy --all-targets -- -D warnings
       - name: test
@@ -95,7 +333,7 @@ jobs:
           workspaces: container-runtime
       - name: fmt check
         run: cargo fmt --all -- --check
-      - name: clippy
+      - name: clippy (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
