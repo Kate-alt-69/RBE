@@ -12,7 +12,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,10 +27,12 @@ const DEFAULT_DASHBOARD_ADDRESS: &str = "127.0.0.1:8787";
 const MONITOR_REFRESH: Duration = Duration::from_secs(500 * 60 * 60);
 const MONITOR_POLL: Duration = Duration::from_millis(250);
 const MONITOR_RESTART_DELAY: Duration = Duration::from_secs(2);
+const MAX_REFRESH_DRAIN: Duration = Duration::from_secs(5 * 60);
 const EVENT_LOG_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const EVENT_LOG_KEEP_BYTES: u64 = 8 * 1024 * 1024;
 const MONITOR_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MONITOR_LOG_KEEP_BYTES: u64 = 4 * 1024 * 1024;
+static EVENT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) fn event_log_path() -> PathBuf {
     runtime_paths::binary_dir().join("data").join("container-runtime").join("container-events.jsonl")
@@ -77,10 +80,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Keep the policy/health registry alive even though live scheduler topology is
-    // reported directly from Runtime snapshots.
     let _registry = Arc::new(EnvironmentRegistry::new(io, vault, &vault_data_dir));
-
     let defaults = RuntimeConfig::default();
     let general_environments = value_after(&args, "--general-environments")
         .and_then(|value| value.parse::<usize>().ok())
@@ -97,6 +97,7 @@ fn main() -> anyhow::Result<()> {
         workers_per_swamp,
         rebalance_interval_ms: 25,
     });
+    let accepting = Arc::new(AtomicBool::new(true));
 
     emit_event("runtime_config", &format!(
         "general_environments={} swamps_per_environment={} workers_per_swamp={}",
@@ -126,7 +127,7 @@ fn main() -> anyhow::Result<()> {
     if debug { run_debug(&args, &runtime)?; }
     if let Some(address) = listen {
         let token = token.ok_or_else(|| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
-        run_control_server(&address, token, runtime.clone())?;
+        run_control_server(&address, token, runtime.clone(), accepting)?;
     } else if !debug {
         println!("container: no control socket requested; exiting after initialization");
     }
@@ -148,22 +149,22 @@ fn spawn_monitor_supervisor() -> anyhow::Result<()> {
             {
                 Ok(child) => child,
                 Err(error) => {
-                    let _ = append_monitor_log(&log, &format!("{} monitor_spawn_failed error={error}", now_ms()));
+                    emit_event("monitor_spawn_failed", &error.to_string());
                     thread::sleep(MONITOR_RESTART_DELAY);
                     continue;
                 }
             };
             let started = Instant::now();
-            let _ = append_monitor_log(&log, &format!("{} monitor_started pid={}", now_ms(), child.id()));
+            emit_event("monitor_started", &format!("pid={}", child.id()));
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        let _ = append_monitor_log(&log, &format!("{} monitor_exit status={status}", now_ms()));
+                        emit_event("monitor_exit", &status.to_string());
                         thread::sleep(MONITOR_RESTART_DELAY);
                         break;
                     }
                     Err(error) => {
-                        let _ = append_monitor_log(&log, &format!("{} monitor_wait_error error={error}", now_ms()));
+                        emit_event("monitor_wait_error", &error.to_string());
                         let _ = child.kill();
                         let _ = child.wait();
                         thread::sleep(MONITOR_RESTART_DELAY);
@@ -172,7 +173,7 @@ fn spawn_monitor_supervisor() -> anyhow::Result<()> {
                     Ok(None) => {}
                 }
                 if started.elapsed() >= MONITOR_REFRESH {
-                    let _ = append_monitor_log(&log, &format!("{} monitor_scheduled_refresh hours=500", now_ms()));
+                    emit_event("monitor_scheduled_refresh", "hours=500");
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
@@ -228,7 +229,7 @@ fn process_exists(pid: u32) -> bool {
         let mut exit_code = 0u32;
         let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
         unsafe { CloseHandle(handle); }
-        ok && exit_code == 259 // STILL_ACTIVE
+        ok && exit_code == 259
     }
 }
 
@@ -241,6 +242,7 @@ fn append_monitor_log(path: &Path, line: &str) -> anyhow::Result<()> {
 }
 
 fn emit_event(kind: &str, detail: &str) {
+    let _guard = EVENT_LOG_LOCK.get_or_init(|| Mutex::new(())).lock().expect("event log lock poisoned");
     let path = event_log_path();
     if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
     let _ = rotate_log(&path, EVENT_LOG_MAX_BYTES, EVENT_LOG_KEEP_BYTES);
@@ -284,7 +286,7 @@ fn run_worker(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>) -> anyhow::Result<()> {
+fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>, accepting: Arc<AtomicBool>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
     println!("container: control socket listening on {}", listener.local_addr()?);
     emit_event("control_listening", address);
@@ -293,8 +295,9 @@ fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>) -> an
             Ok(stream) => {
                 let token = token.clone();
                 let runtime = Arc::clone(&runtime);
+                let accepting = Arc::clone(&accepting);
                 thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &token, &runtime) {
+                    if let Err(err) = handle_connection(stream, &token, &runtime, &accepting) {
                         tracing::warn!(%err, "container control connection closed with error");
                     }
                 });
@@ -305,7 +308,7 @@ fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>) -> an
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime) -> anyhow::Result<()> {
+fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, accepting: &AtomicBool) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let request = decode_request(&read_frame(&mut reader)?)?;
     let response = match request {
@@ -317,6 +320,8 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime) -> a
         Request::Execute(request) => {
             if request.auth_token != token {
                 Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else if !accepting.load(Ordering::Acquire) {
+                Response::Error { request_id: Some(request.request_id), code: "REFRESHING".into(), message: "container is draining for a supervised process refresh".into() }
             } else if let Some(environment) = parse_environment(&request.environment).filter(|id| runtime.has_environment(*id)) {
                 let cost = WorkCost { cpu: request.declared_cost.cpu, memory: request.declared_cost.memory, io: request.declared_cost.io, network: request.declared_cost.network };
                 let execution_id = runtime.submit_with_policy(environment, request.artifact_hash, cost, ResourceLimits::default(), SandboxPolicy::default(), 0, request.payload);
@@ -336,6 +341,7 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime) -> a
                     "protocol": PROTOCOL_VERSION,
                     "process": "container",
                     "pid": std::process::id(),
+                    "accepting_executions": accepting.load(Ordering::Acquire),
                     "environments": snapshots.len(),
                     "general_environments": runtime.config().general_environments,
                     "payment_environments": 1,
@@ -366,12 +372,14 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime) -> a
             if request.auth_token != token {
                 Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
             } else {
-                Response::Inspection { request_id: request.request_id, body: inspection_body(runtime, request.execution_id) }
+                Response::Inspection { request_id: request.request_id, body: inspection_body(runtime, request.execution_id, accepting.load(Ordering::Acquire)) }
             }
         }
         Request::RestartEnvironment(request) => {
             if request.auth_token != token {
                 Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else if !accepting.load(Ordering::Acquire) {
+                Response::Error { request_id: Some(request.request_id), code: "REFRESHING".into(), message: "container is draining for a supervised process refresh".into() }
             } else if let Some(environment) = parse_environment(&request.environment).filter(|id| runtime.has_environment(*id)) {
                 let requeued = runtime.restart_environment(environment);
                 emit_event("environment_restart", &format!("environment={environment} requeued={requeued}"));
@@ -380,12 +388,43 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime) -> a
                 Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("container environment is unavailable: {}", request.environment) }
             }
         }
+        Request::PrepareRefresh(request) => {
+            if request.auth_token != token {
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else {
+                accepting.store(false, Ordering::Release);
+                emit_event("refresh_drain_started", &format!("timeout_ms={}", request.drain_timeout_ms));
+                let requested = Duration::from_millis(request.drain_timeout_ms.max(1_000));
+                let timeout = requested.min(MAX_REFRESH_DRAIN);
+                let started = Instant::now();
+                while !runtime.is_idle() && started.elapsed() < timeout {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if runtime.is_idle() {
+                    emit_event("refresh_drain_ready", &format!("elapsed_ms={}", started.elapsed().as_millis()));
+                    Response::ReadyForRefresh { request_id: request.request_id }
+                } else {
+                    accepting.store(true, Ordering::Release);
+                    emit_event("refresh_drain_timeout", &format!("elapsed_ms={}", started.elapsed().as_millis()));
+                    Response::Error { request_id: Some(request.request_id), code: "DRAIN_TIMEOUT".into(), message: "container could not drain all executions before the refresh deadline; normal execution resumed".into() }
+                }
+            }
+        }
+        Request::Resume(request) => {
+            if request.auth_token != token {
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else {
+                accepting.store(true, Ordering::Release);
+                emit_event("refresh_resume", "backend retained current container");
+                Response::Resumed { request_id: request.request_id }
+            }
+        }
     };
     write_frame(&mut stream, &response)?;
     Ok(())
 }
 
-fn inspection_body(runtime: &Runtime, execution_id: Option<String>) -> serde_json::Value {
+fn inspection_body(runtime: &Runtime, execution_id: Option<String>, accepting: bool) -> serde_json::Value {
     let snapshots = runtime.snapshots();
     let (swamps_total, workers_total, workers_busy, completed, failed) = topology_totals(&snapshots);
     let environments = snapshots.into_iter().map(|environment| {
@@ -440,6 +479,8 @@ fn inspection_body(runtime: &Runtime, execution_id: Option<String>) -> serde_jso
     serde_json::json!({
         "execution_id": execution_id,
         "pid": std::process::id(),
+        "accepting_executions": accepting,
+        "idle": runtime.is_idle(),
         "config": {
             "general_environments": runtime.config().general_environments,
             "payment_environments": 1,
