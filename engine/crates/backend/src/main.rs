@@ -210,11 +210,21 @@ fn spawn_container_refresh(
     refresh_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        const DRAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
         let mut interval = tokio::time::interval(refresh_interval);
         interval.tick().await;
         loop {
             interval.tick().await;
             tracing::info!(hours = refresh_interval.as_secs() / 3600, "starting scheduled rolling container refresh");
+
+            if let Err(err) = client.prepare_refresh(DRAIN_TIMEOUT).await {
+                tracing::warn!(error = %err, "container did not complete refresh drain; retaining current process");
+                if let Err(resume_err) = client.resume().await {
+                    tracing::error!(error = %resume_err, "failed to resume container after refresh drain failure");
+                }
+                continue;
+            }
+
             match container_process::ContainerProcess::spawn(&binary, &settings).await {
                 Ok(replacement) => {
                     let (address, token, pid) = replacement.endpoint();
@@ -225,13 +235,17 @@ fn spawn_container_refresh(
                     client.update_endpoint(address, token, pid);
                     maintenance.record_container_refresh();
                     tracing::info!(pid, %address, "replacement container healthy; IPC switched to new process");
-                    // Give requests that already copied the previous endpoint a
-                    // brief chance to finish before kill_on_drop retires it.
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    // The old process has already stopped accepting work and is
+                    // confirmed idle. This short grace only lets in-flight
+                    // health/inspection IPC calls release their old socket.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     drop(old);
                 }
                 Err(err) => {
-                    tracing::error!(error = %err, "scheduled container refresh failed; keeping existing healthy container online");
+                    tracing::error!(error = %err, "scheduled container replacement failed; resuming existing healthy container");
+                    if let Err(resume_err) = client.resume().await {
+                        tracing::error!(error = %resume_err, "failed to resume existing container after replacement failure");
+                    }
                 }
             }
         }
