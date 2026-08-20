@@ -13,5 +13,8 @@ config = { path = "../config" }
 supervisor = { path = "../supervisor" }
 security = { path = "../security" }
 vault-process = { path = "../../../vault-process" }
+ipc-protocol = { path = "../../../container-runtime/crates/ipc-protocol" }
 tracing = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
