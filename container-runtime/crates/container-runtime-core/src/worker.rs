@@ -52,6 +52,8 @@ impl Worker {
             .name(format!("rbe-worker-{id}"))
             .spawn(move || {
                 while let Ok(command) = rx.recv() {
+                    // try_send reserves the worker before enqueueing, so this
+                    // assignment simply confirms the state on the worker thread.
                     *thread_state.lock().expect("worker state poisoned") = WorkerState::Running;
                     *thread_current.lock().expect("worker current poisoned") = Some(command.task.id);
 
@@ -59,18 +61,15 @@ impl Worker {
                     let result = runner(&command.task);
                     let elapsed_ms = started.elapsed().as_millis() as u64;
 
-                    if result.is_ok() {
-                        thread_completed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        thread_failed.fetch_add(1, Ordering::Relaxed);
-                    }
+                    if result.is_ok() { thread_completed.fetch_add(1, Ordering::Relaxed); }
+                    else { thread_failed.fetch_add(1, Ordering::Relaxed); }
                     thread_total_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
                     on_complete(&command.task, elapsed_ms, result);
 
                     *thread_current.lock().expect("worker current poisoned") = None;
                     *thread_state.lock().expect("worker state poisoned") = WorkerState::Idle;
                 }
-
+                *thread_current.lock().expect("worker current poisoned") = None;
                 *thread_state.lock().expect("worker state poisoned") = WorkerState::Stopped;
             })
             .expect("failed to start worker thread");
@@ -83,8 +82,21 @@ impl Worker {
     }
 
     pub fn try_send(&self, task: ExecutionTask) -> bool {
-        if !self.is_idle() { return false; }
-        self.tx.send(WorkerCommand { task }).is_ok()
+        // Reserve under the state lock BEFORE sending. Previously the dispatcher
+        // could observe Idle repeatedly before the worker thread woke up and put
+        // multiple tasks into one worker's private channel, making queue/drain
+        // accounting inaccurate.
+        {
+            let mut state = self.state.lock().expect("worker state poisoned");
+            if *state != WorkerState::Idle { return false; }
+            *state = WorkerState::Running;
+        }
+        if self.tx.send(WorkerCommand { task }).is_ok() {
+            true
+        } else {
+            *self.state.lock().expect("worker state poisoned") = WorkerState::Stopped;
+            false
+        }
     }
 
     pub fn snapshot(&self) -> WorkerSnapshot {
