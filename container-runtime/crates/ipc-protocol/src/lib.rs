@@ -1,15 +1,10 @@
 //! Authenticated control-plane IPC types for the standalone `container` binary.
-//!
-//! The transport is deliberately kept separate from execution policy: this crate
-//! defines framed JSON messages, protocol versions, request IDs, and the shared
-//! authentication token field. The caller is responsible for enforcing that the
-//! transport is local/private and that the token was provisioned out-of-band.
 
 use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +51,19 @@ pub struct HealthRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareRefreshRequest {
+    pub request_id: String,
+    pub auth_token: String,
+    pub drain_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeRequest {
+    pub request_id: String,
+    pub auth_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Hello(Hello),
     Execute(ExecuteRequest),
@@ -63,6 +71,8 @@ pub enum Request {
     Inspect(InspectRequest),
     RestartEnvironment(RestartEnvironmentRequest),
     Health(HealthRequest),
+    PrepareRefresh(PrepareRefreshRequest),
+    Resume(ResumeRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +91,8 @@ pub enum Response {
     Inspection { request_id: String, body: serde_json::Value },
     Restarted { request_id: String, environment: String },
     Health { request_id: String, body: serde_json::Value },
+    ReadyForRefresh { request_id: String },
+    Resumed { request_id: String },
     Error { request_id: Option<String>, code: String, message: String },
 }
 
@@ -121,14 +133,24 @@ mod tests {
 
     #[test]
     fn frame_round_trip() {
-        let request = Request::Health(HealthRequest {
-            request_id: "req-1".into(),
-            auth_token: "secret".into(),
-        });
+        let request = Request::Health(HealthRequest { request_id: "req-1".into(), auth_token: "secret".into() });
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &request).unwrap();
         let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();
         assert!(matches!(decoded, Request::Health(_)));
+    }
+
+    #[test]
+    fn refresh_round_trip() {
+        let request = Request::PrepareRefresh(PrepareRefreshRequest {
+            request_id: "refresh-1".into(),
+            auth_token: "secret".into(),
+            drain_timeout_ms: 30_000,
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();
+        assert!(matches!(decoded, Request::PrepareRefresh(_)));
     }
 
     #[test]
