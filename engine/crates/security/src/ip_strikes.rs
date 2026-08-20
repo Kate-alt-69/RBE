@@ -1,14 +1,4 @@
-//! Multi-bucket IP strike tracking + ban enforcement. Matches the Node
-//! backend's distinction between abuse categories (API abuse, admin
-//! auth failures, CPU-cost abuse, logic/state-machine abuse) — each
-//! category accumulates strikes independently, but **v1 applies one
-//! configured threshold/window/ban-duration uniformly across all of
-//! them** (`config.security.ip_ban`), not per-category tuning. Real
-//! CPU-abuse and logic-abuse detection (actually measuring request
-//! cost or bypass attempts, not just counting a category label) is a
-//! separate, larger piece of work — not implemented; callers can
-//! record strikes in those categories today, but nothing yet decides
-//! *when* a request counts as CPU/logic abuse in the first place.
+//! Multi-bucket IP strike tracking + ban enforcement.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -27,6 +17,17 @@ pub enum StrikeCategory {
     LogicAbuse,
 }
 
+impl StrikeCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::AdminAuth => "admin_auth",
+            Self::CpuAbuse => "cpu_abuse",
+            Self::LogicAbuse => "logic_abuse",
+        }
+    }
+}
+
 struct StrikeEntry {
     window_start: Instant,
     count: u32,
@@ -34,6 +35,22 @@ struct StrikeEntry {
 
 struct BanEntry {
     banned_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct BanSnapshot {
+    pub ip: String,
+    pub age_secs: u64,
+    pub remaining_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct StrikeSnapshot {
+    pub ip: String,
+    pub category: &'static str,
+    pub count: u32,
+    pub age_secs: u64,
+    pub remaining_window_secs: u64,
 }
 
 pub struct IpStrikeTracker {
@@ -51,10 +68,6 @@ impl IpStrikeTracker {
         }
     }
 
-    /// Records a strike for `ip` in `category`. If it crosses the
-    /// threshold within the configured window, bans the IP (across ALL
-    /// categories — a ban is a ban, not scoped back down to the
-    /// category that triggered it) and returns `true`.
     pub fn record_strike(&self, ip: IpAddr, category: StrikeCategory) -> bool {
         let key = normalize_key(ip);
         let window = Duration::from_secs(self.config.strike_window_secs);
@@ -62,12 +75,10 @@ impl IpStrikeTracker {
 
         let count = {
             let mut strikes = self.strikes.lock().unwrap();
-            let entry = strikes
-                .entry((key.clone(), category))
-                .or_insert(StrikeEntry {
-                    window_start: now,
-                    count: 0,
-                });
+            let entry = strikes.entry((key.clone(), category)).or_insert(StrikeEntry {
+                window_start: now,
+                count: 0,
+            });
             if now.duration_since(entry.window_start) >= window {
                 entry.window_start = now;
                 entry.count = 0;
@@ -77,10 +88,7 @@ impl IpStrikeTracker {
         };
 
         if count >= self.config.strike_threshold {
-            self.bans
-                .lock()
-                .unwrap()
-                .insert(key, BanEntry { banned_at: now });
+            self.bans.lock().unwrap().insert(key, BanEntry { banned_at: now });
             tracing::warn!(ip = %ip, ?category, strikes = count, "IP banned");
             true
         } else {
@@ -92,13 +100,10 @@ impl IpStrikeTracker {
         let key = normalize_key(ip);
         let ban_duration = Duration::from_secs(self.config.ban_duration_secs);
         let now = Instant::now();
-
         let mut bans = self.bans.lock().unwrap();
         match bans.get(&key) {
             Some(entry) if now.duration_since(entry.banned_at) < ban_duration => true,
             Some(_) => {
-                // Ban expired — clean it up so `bans` doesn't grow
-                // unbounded with stale entries.
                 bans.remove(&key);
                 false
             }
@@ -106,36 +111,56 @@ impl IpStrikeTracker {
         }
     }
 
-    /// Opportunistic cleanup — same reasoning as `WindowedCounter::sweep`.
+    pub fn ban_snapshots(&self) -> Vec<BanSnapshot> {
+        let now = Instant::now();
+        let duration = Duration::from_secs(self.config.ban_duration_secs);
+        let mut bans = self.bans.lock().unwrap();
+        bans.retain(|_, entry| now.duration_since(entry.banned_at) < duration);
+        let mut output = bans.iter().map(|(ip, entry)| {
+            let age = now.duration_since(entry.banned_at);
+            BanSnapshot {
+                ip: ip.clone(),
+                age_secs: age.as_secs(),
+                remaining_secs: duration.saturating_sub(age).as_secs(),
+            }
+        }).collect::<Vec<_>>();
+        output.sort_by(|a, b| a.ip.cmp(&b.ip));
+        output
+    }
+
+    pub fn strike_snapshots(&self) -> Vec<StrikeSnapshot> {
+        let now = Instant::now();
+        let window = Duration::from_secs(self.config.strike_window_secs);
+        let mut strikes = self.strikes.lock().unwrap();
+        strikes.retain(|_, entry| now.duration_since(entry.window_start) < window);
+        let mut output = strikes.iter().map(|((ip, category), entry)| {
+            let age = now.duration_since(entry.window_start);
+            StrikeSnapshot {
+                ip: ip.clone(),
+                category: category.label(),
+                count: entry.count,
+                age_secs: age.as_secs(),
+                remaining_window_secs: window.saturating_sub(age).as_secs(),
+            }
+        }).collect::<Vec<_>>();
+        output.sort_by(|a, b| a.ip.cmp(&b.ip).then_with(|| a.category.cmp(b.category)));
+        output
+    }
+
     pub fn sweep(&self) {
         let now = Instant::now();
         let strike_window = Duration::from_secs(self.config.strike_window_secs);
         let ban_duration = Duration::from_secs(self.config.ban_duration_secs);
-
-        self.strikes
-            .lock()
-            .unwrap()
-            .retain(|_, e| now.duration_since(e.window_start) < strike_window);
-        self.bans
-            .lock()
-            .unwrap()
-            .retain(|_, e| now.duration_since(e.banned_at) < ban_duration);
+        self.strikes.lock().unwrap().retain(|_, e| now.duration_since(e.window_start) < strike_window);
+        self.bans.lock().unwrap().retain(|_, e| now.duration_since(e.banned_at) < ban_duration);
     }
 }
 
-/// Same pattern as `rate_limit::HasRateLimiters` — implemented for
-/// `core_lib::AppState`, kept generic here so `security` doesn't need
-/// to depend back on `core_lib`.
 pub trait HasIpStrikes {
     fn ip_strikes(&self) -> &IpStrikeTracker;
     fn trust_proxy_headers(&self) -> bool;
 }
 
-/// Checks ban status before anything else runs — register this
-/// **outermost** in the layer stack (even before correlation ID),
-/// same reasoning as the Node backend's rate limiter escalating to an
-/// outright 403 rather than paying the cost of running the rest of
-/// the pipeline for a request from a banned IP.
 pub async fn ban_check<S>(
     axum::extract::State(state): axum::extract::State<S>,
     req: axum::extract::Request,
@@ -146,8 +171,7 @@ where
 {
     use axum::response::IntoResponse;
 
-    let peer = req
-        .extensions()
+    let peer = req.extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0)
         .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
