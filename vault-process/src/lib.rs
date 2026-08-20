@@ -83,8 +83,6 @@ impl VaultClient {
         rx.recv().map_err(|_| anyhow::anyhow!("Vault client worker stopped responding"))?
     }
 
-    /// Recycles only the Vault child process. The worker thread and durable
-    /// Vault data remain, so long-lived backend callers keep the same client.
     pub fn refresh_process(&self) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx.send(ClientCommand::Refresh { response: tx })
@@ -136,28 +134,22 @@ impl Worker {
     }
 
     fn handle(&mut self, command: ClientCommand) {
-        if matches!(command, ClientCommand::Refresh { .. }) {
-            if let ClientCommand::Refresh { response } = command {
+        match command {
+            ClientCommand::Refresh { response } => {
                 let _ = response.send(self.restart_connection());
             }
-            return;
-        }
-
-        if self.connection_is_dead() {
-            if let Err(err) = self.restart_connection() {
-                match command {
-                    ClientCommand::Get { response, .. } => { let _ = response.send(Err(err)); }
-                    ClientCommand::Set { response, .. } => { let _ = response.send(Err(err)); }
-                    ClientCommand::Refresh { response } => { let _ = response.send(Err(err)); }
+            ClientCommand::Get { name, caller, response } => {
+                if self.connection_is_dead() {
+                    if let Err(err) = self.restart_connection() { let _ = response.send(Err(err)); return; }
                 }
-                return;
+                let _ = response.send(self.request("get", &name, &caller, None));
             }
-        }
-
-        match command {
-            ClientCommand::Get { name, caller, response } => { let _ = response.send(self.request("get", &name, &caller, None)); }
-            ClientCommand::Set { name, value, caller, response } => { let _ = response.send(self.request("set", &name, &caller, Some(value)).map(|_| ())); }
-            ClientCommand::Refresh { response } => { let _ = response.send(self.restart_connection()); }
+            ClientCommand::Set { name, value, caller, response } => {
+                if self.connection_is_dead() {
+                    if let Err(err) = self.restart_connection() { let _ = response.send(Err(err)); return; }
+                }
+                let _ = response.send(self.request("set", &name, &caller, Some(value)).map(|_| ()));
+            }
         }
     }
 
