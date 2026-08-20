@@ -16,14 +16,16 @@ use serde::{Deserialize, Serialize};
 use crate::cache::ArtifactCache;
 use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot, EnvironmentStorage};
 use crate::execution::{ExecutionId, ExecutionTask, WorkCost};
-use crate::worker::Runner;
+use crate::worker::{Runner, WorkerState};
+
+const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
+const JOURNAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 fn journal_path() -> PathBuf {
     runtime_paths::binary_dir().join("data").join("container-runtime").join("execution.journal")
 }
-const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct JournalEvent {
     kind: String,
     epoch_ns: u64,
@@ -47,59 +49,58 @@ struct JournalEvent {
 struct Journal {
     path: PathBuf,
     lock: Mutex<()>,
+    io: atomic_io::AtomicIo,
 }
 
 impl Journal {
     fn open() -> Arc<Self> {
         let path = journal_path();
         if let Some(parent) = path.parent() { let _ = create_dir_all(parent); }
-        Arc::new(Self { path, lock: Mutex::new(()) })
+        Arc::new(Self { path, lock: Mutex::new(()), io: atomic_io::AtomicIo::new() })
     }
 
     fn append(&self, event: JournalEvent) {
         let _guard = self.lock.lock().expect("journal lock poisoned");
         let Ok(line) = serde_json::to_string(&event) else { return; };
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.path) else { return; };
-        let _ = writeln!(file, "{line}");
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.path) {
+            let _ = writeln!(file, "{line}");
+        }
+        if std::fs::metadata(&self.path).map(|metadata| metadata.len() >= JOURNAL_MAX_BYTES).unwrap_or(false) {
+            self.compact_locked();
+        }
     }
 
     fn recover(&self) -> (Vec<ExecutionTask>, u64) {
+        let _guard = self.lock.lock().expect("journal lock poisoned");
         let Ok(contents) = read_to_string(&self.path) else { return (Vec::new(), 0); };
-        let mut latest: HashMap<String, (JournalEvent, bool)> = HashMap::new();
-        let mut max_sequence = 0;
-        for line in contents.lines() {
-            let Ok(event) = serde_json::from_str::<JournalEvent>(line) else { continue; };
-            max_sequence = max_sequence.max(event.sequence);
-            let id = format!("exec-{:016x}-{:016x}", event.epoch_ns, event.sequence);
-            match event.kind.as_str() {
-                "queued" => { latest.insert(id, (event, true)); }
-                "done" | "cancel" => { if let Some(entry) = latest.get_mut(&id) { entry.1 = false; } }
-                _ => {}
+        let (pending, max_sequence) = pending_events(&contents);
+        if contents.len() as u64 >= JOURNAL_MAX_BYTES {
+            self.write_compacted(max_sequence, &pending);
+        }
+        let recovered = pending.into_iter().filter_map(event_to_task).collect();
+        (recovered, max_sequence)
+    }
+
+    fn compact_locked(&self) {
+        let Ok(contents) = read_to_string(&self.path) else { return; };
+        let (pending, max_sequence) = pending_events(&contents);
+        self.write_compacted(max_sequence, &pending);
+    }
+
+    fn write_compacted(&self, max_sequence: u64, pending: &[JournalEvent]) {
+        let checkpoint = checkpoint_event(max_sequence);
+        let mut output = String::new();
+        if let Ok(line) = serde_json::to_string(&checkpoint) {
+            output.push_str(&line);
+            output.push('\n');
+        }
+        for event in pending {
+            if let Ok(line) = serde_json::to_string(event) {
+                output.push_str(&line);
+                output.push('\n');
             }
         }
-        let recovered = latest.into_values().filter_map(|(event, pending)| {
-            if !pending { return None; }
-            let environment = parse_environment(&event.environment)?;
-            Some(ExecutionTask {
-                id: ExecutionId::from_parts(event.epoch_ns, event.sequence),
-                environment: environment.to_string(),
-                artifact_hash: event.artifact_hash,
-                declared_cost: WorkCost { cpu: event.cpu, memory: event.memory, io: event.io, network: event.network },
-                limits: ResourceLimits {
-                    cpu_millis: event.limit_cpu_millis,
-                    memory_bytes: event.limit_memory_bytes,
-                    disk_bytes: event.limit_disk_bytes,
-                    network_bytes: event.limit_network_bytes,
-                    max_processes: event.limit_max_processes,
-                    max_file_descriptors: event.limit_max_file_descriptors,
-                    wall_time_ms: event.limit_wall_time_ms,
-                },
-                sandbox: SandboxPolicy::default(),
-                work_ms: event.work_ms,
-                payload: Vec::new(),
-            })
-        }).collect();
-        (recovered, max_sequence)
+        let _ = self.io.write_atomic(&self.path, output.as_bytes());
     }
 
     fn append_cancel_string(&self, execution_id: &str) {
@@ -115,9 +116,61 @@ impl Journal {
     }
 }
 
+fn pending_events(contents: &str) -> (Vec<JournalEvent>, u64) {
+    let mut latest: HashMap<String, (JournalEvent, bool)> = HashMap::new();
+    let mut max_sequence = 0u64;
+    for line in contents.lines() {
+        let Ok(event) = serde_json::from_str::<JournalEvent>(line) else { continue; };
+        max_sequence = max_sequence.max(event.sequence);
+        if event.kind == "checkpoint" { continue; }
+        let id = format!("exec-{:016x}-{:016x}", event.epoch_ns, event.sequence);
+        match event.kind.as_str() {
+            "queued" => { latest.insert(id, (event, true)); }
+            "done" | "cancel" => {
+                if let Some(entry) = latest.get_mut(&id) { entry.1 = false; }
+            }
+            _ => {}
+        }
+    }
+    let pending = latest.into_values().filter_map(|(event, is_pending)| is_pending.then_some(event)).collect();
+    (pending, max_sequence)
+}
+
+fn checkpoint_event(sequence: u64) -> JournalEvent {
+    JournalEvent {
+        kind: "checkpoint".into(), epoch_ns: 0, sequence,
+        environment: "checkpoint".into(), artifact_hash: "checkpoint".into(),
+        cpu: 0, memory: 0, io: 0, network: 0, work_ms: 0,
+        limit_cpu_millis: 0, limit_memory_bytes: 0, limit_disk_bytes: 0,
+        limit_network_bytes: 0, limit_max_processes: 0, limit_max_file_descriptors: 0,
+        limit_wall_time_ms: 0,
+    }
+}
+
+fn event_to_task(event: JournalEvent) -> Option<ExecutionTask> {
+    let environment = parse_environment(&event.environment)?;
+    Some(ExecutionTask {
+        id: ExecutionId::from_parts(event.epoch_ns, event.sequence),
+        environment: environment.to_string(),
+        artifact_hash: event.artifact_hash,
+        declared_cost: WorkCost { cpu: event.cpu, memory: event.memory, io: event.io, network: event.network },
+        limits: ResourceLimits {
+            cpu_millis: event.limit_cpu_millis,
+            memory_bytes: event.limit_memory_bytes,
+            disk_bytes: event.limit_disk_bytes,
+            network_bytes: event.limit_network_bytes,
+            max_processes: event.limit_max_processes,
+            max_file_descriptors: event.limit_max_file_descriptors,
+            wall_time_ms: event.limit_wall_time_ms,
+        },
+        sandbox: SandboxPolicy::default(),
+        work_ms: event.work_ms,
+        payload: Vec::new(),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    /// Number of general-purpose environments. Payment is always additional.
     pub general_environments: usize,
     pub swamps_per_environment: usize,
     pub workers_per_swamp: usize,
@@ -187,7 +240,9 @@ impl Runtime {
                     limit_network_bytes: task.limits.network_bytes, limit_max_processes: task.limits.max_processes, limit_max_file_descriptors: task.limits.max_file_descriptors,
                     limit_wall_time_ms: task.limits.wall_time_ms,
                 });
-                if let Err(error) = result { if !was_cancelled { tracing::warn!(execution = %task.id, environment = %task.environment, "execution failed: {error}"); } }
+                if let Err(error) = result {
+                    if !was_cancelled { tracing::warn!(execution = %task.id, environment = %task.environment, "execution failed: {error}"); }
+                }
             })
         };
 
@@ -255,17 +310,32 @@ impl Runtime {
     pub fn register_artifact(&self, artifact_hash: impl Into<String>, wasm: Vec<u8>) { self.cache.put_artifact(artifact_hash, wasm); }
 
     pub fn cancel(&self, execution_id: &str) -> bool {
-        let mut found = false;
+        let mut removed_queued = false;
         {
             let mut queue = self.global_queue.lock().expect("global queue poisoned");
             let before = queue.len();
             queue.retain(|(_, task)| task.id.to_string() != execution_id);
-            found |= before != queue.len();
+            removed_queued |= before != queue.len();
         }
-        for environment in &self.environments { found |= environment.cancel_queued_by_string(execution_id); }
-        self.cancelled.lock().expect("cancel table poisoned").insert(execution_id.to_string());
-        self.journal.append_cancel_string(execution_id);
-        found || true
+        for environment in &self.environments {
+            removed_queued |= environment.cancel_queued_by_string(execution_id);
+        }
+
+        let running = self.snapshots().iter().any(|environment| {
+            environment.swamps.iter().any(|swamp| swamp.workers.iter().any(|worker| {
+                worker.current.map(|id| id.to_string() == execution_id).unwrap_or(false)
+            }))
+        });
+
+        if running {
+            self.cancelled.lock().expect("cancel table poisoned").insert(execution_id.to_string());
+        }
+        if removed_queued || running {
+            self.journal.append_cancel_string(execution_id);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn restart_environment(&self, id: EnvironmentId) -> usize {
@@ -291,6 +361,15 @@ impl Runtime {
             else { tracing::warn!(%environment, execution = %task.id, "dropping live dispatch for disabled environment"); }
         }
         for environment in &self.environments { environment.rebalance(); }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        if self.global_queue_len() != 0 { return false; }
+        self.snapshots().iter().all(|environment| {
+            environment.queued == 0 && environment.swamps.iter().all(|swamp| {
+                swamp.queued == 0 && swamp.workers.iter().all(|worker| matches!(worker.state, WorkerState::Idle | WorkerState::Stopped))
+            })
+        })
     }
 
     fn environment(&self, id: EnvironmentId) -> Option<&EnvironmentRuntime> {
@@ -344,6 +423,7 @@ fn parse_environment(value: &str) -> Option<EnvironmentId> {
         "general-4" => Some(EnvironmentId::General4), "general-5" => Some(EnvironmentId::General5), "payment" => Some(EnvironmentId::Payment), _ => None,
     }
 }
+
 fn parse_execution_id(value: &str) -> Result<(u64, u64), ()> {
     let mut parts = value.strip_prefix("exec-").ok_or(())?.split('-');
     let epoch_ns = u64::from_str_radix(parts.next().ok_or(())?, 16).map_err(|_| ())?;
