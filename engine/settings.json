@@ -2,7 +2,9 @@
   "runtime": {
     "environment": "development",
     "workerThreads": 0,
-    "gracefulShutdownTimeoutMs": 10000
+    "gracefulShutdownTimeoutMs": 10000,
+    "reclaimPort": true,
+    "processRefreshHours": 500
   },
   "api": {
     "host": "0.0.0.0",
@@ -36,6 +38,9 @@
     "vodCacheDir": "./cache/vod"
   },
   "containers": {
+    "environments": 5,
+    "swampsPerEnvironment": "auto",
+    "workersPerSwamp": "auto",
     "warmPoolSize": 4,
     "maxConcurrent": 16,
     "defaultTimeoutMs": 5000,
@@ -50,6 +55,7 @@
   },
   "dashboards": {
     "enabled": true,
+    "autoOpen": true,
     "adminPathPrefix": "/admin"
   }
 }
