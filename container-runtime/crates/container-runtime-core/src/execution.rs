@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use resource_limits::ResourceLimits;
 use sandbox_primitives::SandboxPolicy;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExecutionId {
@@ -24,7 +25,7 @@ impl std::fmt::Display for ExecutionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "exec-{:016x}-{:016x}", self.epoch_ns, self.sequence) }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkCost {
     pub cpu: u64,
     pub memory: u64,
