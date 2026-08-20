@@ -1,11 +1,9 @@
 //! Standalone `container` execution service.
 //!
-//! The backend launches this binary as a separate process. The service owns
-//! Environment → Swamp → Worker scheduling and exposes a local authenticated
-//! control socket. `--debug` renders the live topology without requiring the
-//! backend process. `--worker` is a disposable child execution mode used by the
-//! sandbox boundary and never starts the control plane. `--monitor` is a
-//! small sibling process that watches the container supervisor and its event log.
+//! backend.exe owns the user-facing dashboard. This process owns execution,
+//! Environment → Swamp → Worker scheduling, durable cache/journal state, and a
+//! local authenticated control socket. A sibling monitor is supervised and
+//! recycled periodically so long-running process-local allocations are bounded.
 
 mod dashboard;
 
@@ -13,10 +11,10 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use container_runtime_core::{EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost};
 use execution_engine::{ExecutionLimits, WasmExecutor};
@@ -24,20 +22,21 @@ use ipc_protocol::{decode_request, read_frame, write_frame, Request, Response, P
 use resource_limits::ResourceLimits;
 use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, SandboxPolicy};
 
-// Resolved relative to THIS binary's own directory, not the CWD — see
-// `runtime_paths`'s crate doc comment for why bare "./..." string
-// literals here are exactly the bug that made the transpiler cache
-// (and, separately, the shared error-reporter queue) silently break
-// depending on process launch directory. Functions, not `const`s,
-// since `runtime_paths::binary_dir()` calls `current_exe()` and can't
-// be evaluated at compile time.
+const DEFAULT_DASHBOARD_ADDRESS: &str = "127.0.0.1:8787";
+const MONITOR_REFRESH: Duration = Duration::from_secs(500 * 60 * 60);
+const MONITOR_POLL: Duration = Duration::from_millis(250);
+const MONITOR_RESTART_DELAY: Duration = Duration::from_secs(2);
+const EVENT_LOG_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const EVENT_LOG_KEEP_BYTES: u64 = 8 * 1024 * 1024;
+const MONITOR_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MONITOR_LOG_KEEP_BYTES: u64 = 4 * 1024 * 1024;
+
 pub(crate) fn event_log_path() -> PathBuf {
     runtime_paths::binary_dir().join("data").join("container-runtime").join("container-events.jsonl")
 }
 pub(crate) fn monitor_log_path() -> PathBuf {
     runtime_paths::binary_dir().join("data").join("container-runtime").join("container-monitor.log")
 }
-const DEFAULT_DASHBOARD_ADDRESS: &str = "127.0.0.1:8787";
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -49,12 +48,12 @@ fn main() -> anyhow::Result<()> {
     let debug = args.iter().any(|arg| arg == "--debug");
     let listen = value_after(&args, "--listen");
     let dashboard_disabled = args.iter().any(|arg| arg == "--no-dashboard");
-    let dashboard_address = value_after(&args, "--dashboard-listen")
-        .unwrap_or_else(|| DEFAULT_DASHBOARD_ADDRESS.to_string());
+    let dashboard_address = value_after(&args, "--dashboard-listen").unwrap_or_else(|| DEFAULT_DASHBOARD_ADDRESS.to_string());
     emit_event("container_start", &format!("pid={}", std::process::id()));
 
-    if let Err(err) = spawn_monitor_process() {
-        tracing::warn!(error = %err, "container monitor process could not be started");
+    if let Err(err) = spawn_monitor_supervisor() {
+        emit_event("monitor_supervisor_failed", &err.to_string());
+        tracing::warn!(error = %err, "container monitor supervisor could not be started");
     }
 
     let admin_dir = runtime_paths::default_admin_dir();
@@ -78,19 +77,33 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let registry = Arc::new(EnvironmentRegistry::new(io, vault, &vault_data_dir));
+    // Keep the policy/health registry alive even though live scheduler topology is
+    // reported directly from Runtime snapshots.
+    let _registry = Arc::new(EnvironmentRegistry::new(io, vault, &vault_data_dir));
+
+    let defaults = RuntimeConfig::default();
+    let general_environments = value_after(&args, "--general-environments")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(defaults.general_environments);
     let swamps_per_environment = value_after(&args, "--swamps-per-environment")
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_else(|| RuntimeConfig::default().swamps_per_environment);
+        .unwrap_or(defaults.swamps_per_environment);
     let workers_per_swamp = value_after(&args, "--workers-per-swamp")
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
+        .unwrap_or(defaults.workers_per_swamp);
     let runtime = Runtime::new(RuntimeConfig {
+        general_environments,
         swamps_per_environment,
         workers_per_swamp,
         rebalance_interval_ms: 25,
-        ..RuntimeConfig::default()
     });
+
+    emit_event("runtime_config", &format!(
+        "general_environments={} swamps_per_environment={} workers_per_swamp={}",
+        runtime.config().general_environments,
+        runtime.config().swamps_per_environment,
+        runtime.config().workers_per_swamp
+    ));
 
     let token = env::var("RBE_CONTAINER_TOKEN").ok();
     if !dashboard_disabled {
@@ -98,14 +111,14 @@ fn main() -> anyhow::Result<()> {
             Some(token) => {
                 if let Err(error) = dashboard::spawn(dashboard_address.clone(), token.clone(), runtime.clone()) {
                     emit_event("dashboard_start_failed", &error.to_string());
-                    tracing::warn!(error = %error, address = %dashboard_address, "container dashboard could not be started");
+                    tracing::warn!(error = %error, address = %dashboard_address, "container standalone dashboard could not be started");
                 } else {
                     emit_event("dashboard_listening", &dashboard_address);
                 }
             }
             None => {
                 emit_event("dashboard_disabled_no_token", "RBE_CONTAINER_TOKEN is not set");
-                tracing::warn!("container dashboard disabled because RBE_CONTAINER_TOKEN is not set");
+                tracing::warn!("container standalone dashboard disabled because RBE_CONTAINER_TOKEN is not set");
             }
         }
     }
@@ -113,43 +126,72 @@ fn main() -> anyhow::Result<()> {
     if debug { run_debug(&args, &runtime)?; }
     if let Some(address) = listen {
         let token = token.ok_or_else(|| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
-        run_control_server(&address, token, runtime.clone(), registry)?;
+        run_control_server(&address, token, runtime.clone())?;
     } else if !debug {
         println!("container: no control socket requested; exiting after initialization");
     }
     Ok(())
 }
 
-fn spawn_monitor_process() -> anyhow::Result<()> {
+fn spawn_monitor_supervisor() -> anyhow::Result<()> {
     let exe = env::current_exe()?;
-    let pid = std::process::id();
-    std::process::Command::new(exe)
-        .arg("--monitor")
-        .arg("--pid")
-        .arg(pid.to_string())
-        .arg("--events")
-        .arg(event_log_path())
-        .arg("--log")
-        .arg(monitor_log_path())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(Into::into)
+    let watched_pid = std::process::id();
+    let events = event_log_path();
+    let log = monitor_log_path();
+    thread::Builder::new().name("container-monitor-supervisor".into()).spawn(move || {
+        loop {
+            let mut child = match std::process::Command::new(&exe)
+                .arg("--monitor").arg("--pid").arg(watched_pid.to_string())
+                .arg("--events").arg(&events).arg("--log").arg(&log)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = append_monitor_log(&log, &format!("{} monitor_spawn_failed error={error}", now_ms()));
+                    thread::sleep(MONITOR_RESTART_DELAY);
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            let _ = append_monitor_log(&log, &format!("{} monitor_started pid={}", now_ms(), child.id()));
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let _ = append_monitor_log(&log, &format!("{} monitor_exit status={status}", now_ms()));
+                        thread::sleep(MONITOR_RESTART_DELAY);
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = append_monitor_log(&log, &format!("{} monitor_wait_error error={error}", now_ms()));
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        thread::sleep(MONITOR_RESTART_DELAY);
+                        break;
+                    }
+                    Ok(None) => {}
+                }
+                if started.elapsed() >= MONITOR_REFRESH {
+                    let _ = append_monitor_log(&log, &format!("{} monitor_scheduled_refresh hours=500", now_ms()));
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    })?;
+    Ok(())
 }
 
 fn run_monitor(args: &[String]) -> anyhow::Result<()> {
-    let watched_pid = value_after(args, "--pid")
-        .and_then(|value| value.parse::<u32>().ok())
-        .ok_or_else(|| anyhow::anyhow!("monitor: --pid is required"))?;
+    let watched_pid = value_after(args, "--pid").and_then(|value| value.parse::<u32>().ok()).ok_or_else(|| anyhow::anyhow!("monitor: --pid is required"))?;
     let event_path = value_after(args, "--events").map(PathBuf::from).unwrap_or_else(event_log_path);
     let monitor_path = value_after(args, "--log").map(PathBuf::from).unwrap_or_else(monitor_log_path);
     if let Some(parent) = monitor_path.parent() { fs::create_dir_all(parent)?; }
 
     let mut last_event_len = 0_u64;
     loop {
-        let alive = process_exists(watched_pid);
         if let Ok(metadata) = fs::metadata(&event_path) {
             if metadata.len() < last_event_len { last_event_len = 0; }
             if metadata.len() > last_event_len {
@@ -158,16 +200,17 @@ fn run_monitor(args: &[String]) -> anyhow::Result<()> {
                     let mut appended = String::new();
                     file.read_to_string(&mut appended)?;
                     last_event_len = metadata.len();
-                    let line = format!("{} container-event {}", now_ms(), appended.trim_end());
-                    append_monitor_log(&monitor_path, &line)?;
+                    if !appended.trim().is_empty() {
+                        append_monitor_log(&monitor_path, &format!("{} container-event {}", now_ms(), appended.trim_end()))?;
+                    }
                 }
             }
         }
-        if !alive {
+        if !process_exists(watched_pid) {
             append_monitor_log(&monitor_path, &format!("{} container_process_exit pid={watched_pid}", now_ms()))?;
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(MONITOR_POLL);
     }
 }
 
@@ -178,23 +221,50 @@ fn process_exists(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}")]).output();
-        output.map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())).unwrap_or(false)
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle == 0 { return false; }
+        let mut exit_code = 0u32;
+        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+        unsafe { CloseHandle(handle); }
+        ok && exit_code == 259 // STILL_ACTIVE
     }
 }
 
-fn append_monitor_log(path: &PathBuf, line: &str) -> anyhow::Result<()> {
+fn append_monitor_log(path: &Path, line: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    rotate_log(path, MONITOR_LOG_MAX_BYTES, MONITOR_LOG_KEEP_BYTES)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{line}")?;
     Ok(())
 }
 
 fn emit_event(kind: &str, detail: &str) {
-    if let Some(parent) = event_log_path().parent() { let _ = fs::create_dir_all(parent); }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(event_log_path()) {
-        let _ = writeln!(file, "{{\"ts\":{},\"pid\":{},\"kind\":{:?},\"detail\":{:?}}}", now_ms(), std::process::id(), kind, detail);
+    let path = event_log_path();
+    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    let _ = rotate_log(&path, EVENT_LOG_MAX_BYTES, EVENT_LOG_KEEP_BYTES);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let event = serde_json::json!({ "ts": now_ms(), "pid": std::process::id(), "kind": kind, "detail": detail });
+        let _ = writeln!(file, "{event}");
     }
+}
+
+fn rotate_log(path: &Path, max_bytes: u64, keep_bytes: u64) -> anyhow::Result<()> {
+    let Ok(metadata) = fs::metadata(path) else { return Ok(()); };
+    if metadata.len() <= max_bytes { return Ok(()); }
+    let start = metadata.len().saturating_sub(keep_bytes);
+    let mut input = OpenOptions::new().read(true).open(path)?;
+    input.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::new();
+    input.read_to_end(&mut tail)?;
+    if start > 0 {
+        if let Some(index) = tail.iter().position(|byte| *byte == b'\n') { tail.drain(..=index); }
+    }
+    let mut output = OpenOptions::new().write(true).truncate(true).open(path)?;
+    output.write_all(&tail)?;
+    output.flush()?;
+    Ok(())
 }
 
 fn now_ms() -> u128 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() }
@@ -214,17 +284,20 @@ fn run_worker(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>, registry: Arc<EnvironmentRegistry>) -> anyhow::Result<()> {
+fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
     println!("container: control socket listening on {}", listener.local_addr()?);
-    emit_event("control_listening", &address.to_string());
+    emit_event("control_listening", address);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let token = token.clone();
                 let runtime = Arc::clone(&runtime);
-                let registry = Arc::clone(&registry);
-                thread::spawn(move || { if let Err(err) = handle_connection(stream, &token, &runtime, &registry) { tracing::warn!(%err, "container control connection closed with error"); } });
+                thread::spawn(move || {
+                    if let Err(err) = handle_connection(stream, &token, &runtime) {
+                        tracing::warn!(%err, "container control connection closed with error");
+                    }
+                });
             }
             Err(err) => tracing::warn!(%err, "failed to accept container control connection"),
         }
@@ -232,48 +305,198 @@ fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>, regis
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, registry: &EnvironmentRegistry) -> anyhow::Result<()> {
+fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let request = decode_request(&read_frame(&mut reader)?)?;
     let response = match request {
-        Request::Hello(hello) => if hello.version != PROTOCOL_VERSION || hello.auth_token != token { Response::Error { request_id: None, code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } } else { Response::HelloAccepted { version: PROTOCOL_VERSION } },
+        Request::Hello(hello) => {
+            if hello.version != PROTOCOL_VERSION || hello.auth_token != token {
+                Response::Error { request_id: None, code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else { Response::HelloAccepted { version: PROTOCOL_VERSION } }
+        }
         Request::Execute(request) => {
-            if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
-            else if let Some(environment) = parse_environment(&request.environment) {
+            if request.auth_token != token {
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else if let Some(environment) = parse_environment(&request.environment).filter(|id| runtime.has_environment(*id)) {
                 let cost = WorkCost { cpu: request.declared_cost.cpu, memory: request.declared_cost.memory, io: request.declared_cost.io, network: request.declared_cost.network };
                 let execution_id = runtime.submit_with_policy(environment, request.artifact_hash, cost, ResourceLimits::default(), SandboxPolicy::default(), 0, request.payload);
                 emit_event("execution_accepted", &execution_id.to_string());
                 Response::Accepted { request_id: request.request_id, execution_id: execution_id.to_string() }
-            } else { Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("unknown container environment: {}", request.environment) } }
+            } else {
+                Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("container environment is unavailable: {}", request.environment) }
+            }
         }
-        Request::Health(request) => if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } } else { Response::Health { request_id: request.request_id, body: serde_json::json!({ "protocol": PROTOCOL_VERSION, "process": "container", "environments": registry.health_snapshot().len(), "queue": runtime.global_queue_len(), "sandbox_policy": "deny-by-default", "wasm_engine": "wasmtime", "artifact_cache": runtime.cache().artifact_count() }) } },
+        Request::Health(request) => {
+            if request.auth_token != token {
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else {
+                let snapshots = runtime.snapshots();
+                let (swamps, workers, busy, completed, failed) = topology_totals(&snapshots);
+                Response::Health { request_id: request.request_id, body: serde_json::json!({
+                    "protocol": PROTOCOL_VERSION,
+                    "process": "container",
+                    "pid": std::process::id(),
+                    "environments": snapshots.len(),
+                    "general_environments": runtime.config().general_environments,
+                    "payment_environments": 1,
+                    "swamps": swamps,
+                    "workers": workers,
+                    "workers_busy": busy,
+                    "queue": runtime.global_queue_len(),
+                    "completed": completed,
+                    "failed": failed,
+                    "sandbox_policy": "deny-by-default",
+                    "wasm_engine": "wasmtime",
+                    "artifact_cache": runtime.cache().artifact_count(),
+                    "profile_cache": runtime.cache().len()
+                }) }
+            }
+        }
         Request::Cancel(request) => {
-            if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
-            else if runtime.cancel(&request.execution_id) { emit_event("execution_cancel", &request.execution_id); Response::Cancelled { request_id: request.request_id } }
-            else { Response::Error { request_id: Some(request.request_id), code: "NOT_FOUND".into(), message: "execution ID was not found".into() } }
+            if request.auth_token != token {
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else if runtime.cancel(&request.execution_id) {
+                emit_event("execution_cancel", &request.execution_id);
+                Response::Cancelled { request_id: request.request_id }
+            } else {
+                Response::Error { request_id: Some(request.request_id), code: "NOT_FOUND".into(), message: "execution ID was not found".into() }
+            }
         }
         Request::Inspect(request) => {
-            if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
-            else {
-                let environments = runtime.snapshots();
-                let body = environments.iter().map(|environment| serde_json::json!({ "id": environment.id.to_string(), "generation": environment.generation, "queued": environment.queued, "queued_cost": environment.queued_cost, "swamps": environment.swamps.len(), "workers": environment.worker_count, "storage_limit_bytes": environment.storage_limit_bytes, "storage_ephemeral": environment.storage_ephemeral, "storage_path": environment.storage_path })).collect::<Vec<_>>();
-                Response::Inspection { request_id: request.request_id, body: serde_json::json!({ "execution_id": request.execution_id, "environments": body }) }
+            if request.auth_token != token {
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else {
+                Response::Inspection { request_id: request.request_id, body: inspection_body(runtime, request.execution_id) }
             }
         }
         Request::RestartEnvironment(request) => {
-            if request.auth_token != token { Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() } }
-            else if let Some(environment) = parse_environment(&request.environment) {
+            if request.auth_token != token {
+                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+            } else if let Some(environment) = parse_environment(&request.environment).filter(|id| runtime.has_environment(*id)) {
                 let requeued = runtime.restart_environment(environment);
                 emit_event("environment_restart", &format!("environment={environment} requeued={requeued}"));
                 Response::Restarted { request_id: request.request_id, environment: format!("{} ({} executions requeued)", environment, requeued) }
-            } else { Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("unknown container environment: {}", request.environment) } }
+            } else {
+                Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("container environment is unavailable: {}", request.environment) }
+            }
         }
     };
     write_frame(&mut stream, &response)?;
     Ok(())
 }
 
-fn parse_environment(value: &str) -> Option<EnvironmentId> { match value { "general-1" => Some(EnvironmentId::General1), "general-2" => Some(EnvironmentId::General2), "general-3" => Some(EnvironmentId::General3), "general-4" => Some(EnvironmentId::General4), "general-5" => Some(EnvironmentId::General5), "payment" => Some(EnvironmentId::Payment), _ => None } }
+fn inspection_body(runtime: &Runtime, execution_id: Option<String>) -> serde_json::Value {
+    let snapshots = runtime.snapshots();
+    let (swamps_total, workers_total, workers_busy, completed, failed) = topology_totals(&snapshots);
+    let environments = snapshots.into_iter().map(|environment| {
+        let swamps = environment.swamps.into_iter().map(|swamp| {
+            let workers = swamp.workers.into_iter().map(|worker| serde_json::json!({
+                "id": worker.id,
+                "state": format!("{:?}", worker.state),
+                "current_execution": worker.current.map(|id| id.to_string()),
+                "completed": worker.completed,
+                "failed": worker.failed,
+                "total_ms": worker.total_ms,
+                "average_ms": if worker.completed == 0 { 0.0 } else { worker.total_ms as f64 / worker.completed as f64 }
+            })).collect::<Vec<_>>();
+            serde_json::json!({
+                "id": swamp.id,
+                "queued": swamp.queued,
+                "queued_cost": swamp.queued_cost,
+                "throughput_per_sec": swamp.throughput_per_sec,
+                "completed": swamp.completed,
+                "failed": swamp.failed,
+                "workers": workers
+            })
+        }).collect::<Vec<_>>();
+        serde_json::json!({
+            "id": environment.id.to_string(),
+            "generation": environment.generation,
+            "queued": environment.queued,
+            "queued_cost": environment.queued_cost,
+            "worker_count": environment.worker_count,
+            "storage_limit_bytes": environment.storage_limit_bytes,
+            "storage_ephemeral": environment.storage_ephemeral,
+            "storage_path": environment.storage_path,
+            "swamps": swamps
+        })
+    }).collect::<Vec<_>>();
+
+    let cache_profiles = runtime.cache().profiles().into_iter().map(|(hash, profile)| serde_json::json!({
+        "artifact_hash": hash,
+        "samples": profile.samples,
+        "total_ms": profile.total_ms,
+        "last_ms": profile.last_ms,
+        "max_ms": profile.max_ms,
+        "average_ms": profile.average_ms(),
+        "declared_cost": {
+            "cpu": profile.declared_cost.cpu,
+            "memory": profile.declared_cost.memory,
+            "io": profile.declared_cost.io,
+            "network": profile.declared_cost.network
+        }
+    })).collect::<Vec<_>>();
+
+    serde_json::json!({
+        "execution_id": execution_id,
+        "pid": std::process::id(),
+        "config": {
+            "general_environments": runtime.config().general_environments,
+            "payment_environments": 1,
+            "total_environments": environments.len(),
+            "swamps_per_environment": runtime.config().swamps_per_environment,
+            "workers_per_swamp": runtime.config().workers_per_swamp,
+            "rebalance_interval_ms": runtime.config().rebalance_interval_ms
+        },
+        "totals": {
+            "swamps": swamps_total,
+            "workers": workers_total,
+            "workers_busy": workers_busy,
+            "workers_idle": workers_total.saturating_sub(workers_busy),
+            "global_queue": runtime.global_queue_len(),
+            "completed": completed,
+            "failed": failed
+        },
+        "cache": {
+            "artifact_count": runtime.cache().artifact_count(),
+            "profile_count": runtime.cache().len(),
+            "profiles": cache_profiles,
+            "durable_profiles": true,
+            "durable_artifacts": true
+        },
+        "security": {
+            "policy": "deny-by-default",
+            "wasm": "wasmtime",
+            "linux": "namespaces + no_new_privs + seccomp + cgroup-v2 + timeout"
+        },
+        "environments": environments
+    })
+}
+
+fn topology_totals(snapshots: &[container_runtime_core::EnvironmentSnapshot]) -> (usize, usize, usize, u64, u64) {
+    let mut swamps = 0usize;
+    let mut workers = 0usize;
+    let mut busy = 0usize;
+    let mut completed = 0u64;
+    let mut failed = 0u64;
+    for environment in snapshots {
+        swamps += environment.swamps.len();
+        for swamp in &environment.swamps {
+            workers += swamp.workers.len();
+            busy += swamp.workers.iter().filter(|worker| worker.current.is_some()).count();
+            completed = completed.saturating_add(swamp.completed);
+            failed = failed.saturating_add(swamp.failed);
+        }
+    }
+    (swamps, workers, busy, completed, failed)
+}
+
+fn parse_environment(value: &str) -> Option<EnvironmentId> {
+    match value {
+        "general-1" => Some(EnvironmentId::General1), "general-2" => Some(EnvironmentId::General2), "general-3" => Some(EnvironmentId::General3),
+        "general-4" => Some(EnvironmentId::General4), "general-5" => Some(EnvironmentId::General5), "payment" => Some(EnvironmentId::Payment), _ => None,
+    }
+}
 
 fn run_debug(args: &[String], runtime: &Runtime) -> anyhow::Result<()> {
     let demo_count = value_after(args, "--demo").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
@@ -306,4 +529,6 @@ fn print_snapshot(runtime: &Runtime) {
     println!("CACHE profiles={} artifacts={}", runtime.cache().len(), runtime.cache().artifact_count());
 }
 
-fn value_after(args: &[String], flag: &str) -> Option<String> { args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone()) }
+fn value_after(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone())
+}
