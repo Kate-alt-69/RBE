@@ -11,7 +11,7 @@ fn runtime_data_dir() -> PathBuf {
     runtime_paths::binary_dir().join("data").join("container-runtime")
 }
 fn artifact_dir() -> PathBuf { runtime_data_dir().join("artifacts") }
-fn profile_path() -> PathBuf { runtime_data_dir().join("cache-profiles.json") }
+fn profile_dir() -> PathBuf { runtime_data_dir().join("profiles") }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecutionProfile {
@@ -42,23 +42,35 @@ pub struct ArtifactCache {
 impl Default for ArtifactCache {
     fn default() -> Self {
         let io = atomic_io::AtomicIo::new();
-        let profiles = io.read(&profile_path()).ok()
-            .and_then(|bytes| serde_json::from_slice::<HashMap<String, ExecutionProfile>>(&bytes).ok())
-            .unwrap_or_default();
+        let mut profiles = HashMap::new();
+        if let Ok(entries) = fs::read_dir(profile_dir()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") { continue; }
+                let Some(hash) = path.file_stem().and_then(|value| value.to_str()) else { continue; };
+                if !valid_artifact_name(hash) { continue; }
+                let Some(profile) = io.read(&path).ok().and_then(|bytes| serde_json::from_slice::<ExecutionProfile>(&bytes).ok()) else { continue; };
+                profiles.insert(hash.to_string(), profile);
+            }
+        }
         Self { profiles: Mutex::new(profiles), artifacts: Mutex::new(HashMap::new()), io }
     }
 }
 
 impl ArtifactCache {
     pub fn record(&self, artifact_hash: &str, elapsed_ms: u64, declared_cost: WorkCost) {
-        let snapshot = {
+        if !valid_artifact_name(artifact_hash) { return; }
+        let profile = {
             let mut profiles = self.profiles.lock().expect("artifact cache poisoned");
-            profiles.entry(artifact_hash.to_string()).or_default().record(elapsed_ms, declared_cost);
-            profiles.clone()
+            let profile = profiles.entry(artifact_hash.to_string()).or_default();
+            profile.record(elapsed_ms, declared_cost);
+            profile.clone()
         };
-        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-            if let Some(parent) = profile_path().parent() { let _ = fs::create_dir_all(parent); }
-            let _ = self.io.write_atomic(&profile_path(), &bytes);
+        if let Ok(bytes) = serde_json::to_vec(&profile) {
+            let dir = profile_dir();
+            if fs::create_dir_all(&dir).is_ok() {
+                let _ = self.io.write_atomic(&dir.join(format!("{artifact_hash}.json")), &bytes);
+            }
         }
     }
 
