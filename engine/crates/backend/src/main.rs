@@ -11,12 +11,26 @@ use supervisor::{BackendState, RestartPolicy, Supervisor};
 
 mod container_process;
 mod error_reporter_daemon;
+mod maintenance_notice;
 mod port_guard;
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
+
+    if has("--maintenance-notice") {
+        let value = |flag: &str| args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone());
+        let host = value("--maintenance-host").unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = value("--maintenance-port")
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(8080);
+        if let Err(err) = maintenance_notice::run(host, port).await {
+            eprintln!("fatal maintenance responder error: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if has("--er") {
         if !has("--launch") { eprintln!("backend.exe --er requires --launch as well"); std::process::exit(2); }
@@ -109,6 +123,26 @@ async fn boot_and_run() -> anyhow::Result<()> {
     logging::terminal::init(&config.logging)?;
     boot_trace("logging initialized");
 
+    // Reclaim stale/crashed prior backend listeners BEFORE the temporary
+    // responder starts. The responder is this same executable, so running the
+    // old image-name based reclaim after it binds would mistake it for stale RBE.
+    if config.runtime.reclaim_port {
+        port_guard::reclaim_port_if_needed(config.api.port);
+    }
+
+    let maintenance_notice = maintenance_notice::MaintenanceNoticeProcess::spawn(
+        &config.api.host,
+        config.api.port,
+    )
+    .await?;
+    tracing::info!(
+        pid = maintenance_notice.pid(),
+        host = %config.api.host,
+        port = config.api.port,
+        "temporary API maintenance responder ready"
+    );
+    boot_trace("temporary API maintenance responder ready");
+
     let io = atomic_io::AtomicIo::new();
     let admin_dir = runtime_paths::default_admin_dir();
     error_client::init(io.clone(), &admin_dir);
@@ -181,10 +215,11 @@ async fn boot_and_run() -> anyhow::Result<()> {
     }
 
     let router = api::build_router(app_state, &api_dir)?;
-    boot_trace("router built");
+    boot_trace("router built; handing API port to real backend");
     let addr = format!("{}:{}", config.api.host, config.api.port);
-    if config.runtime.reclaim_port { port_guard::reclaim_port_if_needed(config.api.port); }
-    let listener = tokio::net::TcpListener::bind(addr.as_str()).await.map_err(|err| anyhow::anyhow!("failed to bind {addr}: {err}"))?;
+
+    maintenance_notice.stop().await;
+    let listener = bind_backend_listener(addr.as_str()).await?;
     tracing::info!(%addr, "backend ready");
     maybe_open_dashboard(&config);
 
@@ -199,6 +234,37 @@ async fn boot_and_run() -> anyhow::Result<()> {
 
     result.map_err(|err| anyhow::anyhow!("server error: {err}"))?;
     Ok(())
+}
+
+async fn bind_backend_listener(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
+    const HANDOFF_ATTEMPTS: usize = 100;
+    const HANDOFF_RETRY: Duration = Duration::from_millis(50);
+    let mut last_addr_in_use = None;
+
+    for attempt in 1..=HANDOFF_ATTEMPTS {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if attempt > 1 {
+                    tracing::info!(attempt, %addr, "API port acquired after maintenance handoff retry");
+                }
+                return Ok(listener);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                last_addr_in_use = Some(err);
+                tokio::time::sleep(HANDOFF_RETRY).await;
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!("failed to bind {addr} after maintenance handoff: {err}"));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "timed out acquiring {addr} after maintenance handoff: {}",
+        last_addr_in_use
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "address remained unavailable".into())
+    ))
 }
 
 fn spawn_container_refresh(
