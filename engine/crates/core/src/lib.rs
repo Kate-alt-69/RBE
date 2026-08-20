@@ -1,18 +1,11 @@
-//! Home for backend infrastructure/business logic — migration-plan §3.1's
-//! `core/` equivalent. Deliberately near-empty in Phase 0: this crate
-//! should never depend on `axum` types (matches the handbook's
-//! "Infrastructure First" principle — business logic shouldn't know
-//! about the transport layer), so route handlers in `api` borrow from
-//! [`AppState`] rather than the other way around.
+//! Home for backend infrastructure/business logic.
 //!
-//! What's coming, by phase (see rust-migration-plan.md §12):
-//! - Phase 1: vault is wired (see `vault-process` + `AppState::vault`);
-//!   still TODO here: a `storage` module wrapping the `sqlx` pool.
-//! - Phase 2: a `container_client` module — the IPC client talking to
-//!   the *separate* container-runtime process (§5). Never merges that
-//!   process in-process; this module is a client, not the runtime.
-//! - Phase 3+: `email`, `task_engine`, `uac`, etc., each as their own
-//!   module here, registered with the supervisor from `main.rs`.
+//! Transport-independent runtime state lives here so the HTTP dashboard can
+//! observe backend/container state without pulling container internals into the
+//! backend process. The container remains a separate authenticated OS process.
+
+mod container_client;
+mod metrics;
 
 use std::sync::Arc;
 
@@ -21,8 +14,10 @@ use security::{HasIpStrikes, HasRateLimiters, IpStrikeTracker, RateLimiters};
 use supervisor::BackendState;
 use tokio::sync::watch;
 
-/// Shared application state, cloned cheaply (an `Arc` clone) into every
-/// `axum` handler via `State<AppState>`.
+pub use container_client::{ContainerClient, ContainerEndpointSnapshot};
+pub use metrics::{BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot};
+
+/// Shared application state, cloned cheaply into every Axum handler.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -30,8 +25,9 @@ pub struct AppState {
     pub rate_limiters: Arc<RateLimiters>,
     pub ip_strikes: Arc<IpStrikeTracker>,
     pub vault: Arc<vault_process::VaultClient>,
-    // TODO(phase 1): pub storage: sqlx::AnyPool  (or SqlitePool/PgPool per config.storage.driver)
-    // TODO(phase 2): pub container_client: Arc<container_client::Client>
+    pub container: ContainerClient,
+    pub backend_metrics: Arc<BackendMetrics>,
+    pub maintenance: Arc<MaintenanceMetrics>,
 }
 
 impl AppState {
@@ -39,6 +35,8 @@ impl AppState {
         config: Arc<Config>,
         state_rx: watch::Receiver<BackendState>,
         vault: Arc<vault_process::VaultClient>,
+        container: ContainerClient,
+        maintenance: Arc<MaintenanceMetrics>,
     ) -> Self {
         let rate_limiters = Arc::new(RateLimiters::new(&config.security));
         let ip_strikes = Arc::new(IpStrikeTracker::new(&config.security.ip_ban));
@@ -48,12 +46,12 @@ impl AppState {
             rate_limiters,
             ip_strikes,
             vault,
+            container,
+            backend_metrics: Arc::new(BackendMetrics::default()),
+            maintenance,
         }
     }
 
-    /// Current backend lifecycle state (§3.2) — used by the health
-    /// endpoint. Cheap: `watch::Receiver::borrow()` doesn't block or
-    /// clone the whole channel.
     pub fn backend_state(&self) -> BackendState {
         *self.state_rx.borrow()
     }
