@@ -33,7 +33,6 @@ impl ExecutionProfile {
     pub fn average_ms(&self) -> f64 { if self.samples == 0 { 0.0 } else { self.total_ms as f64 / self.samples as f64 } }
 }
 
-#[derive(Debug)]
 pub struct ArtifactCache {
     profiles: Mutex<HashMap<String, ExecutionProfile>>,
     artifacts: Mutex<HashMap<String, Vec<u8>>>,
