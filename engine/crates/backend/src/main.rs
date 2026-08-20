@@ -1,11 +1,12 @@
-//! Backend boot sequence. Vault is a separate OS process using the same backend executable.
+//! Backend boot sequence. Vault and the container are separate supervised OS processes.
 
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use core_lib::AppState;
+use core_lib::{AppState, ContainerClient, MaintenanceMetrics};
 use supervisor::{BackendState, RestartPolicy, Supervisor};
 
 mod container_process;
@@ -46,28 +47,49 @@ async fn run_error_reporter_daemon(separate_process: bool) -> anyhow::Result<()>
     error_reporter_daemon::run(io, admin_dir, separate_process).await
 }
 
-fn spawn_error_reporter_daemon_process() -> anyhow::Result<()> {
+fn spawn_error_reporter_daemon_process(
+    maintenance: Arc<MaintenanceMetrics>,
+    refresh_interval: Duration,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let exe = std::env::current_exe().map_err(|e| anyhow::anyhow!("could not resolve current_exe to spawn the error-reporter daemon: {e}"))?;
-    tokio::spawn(async move {
-        const MAX_ATTEMPTS: u32 = 5;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
-        for attempt in 1..=MAX_ATTEMPTS {
-            let spawn_result = tokio::process::Command::new(&exe).args(["--er", "--separate-process", "--launch"]).kill_on_drop(true).spawn();
+    Ok(tokio::spawn(async move {
+        const RETRY_DELAY: Duration = Duration::from_secs(3);
+        let mut consecutive_failures = 0u32;
+        loop {
+            let spawn_result = tokio::process::Command::new(&exe)
+                .args(["--er", "--separate-process", "--launch"])
+                .kill_on_drop(true)
+                .spawn();
             let mut child = match spawn_result {
                 Ok(child) => child,
-                Err(err) => { tracing::error!(attempt, error = %err, "failed to spawn error-reporter daemon process"); tokio::time::sleep(RETRY_DELAY).await; continue; }
+                Err(err) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    tracing::error!(consecutive_failures, error = %err, "failed to spawn error-reporter daemon process");
+                    tokio::time::sleep(RETRY_DELAY.min(Duration::from_secs(30))).await;
+                    continue;
+                }
             };
-            tracing::info!(pid = child.id(), attempt, "error-reporter daemon process spawned");
-            match child.wait().await {
-                Ok(status) if status.success() => { tracing::info!("error-reporter daemon process exited cleanly — not restarting"); return; }
-                Ok(status) => tracing::warn!(attempt, %status, "error-reporter daemon process exited unexpectedly"),
-                Err(err) => tracing::warn!(attempt, error = %err, "error watching error-reporter daemon process"),
+            consecutive_failures = 0;
+            tracing::info!(pid = child.id(), "error-reporter daemon process spawned");
+
+            tokio::select! {
+                status = child.wait() => {
+                    match status {
+                        Ok(status) if status.success() => tracing::warn!(%status, "error-reporter daemon exited; restarting supervisor child"),
+                        Ok(status) => tracing::warn!(%status, "error-reporter daemon exited unexpectedly; restarting"),
+                        Err(err) => tracing::warn!(error = %err, "error watching error-reporter daemon process; restarting"),
+                    }
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                _ = tokio::time::sleep(refresh_interval) => {
+                    tracing::info!(hours = refresh_interval.as_secs() / 3600, "scheduled error-reporter process refresh");
+                    if let Err(err) = child.kill().await { tracing::warn!(error = %err, "failed to terminate error-reporter for scheduled refresh"); }
+                    let _ = child.wait().await;
+                    maintenance.record_error_reporter_refresh();
+                }
             }
-            if attempt < MAX_ATTEMPTS { tokio::time::sleep(RETRY_DELAY).await; }
         }
-        tracing::error!("error-reporter daemon process failed to stay up after {MAX_ATTEMPTS} attempts — giving up");
-    });
-    Ok(())
+    }))
 }
 
 async fn boot_and_run() -> anyhow::Result<()> {
@@ -79,6 +101,8 @@ async fn boot_and_run() -> anyhow::Result<()> {
     boot_trace(format!("settings path={settings_path}"));
     let config = config::Config::load(&settings_path).map_err(|err| anyhow::anyhow!("failed to load {settings_path}: {err}"))?;
     let config = Arc::new(config);
+    let refresh_interval = Duration::from_secs(config.runtime.process_refresh_hours.saturating_mul(3600));
+    let maintenance = Arc::new(MaintenanceMetrics::new(config.runtime.process_refresh_hours));
     boot_trace("settings loaded");
     boot_trace(format!("effective api bind={}:{}", config.api.host, config.api.port));
 
@@ -90,9 +114,9 @@ async fn boot_and_run() -> anyhow::Result<()> {
     error_client::init(io.clone(), &admin_dir);
     error_client::install_panic_hook();
     boot_trace("error-client initialized, panic hook installed");
-    tracing::info!(path = %settings_path, "configuration loaded");
+    tracing::info!(path = %settings_path, refresh_hours = config.runtime.process_refresh_hours, "configuration loaded");
 
-    if let Err(err) = spawn_error_reporter_daemon_process() { tracing::error!(error = %err, "failed to spawn error-reporter daemon process — continuing boot without it"); }
+    let error_reporter_task = spawn_error_reporter_daemon_process(maintenance.clone(), refresh_interval)?;
 
     boot_trace(format!("vault starting as separate process data dir={}", admin_dir.display()));
     let vault_instance = match vault_process::VaultClient::spawn("backend-rs", &admin_dir) {
@@ -106,13 +130,25 @@ async fn boot_and_run() -> anyhow::Result<()> {
     };
     boot_trace("vault process ready");
 
+    let vault_refresh_task = spawn_vault_refresh(vault_instance.clone(), maintenance.clone(), refresh_interval);
+
     let container_path = container_process::ContainerProcess::packaged_path()?;
     boot_trace(format!("checking required container dependency at {}", container_path.display()));
-    if !container_path.is_file() {
-        anyhow::bail!("required container dependency is missing: {}", container_path.display());
-    }
-    let container_process = container_process::ContainerProcess::spawn(&container_path).await?;
-    boot_trace(format!("verified container process ready pid={:?} address={}", container_process.pid(), container_process.address));
+    if !container_path.is_file() { anyhow::bail!("required container dependency is missing: {}", container_path.display()); }
+
+    let initial_container = container_process::ContainerProcess::spawn(&container_path, &config.containers).await?;
+    let (address, token, pid) = initial_container.endpoint();
+    let container_client = ContainerClient::new(address, token, pid);
+    boot_trace(format!("verified container process ready pid={pid:?} address={address}"));
+    let container_process = Arc::new(tokio::sync::Mutex::new(initial_container));
+    let container_refresh_task = spawn_container_refresh(
+        container_path.clone(),
+        config.containers.clone(),
+        container_process.clone(),
+        container_client.clone(),
+        maintenance.clone(),
+        refresh_interval,
+    );
 
     let mut supervisor = Supervisor::new(RestartPolicy::default());
     supervisor.set_state(BackendState::Initializing);
@@ -120,13 +156,13 @@ async fn boot_and_run() -> anyhow::Result<()> {
     tokio::spawn(async move { supervisor.run().await; });
     boot_trace("supervisor spawned");
 
-    let app_state = AppState::new(config.clone(), state_rx, vault_instance);
+    let app_state = AppState::new(config.clone(), state_rx, vault_instance, container_client, maintenance);
     boot_trace("app state created");
     {
         let rate_limiters = app_state.rate_limiters.clone();
         let ip_strikes = app_state.ip_strikes.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop { interval.tick().await; rate_limiters.sweep(); ip_strikes.sweep(); }
         });
     }
@@ -150,10 +186,96 @@ async fn boot_and_run() -> anyhow::Result<()> {
     if config.runtime.reclaim_port { port_guard::reclaim_port_if_needed(config.api.port); }
     let listener = tokio::net::TcpListener::bind(addr.as_str()).await.map_err(|err| anyhow::anyhow!("failed to bind {addr}: {err}"))?;
     tracing::info!(%addr, "backend ready");
-    let result = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await;
+    maybe_open_dashboard(&config);
+
+    let result = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+
+    container_refresh_task.abort();
+    vault_refresh_task.abort();
+    error_reporter_task.abort();
     drop(container_process);
+
     result.map_err(|err| anyhow::anyhow!("server error: {err}"))?;
     Ok(())
+}
+
+fn spawn_container_refresh(
+    binary: PathBuf,
+    settings: config::ContainersConfig,
+    process: Arc<tokio::sync::Mutex<container_process::ContainerProcess>>,
+    client: ContainerClient,
+    maintenance: Arc<MaintenanceMetrics>,
+    refresh_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(refresh_interval);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            tracing::info!(hours = refresh_interval.as_secs() / 3600, "starting scheduled rolling container refresh");
+            match container_process::ContainerProcess::spawn(&binary, &settings).await {
+                Ok(replacement) => {
+                    let (address, token, pid) = replacement.endpoint();
+                    let old = {
+                        let mut guard = process.lock().await;
+                        std::mem::replace(&mut *guard, replacement)
+                    };
+                    client.update_endpoint(address, token, pid);
+                    maintenance.record_container_refresh();
+                    tracing::info!(pid, %address, "replacement container healthy; IPC switched to new process");
+                    // Give requests that already copied the previous endpoint a
+                    // brief chance to finish before kill_on_drop retires it.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    drop(old);
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "scheduled container refresh failed; keeping existing healthy container online");
+                }
+            }
+        }
+    })
+}
+
+fn spawn_vault_refresh(
+    vault: Arc<vault_process::VaultClient>,
+    maintenance: Arc<MaintenanceMetrics>,
+    refresh_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(refresh_interval);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let vault = vault.clone();
+            let result = tokio::task::spawn_blocking(move || vault.refresh_process()).await;
+            match result {
+                Ok(Ok(())) => { maintenance.record_vault_refresh(); tracing::info!("scheduled Vault process refresh completed"); }
+                Ok(Err(err)) => tracing::error!(error = %err, "scheduled Vault process refresh failed; client will retry on demand"),
+                Err(err) => tracing::error!(error = %err, "Vault refresh worker task failed"),
+            }
+        }
+    })
+}
+
+fn maybe_open_dashboard(config: &config::Config) {
+    if !config.dashboards.enabled || !config.dashboards.auto_open || std::env::var_os("CI").is_some() { return; }
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() { return; }
+
+    let prefix = config.dashboards.admin_path_prefix.trim_end_matches('/');
+    let url = format!("http://127.0.0.1:{}{prefix}/dashboard", config.api.port);
+    tracing::info!(%url, "RBE dashboard ready");
+
+    #[cfg(target_os = "windows")]
+    let spawn = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+    #[cfg(target_os = "macos")]
+    let spawn = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawn = std::process::Command::new("xdg-open").arg(&url).spawn();
+
+    if let Err(err) = spawn { tracing::warn!(error = %err, %url, "could not open RBE dashboard automatically"); }
 }
 
 fn boot_trace(message: impl AsRef<str>) {
