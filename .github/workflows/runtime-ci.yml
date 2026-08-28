@@ -21,7 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: apply one-shot service monitor hardening
+      - name: apply one-shot isolated service monitors
         shell: bash
         run: |
           python - <<'PY'
@@ -29,7 +29,6 @@ jobs:
 
           path = Path("crates/service-runtime/src/lib.rs")
           source = path.read_text()
-
           start = source.index("    fn start_monitor(&self,")
           end = source.index("    pub async fn snapshot(&self)", start)
           replacement = r'''    fn start_monitor(&self, interval: Duration, max_restart_backoff: Duration) {
@@ -83,8 +82,7 @@ jobs:
                       return;
                   }
 
-                  let restart = should_restart(service.file.restart, status.success());
-                  if !restart {
+                  if !should_restart(service.file.restart, status.success()) {
                       service.exit_observed = true;
                       tracing::warn!(
                           service = %service.file.name,
@@ -159,58 +157,6 @@ jobs:
 
           '''
           source = source[:start] + replacement + source[end:]
-
-          old_snapshot = '''#[derive(Debug, Clone, Serialize)]
-          pub struct ServiceSnapshot {
-              pub name: String,
-              pub title: String,
-              pub pid: Option<u32>,
-          }'''
-          new_snapshot = '''#[derive(Debug, Clone, Serialize)]
-          #[serde(rename_all = "camelCase")]
-          pub struct ServiceSnapshot {
-              pub name: String,
-              pub title: String,
-              pub pid: Option<u32>,
-              pub state: String,
-              pub restart: RestartPolicy,
-              pub restart_attempts: u32,
-          }'''
-          if old_snapshot not in source and new_snapshot not in source:
-              raise SystemExit("could not locate ServiceSnapshot")
-          source = source.replace(old_snapshot, new_snapshot, 1)
-
-          old_body = '''            let mut service = handle.lock().await;
-              let alive = matches!(service.child.try_wait(), Ok(None));
-              out.push(ServiceSnapshot {
-                  name: service.file.name.clone(),
-                  title: service.file.title.clone(),
-                  pid: if alive { service.child.id() } else { None },
-              });'''
-          new_body = '''            let mut service = handle.lock().await;
-              let (pid, state) = match service.child.try_wait() {
-                  Ok(None) => (service.child.id(), "running"),
-                  Ok(Some(status))
-                      if service.exit_observed
-                          || !should_restart(service.file.restart, status.success()) =>
-                  {
-                      (None, "stopped")
-                  }
-                  Ok(Some(_)) => (None, "restarting"),
-                  Err(_) => (None, "unknown"),
-              };
-              out.push(ServiceSnapshot {
-                  name: service.file.name.clone(),
-                  title: service.file.title.clone(),
-                  pid,
-                  state: state.into(),
-                  restart: service.file.restart,
-                  restart_attempts: service.restart_attempts,
-              });'''
-          if old_body not in source and new_body not in source:
-              raise SystemExit("could not locate snapshot body")
-          source = source.replace(old_body, new_body, 1)
-
           path.write_text(source)
           PY
           cargo fmt --all
