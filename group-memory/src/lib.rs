@@ -17,6 +17,8 @@ use fs2::FileExt;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use thiserror::Error;
 
+pub mod named;
+
 const MAGIC: [u8; 8] = *b"RBEGRP01";
 const HEADER_LEN: usize = 64;
 pub const FORMAT_VERSION: u32 = 1;
@@ -49,6 +51,8 @@ pub enum GroupMemoryError {
     Truncated { expected: u64, actual: u64 },
     #[error("group-memory payload length does not fit this platform")]
     PayloadTooLarge,
+    #[error("group-memory generation counter overflowed")]
+    GenerationOverflow,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -194,8 +198,19 @@ impl GroupMemoryRegion {
             return Err(GroupMemoryError::ReadOnly);
         }
         let _guard = self.lock_exclusive()?;
-        let payload = self.payload_mut().ok_or(GroupMemoryError::ReadOnly)?;
-        Ok(write(payload))
+        let output = {
+            let payload = self.payload_mut().ok_or(GroupMemoryError::ReadOnly)?;
+            write(payload)
+        };
+        self.advance_generation_unlocked()?;
+        Ok(output)
+    }
+
+    /// Return the current persisted generation. Generation zero means the
+    /// region has never completed a write through this API.
+    pub fn generation(&self) -> Result<u64> {
+        let _guard = self.lock_shared()?;
+        Ok(self.generation_unlocked())
     }
 
     /// Flush dirty writable pages to their backing file. Anonymous regions are
@@ -221,6 +236,30 @@ impl GroupMemoryRegion {
                 Some(&mut mapping[HEADER_LEN..HEADER_LEN + self.payload_len])
             }
         }
+    }
+
+    fn generation_unlocked(&self) -> u64 {
+        let header = match &self.mapping {
+            Mapping::ReadOnly(mapping) => &mapping[..HEADER_LEN],
+            Mapping::ReadWrite(mapping) => &mapping[..HEADER_LEN],
+        };
+        u64::from_le_bytes(
+            header[24..32]
+                .try_into()
+                .expect("fixed group-memory generation slice"),
+        )
+    }
+
+    fn advance_generation_unlocked(&mut self) -> Result<u64> {
+        let current = self.generation_unlocked();
+        let next = current
+            .checked_add(1)
+            .ok_or(GroupMemoryError::GenerationOverflow)?;
+        let Mapping::ReadWrite(mapping) = &mut self.mapping else {
+            return Err(GroupMemoryError::ReadOnly);
+        };
+        mapping[24..32].copy_from_slice(&next.to_le_bytes());
+        Ok(next)
     }
 
     fn lock_shared(&self) -> Result<Option<OwnedFileLock>> {
@@ -399,6 +438,25 @@ mod tests {
             GroupMemoryRegion::open(&path, AccessMode::ReadOnly),
             Err(GroupMemoryError::InvalidMagic)
         ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn generation_is_shared_between_mappings() {
+        let path = test_path("generation");
+        {
+            let mut writer = GroupMemoryRegion::create(&path, 16).unwrap();
+            let reader = GroupMemoryRegion::open(&path, AccessMode::ReadOnly).unwrap();
+            assert_eq!(writer.generation().unwrap(), 0);
+            assert_eq!(reader.generation().unwrap(), 0);
+
+            writer.with_write(|payload| payload[0] = 7).unwrap();
+            assert_eq!(writer.generation().unwrap(), 1);
+            assert_eq!(reader.generation().unwrap(), 1);
+
+            writer.with_write(|payload| payload[1] = 8).unwrap();
+            assert_eq!(reader.generation().unwrap(), 2);
+        }
         let _ = fs::remove_file(path);
     }
 }

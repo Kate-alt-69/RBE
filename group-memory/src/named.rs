@@ -239,4 +239,38 @@ mod tests {
         assert!(SegmentId::new(".").is_err());
         assert!(SegmentId::new("..").is_err());
     }
+
+    #[test]
+    fn named_segments_preserve_identity_and_generation() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rbe-group-store-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = GroupMemoryStore::new(&root);
+        let group = GroupId::new("accounts").unwrap();
+        let segment = SegmentId::new("users-index").unwrap();
+
+        let mut writer = store
+            .create_segment(group.clone(), segment.clone(), 32)
+            .unwrap();
+        assert_eq!(writer.group(), &group);
+        assert_eq!(writer.segment(), &segment);
+        assert_eq!(writer.generation().unwrap(), 0);
+        writer.with_write(|payload| payload[0] = 55).unwrap();
+        assert_eq!(writer.generation().unwrap(), 1);
+
+        let reader = store
+            .open_segment(group, segment, AccessMode::ReadOnly)
+            .unwrap();
+        assert_eq!(reader.generation().unwrap(), 1);
+        assert_eq!(reader.with_read(|payload| payload[0]).unwrap(), 55);
+
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
