@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   engine-runtime:
@@ -21,249 +21,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: wire hybrid service lifecycle
+      - name: format runtime slice
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          manager = Path("crates/service-runtime/src/manager.rs")
-          m = manager.read_text()
-          m = m.replace("use std::path::PathBuf;", "use std::path::{Path, PathBuf};", 1)
-          m = m.replace("async fn cleanup_failed_spawn(alias: &PathBuf, child: &mut Child)", "async fn cleanup_failed_spawn(alias: &Path, child: &mut Child)", 1)
-          snapshot_start = m.index("    pub async fn snapshot(&self)")
-          borrow_start = m.index("            let mut service = handle.lock().await;", snapshot_start)
-          push_start = m.index("            out.push(ServiceSnapshot {", borrow_start)
-          replacement = '''            let mut service = handle.lock().await;
-              let restarting = service.restarting;
-              let wakeable = service.wakeable();
-              let exit_observed = service.exit_observed;
-              let restart = service.file.restart;
-              let (pid, state) = match service.process.as_mut() {
-                  None if restarting => (None, ServiceRuntimeState::Restarting),
-                  None if wakeable && !exit_observed => (None, ServiceRuntimeState::Dormant),
-                  None => (None, ServiceRuntimeState::Stopped),
-                  Some(process) => match process.child.try_wait() {
-                      Ok(None) => (process.child.id(), ServiceRuntimeState::Running),
-                      Ok(Some(_)) if restarting => (None, ServiceRuntimeState::Restarting),
-                      Ok(Some(status))
-                          if exit_observed || !should_restart(restart, status.success()) =>
-                      {
-                          (None, ServiceRuntimeState::Stopped)
-                      }
-                      Ok(Some(_)) => (None, ServiceRuntimeState::Restarting),
-                      Err(_) => (None, ServiceRuntimeState::Unknown),
-                  },
-              };
-          '''.replace('              ', '')
-          m = m[:borrow_start] + replacement + m[push_start:]
-          manager.write_text(m)
-
-          lib = Path("crates/service-runtime/src/lib.rs")
-          s = lib.read_text()
-          for old in [
-              "use std::process::Stdio;\n",
-              "use std::sync::atomic::{AtomicBool, Ordering};\n",
-              "use std::time::{Duration, Instant};\n",
-              "use anyhow::Context;\n",
-              "use rand::RngCore;\n",
-              "use tokio::process::{Child, Command};\n",
-              "use tokio::sync::{Mutex, RwLock as AsyncRwLock};\n",
-          ]:
-              s = s.replace(old, "", 1)
-          s = s.replace("use tokio::net::{TcpListener, TcpStream};", "use tokio::net::TcpListener;", 1)
-
-          module_anchor = "use tokio::net::TcpListener;\n"
-          if "mod manager;" not in s:
-              if module_anchor not in s:
-                  raise SystemExit("manager module anchor missing")
-              s = s.replace(
-                  module_anchor,
-                  module_anchor + "\nmod manager;\npub use manager::{ServiceCallError, ServiceManager, ServiceRuntimeState, ServiceSnapshot};\n",
-                  1,
-              )
-
-          restart_enum = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-          #[serde(rename_all = "kebab-case")]
-          pub enum RestartPolicy {
-              Always,
-              #[default]
-              OnFailure,
-              Never,
-          }
-          '''.replace('          ', '')
-          mode_enum = restart_enum + '''
-          #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-          #[serde(rename_all = "kebab-case")]
-          pub enum ServiceMode {
-              #[default]
-              Resident,
-              OnDemand,
-              Hybrid,
-          }
-          '''.replace('          ', '')
-          if "pub enum ServiceMode" not in s:
-              if restart_enum not in s:
-                  raise SystemExit("restart enum anchor missing")
-              s = s.replace(restart_enum, mode_enum, 1)
-
-          if "pub mode: ServiceMode" not in s:
-              s = s.replace(
-                  "    pub title: String,\n    pub restart: RestartPolicy,",
-                  "    pub title: String,\n    pub mode: ServiceMode,\n    pub restart: RestartPolicy,",
-                  1,
-              )
-          if "pub idle_timeout_ms: u64" not in s:
-              s = s.replace(
-                  "    pub startup_timeout_ms: u64,\n    pub imports: Vec<String>,",
-                  "    pub startup_timeout_ms: u64,\n    pub idle_timeout_ms: u64,\n    pub imports: Vec<String>,",
-                  1,
-              )
-
-          if "invalid service mode" not in s:
-              title_start = s.index("    let title = fields")
-              restart_start = s.index("    let restart = match fields", title_start)
-              mode_parse = '''    let mode = match fields
-                  .get("mode")
-                  .map(|value| unquote(value).to_ascii_lowercase())
-              {
-                  None => ServiceMode::Resident,
-                  Some(value) if value == "resident" => ServiceMode::Resident,
-                  Some(value)
-                      if matches!(value.as_str(), "on-demand" | "on_demand" | "ondemand") =>
-                  {
-                      ServiceMode::OnDemand
-                  }
-                  Some(value) if value == "hybrid" => ServiceMode::Hybrid,
-                  Some(value) => {
-                      return Err(compile_error(
-                          "SVC1010",
-                          path,
-                          line,
-                          format!("invalid service mode {value:?}"),
-                      ));
-                  }
-              };
-
-          '''.replace('              ', '')
-              s = s[:restart_start] + mode_parse + s[restart_start:]
-
-          if "idleTimeoutMs must be greater than zero" not in s:
-              number_start = s.index("    let number = |key: &str")
-              imports_start = s.index("    let mut imports = Vec::new();", number_start)
-              idle_parse = '''    let idle_timeout_ms = number("idleTimeoutMs", 300_000)?;
-              if mode != ServiceMode::Resident && idle_timeout_ms == 0 {
-                  return Err(compile_error(
-                      "SVC1011",
-                      path,
-                      line,
-                      "idleTimeoutMs must be greater than zero for on-demand and hybrid services".into(),
-                  ));
-              }
-
-          '''.replace('              ', '')
-              s = s[:imports_start] + idle_parse + s[imports_start:]
-
-          if "        mode,\n        restart," not in s:
-              s = s.replace(
-                  "        title,\n        restart,",
-                  "        title,\n        mode,\n        restart,",
-                  1,
-              )
-          if "        idle_timeout_ms,\n        imports," not in s:
-              s = s.replace(
-                  "        startup_timeout_ms: number(\"startupTimeoutMs\", defaults.startup_timeout_ms)?,\n        imports,",
-                  "        startup_timeout_ms: number(\"startupTimeoutMs\", defaults.startup_timeout_ms)?,\n        idle_timeout_ms,\n        imports,",
-                  1,
-              )
-
-          old_manager_start = s.index("const RESTART_BASE_DELAY_MS")
-          host_start = s.index("pub async fn run_service_host(", old_manager_start)
-          s = s[:old_manager_start] + s[host_start:]
-
-          tests_start = s.rindex("#[cfg(test)]\nmod tests {")
-          tests = r'''#[cfg(test)]
-          mod tests {
-              use super::*;
-
-              fn test_service_path(name: &str) -> PathBuf {
-                  let nonce = std::time::SystemTime::now()
-                      .duration_since(std::time::UNIX_EPOCH)
-                      .unwrap_or_default()
-                      .as_nanos();
-                  std::env::temp_dir().join(format!(
-                      "rbe-service-runtime-{name}-{}-{nonce}.service",
-                      std::process::id()
-                  ))
-              }
-
-              #[test]
-              fn memory_round_trip() {
-                  let memory = ServiceMemory::default();
-                  memory.set("x".into(), serde_json::json!(7));
-                  assert_eq!(memory.get("x"), Some(serde_json::json!(7)));
-              }
-
-              #[test]
-              fn parses_hybrid_and_on_demand_modes() {
-                  let hybrid_path = test_service_path("hybrid");
-                  std::fs::write(
-                      &hybrid_path,
-                      ":service[name = cache, mode = hybrid, idleTimeoutMs = 1234]\nexport function get() {}",
-                  )
-                  .unwrap();
-                  let hybrid = parse_service(&hybrid_path, ServiceDefaults::default()).unwrap();
-                  assert_eq!(hybrid.mode, ServiceMode::Hybrid);
-                  assert_eq!(hybrid.idle_timeout_ms, 1234);
-                  let _ = std::fs::remove_file(&hybrid_path);
-
-                  let demand_path = test_service_path("demand");
-                  std::fs::write(
-                      &demand_path,
-                      ":service[name = lazy, mode = on-demand]\nexport function get() {}",
-                  )
-                  .unwrap();
-                  let demand = parse_service(&demand_path, ServiceDefaults::default()).unwrap();
-                  assert_eq!(demand.mode, ServiceMode::OnDemand);
-                  assert_eq!(demand.idle_timeout_ms, 300_000);
-                  let _ = std::fs::remove_file(&demand_path);
-              }
-
-              #[test]
-              fn resident_is_the_compatibility_default() {
-                  let path = test_service_path("resident");
-                  std::fs::write(&path, ":service[name = existing]\nexport function run() {}").unwrap();
-                  let service = parse_service(&path, ServiceDefaults::default()).unwrap();
-                  assert_eq!(service.mode, ServiceMode::Resident);
-                  let _ = std::fs::remove_file(path);
-              }
-          }
-          '''.replace('          ', '')
-          s = s[:tests_start] + tests
-          lib.write_text(s)
-          PY
-
-          rustfmt --edition 2021 crates/service-runtime/src/lib.rs crates/service-runtime/src/manager.rs
-          git diff --check
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo test --workspace --locked
-
-          python - <<'PY'
-          import subprocess
-          changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
-          allowed = {
-              "crates/service-runtime/src/lib.rs",
-              "crates/service-runtime/src/manager.rs",
-          }
-          unexpected = changed - allowed
-          if unexpected:
-              raise SystemExit("unexpected hybrid service paths: " + ", ".join(sorted(unexpected)))
-          PY
-
-          if ! git diff --quiet; then
-            git config user.name "Kate"
-            git config user.email "dhwanksh2000@gmail.com"
-            git add -- crates/service-runtime/src/lib.rs crates/service-runtime/src/manager.rs
-            git commit -m "feat: add hybrid service activation"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          fi
+          rustfmt --edition 2021 --check \
+            crates/service-runtime/src/lib.rs \
+            crates/service-runtime/src/manager.rs \
+            crates/backend/src/service_boot.rs \
+            crates/video-manager/src/lib.rs \
+            crates/api/src/health.rs \
+            crates/route-engine/src/ast.rs \
+            crates/route-engine/src/parser.rs \
+            crates/route-engine/src/modules.rs \
+            crates/route-engine/src/analyzer.rs \
+            crates/route-engine/src/transpiler.rs \
+            crates/route-engine/src/module_runtime.rs \
+            crates/route-engine/src/module_eval.rs \
+            crates/route-engine/src/service_eval.rs \
+            crates/route-engine/src/discovery.rs
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --locked
