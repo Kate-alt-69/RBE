@@ -123,6 +123,12 @@ pub struct ServiceSnapshot {
     pub restart: RestartPolicy,
     pub restart_attempts: u32,
     pub idle_timeout_ms: u64,
+    pub ready: bool,
+    pub health_checked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_error: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -514,37 +520,78 @@ impl ServiceManager {
             .collect::<Vec<_>>();
         let mut out = Vec::new();
         for handle in handles {
-            let mut service = handle.lock().await;
-            let restarting = service.restarting;
-            let wakeable = service.wakeable();
-            let exit_observed = service.exit_observed;
-            let restart = service.file.restart;
-            let (pid, state) = match service.process.as_mut() {
-                None if restarting => (None, ServiceRuntimeState::Restarting),
-                None if wakeable && !exit_observed => (None, ServiceRuntimeState::Dormant),
-                None => (None, ServiceRuntimeState::Stopped),
-                Some(process) => match process.child.try_wait() {
-                    Ok(None) => (process.child.id(), ServiceRuntimeState::Running),
-                    Ok(Some(_)) if restarting => (None, ServiceRuntimeState::Restarting),
-                    Ok(Some(status))
-                        if exit_observed || !should_restart(restart, status.success()) =>
-                    {
-                        (None, ServiceRuntimeState::Stopped)
+            let (mut snapshot, health_target) = {
+                let mut service = handle.lock().await;
+                let restarting = service.restarting;
+                let wakeable = service.wakeable();
+                let exit_observed = service.exit_observed;
+                let restart = service.file.restart;
+                let (pid, state, health_target) = match service.process.as_mut() {
+                    None if restarting => (None, ServiceRuntimeState::Restarting, None),
+                    None if wakeable && !exit_observed => {
+                        (None, ServiceRuntimeState::Dormant, None)
                     }
-                    Ok(Some(_)) => (None, ServiceRuntimeState::Restarting),
-                    Err(_) => (None, ServiceRuntimeState::Unknown),
-                },
+                    None => (None, ServiceRuntimeState::Stopped, None),
+                    Some(process) => match process.child.try_wait() {
+                        Ok(None) => (
+                            process.child.id(),
+                            ServiceRuntimeState::Running,
+                            Some((process.ready.address, process.token.clone())),
+                        ),
+                        Ok(Some(_)) if restarting => (None, ServiceRuntimeState::Restarting, None),
+                        Ok(Some(status))
+                            if exit_observed || !should_restart(restart, status.success()) =>
+                        {
+                            (None, ServiceRuntimeState::Stopped, None)
+                        }
+                        Ok(Some(_)) => (None, ServiceRuntimeState::Restarting, None),
+                        Err(_) => (None, ServiceRuntimeState::Unknown, None),
+                    },
+                };
+                if health_target.is_some() {
+                    service.active_calls = service.active_calls.saturating_add(1);
+                }
+                (
+                    ServiceSnapshot {
+                        name: service.file.name.clone(),
+                        title: service.file.title.clone(),
+                        pid,
+                        state,
+                        mode: service.file.mode,
+                        restart: service.file.restart,
+                        restart_attempts: service.restart_attempts,
+                        idle_timeout_ms: service.file.idle_timeout_ms,
+                        ready: state == ServiceRuntimeState::Dormant,
+                        health_checked: false,
+                        health: None,
+                        health_error: None,
+                    },
+                    health_target,
+                )
             };
-            out.push(ServiceSnapshot {
-                name: service.file.name.clone(),
-                title: service.file.title.clone(),
-                pid,
-                state,
-                mode: service.file.mode,
-                restart: service.file.restart,
-                restart_attempts: service.restart_attempts,
-                idle_timeout_ms: service.file.idle_timeout_ms,
-            });
+
+            if let Some((address, token)) = health_target {
+                snapshot.health_checked = true;
+                let response = rpc(address, ServiceRequest::Health { token }).await;
+                {
+                    let mut service = handle.lock().await;
+                    service.active_calls = service.active_calls.saturating_sub(1);
+                }
+                match response {
+                    Ok(ServiceResponse::Ok { value }) => {
+                        snapshot.ready = health_value_ready(&value);
+                        snapshot.health = Some(value);
+                    }
+                    Ok(ServiceResponse::Error { code, message }) => {
+                        snapshot.health_error = Some(format!("{code}: {message}"));
+                    }
+                    Err(error) => {
+                        snapshot.health_error = Some(error.to_string());
+                    }
+                }
+            }
+
+            out.push(snapshot);
         }
         out.sort_by(|left, right| left.name.cmp(&right.name));
         out
@@ -568,6 +615,10 @@ impl ServiceManager {
             service.restarting = false;
         }
     }
+}
+
+fn health_value_ready(value: &Value) -> bool {
+    value.get("ok").and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn map_call_response(
@@ -832,5 +883,16 @@ mod tests {
         assert_eq!(snapshots[0].state, ServiceRuntimeState::Dormant);
         assert_eq!(snapshots[0].mode, ServiceMode::OnDemand);
         assert!(snapshots[0].pid.is_none());
+        assert!(snapshots[0].ready);
+        assert!(!snapshots[0].health_checked);
+        assert!(snapshots[0].health.is_none());
+        assert!(snapshots[0].health_error.is_none());
+    }
+
+    #[test]
+    fn health_value_requires_explicit_ok_true() {
+        assert!(health_value_ready(&serde_json::json!({"ok": true})));
+        assert!(!health_value_ready(&serde_json::json!({"ok": false})));
+        assert!(!health_value_ready(&serde_json::json!({})));
     }
 }

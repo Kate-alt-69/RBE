@@ -17,6 +17,10 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         .iter()
         .filter(|service| service.state == ServiceRuntimeState::Running)
         .count();
+    let dormant_services = services
+        .iter()
+        .filter(|service| service.state == ServiceRuntimeState::Dormant)
+        .count();
     let restarting_services = services
         .iter()
         .filter(|service| service.state == ServiceRuntimeState::Restarting)
@@ -29,7 +33,12 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         .iter()
         .filter(|service| service.state == ServiceRuntimeState::Unknown)
         .count();
-    let services_ok = running_services == services.len();
+    let ready_services = services.iter().filter(|service| service.ready).count();
+    let unhealthy_services = services
+        .iter()
+        .filter(|service| service.health_checked && !service.ready)
+        .count();
+    let services_ok = ready_services == services.len();
 
     let (video_ok, video_status) = match state.video_manager.as_ref() {
         Some(manager) => match manager.status() {
@@ -37,8 +46,8 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
             Err(error) => (
                 false,
                 json!({
-                    "ok": false,
-                    "error": error.to_string()
+                "ok": false,
+                "error": error.to_string()
                 }),
             ),
         },
@@ -47,17 +56,20 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 
     let lifecycle_ok = matches!(lifecycle, BackendState::Ready | BackendState::Running);
     Json(json!({
-        "ok": lifecycle_ok && services_ok && video_ok,
-        "state": lifecycle,
-        "services": {
-            "ok": services_ok,
-            "running": running_services,
-            "restarting": restarting_services,
-            "stopped": stopped_services,
-            "unknown": unknown_services,
-            "total": services.len(),
-            "entries": services
-        },
-        "videoManager": video_status
-    }))
+          "ok": lifecycle_ok && services_ok && video_ok,
+          "state": lifecycle,
+          "services": {
+    "ok": services_ok,
+    "ready": ready_services,
+    "running": running_services,
+    "dormant": dormant_services,
+    "unhealthy": unhealthy_services,
+    "restarting": restarting_services,
+    "stopped": stopped_services,
+    "unknown": unknown_services,
+    "total": services.len(),
+    "entries": services
+          },
+          "videoManager": video_status
+      }))
 }
