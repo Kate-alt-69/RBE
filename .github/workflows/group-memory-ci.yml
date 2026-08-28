@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   group-memory:
@@ -24,76 +24,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: group-memory
-      - name: fix owned file locks and checkpoint
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("src/lib.rs")
-          source = path.read_text()
-          start = source.index("    fn lock_shared(&self)")
-          end = source.index("\nfn ensure_payload_len", start)
-          replacement = '''    fn lock_shared(&self) -> Result<Option<OwnedFileLock>> {
-              self.file
-                  .as_ref()
-                  .map(OwnedFileLock::shared)
-                  .transpose()
-          }
-
-          fn lock_exclusive(&self) -> Result<Option<OwnedFileLock>> {
-              self.file
-                  .as_ref()
-                  .map(OwnedFileLock::exclusive)
-                  .transpose()
-          }
-          }
-
-          struct OwnedFileLock {
-              file: File,
-          }
-
-          impl OwnedFileLock {
-              fn shared(file: &File) -> Result<Self> {
-                  let file = file.try_clone()?;
-                  FileExt::lock_shared(&file)?;
-                  Ok(Self { file })
-              }
-
-              fn exclusive(file: &File) -> Result<Self> {
-                  let file = file.try_clone()?;
-                  FileExt::lock_exclusive(&file)?;
-                  Ok(Self { file })
-              }
-          }
-
-          impl Drop for OwnedFileLock {
-              fn drop(&mut self) {
-                  let _ = FileExt::unlock(&self.file);
-              }
-          }
-          '''.replace('          ', '')
-          path.write_text(source[:start] + replacement + source[end:])
-          PY
-
-          cargo fmt --all
-          git diff --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test --all-targets
-
-          python - <<'PY'
-          import subprocess
-          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
-          allowed = {"group-memory/src/lib.rs"}
-          unexpected = changed - allowed
-          if unexpected:
-              raise SystemExit("unexpected group-memory paths: " + ", ".join(sorted(unexpected)))
-          PY
-
-          if ! git diff --quiet; then
-            git config user.name "Kate"
-            git config user.email "dhwanksh2000@gmail.com"
-            git add -- src/lib.rs
-            git commit -m "fix: own group memory file lock handles"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          fi
+      - name: format
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test --all-targets
