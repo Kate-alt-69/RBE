@@ -30,20 +30,13 @@ jobs:
           ast = Path("crates/route-engine/src/ast.rs")
           source = ast.read_text()
           if "Service(String)" not in source:
-              anchor = '''    CustomFunction {
-              path: String,
-              function: String,
-          },
-          '''
-              replacement = anchor + '''    Service(String),
-          ServiceFunction {
-              service: String,
-              function: String,
-          },
-          '''
-              if anchor not in source:
-                  raise SystemExit("ImportTarget service anchor missing")
-              source = source.replace(anchor, replacement, 1)
+              at = source.index("    Aliased {")
+              source = source[:at] + '''    Service(String),
+              ServiceFunction {
+                  service: String,
+                  function: String,
+              },
+          ''' + source[at:]
               ast.write_text(source)
 
           parser = Path("crates/route-engine/src/parser.rs")
@@ -116,61 +109,43 @@ jobs:
 
           modules = Path("crates/route-engine/src/modules.rs")
           source = modules.read_text()
-          old = '''        ImportTarget::CustomFunction { function, .. } => function.clone(),
-          '''
-          new = old + '''        ImportTarget::Service(name) => name.clone(),
-              ImportTarget::ServiceFunction { function, .. } => function.clone(),
-          '''
           if "ImportTarget::Service(name) => name.clone()" not in source:
-              if old not in source:
-                  raise SystemExit("binding_name service anchor missing")
-              source = source.replace(old, new, 1)
-
-          needle = '''                ImportTarget::CustomFunction { path, function } => {
-                      let resolved = crate::paths::resolve_custom_import(&crate::paths::binary_dir(), path);
-                      let module_name = std::path::Path::new(path)
-                          .file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string();
-                      modules.entry(module_name.clone()).or_insert(ModuleKind::CustomUnimplemented {
-                          source_path: path.clone(), resolved_path: resolved,
-                      });
-                      direct_functions.insert(binding_name(target), (module_name, function.clone()));
-                  }
-          '''
-          if "ImportTarget::Service(_) | ImportTarget::ServiceFunction" not in source:
-              if needle not in source:
-                  raise SystemExit("ModuleRegistry service arm anchor missing")
+              anchor = "        ImportTarget::CustomFunction { function, .. } => function.clone(),\n"
+              if anchor not in source:
+                  raise SystemExit("binding_name anchor missing")
               source = source.replace(
-                  needle,
-                  needle + '''                ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => {
+                  anchor,
+                  anchor
+                  + "        ImportTarget::Service(name) => name.clone(),\n"
+                  + "        ImportTarget::ServiceFunction { function, .. } => function.clone(),\n",
+                  1,
+              )
+          if "Service calls are async" not in source:
+              marker = '                ImportTarget::Aliased { .. } => unreachable!("base_target removes aliased import wrappers"),'
+              at = source.index(marker)
+              arm = '''                ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => {
                       // Service calls are async and are intentionally handled by ModuleExecutor,
                       // never by the synchronous route capability registry.
                   }
-          ''',
-                  1,
-              )
+          '''
+              source = source[:at] + arm + source[at:]
           modules.write_text(source)
 
           analyzer = Path("crates/route-engine/src/analyzer.rs")
           source = analyzer.read_text()
-          old = '''        ImportTarget::CustomFunction { path, function } => format!("custom:{path}.{function}"),
-          '''
-          if "format!(\"service:{service}\")" not in source:
-              if old not in source:
-                  raise SystemExit("analyzer import source anchor missing")
-              source = source.replace(
-                  old,
-                  old + '''        ImportTarget::Service(service) => format!("service:{service}"),
+          if 'format!("service:{service}")' not in source:
+              marker = '        ImportTarget::Aliased { .. } => unreachable!("import_base removes aliased import wrappers"),'
+              at = source.index(marker)
+              arms = '''        ImportTarget::Service(service) => format!("service:{service}"),
               ImportTarget::ServiceFunction { service, function } => {
                   format!("service:{service}.{function}")
               }
-          ''',
-                  1,
-              )
-          old = '''            ImportTarget::Custom(_) | ImportTarget::CustomFunction { .. } => SymbolKind::Module,
           '''
+              source = source[:at] + arms + source[at:]
           if 'code: "E3020"' not in source:
+              old = "            ImportTarget::Custom(_) | ImportTarget::CustomFunction { .. } => SymbolKind::Module,\n"
               if old not in source:
-                  raise SystemExit("analyzer service policy anchor missing")
+                  raise SystemExit("route service policy anchor missing")
               replacement = '''            ImportTarget::Custom(_) => SymbolKind::Module,
               ImportTarget::CustomFunction { .. } => SymbolKind::DirectFunction,
               ImportTarget::Service(service) => {
@@ -201,16 +176,16 @@ jobs:
 
           transpiler = Path("crates/route-engine/src/transpiler.rs")
           source = transpiler.read_text()
-          old = '''                ImportTarget::Builtin(_) | ImportTarget::Custom(_) => {
+          if "ImportTarget::Service(_)" not in source:
+              old = '''                ImportTarget::Builtin(_) | ImportTarget::Custom(_) => {
                       names.insert(crate::modules::binding_name(import), NameKind::Module);
                   }
                   ImportTarget::BuiltinFunction { .. } | ImportTarget::CustomFunction { .. } => {
                       names.insert(crate::modules::binding_name(import), NameKind::DirectFunction);
                   }
           '''
-          if "ImportTarget::Service(_)" not in source:
               if old not in source:
-                  raise SystemExit("transpiler service arm anchor missing")
+                  raise SystemExit("transpiler import kind anchor missing")
               new = '''                ImportTarget::Builtin(_) | ImportTarget::Custom(_) | ImportTarget::Service(_) => {
                       names.insert(crate::modules::binding_name(import), NameKind::Module);
                   }
@@ -225,22 +200,15 @@ jobs:
 
           runtime = Path("crates/route-engine/src/module_runtime.rs")
           source = runtime.read_text()
-          old = '''        ImportTarget::CustomFunction { path, function } => {
-              format!("module:{path}.{function}")
-          }
-          '''
           if "ImportTarget::Service(service)" not in source:
-              if old not in source:
-                  raise SystemExit("module runtime service source anchor missing")
-              source = source.replace(
-                  old,
-                  old + '''        ImportTarget::Service(service) => format!("service:{service}"),
+              marker = "        ImportTarget::Aliased { .. } => unreachable!(),"
+              at = source.index(marker, source.index("fn import_source_key"))
+              arms = '''        ImportTarget::Service(service) => format!("service:{service}"),
               ImportTarget::ServiceFunction { service, function } => {
                   format!("service:{service}.{function}")
               }
-          ''',
-                  1,
-              )
+          '''
+              source = source[:at] + arms + source[at:]
           if "accepts_service_imports_without_module_dependencies" not in source:
               insert = source.rfind("}\n")
               test = r'''
@@ -253,7 +221,6 @@ jobs:
                       ":import[service:uac-cache, service:search.find as lookup]\nexport function run(value) { return value; }",
                   )
                   .unwrap();
-
                   let program = ModuleProgram::load(&root.join("module")).unwrap();
                   assert_eq!(program.len(), 1);
                   let _ = fs::remove_dir_all(root);
@@ -267,7 +234,7 @@ jobs:
           if "parses_service_imports_for_modules" not in source:
               anchor = "    #[test]\n    fn parses_multiple_import_entries_and_aliases()"
               if anchor not in source:
-                  raise SystemExit("lib service parser test anchor missing")
+                  raise SystemExit("lib test anchor missing")
               tests = r'''    #[test]
               fn parses_service_imports_for_modules() {
                   let tokens = Lexer::new(
