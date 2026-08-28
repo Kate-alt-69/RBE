@@ -24,11 +24,12 @@ jobs:
       - name: apply executable service parser
         shell: bash
         run: |
+          git fetch --no-tags --depth=1 origin bc09cc29c321478d8d5f73447cd325dc3920b621
           python - <<'PY'
           import subprocess
 
           previous = subprocess.check_output(
-              ["git", "show", "HEAD^:.github/workflows/runtime-ci.yml"],
+              ["git", "show", "bc09cc29c321478d8d5f73447cd325dc3920b621:.github/workflows/runtime-ci.yml"],
               text=True,
           )
           marker = "          python - <<'PY'\n"
