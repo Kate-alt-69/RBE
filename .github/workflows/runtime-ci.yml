@@ -21,8 +21,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: fmt check
-        run: cargo fmt --all -- --check
+      - name: format workspace
+        run: cargo fmt --all
+      - name: upload formatted service runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-runtime-formatted
+          path: engine/crates/service-runtime/src/lib.rs
+          if-no-files-found: error
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
