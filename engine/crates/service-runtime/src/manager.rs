@@ -287,41 +287,72 @@ impl ServiceManager {
                 return;
             }
 
-            match spawn_process(&file).await {
-                Ok(mut replacement) => {
-                    let new_pid = replacement.ready.pid;
-                    let mut service = handle.lock().await;
-                    if self.shutting_down.load(Ordering::Acquire) {
-                        drop(service);
-                        stop_process(&file.name, &mut replacement).await;
-                        return;
+            let mut service = handle.lock().await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            if !service.restarting {
+                tracing::debug!(
+                    service = %file.name,
+                    attempt,
+                    "scheduled service restart was superseded"
+                );
+                continue;
+            }
+
+            let running_pid = if let Some(process) = service.process.as_mut() {
+                match process.child.try_wait() {
+                    Ok(None) => process.child.id(),
+                    Ok(Some(_)) => None,
+                    Err(error) => {
+                        tracing::warn!(
+                            service = %file.name,
+                            attempt,
+                            error = %error,
+                            "failed to re-check service before restart"
+                        );
+                        continue;
                     }
+                }
+            } else {
+                None
+            };
+            if let Some(pid) = running_pid {
+                service.restarting = false;
+                tracing::debug!(
+                    service = %file.name,
+                    pid,
+                    attempt,
+                    "scheduled service restart found a running replacement"
+                );
+                continue;
+            }
+
+            match spawn_process(&file).await {
+                Ok(replacement) => {
+                    let new_pid = replacement.ready.pid;
                     service.process = Some(replacement);
                     service.restart_attempts = attempt;
                     service.exit_observed = false;
                     service.restarting = false;
                     service.last_activity = Instant::now();
                     tracing::info!(
-                        service = %file.name,
-                        old_pid,
-                        new_pid,
-                        attempt,
-                        "service process restarted"
-                    );
+                    service = %file.name,
+                    old_pid,
+                    new_pid,
+                    attempt,
+                    "service process restarted"
+                              );
                 }
                 Err(error) => {
-                    let mut service = handle.lock().await;
-                    if self.shutting_down.load(Ordering::Acquire) {
-                        return;
-                    }
                     service.restart_attempts = attempt;
                     service.restarting = true;
                     tracing::error!(
-                        service = %file.name,
-                        attempt,
-                        error = %error,
-                        "service restart attempt failed"
-                    );
+                    service = %file.name,
+                    attempt,
+                    error = %error,
+                    "service restart attempt failed"
+                              );
                 }
             }
         }
