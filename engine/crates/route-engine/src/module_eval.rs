@@ -5,6 +5,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use serde_json::Value as JsonValue;
+use service_runtime::ServiceManager;
+
 use crate::ast::{BinaryOp, Expr, ImportTarget, ModuleFile, Statement, Value};
 use crate::module_runtime::ModuleProgram;
 use crate::modules::{binding_name, ModuleRegistry};
@@ -13,6 +16,33 @@ const MAX_MODULE_CALL_DEPTH: usize = 64;
 
 type EvalFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ModuleEvalError>> + Send + 'a>>;
 type FlowFuture<'a> = Pin<Box<dyn Future<Output = Result<Flow, ModuleEvalError>> + Send + 'a>>;
+
+pub type ServiceCallFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<JsonValue, String>> + Send + 'a>>;
+
+pub trait ServiceCaller: Send + Sync {
+    fn call<'a>(
+        &'a self,
+        service: &'a str,
+        function: &'a str,
+        args: Vec<JsonValue>,
+    ) -> ServiceCallFuture<'a>;
+}
+
+impl ServiceCaller for ServiceManager {
+    fn call<'a>(
+        &'a self,
+        service: &'a str,
+        function: &'a str,
+        args: Vec<JsonValue>,
+    ) -> ServiceCallFuture<'a> {
+        Box::pin(async move {
+            ServiceManager::call(self, service, function, args)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ModuleEvalError {
@@ -39,11 +69,29 @@ impl std::error::Error for ModuleEvalError {}
 
 pub struct ModuleExecutor<'a> {
     program: &'a ModuleProgram,
+    services: Option<Arc<dyn ServiceCaller>>,
 }
 
 impl<'a> ModuleExecutor<'a> {
     pub fn new(program: &'a ModuleProgram) -> Self {
-        Self { program }
+        Self {
+            program,
+            services: None,
+        }
+    }
+
+    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {
+        Self::with_service_caller(program, Arc::new(services))
+    }
+
+    pub fn with_service_caller(
+        program: &'a ModuleProgram,
+        services: Arc<dyn ServiceCaller>,
+    ) -> Self {
+        Self {
+            program,
+            services: Some(services),
+        }
     }
 
     pub async fn call(
@@ -53,6 +101,34 @@ impl<'a> ModuleExecutor<'a> {
         args: Vec<Value>,
     ) -> Result<Value, ModuleEvalError> {
         self.call_export(raw_path, function, args, 0).await
+    }
+
+    async fn call_service(
+        &self,
+        service: &str,
+        function: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, ModuleEvalError> {
+        let services = self.services.as_ref().ok_or_else(|| {
+            ModuleEvalError::new(
+                "MOD3400",
+                format!("service runtime is unavailable while calling {service}.{function}"),
+            )
+        })?;
+        let args = args
+            .into_iter()
+            .map(value_to_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        let value = services
+            .call(service, function, args)
+            .await
+            .map_err(|message| {
+                ModuleEvalError::new(
+                    "MOD3401",
+                    format!("service {service}.{function} failed: {message}"),
+                )
+            })?;
+        value_from_json(value)
     }
 
     async fn call_export(
@@ -141,6 +217,8 @@ struct Frame<'exec, 'program> {
     modules: ModuleRegistry,
     custom_modules: HashMap<String, String>,
     custom_functions: HashMap<String, (String, String)>,
+    service_modules: HashMap<String, String>,
+    service_functions: HashMap<String, (String, String)>,
     scope: HashMap<String, Value>,
     depth: usize,
 }
@@ -150,6 +228,8 @@ impl<'exec, 'program> Frame<'exec, 'program> {
         let modules = ModuleRegistry::from_imports(&file.imports);
         let mut custom_modules = HashMap::new();
         let mut custom_functions = HashMap::new();
+        let mut service_modules = HashMap::new();
+        let mut service_functions = HashMap::new();
         for import in &file.imports {
             let binding = binding_name(import);
             match import_base(import) {
@@ -158,6 +238,12 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                 }
                 ImportTarget::CustomFunction { path, function } => {
                     custom_functions.insert(binding, (path.clone(), function.clone()));
+                }
+                ImportTarget::Service(service) => {
+                    service_modules.insert(binding, service.clone());
+                }
+                ImportTarget::ServiceFunction { service, function } => {
+                    service_functions.insert(binding, (service.clone(), function.clone()));
                 }
                 _ => {}
             }
@@ -168,6 +254,8 @@ impl<'exec, 'program> Frame<'exec, 'program> {
             modules,
             custom_modules,
             custom_functions,
+            service_modules,
+            service_functions,
             scope: HashMap::new(),
             depth,
         }
@@ -279,6 +367,10 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                     }
 
                     if let Expr::Ident(name) = callee.as_ref() {
+                        if let Some((service, function)) = self.service_functions.get(name).cloned()
+                        {
+                            return self.executor.call_service(&service, &function, args).await;
+                        }
                         if let Some((path, function)) = self.custom_functions.get(name).cloned() {
                             return self
                                 .executor
@@ -311,6 +403,12 @@ impl<'exec, 'program> Frame<'exec, 'program> {
 
                     if let Expr::Member(base, function_name) = callee.as_ref() {
                         if let Expr::Ident(module_name) = base.as_ref() {
+                            if let Some(service) = self.service_modules.get(module_name).cloned() {
+                                return self
+                                    .executor
+                                    .call_service(&service, function_name, args)
+                                    .await;
+                            }
                             if let Some(path) = self.custom_modules.get(module_name).cloned() {
                                 return self
                                     .executor
@@ -369,6 +467,60 @@ fn import_base(import: &ImportTarget) -> &ImportTarget {
     match import {
         ImportTarget::Aliased { target, .. } => target.as_ref(),
         other => other,
+    }
+}
+
+fn value_to_json(value: Value) -> Result<JsonValue, ModuleEvalError> {
+    match value {
+        Value::String(value) => Ok(JsonValue::String(value)),
+        Value::Number(value) => serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| {
+                ModuleEvalError::new(
+                    "MOD3402",
+                    "non-finite numbers cannot cross the service IPC boundary",
+                )
+            }),
+        Value::Bool(value) => Ok(JsonValue::Bool(value)),
+        Value::Null => Ok(JsonValue::Null),
+        Value::Object(fields) => {
+            let mut out = serde_json::Map::with_capacity(fields.len());
+            for (key, value) in fields {
+                out.insert(key, value_to_json(value)?);
+            }
+            Ok(JsonValue::Object(out))
+        }
+        Value::Array(items) => items
+            .into_iter()
+            .map(value_to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(JsonValue::Array),
+    }
+}
+
+fn value_from_json(value: JsonValue) -> Result<Value, ModuleEvalError> {
+    match value {
+        JsonValue::Null => Ok(Value::Null),
+        JsonValue::Bool(value) => Ok(Value::Bool(value)),
+        JsonValue::Number(value) => value.as_f64().map(Value::Number).ok_or_else(|| {
+            ModuleEvalError::new(
+                "MOD3403",
+                "service returned a JSON number that cannot be represented as f64",
+            )
+        }),
+        JsonValue::String(value) => Ok(Value::String(value)),
+        JsonValue::Array(items) => items
+            .into_iter()
+            .map(value_from_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        JsonValue::Object(fields) => {
+            let mut out = HashMap::with_capacity(fields.len());
+            for (key, value) in fields {
+                out.insert(key, value_from_json(value)?);
+            }
+            Ok(Value::Object(out))
+        }
     }
 }
 
@@ -529,6 +681,79 @@ mod tests {
         let program = ModuleProgram::load(&root.join("module")).unwrap();
         let error = block_on_ready(program.call("./module/a", "run", Vec::new())).unwrap_err();
         assert_eq!(error.code, "MOD3004");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[derive(Default)]
+    struct FakeServices {
+        calls: std::sync::Mutex<Vec<(String, String, Vec<JsonValue>)>>,
+    }
+
+    impl ServiceCaller for FakeServices {
+        fn call<'a>(
+            &'a self,
+            service: &'a str,
+            function: &'a str,
+            args: Vec<JsonValue>,
+        ) -> ServiceCallFuture<'a> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((
+                    service.to_string(),
+                    function.to_string(),
+                    args.clone(),
+                ));
+                match (service, function) {
+                    ("uac-cache", "get") => Ok(args.into_iter().next().unwrap_or(JsonValue::Null)),
+                    ("search", "find") => Ok(serde_json::json!({
+                        "found": args.into_iter().next().unwrap_or(JsonValue::Null)
+                    })),
+                    _ => Err(format!("unexpected fake service call {service}.{function}")),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn module_dispatches_namespace_and_direct_service_calls() {
+        let root = root();
+        fs::write(
+            root.join("module/services.module"),
+            ":import[service:uac-cache as cache, service:search.find as lookup]\nexport function run(id) { return lookup(cache.get(id)); }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let caller = Arc::new(FakeServices::default());
+        let executor = ModuleExecutor::with_service_caller(&program, caller.clone());
+        let value = block_on_ready(executor.call(
+            "./module/services",
+            "run",
+            vec![Value::String("abc".into())],
+        ))
+        .unwrap();
+        let Value::Object(fields) = value else {
+            panic!("expected object service response");
+        };
+        assert!(matches!(fields.get("found"), Some(Value::String(value)) if value == "abc"));
+        assert_eq!(caller.calls.lock().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_call_without_runtime_is_explicit() {
+        let root = root();
+        fs::write(
+            root.join("module/services.module"),
+            ":import[service:uac-cache as cache]\nexport function run(id) { return cache.get(id); }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let error = block_on_ready(program.call(
+            "./module/services",
+            "run",
+            vec![Value::String("abc".into())],
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, "MOD3400");
         let _ = fs::remove_dir_all(root);
     }
 }
