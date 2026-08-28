@@ -21,45 +21,214 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: apply one-shot RestartPolicy fix
+      - name: apply one-shot typed request audit refactor
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
-          path = Path("crates/service-runtime/src/lib.rs")
+
+          path = Path("crates/security/src/timing.rs")
           source = path.read_text()
-          old = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-          #[serde(rename_all = "kebab-case")]
-          pub enum RestartPolicy {
-              Always,
-              OnFailure,
-              Never,
+
+          enum_block = '''enum ErrorAuditDecision {
+              Log { suppressed: u64 },
+              Suppress,
+              NotApplicable,
+          }
+          '''
+          typed_block = '''enum ErrorAuditDecision {
+              Log { suppressed: u64 },
+              Suppress,
+              NotApplicable,
           }
 
-          impl Default for RestartPolicy {
-              fn default() -> Self {
-                  Self::OnFailure
+          struct CorsAudit {
+              origin: Option<String>,
+              preflight: bool,
+              request_method: Option<String>,
+              request_headers: Option<String>,
+              response_origin: Option<String>,
+              response_methods: Option<String>,
+              response_headers: Option<String>,
+              response_credentials: Option<String>,
+              blocked: bool,
+          }
+
+          struct RequestAudit<'a> {
+              config: &'a Config,
+              request_headers: &'a HeaderMap,
+              response_headers: &'a HeaderMap,
+              method: &'a str,
+              path: &'a str,
+              query: &'a str,
+              peer: SocketAddr,
+              client_ip: String,
+              duration_ms: f64,
+              status: u16,
+              cors: CorsAudit,
+              suppressed: u64,
+          }
+          '''
+
+          old_calls = '''    match error_audit_decision(&client_ip.to_string(), method.as_str(), &path, status) {
+              ErrorAuditDecision::Suppress => {}
+              ErrorAuditDecision::Log { suppressed } => {
+                  write_request_audit(
+                      &config,
+                      &headers,
+                      response.headers(),
+                      &method.to_string(),
+                      &path,
+                      &query,
+                      peer,
+                      client_ip.to_string(),
+                      duration_ms,
+                      status,
+                      origin,
+                      preflight,
+                      request_cors_method,
+                      request_cors_headers,
+                      response_cors_origin,
+                      response_cors_methods,
+                      response_cors_headers,
+                      response_cors_credentials,
+                      cors_blocked,
+                      suppressed,
+                  );
+              }
+              ErrorAuditDecision::NotApplicable => {
+                  write_request_audit(
+                      &config,
+                      &headers,
+                      response.headers(),
+                      &method.to_string(),
+                      &path,
+                      &query,
+                      peer,
+                      client_ip.to_string(),
+                      duration_ms,
+                      status,
+                      origin,
+                      preflight,
+                      request_cors_method,
+                      request_cors_headers,
+                      response_cors_origin,
+                      response_cors_methods,
+                      response_cors_headers,
+                      response_cors_credentials,
+                      cors_blocked,
+                      0,
+                  );
               }
           }
           '''
-          new = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-          #[serde(rename_all = "kebab-case")]
-          pub enum RestartPolicy {
-              Always,
-              #[default]
-              OnFailure,
-              Never,
-          }
+          new_calls = '''    let client_ip = client_ip.to_string();
+              let suppressed = match error_audit_decision(&client_ip, method.as_str(), &path, status) {
+                  ErrorAuditDecision::Suppress => None,
+                  ErrorAuditDecision::Log { suppressed } => Some(suppressed),
+                  ErrorAuditDecision::NotApplicable => Some(0),
+              };
+              if let Some(suppressed) = suppressed {
+                  write_request_audit(RequestAudit {
+                      config: config.as_ref(),
+                      request_headers: &headers,
+                      response_headers: response.headers(),
+                      method: method.as_str(),
+                      path: &path,
+                      query: &query,
+                      peer,
+                      client_ip,
+                      duration_ms,
+                      status,
+                      cors: CorsAudit {
+                          origin,
+                          preflight,
+                          request_method: request_cors_method,
+                          request_headers: request_cors_headers,
+                          response_origin: response_cors_origin,
+                          response_methods: response_cors_methods,
+                          response_headers: response_cors_headers,
+                          response_credentials: response_cors_credentials,
+                          blocked: cors_blocked,
+                      },
+                      suppressed,
+                  });
+              }
           '''
-          if old in source:
-              path.write_text(source.replace(old, new, 1))
+
+          old_signature = '''fn write_request_audit(
+              config: &Config,
+              request_headers: &HeaderMap,
+              response_headers: &HeaderMap,
+              method: &str,
+              path: &str,
+              query: &str,
+              peer: SocketAddr,
+              client_ip: String,
+              duration_ms: f64,
+              status: u16,
+              origin: Option<String>,
+              preflight: bool,
+              request_cors_method: Option<String>,
+              request_cors_headers: Option<String>,
+              response_cors_origin: Option<String>,
+              response_cors_methods: Option<String>,
+              response_cors_headers: Option<String>,
+              response_cors_credentials: Option<String>,
+              cors_blocked: bool,
+              suppressed: u64,
+          ) {
+          '''
+          new_signature = '''fn write_request_audit(audit: RequestAudit<'_>) {
+              let RequestAudit {
+                  config,
+                  request_headers,
+                  response_headers,
+                  method,
+                  path,
+                  query,
+                  peer,
+                  client_ip,
+                  duration_ms,
+                  status,
+                  cors,
+                  suppressed,
+              } = audit;
+              let CorsAudit {
+                  origin,
+                  preflight,
+                  request_method: request_cors_method,
+                  request_headers: request_cors_headers,
+                  response_origin: response_cors_origin,
+                  response_methods: response_cors_methods,
+                  response_headers: response_cors_headers,
+                  response_credentials: response_cors_credentials,
+                  blocked: cors_blocked,
+              } = cors;
+          '''
+
+          replacements = [
+              (enum_block, typed_block, "audit type insertion"),
+              (old_calls, new_calls, "audit call consolidation"),
+              (old_signature, new_signature, "audit writer signature"),
+          ]
+          changed = False
+          for old, new, label in replacements:
+              if old in source:
+                  source = source.replace(old, new, 1)
+                  changed = True
+              elif new not in source:
+                  raise SystemExit(f"could not locate {label}")
+
+          if changed:
+              path.write_text(source)
           PY
           cargo fmt --all
-          if ! git diff --quiet -- crates/service-runtime/src/lib.rs; then
+          if ! git diff --quiet -- crates/security/src/timing.rs; then
             git config user.name "Kate"
             git config user.email "dhwanksh2000@gmail.com"
-            git add crates/service-runtime/src/lib.rs
-            git commit -m "fix: derive service restart default"
+            git add crates/security/src/timing.rs
+            git commit -m "refactor: type request audit metadata"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
       - name: format check
