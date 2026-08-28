@@ -1,0 +1,32 @@
+name: Group Memory CI
+
+on:
+  push:
+    paths:
+      - "group-memory/**"
+      - ".github/workflows/group-memory-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  group-memory:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: group-memory
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: group-memory
+      - name: format
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test --all-targets
