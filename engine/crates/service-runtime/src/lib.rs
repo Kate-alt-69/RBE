@@ -525,117 +525,122 @@ impl ServiceManager {
     fn start_monitor(&self, interval: Duration, max_restart_backoff: Duration) {
         let manager = self.clone();
         tokio::spawn(async move {
-            manager.monitor_loop(interval, max_restart_backoff).await;
-        });
-    }
-
-    async fn monitor_loop(&self, interval: Duration, max_restart_backoff: Duration) {
-        loop {
-            tokio::time::sleep(interval).await;
-            if self.shutting_down.load(Ordering::Acquire) {
-                return;
-            }
-
-            let handles = self
+            let handles = manager
                 .services
                 .read()
                 .await
                 .values()
                 .cloned()
                 .collect::<Vec<_>>();
-
             for handle in handles {
-                if self.shutting_down.load(Ordering::Acquire) {
-                    return;
-                }
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .monitor_service(handle, interval, max_restart_backoff)
+                        .await;
+                });
+            }
+        });
+    }
 
-                let mut service = handle.lock().await;
-                let status = match service.child.try_wait() {
-                    Ok(Some(status)) => status,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        tracing::warn!(
-                            service = %service.file.name,
-                            error = %error,
-                            "failed to inspect .service child status"
-                        );
-                        continue;
-                    }
-                };
+    async fn monitor_service(
+        &self,
+        handle: Arc<Mutex<Managed>>,
+        interval: Duration,
+        max_restart_backoff: Duration,
+    ) {
+        loop {
+            tokio::time::sleep(interval).await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
 
-                if service.exit_observed {
-                    continue;
-                }
-
-                let restart = should_restart(service.file.restart, status.success());
-                if !restart {
-                    service.exit_observed = true;
+            let mut service = handle.lock().await;
+            let status = match service.child.try_wait() {
+                Ok(Some(status)) => status,
+                Ok(None) => continue,
+                Err(error) => {
                     tracing::warn!(
                         service = %service.file.name,
-                        pid = service.ready.pid,
-                        %status,
-                        restart = ?service.file.restart,
-                        "service process exited and restart policy leaves it stopped"
+                        error = %error,
+                        "failed to inspect .service child status"
                     );
                     continue;
                 }
+            };
 
-                if service.started_at.elapsed() >= SERVICE_STABLE_WINDOW {
-                    service.restart_attempts = 0;
-                }
-                service.restart_attempts = service.restart_attempts.saturating_add(1);
-                let attempt = service.restart_attempts;
-                let delay = restart_delay(attempt, max_restart_backoff);
-                let file = service.file.clone();
-                let old_pid = service.ready.pid;
-                service.started_at = Instant::now();
+            if service.exit_observed {
+                return;
+            }
+
+            if !should_restart(service.file.restart, status.success()) {
+                service.exit_observed = true;
                 tracing::warn!(
-                    service = %file.name,
-                    pid = old_pid,
+                    service = %service.file.name,
+                    pid = service.ready.pid,
                     %status,
-                    attempt,
-                    backoff_ms = delay.as_millis() as u64,
-                    "service process exited; scheduling restart"
+                    restart = ?service.file.restart,
+                    "service process exited and restart policy leaves it stopped"
                 );
-                drop(service);
+                return;
+            }
 
-                tokio::time::sleep(delay).await;
-                if self.shutting_down.load(Ordering::Acquire) {
-                    return;
-                }
+            if service.started_at.elapsed() >= SERVICE_STABLE_WINDOW {
+                service.restart_attempts = 0;
+            }
+            service.restart_attempts = service.restart_attempts.saturating_add(1);
+            let attempt = service.restart_attempts;
+            let delay = restart_delay(attempt, max_restart_backoff);
+            let file = service.file.clone();
+            let old_pid = service.ready.pid;
+            service.started_at = Instant::now();
+            tracing::warn!(
+                service = %file.name,
+                pid = old_pid,
+                %status,
+                attempt,
+                backoff_ms = delay.as_millis() as u64,
+                "service process exited; scheduling restart"
+            );
+            drop(service);
 
-                match spawn(file.clone()).await {
-                    Ok(mut replacement) => {
-                        replacement.restart_attempts = attempt;
-                        let new_pid = replacement.ready.pid;
-                        let service = handle.lock().await;
-                        if self.shutting_down.load(Ordering::Acquire) {
-                            drop(service);
-                            stop_managed(&mut replacement).await;
-                            return;
-                        }
+            tokio::time::sleep(delay).await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+
+            match spawn(file.clone()).await {
+                Ok(mut replacement) => {
+                    replacement.restart_attempts = attempt;
+                    let new_pid = replacement.ready.pid;
+                    let mut service = handle.lock().await;
+                    if self.shutting_down.load(Ordering::Acquire) {
                         drop(service);
-                        let mut service = handle.lock().await;
-                        *service = replacement;
-                        tracing::info!(
-                            service = %file.name,
-                            old_pid,
-                            new_pid,
-                            attempt,
-                            "service process restarted"
-                        );
+                        stop_managed(&mut replacement).await;
+                        return;
                     }
-                    Err(error) => {
-                        let mut service = handle.lock().await;
-                        service.restart_attempts = attempt;
-                        service.started_at = Instant::now();
-                        tracing::error!(
-                            service = %file.name,
-                            attempt,
-                            error = %error,
-                            "service restart attempt failed"
-                        );
+                    *service = replacement;
+                    tracing::info!(
+                        service = %file.name,
+                        old_pid,
+                        new_pid,
+                        attempt,
+                        "service process restarted"
+                    );
+                }
+                Err(error) => {
+                    let mut service = handle.lock().await;
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        return;
                     }
+                    service.restart_attempts = attempt;
+                    service.started_at = Instant::now();
+                    tracing::error!(
+                        service = %file.name,
+                        attempt,
+                        error = %error,
+                        "service restart attempt failed"
+                    );
                 }
             }
         }
