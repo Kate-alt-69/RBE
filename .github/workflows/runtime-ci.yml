@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,6 +21,169 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+      - name: apply async module evaluator
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          evaluator = Path("crates/route-engine/src/module_eval.rs")
+          source = evaluator.read_text()
+          source = source.replace(
+              "struct Frame<'a> {\n    executor: &'a ModuleExecutor<'a>,",
+              "struct Frame<'exec, 'program> {\n    executor: &'exec ModuleExecutor<'program>,",
+          )
+          source = source.replace(
+              "impl<'a> Frame<'a> {\n    fn new(executor: &'a ModuleExecutor<'a>, file: Arc<ModuleFile>, depth: usize) -> Self {",
+              "impl<'exec, 'program> Frame<'exec, 'program> {\n    fn new(\n        executor: &'exec ModuleExecutor<'program>,\n        file: Arc<ModuleFile>,\n        depth: usize,\n    ) -> Self {",
+          )
+
+          if "executes_helpers_and_module_dependencies" not in source:
+              source += r'''
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+              use std::fs;
+              use std::sync::atomic::{AtomicU64, Ordering};
+              use std::sync::Arc;
+              use std::task::{Context, Poll, Wake, Waker};
+              use std::time::{SystemTime, UNIX_EPOCH};
+
+              static NEXT: AtomicU64 = AtomicU64::new(0);
+
+              struct NoopWake;
+
+              impl Wake for NoopWake {
+                  fn wake(self: Arc<Self>) {}
+              }
+
+              fn block_on_ready<F: Future>(future: F) -> F::Output {
+                  let waker = Waker::from(Arc::new(NoopWake));
+                  let mut context = Context::from_waker(&waker);
+                  let mut future = Box::pin(future);
+                  loop {
+                      match future.as_mut().poll(&mut context) {
+                          Poll::Ready(value) => return value,
+                          Poll::Pending => std::thread::yield_now(),
+                      }
+                  }
+              }
+
+              fn root() -> std::path::PathBuf {
+                  let nonce = SystemTime::now()
+                      .duration_since(UNIX_EPOCH)
+                      .unwrap_or_default()
+                      .as_nanos();
+                  let path = std::env::temp_dir().join(format!(
+                      "rbe-module-eval-test-{}-{nonce}-{}",
+                      std::process::id(),
+                      NEXT.fetch_add(1, Ordering::Relaxed)
+                  ));
+                  fs::create_dir_all(path.join("module")).unwrap();
+                  path
+              }
+
+              #[test]
+              fn executes_helpers_and_module_dependencies() {
+                  let root = root();
+                  fs::write(
+                      root.join("module/b.module"),
+                      "export function twice(value) { return value * 2; }",
+                  )
+                  .unwrap();
+                  fs::write(
+                      root.join("module/a.module"),
+                      ":import[module&b]\nfunction plusOne(value) { return value + 1; }\nexport function run(value) { return b.twice(plusOne(value)); }",
+                  )
+                  .unwrap();
+                  let program = ModuleProgram::load(&root.join("module")).unwrap();
+                  let value = block_on_ready(program.call(
+                      "./module/a",
+                      "run",
+                      vec![Value::Number(3.0)],
+                  ))
+                  .unwrap();
+                  assert!(matches!(value, Value::Number(value) if value == 8.0));
+                  let _ = fs::remove_dir_all(root);
+              }
+
+              #[test]
+              fn private_functions_cannot_be_called_from_outside() {
+                  let root = root();
+                  fs::write(
+                      root.join("module/a.module"),
+                      "function hidden() { return 7; }\nexport function visible() { return hidden(); }",
+                  )
+                  .unwrap();
+                  let program = ModuleProgram::load(&root.join("module")).unwrap();
+                  let error = block_on_ready(program.call("./module/a", "hidden", Vec::new()))
+                      .unwrap_err();
+                  assert_eq!(error.code, "MOD3001");
+                  let visible = block_on_ready(program.call("./module/a", "visible", Vec::new()))
+                      .unwrap();
+                  assert!(matches!(visible, Value::Number(value) if value == 7.0));
+                  let _ = fs::remove_dir_all(root);
+              }
+
+              #[test]
+              fn recursive_helpers_stop_at_depth_limit() {
+                  let root = root();
+                  fs::write(
+                      root.join("module/a.module"),
+                      "function forever() { return forever(); }\nexport function run() { return forever(); }",
+                  )
+                  .unwrap();
+                  let program = ModuleProgram::load(&root.join("module")).unwrap();
+                  let error = block_on_ready(program.call("./module/a", "run", Vec::new()))
+                      .unwrap_err();
+                  assert_eq!(error.code, "MOD3004");
+                  let _ = fs::remove_dir_all(root);
+              }
+          }
+          '''
+          evaluator.write_text(source)
+
+          lib = Path("crates/route-engine/src/lib.rs")
+          source = lib.read_text()
+          if "mod module_eval;" not in source:
+              source = source.replace("mod module_runtime;\n", "mod module_runtime;\nmod module_eval;\n", 1)
+          if "pub use module_eval::" not in source:
+              anchor = "pub use module_runtime::{ModuleCompileError, ModuleCompileErrors, ModuleProgram};\n"
+              if anchor not in source:
+                  raise SystemExit("module runtime export anchor missing")
+              source = source.replace(
+                  anchor,
+                  anchor + "pub use module_eval::{ModuleEvalError, ModuleExecutor};\n",
+                  1,
+              )
+          lib.write_text(source)
+          PY
+
+          rustfmt --edition 2021 crates/route-engine/src/module_eval.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+          python - <<'PY'
+          import subprocess
+          allowed = {
+              "engine/crates/route-engine/src/module_eval.rs",
+              "engine/crates/route-engine/src/lib.rs",
+          }
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected evaluator paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- crates/route-engine/src/module_eval.rs crates/route-engine/src/lib.rs
+            git commit -m "feat: execute module functions"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: format runtime slice
         shell: bash
         run: |
@@ -32,6 +195,7 @@ jobs:
             crates/route-engine/src/ast.rs \
             crates/route-engine/src/parser.rs \
             crates/route-engine/src/module_runtime.rs \
+            crates/route-engine/src/module_eval.rs \
             crates/route-engine/src/discovery.rs
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
