@@ -27,7 +27,8 @@ jobs:
           rustfmt --edition 2021 --check \
             crates/service-runtime/src/lib.rs \
             crates/backend/src/service_boot.rs \
-            crates/video-manager/src/lib.rs
+            crates/video-manager/src/lib.rs \
+            crates/api/src/health.rs
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test

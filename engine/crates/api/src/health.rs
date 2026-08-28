@@ -3,6 +3,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use core_lib::AppState;
 use serde_json::{json, Value};
+use service_runtime::ServiceRuntimeState;
 use supervisor::BackendState;
 
 pub fn routes() -> Router<AppState> {
@@ -12,7 +13,22 @@ pub fn routes() -> Router<AppState> {
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let lifecycle = state.backend_state();
     let services = state.services.snapshot().await;
-    let running_services = services.iter().filter(|service| service.pid.is_some()).count();
+    let running_services = services
+        .iter()
+        .filter(|service| service.state == ServiceRuntimeState::Running)
+        .count();
+    let restarting_services = services
+        .iter()
+        .filter(|service| service.state == ServiceRuntimeState::Restarting)
+        .count();
+    let stopped_services = services
+        .iter()
+        .filter(|service| service.state == ServiceRuntimeState::Stopped)
+        .count();
+    let unknown_services = services
+        .iter()
+        .filter(|service| service.state == ServiceRuntimeState::Unknown)
+        .count();
     let services_ok = running_services == services.len();
 
     let (video_ok, video_status) = match state.video_manager.as_ref() {
@@ -36,6 +52,9 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "services": {
             "ok": services_ok,
             "running": running_services,
+            "restarting": restarting_services,
+            "stopped": stopped_services,
+            "unknown": unknown_services,
             "total": services.len(),
             "entries": services
         },
