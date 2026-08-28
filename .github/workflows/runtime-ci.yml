@@ -21,47 +21,417 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: apply one-shot Rust 1.98 lint cleanups
+      - name: apply one-shot service crash supervisor
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          terminal = Path("crates/route-engine/src/terminal.rs")
-          source = terminal.read_text()
-          source = source.replace(
-              "let filled = if total == 0 { 0 } else { 1usize.saturating_mul(width) / total };",
-              "let filled = 1usize.saturating_mul(width).checked_div(total).unwrap_or(0);",
-          )
-          terminal.write_text(source)
+          path = Path("crates/service-runtime/src/lib.rs")
+          source = path.read_text()
 
-          dashboard = Path("crates/api/src/dashboard.rs")
-          source = dashboard.read_text()
           source = source.replace(
-              "fn local_only(peer: SocketAddr) -> Result<(), Response> {",
-              "fn local_only(peer: SocketAddr) -> Result<(), (StatusCode, &'static str)> {",
+              "use std::sync::{Arc, RwLock};\nuse std::time::Duration;",
+              "use std::sync::atomic::{AtomicBool, Ordering};\nuse std::sync::{Arc, RwLock};\nuse std::time::{Duration, Instant};",
+              1,
           )
-          source = source.replace(
-              "Err((StatusCode::FORBIDDEN, \"RBE dashboard is loopback-only\").into_response())",
-              "Err((StatusCode::FORBIDDEN, \"RBE dashboard is loopback-only\"))",
-          )
-          source = source.replace(
-              "if let Err(response) = local_only(peer) { return response; }",
-              "if let Err(error) = local_only(peer) { return error.into_response(); }",
-          )
-          dashboard.write_text(source)
 
-          container = Path("crates/backend/src/container_process.rs")
-          source = container.read_text()
-          source = source.replace("    pub fn pid(&self) -> Option<u32> { self.child.id() }\n", "")
-          container.write_text(source)
+          old_defaults = '''pub struct ServiceDefaults {
+              pub memory_limit_mb: u64,
+              pub startup_timeout_ms: u64,
+          }
+
+          impl Default for ServiceDefaults {
+              fn default() -> Self {
+                  Self {
+                      memory_limit_mb: 256,
+                      startup_timeout_ms: 10_000,
+                  }
+              }
+          }'''
+          new_defaults = '''pub struct ServiceDefaults {
+              pub memory_limit_mb: u64,
+              pub startup_timeout_ms: u64,
+              pub monitor_interval_ms: u64,
+              pub max_restart_backoff_ms: u64,
+          }
+
+          impl Default for ServiceDefaults {
+              fn default() -> Self {
+                  Self {
+                      memory_limit_mb: 256,
+                      startup_timeout_ms: 10_000,
+                      monitor_interval_ms: 1_000,
+                      max_restart_backoff_ms: 30_000,
+                  }
+              }
+          }'''
+          if old_defaults not in source and new_defaults not in source:
+              raise SystemExit("could not locate ServiceDefaults")
+          source = source.replace(old_defaults, new_defaults, 1)
+
+          old_catalog = '''pub struct ServiceCatalog {
+              services: Vec<ServiceFile>,
+          }'''
+          new_catalog = '''pub struct ServiceCatalog {
+              services: Vec<ServiceFile>,
+              monitor_interval_ms: u64,
+              max_restart_backoff_ms: u64,
+          }'''
+          if old_catalog not in source and new_catalog not in source:
+              raise SystemExit("could not locate ServiceCatalog")
+          source = source.replace(old_catalog, new_catalog, 1)
+          source = source.replace(
+              "Ok(Self { services })",
+              "Ok(Self {\n                services,\n                monitor_interval_ms: defaults.monitor_interval_ms,\n                max_restart_backoff_ms: defaults.max_restart_backoff_ms,\n            })",
+              1,
+          )
+
+          old_managed = '''struct Managed {
+              file: ServiceFile,
+              child: Child,
+              alias: PathBuf,
+              ready: ServiceReady,
+              token: String,
+          }
+
+          #[derive(Clone, Default)]
+          pub struct ServiceManager {
+              services: Arc<AsyncRwLock<HashMap<String, Arc<Mutex<Managed>>>>>,
+          }'''
+          new_managed = '''const RESTART_BASE_DELAY_MS: u64 = 250;
+          const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
+
+          struct Managed {
+              file: ServiceFile,
+              child: Child,
+              alias: PathBuf,
+              ready: ServiceReady,
+              token: String,
+              started_at: Instant,
+              restart_attempts: u32,
+              exit_observed: bool,
+          }
+
+          #[derive(Clone, Default)]
+          pub struct ServiceManager {
+              services: Arc<AsyncRwLock<HashMap<String, Arc<Mutex<Managed>>>>>,
+              shutting_down: Arc<AtomicBool>,
+          }'''
+          if old_managed not in source and new_managed not in source:
+              raise SystemExit("could not locate Managed/ServiceManager")
+          source = source.replace(old_managed, new_managed, 1)
+
+          impl_start = source.index("impl ServiceManager {")
+          impl_end = source.index("\n}\n\nasync fn spawn(", impl_start) + 2
+          new_impl = r'''impl ServiceManager {
+              pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
+                  let manager = Self::default();
+                  for file in catalog.services() {
+                      let managed = spawn(file.clone()).await?;
+                      manager
+                          .services
+                          .write()
+                          .await
+                          .insert(file.name.clone(), Arc::new(Mutex::new(managed)));
+                  }
+                  if !catalog.services().is_empty() {
+                      manager.start_monitor(
+                          Duration::from_millis(catalog.monitor_interval_ms.max(50)),
+                          Duration::from_millis(
+                              catalog.max_restart_backoff_ms.max(RESTART_BASE_DELAY_MS),
+                          ),
+                      );
+                  }
+                  Ok(manager)
+              }
+
+              fn start_monitor(&self, interval: Duration, max_restart_backoff: Duration) {
+                  let manager = self.clone();
+                  tokio::spawn(async move {
+                      manager.monitor_loop(interval, max_restart_backoff).await;
+                  });
+              }
+
+              async fn monitor_loop(&self, interval: Duration, max_restart_backoff: Duration) {
+                  loop {
+                      tokio::time::sleep(interval).await;
+                      if self.shutting_down.load(Ordering::Acquire) {
+                          return;
+                      }
+
+                      let handles = self
+                          .services
+                          .read()
+                          .await
+                          .values()
+                          .cloned()
+                          .collect::<Vec<_>>();
+
+                      for handle in handles {
+                          if self.shutting_down.load(Ordering::Acquire) {
+                              return;
+                          }
+
+                          let mut service = handle.lock().await;
+                          let status = match service.child.try_wait() {
+                              Ok(Some(status)) => status,
+                              Ok(None) => continue,
+                              Err(error) => {
+                                  tracing::warn!(
+                                      service = %service.file.name,
+                                      error = %error,
+                                      "failed to inspect .service child status"
+                                  );
+                                  continue;
+                              }
+                          };
+
+                          if service.exit_observed {
+                              continue;
+                          }
+
+                          let restart = should_restart(service.file.restart, status.success());
+                          if !restart {
+                              service.exit_observed = true;
+                              tracing::warn!(
+                                  service = %service.file.name,
+                                  pid = service.ready.pid,
+                                  %status,
+                                  restart = ?service.file.restart,
+                                  "service process exited and restart policy leaves it stopped"
+                              );
+                              continue;
+                          }
+
+                          if service.started_at.elapsed() >= SERVICE_STABLE_WINDOW {
+                              service.restart_attempts = 0;
+                          }
+                          service.restart_attempts = service.restart_attempts.saturating_add(1);
+                          let attempt = service.restart_attempts;
+                          let delay = restart_delay(attempt, max_restart_backoff);
+                          let file = service.file.clone();
+                          let old_pid = service.ready.pid;
+                          service.started_at = Instant::now();
+                          tracing::warn!(
+                              service = %file.name,
+                              pid = old_pid,
+                              %status,
+                              attempt,
+                              backoff_ms = delay.as_millis() as u64,
+                              "service process exited; scheduling restart"
+                          );
+                          drop(service);
+
+                          tokio::time::sleep(delay).await;
+                          if self.shutting_down.load(Ordering::Acquire) {
+                              return;
+                          }
+
+                          match spawn(file.clone()).await {
+                              Ok(mut replacement) => {
+                                  replacement.restart_attempts = attempt;
+                                  let new_pid = replacement.ready.pid;
+                                  let mut service = handle.lock().await;
+                                  if self.shutting_down.load(Ordering::Acquire) {
+                                      drop(service);
+                                      stop_managed(&mut replacement).await;
+                                      return;
+                                  }
+                                  *service = replacement;
+                                  tracing::info!(
+                                      service = %file.name,
+                                      old_pid,
+                                      new_pid,
+                                      attempt,
+                                      "service process restarted"
+                                  );
+                              }
+                              Err(error) => {
+                                  let mut service = handle.lock().await;
+                                  service.restart_attempts = attempt;
+                                  service.started_at = Instant::now();
+                                  tracing::error!(
+                                      service = %file.name,
+                                      attempt,
+                                      error = %error,
+                                      "service restart attempt failed"
+                                  );
+                              }
+                          }
+                      }
+                  }
+              }
+
+              pub async fn snapshot(&self) -> Vec<ServiceSnapshot> {
+                  let handles = self
+                      .services
+                      .read()
+                      .await
+                      .values()
+                      .cloned()
+                      .collect::<Vec<_>>();
+                  let mut out = Vec::new();
+                  for handle in handles {
+                      let mut service = handle.lock().await;
+                      let alive = matches!(service.child.try_wait(), Ok(None));
+                      out.push(ServiceSnapshot {
+                          name: service.file.name.clone(),
+                          title: service.file.title.clone(),
+                          pid: if alive { service.child.id() } else { None },
+                      });
+                  }
+                  out.sort_by(|left, right| left.name.cmp(&right.name));
+                  out
+              }
+
+              pub async fn shutdown_all(&self) {
+                  self.shutting_down.store(true, Ordering::Release);
+                  let handles = self
+                      .services
+                      .read()
+                      .await
+                      .values()
+                      .cloned()
+                      .collect::<Vec<_>>();
+                  for handle in handles {
+                      let mut service = handle.lock().await;
+                      stop_managed(&mut service).await;
+                  }
+              }
+          }
+
+          fn should_restart(policy: RestartPolicy, success: bool) -> bool {
+              match policy {
+                  RestartPolicy::Always => true,
+                  RestartPolicy::OnFailure => !success,
+                  RestartPolicy::Never => false,
+              }
+          }
+
+          fn restart_delay(attempt: u32, maximum: Duration) -> Duration {
+              let exponent = attempt.saturating_sub(1).min(16);
+              let factor = 1u32 << exponent;
+              Duration::from_millis(RESTART_BASE_DELAY_MS)
+                  .saturating_mul(factor)
+                  .min(maximum)
+          }
+
+          async fn stop_managed(service: &mut Managed) {
+              let _ = rpc(
+                  service.ready.address,
+                  ServiceRequest::Shutdown {
+                      token: service.token.clone(),
+                  },
+              )
+              .await;
+              match tokio::time::timeout(Duration::from_secs(3), service.child.wait()).await {
+                  Ok(Ok(_)) => {}
+                  Ok(Err(error)) => tracing::warn!(
+                      service = %service.file.name,
+                      error = %error,
+                      "failed while waiting for service shutdown"
+                  ),
+                  Err(_) => {
+                      let _ = service.child.kill().await;
+                      let _ = service.child.wait().await;
+                  }
+              }
+              let _ = std::fs::remove_file(&service.alias);
+          }'''
+          source = source[:impl_start] + new_impl + source[impl_end:]
+
+          old_spawn_tail = '''    Ok(Managed {
+              file,
+              child,
+              alias,
+              ready,
+              token,
+          })'''
+          new_spawn_tail = '''    Ok(Managed {
+              file,
+              child,
+              alias,
+              ready,
+              token,
+              started_at: Instant::now(),
+              restart_attempts: 0,
+              exit_observed: false,
+          })'''
+          if old_spawn_tail not in source and new_spawn_tail not in source:
+              raise SystemExit("could not locate Managed construction")
+          source = source.replace(old_spawn_tail, new_spawn_tail, 1)
+
+          old_test = '''    #[test]
+              fn memory_round_trip() {
+                  let memory = ServiceMemory::default();
+                  memory.set("x".into(), serde_json::json!(7));
+                  assert_eq!(memory.get("x"), Some(serde_json::json!(7)));
+              }'''
+          new_test = '''    #[test]
+              fn memory_round_trip() {
+                  let memory = ServiceMemory::default();
+                  memory.set("x".into(), serde_json::json!(7));
+                  assert_eq!(memory.get("x"), Some(serde_json::json!(7)));
+              }
+
+              #[test]
+              fn restart_policy_distinguishes_clean_and_failed_exits() {
+                  assert!(should_restart(RestartPolicy::Always, true));
+                  assert!(should_restart(RestartPolicy::Always, false));
+                  assert!(!should_restart(RestartPolicy::OnFailure, true));
+                  assert!(should_restart(RestartPolicy::OnFailure, false));
+                  assert!(!should_restart(RestartPolicy::Never, false));
+              }
+
+              #[test]
+              fn restart_backoff_is_exponential_and_capped() {
+                  let maximum = Duration::from_secs(30);
+                  assert_eq!(restart_delay(1, maximum), Duration::from_millis(250));
+                  assert_eq!(restart_delay(2, maximum), Duration::from_millis(500));
+                  assert_eq!(restart_delay(3, maximum), Duration::from_millis(1_000));
+                  assert_eq!(restart_delay(32, maximum), maximum);
+              }'''
+          if old_test not in source and new_test not in source:
+              raise SystemExit("could not locate service tests")
+          source = source.replace(old_test, new_test, 1)
+          path.write_text(source)
+
+          boot = Path("crates/backend/src/service_boot.rs")
+          boot_source = boot.read_text()
+          first = '''    let defaults = ServiceDefaults {
+              memory_limit_mb: config.services.default_memory_limit_mb,
+              startup_timeout_ms: config.services.startup_timeout_ms,
+          };'''
+          first_new = '''    let defaults = ServiceDefaults {
+              memory_limit_mb: config.services.default_memory_limit_mb,
+              startup_timeout_ms: config.services.startup_timeout_ms,
+              monitor_interval_ms: config.services.monitor_interval_ms,
+              max_restart_backoff_ms: config.services.max_restart_backoff_ms,
+          };'''
+          second = '''    let defaults = ServiceDefaults {
+              memory_limit_mb: settings.default_memory_limit_mb,
+              startup_timeout_ms: settings.startup_timeout_ms,
+          };'''
+          second_new = '''    let defaults = ServiceDefaults {
+              memory_limit_mb: settings.default_memory_limit_mb,
+              startup_timeout_ms: settings.startup_timeout_ms,
+              monitor_interval_ms: settings.monitor_interval_ms,
+              max_restart_backoff_ms: settings.max_restart_backoff_ms,
+          };'''
+          if first not in boot_source and first_new not in boot_source:
+              raise SystemExit("could not locate service host defaults")
+          if second not in boot_source and second_new not in boot_source:
+              raise SystemExit("could not locate service compiler defaults")
+          boot_source = boot_source.replace(first, first_new, 1).replace(second, second_new, 1)
+          boot.write_text(boot_source)
           PY
           cargo fmt --all
-          if ! git diff --quiet -- crates/route-engine/src/terminal.rs crates/api/src/dashboard.rs crates/backend/src/container_process.rs; then
+          if ! git diff --quiet -- crates/service-runtime/src/lib.rs crates/backend/src/service_boot.rs; then
             git config user.name "Kate"
             git config user.email "dhwanksh2000@gmail.com"
-            git add crates/route-engine/src/terminal.rs crates/api/src/dashboard.rs crates/backend/src/container_process.rs
-            git commit -m "fix: satisfy Rust 1.98 workspace lints"
+            git add -- crates/service-runtime/src/lib.rs crates/backend/src/service_boot.rs
+            git commit -m "feat: supervise service process crashes"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
       - name: format check
