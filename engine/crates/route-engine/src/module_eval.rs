@@ -95,8 +95,8 @@ impl<'a> ModuleExecutor<'a> {
     }
 
     pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {
-        Self::with_service_caller(program, Arc::new(services))
-    }
+    Self::with_service_caller(program, Arc::new(services))
+}
 
     pub fn with_service_caller(
         program: &'a ModuleProgram,
