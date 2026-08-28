@@ -512,19 +512,17 @@ pub enum ServiceRequest {
 
 impl ServiceRequest {
     fn token(&self) -> &str {
-    match self {
-        Self::Health { token }
-        | Self::Call { token, .. }
-        | Self::Event { token, .. }
-        | Self::MemoryGet { token, .. }
-        | Self::MemorySet { token, .. }
-        | Self::MemoryDelete { token, .. }
-        | Self::MemoryClear { token }
-        | Self::Shutdown { token } => token,
+        match self {
+  Self::Health { token }
+  | Self::Call { token, .. }
+  | Self::Event { token, .. }
+  | Self::MemoryGet { token, .. }
+  | Self::MemorySet { token, .. }
+  | Self::MemoryDelete { token, .. }
+  | Self::MemoryClear { token }
+  | Self::Shutdown { token } => token,
+        }
     }
-}
-}
-}
 }
 
 #[derive(Debug, Serialize, Deserialize)]
