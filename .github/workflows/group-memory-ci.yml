@@ -84,7 +84,7 @@ jobs:
           python - <<'PY'
           import subprocess
           changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
-          allowed = {"group-memory/src/lib.rs", "group-memory/Cargo.lock"}
+          allowed = {"group-memory/src/lib.rs"}
           unexpected = changed - allowed
           if unexpected:
               raise SystemExit("unexpected group-memory paths: " + ", ".join(sorted(unexpected)))
@@ -93,7 +93,7 @@ jobs:
           if ! git diff --quiet; then
             git config user.name "Kate"
             git config user.email "dhwanksh2000@gmail.com"
-            git add -- src/lib.rs Cargo.lock
+            git add -- src/lib.rs
             git commit -m "fix: own group memory file lock handles"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
