@@ -15,6 +15,7 @@ config = { path = "../config" }
 supervisor = { path = "../supervisor" }
 logging = { path = "../logging" }
 service-runtime = { path = "../service-runtime" }
+video-manager = { path = "../video-manager" }
 vault-process = { path = "../../../vault-process" }
 atomic-io = { path = "../../../atomic-io" }
 runtime-paths = { path = "../../../runtime-paths" }
