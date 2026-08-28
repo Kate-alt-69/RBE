@@ -17,6 +17,7 @@ mod interpreter;
 mod lexer;
 mod modules;
 mod module_runtime;
+mod module_eval;
 mod parser;
 mod paths;
 mod terminal;
@@ -31,6 +32,7 @@ pub use discovery::{build_routes, RouteCache};
 pub use interpreter::{EvalError, Interpreter, RequestContext};
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
 pub use module_runtime::{ModuleCompileError, ModuleCompileErrors, ModuleProgram};
+pub use module_eval::{ModuleEvalError, ModuleExecutor};
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
 
 #[cfg(test)]

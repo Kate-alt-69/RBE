@@ -5,16 +5,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, ModuleFile, Statement, Value};
+use crate::ast::{BinaryOp, Expr, ImportTarget, ModuleFile, Statement, Value};
 use crate::module_runtime::ModuleProgram;
 use crate::modules::{binding_name, ModuleRegistry};
 
 const MAX_MODULE_CALL_DEPTH: usize = 64;
 
-type EvalFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Value, ModuleEvalError>> + Send + 'a>>;
-type FlowFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Flow, ModuleEvalError>> + Send + 'a>>;
+type EvalFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ModuleEvalError>> + Send + 'a>>;
+type FlowFuture<'a> = Pin<Box<dyn Future<Output = Result<Flow, ModuleEvalError>> + Send + 'a>>;
 
 #[derive(Debug, Clone)]
 pub struct ModuleEvalError {
@@ -65,10 +63,7 @@ impl<'a> ModuleExecutor<'a> {
         depth: usize,
     ) -> Result<Value, ModuleEvalError> {
         let file = self.program.resolve(raw_path).ok_or_else(|| {
-            ModuleEvalError::new(
-                "MOD3000",
-                format!("module {raw_path:?} is not loaded"),
-            )
+            ModuleEvalError::new("MOD3000", format!("module {raw_path:?} is not loaded"))
         })?;
         if !file.exports.iter().any(|name| name == function) {
             return Err(ModuleEvalError::new(
@@ -98,10 +93,7 @@ impl<'a> ModuleExecutor<'a> {
             .find(|candidate| candidate.name == function_name)
             .cloned()
             .ok_or_else(|| {
-                ModuleEvalError::new(
-                    "MOD3002",
-                    format!("function {function_name:?} has no body"),
-                )
+                ModuleEvalError::new("MOD3002", format!("function {function_name:?} has no body"))
             })?;
         if function.params.len() != args.len() {
             return Err(ModuleEvalError::new(
@@ -132,7 +124,9 @@ impl ModuleProgram {
         function: &str,
         args: Vec<Value>,
     ) -> Result<Value, ModuleEvalError> {
-        ModuleExecutor::new(self).call(raw_path, function, args).await
+        ModuleExecutor::new(self)
+            .call(raw_path, function, args)
+            .await
     }
 }
 
@@ -141,8 +135,8 @@ enum Flow {
     Return(Value),
 }
 
-struct Frame<'a> {
-    executor: &'a ModuleExecutor<'a>,
+struct Frame<'exec, 'program> {
+    executor: &'exec ModuleExecutor<'program>,
     file: Arc<ModuleFile>,
     modules: ModuleRegistry,
     custom_modules: HashMap<String, String>,
@@ -151,8 +145,8 @@ struct Frame<'a> {
     depth: usize,
 }
 
-impl<'a> Frame<'a> {
-    fn new(executor: &'a ModuleExecutor<'a>, file: Arc<ModuleFile>, depth: usize) -> Self {
+impl<'exec, 'program> Frame<'exec, 'program> {
+    fn new(executor: &'exec ModuleExecutor<'program>, file: Arc<ModuleFile>, depth: usize) -> Self {
         let modules = ModuleRegistry::from_imports(&file.imports);
         let mut custom_modules = HashMap::new();
         let mut custom_functions = HashMap::new();
@@ -225,7 +219,12 @@ impl<'a> Frame<'a> {
                     if let Some(value) = self.scope.get(name) {
                         return Ok(value.clone());
                     }
-                    if self.file.functions.iter().any(|function| function.name == *name) {
+                    if self
+                        .file
+                        .functions
+                        .iter()
+                        .any(|function| function.name == *name)
+                    {
                         return Err(ModuleEvalError::new(
                             "MOD3100",
                             format!("function {name:?} must be called, not used as a value"),
@@ -376,9 +375,7 @@ fn import_base(import: &ImportTarget) -> &ImportTarget {
 fn binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value, ModuleEvalError> {
     match op {
         BinaryOp::Equal | BinaryOp::StrictEqual => Ok(Value::Bool(value_eq(&left, &right))),
-        BinaryOp::NotEqual | BinaryOp::StrictNotEqual => {
-            Ok(Value::Bool(!value_eq(&left, &right)))
-        }
+        BinaryOp::NotEqual | BinaryOp::StrictNotEqual => Ok(Value::Bool(!value_eq(&left, &right))),
         BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
             match (&left, &right) {
                 (Value::Number(a), Value::Number(b)) => Ok(Value::Bool(match op {
@@ -439,13 +436,99 @@ fn value_eq(left: &Value, right: &Value) -> bool {
         (Value::Null, Value::Null) => true,
         (Value::Object(a), Value::Object(b)) => {
             a.len() == b.len()
-                && a
-                    .iter()
+                && a.iter()
                     .all(|(key, value)| b.get(key).is_some_and(|other| value_eq(value, other)))
         }
         (Value::Array(a), Value::Array(b)) => {
             a.iter().zip(b).all(|(left, right)| value_eq(left, right)) && a.len() == b.len()
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::{Context, Poll, Waker};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn block_on_ready<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn root() -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rbe-module-eval-test-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(path.join("module")).unwrap();
+        path
+    }
+
+    #[test]
+    fn executes_helpers_and_module_dependencies() {
+        let root = root();
+        fs::write(
+            root.join("module/b.module"),
+            "export function twice(value) { return value * 2; }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("module/a.module"),
+            ":import[module&b]\nfunction plusOne(value) { return value + 1; }\nexport function run(value) { return b.twice(plusOne(value)); }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let value =
+            block_on_ready(program.call("./module/a", "run", vec![Value::Number(3.0)])).unwrap();
+        assert!(matches!(value, Value::Number(value) if value == 8.0));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_functions_cannot_be_called_from_outside() {
+        let root = root();
+        fs::write(
+            root.join("module/a.module"),
+            "function hidden() { return 7; }\nexport function visible() { return hidden(); }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let error = block_on_ready(program.call("./module/a", "hidden", Vec::new())).unwrap_err();
+        assert_eq!(error.code, "MOD3001");
+        let visible = block_on_ready(program.call("./module/a", "visible", Vec::new())).unwrap();
+        assert!(matches!(visible, Value::Number(value) if value == 7.0));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recursive_helpers_stop_at_depth_limit() {
+        let root = root();
+        fs::write(
+            root.join("module/a.module"),
+            "function forever() { return forever(); }\nexport function run() { return forever(); }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let error = block_on_ready(program.call("./module/a", "run", Vec::new())).unwrap_err();
+        assert_eq!(error.code, "MOD3004");
+        let _ = fs::remove_dir_all(root);
     }
 }
