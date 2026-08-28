@@ -35,24 +35,37 @@ impl ContainerProcess {
 
             let mut command = Command::new(binary);
             command
-                .arg("--listen").arg(address.to_string())
+                .arg("--listen")
+                .arg(address.to_string())
                 // The browser dashboard belongs to backend.exe. The child keeps
                 // its old standalone dashboard code only for direct debug runs.
                 .arg("--no-dashboard")
-                .arg("--general-environments").arg(settings.environments.to_string());
+                .arg("--general-environments")
+                .arg(settings.environments.to_string());
             if let Some(value) = settings.swamps_per_environment.fixed() {
-                command.arg("--swamps-per-environment").arg(value.to_string());
+                command
+                    .arg("--swamps-per-environment")
+                    .arg(value.to_string());
             }
             if let Some(value) = settings.workers_per_swamp.fixed() {
                 command.arg("--workers-per-swamp").arg(value.to_string());
             }
-            command.env("RBE_CONTAINER_TOKEN", &token).kill_on_drop(true);
+            command
+                .env("RBE_CONTAINER_TOKEN", &token)
+                .kill_on_drop(true);
 
-            let child = command.spawn().map_err(|err| anyhow::anyhow!(
-                "failed to spawn verified container process {}: {err}", binary.display()
-            ))?;
+            let child = command.spawn().map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to spawn verified container process {}: {err}",
+                    binary.display()
+                )
+            })?;
 
-            let mut process = Self { child, address, token };
+            let mut process = Self {
+                child,
+                address,
+                token,
+            };
             match process.wait_for_control_socket().await {
                 Ok(()) => {
                     tracing::info!(
@@ -70,13 +83,22 @@ impl ContainerProcess {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("failed to start container process after {MAX_SPAWN_ATTEMPTS} attempts")))
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("failed to start container process after {MAX_SPAWN_ATTEMPTS} attempts")
+        }))
     }
 
     pub fn packaged_path() -> anyhow::Result<PathBuf> {
-        let executable = std::env::current_exe().map_err(|err| anyhow::anyhow!("could not resolve backend executable path: {err}"))?;
-        let root = executable.parent().ok_or_else(|| anyhow::anyhow!("backend executable has no parent directory"))?;
-        let name = if cfg!(windows) { "container.exe" } else { "container" };
+        let executable = std::env::current_exe()
+            .map_err(|err| anyhow::anyhow!("could not resolve backend executable path: {err}"))?;
+        let root = executable
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("backend executable has no parent directory"))?;
+        let name = if cfg!(windows) {
+            "container.exe"
+        } else {
+            "container"
+        };
         Ok(root.join("dep").join(name))
     }
 
@@ -97,8 +119,9 @@ impl ContainerProcess {
         Ok(())
     }
 
-    pub fn pid(&self) -> Option<u32> { self.child.id() }
-    pub fn endpoint(&self) -> (SocketAddr, String, Option<u32>) { (self.address, self.token.clone(), self.child.id()) }
+    pub fn endpoint(&self) -> (SocketAddr, String, Option<u32>) {
+        (self.address, self.token.clone(), self.child.id())
+    }
 }
 
 fn verify_container(binary: &Path) -> anyhow::Result<()> {
@@ -108,19 +131,44 @@ fn verify_container(binary: &Path) -> anyhow::Result<()> {
     {
         anyhow::bail!("container dependency is not cryptographically bound to this backend build; refusing startup");
     }
-    if !binary.is_file() { anyhow::bail!("required container dependency is missing: {}", binary.display()); }
-
-    let actual_hash = sha256_file(binary)?;
-    if !constant_time_eq(actual_hash.as_bytes(), container_integrity::EXPECTED_CONTAINER_SHA256.as_bytes()) {
-        anyhow::bail!("container integrity check failed: SHA-256 mismatch (expected {}, got {})", container_integrity::EXPECTED_CONTAINER_SHA256, actual_hash);
+    if !binary.is_file() {
+        anyhow::bail!(
+            "required container dependency is missing: {}",
+            binary.display()
+        );
     }
 
-    let public_key_bytes = decode_exact::<32>(container_integrity::CONTAINER_PUBLIC_KEY_HEX, "container public key")?;
-    let signature_bytes = decode_exact::<64>(container_integrity::CONTAINER_SIGNATURE_HEX, "container signature")?;
-    let public_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|err| anyhow::anyhow!("invalid embedded container public key: {err}"))?;
+    let actual_hash = sha256_file(binary)?;
+    if !constant_time_eq(
+        actual_hash.as_bytes(),
+        container_integrity::EXPECTED_CONTAINER_SHA256.as_bytes(),
+    ) {
+        anyhow::bail!(
+            "container integrity check failed: SHA-256 mismatch (expected {}, got {})",
+            container_integrity::EXPECTED_CONTAINER_SHA256,
+            actual_hash
+        );
+    }
+
+    let public_key_bytes = decode_exact::<32>(
+        container_integrity::CONTAINER_PUBLIC_KEY_HEX,
+        "container public key",
+    )?;
+    let signature_bytes = decode_exact::<64>(
+        container_integrity::CONTAINER_SIGNATURE_HEX,
+        "container signature",
+    )?;
+    let public_key = VerifyingKey::from_bytes(&public_key_bytes)
+        .map_err(|err| anyhow::anyhow!("invalid embedded container public key: {err}"))?;
     let signature = Signature::from_bytes(&signature_bytes);
-    let statement = signing_statement(container_integrity::EXPECTED_CONTAINER_SHA256, container_integrity::CONTAINER_BUILD_ID, container_integrity::CONTAINER_TARGET);
-    public_key.verify(statement.as_bytes(), &signature).map_err(|err| anyhow::anyhow!("container signature verification failed: {err}"))?;
+    let statement = signing_statement(
+        container_integrity::EXPECTED_CONTAINER_SHA256,
+        container_integrity::CONTAINER_BUILD_ID,
+        container_integrity::CONTAINER_TARGET,
+    );
+    public_key
+        .verify(statement.as_bytes(), &signature)
+        .map_err(|err| anyhow::anyhow!("container signature verification failed: {err}"))?;
     Ok(())
 }
 
@@ -130,7 +178,9 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
-        if read == 0 { break; }
+        if read == 0 {
+            break;
+        }
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
@@ -138,15 +188,21 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 
 fn decode_exact<const N: usize>(hex_value: &str, label: &str) -> anyhow::Result<[u8; N]> {
     let bytes = hex::decode(hex_value).map_err(|err| anyhow::anyhow!("invalid {label}: {err}"))?;
-    bytes.try_into().map_err(|_| anyhow::anyhow!("invalid {label}: expected {} bytes", N))
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid {label}: expected {} bytes", N))
 }
 fn signing_statement(hash: &str, build_id: &str, target: &str) -> String {
     format!("RBE-CONTAINER-INTEGRITY-V1\nsha256={hash}\nbuild_id={build_id}\ntarget={target}\n")
 }
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() { return false; }
+    if left.len() != right.len() {
+        return false;
+    }
     let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) { diff |= a ^ b; }
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
     diff == 0
 }
 fn reserve_loopback_port() -> std::io::Result<u16> {
@@ -162,9 +218,16 @@ fn generate_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn reserves_loopback_port() { assert!(reserve_loopback_port().unwrap() > 0); }
-    #[test] fn token_has_256_bit_length() { assert_eq!(generate_token().len(), 64); }
-    #[test] fn constant_time_compare_works() {
+    #[test]
+    fn reserves_loopback_port() {
+        assert!(reserve_loopback_port().unwrap() > 0);
+    }
+    #[test]
+    fn token_has_256_bit_length() {
+        assert_eq!(generate_token().len(), 64);
+    }
+    #[test]
+    fn constant_time_compare_works() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));

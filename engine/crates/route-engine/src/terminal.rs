@@ -20,11 +20,17 @@ impl Terminal {
     }
 
     pub fn width(&self) -> usize {
-        terminal_size().map(|(width, _)| width).unwrap_or(80).clamp(40, 512)
+        terminal_size()
+            .map(|(width, _)| width)
+            .unwrap_or(80)
+            .clamp(40, 512)
     }
 
     pub fn height(&self) -> usize {
-        terminal_size().map(|(_, height)| height).unwrap_or(24).clamp(12, 256)
+        terminal_size()
+            .map(|(_, height)| height)
+            .unwrap_or(24)
+            .clamp(12, 256)
     }
 
     pub fn begin_boot(&self) {
@@ -66,7 +72,11 @@ impl Terminal {
         let filled = if total == 0 {
             0
         } else {
-            current.saturating_mul(bar_width).checked_div(total).unwrap_or(0).min(bar_width)
+            current
+                .saturating_mul(bar_width)
+                .checked_div(total)
+                .unwrap_or(0)
+                .min(bar_width)
         };
         let filled_bar = "█".repeat(filled);
         let empty_bar = "░".repeat(bar_width - filled);
@@ -95,9 +105,7 @@ impl Terminal {
             let used_lines = 6 + usize::from(current_file.is_some());
             let blank_lines = height.saturating_sub(used_lines + 1);
             output.push_str(&"\n".repeat(blank_lines));
-            output.push_str(&format!(
-                "[\x1b[36m{filled_bar}\x1b[90m{empty_bar}\x1b[0m]"
-            ));
+            output.push_str(&format!("[\x1b[36m{filled_bar}\x1b[90m{empty_bar}\x1b[0m]"));
             print!("{output}");
         } else {
             print!("\rRBE Route Compiler — {state} {counter}");
@@ -230,7 +238,10 @@ fn windows_console_size() -> Option<(usize, usize)> {
     type Dword = u32;
 
     #[repr(C)]
-    struct Coord { x: SmallInt, y: SmallInt }
+    struct Coord {
+        x: SmallInt,
+        y: SmallInt,
+    }
 
     #[repr(C)]
     struct SmallRect {
@@ -266,7 +277,12 @@ fn windows_console_size() -> Option<(usize, usize)> {
             size: Coord { x: 0, y: 0 },
             cursor: Coord { x: 0, y: 0 },
             attributes: 0,
-            window: SmallRect { left: 0, top: 0, right: 0, bottom: 0 },
+            window: SmallRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
             maximum_window_size: Coord { x: 0, y: 0 },
         };
         if GetConsoleScreenBufferInfo(handle, &mut info) == 0 {
@@ -284,7 +300,7 @@ mod tests {
     fn zero_work_starts_with_an_empty_bar() {
         let total = 0usize;
         let width = 30usize;
-        let filled = if total == 0 { 0 } else { 1usize.saturating_mul(width) / total };
+        let filled = 1usize.saturating_mul(width).checked_div(total).unwrap_or(0);
         assert_eq!(filled, 0);
     }
 
