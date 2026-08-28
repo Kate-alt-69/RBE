@@ -32,40 +32,9 @@ jobs:
 
           path = Path("src/lib.rs")
           source = path.read_text()
-
-          old = '''    fn lock_shared(&self) -> Result<Option<FileLock<'_>>> {
-              self.file.as_ref().map(FileLock::shared).transpose()
-          }
-
-          fn lock_exclusive(&self) -> Result<Option<FileLock<'_>>> {
-              self.file.as_ref().map(FileLock::exclusive).transpose()
-          }
-          }
-
-          struct FileLock<'a> {
-              file: &'a File,
-          }
-
-          impl<'a> FileLock<'a> {
-              fn shared(file: &'a File) -> Result<Self> {
-                  FileExt::lock_shared(file)?;
-                  Ok(Self { file })
-              }
-
-              fn exclusive(file: &'a File) -> Result<Self> {
-                  FileExt::lock_exclusive(file)?;
-                  Ok(Self { file })
-              }
-          }
-
-          impl Drop for FileLock<'_> {
-              fn drop(&mut self) {
-                  let _ = FileExt::unlock(self.file);
-              }
-          }
-          '''.replace('          ', '')
-
-          new = '''    fn lock_shared(&self) -> Result<Option<OwnedFileLock>> {
+          start = source.index("    fn lock_shared(&self)")
+          end = source.index("\nfn ensure_payload_len", start)
+          replacement = '''    fn lock_shared(&self) -> Result<Option<OwnedFileLock>> {
               self.file
                   .as_ref()
                   .map(OwnedFileLock::shared)
@@ -104,10 +73,7 @@ jobs:
               }
           }
           '''.replace('          ', '')
-
-          if old not in source:
-              raise SystemExit("file lock ownership anchor missing")
-          path.write_text(source.replace(old, new, 1))
+          path.write_text(source[:start] + replacement + source[end:])
           PY
 
           cargo fmt --all
@@ -118,7 +84,7 @@ jobs:
           python - <<'PY'
           import subprocess
           changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
-          allowed = {"group-memory/src/lib.rs"}
+          allowed = {"group-memory/src/lib.rs", "group-memory/Cargo.lock"}
           unexpected = changed - allowed
           if unexpected:
               raise SystemExit("unexpected group-memory paths: " + ", ".join(sorted(unexpected)))
@@ -127,7 +93,7 @@ jobs:
           if ! git diff --quiet; then
             git config user.name "Kate"
             git config user.email "dhwanksh2000@gmail.com"
-            git add -- src/lib.rs
+            git add -- src/lib.rs Cargo.lock
             git commit -m "fix: own group memory file lock handles"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
