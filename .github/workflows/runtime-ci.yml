@@ -30,13 +30,14 @@ jobs:
           path = Path("crates/security/src/timing.rs")
           source = path.read_text()
 
-          enum_block = '''enum ErrorAuditDecision {
+          if "struct RequestAudit<'a>" not in source:
+              enum_block = '''enum ErrorAuditDecision {
               Log { suppressed: u64 },
               Suppress,
               NotApplicable,
           }
           '''
-          typed_block = '''enum ErrorAuditDecision {
+              typed_block = '''enum ErrorAuditDecision {
               Log { suppressed: u64 },
               Suppress,
               NotApplicable,
@@ -69,60 +70,14 @@ jobs:
               suppressed: u64,
           }
           '''
+              if enum_block not in source:
+                  raise SystemExit("could not locate ErrorAuditDecision")
+              source = source.replace(enum_block, typed_block, 1)
 
-          old_calls = '''    match error_audit_decision(&client_ip.to_string(), method.as_str(), &path, status) {
-              ErrorAuditDecision::Suppress => {}
-              ErrorAuditDecision::Log { suppressed } => {
-                  write_request_audit(
-                      &config,
-                      &headers,
-                      response.headers(),
-                      &method.to_string(),
-                      &path,
-                      &query,
-                      peer,
-                      client_ip.to_string(),
-                      duration_ms,
-                      status,
-                      origin,
-                      preflight,
-                      request_cors_method,
-                      request_cors_headers,
-                      response_cors_origin,
-                      response_cors_methods,
-                      response_cors_headers,
-                      response_cors_credentials,
-                      cors_blocked,
-                      suppressed,
-                  );
-              }
-              ErrorAuditDecision::NotApplicable => {
-                  write_request_audit(
-                      &config,
-                      &headers,
-                      response.headers(),
-                      &method.to_string(),
-                      &path,
-                      &query,
-                      peer,
-                      client_ip.to_string(),
-                      duration_ms,
-                      status,
-                      origin,
-                      preflight,
-                      request_cors_method,
-                      request_cors_headers,
-                      response_cors_origin,
-                      response_cors_methods,
-                      response_cors_headers,
-                      response_cors_credentials,
-                      cors_blocked,
-                      0,
-                  );
-              }
-          }
-          '''
-          new_calls = '''    let client_ip = client_ip.to_string();
+          if "write_request_audit(RequestAudit {" not in source:
+              start = source.index("    match error_audit_decision(")
+              end = source.index("\n\n    if let Ok(value)", start)
+              new_calls = '''    let client_ip = client_ip.to_string();
               let suppressed = match error_audit_decision(&client_ip, method.as_str(), &path, status) {
                   ErrorAuditDecision::Suppress => None,
                   ErrorAuditDecision::Log { suppressed } => Some(suppressed),
@@ -153,33 +108,13 @@ jobs:
                       },
                       suppressed,
                   });
-              }
-          '''
+              }'''
+              source = source[:start] + new_calls + source[end:]
 
-          old_signature = '''fn write_request_audit(
-              config: &Config,
-              request_headers: &HeaderMap,
-              response_headers: &HeaderMap,
-              method: &str,
-              path: &str,
-              query: &str,
-              peer: SocketAddr,
-              client_ip: String,
-              duration_ms: f64,
-              status: u16,
-              origin: Option<String>,
-              preflight: bool,
-              request_cors_method: Option<String>,
-              request_cors_headers: Option<String>,
-              response_cors_origin: Option<String>,
-              response_cors_methods: Option<String>,
-              response_cors_headers: Option<String>,
-              response_cors_credentials: Option<String>,
-              cors_blocked: bool,
-              suppressed: u64,
-          ) {
-          '''
-          new_signature = '''fn write_request_audit(audit: RequestAudit<'_>) {
+          if "fn write_request_audit(audit: RequestAudit<'_>)" not in source:
+              start = source.index("fn write_request_audit(")
+              body = source.index("    let mut entry = Map::new();", start)
+              new_signature = '''fn write_request_audit(audit: RequestAudit<'_>) {
               let RequestAudit {
                   config,
                   request_headers,
@@ -206,22 +141,9 @@ jobs:
                   blocked: cors_blocked,
               } = cors;
           '''
+              source = source[:start] + new_signature + source[body:]
 
-          replacements = [
-              (enum_block, typed_block, "audit type insertion"),
-              (old_calls, new_calls, "audit call consolidation"),
-              (old_signature, new_signature, "audit writer signature"),
-          ]
-          changed = False
-          for old, new, label in replacements:
-              if old in source:
-                  source = source.replace(old, new, 1)
-                  changed = True
-              elif new not in source:
-                  raise SystemExit(f"could not locate {label}")
-
-          if changed:
-              path.write_text(source)
+          path.write_text(source)
           PY
           cargo fmt --all
           if ! git diff --quiet -- crates/security/src/timing.rs; then
