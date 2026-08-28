@@ -30,7 +30,8 @@ const ERROR_STATE_TTL: Duration = Duration::from_secs(60);
 const MAX_ERROR_BUCKETS: usize = 16_384;
 
 static REQUEST_AUDIT_IO: OnceLock<AtomicIo> = OnceLock::new();
-static ERROR_STATUS_STATE: OnceLock<Mutex<HashMap<ErrorStatusKey, ErrorStatusBucket>>> = OnceLock::new();
+static ERROR_STATUS_STATE: OnceLock<Mutex<HashMap<ErrorStatusKey, ErrorStatusBucket>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ErrorStatusKey {
@@ -52,6 +53,33 @@ enum ErrorAuditDecision {
     NotApplicable,
 }
 
+struct CorsAudit {
+    origin: Option<String>,
+    preflight: bool,
+    request_method: Option<String>,
+    request_headers: Option<String>,
+    response_origin: Option<String>,
+    response_methods: Option<String>,
+    response_headers: Option<String>,
+    response_credentials: Option<String>,
+    blocked: bool,
+}
+
+struct RequestAudit<'a> {
+    config: &'a Config,
+    request_headers: &'a HeaderMap,
+    response_headers: &'a HeaderMap,
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+    peer: SocketAddr,
+    client_ip: String,
+    duration_ms: f64,
+    status: u16,
+    cors: CorsAudit,
+    suppressed: u64,
+}
+
 pub async fn request_timing(
     State(config): State<std::sync::Arc<Config>>,
     request: Request,
@@ -70,11 +98,7 @@ pub async fn request_timing(
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
 
     let headers = request.headers().clone();
-    let client_ip = extract_real_ip(
-        &headers,
-        peer,
-        config.security.trusted_proxy_headers,
-    );
+    let client_ip = extract_real_ip(&headers, peer, config.security.trusted_proxy_headers);
 
     let origin = header(&headers, "origin");
     let preflight = method.as_str().eq_ignore_ascii_case("OPTIONS")
@@ -124,56 +148,37 @@ pub async fn request_timing(
         );
     }
 
-    match error_audit_decision(&client_ip.to_string(), method.as_str(), &path, status) {
-        ErrorAuditDecision::Suppress => {}
-        ErrorAuditDecision::Log { suppressed } => {
-            write_request_audit(
-                &config,
-                &headers,
-                response.headers(),
-                &method.to_string(),
-                &path,
-                &query,
-                peer,
-                client_ip.to_string(),
-                duration_ms,
-                status,
+    let client_ip = client_ip.to_string();
+    let suppressed = match error_audit_decision(&client_ip, method.as_str(), &path, status) {
+        ErrorAuditDecision::Suppress => None,
+        ErrorAuditDecision::Log { suppressed } => Some(suppressed),
+        ErrorAuditDecision::NotApplicable => Some(0),
+    };
+    if let Some(suppressed) = suppressed {
+        write_request_audit(RequestAudit {
+            config: config.as_ref(),
+            request_headers: &headers,
+            response_headers: response.headers(),
+            method: method.as_str(),
+            path: &path,
+            query: &query,
+            peer,
+            client_ip,
+            duration_ms,
+            status,
+            cors: CorsAudit {
                 origin,
                 preflight,
-                request_cors_method,
-                request_cors_headers,
-                response_cors_origin,
-                response_cors_methods,
-                response_cors_headers,
-                response_cors_credentials,
-                cors_blocked,
-                suppressed,
-            );
-        }
-        ErrorAuditDecision::NotApplicable => {
-            write_request_audit(
-                &config,
-                &headers,
-                response.headers(),
-                &method.to_string(),
-                &path,
-                &query,
-                peer,
-                client_ip.to_string(),
-                duration_ms,
-                status,
-                origin,
-                preflight,
-                request_cors_method,
-                request_cors_headers,
-                response_cors_origin,
-                response_cors_methods,
-                response_cors_headers,
-                response_cors_credentials,
-                cors_blocked,
-                0,
-            );
-        }
+                request_method: request_cors_method,
+                request_headers: request_cors_headers,
+                response_origin: response_cors_origin,
+                response_methods: response_cors_methods,
+                response_headers: response_cors_headers,
+                response_credentials: response_cors_credentials,
+                blocked: cors_blocked,
+            },
+            suppressed,
+        });
     }
 
     if let Ok(value) = HeaderValue::from_str(&format!("total;dur={duration_ms:.3}")) {
@@ -272,28 +277,32 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn write_request_audit(
-    config: &Config,
-    request_headers: &HeaderMap,
-    response_headers: &HeaderMap,
-    method: &str,
-    path: &str,
-    query: &str,
-    peer: SocketAddr,
-    client_ip: String,
-    duration_ms: f64,
-    status: u16,
-    origin: Option<String>,
-    preflight: bool,
-    request_cors_method: Option<String>,
-    request_cors_headers: Option<String>,
-    response_cors_origin: Option<String>,
-    response_cors_methods: Option<String>,
-    response_cors_headers: Option<String>,
-    response_cors_credentials: Option<String>,
-    cors_blocked: bool,
-    suppressed: u64,
-) {
+fn write_request_audit(audit: RequestAudit<'_>) {
+    let RequestAudit {
+        config,
+        request_headers,
+        response_headers,
+        method,
+        path,
+        query,
+        peer,
+        client_ip,
+        duration_ms,
+        status,
+        cors,
+        suppressed,
+    } = audit;
+    let CorsAudit {
+        origin,
+        preflight,
+        request_method: request_cors_method,
+        request_headers: request_cors_headers,
+        response_origin: response_cors_origin,
+        response_methods: response_cors_methods,
+        response_headers: response_cors_headers,
+        response_credentials: response_cors_credentials,
+        blocked: cors_blocked,
+    } = cors;
     let mut entry = Map::new();
     entry.insert("ts_ms".into(), json!(now_ms()));
     entry.insert("method".into(), json!(method));
@@ -334,9 +343,10 @@ fn write_request_audit(
                 json!(suppression_window.as_millis() as u64),
             );
         } else {
-            entry.insert("kind".into(), json!(
-                if status >= 500 { "5xx" } else { "4xx" }
-            ));
+            entry.insert(
+                "kind".into(),
+                json!(if status >= 500 { "5xx" } else { "4xx" }),
+            );
         }
 
         // Error-status records intentionally stay compact. No raw request
