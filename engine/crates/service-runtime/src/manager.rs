@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -133,15 +133,13 @@ impl ServiceManager {
         for file in catalog.services() {
             let managed = match file.mode {
                 ServiceMode::OnDemand => Managed::dormant(file.clone()),
-                ServiceMode::Resident | ServiceMode::Hybrid => {
-                    match spawn_process(file).await {
-                        Ok(process) => Managed::running(file.clone(), process),
-                        Err(error) => {
-                            manager.shutdown_all().await;
-                            return Err(error);
-                        }
+                ServiceMode::Resident | ServiceMode::Hybrid => match spawn_process(file).await {
+                    Ok(process) => Managed::running(file.clone(), process),
+                    Err(error) => {
+                        manager.shutdown_all().await;
+                        return Err(error);
                     }
-                }
+                },
             };
             manager
                 .services
@@ -354,12 +352,13 @@ impl ServiceManager {
         let (address, token) = {
             let mut service = handle.lock().await;
             self.activate_for_call(&mut service).await?;
-            let process = service
-                .process
-                .as_ref()
-                .ok_or_else(|| ServiceCallError::Unavailable {
-                    service: service_name.to_string(),
-                })?;
+            let process =
+                service
+                    .process
+                    .as_ref()
+                    .ok_or_else(|| ServiceCallError::Unavailable {
+                        service: service_name.to_string(),
+                    })?;
             let address = process.ready.address;
             let token = process.token.clone();
             service.active_calls = service.active_calls.saturating_add(1);
@@ -454,20 +453,19 @@ impl ServiceManager {
         let mut out = Vec::new();
         for handle in handles {
             let mut service = handle.lock().await;
+            let restarting = service.restarting;
+            let wakeable = service.wakeable();
+            let exit_observed = service.exit_observed;
+            let restart = service.file.restart;
             let (pid, state) = match service.process.as_mut() {
-                None if service.restarting => (None, ServiceRuntimeState::Restarting),
-                None if service.wakeable() && !service.exit_observed => {
-                    (None, ServiceRuntimeState::Dormant)
-                }
+                None if restarting => (None, ServiceRuntimeState::Restarting),
+                None if wakeable && !exit_observed => (None, ServiceRuntimeState::Dormant),
                 None => (None, ServiceRuntimeState::Stopped),
                 Some(process) => match process.child.try_wait() {
                     Ok(None) => (process.child.id(), ServiceRuntimeState::Running),
-                    Ok(Some(status)) if service.restarting => {
-                        (None, ServiceRuntimeState::Restarting)
-                    }
+                    Ok(Some(_)) if restarting => (None, ServiceRuntimeState::Restarting),
                     Ok(Some(status))
-                        if service.exit_observed
-                            || !should_restart(service.file.restart, status.success()) =>
+                        if exit_observed || !should_restart(restart, status.success()) =>
                     {
                         (None, ServiceRuntimeState::Stopped)
                     }
@@ -674,7 +672,7 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
     })
 }
 
-async fn cleanup_failed_spawn(alias: &PathBuf, child: &mut Child) {
+async fn cleanup_failed_spawn(alias: &Path, child: &mut Child) {
     let _ = child.kill().await;
     let _ = child.wait().await;
     let _ = std::fs::remove_file(alias);

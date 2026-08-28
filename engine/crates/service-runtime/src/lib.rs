@@ -6,19 +6,15 @@ use std::io::{IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
 
-use anyhow::Context;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock as AsyncRwLock};
+use tokio::net::TcpListener;
+
+mod manager;
+pub use manager::{ServiceCallError, ServiceManager, ServiceRuntimeState, ServiceSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -29,14 +25,25 @@ pub enum RestartPolicy {
     Never,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceMode {
+    #[default]
+    Resident,
+    OnDemand,
+    Hybrid,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceFile {
     pub path: PathBuf,
     pub name: String,
     pub title: String,
+    pub mode: ServiceMode,
     pub restart: RestartPolicy,
     pub memory_limit_mb: u64,
     pub startup_timeout_ms: u64,
+    pub idle_timeout_ms: u64,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
 }
@@ -230,6 +237,26 @@ fn parse_service(
         .get("title")
         .map(|value| unquote(value))
         .unwrap_or_else(|| name.clone());
+    let mode = match fields
+        .get("mode")
+        .map(|value| unquote(value).to_ascii_lowercase())
+    {
+        None => ServiceMode::Resident,
+        Some(value) if value == "resident" => ServiceMode::Resident,
+        Some(value) if matches!(value.as_str(), "on-demand" | "on_demand" | "ondemand") => {
+            ServiceMode::OnDemand
+        }
+        Some(value) if value == "hybrid" => ServiceMode::Hybrid,
+        Some(value) => {
+            return Err(compile_error(
+                "SVC1010",
+                path,
+                line,
+                format!("invalid service mode {value:?}"),
+            ));
+        }
+    };
+
     let restart = match fields
         .get("restart")
         .map(|value| unquote(value).to_ascii_lowercase())
@@ -261,6 +288,16 @@ fn parse_service(
             }),
         }
     };
+
+    let idle_timeout_ms = number("idleTimeoutMs", 300_000)?;
+    if mode != ServiceMode::Resident && idle_timeout_ms == 0 {
+        return Err(compile_error(
+            "SVC1011",
+            path,
+            line,
+            "idleTimeoutMs must be greater than zero for on-demand and hybrid services".into(),
+        ));
+    }
 
     let mut imports = Vec::new();
     let mut cursor = 0;
@@ -301,9 +338,11 @@ fn parse_service(
         path: path.to_path_buf(),
         name,
         title,
+        mode,
         restart,
         memory_limit_mb: number("memoryLimitMb", defaults.memory_limit_mb)?,
         startup_timeout_ms: number("startupTimeoutMs", defaults.startup_timeout_ms)?,
+        idle_timeout_ms,
         imports,
         exports,
     })
@@ -527,462 +566,6 @@ impl ServiceExecutor for AddressableOnlyExecutor {
     }
 }
 
-const RESTART_BASE_DELAY_MS: u64 = 250;
-const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
-
-struct Managed {
-    file: ServiceFile,
-    child: Child,
-    alias: PathBuf,
-    ready: ServiceReady,
-    token: String,
-    started_at: Instant,
-    restart_attempts: u32,
-    exit_observed: bool,
-}
-
-#[derive(Clone, Default)]
-pub struct ServiceManager {
-    services: Arc<AsyncRwLock<HashMap<String, Arc<Mutex<Managed>>>>>,
-    shutting_down: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceRuntimeState {
-    Running,
-    Restarting,
-    Stopped,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServiceSnapshot {
-    pub name: String,
-    pub title: String,
-    pub pid: Option<u32>,
-    pub state: ServiceRuntimeState,
-    pub restart: RestartPolicy,
-    pub restart_attempts: u32,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ServiceCallError {
-    #[error("unknown service {service:?}")]
-    Unknown { service: String },
-    #[error("service {service:?} is unavailable")]
-    Unavailable { service: String },
-    #[error("failed to inspect service {service:?}: {message}")]
-    Inspect { service: String, message: String },
-    #[error("service {service:?} IPC failed: {message}")]
-    Ipc { service: String, message: String },
-    #[error("service {service:?} returned {code}: {message}")]
-    Remote {
-        service: String,
-        code: String,
-        message: String,
-    },
-}
-
-impl ServiceManager {
-    pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
-        let manager = Self::default();
-        for file in catalog.services() {
-            let managed = spawn(file.clone()).await?;
-            manager
-                .services
-                .write()
-                .await
-                .insert(file.name.clone(), Arc::new(Mutex::new(managed)));
-        }
-        if !catalog.services().is_empty() {
-            manager.start_monitor(
-                Duration::from_millis(catalog.monitor_interval_ms.max(50)),
-                Duration::from_millis(catalog.max_restart_backoff_ms.max(RESTART_BASE_DELAY_MS)),
-            );
-        }
-        Ok(manager)
-    }
-
-    fn start_monitor(&self, interval: Duration, max_restart_backoff: Duration) {
-        let manager = self.clone();
-        tokio::spawn(async move {
-            let handles = manager
-                .services
-                .read()
-                .await
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            for handle in handles {
-                let manager = manager.clone();
-                tokio::spawn(async move {
-                    manager
-                        .monitor_service(handle, interval, max_restart_backoff)
-                        .await;
-                });
-            }
-        });
-    }
-
-    async fn monitor_service(
-        &self,
-        handle: Arc<Mutex<Managed>>,
-        interval: Duration,
-        max_restart_backoff: Duration,
-    ) {
-        loop {
-            tokio::time::sleep(interval).await;
-            if self.shutting_down.load(Ordering::Acquire) {
-                return;
-            }
-
-            let mut service = handle.lock().await;
-            let status = match service.child.try_wait() {
-                Ok(Some(status)) => status,
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::warn!(
-                        service = %service.file.name,
-                        error = %error,
-                        "failed to inspect .service child status"
-                    );
-                    continue;
-                }
-            };
-
-            if service.exit_observed {
-                return;
-            }
-
-            if !should_restart(service.file.restart, status.success()) {
-                service.exit_observed = true;
-                tracing::warn!(
-                    service = %service.file.name,
-                    pid = service.ready.pid,
-                    %status,
-                    restart = ?service.file.restart,
-                    "service process exited and restart policy leaves it stopped"
-                );
-                return;
-            }
-
-            if service.started_at.elapsed() >= SERVICE_STABLE_WINDOW {
-                service.restart_attempts = 0;
-            }
-            service.restart_attempts = service.restart_attempts.saturating_add(1);
-            let attempt = service.restart_attempts;
-            let delay = restart_delay(attempt, max_restart_backoff);
-            let file = service.file.clone();
-            let old_pid = service.ready.pid;
-            service.started_at = Instant::now();
-            tracing::warn!(
-                service = %file.name,
-                pid = old_pid,
-                %status,
-                attempt,
-                backoff_ms = delay.as_millis() as u64,
-                "service process exited; scheduling restart"
-            );
-            drop(service);
-
-            tokio::time::sleep(delay).await;
-            if self.shutting_down.load(Ordering::Acquire) {
-                return;
-            }
-
-            match spawn(file.clone()).await {
-                Ok(mut replacement) => {
-                    replacement.restart_attempts = attempt;
-                    let new_pid = replacement.ready.pid;
-                    let mut service = handle.lock().await;
-                    if self.shutting_down.load(Ordering::Acquire) {
-                        drop(service);
-                        stop_managed(&mut replacement).await;
-                        return;
-                    }
-                    *service = replacement;
-                    tracing::info!(
-                        service = %file.name,
-                        old_pid,
-                        new_pid,
-                        attempt,
-                        "service process restarted"
-                    );
-                }
-                Err(error) => {
-                    let mut service = handle.lock().await;
-                    if self.shutting_down.load(Ordering::Acquire) {
-                        return;
-                    }
-                    service.restart_attempts = attempt;
-                    service.started_at = Instant::now();
-                    tracing::error!(
-                        service = %file.name,
-                        attempt,
-                        error = %error,
-                        "service restart attempt failed"
-                    );
-                }
-            }
-        }
-    }
-
-    pub async fn call(
-        &self,
-        service_name: &str,
-        function: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, ServiceCallError> {
-        if self.shutting_down.load(Ordering::Acquire) {
-            return Err(ServiceCallError::Unavailable {
-                service: service_name.to_string(),
-            });
-        }
-
-        let handle = self
-            .services
-            .read()
-            .await
-            .get(service_name)
-            .cloned()
-            .ok_or_else(|| ServiceCallError::Unknown {
-                service: service_name.to_string(),
-            })?;
-
-        let (address, token) = {
-            let mut service = handle.lock().await;
-            match service.child.try_wait() {
-                Ok(None) => (service.ready.address, service.token.clone()),
-                Ok(Some(_)) => {
-                    return Err(ServiceCallError::Unavailable {
-                        service: service_name.to_string(),
-                    });
-                }
-                Err(error) => {
-                    return Err(ServiceCallError::Inspect {
-                        service: service_name.to_string(),
-                        message: error.to_string(),
-                    });
-                }
-            }
-        };
-
-        let response = rpc(
-            address,
-            ServiceRequest::Call {
-                token,
-                function: function.to_string(),
-                args,
-            },
-        )
-        .await
-        .map_err(|error| ServiceCallError::Ipc {
-            service: service_name.to_string(),
-            message: error.to_string(),
-        })?;
-
-        map_call_response(service_name, response)
-    }
-
-    pub async fn snapshot(&self) -> Vec<ServiceSnapshot> {
-        let handles = self
-            .services
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut out = Vec::new();
-        for handle in handles {
-            let mut service = handle.lock().await;
-            let (pid, state) = match service.child.try_wait() {
-                Ok(None) => (service.child.id(), ServiceRuntimeState::Running),
-                Ok(Some(status))
-                    if service.exit_observed
-                        || !should_restart(service.file.restart, status.success()) =>
-                {
-                    (None, ServiceRuntimeState::Stopped)
-                }
-                Ok(Some(_)) => (None, ServiceRuntimeState::Restarting),
-                Err(_) => (None, ServiceRuntimeState::Unknown),
-            };
-            out.push(ServiceSnapshot {
-                name: service.file.name.clone(),
-                title: service.file.title.clone(),
-                pid,
-                state,
-                restart: service.file.restart,
-                restart_attempts: service.restart_attempts,
-            });
-        }
-        out.sort_by(|left, right| left.name.cmp(&right.name));
-        out
-    }
-
-    pub async fn shutdown_all(&self) {
-        self.shutting_down.store(true, Ordering::Release);
-        let handles = self
-            .services
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for handle in handles {
-            let mut service = handle.lock().await;
-            stop_managed(&mut service).await;
-        }
-    }
-}
-
-fn map_call_response(
-    service_name: &str,
-    response: ServiceResponse,
-) -> Result<Value, ServiceCallError> {
-    match response {
-        ServiceResponse::Ok { value } => Ok(value),
-        ServiceResponse::Error { code, message } => Err(ServiceCallError::Remote {
-            service: service_name.to_string(),
-            code,
-            message,
-        }),
-    }
-}
-
-fn should_restart(policy: RestartPolicy, success: bool) -> bool {
-    match policy {
-        RestartPolicy::Always => true,
-        RestartPolicy::OnFailure => !success,
-        RestartPolicy::Never => false,
-    }
-}
-
-fn restart_delay(attempt: u32, maximum: Duration) -> Duration {
-    let exponent = attempt.saturating_sub(1).min(16);
-    let factor = 1u32 << exponent;
-    Duration::from_millis(RESTART_BASE_DELAY_MS)
-        .saturating_mul(factor)
-        .min(maximum)
-}
-
-async fn stop_managed(service: &mut Managed) {
-    let _ = rpc(
-        service.ready.address,
-        ServiceRequest::Shutdown {
-            token: service.token.clone(),
-        },
-    )
-    .await;
-    match tokio::time::timeout(Duration::from_secs(3), service.child.wait()).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => tracing::warn!(
-            service = %service.file.name,
-            error = %error,
-            "failed while waiting for service shutdown"
-        ),
-        Err(_) => {
-            let _ = service.child.kill().await;
-            let _ = service.child.wait().await;
-        }
-    }
-    let _ = std::fs::remove_file(&service.alias);
-}
-
-async fn spawn(file: ServiceFile) -> anyhow::Result<Managed> {
-    let exe = std::env::current_exe().context("resolve backend executable")?;
-    let parent = exe.parent().context("backend executable has no parent")?;
-    let dir = parent.join(".runtime/process");
-    std::fs::create_dir_all(&dir)?;
-    let extension = exe
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| format!(".{value}"))
-        .unwrap_or_default();
-    let alias = dir.join(format!(
-        "rbe-service-{}-parent-{}{}",
-        process_name(&file.name),
-        std::process::id(),
-        extension
-    ));
-    let _ = std::fs::remove_file(&alias);
-    if std::fs::hard_link(&exe, &alias).is_err() {
-        std::fs::copy(&exe, &alias)?;
-    }
-
-    let token = random_token();
-    let mut child = Command::new(&alias)
-        .args(["--service-host", "--service-file"])
-        .arg(&file.path)
-        .arg("--service-token")
-        .arg(&token)
-        .current_dir(parent)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()?;
-    let stdout = child.stdout.take().context("service stdout unavailable")?;
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    let bytes = tokio::time::timeout(
-        Duration::from_millis(file.startup_timeout_ms.max(1)),
-        reader.read_line(&mut line),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("service {:?} startup timeout", file.name))??;
-    if bytes == 0 {
-        anyhow::bail!("service {:?} exited before readiness", file.name);
-    }
-    let ready: ServiceReady = serde_json::from_str(line.trim())?;
-    if ready.service != file.name {
-        anyhow::bail!("service readiness identity mismatch");
-    }
-    Ok(Managed {
-        file,
-        child,
-        alias,
-        ready,
-        token,
-        started_at: Instant::now(),
-        restart_attempts: 0,
-        exit_observed: false,
-    })
-}
-
-fn process_name(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
-fn random_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<ServiceResponse> {
-    let stream = TcpStream::connect(address).await?;
-    let (read, mut write) = stream.into_split();
-    write
-        .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
-        .await?;
-    write.shutdown().await?;
-    let mut reader = BufReader::new(read);
-    let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-        .await
-        .map_err(|_| anyhow::anyhow!("service IPC timeout"))??;
-    Ok(serde_json::from_str(line.trim())?)
-}
-
 pub async fn run_service_host(
     path: PathBuf,
     token: String,
@@ -1142,6 +725,17 @@ pub fn pause_for_interactive_exit() {
 mod tests {
     use super::*;
 
+    fn test_service_path(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rbe-service-runtime-{name}-{}-{nonce}.service",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn memory_round_trip() {
         let memory = ServiceMemory::default();
@@ -1150,158 +744,36 @@ mod tests {
     }
 
     #[test]
-    fn restart_policy_distinguishes_clean_and_failed_exits() {
-        assert!(should_restart(RestartPolicy::Always, true));
-        assert!(should_restart(RestartPolicy::Always, false));
-        assert!(!should_restart(RestartPolicy::OnFailure, true));
-        assert!(should_restart(RestartPolicy::OnFailure, false));
-        assert!(!should_restart(RestartPolicy::Never, false));
-    }
-
-    #[test]
-    fn restart_backoff_is_exponential_and_capped() {
-        let maximum = Duration::from_secs(30);
-        assert_eq!(restart_delay(1, maximum), Duration::from_millis(250));
-        assert_eq!(restart_delay(2, maximum), Duration::from_millis(500));
-        assert_eq!(restart_delay(3, maximum), Duration::from_millis(1_000));
-        assert_eq!(restart_delay(32, maximum), maximum);
-    }
-
-    #[tokio::test]
-    async fn unknown_service_call_is_typed() {
-        let error = ServiceManager::default()
-            .call("missing", "get", Vec::new())
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ServiceCallError::Unknown { service } if service == "missing"
-        ));
-    }
-
-    #[test]
-    fn call_response_maps_success_and_remote_error() {
-        assert_eq!(
-            map_call_response(
-                "cache",
-                ServiceResponse::Ok {
-                    value: serde_json::json!(7),
-                },
-            )
-            .unwrap(),
-            serde_json::json!(7)
-        );
-
-        let error = map_call_response(
-            "cache",
-            ServiceResponse::Error {
-                code: "SVC4100".into(),
-                message: "pending evaluator".into(),
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ServiceCallError::Remote { service, code, message }
-                if service == "cache"
-                    && code == "SVC4100"
-                    && message == "pending evaluator"
-        ));
-    }
-
-    struct EchoExecutor;
-
-    impl ServiceExecutor for EchoExecutor {
-        fn call<'a>(&'a self, function: &'a str, args: Vec<Value>) -> ServiceExecutionFuture<'a> {
-            Box::pin(async move {
-                if function == "echo" {
-                    Ok(args.into_iter().next().unwrap_or(Value::Null))
-                } else {
-                    Err(ServiceExecutionError::new(
-                        "TEST",
-                        format!("unexpected function {function}"),
-                    ))
-                }
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn dispatch_delegates_exported_calls_to_executor() {
-        let file = ServiceFile {
-            path: PathBuf::from("echo.service"),
-            name: "echo".into(),
-            title: "echo".into(),
-            restart: RestartPolicy::Never,
-            memory_limit_mb: 0,
-            startup_timeout_ms: 1000,
-            imports: Vec::new(),
-            exports: vec!["echo".into()],
-        };
-        let memory = ServiceMemory::default();
-        let (response, shutdown) = dispatch(
-            ServiceRequest::Call {
-                token: "token".into(),
-                function: "echo".into(),
-                args: vec![serde_json::json!({"ok": true})],
-            },
-            &file,
-            "token",
-            &memory,
-            &EchoExecutor,
-        )
-        .await;
-        assert!(!shutdown);
-        assert!(matches!(
-            response,
-            ServiceResponse::Ok { value } if value == serde_json::json!({"ok": true})
-        ));
-    }
-
-    fn temp_service_path(label: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "rbe-service-{label}-{}-{nonce}.service",
-            std::process::id()
-        ))
-    }
-
-    #[test]
-    fn metadata_accepts_async_exports() {
-        let path = temp_service_path("async-export");
+    fn parses_hybrid_and_on_demand_modes() {
+        let hybrid_path = test_service_path("hybrid");
         std::fs::write(
-            &path,
-            ":service[name = worker, instances = 1]\nexport async function fetch(value) { return value; }",
+            &hybrid_path,
+            ":service[name = cache, mode = hybrid, idleTimeoutMs = 1234]\nexport function get() {}",
         )
         .unwrap();
-        let file = parse_service(&path, ServiceDefaults::default()).unwrap();
-        assert_eq!(file.exports, vec!["fetch"]);
-        let _ = std::fs::remove_file(path);
-    }
+        let hybrid = parse_service(&hybrid_path, ServiceDefaults::default()).unwrap();
+        assert_eq!(hybrid.mode, ServiceMode::Hybrid);
+        assert_eq!(hybrid.idle_timeout_ms, 1234);
+        let _ = std::fs::remove_file(&hybrid_path);
 
-    #[test]
-    fn metadata_rejects_multiple_instances_until_supported() {
-        let path = temp_service_path("instances");
+        let demand_path = test_service_path("demand");
         std::fs::write(
-            &path,
-            ":service[name = worker, instances = 2]\nexport function run() { return true; }",
+            &demand_path,
+            ":service[name = lazy, mode = on-demand]\nexport function get() {}",
         )
         .unwrap();
-        let error = parse_service(&path, ServiceDefaults::default()).unwrap_err();
-        assert_eq!(error.code, "SVC1009");
-        let _ = std::fs::remove_file(path);
+        let demand = parse_service(&demand_path, ServiceDefaults::default()).unwrap();
+        assert_eq!(demand.mode, ServiceMode::OnDemand);
+        assert_eq!(demand.idle_timeout_ms, 300_000);
+        let _ = std::fs::remove_file(&demand_path);
     }
 
     #[test]
-    fn cloned_memory_shares_backing_store() {
-        let memory = ServiceMemory::default();
-        let clone = memory.clone();
-        memory.set("shared".into(), serde_json::json!({"ok": true}));
-        assert_eq!(clone.get("shared"), Some(serde_json::json!({"ok": true})));
-        clone.delete("shared");
-        assert!(memory.get("shared").is_none());
+    fn resident_is_the_compatibility_default() {
+        let path = test_service_path("resident");
+        std::fs::write(&path, ":service[name = existing]\nexport function run() {}").unwrap();
+        let service = parse_service(&path, ServiceDefaults::default()).unwrap();
+        assert_eq!(service.mode, ServiceMode::Resident);
+        let _ = std::fs::remove_file(path);
     }
 }
