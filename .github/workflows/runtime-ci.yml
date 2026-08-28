@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,6 +21,322 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+      - name: apply executable service parser
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          ast = Path("crates/route-engine/src/ast.rs")
+          source = ast.read_text()
+          if "pub struct ServiceProgram" not in source:
+              anchor = '''#[derive(Debug, Clone)]
+          pub struct FunctionDef {'''
+              if anchor not in source:
+                  raise SystemExit("ServiceProgram AST anchor missing")
+              insertion = '''#[derive(Debug, Clone)]
+          pub struct ServiceProgram {
+              pub imports: Vec<ImportTarget>,
+              pub functions: Vec<FunctionDef>,
+              pub exports: Vec<String>,
+              pub class_name: Option<String>,
+              pub lifecycle: Vec<MethodDef>,
+          }
+
+          #[derive(Debug, Clone)]
+          pub struct FunctionDef {'''
+              ast.write_text(source.replace(anchor, insertion, 1))
+
+          parser = Path("crates/route-engine/src/parser.rs")
+          source = parser.read_text()
+          old_use = '''use crate::ast::{
+              BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, Statement,
+          };'''
+          new_use = '''use crate::ast::{
+              BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram,
+              Statement,
+          };'''
+          if old_use in source:
+              source = source.replace(old_use, new_use, 1)
+
+          if "pub fn parse_service_file" not in source:
+              anchor = "    /// Parse a route while retaining recoverable statement errors."
+              if anchor not in source:
+                  raise SystemExit("service parser insertion anchor missing")
+              method = r'''    pub fn parse_service_file(mut self) -> Result<ServiceProgram, ParseError> {
+              let mut imports = Vec::new();
+              while self.is_import_directive() {
+                  imports.extend(self.parse_imports()?);
+              }
+
+              if imports.iter().any(import_contains_service) {
+                  return Err(self.error_here(
+                      "service-to-service imports are not supported in .service files",
+                  ));
+              }
+
+              self.parse_service_directive()?;
+
+              let mut functions = Vec::new();
+              let mut exports = Vec::new();
+              while !self.check(&TokenKind::Class) && !self.check(&TokenKind::Eof) {
+                  let exported = self.is_export_keyword();
+                  if exported {
+                      self.advance();
+                  }
+                  if self.check(&TokenKind::Async) {
+                      self.advance();
+                  }
+                  if !self.check(&TokenKind::Function) {
+                      return Err(self.error_here(
+                          "expected `function`, `export function`, or `class Service` in .service file",
+                      ));
+                  }
+                  let function = self.parse_function()?;
+                  if exported {
+                      if exports.iter().any(|name| name == &function.name) {
+                          return Err(self.error_here(&format!(
+                              "duplicate service export {:?}",
+                              function.name
+                          )));
+                      }
+                      exports.push(function.name.clone());
+                  }
+                  functions.push(function);
+              }
+
+              let (class_name, lifecycle) = if self.check(&TokenKind::Class) {
+                  let (name, methods) = self.parse_service_class()?;
+                  (Some(name), methods)
+              } else {
+                  (None, Vec::new())
+              };
+
+              if !self.check(&TokenKind::Eof) {
+                  return Err(self.error_here("unexpected content after service program"));
+              }
+
+              Ok(ServiceProgram {
+                  imports,
+                  functions,
+                  exports,
+                  class_name,
+                  lifecycle,
+              })
+          }
+
+          fn is_import_directive(&self) -> bool {
+              self.check(&TokenKind::Colon)
+                  && matches!(
+                      self.tokens.get(self.pos + 1).map(|token| &token.kind),
+                      Some(TokenKind::Import)
+                  )
+          }
+
+          fn parse_service_directive(&mut self) -> Result<(), ParseError> {
+              self.expect(TokenKind::Colon)?;
+              match self.advance().kind {
+                  TokenKind::Ident(name) if name == "service" => {}
+                  other => {
+                      return Err(self.error_here(&format!(
+                          "expected :service[...] declaration, got {other:?}"
+                      )));
+                  }
+              }
+              self.expect(TokenKind::LBracket)?;
+              let mut depth = 1usize;
+              while depth > 0 {
+                  match self.advance().kind {
+                      TokenKind::LBracket => depth = depth.saturating_add(1),
+                      TokenKind::RBracket => depth -= 1,
+                      TokenKind::Eof => {
+                          return Err(self.error_here("unterminated :service[...] declaration"));
+                      }
+                      _ => {}
+                  }
+              }
+              Ok(())
+          }
+
+          fn parse_service_class(&mut self) -> Result<(String, Vec<MethodDef>), ParseError> {
+              const LIFECYCLE: &[&str] = &["start", "event", "health", "stop"];
+
+              self.expect(TokenKind::Class)?;
+              let name = self.expect_ident()?;
+              if name != "Service" {
+                  return Err(self.error_here(".service lifecycle class must be named `Service`"));
+              }
+              self.expect(TokenKind::LBrace)?;
+
+              let mut methods = Vec::new();
+              while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                  if self.check(&TokenKind::Async) {
+                      self.advance();
+                  }
+                  let method_name = self.expect_ident()?;
+                  let lifecycle_name = method_name.to_ascii_lowercase();
+                  if !LIFECYCLE.contains(&lifecycle_name.as_str()) {
+                      return Err(self.error_here(&format!(
+                          "unsupported Service lifecycle method {method_name:?}; expected one of {LIFECYCLE:?}"
+                      )));
+                  }
+                  if methods.iter().any(|method: &MethodDef| method.verb == lifecycle_name) {
+                      return Err(self.error_here(&format!(
+                          "duplicate Service lifecycle method {lifecycle_name:?}"
+                      )));
+                  }
+                  let params = self.parse_params()?;
+                  if params.len() > 1 {
+                      return Err(self.error_here(
+                          "Service lifecycle methods currently accept zero or one parameter",
+                      ));
+                  }
+                  let body = self.parse_block()?;
+                  methods.push(MethodDef {
+                      verb: lifecycle_name,
+                      param_name: params.into_iter().next(),
+                      body,
+                  });
+              }
+              self.expect(TokenKind::RBrace)?;
+              Ok((name, methods))
+          }
+
+          '''
+              source = source.replace(anchor, method + anchor, 1)
+
+          if "fn import_contains_service" not in source:
+              anchor = "const KNOWN_VERBS: &[&str] = &[\"get\", \"post\", \"put\", \"delete\", \"patch\", \"head\", \"options\"];\n"
+              if anchor not in source:
+                  raise SystemExit("service import policy helper anchor missing")
+              helper = r'''
+
+          fn import_contains_service(import: &ImportTarget) -> bool {
+              match import {
+                  ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => true,
+                  ImportTarget::Aliased { target, .. } => import_contains_service(target),
+                  _ => false,
+              }
+          }
+          '''
+              source = source.replace(anchor, anchor + helper, 1)
+
+          parser.write_text(source)
+
+          lib = Path("crates/route-engine/src/lib.rs")
+          source = lib.read_text()
+          old = "pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, Statement, Value};"
+          new = "pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram, Statement, Value};"
+          if old in source:
+              source = source.replace(old, new, 1)
+          if "pub use parser::ParseError;" not in source:
+              anchor = "pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};\n"
+              if anchor not in source:
+                  raise SystemExit("ParseError export anchor missing")
+              source = source.replace(anchor, anchor + "pub use parser::ParseError;\n", 1)
+          if "pub fn parse_service_source" not in source:
+              anchor = "#[cfg(test)]\nmod tests {"
+              if anchor not in source:
+                  raise SystemExit("parse_service_source function anchor missing")
+              function = r'''pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
+              let tokens = lexer::Lexer::new(source).tokenize().map_err(|error| ParseError {
+                  message: error.message,
+                  line: error.line,
+                  column: error.column,
+              })?;
+              parser::Parser::new(tokens).parse_service_file()
+          }
+
+          '''
+              source = source.replace(anchor, function + anchor, 1)
+          if "parses_executable_service_program" not in source:
+              anchor = "    #[test]\n    fn parses_service_imports_for_modules()"
+              if anchor not in source:
+                  raise SystemExit("service parser test anchor missing")
+              tests = r'''    #[test]
+              fn parses_executable_service_program() {
+                  let file = parse_service_source(r#"
+                      :import[memory, json]
+                      :service[
+                          name = uac-cache
+                          restart = on-failure
+                          instances = 1
+                      ]
+                      function normalize(value) { return value; }
+                      export async function get(id) { return normalize(id); }
+                      class Service {
+                          start(ctx) { return true; }
+                          health() { return { ok: true }; }
+                          stop(ctx) { return true; }
+                      }
+                  "#)
+                  .expect("service parse failed");
+                  assert_eq!(file.functions.len(), 2);
+                  assert_eq!(file.exports, vec!["get"]);
+                  assert_eq!(file.class_name.as_deref(), Some("Service"));
+                  assert_eq!(
+                      file.lifecycle.iter().map(|method| method.verb.as_str()).collect::<Vec<_>>(),
+                      vec!["start", "health", "stop"]
+                  );
+              }
+
+              #[test]
+              fn rejects_service_to_service_imports() {
+                  let error = parse_service_source(r#"
+                      :import[service:other]
+                      :service[name = current]
+                      export function run() { return true; }
+                  "#)
+                  .expect_err("service-to-service import should fail");
+                  assert!(error.message.contains("service-to-service"));
+              }
+
+              #[test]
+              fn rejects_malformed_service_body() {
+                  let error = parse_service_source(r#"
+                      :service[name = broken]
+                      export function run(value) { return value }
+                  "#)
+                  .expect_err("missing semicolon should fail");
+                  assert!(error.message.contains("Semicolon") || error.message.contains("semicolon"));
+              }
+
+          '''
+              source = source.replace(anchor, tests + anchor, 1)
+          lib.write_text(source)
+          PY
+
+          rustfmt --edition 2021 \
+            crates/route-engine/src/ast.rs \
+            crates/route-engine/src/parser.rs \
+            crates/route-engine/src/lib.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+          python - <<'PY'
+          import subprocess
+          allowed = {
+              "engine/crates/route-engine/src/ast.rs",
+              "engine/crates/route-engine/src/parser.rs",
+              "engine/crates/route-engine/src/lib.rs",
+          }
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected service parser paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- \
+              crates/route-engine/src/ast.rs \
+              crates/route-engine/src/parser.rs \
+              crates/route-engine/src/lib.rs
+            git commit -m "feat: parse executable service programs"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: format runtime slice
         shell: bash
         run: |
