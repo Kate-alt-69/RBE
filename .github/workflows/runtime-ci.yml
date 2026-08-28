@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,6 +21,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+      - name: format video manager source
+        shell: bash
+        run: |
+          rustfmt --edition 2021 crates/video-manager/src/lib.rs
+          python - <<'PY'
+          import subprocess
+          changed = [
+              line.strip()
+              for line in subprocess.check_output(
+                  ["git", "diff", "--name-only"], text=True
+              ).splitlines()
+              if line.strip()
+          ]
+          if changed not in ([], ["engine/crates/video-manager/src/lib.rs"], ["crates/video-manager/src/lib.rs"]):
+              raise SystemExit("unexpected formatter paths: " + ", ".join(changed))
+          PY
+          git diff --check
+          if ! git diff --quiet -- crates/video-manager/src/lib.rs; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- crates/video-manager/src/lib.rs
+            git commit -m "style: format video manager runtime"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: format runtime slice
         shell: bash
         run: |
