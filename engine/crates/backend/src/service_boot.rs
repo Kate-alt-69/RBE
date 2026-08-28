@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceManager};
+use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceManager, ServiceMemory};
 
 pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let value = |flag: &str| {
@@ -29,7 +30,38 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         monitor_interval_ms: config.services.monitor_interval_ms,
         max_restart_backoff_ms: config.services.max_restart_backoff_ms,
     };
-    service_runtime::run_service_host(service_file, token, defaults).await
+    let source = std::fs::read_to_string(&service_file).map_err(|error| {
+        anyhow::anyhow!(
+            "service host failed to read executable body {}: {error}",
+            service_file.display()
+        )
+    })?;
+    let program = route_engine::parse_service_source(&source).map_err(|error| {
+        anyhow::anyhow!(
+            "service host failed to parse {}:{}:{}: {}",
+            service_file.display(),
+            error.line,
+            error.column,
+            error.message
+        )
+    })?;
+    let modules = route_engine::ModuleProgram::load_default().map_err(|errors| {
+        anyhow::anyhow!(
+            "service host module compilation failed:
+{}",
+            errors.render()
+        )
+    })?;
+    let memory = ServiceMemory::default();
+    let executor = route_engine::ServiceProgramExecutor::new(program, modules, memory.clone());
+    service_runtime::run_service_host_with_executor_and_memory(
+        service_file,
+        token,
+        defaults,
+        memory,
+        Arc::new(executor),
+    )
+    .await
 }
 
 fn validate_executable_catalog(catalog: &ServiceCatalog) -> Result<(), String> {

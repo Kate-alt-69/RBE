@@ -112,11 +112,7 @@ impl ServiceProgramExecutor {
 }
 
 impl ServiceExecutor for ServiceProgramExecutor {
-    fn call<'a>(
-        &'a self,
-        function: &'a str,
-        args: Vec<JsonValue>,
-    ) -> ServiceExecutionFuture<'a> {
+    fn call<'a>(&'a self, function: &'a str, args: Vec<JsonValue>) -> ServiceExecutionFuture<'a> {
         Box::pin(async move {
             let args = args
                 .into_iter()
