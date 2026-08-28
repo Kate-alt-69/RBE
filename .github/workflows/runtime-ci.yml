@@ -34,11 +34,11 @@ jobs:
               anchor = 'core-lib = { path = "../core" }\n'
               if anchor not in source:
                   raise SystemExit("route-engine core dependency anchor missing")
-              source = source.replace(anchor, anchor + dep, 1)
-              cargo.write_text(source)
+              cargo.write_text(source.replace(anchor, anchor + dep, 1))
 
           evaluator = Path("crates/route-engine/src/module_eval.rs")
           source = evaluator.read_text()
+
           if "use serde_json::Value as JsonValue;" not in source:
               anchor = "use std::sync::Arc;\n\n"
               if anchor not in source:
@@ -53,7 +53,7 @@ jobs:
               anchor = "type FlowFuture<'a> = Pin<Box<dyn Future<Output = Result<Flow, ModuleEvalError>> + Send + 'a>>;\n"
               if anchor not in source:
                   raise SystemExit("module_eval future alias anchor missing")
-              addition = r'''
+              source = source.replace(anchor, anchor + r'''
           pub type ServiceCallFuture<'a> =
               Pin<Box<dyn Future<Output = Result<JsonValue, String>> + Send + 'a>>;
 
@@ -80,22 +80,12 @@ jobs:
                   })
               }
           }
-          '''
-              source = source.replace(anchor, anchor + addition, 1)
+          ''', 1)
 
-          old = '''pub struct ModuleExecutor<'a> {
-              program: &'a ModuleProgram,
-          }
-
-          impl<'a> ModuleExecutor<'a> {
-              pub fn new(program: &'a ModuleProgram) -> Self {
-                  Self { program }
-              }
-          '''
           if "services: Option<Arc<dyn ServiceCaller>>" not in source:
-              if old not in source:
-                  raise SystemExit("ModuleExecutor constructor anchor missing")
-              new = '''pub struct ModuleExecutor<'a> {
+              start = source.index("pub struct ModuleExecutor<'a> {")
+              call_at = source.index("    pub async fn call(\n", start)
+              prefix = r'''pub struct ModuleExecutor<'a> {
               program: &'a ModuleProgram,
               services: Option<Arc<dyn ServiceCaller>>,
           }
@@ -121,13 +111,13 @@ jobs:
                       services: Some(services),
                   }
               }
+
           '''
-              source = source.replace(old, new, 1)
+              source = source[:start] + prefix + source[call_at:]
 
           if "async fn call_service(" not in source:
-              anchor = "    async fn call_export(\n"
-              at = source.index(anchor, source.index("impl<'a> ModuleExecutor"))
-              method = r'''    async fn call_service(
+              at = source.index("    async fn call_export(\n", source.index("impl<'a> ModuleExecutor"))
+              source = source[:at] + r'''    async fn call_service(
               &self,
               service: &str,
               function: &str,
@@ -136,9 +126,7 @@ jobs:
               let services = self.services.as_ref().ok_or_else(|| {
                   ModuleEvalError::new(
                       "MOD3400",
-                      format!(
-                          "service runtime is unavailable while calling {service}.{function}"
-                      ),
+                      format!("service runtime is unavailable while calling {service}.{function}"),
                   )
               })?;
               let args = args
@@ -157,107 +145,96 @@ jobs:
               value_from_json(value)
           }
 
-          '''
-              source = source[:at] + method + source[at:]
+          ''' + source[at:]
 
           if "service_modules: HashMap<String, String>" not in source:
-              anchor = "    custom_functions: HashMap<String, (String, String)>,\n"
-              if anchor not in source:
-                  raise SystemExit("Frame field anchor missing")
-              source = source.replace(
-                  anchor,
-                  anchor
-                  + "    service_modules: HashMap<String, String>,\n"
-                  + "    service_functions: HashMap<String, (String, String)>,\n",
-                  1,
-              )
+              start = source.index("struct Frame<'exec, 'program> {")
+              end = source.index("    fn exec_block<'b>", start)
+              replacement = r'''struct Frame<'exec, 'program> {
+              executor: &'exec ModuleExecutor<'program>,
+              file: Arc<ModuleFile>,
+              modules: ModuleRegistry,
+              custom_modules: HashMap<String, String>,
+              custom_functions: HashMap<String, (String, String)>,
+              service_modules: HashMap<String, String>,
+              service_functions: HashMap<String, (String, String)>,
+              scope: HashMap<String, Value>,
+              depth: usize,
+          }
 
-              anchor = "        let mut custom_functions = HashMap::new();\n"
-              if anchor not in source:
-                  raise SystemExit("Frame map initialization anchor missing")
-              source = source.replace(
-                  anchor,
-                  anchor
-                  + "        let mut service_modules = HashMap::new();\n"
-                  + "        let mut service_functions = HashMap::new();\n",
-                  1,
-              )
-
-              anchor = '''                ImportTarget::CustomFunction { path, function } => {
-                      custom_functions.insert(binding, (path.clone(), function.clone()));
+          impl<'exec, 'program> Frame<'exec, 'program> {
+              fn new(executor: &'exec ModuleExecutor<'program>, file: Arc<ModuleFile>, depth: usize) -> Self {
+                  let modules = ModuleRegistry::from_imports(&file.imports);
+                  let mut custom_modules = HashMap::new();
+                  let mut custom_functions = HashMap::new();
+                  let mut service_modules = HashMap::new();
+                  let mut service_functions = HashMap::new();
+                  for import in &file.imports {
+                      let binding = binding_name(import);
+                      match import_base(import) {
+                          ImportTarget::Custom(path) => {
+                              custom_modules.insert(binding, path.clone());
+                          }
+                          ImportTarget::CustomFunction { path, function } => {
+                              custom_functions.insert(binding, (path.clone(), function.clone()));
+                          }
+                          ImportTarget::Service(service) => {
+                              service_modules.insert(binding, service.clone());
+                          }
+                          ImportTarget::ServiceFunction { service, function } => {
+                              service_functions.insert(binding, (service.clone(), function.clone()));
+                          }
+                          _ => {}
+                      }
                   }
+                  Self {
+                      executor,
+                      file,
+                      modules,
+                      custom_modules,
+                      custom_functions,
+                      service_modules,
+                      service_functions,
+                      scope: HashMap::new(),
+                      depth,
+                  }
+              }
+
           '''
-              if anchor not in source:
-                  raise SystemExit("Frame import match anchor missing")
-              source = source.replace(
-                  anchor,
-                  anchor
-                  + '''                ImportTarget::Service(service) => {
-                      service_modules.insert(binding, service.clone());
-                  }
-                  ImportTarget::ServiceFunction { service, function } => {
-                      service_functions.insert(binding, (service.clone(), function.clone()));
-                  }
-          ''',
-                  1,
-              )
-
-              anchor = "            custom_functions,\n"
-              if anchor not in source:
-                  raise SystemExit("Frame constructor field anchor missing")
-              source = source.replace(
-                  anchor,
-                  anchor
-                  + "            service_modules,\n"
-                  + "            service_functions,\n",
-                  1,
-              )
+              source = source[:start] + replacement + source[end:]
 
           if "self.service_functions.get(name)" not in source:
-              anchor = '''                    if let Expr::Ident(name) = callee.as_ref() {
-                          if let Some((path, function)) = self.custom_functions.get(name).cloned() {
-          '''
-              if anchor not in source:
-                  raise SystemExit("direct call dispatch anchor missing")
-              replacement = '''                    if let Expr::Ident(name) = callee.as_ref() {
-                          if let Some((service, function)) = self.service_functions.get(name).cloned() {
+              needle = "                        if let Some((path, function)) = self.custom_functions.get(name).cloned() {\n"
+              at = source.index(needle, source.index("Expr::Call"))
+              service = r'''                        if let Some((service, function)) = self.service_functions.get(name).cloned() {
                               return self.executor.call_service(&service, &function, args).await;
                           }
-                          if let Some((path, function)) = self.custom_functions.get(name).cloned() {
           '''
-              source = source.replace(anchor, replacement, 1)
+              source = source[:at] + service + source[at:]
 
           if "self.service_modules.get(module_name)" not in source:
-              anchor = '''                        if let Expr::Ident(module_name) = base.as_ref() {
-                              if let Some(path) = self.custom_modules.get(module_name).cloned() {
-          '''
-              if anchor not in source:
-                  raise SystemExit("namespace call dispatch anchor missing")
-              replacement = '''                        if let Expr::Ident(module_name) = base.as_ref() {
-                              if let Some(service) = self.service_modules.get(module_name).cloned() {
+              needle = "                            if let Some(path) = self.custom_modules.get(module_name).cloned() {\n"
+              at = source.index(needle, source.index("Expr::Call"))
+              service = r'''                            if let Some(service) = self.service_modules.get(module_name).cloned() {
                                   return self
                                       .executor
                                       .call_service(&service, function_name, args)
                                       .await;
                               }
-                              if let Some(path) = self.custom_modules.get(module_name).cloned() {
           '''
-              source = source.replace(anchor, replacement, 1)
+              source = source[:at] + service + source[at:]
 
           if "fn value_to_json(" not in source:
-              anchor = "fn binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value, ModuleEvalError> {\n"
-              at = source.index(anchor)
-              converters = r'''fn value_to_json(value: Value) -> Result<JsonValue, ModuleEvalError> {
+              at = source.index("fn binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value, ModuleEvalError> {")
+              source = source[:at] + r'''fn value_to_json(value: Value) -> Result<JsonValue, ModuleEvalError> {
               match value {
                   Value::String(value) => Ok(JsonValue::String(value)),
                   Value::Number(value) => serde_json::Number::from_f64(value)
                       .map(JsonValue::Number)
-                      .ok_or_else(|| {
-                          ModuleEvalError::new(
-                              "MOD3402",
-                              "non-finite numbers cannot cross the service IPC boundary",
-                          )
-                      }),
+                      .ok_or_else(|| ModuleEvalError::new(
+                          "MOD3402",
+                          "non-finite numbers cannot cross the service IPC boundary",
+                      )),
                   Value::Bool(value) => Ok(JsonValue::Bool(value)),
                   Value::Null => Ok(JsonValue::Null),
                   Value::Object(fields) => {
@@ -301,12 +278,11 @@ jobs:
               }
           }
 
-          '''
-              source = source[:at] + converters + source[at:]
+          ''' + source[at:]
 
           if "module_dispatches_namespace_and_direct_service_calls" not in source:
               insert = source.rfind("\n}")
-              tests = r'''
+              source = source[:insert] + r'''
 
               #[derive(Default)]
               struct FakeServices {
@@ -327,9 +303,7 @@ jobs:
                               args.clone(),
                           ));
                           match (service, function) {
-                              ("uac-cache", "get") => {
-                                  Ok(args.into_iter().next().unwrap_or(JsonValue::Null))
-                              }
+                              ("uac-cache", "get") => Ok(args.into_iter().next().unwrap_or(JsonValue::Null)),
                               ("search", "find") => Ok(serde_json::json!({
                                   "found": args.into_iter().next().unwrap_or(JsonValue::Null)
                               })),
@@ -382,8 +356,7 @@ jobs:
                   assert_eq!(error.code, "MOD3400");
                   let _ = fs::remove_dir_all(root);
               }
-          '''
-              source = source[:insert] + tests + source[insert:]
+          ''' + source[insert:]
 
           evaluator.write_text(source)
           PY
