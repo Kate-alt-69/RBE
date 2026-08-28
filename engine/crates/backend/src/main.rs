@@ -2,6 +2,7 @@
 //! are separate supervised OS processes. Video Manager's lightweight control
 //! plane lives in-process; heavy media workers remain lazy/separate.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -79,9 +80,7 @@ async fn main() {
             &runtime_paths::default_admin_dir().to_string_lossy(),
         ));
         let force_dbus = has("--dbus");
-        if let Err(error) =
-            vault_process::run_vault_daemon(service_name, data_dir, force_dbus)
-        {
+        if let Err(error) = vault_process::run_vault_daemon(service_name, data_dir, force_dbus) {
             eprintln!("fatal Vault daemon error: {error:#}");
             std::process::exit(1);
         }
@@ -188,12 +187,8 @@ async fn boot_and_run() -> anyhow::Result<()> {
     let config = config::Config::load(&settings_path)
         .map_err(|error| anyhow::anyhow!("failed to load {settings_path}: {error}"))?;
     let config = Arc::new(config);
-    let refresh_interval = Duration::from_secs(
-        config
-            .runtime
-            .process_refresh_hours
-            .saturating_mul(3600),
-    );
+    let refresh_interval =
+        Duration::from_secs(config.runtime.process_refresh_hours.saturating_mul(3600));
     let maintenance = Arc::new(MaintenanceMetrics::new(
         config.runtime.process_refresh_hours,
     ));
@@ -249,6 +244,21 @@ async fn boot_and_run() -> anyhow::Result<()> {
     // startup. One malformed service fails the whole boot with SVC diagnostics
     // rather than leaving a partially-started backend.
     let service_catalog = service_boot::compile(&config.services, &io)?;
+    let service_interfaces: route_engine::ServiceInterfaces = service_catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .services()
+                .iter()
+                .map(|service| {
+                    (
+                        service.name.clone(),
+                        service.exports.iter().cloned().collect::<HashSet<_>>(),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     lifecycle.set(BackendState::ServicesStarting);
 
     let error_reporter_task =
@@ -275,8 +285,11 @@ async fn boot_and_run() -> anyhow::Result<()> {
     };
     boot_trace("vault process ready");
 
-    let vault_refresh_task =
-        spawn_vault_refresh(vault_instance.clone(), maintenance.clone(), refresh_interval);
+    let vault_refresh_task = spawn_vault_refresh(
+        vault_instance.clone(),
+        maintenance.clone(),
+        refresh_interval,
+    );
 
     let container_path = container_process::ContainerProcess::packaged_path()?;
     boot_trace(format!(
@@ -395,7 +408,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
         ),
     }
 
-    let router = api::build_router(app_state, &api_dir)?;
+    let router = api::build_router(app_state, &api_dir, &service_interfaces)?;
     boot_trace("router built; handing API port to real backend");
     let addr = format!("{}:{}", config.api.host, config.api.port);
 
@@ -573,17 +586,12 @@ fn maybe_open_dashboard(config: &config::Config) {
         return;
     }
     #[cfg(target_os = "linux")]
-    if std::env::var_os("DISPLAY").is_none()
-        && std::env::var_os("WAYLAND_DISPLAY").is_none()
-    {
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return;
     }
 
     let prefix = config.dashboards.admin_path_prefix.trim_end_matches('/');
-    let url = format!(
-        "http://127.0.0.1:{}{prefix}/dashboard",
-        config.api.port
-    );
+    let url = format!("http://127.0.0.1:{}{prefix}/dashboard", config.api.port);
     tracing::info!(%url, "RBE dashboard ready");
 
     #[cfg(target_os = "windows")]

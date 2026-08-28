@@ -1,6 +1,8 @@
 //! Boot-time loader and dependency validator for `.module` files.
 
 use std::collections::{HashMap, HashSet};
+
+pub type ServiceInterfaces = HashMap<String, HashSet<String>>;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -68,7 +70,27 @@ impl ModuleProgram {
         Self::load(&default_module_dir())
     }
 
+    pub fn load_default_with_services(
+        services: &ServiceInterfaces,
+    ) -> Result<Self, ModuleCompileErrors> {
+        Self::load_with_services(&default_module_dir(), services)
+    }
+
     pub fn load(module_dir: &Path) -> Result<Self, ModuleCompileErrors> {
+        Self::load_internal(module_dir, None)
+    }
+
+    pub fn load_with_services(
+        module_dir: &Path,
+        services: &ServiceInterfaces,
+    ) -> Result<Self, ModuleCompileErrors> {
+        Self::load_internal(module_dir, Some(services))
+    }
+
+    fn load_internal(
+        module_dir: &Path,
+        services: Option<&ServiceInterfaces>,
+    ) -> Result<Self, ModuleCompileErrors> {
         let binary_root = module_dir
             .parent()
             .map(Path::to_path_buf)
@@ -90,7 +112,7 @@ impl ModuleProgram {
         for path in files {
             match load_one(&path) {
                 Ok(file) => {
-                    validate_local(&path, &file, &mut errors);
+                    validate_local(&path, &file, services, &mut errors);
                     modules.insert(normalize(&path), Arc::new(file));
                 }
                 Err(error) => errors.push(error),
@@ -187,7 +209,12 @@ fn load_one(path: &Path) -> Result<ModuleFile, ModuleCompileError> {
         })
 }
 
-fn validate_local(path: &Path, file: &ModuleFile, errors: &mut Vec<ModuleCompileError>) {
+fn validate_local(
+    path: &Path,
+    file: &ModuleFile,
+    services: Option<&ServiceInterfaces>,
+    errors: &mut Vec<ModuleCompileError>,
+) {
     let mut functions = HashSet::new();
     for function in &file.functions {
         if !functions.insert(function.name.clone()) {
@@ -245,6 +272,43 @@ fn validate_local(path: &Path, file: &ModuleFile, errors: &mut Vec<ModuleCompile
                 column: 1,
                 message: format!("duplicate import source {source:?}"),
             });
+        }
+
+        let Some(services) = services else {
+            continue;
+        };
+        match import_base(import) {
+            ImportTarget::Service(service) => {
+                if !services.contains_key(service) {
+                    errors.push(ModuleCompileError {
+                        code: "MOD2008",
+                        path: path.to_path_buf(),
+                        line: 1,
+                        column: 1,
+                        message: format!("module imports unknown service {service:?}"),
+                    });
+                }
+            }
+            ImportTarget::ServiceFunction { service, function } => match services.get(service) {
+                None => errors.push(ModuleCompileError {
+                    code: "MOD2008",
+                    path: path.to_path_buf(),
+                    line: 1,
+                    column: 1,
+                    message: format!("module imports unknown service {service:?}"),
+                }),
+                Some(exports) if !exports.contains(function) => {
+                    errors.push(ModuleCompileError {
+                        code: "MOD2009",
+                        path: path.to_path_buf(),
+                        line: 1,
+                        column: 1,
+                        message: format!("service {service:?} does not export {function:?}"),
+                    });
+                }
+                Some(_) => {}
+            },
+            _ => {}
         }
     }
 }
@@ -419,6 +483,39 @@ mod tests {
         .unwrap();
         let program = ModuleProgram::load(&root.join("module")).unwrap();
         assert_eq!(program.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_contract_validation_rejects_unknown_service_and_export() {
+        let root = root();
+        fs::write(
+  root.join("module/service.module"),
+  ":import[service:missing as missing, service:search.nope as nope]\nexport function run() { return true; }",
+        )
+        .unwrap();
+        let mut services = ServiceInterfaces::new();
+        services.insert("search".into(), HashSet::from(["find".into()]));
+        let errors = ModuleProgram::load_with_services(&root.join("module"), &services)
+            .expect_err("invalid service contracts should fail module boot validation");
+        assert!(errors.0.iter().any(|error| error.code == "MOD2008"));
+        assert!(errors.0.iter().any(|error| error.code == "MOD2009"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_contract_validation_accepts_registered_interfaces() {
+        let root = root();
+        fs::write(
+  root.join("module/service.module"),
+  ":import[service:uac-cache as cache, service:search.find as lookup]\nexport function run(value) { return value; }",
+        )
+        .unwrap();
+        let mut services = ServiceInterfaces::new();
+        services.insert("uac-cache".into(), HashSet::from(["get".into()]));
+        services.insert("search".into(), HashSet::from(["find".into()]));
+        ModuleProgram::load_with_services(&root.join("module"), &services)
+            .expect("registered service interfaces should validate");
         let _ = fs::remove_dir_all(root);
     }
 }

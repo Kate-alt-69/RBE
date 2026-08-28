@@ -20,7 +20,7 @@ use crate::analyzer::{analyze, Severity};
 use crate::ast::{FunctionDef, ModuleFile, RouteFile, Value};
 use crate::lexer::Lexer;
 use crate::module_eval::ModuleExecutor;
-use crate::module_runtime::ModuleProgram;
+use crate::module_runtime::{ModuleProgram, ServiceInterfaces};
 use crate::modules::binding_name;
 use crate::parser::Parser;
 use crate::terminal::Terminal;
@@ -633,8 +633,13 @@ fn boot_compile(
 /// Scans `api_dir`, validates every `.route` file before routing starts,
 /// and only then constructs the Axum router. A broken route fails the boot,
 /// but errors from every file are collected into compiler-error.txt first.
-pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
-    let module_program = Arc::new(ModuleProgram::load_default()?);
+pub fn build_routes(
+    api_dir: &Path,
+    service_interfaces: &ServiceInterfaces,
+) -> anyhow::Result<Router<AppState>> {
+    let module_program = Arc::new(ModuleProgram::load_default_with_services(
+        service_interfaces,
+    )?);
     tracing::info!(
         modules = module_program.len(),
         module_dir = %module_program.module_dir().display(),
