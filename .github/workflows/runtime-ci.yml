@@ -232,12 +232,14 @@ jobs:
                               Ok(mut replacement) => {
                                   replacement.restart_attempts = attempt;
                                   let new_pid = replacement.ready.pid;
-                                  let mut service = handle.lock().await;
+                                  let service = handle.lock().await;
                                   if self.shutting_down.load(Ordering::Acquire) {
                                       drop(service);
                                       stop_managed(&mut replacement).await;
                                       return;
                                   }
+                                  drop(service);
+                                  let mut service = handle.lock().await;
                                   *service = replacement;
                                   tracing::info!(
                                       service = %file.name,
@@ -341,39 +343,28 @@ jobs:
           }'''
           source = source[:impl_start] + new_impl + source[impl_end:]
 
-          old_spawn_tail = '''    Ok(Managed {
-              file,
-              child,
-              alias,
-              ready,
-              token,
-          })'''
-          new_spawn_tail = '''    Ok(Managed {
-              file,
-              child,
-              alias,
-              ready,
-              token,
-              started_at: Instant::now(),
-              restart_attempts: 0,
-              exit_observed: false,
-          })'''
-          if old_spawn_tail not in source and new_spawn_tail not in source:
-              raise SystemExit("could not locate Managed construction")
-          source = source.replace(old_spawn_tail, new_spawn_tail, 1)
+          if "started_at: Instant::now()," not in source:
+              spawn_start = source.index("async fn spawn(")
+              ctor_start = source.index("    Ok(Managed {", spawn_start)
+              ctor_end = source.index("\n    })", ctor_start) + len("\n    })")
+              new_ctor = '''    Ok(Managed {
+                  file,
+                  child,
+                  alias,
+                  ready,
+                  token,
+                  started_at: Instant::now(),
+                  restart_attempts: 0,
+                  exit_observed: false,
+              })'''
+              source = source[:ctor_start] + new_ctor + source[ctor_end:]
 
-          old_test = '''    #[test]
-              fn memory_round_trip() {
-                  let memory = ServiceMemory::default();
-                  memory.set("x".into(), serde_json::json!(7));
-                  assert_eq!(memory.get("x"), Some(serde_json::json!(7)));
-              }'''
-          new_test = '''    #[test]
-              fn memory_round_trip() {
-                  let memory = ServiceMemory::default();
-                  memory.set("x".into(), serde_json::json!(7));
-                  assert_eq!(memory.get("x"), Some(serde_json::json!(7)));
-              }
+          if "fn restart_policy_distinguishes_clean_and_failed_exits()" not in source:
+              tests_start = source.index("#[cfg(test)]")
+              module_end = source.rfind("}")
+              if module_end <= tests_start:
+                  raise SystemExit("could not locate service test module end")
+              extra_tests = r'''
 
               #[test]
               fn restart_policy_distinguishes_clean_and_failed_exits() {
@@ -391,39 +382,35 @@ jobs:
                   assert_eq!(restart_delay(2, maximum), Duration::from_millis(500));
                   assert_eq!(restart_delay(3, maximum), Duration::from_millis(1_000));
                   assert_eq!(restart_delay(32, maximum), maximum);
-              }'''
-          if old_test not in source and new_test not in source:
-              raise SystemExit("could not locate service tests")
-          source = source.replace(old_test, new_test, 1)
+              }
+          '''
+              source = source[:module_end] + extra_tests + source[module_end:]
           path.write_text(source)
 
           boot = Path("crates/backend/src/service_boot.rs")
           boot_source = boot.read_text()
-          first = '''    let defaults = ServiceDefaults {
-              memory_limit_mb: config.services.default_memory_limit_mb,
-              startup_timeout_ms: config.services.startup_timeout_ms,
-          };'''
-          first_new = '''    let defaults = ServiceDefaults {
-              memory_limit_mb: config.services.default_memory_limit_mb,
-              startup_timeout_ms: config.services.startup_timeout_ms,
-              monitor_interval_ms: config.services.monitor_interval_ms,
-              max_restart_backoff_ms: config.services.max_restart_backoff_ms,
-          };'''
-          second = '''    let defaults = ServiceDefaults {
-              memory_limit_mb: settings.default_memory_limit_mb,
-              startup_timeout_ms: settings.startup_timeout_ms,
-          };'''
-          second_new = '''    let defaults = ServiceDefaults {
-              memory_limit_mb: settings.default_memory_limit_mb,
-              startup_timeout_ms: settings.startup_timeout_ms,
-              monitor_interval_ms: settings.monitor_interval_ms,
-              max_restart_backoff_ms: settings.max_restart_backoff_ms,
-          };'''
-          if first not in boot_source and first_new not in boot_source:
-              raise SystemExit("could not locate service host defaults")
-          if second not in boot_source and second_new not in boot_source:
-              raise SystemExit("could not locate service compiler defaults")
-          boot_source = boot_source.replace(first, first_new, 1).replace(second, second_new, 1)
+          if "monitor_interval_ms: config.services.monitor_interval_ms," not in boot_source:
+              needle = "        startup_timeout_ms: config.services.startup_timeout_ms,\n    };"
+              replacement = (
+                  "        startup_timeout_ms: config.services.startup_timeout_ms,\n"
+                  "        monitor_interval_ms: config.services.monitor_interval_ms,\n"
+                  "        max_restart_backoff_ms: config.services.max_restart_backoff_ms,\n"
+                  "    };"
+              )
+              if needle not in boot_source:
+                  raise SystemExit("could not locate service host defaults")
+              boot_source = boot_source.replace(needle, replacement, 1)
+          if "monitor_interval_ms: settings.monitor_interval_ms," not in boot_source:
+              needle = "        startup_timeout_ms: settings.startup_timeout_ms,\n    };"
+              replacement = (
+                  "        startup_timeout_ms: settings.startup_timeout_ms,\n"
+                  "        monitor_interval_ms: settings.monitor_interval_ms,\n"
+                  "        max_restart_backoff_ms: settings.max_restart_backoff_ms,\n"
+                  "    };"
+              )
+              if needle not in boot_source:
+                  raise SystemExit("could not locate service compiler defaults")
+              boot_source = boot_source.replace(needle, replacement, 1)
           boot.write_text(boot_source)
           PY
           cargo fmt --all
