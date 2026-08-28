@@ -52,6 +52,7 @@ pub struct ServiceFile {
 pub struct ServiceDefaults {
     pub memory_limit_mb: u64,
     pub startup_timeout_ms: u64,
+    pub default_idle_timeout_ms: u64,
     pub monitor_interval_ms: u64,
     pub max_restart_backoff_ms: u64,
 }
@@ -61,6 +62,7 @@ impl Default for ServiceDefaults {
         Self {
             memory_limit_mb: 256,
             startup_timeout_ms: 10_000,
+            default_idle_timeout_ms: 300_000,
             monitor_interval_ms: 1_000,
             max_restart_backoff_ms: 30_000,
         }
@@ -289,7 +291,7 @@ fn parse_service(
         }
     };
 
-    let idle_timeout_ms = number("idleTimeoutMs", 300_000)?;
+    let idle_timeout_ms = number("idleTimeoutMs", defaults.default_idle_timeout_ms)?;
     if mode != ServiceMode::Resident && idle_timeout_ms == 0 {
         return Err(compile_error(
             "SVC1011",

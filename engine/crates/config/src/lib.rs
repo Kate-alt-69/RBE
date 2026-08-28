@@ -308,6 +308,7 @@ pub struct ServicesConfig {
     pub directory: String,
     pub default_memory_limit_mb: u64,
     pub startup_timeout_ms: u64,
+    pub default_idle_timeout_ms: u64,
     pub monitor_interval_ms: u64,
     pub max_restart_backoff_ms: u64,
 }
@@ -319,6 +320,7 @@ impl Default for ServicesConfig {
             directory: "service".into(),
             default_memory_limit_mb: 256,
             startup_timeout_ms: 10_000,
+            default_idle_timeout_ms: 300_000,
             monitor_interval_ms: 1_000,
             max_restart_backoff_ms: 30_000,
         }
@@ -449,10 +451,11 @@ impl Config {
             path: path_str.clone(),
             source,
         })?;
-        let mut config: Config = serde_json::from_str(&raw).map_err(|source| ConfigError::Parse {
-            path: path_str,
-            source,
-        })?;
+        let mut config: Config =
+            serde_json::from_str(&raw).map_err(|source| ConfigError::Parse {
+                path: path_str,
+                source,
+            })?;
         config.apply_env_overrides();
         config.validate()?;
         Ok(config)
@@ -462,7 +465,9 @@ impl Config {
         if let Ok(port) = std::env::var("API_PORT") {
             match port.parse::<u16>() {
                 Ok(port) => self.api.port = port,
-                Err(_) => tracing::warn!(value = %port, "API_PORT env var is not a valid u16, ignoring"),
+                Err(_) => {
+                    tracing::warn!(value = %port, "API_PORT env var is not a valid u16, ignoring")
+                }
             }
         }
         if let Ok(host) = std::env::var("API_HOST") {
@@ -510,7 +515,10 @@ impl Config {
             ));
         }
         for (name, value) in [
-            ("swampsPerEnvironment", self.containers.swamps_per_environment),
+            (
+                "swampsPerEnvironment",
+                self.containers.swamps_per_environment,
+            ),
             ("workersPerSwamp", self.containers.workers_per_swamp),
         ] {
             if let Some(value) = value.fixed() {
@@ -527,9 +535,13 @@ impl Config {
                     "services.directory must not be empty".into(),
                 ));
             }
-            if self.services.startup_timeout_ms == 0 || self.services.monitor_interval_ms == 0 {
+            if self.services.startup_timeout_ms == 0
+                || self.services.default_idle_timeout_ms == 0
+                || self.services.monitor_interval_ms == 0
+            {
                 return Err(ConfigError::Invalid(
-                    "service startup/monitor intervals must be greater than zero".into(),
+                    "service startup/default idle/monitor intervals must be greater than zero"
+                        .into(),
                 ));
             }
         }
@@ -562,14 +574,13 @@ mod tests {
 
     #[test]
     fn minimal_valid_config_loads() {
-        let config: Config = serde_json::from_str(
-            r#"{ "api": { "host": "0.0.0.0", "port": 8080 } }"#,
-        )
-        .unwrap();
+        let config: Config =
+            serde_json::from_str(r#"{ "api": { "host": "0.0.0.0", "port": 8080 } }"#).unwrap();
         assert!(config.validate().is_ok());
         assert_eq!(config.containers.environments, 5);
         assert_eq!(config.containers.swamps_per_environment, AutoCount::Auto);
         assert!(config.services.enabled);
+        assert_eq!(config.services.default_idle_timeout_ms, 300_000);
         assert_eq!(config.video_manager.live_idle_secs, 7200);
     }
 

@@ -27,6 +27,7 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let defaults = ServiceDefaults {
         memory_limit_mb: config.services.default_memory_limit_mb,
         startup_timeout_ms: config.services.startup_timeout_ms,
+        default_idle_timeout_ms: config.services.default_idle_timeout_ms,
         monitor_interval_ms: config.services.monitor_interval_ms,
         max_restart_backoff_ms: config.services.max_restart_backoff_ms,
     };
@@ -121,6 +122,7 @@ pub fn compile(
     let defaults = ServiceDefaults {
         memory_limit_mb: settings.default_memory_limit_mb,
         startup_timeout_ms: settings.startup_timeout_ms,
+        default_idle_timeout_ms: settings.default_idle_timeout_ms,
         monitor_interval_ms: settings.monitor_interval_ms,
         max_restart_backoff_ms: settings.max_restart_backoff_ms,
     };

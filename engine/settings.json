@@ -13,11 +13,26 @@
     "maxBodySizeBytes": 10485760
   },
   "security": {
-    "corsAllowedOrigins": ["http://localhost:5173"],
-    "debugCorsOrigins": ["http://localhost:8080", "http://127.0.0.1:3000"],
-    "globalRateLimit": { "windowSecs": 30, "maxRequests": 90 },
-    "apiRateLimit": { "windowSecs": 60, "maxRequests": 120 },
-    "ipBan": { "strikeThreshold": 5, "strikeWindowSecs": 900, "banDurationSecs": 3600 },
+    "corsAllowedOrigins": [
+      "http://localhost:5173"
+    ],
+    "debugCorsOrigins": [
+      "http://localhost:8080",
+      "http://127.0.0.1:3000"
+    ],
+    "globalRateLimit": {
+      "windowSecs": 30,
+      "maxRequests": 90
+    },
+    "apiRateLimit": {
+      "windowSecs": 60,
+      "maxRequests": 120
+    },
+    "ipBan": {
+      "strikeThreshold": 5,
+      "strikeWindowSecs": 900,
+      "banDurationSecs": 3600
+    },
     "maxJsonPayloadBytes": 1048576,
     "cspPolicy": "default-src 'self'; script-src 'self' 'unsafe-inline'",
     "trustedProxyHeaders": false
@@ -25,7 +40,9 @@
   "uac": {
     "sessionTtlMinutes": 1440,
     "requireEmailVerification": true,
-    "oauthProviders": ["google"]
+    "oauthProviders": [
+      "google"
+    ]
   },
   "storage": {
     "driver": "sqlite",
@@ -43,7 +60,8 @@
     "defaultMemoryLimitMb": 256,
     "startupTimeoutMs": 10000,
     "monitorIntervalMs": 1000,
-    "maxRestartBackoffMs": 30000
+    "maxRestartBackoffMs": 30000,
+    "defaultIdleTimeoutMs": 300000
   },
   "videoManager": {
     "enabled": true,
@@ -62,7 +80,9 @@
     "memoryLimitMb": 256
   },
   "bootstrap": {
-    "services": ["email"]
+    "services": [
+      "email"
+    ]
   },
   "logging": {
     "level": "info",
