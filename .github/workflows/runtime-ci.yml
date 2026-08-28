@@ -49,6 +49,8 @@ jobs:
 
           module_anchor = "use tokio::net::TcpListener;\n"
           if "mod manager;" not in s:
+              if module_anchor not in s:
+                  raise SystemExit("manager module anchor missing")
               s = s.replace(
                   module_anchor,
                   module_anchor + "\nmod manager;\npub use manager::{ServiceCallError, ServiceManager, ServiceRuntimeState, ServiceSnapshot};\n",
@@ -79,56 +81,51 @@ jobs:
                   raise SystemExit("restart enum anchor missing")
               s = s.replace(restart_enum, mode_enum, 1)
 
-          s = s.replace(
-              "    pub title: String,\n    pub restart: RestartPolicy,",
-              "    pub title: String,\n    pub mode: ServiceMode,\n    pub restart: RestartPolicy,",
-              1,
-          )
-          s = s.replace(
-              "    pub startup_timeout_ms: u64,\n    pub imports: Vec<String>,",
-              "    pub startup_timeout_ms: u64,\n    pub idle_timeout_ms: u64,\n    pub imports: Vec<String>,",
-              1,
-          )
+          if "pub mode: ServiceMode" not in s:
+              s = s.replace(
+                  "    pub title: String,\n    pub restart: RestartPolicy,",
+                  "    pub title: String,\n    pub mode: ServiceMode,\n    pub restart: RestartPolicy,",
+                  1,
+              )
+          if "pub idle_timeout_ms: u64" not in s:
+              s = s.replace(
+                  "    pub startup_timeout_ms: u64,\n    pub imports: Vec<String>,",
+                  "    pub startup_timeout_ms: u64,\n    pub idle_timeout_ms: u64,\n    pub imports: Vec<String>,",
+                  1,
+              )
 
-          title_anchor = '''    let title = fields
-              .get("title")
-              .map(|value| unquote(value))
-              .unwrap_or_else(|| name.clone());
-          '''.replace('          ', '')
-          mode_parse = title_anchor + '''    let mode = match fields
-              .get("mode")
-              .map(|value| unquote(value).to_ascii_lowercase())
-          {
-              None => ServiceMode::Resident,
-              Some(value) if value == "resident" => ServiceMode::Resident,
-              Some(value)
-                  if matches!(value.as_str(), "on-demand" | "on_demand" | "ondemand") =>
-              {
-                  ServiceMode::OnDemand
-              }
-              Some(value) if value == "hybrid" => ServiceMode::Hybrid,
-              Some(value) => {
-                  return Err(compile_error(
-                      "SVC1010",
-                      path,
-                      line,
-                      format!("invalid service mode {value:?}"),
-                  ));
-              }
-          };
-          '''.replace('          ', '')
           if "invalid service mode" not in s:
-              if title_anchor not in s:
-                  raise SystemExit("service mode parser anchor missing")
-              s = s.replace(title_anchor, mode_parse, 1)
+              title_start = s.index("    let title = fields")
+              restart_start = s.index("    let restart = match fields", title_start)
+              mode_parse = '''    let mode = match fields
+                  .get("mode")
+                  .map(|value| unquote(value).to_ascii_lowercase())
+              {
+                  None => ServiceMode::Resident,
+                  Some(value) if value == "resident" => ServiceMode::Resident,
+                  Some(value)
+                      if matches!(value.as_str(), "on-demand" | "on_demand" | "ondemand") =>
+                  {
+                      ServiceMode::OnDemand
+                  }
+                  Some(value) if value == "hybrid" => ServiceMode::Hybrid,
+                  Some(value) => {
+                      return Err(compile_error(
+                          "SVC1010",
+                          path,
+                          line,
+                          format!("invalid service mode {value:?}"),
+                      ));
+                  }
+              };
 
-          number_end = '''    };
-
-              let mut imports = Vec::new();
           '''.replace('              ', '')
-          idle_parse = '''    };
+              s = s[:restart_start] + mode_parse + s[restart_start:]
 
-              let idle_timeout_ms = number("idleTimeoutMs", 300_000)?;
+          if "idleTimeoutMs must be greater than zero" not in s:
+              number_start = s.index("    let number = |key: &str")
+              imports_start = s.index("    let mut imports = Vec::new();", number_start)
+              idle_parse = '''    let idle_timeout_ms = number("idleTimeoutMs", 300_000)?;
               if mode != ServiceMode::Resident && idle_timeout_ms == 0 {
                   return Err(compile_error(
                       "SVC1011",
@@ -138,23 +135,21 @@ jobs:
                   ));
               }
 
-              let mut imports = Vec::new();
           '''.replace('              ', '')
-          if "idleTimeoutMs must be greater than zero" not in s:
-              if number_end not in s:
-                  raise SystemExit("idle timeout parser anchor missing")
-              s = s.replace(number_end, idle_parse, 1)
+              s = s[:imports_start] + idle_parse + s[imports_start:]
 
-          s = s.replace(
-              "        title,\n        restart,",
-              "        title,\n        mode,\n        restart,",
-              1,
-          )
-          s = s.replace(
-              "        startup_timeout_ms: number(\"startupTimeoutMs\", defaults.startup_timeout_ms)?,\n        imports,",
-              "        startup_timeout_ms: number(\"startupTimeoutMs\", defaults.startup_timeout_ms)?,\n        idle_timeout_ms,\n        imports,",
-              1,
-          )
+          if "        mode,\n        restart," not in s:
+              s = s.replace(
+                  "        title,\n        restart,",
+                  "        title,\n        mode,\n        restart,",
+                  1,
+              )
+          if "        idle_timeout_ms,\n        imports," not in s:
+              s = s.replace(
+                  "        startup_timeout_ms: number(\"startupTimeoutMs\", defaults.startup_timeout_ms)?,\n        imports,",
+                  "        startup_timeout_ms: number(\"startupTimeoutMs\", defaults.startup_timeout_ms)?,\n        idle_timeout_ms,\n        imports,",
+                  1,
+              )
 
           old_manager_start = s.index("const RESTART_BASE_DELAY_MS")
           host_start = s.index("pub async fn run_service_host(", old_manager_start)
@@ -229,10 +224,10 @@ jobs:
 
           python - <<'PY'
           import subprocess
-          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
           allowed = {
-              "engine/crates/service-runtime/src/lib.rs",
-              "engine/crates/service-runtime/src/manager.rs",
+              "crates/service-runtime/src/lib.rs",
+              "crates/service-runtime/src/manager.rs",
           }
           unexpected = changed - allowed
           if unexpected:
