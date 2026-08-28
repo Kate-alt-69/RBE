@@ -392,9 +392,9 @@ fn unquote(input: &str) -> String {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ServiceMemory {
-    values: RwLock<HashMap<String, Value>>,
+    values: Arc<RwLock<HashMap<String, Value>>>,
 }
 
 impl ServiceMemory {
@@ -997,6 +997,23 @@ pub async fn run_service_host_with_executor(
     defaults: ServiceDefaults,
     executor: Arc<dyn ServiceExecutor>,
 ) -> anyhow::Result<()> {
+    run_service_host_with_executor_and_memory(
+        path,
+        token,
+        defaults,
+        ServiceMemory::default(),
+        executor,
+    )
+    .await
+}
+
+pub async fn run_service_host_with_executor_and_memory(
+    path: PathBuf,
+    token: String,
+    defaults: ServiceDefaults,
+    memory: ServiceMemory,
+    executor: Arc<dyn ServiceExecutor>,
+) -> anyhow::Result<()> {
     let file = parse_service(&path, defaults)?;
     apply_memory_limit(file.memory_limit_mb)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1007,8 +1024,6 @@ pub async fn run_service_host_with_executor(
     };
     println!("{}", serde_json::to_string(&ready)?);
     std::io::stdout().flush()?;
-    let memory = ServiceMemory::default();
-
     loop {
         let (stream, _) = listener.accept().await?;
         let (read, mut write) = stream.into_split();
@@ -1278,5 +1293,15 @@ mod tests {
         let error = parse_service(&path, ServiceDefaults::default()).unwrap_err();
         assert_eq!(error.code, "SVC1009");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cloned_memory_shares_backing_store() {
+        let memory = ServiceMemory::default();
+        let clone = memory.clone();
+        memory.set("shared".into(), serde_json::json!({"ok": true}));
+        assert_eq!(clone.get("shared"), Some(serde_json::json!({"ok": true})));
+        clone.delete("shared");
+        assert!(memory.get("shared").is_none());
     }
 }
