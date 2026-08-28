@@ -32,6 +32,50 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     service_runtime::run_service_host(service_file, token, defaults).await
 }
 
+fn validate_executable_catalog(catalog: &ServiceCatalog) -> Result<(), String> {
+    let mut diagnostics = Vec::new();
+    for service in catalog.services() {
+        let source = match std::fs::read_to_string(&service.path) {
+            Ok(source) => source,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "SVC2001 {}:1:1 failed to read executable service body: {error}",
+                    service.path.display()
+                ));
+                continue;
+            }
+        };
+        if let Err(error) = route_engine::parse_service_source(&source) {
+            diagnostics.push(format!(
+                "SVC2000 {}:{}:{} {}",
+                service.path.display(),
+                error.line,
+                error.column,
+                error.message
+            ));
+        }
+    }
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(diagnostics.join("\n"))
+    }
+}
+
+fn report_compile_failure(rendered: &str, io: &atomic_io::AtomicIo) {
+    let error_path = compiler_error_path();
+    if let Err(write_error) = io.write_atomic(&error_path, rendered.as_bytes()) {
+        tracing::error!(
+            error = %write_error,
+            path = %error_path.display(),
+            "failed to persist service compiler diagnostics"
+        );
+    }
+    eprintln!("backend couldn't start because a .service file failed to compile:\n{rendered}");
+    eprintln!("compiler log: {}", error_path.display());
+    service_runtime::pause_for_interactive_exit();
+}
+
 pub fn compile(
     settings: &config::ServicesConfig,
     io: &atomic_io::AtomicIo,
@@ -50,6 +94,10 @@ pub fn compile(
     };
     match ServiceCatalog::compile_dir(&directory, defaults) {
         Ok(catalog) => {
+            if let Err(rendered) = validate_executable_catalog(&catalog) {
+                report_compile_failure(&rendered, io);
+                return Err(anyhow::anyhow!(".service executable compilation failed"));
+            }
             let error_path = compiler_error_path();
             if error_path.exists() {
                 let _ = io.write_atomic(&error_path, b"");
@@ -63,19 +111,7 @@ pub fn compile(
         }
         Err(errors) => {
             let rendered = errors.render();
-            let error_path = compiler_error_path();
-            if let Err(write_error) = io.write_atomic(&error_path, rendered.as_bytes()) {
-                tracing::error!(
-                    error = %write_error,
-                    path = %error_path.display(),
-                    "failed to persist service compiler diagnostics"
-                );
-            }
-            eprintln!(
-                "backend couldn't start because a .service file failed to compile:\n{rendered}"
-            );
-            eprintln!("compiler log: {}", error_path.display());
-            service_runtime::pause_for_interactive_exit();
+            report_compile_failure(&rendered, io);
             Err(anyhow::anyhow!(".service compilation failed"))
         }
     }
@@ -109,4 +145,38 @@ pub fn resolve_runtime_path(path: impl AsRef<Path>) -> PathBuf {
 
 fn compiler_error_path() -> PathBuf {
     runtime_paths::default_admin_dir().join("service-compiler-error.txt")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rbe-service-boot-test-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn executable_validation_reports_file_and_location() {
+        let dir = temp_dir();
+        let path = dir.join("broken.service");
+        std::fs::write(
+            &path,
+            ":service[name = broken]\nexport function run(value) { return value }",
+        )
+        .unwrap();
+        let catalog = ServiceCatalog::compile_dir(&dir, ServiceDefaults::default()).unwrap();
+        let rendered = validate_executable_catalog(&catalog).unwrap_err();
+        assert!(rendered.contains("SVC2000"));
+        assert!(rendered.contains("broken.service"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

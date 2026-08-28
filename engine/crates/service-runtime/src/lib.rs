@@ -275,7 +275,10 @@ fn parse_service(
     let exports = source
         .lines()
         .filter_map(|line| {
-            let rest = line.trim_start().strip_prefix("export function ")?;
+            let line = line.trim_start();
+            let rest = line
+                .strip_prefix("export function ")
+                .or_else(|| line.strip_prefix("export async function "))?;
             let name: String = rest
                 .chars()
                 .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
@@ -283,6 +286,16 @@ fn parse_service(
             (!name.is_empty()).then_some(name)
         })
         .collect();
+
+    let instances = number("instances", 1)?;
+    if instances != 1 {
+        return Err(compile_error(
+            "SVC1009",
+            path,
+            line,
+            format!("instances={instances} is not supported yet; .service currently requires instances=1"),
+        ));
+    }
 
     Ok(ServiceFile {
         path: path.to_path_buf(),
@@ -1228,5 +1241,42 @@ mod tests {
             response,
             ServiceResponse::Ok { value } if value == serde_json::json!({"ok": true})
         ));
+    }
+
+    fn temp_service_path(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rbe-service-{label}-{}-{nonce}.service",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn metadata_accepts_async_exports() {
+        let path = temp_service_path("async-export");
+        std::fs::write(
+            &path,
+            ":service[name = worker, instances = 1]\nexport async function fetch(value) { return value; }",
+        )
+        .unwrap();
+        let file = parse_service(&path, ServiceDefaults::default()).unwrap();
+        assert_eq!(file.exports, vec!["fetch"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn metadata_rejects_multiple_instances_until_supported() {
+        let path = temp_service_path("instances");
+        std::fs::write(
+            &path,
+            ":service[name = worker, instances = 2]\nexport function run() { return true; }",
+        )
+        .unwrap();
+        let error = parse_service(&path, ServiceDefaults::default()).unwrap_err();
+        assert_eq!(error.code, "SVC1009");
+        let _ = std::fs::remove_file(path);
     }
 }
