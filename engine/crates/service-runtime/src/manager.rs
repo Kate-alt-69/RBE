@@ -1,0 +1,776 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+use rand::RngCore;
+use serde::Serialize;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, RwLock as AsyncRwLock};
+
+use super::{
+    RestartPolicy, ServiceCatalog, ServiceFile, ServiceMode, ServiceReady, ServiceRequest,
+    ServiceResponse,
+};
+
+const RESTART_BASE_DELAY_MS: u64 = 250;
+const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
+
+struct ServiceProcess {
+    child: Child,
+    alias: PathBuf,
+    ready: ServiceReady,
+    token: String,
+    started_at: Instant,
+}
+
+struct Managed {
+    file: ServiceFile,
+    process: Option<ServiceProcess>,
+    restart_attempts: u32,
+    exit_observed: bool,
+    restarting: bool,
+    active_calls: u32,
+    last_activity: Instant,
+}
+
+impl Managed {
+    fn dormant(file: ServiceFile) -> Self {
+        Self {
+            file,
+            process: None,
+            restart_attempts: 0,
+            exit_observed: false,
+            restarting: false,
+            active_calls: 0,
+            last_activity: Instant::now(),
+        }
+    }
+
+    fn running(file: ServiceFile, process: ServiceProcess) -> Self {
+        Self {
+            file,
+            process: Some(process),
+            restart_attempts: 0,
+            exit_observed: false,
+            restarting: false,
+            active_calls: 0,
+            last_activity: Instant::now(),
+        }
+    }
+
+    fn wakeable(&self) -> bool {
+        self.file.mode != ServiceMode::Resident
+    }
+
+    fn idle_due(&self) -> bool {
+        self.wakeable()
+            && self.active_calls == 0
+            && self.last_activity.elapsed()
+                >= Duration::from_millis(self.file.idle_timeout_ms.max(1))
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ServiceManager {
+    services: Arc<AsyncRwLock<HashMap<String, Arc<Mutex<Managed>>>>>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceRuntimeState {
+    Dormant,
+    Running,
+    Restarting,
+    Stopped,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceSnapshot {
+    pub name: String,
+    pub title: String,
+    pub pid: Option<u32>,
+    pub state: ServiceRuntimeState,
+    pub mode: ServiceMode,
+    pub restart: RestartPolicy,
+    pub restart_attempts: u32,
+    pub idle_timeout_ms: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceCallError {
+    #[error("unknown service {service:?}")]
+    Unknown { service: String },
+    #[error("service {service:?} is unavailable")]
+    Unavailable { service: String },
+    #[error("failed to activate service {service:?}: {message}")]
+    Activation { service: String, message: String },
+    #[error("failed to inspect service {service:?}: {message}")]
+    Inspect { service: String, message: String },
+    #[error("service {service:?} IPC failed: {message}")]
+    Ipc { service: String, message: String },
+    #[error("service {service:?} returned {code}: {message}")]
+    Remote {
+        service: String,
+        code: String,
+        message: String,
+    },
+}
+
+impl ServiceManager {
+    pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
+        let manager = Self::default();
+        for file in catalog.services() {
+            let managed = match file.mode {
+                ServiceMode::OnDemand => Managed::dormant(file.clone()),
+                ServiceMode::Resident | ServiceMode::Hybrid => {
+                    match spawn_process(file).await {
+                        Ok(process) => Managed::running(file.clone(), process),
+                        Err(error) => {
+                            manager.shutdown_all().await;
+                            return Err(error);
+                        }
+                    }
+                }
+            };
+            manager
+                .services
+                .write()
+                .await
+                .insert(file.name.clone(), Arc::new(Mutex::new(managed)));
+        }
+        if !catalog.services().is_empty() {
+            manager.start_monitor(
+                Duration::from_millis(catalog.monitor_interval_ms.max(50)),
+                Duration::from_millis(catalog.max_restart_backoff_ms.max(RESTART_BASE_DELAY_MS)),
+            );
+        }
+        Ok(manager)
+    }
+
+    fn start_monitor(&self, interval: Duration, max_restart_backoff: Duration) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let handles = manager
+                .services
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for handle in handles {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .monitor_service(handle, interval, max_restart_backoff)
+                        .await;
+                });
+            }
+        });
+    }
+
+    async fn monitor_service(
+        &self,
+        handle: Arc<Mutex<Managed>>,
+        interval: Duration,
+        max_restart_backoff: Duration,
+    ) {
+        loop {
+            tokio::time::sleep(interval).await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+
+            let mut service = handle.lock().await;
+            let status = match service.process.as_mut() {
+                None => continue,
+                Some(process) => match process.child.try_wait() {
+                    Ok(Some(status)) => Some(status),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(
+                            service = %service.file.name,
+                            error = %error,
+                            "failed to inspect .service child status"
+                        );
+                        continue;
+                    }
+                },
+            };
+
+            if status.is_none() {
+                if service.idle_due() {
+                    let name = service.file.name.clone();
+                    let pid = service
+                        .process
+                        .as_ref()
+                        .and_then(|process| process.child.id());
+                    let idle_timeout_ms = service.file.idle_timeout_ms;
+                    let mut process = service
+                        .process
+                        .take()
+                        .expect("running process checked immediately above");
+                    service.restart_attempts = 0;
+                    service.exit_observed = false;
+                    service.restarting = false;
+                    stop_process(&name, &mut process).await;
+                    tracing::info!(
+                        service = %name,
+                        ?pid,
+                        idle_timeout_ms,
+                        "service entered dormant state after idle timeout"
+                    );
+                }
+                continue;
+            }
+
+            let status = status.expect("status checked above");
+            let old_pid = service
+                .process
+                .as_ref()
+                .map(|process| process.ready.pid)
+                .unwrap_or_default();
+
+            if service.exit_observed {
+                continue;
+            }
+
+            if !should_restart(service.file.restart, status.success()) {
+                service.exit_observed = true;
+                service.restarting = false;
+                if let Some(process) = service.process.as_ref() {
+                    let _ = std::fs::remove_file(&process.alias);
+                }
+                tracing::warn!(
+                    service = %service.file.name,
+                    pid = old_pid,
+                    %status,
+                    restart = ?service.file.restart,
+                    "service process exited and restart policy leaves it stopped"
+                );
+                continue;
+            }
+
+            let stable = service
+                .process
+                .as_ref()
+                .map(|process| process.started_at.elapsed() >= SERVICE_STABLE_WINDOW)
+                .unwrap_or(false);
+            if stable {
+                service.restart_attempts = 0;
+            }
+            service.restart_attempts = service.restart_attempts.saturating_add(1);
+            let attempt = service.restart_attempts;
+            let delay = restart_delay(attempt, max_restart_backoff);
+            let file = service.file.clone();
+            service.restarting = true;
+            tracing::warn!(
+                service = %file.name,
+                pid = old_pid,
+                %status,
+                attempt,
+                backoff_ms = delay.as_millis() as u64,
+                "service process exited; scheduling restart"
+            );
+            drop(service);
+
+            tokio::time::sleep(delay).await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+
+            match spawn_process(&file).await {
+                Ok(mut replacement) => {
+                    let new_pid = replacement.ready.pid;
+                    let mut service = handle.lock().await;
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        drop(service);
+                        stop_process(&file.name, &mut replacement).await;
+                        return;
+                    }
+                    service.process = Some(replacement);
+                    service.restart_attempts = attempt;
+                    service.exit_observed = false;
+                    service.restarting = false;
+                    service.last_activity = Instant::now();
+                    tracing::info!(
+                        service = %file.name,
+                        old_pid,
+                        new_pid,
+                        attempt,
+                        "service process restarted"
+                    );
+                }
+                Err(error) => {
+                    let mut service = handle.lock().await;
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        return;
+                    }
+                    service.restart_attempts = attempt;
+                    service.restarting = true;
+                    tracing::error!(
+                        service = %file.name,
+                        attempt,
+                        error = %error,
+                        "service restart attempt failed"
+                    );
+                }
+            }
+        }
+    }
+
+    pub async fn call(
+        &self,
+        service_name: &str,
+        function: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, ServiceCallError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ServiceCallError::Unavailable {
+                service: service_name.to_string(),
+            });
+        }
+
+        let handle = self
+            .services
+            .read()
+            .await
+            .get(service_name)
+            .cloned()
+            .ok_or_else(|| ServiceCallError::Unknown {
+                service: service_name.to_string(),
+            })?;
+
+        let (address, token) = {
+            let mut service = handle.lock().await;
+            self.activate_for_call(&mut service).await?;
+            let process = service
+                .process
+                .as_ref()
+                .ok_or_else(|| ServiceCallError::Unavailable {
+                    service: service_name.to_string(),
+                })?;
+            let address = process.ready.address;
+            let token = process.token.clone();
+            service.active_calls = service.active_calls.saturating_add(1);
+            service.last_activity = Instant::now();
+            (address, token)
+        };
+
+        let response = rpc(
+            address,
+            ServiceRequest::Call {
+                token,
+                function: function.to_string(),
+                args,
+            },
+        )
+        .await;
+
+        {
+            let mut service = handle.lock().await;
+            service.active_calls = service.active_calls.saturating_sub(1);
+            service.last_activity = Instant::now();
+        }
+
+        let response = response.map_err(|error| ServiceCallError::Ipc {
+            service: service_name.to_string(),
+            message: error.to_string(),
+        })?;
+        map_call_response(service_name, response)
+    }
+
+    async fn activate_for_call(&self, service: &mut Managed) -> Result<(), ServiceCallError> {
+        let service_name = service.file.name.clone();
+        let running = match service.process.as_mut() {
+            None => false,
+            Some(process) => match process.child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(_)) => false,
+                Err(error) => {
+                    return Err(ServiceCallError::Inspect {
+                        service: service_name,
+                        message: error.to_string(),
+                    });
+                }
+            },
+        };
+        if running {
+            return Ok(());
+        }
+
+        if !service.wakeable() {
+            return Err(ServiceCallError::Unavailable {
+                service: service.file.name.clone(),
+            });
+        }
+
+        let file = service.file.clone();
+        service.restarting = true;
+        match spawn_process(&file).await {
+            Ok(process) => {
+                let pid = process.ready.pid;
+                service.process = Some(process);
+                service.restart_attempts = 0;
+                service.exit_observed = false;
+                service.restarting = false;
+                service.last_activity = Instant::now();
+                tracing::info!(
+                    service = %file.name,
+                    pid,
+                    mode = ?file.mode,
+                    "service activated on demand"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                service.restarting = false;
+                Err(ServiceCallError::Activation {
+                    service: file.name,
+                    message: error.to_string(),
+                })
+            }
+        }
+    }
+
+    pub async fn snapshot(&self) -> Vec<ServiceSnapshot> {
+        let handles = self
+            .services
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+        for handle in handles {
+            let mut service = handle.lock().await;
+            let (pid, state) = match service.process.as_mut() {
+                None if service.restarting => (None, ServiceRuntimeState::Restarting),
+                None if service.wakeable() && !service.exit_observed => {
+                    (None, ServiceRuntimeState::Dormant)
+                }
+                None => (None, ServiceRuntimeState::Stopped),
+                Some(process) => match process.child.try_wait() {
+                    Ok(None) => (process.child.id(), ServiceRuntimeState::Running),
+                    Ok(Some(status)) if service.restarting => {
+                        (None, ServiceRuntimeState::Restarting)
+                    }
+                    Ok(Some(status))
+                        if service.exit_observed
+                            || !should_restart(service.file.restart, status.success()) =>
+                    {
+                        (None, ServiceRuntimeState::Stopped)
+                    }
+                    Ok(Some(_)) => (None, ServiceRuntimeState::Restarting),
+                    Err(_) => (None, ServiceRuntimeState::Unknown),
+                },
+            };
+            out.push(ServiceSnapshot {
+                name: service.file.name.clone(),
+                title: service.file.title.clone(),
+                pid,
+                state,
+                mode: service.file.mode,
+                restart: service.file.restart,
+                restart_attempts: service.restart_attempts,
+                idle_timeout_ms: service.file.idle_timeout_ms,
+            });
+        }
+        out.sort_by(|left, right| left.name.cmp(&right.name));
+        out
+    }
+
+    pub async fn shutdown_all(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let handles = self
+            .services
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let mut service = handle.lock().await;
+            if let Some(mut process) = service.process.take() {
+                stop_process(&service.file.name, &mut process).await;
+            }
+            service.exit_observed = true;
+            service.restarting = false;
+        }
+    }
+}
+
+fn map_call_response(
+    service_name: &str,
+    response: ServiceResponse,
+) -> Result<Value, ServiceCallError> {
+    match response {
+        ServiceResponse::Ok { value } => Ok(value),
+        ServiceResponse::Error { code, message } => Err(ServiceCallError::Remote {
+            service: service_name.to_string(),
+            code,
+            message,
+        }),
+    }
+}
+
+fn should_restart(policy: RestartPolicy, success: bool) -> bool {
+    match policy {
+        RestartPolicy::Always => true,
+        RestartPolicy::OnFailure => !success,
+        RestartPolicy::Never => false,
+    }
+}
+
+fn restart_delay(attempt: u32, maximum: Duration) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(16);
+    let factor = 1u32 << exponent;
+    Duration::from_millis(RESTART_BASE_DELAY_MS)
+        .saturating_mul(factor)
+        .min(maximum)
+}
+
+async fn stop_process(service_name: &str, process: &mut ServiceProcess) {
+    let _ = rpc(
+        process.ready.address,
+        ServiceRequest::Shutdown {
+            token: process.token.clone(),
+        },
+    )
+    .await;
+    match tokio::time::timeout(Duration::from_secs(3), process.child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(
+            service = %service_name,
+            error = %error,
+            "failed while waiting for service shutdown"
+        ),
+        Err(_) => {
+            let _ = process.child.kill().await;
+            let _ = process.child.wait().await;
+        }
+    }
+    let _ = std::fs::remove_file(&process.alias);
+}
+
+async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
+    let exe = std::env::current_exe().context("resolve backend executable")?;
+    let parent = exe.parent().context("backend executable has no parent")?;
+    let dir = parent.join(".runtime/process");
+    std::fs::create_dir_all(&dir)?;
+    let extension = exe
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let alias = dir.join(format!(
+        "rbe-service-{}-parent-{}{}",
+        process_name(&file.name),
+        std::process::id(),
+        extension
+    ));
+    let _ = std::fs::remove_file(&alias);
+    if std::fs::hard_link(&exe, &alias).is_err() {
+        std::fs::copy(&exe, &alias)?;
+    }
+
+    let token = random_token();
+    let mut child = match Command::new(&alias)
+        .args(["--service-host", "--service-file"])
+        .arg(&file.path)
+        .arg("--service-token")
+        .arg(&token)
+        .current_dir(parent)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&alias);
+            return Err(error.into());
+        }
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            anyhow::bail!("service {:?} stdout unavailable", file.name);
+        }
+    };
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let bytes = match tokio::time::timeout(
+        Duration::from_millis(file.startup_timeout_ms.max(1)),
+        reader.read_line(&mut line),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            return Err(error.into());
+        }
+        Err(_) => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            anyhow::bail!("service {:?} startup timeout", file.name);
+        }
+    };
+    if bytes == 0 {
+        cleanup_failed_spawn(&alias, &mut child).await;
+        anyhow::bail!("service {:?} exited before readiness", file.name);
+    }
+    let ready: ServiceReady = match serde_json::from_str(line.trim()) {
+        Ok(ready) => ready,
+        Err(error) => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            return Err(error.into());
+        }
+    };
+    if ready.service != file.name {
+        cleanup_failed_spawn(&alias, &mut child).await;
+        anyhow::bail!("service readiness identity mismatch");
+    }
+
+    let service_name = file.name.clone();
+    tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => return,
+                Ok(_) => {
+                    let output = line.trim_end();
+                    if !output.is_empty() {
+                        tracing::info!(service = %service_name, %output, ".service stdout");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(service = %service_name, %error, "failed to drain .service stdout");
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(ServiceProcess {
+        child,
+        alias,
+        ready,
+        token,
+        started_at: Instant::now(),
+    })
+}
+
+async fn cleanup_failed_spawn(alias: &PathBuf, child: &mut Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = std::fs::remove_file(alias);
+}
+
+fn process_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<ServiceResponse> {
+    let stream = TcpStream::connect(address).await?;
+    let (read, mut write) = stream.into_split();
+    write
+        .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
+        .await?;
+    write.shutdown().await?;
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .map_err(|_| anyhow::anyhow!("service IPC timeout"))??;
+    Ok(serde_json::from_str(line.trim())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_policy_distinguishes_clean_and_failed_exits() {
+        assert!(should_restart(RestartPolicy::Always, true));
+        assert!(should_restart(RestartPolicy::Always, false));
+        assert!(!should_restart(RestartPolicy::OnFailure, true));
+        assert!(should_restart(RestartPolicy::OnFailure, false));
+        assert!(!should_restart(RestartPolicy::Never, false));
+    }
+
+    #[test]
+    fn restart_backoff_is_exponential_and_capped() {
+        let maximum = Duration::from_secs(30);
+        assert_eq!(restart_delay(1, maximum), Duration::from_millis(250));
+        assert_eq!(restart_delay(2, maximum), Duration::from_millis(500));
+        assert_eq!(restart_delay(3, maximum), Duration::from_millis(1_000));
+        assert_eq!(restart_delay(32, maximum), maximum);
+    }
+
+    #[tokio::test]
+    async fn unknown_service_call_is_typed() {
+        let error = ServiceManager::default()
+            .call("missing", "get", Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceCallError::Unknown { service } if service == "missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn on_demand_service_snapshot_is_dormant() {
+        let manager = ServiceManager::default();
+        let file = ServiceFile {
+            path: PathBuf::from("test.service"),
+            name: "lazy".into(),
+            title: "Lazy".into(),
+            mode: ServiceMode::OnDemand,
+            restart: RestartPolicy::OnFailure,
+            memory_limit_mb: 64,
+            startup_timeout_ms: 1_000,
+            idle_timeout_ms: 5_000,
+            imports: Vec::new(),
+            exports: vec!["get".into()],
+        };
+        manager.services.write().await.insert(
+            file.name.clone(),
+            Arc::new(Mutex::new(Managed::dormant(file))),
+        );
+
+        let snapshots = manager.snapshot().await;
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].state, ServiceRuntimeState::Dormant);
+        assert_eq!(snapshots[0].mode, ServiceMode::OnDemand);
+        assert!(snapshots[0].pid.is_none());
+    }
+}
