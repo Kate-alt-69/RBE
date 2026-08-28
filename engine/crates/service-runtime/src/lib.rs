@@ -5,8 +5,9 @@ use std::io::{IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rand::RngCore;
@@ -42,6 +43,8 @@ pub struct ServiceFile {
 pub struct ServiceDefaults {
     pub memory_limit_mb: u64,
     pub startup_timeout_ms: u64,
+    pub monitor_interval_ms: u64,
+    pub max_restart_backoff_ms: u64,
 }
 
 impl Default for ServiceDefaults {
@@ -49,6 +52,8 @@ impl Default for ServiceDefaults {
         Self {
             memory_limit_mb: 256,
             startup_timeout_ms: 10_000,
+            monitor_interval_ms: 1_000,
+            max_restart_backoff_ms: 30_000,
         }
     }
 }
@@ -104,6 +109,8 @@ impl std::error::Error for ServiceCompileErrors {}
 #[derive(Debug, Clone)]
 pub struct ServiceCatalog {
     services: Vec<ServiceFile>,
+    monitor_interval_ms: u64,
+    max_restart_backoff_ms: u64,
 }
 
 impl ServiceCatalog {
@@ -143,7 +150,11 @@ impl ServiceCatalog {
         }
 
         if errors.is_empty() {
-            Ok(Self { services })
+            Ok(Self {
+                services,
+                monitor_interval_ms: defaults.monitor_interval_ms,
+                max_restart_backoff_ms: defaults.max_restart_backoff_ms,
+            })
         } else {
             Err(ServiceCompileErrors(errors))
         }
@@ -464,17 +475,24 @@ pub enum ServiceResponse {
     Error { code: String, message: String },
 }
 
+const RESTART_BASE_DELAY_MS: u64 = 250;
+const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
+
 struct Managed {
     file: ServiceFile,
     child: Child,
     alias: PathBuf,
     ready: ServiceReady,
     token: String,
+    started_at: Instant,
+    restart_attempts: u32,
+    exit_observed: bool,
 }
 
 #[derive(Clone, Default)]
 pub struct ServiceManager {
     services: Arc<AsyncRwLock<HashMap<String, Arc<Mutex<Managed>>>>>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -495,7 +513,132 @@ impl ServiceManager {
                 .await
                 .insert(file.name.clone(), Arc::new(Mutex::new(managed)));
         }
+        if !catalog.services().is_empty() {
+            manager.start_monitor(
+                Duration::from_millis(catalog.monitor_interval_ms.max(50)),
+                Duration::from_millis(catalog.max_restart_backoff_ms.max(RESTART_BASE_DELAY_MS)),
+            );
+        }
         Ok(manager)
+    }
+
+    fn start_monitor(&self, interval: Duration, max_restart_backoff: Duration) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager.monitor_loop(interval, max_restart_backoff).await;
+        });
+    }
+
+    async fn monitor_loop(&self, interval: Duration, max_restart_backoff: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+
+            let handles = self
+                .services
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+
+            for handle in handles {
+                if self.shutting_down.load(Ordering::Acquire) {
+                    return;
+                }
+
+                let mut service = handle.lock().await;
+                let status = match service.child.try_wait() {
+                    Ok(Some(status)) => status,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            service = %service.file.name,
+                            error = %error,
+                            "failed to inspect .service child status"
+                        );
+                        continue;
+                    }
+                };
+
+                if service.exit_observed {
+                    continue;
+                }
+
+                let restart = should_restart(service.file.restart, status.success());
+                if !restart {
+                    service.exit_observed = true;
+                    tracing::warn!(
+                        service = %service.file.name,
+                        pid = service.ready.pid,
+                        %status,
+                        restart = ?service.file.restart,
+                        "service process exited and restart policy leaves it stopped"
+                    );
+                    continue;
+                }
+
+                if service.started_at.elapsed() >= SERVICE_STABLE_WINDOW {
+                    service.restart_attempts = 0;
+                }
+                service.restart_attempts = service.restart_attempts.saturating_add(1);
+                let attempt = service.restart_attempts;
+                let delay = restart_delay(attempt, max_restart_backoff);
+                let file = service.file.clone();
+                let old_pid = service.ready.pid;
+                service.started_at = Instant::now();
+                tracing::warn!(
+                    service = %file.name,
+                    pid = old_pid,
+                    %status,
+                    attempt,
+                    backoff_ms = delay.as_millis() as u64,
+                    "service process exited; scheduling restart"
+                );
+                drop(service);
+
+                tokio::time::sleep(delay).await;
+                if self.shutting_down.load(Ordering::Acquire) {
+                    return;
+                }
+
+                match spawn(file.clone()).await {
+                    Ok(mut replacement) => {
+                        replacement.restart_attempts = attempt;
+                        let new_pid = replacement.ready.pid;
+                        let service = handle.lock().await;
+                        if self.shutting_down.load(Ordering::Acquire) {
+                            drop(service);
+                            stop_managed(&mut replacement).await;
+                            return;
+                        }
+                        drop(service);
+                        let mut service = handle.lock().await;
+                        *service = replacement;
+                        tracing::info!(
+                            service = %file.name,
+                            old_pid,
+                            new_pid,
+                            attempt,
+                            "service process restarted"
+                        );
+                    }
+                    Err(error) => {
+                        let mut service = handle.lock().await;
+                        service.restart_attempts = attempt;
+                        service.started_at = Instant::now();
+                        tracing::error!(
+                            service = %file.name,
+                            attempt,
+                            error = %error,
+                            "service restart attempt failed"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     pub async fn snapshot(&self) -> Vec<ServiceSnapshot> {
@@ -521,6 +664,7 @@ impl ServiceManager {
     }
 
     pub async fn shutdown_all(&self) {
+        self.shutting_down.store(true, Ordering::Release);
         let handles = self
             .services
             .read()
@@ -530,22 +674,48 @@ impl ServiceManager {
             .collect::<Vec<_>>();
         for handle in handles {
             let mut service = handle.lock().await;
-            let _ = rpc(
-                service.ready.address,
-                ServiceRequest::Shutdown {
-                    token: service.token.clone(),
-                },
-            )
-            .await;
-            if tokio::time::timeout(Duration::from_secs(3), service.child.wait())
-                .await
-                .is_err()
-            {
-                let _ = service.child.kill().await;
-            }
-            let _ = std::fs::remove_file(&service.alias);
+            stop_managed(&mut service).await;
         }
     }
+}
+
+fn should_restart(policy: RestartPolicy, success: bool) -> bool {
+    match policy {
+        RestartPolicy::Always => true,
+        RestartPolicy::OnFailure => !success,
+        RestartPolicy::Never => false,
+    }
+}
+
+fn restart_delay(attempt: u32, maximum: Duration) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(16);
+    let factor = 1u32 << exponent;
+    Duration::from_millis(RESTART_BASE_DELAY_MS)
+        .saturating_mul(factor)
+        .min(maximum)
+}
+
+async fn stop_managed(service: &mut Managed) {
+    let _ = rpc(
+        service.ready.address,
+        ServiceRequest::Shutdown {
+            token: service.token.clone(),
+        },
+    )
+    .await;
+    match tokio::time::timeout(Duration::from_secs(3), service.child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(
+            service = %service.file.name,
+            error = %error,
+            "failed while waiting for service shutdown"
+        ),
+        Err(_) => {
+            let _ = service.child.kill().await;
+            let _ = service.child.wait().await;
+        }
+    }
+    let _ = std::fs::remove_file(&service.alias);
 }
 
 async fn spawn(file: ServiceFile) -> anyhow::Result<Managed> {
@@ -602,6 +772,9 @@ async fn spawn(file: ServiceFile) -> anyhow::Result<Managed> {
         alias,
         ready,
         token,
+        started_at: Instant::now(),
+        restart_attempts: 0,
+        exit_observed: false,
     })
 }
 
@@ -775,5 +948,23 @@ mod tests {
         let memory = ServiceMemory::default();
         memory.set("x".into(), serde_json::json!(7));
         assert_eq!(memory.get("x"), Some(serde_json::json!(7)));
+    }
+
+    #[test]
+    fn restart_policy_distinguishes_clean_and_failed_exits() {
+        assert!(should_restart(RestartPolicy::Always, true));
+        assert!(should_restart(RestartPolicy::Always, false));
+        assert!(!should_restart(RestartPolicy::OnFailure, true));
+        assert!(should_restart(RestartPolicy::OnFailure, false));
+        assert!(!should_restart(RestartPolicy::Never, false));
+    }
+
+    #[test]
+    fn restart_backoff_is_exponential_and_capped() {
+        let maximum = Duration::from_secs(30);
+        assert_eq!(restart_delay(1, maximum), Duration::from_millis(250));
+        assert_eq!(restart_delay(2, maximum), Duration::from_millis(500));
+        assert_eq!(restart_delay(3, maximum), Duration::from_millis(1_000));
+        assert_eq!(restart_delay(32, maximum), maximum);
     }
 }

@@ -13,7 +13,9 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("backend --service-host requires --service-file <path>"))?;
     let token = value("--service-token")
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("backend --service-host requires --service-token <token>"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("backend --service-host requires --service-token <token>")
+        })?;
 
     // Service children load the same typed settings as the mother process so
     // configurable defaults stay consistent even when the .service file omits
@@ -24,6 +26,8 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let defaults = ServiceDefaults {
         memory_limit_mb: config.services.default_memory_limit_mb,
         startup_timeout_ms: config.services.startup_timeout_ms,
+        monitor_interval_ms: config.services.monitor_interval_ms,
+        max_restart_backoff_ms: config.services.max_restart_backoff_ms,
     };
     service_runtime::run_service_host(service_file, token, defaults).await
 }
@@ -41,6 +45,8 @@ pub fn compile(
     let defaults = ServiceDefaults {
         memory_limit_mb: settings.default_memory_limit_mb,
         startup_timeout_ms: settings.startup_timeout_ms,
+        monitor_interval_ms: settings.monitor_interval_ms,
+        max_restart_backoff_ms: settings.max_restart_backoff_ms,
     };
     match ServiceCatalog::compile_dir(&directory, defaults) {
         Ok(catalog) => {
@@ -65,7 +71,9 @@ pub fn compile(
                     "failed to persist service compiler diagnostics"
                 );
             }
-            eprintln!("backend couldn't start because a .service file failed to compile:\n{rendered}");
+            eprintln!(
+                "backend couldn't start because a .service file failed to compile:\n{rendered}"
+            );
             eprintln!("compiler log: {}", error_path.display());
             service_runtime::pause_for_interactive_exit();
             Err(anyhow::anyhow!(".service compilation failed"))
@@ -81,7 +89,10 @@ pub async fn start(catalog: Option<&ServiceCatalog>) -> anyhow::Result<ServiceMa
     let snapshots = manager.snapshot().await;
     tracing::info!(
         services = snapshots.len(),
-        running = snapshots.iter().filter(|service| service.pid.is_some()).count(),
+        running = snapshots
+            .iter()
+            .filter(|service| service.pid.is_some())
+            .count(),
         "user .service processes ready"
     );
     Ok(manager)
