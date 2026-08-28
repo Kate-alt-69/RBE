@@ -16,6 +16,7 @@ mod discovery;
 mod interpreter;
 mod lexer;
 mod modules;
+mod module_runtime;
 mod parser;
 mod paths;
 mod terminal;
@@ -25,10 +26,11 @@ pub mod transpiled_support;
 pub mod transpiler;
 
 pub use analyzer::{analyze, Diagnostic, Severity};
-pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement, Value};
+pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, Statement, Value};
 pub use discovery::{build_routes, RouteCache};
 pub use interpreter::{EvalError, Interpreter, RequestContext};
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
+pub use module_runtime::{ModuleCompileError, ModuleCompileErrors, ModuleProgram};
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
 
 #[cfg(test)]
@@ -63,6 +65,22 @@ mod tests {
         assert_eq!(file.functions[0].name, "makeResponse");
         assert_eq!(file.functions[0].params, vec!["value"]);
         assert_eq!(file.methods[0].verb, "get");
+    }
+
+    #[test]
+    fn parses_module_exports() {
+        let tokens = Lexer::new(
+            r#":import[net]
+            function hidden(value) { return value; }
+            export async function visible(value) { return hidden(value); }"#,
+        )
+        .tokenize()
+        .expect("lex failed");
+        let file = Parser::new(tokens)
+            .parse_module_file()
+            .expect("module parse failed");
+        assert_eq!(file.functions.len(), 2);
+        assert_eq!(file.exports, vec!["visible"]);
     }
 
     #[test]

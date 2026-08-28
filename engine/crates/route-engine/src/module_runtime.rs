@@ -167,13 +167,15 @@ fn load_one(path: &Path) -> Result<ModuleFile, ModuleCompileError> {
         column: 0,
         message: format!("module is not valid UTF-8: {error}"),
     })?;
-    let tokens = Lexer::new(&source).tokenize().map_err(|error| ModuleCompileError {
-        code: "MOD1100",
-        path: path.to_path_buf(),
-        line: error.line,
-        column: error.column,
-        message: error.message,
-    })?;
+    let tokens = Lexer::new(&source)
+        .tokenize()
+        .map_err(|error| ModuleCompileError {
+            code: "MOD1100",
+            path: path.to_path_buf(),
+            line: error.line,
+            column: error.column,
+            message: error.message,
+        })?;
     Parser::new(tokens)
         .parse_module_file()
         .map_err(|error| ModuleCompileError {
@@ -292,14 +294,7 @@ fn detect_cycles(graph: &HashMap<PathBuf, Vec<PathBuf>>, errors: &mut Vec<Module
     let mut stack = Vec::new();
     let mut reported = HashSet::new();
     for node in graph.keys() {
-        visit(
-            node,
-            graph,
-            &mut states,
-            &mut stack,
-            &mut reported,
-            errors,
-        );
+        visit(node, graph, &mut states, &mut stack, &mut reported, errors);
     }
 }
 

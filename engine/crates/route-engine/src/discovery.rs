@@ -126,9 +126,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             }
             serde_json::Value::Object(obj)
         }
-        Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
-        }
+        Value::Array(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
     }
 }
 
@@ -137,7 +135,11 @@ fn append_runtime_error(path: &str, error: &str) {
     if let Some(parent) = error_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&error_path) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&error_path)
+    {
         let _ = writeln!(file, "E4000: route evaluation failed at {path}: {error}");
     }
 }
@@ -225,7 +227,9 @@ fn build_method_router(
 }
 
 fn compiler_error_path() -> PathBuf {
-    PathBuf::from("data").join("admin").join("compiler-error.txt")
+    PathBuf::from("data")
+        .join("admin")
+        .join("compiler-error.txt")
 }
 
 fn find_symbol_location(source: &str, symbol: Option<&str>) -> (usize, usize) {
@@ -258,7 +262,11 @@ fn frame_diagnostic_with_symbol(
     let lines: Vec<&str> = source.lines().collect();
     let start = line.saturating_sub(1);
     let end = (start + 4).min(lines.len());
-    let line_numbers = if end > start { end.to_string().len() } else { 1 };
+    let line_numbers = if end > start {
+        end.to_string().len()
+    } else {
+        1
+    };
     let content_width = terminal_width.saturating_sub(line_numbers + 8).max(24);
     let border = "#".repeat(content_width + line_numbers + 7);
     let mut out = String::new();
@@ -326,7 +334,10 @@ fn render_diagnostic_reports(reports: &[FileDiagnosticReport]) {
 /// three work units: parse, semantic analysis, and Rust artifact generation.
 /// Syntax/semantic errors are accumulated across the entire tree and written
 /// to `data/admin/compiler-error.txt` before boot is allowed to continue.
-fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Arc<RouteFile>)>> {
+fn boot_compile(
+    _api_dir: &Path,
+    files: &[PathBuf],
+) -> anyhow::Result<Vec<(PathBuf, Arc<RouteFile>)>> {
     let error_path = compiler_error_path();
     if let Some(parent) = error_path.parent() {
         fs::create_dir_all(parent)?;
@@ -361,7 +372,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 report.details.push(detail.clone());
                 report.error_details.push(detail);
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
                 reports.push(report);
                 continue;
             }
@@ -375,7 +392,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 report.details.push(detail.clone());
                 report.error_details.push(detail);
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
                 reports.push(report);
                 continue;
             }
@@ -397,7 +420,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 report.details.push(detail.clone());
                 report.error_details.push(detail);
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
                 reports.push(report);
                 continue;
             }
@@ -405,7 +434,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
 
         let (file_opt, parse_errors) = Parser::new(tokens).parse_file_collecting();
         done += 1;
-        terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Parsing",
+            done,
+            total_units,
+        );
 
         for error in &parse_errors {
             let detail = frame_diagnostic_with_symbol(
@@ -424,28 +459,54 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
 
         let Some(file) = file_opt else {
             done += 2;
-            terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+            terminal.render(
+                files.len(),
+                Some(&display_path),
+                "Parsing",
+                done,
+                total_units,
+            );
             reports.push(report);
             continue;
         };
 
         if report.errors > 0 {
             done += 2;
-            terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+            terminal.render(
+                files.len(),
+                Some(&display_path),
+                "Parsing",
+                done,
+                total_units,
+            );
             reports.push(report);
             continue;
         }
 
         let file = Arc::new(file);
-        terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Semantic",
+            done,
+            total_units,
+        );
 
         let diagnostics = analyze(&file);
-        report.errors += diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-        report.warnings = diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+        report.errors += diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        report.warnings = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
 
         for diagnostic in &diagnostics {
             let message = if matches!(diagnostic.code, "E3010" | "E3011") {
-                diagnostic.message.replace("from the route file", &format!("from {}", path.display()))
+                diagnostic
+                    .message
+                    .replace("from the route file", &format!("from {}", path.display()))
             } else {
                 diagnostic.message.clone()
             };
@@ -465,16 +526,34 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
         }
 
         done += 1;
-        terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Semantic",
+            done,
+            total_units,
+        );
 
         if report.errors > 0 {
             done += 1;
-            terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
+            terminal.render(
+                files.len(),
+                Some(&display_path),
+                "Semantic",
+                done,
+                total_units,
+            );
             reports.push(report);
             continue;
         }
 
-        terminal.render(files.len(), Some(&display_path), "Generating", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Generating",
+            done,
+            total_units,
+        );
         let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
         match transpile_file(&file, &path.to_string_lossy(), &module_names) {
             Ok(_) => {
@@ -497,7 +576,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 done += 1;
             }
         }
-        terminal.render(files.len(), Some(&display_path), "Generating", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Generating",
+            done,
+            total_units,
+        );
 
         if report.errors > 0 || report.warnings > 0 {
             reports.push(report);
@@ -533,6 +618,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
 /// and only then constructs the Axum router. A broken route fails the boot,
 /// but errors from every file are collected into compiler-error.txt first.
 pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
+    let module_program = crate::module_runtime::ModuleProgram::load_default()?;
+    tracing::info!(
+        modules = module_program.len(),
+        module_dir = %module_program.module_dir().display(),
+        "validated .module files"
+    );
+
     let mut files = Vec::new();
     collect_route_files(api_dir, &mut files)?;
     files.sort();
@@ -542,13 +634,8 @@ pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
 
     for (path, route_file) in compiled {
         let url_path = url_path_for(api_dir, &path);
-        let module_names: Arc<Vec<String>> = Arc::new(
-            route_file
-                .imports
-                .iter()
-                .map(binding_name)
-                .collect(),
-        );
+        let module_names: Arc<Vec<String>> =
+            Arc::new(route_file.imports.iter().map(binding_name).collect());
         let modules = Arc::new(ModuleRegistry::from_imports(&route_file.imports));
 
         tracing::info!(

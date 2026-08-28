@@ -1,7 +1,9 @@
 //! Recursive-descent / precedence parser for the RBE `.route` language.
 //! The parser is intentionally strict and reports line/column information.
 
-use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement};
+use crate::ast::{
+    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, Statement,
+};
 use crate::lexer::{Token, TokenKind};
 
 const KNOWN_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
@@ -19,7 +21,9 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self { Self { tokens, pos: 0 } }
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens, pos: 0 }
+    }
 
     pub fn parse_file(self) -> Result<RouteFile, ParseError> {
         let (file, errors) = self.parse_file_collecting();
@@ -30,6 +34,41 @@ impl Parser {
             message: "route file did not produce an AST".to_string(),
             line: 0,
             column: 0,
+        })
+    }
+
+    pub fn parse_module_file(mut self) -> Result<ModuleFile, ParseError> {
+        let mut imports = Vec::new();
+        while self.check(&TokenKind::Colon) {
+            imports.extend(self.parse_imports()?);
+        }
+
+        let mut functions = Vec::new();
+        let mut exports = Vec::new();
+        while !self.check(&TokenKind::Eof) {
+            let exported = self.is_export_keyword();
+            if exported {
+                self.advance();
+            }
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
+            if !self.check(&TokenKind::Function) {
+                return Err(
+                    self.error_here("expected `function` or `export function` in .module file")
+                );
+            }
+            let function = self.parse_function()?;
+            if exported {
+                exports.push(function.name.clone());
+            }
+            functions.push(function);
+        }
+
+        Ok(ModuleFile {
+            imports,
+            functions,
+            exports,
         })
     }
 
@@ -68,7 +107,15 @@ impl Parser {
             errors.push(self.error_here("unexpected content after Route class"));
         }
 
-        (Some(RouteFile { imports, functions, class_name, methods }), errors)
+        (
+            Some(RouteFile {
+                imports,
+                functions,
+                class_name,
+                methods,
+            }),
+            errors,
+        )
     }
 
     fn parse_imports(&mut self) -> Result<Vec<ImportTarget>, ParseError> {
@@ -80,7 +127,9 @@ impl Parser {
         loop {
             if self.check(&TokenKind::RBracket) {
                 if entries.is_empty() {
-                    return Err(self.error_here("expected at least one import entry inside :import[...]"));
+                    return Err(
+                        self.error_here("expected at least one import entry inside :import[...]")
+                    );
                 }
                 self.advance();
                 break;
@@ -90,7 +139,10 @@ impl Parser {
             let target = if self.is_as_keyword() {
                 self.advance();
                 let alias = self.expect_ident()?;
-                ImportTarget::Aliased { target: Box::new(target), alias }
+                ImportTarget::Aliased {
+                    target: Box::new(target),
+                    alias,
+                }
             } else {
                 target
             };
@@ -117,7 +169,10 @@ impl Parser {
                 if self.check(&TokenKind::Dot) {
                     self.advance();
                     let function = self.expect_ident()?;
-                    Ok(ImportTarget::BuiltinFunction { module: name, function })
+                    Ok(ImportTarget::BuiltinFunction {
+                        module: name,
+                        function,
+                    })
                 } else if let Some((prefix, module_name)) = name.split_once('&') {
                     if prefix != "module" {
                         return Err(self.error_here("only module&name shorthand is supported"));
@@ -128,7 +183,10 @@ impl Parser {
                 }
             }
             TokenKind::String(path) => {
-                if self.check(&TokenKind::RBracket) || self.check(&TokenKind::Comma) || self.is_as_keyword() {
+                if self.check(&TokenKind::RBracket)
+                    || self.check(&TokenKind::Comma)
+                    || self.is_as_keyword()
+                {
                     Ok(ImportTarget::Custom(path))
                 } else {
                     self.expect(TokenKind::Dot)?;
@@ -140,6 +198,13 @@ impl Parser {
                 "expected builtin identifier or string path inside :import[...], got {other:?}"
             ))),
         }
+    }
+
+    fn is_export_keyword(&self) -> bool {
+        matches!(
+            self.tokens.get(self.pos).map(|token| &token.kind),
+            Some(TokenKind::Ident(name)) if name == "export"
+        )
     }
 
     fn is_as_keyword(&self) -> bool {
@@ -185,7 +250,9 @@ impl Parser {
 
         let mut methods = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            if self.check(&TokenKind::Async) { self.advance(); }
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
             let method_name = self.expect_ident()?;
             let verb = method_name.to_lowercase();
             if !KNOWN_VERBS.contains(&verb.as_str()) {
@@ -196,16 +263,25 @@ impl Parser {
 
             let params = self.parse_params()?;
             if params.len() > 1 {
-                return Err(self.error_here("route methods currently accept zero or one request parameter"));
+                return Err(
+                    self.error_here("route methods currently accept zero or one request parameter")
+                );
             }
             let body = self.parse_block()?;
-            methods.push(MethodDef { verb, param_name: params.into_iter().next(), body });
+            methods.push(MethodDef {
+                verb,
+                param_name: params.into_iter().next(),
+                body,
+            });
         }
         self.expect(TokenKind::RBrace)?;
         Ok((name, methods))
     }
 
-    fn parse_class_collecting(&mut self, errors: &mut Vec<ParseError>) -> Option<(String, Vec<MethodDef>)> {
+    fn parse_class_collecting(
+        &mut self,
+        errors: &mut Vec<ParseError>,
+    ) -> Option<(String, Vec<MethodDef>)> {
         if let Err(error) = self.expect(TokenKind::Class) {
             errors.push(error);
             return None;
@@ -224,7 +300,9 @@ impl Parser {
 
         let mut methods = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            if self.check(&TokenKind::Async) { self.advance(); }
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
             let method_name = match self.expect_ident() {
                 Ok(name) => name,
                 Err(error) => {
@@ -251,7 +329,9 @@ impl Parser {
                 }
             };
             if params.len() > 1 {
-                errors.push(self.error_here("route methods currently accept zero or one request parameter"));
+                errors.push(
+                    self.error_here("route methods currently accept zero or one request parameter"),
+                );
                 self.recover_class_member();
                 continue;
             }
@@ -259,7 +339,11 @@ impl Parser {
                 self.recover_class_member();
                 continue;
             };
-            methods.push(MethodDef { verb, param_name: params.into_iter().next(), body });
+            methods.push(MethodDef {
+                verb,
+                param_name: params.into_iter().next(),
+                body,
+            });
         }
 
         if let Err(error) = self.expect(TokenKind::RBrace) {
@@ -275,7 +359,9 @@ impl Parser {
         if !self.check(&TokenKind::RParen) {
             loop {
                 params.push(self.parse_identifier_spelling()?);
-                if !self.check(&TokenKind::Comma) { break; }
+                if !self.check(&TokenKind::Comma) {
+                    break;
+                }
                 self.advance();
             }
         }
@@ -374,16 +460,26 @@ impl Parser {
         } else {
             Vec::new()
         };
-        Ok(Statement::If { condition, then_body, else_body })
+        Ok(Statement::If {
+            condition,
+            then_body,
+            else_body,
+        })
     }
 
-    fn parse_expression(&mut self) -> Result<Expr, ParseError> { self.parse_or() }
+    fn parse_expression(&mut self) -> Result<Expr, ParseError> {
+        self.parse_or()
+    }
 
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_and()?;
         while self.check(&TokenKind::OrOr) {
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op: BinaryOp::Or, right: Box::new(self.parse_and()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op: BinaryOp::Or,
+                right: Box::new(self.parse_and()?),
+            };
         }
         Ok(expr)
     }
@@ -392,7 +488,11 @@ impl Parser {
         let mut expr = self.parse_equality()?;
         while self.check(&TokenKind::AndAnd) {
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op: BinaryOp::And, right: Box::new(self.parse_equality()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op: BinaryOp::And,
+                right: Box::new(self.parse_equality()?),
+            };
         }
         Ok(expr)
     }
@@ -409,7 +509,11 @@ impl Parser {
             };
             let Some(op) = op else { break };
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_comparison()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_comparison()?),
+            };
         }
         Ok(expr)
     }
@@ -426,7 +530,11 @@ impl Parser {
             };
             let Some(op) = op else { break };
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_term()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_term()?),
+            };
         }
         Ok(expr)
     }
@@ -441,7 +549,11 @@ impl Parser {
             };
             let Some(op) = op else { break };
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_factor()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_factor()?),
+            };
         }
         Ok(expr)
     }
@@ -457,7 +569,11 @@ impl Parser {
             };
             let Some(op) = op else { break };
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_unary()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_unary()?),
+            };
         }
         Ok(expr)
     }
@@ -485,7 +601,9 @@ impl Parser {
                     if !self.check(&TokenKind::RParen) {
                         loop {
                             args.push(self.parse_expression()?);
-                            if !self.check(&TokenKind::Comma) { break; }
+                            if !self.check(&TokenKind::Comma) {
+                                break;
+                            }
                             self.advance();
                         }
                     }
@@ -526,9 +644,13 @@ impl Parser {
                 self.expect(TokenKind::Colon)?;
                 let value = self.parse_expression()?;
                 fields.push((key, value));
-                if !self.check(&TokenKind::Comma) { break; }
+                if !self.check(&TokenKind::Comma) {
+                    break;
+                }
                 self.advance();
-                if self.check(&TokenKind::RBrace) { break; }
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
             }
         }
         self.expect(TokenKind::RBrace)?;
@@ -540,9 +662,13 @@ impl Parser {
         if !self.check(&TokenKind::RBracket) {
             loop {
                 items.push(self.parse_expression()?);
-                if !self.check(&TokenKind::Comma) { break; }
+                if !self.check(&TokenKind::Comma) {
+                    break;
+                }
                 self.advance();
-                if self.check(&TokenKind::RBracket) { break; }
+                if self.check(&TokenKind::RBracket) {
+                    break;
+                }
             }
         }
         self.expect(TokenKind::RBracket)?;
@@ -556,17 +682,51 @@ impl Parser {
 
         while !self.check(&TokenKind::Eof) {
             match self.peek_kind() {
-                TokenKind::LParen => { paren_depth += 1; self.advance(); }
-                TokenKind::RParen if paren_depth > 0 => { paren_depth -= 1; self.advance(); }
-                TokenKind::LBracket => { bracket_depth += 1; self.advance(); }
-                TokenKind::RBracket if bracket_depth > 0 => { bracket_depth -= 1; self.advance(); }
-                TokenKind::LBrace => { brace_depth += 1; self.advance(); }
-                TokenKind::RBrace if brace_depth > 0 => { brace_depth -= 1; self.advance(); }
-                TokenKind::Semicolon if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => { self.advance(); break; }
-                TokenKind::RBrace if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
-                TokenKind::Const | TokenKind::Let | TokenKind::Return | TokenKind::If | TokenKind::Else
-                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
-                _ => { self.advance(); }
+                TokenKind::LParen => {
+                    paren_depth += 1;
+                    self.advance();
+                }
+                TokenKind::RParen if paren_depth > 0 => {
+                    paren_depth -= 1;
+                    self.advance();
+                }
+                TokenKind::LBracket => {
+                    bracket_depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBracket if bracket_depth > 0 => {
+                    bracket_depth -= 1;
+                    self.advance();
+                }
+                TokenKind::LBrace => {
+                    brace_depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBrace if brace_depth > 0 => {
+                    brace_depth -= 1;
+                    self.advance();
+                }
+                TokenKind::Semicolon
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    self.advance();
+                    break;
+                }
+                TokenKind::RBrace if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                    break
+                }
+                TokenKind::Const
+                | TokenKind::Let
+                | TokenKind::Return
+                | TokenKind::If
+                | TokenKind::Else
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    break
+                }
+                _ => {
+                    self.advance();
+                }
             }
         }
     }
@@ -591,16 +751,27 @@ impl Parser {
     }
 
     fn is_identifier_followed_by_lparen(&self) -> bool {
-        matches!(self.tokens.get(self.pos).map(|token| &token.kind), Some(TokenKind::Ident(_)))
-            && matches!(self.tokens.get(self.pos + 1).map(|token| &token.kind), Some(TokenKind::LParen))
+        matches!(
+            self.tokens.get(self.pos).map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
+        ) && matches!(
+            self.tokens.get(self.pos + 1).map(|token| &token.kind),
+            Some(TokenKind::LParen)
+        )
     }
 
     fn peek_kind(&self) -> TokenKind {
-        self.tokens.get(self.pos).map(|t| t.kind.clone()).unwrap_or(TokenKind::Eof)
+        self.tokens
+            .get(self.pos)
+            .map(|t| t.kind.clone())
+            .unwrap_or(TokenKind::Eof)
     }
 
     fn check(&self, expected: &TokenKind) -> bool {
-        self.tokens.get(self.pos).map(|t| &t.kind == expected).unwrap_or(false)
+        self.tokens
+            .get(self.pos)
+            .map(|t| &t.kind == expected)
+            .unwrap_or(false)
     }
 
     fn advance(&mut self) -> Token {
@@ -613,7 +784,9 @@ impl Parser {
             start: 0,
             end: 0,
         });
-        if self.pos < self.tokens.len() { self.pos += 1; }
+        if self.pos < self.tokens.len() {
+            self.pos += 1;
+        }
         tok
     }
 
@@ -622,7 +795,10 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
-            Err(self.error_here(&format!("expected {expected:?}, got {:?}", self.peek_kind())))
+            Err(self.error_here(&format!(
+                "expected {expected:?}, got {:?}",
+                self.peek_kind()
+            )))
         }
     }
 
