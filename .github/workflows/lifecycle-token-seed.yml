@@ -1,4 +1,4 @@
-# One-shot lifecycle token seed; delete after lifecycle lands.
+# One-shot lifecycle token repair; delete after lifecycle lands.
 name: Lifecycle Token Seed
 
 on:
@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: seed event token arm
+      - name: repair event token arm
         shell: bash
         run: |
           python - <<'PY'
@@ -21,23 +21,27 @@ jobs:
 
           path = Path("engine/crates/service-runtime/src/lib.rs")
           source = path.read_text()
-          token_start = source.index("    fn token(&self) -> &str {")
-          token_end = source.index("\n    }\n}", token_start) + len("\n    }")
-          token_impl = '''    fn token(&self) -> &str {
-              match self {
-                  Self::Health { token }
-                  | Self::Call { token, .. }
-                  | Self::Event { token, .. }
-                  | Self::MemoryGet { token, .. }
-                  | Self::MemorySet { token, .. }
-                  | Self::MemoryDelete { token, .. }
-                  | Self::MemoryClear { token }
-                  | Self::Shutdown { token } => token,
+          impl_start = source.index("impl ServiceRequest {")
+          next_item = source.index("\n#[derive(Debug, Serialize, Deserialize)]\n#[serde(tag = \"status\"", impl_start)
+          token_impl = '''impl ServiceRequest {
+              fn token(&self) -> &str {
+                  match self {
+                      Self::Health { token }
+                      | Self::Call { token, .. }
+                      | Self::Event { token, .. }
+                      | Self::MemoryGet { token, .. }
+                      | Self::MemorySet { token, .. }
+                      | Self::MemoryDelete { token, .. }
+                      | Self::MemoryClear { token }
+                      | Self::Shutdown { token } => token,
+                  }
               }
-          }'''.replace('          ', '')
-          current = source[token_start:token_end]
-          if current != token_impl:
-              path.write_text(source[:token_start] + token_impl + source[token_end:])
+          }
+          '''.replace('          ', '')
+          replacement = token_impl.rstrip() + "\n"
+          current = source[impl_start:next_item]
+          if current != replacement:
+              path.write_text(source[:impl_start] + replacement + source[next_item:])
           PY
 
           git diff --check
@@ -45,6 +49,6 @@ jobs:
             git config user.name "Kate"
             git config user.email "dhwanksh2000@gmail.com"
             git add -- engine/crates/service-runtime/src/lib.rs
-            git commit -m "ci: seed lifecycle event token arm"
+            git commit -m "ci: repair lifecycle event token arm"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
