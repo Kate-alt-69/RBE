@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 use service_runtime::{
-    ServiceExecutionError, ServiceExecutionFuture, ServiceExecutor, ServiceMemory,
+    ServiceExecutionError, ServiceExecutionFuture, ServiceExecutor, ServiceLifecycle,
+    ServiceLifecycleFuture, ServiceMemory,
 };
 
-use crate::ast::{ModuleFile, ServiceProgram, Value};
+use crate::ast::{FunctionDef, MethodDef, ModuleFile, ServiceProgram, Value};
 use crate::module_eval::{
     HostCapabilityCaller, HostCapabilityFuture, ModuleEvalError, ModuleExecutor,
 };
@@ -93,21 +94,37 @@ impl HostCapabilityCaller for ServiceHostCapabilities {
 pub struct ServiceProgramExecutor {
     modules: ModuleProgram,
     file: Arc<ModuleFile>,
+    lifecycle: Vec<MethodDef>,
     host_capabilities: Arc<dyn HostCapabilityCaller>,
 }
 
 impl ServiceProgramExecutor {
     pub fn new(program: ServiceProgram, modules: ModuleProgram, memory: ServiceMemory) -> Self {
+        let ServiceProgram {
+            imports,
+            functions,
+            exports,
+            lifecycle,
+            ..
+        } = program;
         let file = Arc::new(ModuleFile {
-            imports: program.imports,
-            functions: program.functions,
-            exports: program.exports,
+            imports,
+            functions,
+            exports,
         });
         Self {
             modules,
             file,
+            lifecycle,
             host_capabilities: Arc::new(ServiceHostCapabilities::new(memory)),
         }
+    }
+
+    fn lifecycle_method(&self, phase: ServiceLifecycle) -> Option<MethodDef> {
+        self.lifecycle
+            .iter()
+            .find(|method| method.verb == phase.as_str())
+            .cloned()
     }
 }
 
@@ -128,6 +145,37 @@ impl ServiceExecutor for ServiceProgramExecutor {
                 .await
                 .map_err(service_error)?;
             value_to_json(value).map_err(service_error)
+        })
+    }
+
+    fn lifecycle<'a>(
+        &'a self,
+        phase: ServiceLifecycle,
+        argument: JsonValue,
+    ) -> ServiceLifecycleFuture<'a> {
+        Box::pin(async move {
+            let Some(method) = self.lifecycle_method(phase) else {
+                return Ok(None);
+            };
+            let args = if method.param_name.is_some() {
+                vec![json_to_value(argument).map_err(service_error)?]
+            } else {
+                Vec::new()
+            };
+            let function = FunctionDef {
+                name: format!("Service.{}", phase.as_str()),
+                params: method.param_name.into_iter().collect(),
+                body: method.body,
+            };
+            let executor = ModuleExecutor::with_host_capabilities(
+                &self.modules,
+                self.host_capabilities.clone(),
+            );
+            let value = executor
+                .call_inline_definition(self.file.clone(), function, args)
+                .await
+                .map_err(service_error)?;
+            value_to_json(value).map(Some).map_err(service_error)
         })
     }
 }
@@ -281,5 +329,80 @@ mod tests {
         .expect("service execution failed");
         assert_eq!(value, serde_json::json!(42.0));
         assert_eq!(observer.get("answer"), Some(serde_json::json!(42.0)));
+    }
+
+    #[test]
+    fn executes_service_lifecycle_with_shared_memory() {
+        let source = r#"
+            :import[memory]
+            :service[name = lifecycle]
+            export function read() {
+                return memory.get("phase");
+            }
+            class Service {
+                start() {
+                    memory.set("phase", "started");
+                }
+                event(event) {
+                    memory.set("event", event);
+                    return event;
+                }
+                health() {
+                    return memory.get("phase");
+                }
+                stop() {
+                    memory.set("phase", "stopped");
+                }
+            }
+        "#;
+        let program = crate::parse_service_source(source).expect("service parse failed");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rbe-service-lifecycle-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let modules = ModuleProgram::load(&root.join("module")).expect("module load failed");
+        let memory = ServiceMemory::default();
+        let observer = memory.clone();
+        let executor = ServiceProgramExecutor::new(program, modules, memory);
+
+        let start = block_on_ready(ServiceExecutor::lifecycle(
+            &executor,
+            ServiceLifecycle::Start,
+            serde_json::json!({"service": "lifecycle"}),
+        ))
+        .expect("start lifecycle failed");
+        assert_eq!(start, Some(serde_json::Value::Null));
+
+        let health = block_on_ready(ServiceExecutor::lifecycle(
+            &executor,
+            ServiceLifecycle::Health,
+            serde_json::json!({"service": "lifecycle"}),
+        ))
+        .expect("health lifecycle failed");
+        assert_eq!(health, Some(serde_json::json!("started")));
+
+        let event = block_on_ready(ServiceExecutor::lifecycle(
+            &executor,
+            ServiceLifecycle::Event,
+            serde_json::json!({"kind": "refresh"}),
+        ))
+        .expect("event lifecycle failed");
+        assert_eq!(event, Some(serde_json::json!({"kind": "refresh"})));
+        assert_eq!(
+            observer.get("event"),
+            Some(serde_json::json!({"kind": "refresh"}))
+        );
+
+        block_on_ready(ServiceExecutor::lifecycle(
+            &executor,
+            ServiceLifecycle::Stop,
+            serde_json::json!({"service": "lifecycle"}),
+        ))
+        .expect("stop lifecycle failed");
+        assert_eq!(observer.get("phase"), Some(serde_json::json!("stopped")));
     }
 }

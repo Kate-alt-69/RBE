@@ -31,6 +31,24 @@ struct ServiceProcess {
     started_at: Instant,
 }
 
+enum ServiceOperation {
+    Call { function: String, args: Vec<Value> },
+    Event { event: Value },
+}
+
+impl ServiceOperation {
+    fn into_request(self, token: String) -> ServiceRequest {
+        match self {
+            Self::Call { function, args } => ServiceRequest::Call {
+                token,
+                function,
+                args,
+            },
+            Self::Event { event } => ServiceRequest::Event { token, event },
+        }
+    }
+}
+
 struct Managed {
     file: ServiceFile,
     process: Option<ServiceProcess>,
@@ -364,6 +382,26 @@ impl ServiceManager {
         function: &str,
         args: Vec<Value>,
     ) -> Result<Value, ServiceCallError> {
+        self.invoke(
+            service_name,
+            ServiceOperation::Call {
+                function: function.to_string(),
+                args,
+            },
+        )
+        .await
+    }
+
+    pub async fn event(&self, service_name: &str, event: Value) -> Result<Value, ServiceCallError> {
+        self.invoke(service_name, ServiceOperation::Event { event })
+            .await
+    }
+
+    async fn invoke(
+        &self,
+        service_name: &str,
+        operation: ServiceOperation,
+    ) -> Result<Value, ServiceCallError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(ServiceCallError::Unavailable {
                 service: service_name.to_string(),
@@ -397,15 +435,8 @@ impl ServiceManager {
             (address, token)
         };
 
-        let response = rpc(
-            address,
-            ServiceRequest::Call {
-                token,
-                function: function.to_string(),
-                args,
-            },
-        )
-        .await;
+        let request = operation.into_request(token);
+        let response = rpc(address, request).await;
 
         {
             let mut service = handle.lock().await;

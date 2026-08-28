@@ -489,6 +489,10 @@ pub enum ServiceRequest {
         function: String,
         args: Vec<Value>,
     },
+    Event {
+        token: String,
+        event: Value,
+    },
     MemoryGet {
         token: String,
         key: String,
@@ -513,14 +517,14 @@ pub enum ServiceRequest {
 impl ServiceRequest {
     fn token(&self) -> &str {
         match self {
-  Self::Health { token }
-  | Self::Call { token, .. }
-  | Self::Event { token, .. }
-  | Self::MemoryGet { token, .. }
-  | Self::MemorySet { token, .. }
-  | Self::MemoryDelete { token, .. }
-  | Self::MemoryClear { token }
-  | Self::Shutdown { token } => token,
+            Self::Health { token }
+            | Self::Call { token, .. }
+            | Self::Event { token, .. }
+            | Self::MemoryGet { token, .. }
+            | Self::MemorySet { token, .. }
+            | Self::MemoryDelete { token, .. }
+            | Self::MemoryClear { token }
+            | Self::Shutdown { token } => token,
         }
     }
 }
@@ -550,8 +554,38 @@ impl ServiceExecutionError {
 pub type ServiceExecutionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, ServiceExecutionError>> + Send + 'a>>;
 
+pub type ServiceLifecycleFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Value>, ServiceExecutionError>> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceLifecycle {
+    Start,
+    Event,
+    Health,
+    Stop,
+}
+
+impl ServiceLifecycle {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Event => "event",
+            Self::Health => "health",
+            Self::Stop => "stop",
+        }
+    }
+}
+
 pub trait ServiceExecutor: Send + Sync {
     fn call<'a>(&'a self, function: &'a str, args: Vec<Value>) -> ServiceExecutionFuture<'a>;
+
+    fn lifecycle<'a>(
+        &'a self,
+        _phase: ServiceLifecycle,
+        _argument: Value,
+    ) -> ServiceLifecycleFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 struct AddressableOnlyExecutor;
@@ -603,6 +637,17 @@ pub async fn run_service_host_with_executor_and_memory(
     let file = parse_service(&path, defaults)?;
     apply_memory_limit(file.memory_limit_mb)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
+    if let Err(error) = executor
+        .lifecycle(ServiceLifecycle::Start, lifecycle_context(&file))
+        .await
+    {
+        anyhow::bail!(
+            "service {:?} start lifecycle failed with {}: {}",
+            file.name,
+            error.code,
+            error.message
+        );
+    }
     let ready = ServiceReady {
         service: file.name.clone(),
         pid: std::process::id(),
@@ -647,12 +692,37 @@ async fn dispatch(
     }
     let ok = |value| (ServiceResponse::Ok { value }, false);
     match request {
-        ServiceRequest::Health { .. } => ok(serde_json::json!({
-            "ok": true,
-            "service": &file.name,
-            "pid": std::process::id(),
-            "memoryEntries": memory.len()
-        })),
+        ServiceRequest::Health { .. } => {
+            match executor
+                .lifecycle(ServiceLifecycle::Health, lifecycle_context(file))
+                .await
+            {
+                Ok(lifecycle) => {
+                    let healthy = lifecycle_health_ok(lifecycle.as_ref());
+                    ok(serde_json::json!({
+                        "ok": healthy,
+                        "service": &file.name,
+                        "pid": std::process::id(),
+                        "memoryEntries": memory.len(),
+                        "lifecycle": lifecycle.unwrap_or(Value::Null)
+                    }))
+                }
+                Err(error) => execution_error_response(error, false),
+            }
+        }
+        ServiceRequest::Event { event, .. } => {
+            match executor.lifecycle(ServiceLifecycle::Event, event).await {
+                Ok(Some(value)) => ok(value),
+                Ok(None) => (
+                    ServiceResponse::Error {
+                        code: "SVC4304".into(),
+                        message: "service does not define Service.event()".into(),
+                    },
+                    false,
+                ),
+                Err(error) => execution_error_response(error, false),
+            }
+        }
         ServiceRequest::MemoryGet { key, .. } => ok(memory.get(&key).unwrap_or(Value::Null)),
         ServiceRequest::MemorySet { key, value, .. } => {
             memory.set(key, value);
@@ -676,20 +746,52 @@ async fn dispatch(
         }
         ServiceRequest::Call { function, args, .. } => match executor.call(&function, args).await {
             Ok(value) => ok(value),
-            Err(error) => (
-                ServiceResponse::Error {
-                    code: error.code,
-                    message: error.message,
-                },
-                false,
-            ),
+            Err(error) => execution_error_response(error, false),
         },
-        ServiceRequest::Shutdown { .. } => (
-            ServiceResponse::Ok {
-                value: Value::Bool(true),
-            },
-            true,
-        ),
+        ServiceRequest::Shutdown { .. } => {
+            match executor
+                .lifecycle(ServiceLifecycle::Stop, lifecycle_context(file))
+                .await
+            {
+                Ok(value) => (
+                    ServiceResponse::Ok {
+                        value: value.unwrap_or(Value::Bool(true)),
+                    },
+                    true,
+                ),
+                Err(error) => execution_error_response(error, true),
+            }
+        }
+    }
+}
+
+fn execution_error_response(
+    error: ServiceExecutionError,
+    shutdown: bool,
+) -> (ServiceResponse, bool) {
+    (
+        ServiceResponse::Error {
+            code: error.code,
+            message: error.message,
+        },
+        shutdown,
+    )
+}
+
+fn lifecycle_context(file: &ServiceFile) -> Value {
+    serde_json::json!({
+        "service": &file.name,
+        "pid": std::process::id(),
+        "mode": file.mode,
+    })
+}
+
+fn lifecycle_health_ok(value: Option<&Value>) -> bool {
+    match value {
+        None => true,
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Object(fields)) => fields.get("ok").and_then(Value::as_bool).unwrap_or(true),
+        _ => true,
     }
 }
 
@@ -777,6 +879,91 @@ mod tests {
         std::fs::write(&path, ":service[name = existing]\nexport function run() {}").unwrap();
         let service = parse_service(&path, ServiceDefaults::default()).unwrap();
         assert_eq!(service.mode, ServiceMode::Resident);
+        let _ = std::fs::remove_file(path);
+    }
+
+    struct LifecycleTestExecutor;
+
+    impl ServiceExecutor for LifecycleTestExecutor {
+        fn call<'a>(&'a self, _function: &'a str, _args: Vec<Value>) -> ServiceExecutionFuture<'a> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+
+        fn lifecycle<'a>(
+            &'a self,
+            phase: ServiceLifecycle,
+            argument: Value,
+        ) -> ServiceLifecycleFuture<'a> {
+            Box::pin(async move {
+                Ok(Some(serde_json::json!({
+                    "phase": phase.as_str(),
+                    "argument": argument
+                })))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_health_event_and_stop_lifecycle() {
+        let path = test_service_path("lifecycle-dispatch");
+        std::fs::write(
+            &path,
+            ":service[name = lifecycle]\nexport function get() {}",
+        )
+        .unwrap();
+        let file = parse_service(&path, ServiceDefaults::default()).unwrap();
+        let memory = ServiceMemory::default();
+        let executor = LifecycleTestExecutor;
+
+        let (health, shutdown) = dispatch(
+            ServiceRequest::Health {
+                token: "secret".into(),
+            },
+            &file,
+            "secret",
+            &memory,
+            &executor,
+        )
+        .await;
+        assert!(!shutdown);
+        let ServiceResponse::Ok { value } = health else {
+            panic!("health lifecycle should succeed");
+        };
+        assert_eq!(value["lifecycle"]["phase"], "health");
+
+        let (event, shutdown) = dispatch(
+            ServiceRequest::Event {
+                token: "secret".into(),
+                event: serde_json::json!({"kind": "refresh"}),
+            },
+            &file,
+            "secret",
+            &memory,
+            &executor,
+        )
+        .await;
+        assert!(!shutdown);
+        let ServiceResponse::Ok { value } = event else {
+            panic!("event lifecycle should succeed");
+        };
+        assert_eq!(value["phase"], "event");
+        assert_eq!(value["argument"]["kind"], "refresh");
+
+        let (stop, shutdown) = dispatch(
+            ServiceRequest::Shutdown {
+                token: "secret".into(),
+            },
+            &file,
+            "secret",
+            &memory,
+            &executor,
+        )
+        .await;
+        assert!(shutdown);
+        let ServiceResponse::Ok { value } = stop else {
+            panic!("stop lifecycle should succeed");
+        };
+        assert_eq!(value["phase"], "stop");
         let _ = std::fs::remove_file(path);
     }
 }

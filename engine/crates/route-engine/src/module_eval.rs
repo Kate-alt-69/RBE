@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 use service_runtime::ServiceManager;
 
-use crate::ast::{BinaryOp, Expr, ImportTarget, ModuleFile, Statement, Value};
+use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, ModuleFile, Statement, Value};
 use crate::module_runtime::ModuleProgram;
 use crate::modules::{binding_name, ModuleRegistry};
 
@@ -150,6 +150,15 @@ impl<'a> ModuleExecutor<'a> {
         self.call_function(file, function, args, 0).await
     }
 
+    pub(crate) async fn call_inline_definition(
+        &self,
+        file: Arc<ModuleFile>,
+        function: FunctionDef,
+        args: Vec<Value>,
+    ) -> Result<Value, ModuleEvalError> {
+        self.execute_function(file, function, args, 0).await
+    }
+
     async fn call_service(
         &self,
         service: &str,
@@ -218,11 +227,22 @@ impl<'a> ModuleExecutor<'a> {
             .ok_or_else(|| {
                 ModuleEvalError::new("MOD3002", format!("function {function_name:?} has no body"))
             })?;
+        self.execute_function(file, function, args, depth).await
+    }
+
+    async fn execute_function(
+        &self,
+        file: Arc<ModuleFile>,
+        function: FunctionDef,
+        args: Vec<Value>,
+        depth: usize,
+    ) -> Result<Value, ModuleEvalError> {
         if function.params.len() != args.len() {
             return Err(ModuleEvalError::new(
                 "MOD3003",
                 format!(
-                    "function {function_name:?} expected {} argument(s), got {}",
+                    "function {:?} expected {} argument(s), got {}",
+                    function.name,
                     function.params.len(),
                     args.len()
                 ),
