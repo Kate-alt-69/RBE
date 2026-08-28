@@ -79,7 +79,10 @@ impl GroupMemoryRegion {
     pub fn create(path: impl AsRef<Path>, payload_len: usize) -> Result<Self> {
         ensure_payload_len(payload_len)?;
         let path = path.as_ref();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)?;
         }
         let total_len = total_len(payload_len)?;
@@ -221,17 +224,11 @@ impl GroupMemoryRegion {
     }
 
     fn lock_shared(&self) -> Result<Option<FileLock<'_>>> {
-        self.file
-            .as_ref()
-            .map(FileLock::shared)
-            .transpose()
+        self.file.as_ref().map(FileLock::shared).transpose()
     }
 
     fn lock_exclusive(&self) -> Result<Option<FileLock<'_>>> {
-        self.file
-            .as_ref()
-            .map(FileLock::exclusive)
-            .transpose()
+        self.file.as_ref().map(FileLock::exclusive).transpose()
     }
 }
 
@@ -307,7 +304,8 @@ fn read_and_validate_header(file: &File) -> Result<(usize, usize)> {
             .try_into()
             .expect("fixed group-memory header slice"),
     );
-    let payload_len = usize::try_from(payload_u64).map_err(|_| GroupMemoryError::PayloadTooLarge)?;
+    let payload_len =
+        usize::try_from(payload_u64).map_err(|_| GroupMemoryError::PayloadTooLarge)?;
     ensure_payload_len(payload_len)?;
     let total_len = total_len(payload_len)?;
     if actual_len < total_len as u64 {
