@@ -1,9 +1,11 @@
 //! RBE `.service` compiler/runtime primitives.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -475,6 +477,43 @@ pub enum ServiceResponse {
     Error { code: String, message: String },
 }
 
+#[derive(Debug, Clone)]
+pub struct ServiceExecutionError {
+    pub code: String,
+    pub message: String,
+}
+
+impl ServiceExecutionError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+pub type ServiceExecutionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Value, ServiceExecutionError>> + Send + 'a>>;
+
+pub trait ServiceExecutor: Send + Sync {
+    fn call<'a>(&'a self, function: &'a str, args: Vec<Value>) -> ServiceExecutionFuture<'a>;
+}
+
+struct AddressableOnlyExecutor;
+
+impl ServiceExecutor for AddressableOnlyExecutor {
+    fn call<'a>(&'a self, function: &'a str, _args: Vec<Value>) -> ServiceExecutionFuture<'a> {
+        Box::pin(async move {
+            Err(ServiceExecutionError::new(
+                "SVC4100",
+                format!(
+                    "export {function:?} is addressable; executable service bodies require a service executor"
+                ),
+            ))
+        })
+    }
+}
+
 const RESTART_BASE_DELAY_MS: u64 = 250;
 const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
 
@@ -936,6 +975,15 @@ pub async fn run_service_host(
     token: String,
     defaults: ServiceDefaults,
 ) -> anyhow::Result<()> {
+    run_service_host_with_executor(path, token, defaults, Arc::new(AddressableOnlyExecutor)).await
+}
+
+pub async fn run_service_host_with_executor(
+    path: PathBuf,
+    token: String,
+    defaults: ServiceDefaults,
+    executor: Arc<dyn ServiceExecutor>,
+) -> anyhow::Result<()> {
     let file = parse_service(&path, defaults)?;
     apply_memory_limit(file.memory_limit_mb)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -955,7 +1003,8 @@ pub async fn run_service_host(
         let mut line = String::new();
         reader.read_line(&mut line).await?;
         let request: ServiceRequest = serde_json::from_str(line.trim())?;
-        let (response, shutdown) = dispatch(request, &file, &token, &memory);
+        let (response, shutdown) =
+            dispatch(request, &file, &token, &memory, executor.as_ref()).await;
         write
             .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
             .await?;
@@ -966,11 +1015,12 @@ pub async fn run_service_host(
     }
 }
 
-fn dispatch(
+async fn dispatch(
     request: ServiceRequest,
     file: &ServiceFile,
     token: &str,
     memory: &ServiceMemory,
+    executor: &dyn ServiceExecutor,
 ) -> (ServiceResponse, bool) {
     if request.token() != token {
         return (
@@ -1010,15 +1060,16 @@ fn dispatch(
                 false,
             )
         }
-        ServiceRequest::Call { function, .. } => (
-            ServiceResponse::Error {
-                code: "SVC4100".into(),
-                message: format!(
-                    "export {function:?} is addressable; executable service bodies land with the module/service evaluator"
-                ),
-            },
-            false,
-        ),
+        ServiceRequest::Call { function, args, .. } => match executor.call(&function, args).await {
+            Ok(value) => ok(value),
+            Err(error) => (
+                ServiceResponse::Error {
+                    code: error.code,
+                    message: error.message,
+                },
+                false,
+            ),
+        },
         ServiceRequest::Shutdown { .. } => (
             ServiceResponse::Ok {
                 value: Value::Bool(true),
@@ -1127,6 +1178,55 @@ mod tests {
                 if service == "cache"
                     && code == "SVC4100"
                     && message == "pending evaluator"
+        ));
+    }
+
+    struct EchoExecutor;
+
+    impl ServiceExecutor for EchoExecutor {
+        fn call<'a>(&'a self, function: &'a str, args: Vec<Value>) -> ServiceExecutionFuture<'a> {
+            Box::pin(async move {
+                if function == "echo" {
+                    Ok(args.into_iter().next().unwrap_or(Value::Null))
+                } else {
+                    Err(ServiceExecutionError::new(
+                        "TEST",
+                        format!("unexpected function {function}"),
+                    ))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_delegates_exported_calls_to_executor() {
+        let file = ServiceFile {
+            path: PathBuf::from("echo.service"),
+            name: "echo".into(),
+            title: "echo".into(),
+            restart: RestartPolicy::Never,
+            memory_limit_mb: 0,
+            startup_timeout_ms: 1000,
+            imports: Vec::new(),
+            exports: vec!["echo".into()],
+        };
+        let memory = ServiceMemory::default();
+        let (response, shutdown) = dispatch(
+            ServiceRequest::Call {
+                token: "token".into(),
+                function: "echo".into(),
+                args: vec![serde_json::json!({"ok": true})],
+            },
+            &file,
+            "token",
+            &memory,
+            &EchoExecutor,
+        )
+        .await;
+        assert!(!shutdown);
+        assert!(matches!(
+            response,
+            ServiceResponse::Ok { value } if value == serde_json::json!({"ok": true})
         ));
     }
 }
