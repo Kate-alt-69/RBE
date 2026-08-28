@@ -525,6 +525,7 @@ impl ServiceRequest {
 }
 }
 }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
