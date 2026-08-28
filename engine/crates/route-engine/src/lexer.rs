@@ -4,15 +4,49 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
-    Colon, LBracket, RBracket, LBrace, RBrace, LParen, RParen,
-    Comma, Dot, Semicolon,
-    Eq, EqEq, EqEqEq, Not, NotEq, NotEqEq,
-    Lt, LtEq, Gt, GtEq,
-    AndAnd, OrOr, Plus, Minus, Star, Slash, Percent,
+    Colon,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
+    LParen,
+    RParen,
+    Comma,
+    Dot,
+    Semicolon,
+    Eq,
+    EqEq,
+    EqEqEq,
+    Not,
+    NotEq,
+    NotEqEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    AndAnd,
+    OrOr,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
     Dollar,
-    Import, Class, Async, Const, Let, Return, Function, If, Else,
-    True, False, Null,
-    Ident(String), String(String), Number(f64),
+    Import,
+    Class,
+    Async,
+    Const,
+    Let,
+    Return,
+    Function,
+    If,
+    Else,
+    True,
+    False,
+    Null,
+    Ident(String),
+    String(String),
+    Number(f64),
     Eof,
 }
 
@@ -52,7 +86,7 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Token>, LexError> {
-        let mut tokens = Vec::new();
+        let mut tokens: Vec<Token> = Vec::new();
 
         loop {
             self.skip_ws_comments();
@@ -72,64 +106,153 @@ impl<'a> Lexer<'a> {
                 return Ok(tokens);
             };
 
+            // JavaScript reserves words in syntactic positions such as
+            // `return`, but those same spellings are perfectly valid property
+            // names after a dot (`video.delete`, `module.import`, etc.). Keep
+            // that distinction in the lexer so the parser receives an Ident
+            // for member names without weakening top-level keyword handling.
+            let recognize_keywords = !matches!(
+                tokens.last().map(|token| &token.kind),
+                Some(TokenKind::Dot)
+            );
+
             let kind = match c {
-                ':' => { self.bump(); TokenKind::Colon }
-                '[' => { self.bump(); TokenKind::LBracket }
-                ']' => { self.bump(); TokenKind::RBracket }
-                '{' => { self.bump(); TokenKind::LBrace }
-                '}' => { self.bump(); TokenKind::RBrace }
-                '(' => { self.bump(); TokenKind::LParen }
-                ')' => { self.bump(); TokenKind::RParen }
-                ',' => { self.bump(); TokenKind::Comma }
-                '.' => { self.bump(); TokenKind::Dot }
-                ';' => { self.bump(); TokenKind::Semicolon }
-                '$' => { self.bump(); TokenKind::Dollar }
+                ':' => {
+                    self.bump();
+                    TokenKind::Colon
+                }
+                '[' => {
+                    self.bump();
+                    TokenKind::LBracket
+                }
+                ']' => {
+                    self.bump();
+                    TokenKind::RBracket
+                }
+                '{' => {
+                    self.bump();
+                    TokenKind::LBrace
+                }
+                '}' => {
+                    self.bump();
+                    TokenKind::RBrace
+                }
+                '(' => {
+                    self.bump();
+                    TokenKind::LParen
+                }
+                ')' => {
+                    self.bump();
+                    TokenKind::RParen
+                }
+                ',' => {
+                    self.bump();
+                    TokenKind::Comma
+                }
+                '.' => {
+                    self.bump();
+                    TokenKind::Dot
+                }
+                ';' => {
+                    self.bump();
+                    TokenKind::Semicolon
+                }
+                '$' => {
+                    self.bump();
+                    TokenKind::Dollar
+                }
                 '!' => {
                     self.bump();
                     if self.take_if('=') {
-                        if self.take_if('=') { TokenKind::NotEqEq } else { TokenKind::NotEq }
-                    } else { TokenKind::Not }
+                        if self.take_if('=') {
+                            TokenKind::NotEqEq
+                        } else {
+                            TokenKind::NotEq
+                        }
+                    } else {
+                        TokenKind::Not
+                    }
                 }
                 '=' => {
                     self.bump();
                     if self.take_if('=') {
-                        if self.take_if('=') { TokenKind::EqEqEq } else { TokenKind::EqEq }
-                    } else { TokenKind::Eq }
+                        if self.take_if('=') {
+                            TokenKind::EqEqEq
+                        } else {
+                            TokenKind::EqEq
+                        }
+                    } else {
+                        TokenKind::Eq
+                    }
                 }
                 '<' => {
                     self.bump();
-                    if self.take_if('=') { TokenKind::LtEq } else { TokenKind::Lt }
+                    if self.take_if('=') {
+                        TokenKind::LtEq
+                    } else {
+                        TokenKind::Lt
+                    }
                 }
                 '>' => {
                     self.bump();
-                    if self.take_if('=') { TokenKind::GtEq } else { TokenKind::Gt }
+                    if self.take_if('=') {
+                        TokenKind::GtEq
+                    } else {
+                        TokenKind::Gt
+                    }
                 }
                 '&' => {
                     self.bump();
                     if !self.take_if('&') {
-                        return Err(LexError { message: "single '&' is not supported; use '&&'".into(), line, column });
+                        return Err(LexError {
+                            message: "single '&' is not supported; use '&&'".into(),
+                            line,
+                            column,
+                        });
                     }
                     TokenKind::AndAnd
                 }
                 '|' => {
                     self.bump();
                     if !self.take_if('|') {
-                        return Err(LexError { message: "single '|' is not supported; use '||'".into(), line, column });
+                        return Err(LexError {
+                            message: "single '|' is not supported; use '||'".into(),
+                            line,
+                            column,
+                        });
                     }
                     TokenKind::OrOr
                 }
-                '+' => { self.bump(); TokenKind::Plus }
-                '-' => { self.bump(); TokenKind::Minus }
-                '*' => { self.bump(); TokenKind::Star }
-                '/' => { self.bump(); TokenKind::Slash }
-                '%' => { self.bump(); TokenKind::Percent }
+                '+' => {
+                    self.bump();
+                    TokenKind::Plus
+                }
+                '-' => {
+                    self.bump();
+                    TokenKind::Minus
+                }
+                '*' => {
+                    self.bump();
+                    TokenKind::Star
+                }
+                '/' => {
+                    self.bump();
+                    TokenKind::Slash
+                }
+                '%' => {
+                    self.bump();
+                    TokenKind::Percent
+                }
                 '"' | '\'' => self.read_string(c, line, column)?,
                 c if c.is_ascii_digit() => self.read_number(),
-                c if c.is_alphabetic() || c == '_' => self.read_ident_or_keyword(),
+                c if c.is_alphabetic() || c == '_' => {
+                    self.read_ident_or_keyword(recognize_keywords)
+                }
                 other => {
                     return Err(LexError {
                         message: format!("unexpected character {other:?}"),
-                        line, column,
+                        line,
+                        column,
                     });
                 }
             };
@@ -137,7 +260,15 @@ impl<'a> Lexer<'a> {
             let end_line = self.line;
             let end_column = self.column;
             let end = self.offset;
-            tokens.push(Token { kind, line, column, end_line, end_column, start, end });
+            tokens.push(Token {
+                kind,
+                line,
+                column,
+                end_line,
+                end_column,
+                start,
+                end,
+            });
         }
     }
 
@@ -154,26 +285,44 @@ impl<'a> Lexer<'a> {
     }
 
     fn take_if(&mut self, expected: char) -> bool {
-        if self.chars.peek() == Some(&expected) { self.bump(); true } else { false }
+        if self.chars.peek() == Some(&expected) {
+            self.bump();
+            true
+        } else {
+            false
+        }
     }
 
     fn skip_ws_comments(&mut self) {
         loop {
             match self.chars.peek() {
-                Some(c) if c.is_whitespace() => { self.bump(); }
+                Some(c) if c.is_whitespace() => {
+                    self.bump();
+                }
                 Some('/') => {
                     let mut clone = self.chars.clone();
                     clone.next();
                     if clone.peek() == Some(&'/') {
-                        while let Some(c) = self.bump() { if c == '\n' { break; } }
-                    } else { break; }
+                        while let Some(c) = self.bump() {
+                            if c == '\n' {
+                                break;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
                 }
                 _ => break,
             }
         }
     }
 
-    fn read_string(&mut self, quote: char, line: usize, column: usize) -> Result<TokenKind, LexError> {
+    fn read_string(
+        &mut self,
+        quote: char,
+        line: usize,
+        column: usize,
+    ) -> Result<TokenKind, LexError> {
         self.bump();
         let mut out = String::new();
         loop {
@@ -184,10 +333,22 @@ impl<'a> Lexer<'a> {
                     Some('t') => out.push('\t'),
                     Some('r') => out.push('\r'),
                     Some(other) => out.push(other),
-                    None => return Err(LexError { message: "unterminated escape in string".into(), line: self.line, column: self.column }),
+                    None => {
+                        return Err(LexError {
+                            message: "unterminated escape in string".into(),
+                            line: self.line,
+                            column: self.column,
+                        });
+                    }
                 },
                 Some(c) => out.push(c),
-                None => return Err(LexError { message: "unterminated string literal".into(), line, column }),
+                None => {
+                    return Err(LexError {
+                        message: "unterminated string literal".into(),
+                        line,
+                        column,
+                    });
+                }
             }
         }
     }
@@ -195,17 +356,28 @@ impl<'a> Lexer<'a> {
     fn read_number(&mut self) -> TokenKind {
         let mut out = String::new();
         while let Some(&c) = self.chars.peek() {
-            if c.is_ascii_digit() || c == '.' { out.push(c); self.bump(); } else { break; }
+            if c.is_ascii_digit() || c == '.' {
+                out.push(c);
+                self.bump();
+            } else {
+                break;
+            }
         }
         TokenKind::Number(out.parse().unwrap_or(0.0))
     }
 
-    fn read_ident_or_keyword(&mut self) -> TokenKind {
+    fn read_ident_or_keyword(&mut self, recognize_keywords: bool) -> TokenKind {
         let mut out = String::new();
         while let Some(&c) = self.chars.peek() {
             if c.is_alphanumeric() || c == '_' || c == '-' || c == '&' {
-                out.push(c); self.bump();
-            } else { break; }
+                out.push(c);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        if !recognize_keywords {
+            return TokenKind::Ident(out);
         }
         match out.as_str() {
             "import" => TokenKind::Import,
@@ -231,7 +403,9 @@ mod tests {
 
     #[test]
     fn records_byte_and_line_spans() {
-        let tokens = Lexer::new("const value = 1;\nreturn value;").tokenize().unwrap();
+        let tokens = Lexer::new("const value = 1;\nreturn value;")
+            .tokenize()
+            .unwrap();
         let const_token = &tokens[0];
         assert_eq!(const_token.line, 1);
         assert_eq!(const_token.column, 1);
@@ -249,7 +423,23 @@ mod tests {
     #[test]
     fn tracks_multibyte_offsets_as_bytes() {
         let tokens = Lexer::new("const café = 1;").tokenize().unwrap();
-        let ident = tokens.iter().find(|token| matches!(&token.kind, TokenKind::Ident(name) if name == "café")).unwrap();
+        let ident = tokens
+            .iter()
+            .find(|token| matches!(&token.kind, TokenKind::Ident(name) if name == "café"))
+            .unwrap();
         assert_eq!(&"const café = 1;"[ident.start..ident.end], "café");
+    }
+
+    #[test]
+    fn reserved_word_is_identifier_after_dot() {
+        let tokens = Lexer::new("module.import(); video.delete();")
+            .tokenize()
+            .unwrap();
+        assert!(tokens
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Ident(name) if name == "import")));
+        assert!(tokens
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Ident(name) if name == "delete")));
     }
 }
