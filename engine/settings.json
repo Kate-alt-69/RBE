@@ -37,6 +37,21 @@
     "whipEnabled": false,
     "vodCacheDir": "./cache/vod"
   },
+  "services": {
+    "enabled": true,
+    "directory": "service",
+    "defaultMemoryLimitMb": 256,
+    "startupTimeoutMs": 10000,
+    "monitorIntervalMs": 1000,
+    "maxRestartBackoffMs": 30000
+  },
+  "videoManager": {
+    "enabled": true,
+    "dataDir": "data/video",
+    "defaultDatabase": "default",
+    "liveIdleSecs": 7200,
+    "downloadMaxBytes": 8589934592
+  },
   "containers": {
     "environments": 5,
     "swampsPerEnvironment": "auto",
