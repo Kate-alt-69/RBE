@@ -43,7 +43,7 @@ jobs:
           source = parser.read_text()
           start = source.index("    fn parse_import_target(&mut self) -> Result<ImportTarget, ParseError> {")
           end = source.index("\n    fn is_export_keyword", start)
-          replacement = r'''    fn parse_import_target(&mut self) -> Result<ImportTarget, ParseError> {
+          source = source[:start] + r'''    fn parse_import_target(&mut self) -> Result<ImportTarget, ParseError> {
               match self.advance().kind {
                   TokenKind::Ident(name) => {
                       if name == "service" && self.check(&TokenKind::Colon) {
@@ -59,10 +59,7 @@ jobs:
                       } else if self.check(&TokenKind::Dot) {
                           self.advance();
                           let function = self.expect_ident()?;
-                          Ok(ImportTarget::BuiltinFunction {
-                              module: name,
-                              function,
-                          })
+                          Ok(ImportTarget::BuiltinFunction { module: name, function })
                       } else if let Some((prefix, module_name)) = name.split_once('&') {
                           if prefix != "module" {
                               return Err(self.error_here("only module&name shorthand is supported"));
@@ -103,8 +100,7 @@ jobs:
                   ))),
               }
           }
-          '''
-          source = source[:start] + replacement + source[end:]
+          ''' + source[end:]
           parser.write_text(source)
 
           modules = Path("crates/route-engine/src/modules.rs")
@@ -123,12 +119,11 @@ jobs:
           if "Service calls are async" not in source:
               marker = '                ImportTarget::Aliased { .. } => unreachable!("base_target removes aliased import wrappers"),'
               at = source.index(marker)
-              arm = '''                ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => {
+              source = source[:at] + '''                ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => {
                       // Service calls are async and are intentionally handled by ModuleExecutor,
                       // never by the synchronous route capability registry.
                   }
-          '''
-              source = source[:at] + arm + source[at:]
+          ''' + source[at:]
           modules.write_text(source)
 
           analyzer = Path("crates/route-engine/src/analyzer.rs")
@@ -136,17 +131,16 @@ jobs:
           if 'format!("service:{service}")' not in source:
               marker = '        ImportTarget::Aliased { .. } => unreachable!("import_base removes aliased import wrappers"),'
               at = source.index(marker)
-              arms = '''        ImportTarget::Service(service) => format!("service:{service}"),
+              source = source[:at] + '''        ImportTarget::Service(service) => format!("service:{service}"),
               ImportTarget::ServiceFunction { service, function } => {
                   format!("service:{service}.{function}")
               }
-          '''
-              source = source[:at] + arms + source[at:]
+          ''' + source[at:]
           if 'code: "E3020"' not in source:
               old = "            ImportTarget::Custom(_) | ImportTarget::CustomFunction { .. } => SymbolKind::Module,\n"
               if old not in source:
                   raise SystemExit("route service policy anchor missing")
-              replacement = '''            ImportTarget::Custom(_) => SymbolKind::Module,
+              source = source.replace(old, '''            ImportTarget::Custom(_) => SymbolKind::Module,
               ImportTarget::CustomFunction { .. } => SymbolKind::DirectFunction,
               ImportTarget::Service(service) => {
                   diagnostics.push(Diagnostic {
@@ -170,23 +164,19 @@ jobs:
                   });
                   SymbolKind::DirectFunction
               }
-          '''
-              source = source.replace(old, replacement, 1)
+          ''', 1)
           analyzer.write_text(source)
 
           transpiler = Path("crates/route-engine/src/transpiler.rs")
           source = transpiler.read_text()
           if "ImportTarget::Service(_)" not in source:
-              old = '''                ImportTarget::Builtin(_) | ImportTarget::Custom(_) => {
-                      names.insert(crate::modules::binding_name(import), NameKind::Module);
-                  }
-                  ImportTarget::BuiltinFunction { .. } | ImportTarget::CustomFunction { .. } => {
-                      names.insert(crate::modules::binding_name(import), NameKind::DirectFunction);
-                  }
-          '''
-              if old not in source:
-                  raise SystemExit("transpiler import kind anchor missing")
-              new = '''                ImportTarget::Builtin(_) | ImportTarget::Custom(_) | ImportTarget::Service(_) => {
+              loop_at = source.index("        for import in imports {", source.index("impl Scope"))
+              match_at = source.index("            match base_import(import) {", loop_at)
+              end_marker = "            }\n        }\n        for function in functions {"
+              match_end = source.index(end_marker, match_at)
+              match_end += len("            }\n")
+              replacement = '''            match base_import(import) {
+                  ImportTarget::Builtin(_) | ImportTarget::Custom(_) | ImportTarget::Service(_) => {
                       names.insert(crate::modules::binding_name(import), NameKind::Module);
                   }
                   ImportTarget::BuiltinFunction { .. }
@@ -194,8 +184,12 @@ jobs:
                   | ImportTarget::ServiceFunction { .. } => {
                       names.insert(crate::modules::binding_name(import), NameKind::DirectFunction);
                   }
+                  ImportTarget::Aliased { .. } => {
+                      unreachable!("base_import removes aliased import wrappers")
+                  }
+              }
           '''
-              source = source.replace(old, new, 1)
+              source = source[:match_at] + replacement + source[match_end:]
           transpiler.write_text(source)
 
           runtime = Path("crates/route-engine/src/module_runtime.rs")
@@ -203,15 +197,14 @@ jobs:
           if "ImportTarget::Service(service)" not in source:
               marker = "        ImportTarget::Aliased { .. } => unreachable!(),"
               at = source.index(marker, source.index("fn import_source_key"))
-              arms = '''        ImportTarget::Service(service) => format!("service:{service}"),
+              source = source[:at] + '''        ImportTarget::Service(service) => format!("service:{service}"),
               ImportTarget::ServiceFunction { service, function } => {
                   format!("service:{service}.{function}")
               }
-          '''
-              source = source[:at] + arms + source[at:]
+          ''' + source[at:]
           if "accepts_service_imports_without_module_dependencies" not in source:
               insert = source.rfind("}\n")
-              test = r'''
+              source = source[:insert] + r'''
 
               #[test]
               fn accepts_service_imports_without_module_dependencies() {
@@ -225,8 +218,7 @@ jobs:
                   assert_eq!(program.len(), 1);
                   let _ = fs::remove_dir_all(root);
               }
-          '''
-              source = source[:insert] + test + source[insert:]
+          ''' + source[insert:]
           runtime.write_text(source)
 
           lib = Path("crates/route-engine/src/lib.rs")
@@ -235,7 +227,7 @@ jobs:
               anchor = "    #[test]\n    fn parses_multiple_import_entries_and_aliases()"
               if anchor not in source:
                   raise SystemExit("lib test anchor missing")
-              tests = r'''    #[test]
+              source = source.replace(anchor, r'''    #[test]
               fn parses_service_imports_for_modules() {
                   let tokens = Lexer::new(
                       r#":import[service:uac-cache as uac, service:search.find as lookup, "service:media"]
@@ -264,8 +256,7 @@ jobs:
                   assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "E3020"));
               }
 
-          '''
-              source = source.replace(anchor, tests + anchor, 1)
+          ''' + anchor, 1)
           lib.write_text(source)
           PY
 
