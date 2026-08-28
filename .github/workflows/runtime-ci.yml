@@ -107,6 +107,20 @@ jobs:
           '''.replace('          ', '')
           source = source[:start] + prefix + source[end:]
 
+          fields_anchor = '''    modules: ModuleRegistry,
+              custom_modules: HashMap<String, String>,
+              custom_functions: HashMap<String, (String, String)>,
+          '''.replace('          ', '')
+          fields_new = '''    modules: ModuleRegistry,
+              builtin_modules: HashMap<String, String>,
+              builtin_functions: HashMap<String, (String, String)>,
+              custom_modules: HashMap<String, String>,
+              custom_functions: HashMap<String, (String, String)>,
+          '''.replace('          ', '')
+          if fields_anchor not in source:
+              raise SystemExit("Frame field anchor missing")
+          source = source.replace(fields_anchor, fields_new, 1)
+
           start = source.index("    fn new(executor: &'exec ModuleExecutor<'program>, file: Arc<ModuleFile>, depth: usize) -> Self {")
           end = source.index("\n    fn exec_block<'b>", start)
           frame_new = '''    fn new(executor: &'exec ModuleExecutor<'program>, file: Arc<ModuleFile>, depth: usize) -> Self {
@@ -158,24 +172,11 @@ jobs:
           '''.replace('          ', '')
           source = source[:start] + frame_new + source[end:]
 
-          old_fields = '''    modules: ModuleRegistry,
-              custom_modules: HashMap<String, String>,
-              custom_functions: HashMap<String, (String, String)>,
-          '''.replace('          ', '')
-          new_fields = '''    modules: ModuleRegistry,
-              builtin_modules: HashMap<String, String>,
-              builtin_functions: HashMap<String, (String, String)>,
-              custom_modules: HashMap<String, String>,
-              custom_functions: HashMap<String, (String, String)>,
-          '''.replace('          ', '')
-          if old_fields not in source:
-              raise SystemExit("Frame field anchor missing")
-          source = source.replace(old_fields, new_fields, 1)
-
-          ident_anchor = '''                    if let Expr::Ident(name) = callee.as_ref() {
-              if let Some((service, function)) = self.service_functions.get(name).cloned()
-          '''.replace('          ', '')
-          ident_new = '''                    if let Expr::Ident(name) = callee.as_ref() {
+          call_start = source.index("                Expr::Call(callee, arg_exprs) => {")
+          ident = "                    if let Expr::Ident(name) = callee.as_ref() {"
+          ident_at = source.index(ident, call_start)
+          ident_end = ident_at + len(ident)
+          direct_hook = '''
               if let Some((module, function)) = self.builtin_functions.get(name).cloned() {
                   if let Some(value) = self
                       .executor
@@ -185,32 +186,26 @@ jobs:
                       return Ok(value);
                   }
               }
-              if let Some((service, function)) = self.service_functions.get(name).cloned()
           '''.replace('          ', '')
-          if ident_anchor not in source:
-              raise SystemExit("direct call host hook anchor missing")
-          source = source.replace(ident_anchor, ident_new, 1)
+          source = source[:ident_end] + direct_hook + source[ident_end:]
 
-          member_anchor = '''                    if let Expr::Member(base, function_name) = callee.as_ref() {
-              if let Expr::Ident(module_name) = base.as_ref() {
-                  if let Some(service) = self.service_modules.get(module_name).cloned() {
-          '''.replace('          ', '')
-          member_new = '''                    if let Expr::Member(base, function_name) = callee.as_ref() {
-              if let Expr::Ident(module_name) = base.as_ref() {
-                  if let Some(module) = self.builtin_modules.get(module_name).cloned() {
-                      if let Some(value) = self
-                          .executor
-                          .call_host_capability(&module, function_name, args.clone())
-                          .await?
-                      {
-                          return Ok(value);
-                      }
+          member = "                    if let Expr::Member(base, function_name) = callee.as_ref() {"
+          member_at = source.index(member, call_start)
+          nested = "                        if let Expr::Ident(module_name) = base.as_ref() {"
+          nested_at = source.index(nested, member_at)
+          nested_end = nested_at + len(nested)
+          member_hook = '''
+              if let Some(module) = self.builtin_modules.get(module_name).cloned() {
+                  if let Some(value) = self
+                      .executor
+                      .call_host_capability(&module, function_name, args.clone())
+                      .await?
+                  {
+                      return Ok(value);
                   }
-                  if let Some(service) = self.service_modules.get(module_name).cloned() {
+              }
           '''.replace('          ', '')
-          if member_anchor not in source:
-              raise SystemExit("member call host hook anchor missing")
-          source = source.replace(member_anchor, member_new, 1)
+          source = source[:nested_end] + member_hook + source[nested_end:]
 
           if "host_capability_can_override_imported_builtin" not in source:
               insert = source.rfind("\n}")
