@@ -234,3 +234,56 @@ fn json_to_value(value: JsonValue) -> Result<Value, ModuleEvalError> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn block_on_ready<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn executes_service_exports_with_shared_memory() {
+        let source = r#"
+            :import[memory]
+            :service[name = cache]
+            export function remember(key, value) {
+                memory.set(key, value);
+                return memory.get(key);
+            }
+        "#;
+        let program = crate::parse_service_source(source).expect("service parse failed");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rbe-service-eval-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let modules = ModuleProgram::load(&root.join("module")).expect("module load failed");
+        let memory = ServiceMemory::default();
+        let observer = memory.clone();
+        let executor = ServiceProgramExecutor::new(program, modules, memory);
+        let value = block_on_ready(ServiceExecutor::call(
+            &executor,
+            "remember",
+            vec![serde_json::json!("answer"), serde_json::json!(42)],
+        ))
+        .expect("service execution failed");
+        assert_eq!(value, serde_json::json!(42.0));
+        assert_eq!(observer.get("answer"), Some(serde_json::json!(42.0)));
+    }
+}
