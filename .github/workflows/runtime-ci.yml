@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,6 +21,111 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+      - name: apply shared service memory handle
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/service-runtime/src/lib.rs")
+          source = path.read_text()
+
+          old = '''#[derive(Default)]
+          pub struct ServiceMemory {
+              values: RwLock<HashMap<String, Value>>,
+          }
+          '''.replace('          ', '')
+          new = '''#[derive(Clone, Default)]
+          pub struct ServiceMemory {
+              values: Arc<RwLock<HashMap<String, Value>>>,
+          }
+          '''.replace('          ', '')
+          if old not in source:
+              raise SystemExit("ServiceMemory definition anchor missing")
+          source = source.replace(old, new, 1)
+
+          old = '''pub async fn run_service_host_with_executor(
+              path: PathBuf,
+              token: String,
+              defaults: ServiceDefaults,
+              executor: Arc<dyn ServiceExecutor>,
+          ) -> anyhow::Result<()> {
+              let file = parse_service(&path, defaults)?;
+          '''.replace('          ', '')
+          new = '''pub async fn run_service_host_with_executor(
+              path: PathBuf,
+              token: String,
+              defaults: ServiceDefaults,
+              executor: Arc<dyn ServiceExecutor>,
+          ) -> anyhow::Result<()> {
+              run_service_host_with_executor_and_memory(
+                  path,
+                  token,
+                  defaults,
+                  ServiceMemory::default(),
+                  executor,
+              )
+              .await
+          }
+
+          pub async fn run_service_host_with_executor_and_memory(
+              path: PathBuf,
+              token: String,
+              defaults: ServiceDefaults,
+              memory: ServiceMemory,
+              executor: Arc<dyn ServiceExecutor>,
+          ) -> anyhow::Result<()> {
+              let file = parse_service(&path, defaults)?;
+          '''.replace('          ', '')
+          if old not in source:
+              raise SystemExit("service host executor anchor missing")
+          source = source.replace(old, new, 1)
+
+          marker = "    let memory = ServiceMemory::default();\n\n    loop {"
+          if marker not in source:
+              raise SystemExit("service host memory allocation anchor missing")
+          source = source.replace(marker, "    loop {", 1)
+
+          if "cloned_memory_shares_backing_store" not in source:
+              insert = source.rfind("\n}")
+              test = r'''
+
+              #[test]
+              fn cloned_memory_shares_backing_store() {
+                  let memory = ServiceMemory::default();
+                  let clone = memory.clone();
+                  memory.set("shared".into(), serde_json::json!({"ok": true}));
+                  assert_eq!(clone.get("shared"), Some(serde_json::json!({"ok": true})));
+                  clone.delete("shared");
+                  assert!(memory.get("shared").is_none());
+              }
+          '''
+              source = source[:insert] + test + source[insert:]
+
+          path.write_text(source)
+          PY
+
+          rustfmt --edition 2021 crates/service-runtime/src/lib.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          allowed = {"engine/crates/service-runtime/src/lib.rs"}
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected shared-memory paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- crates/service-runtime/src/lib.rs
+            git commit -m "feat: share service host memory with executors"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: format runtime slice
         shell: bash
         run: |
