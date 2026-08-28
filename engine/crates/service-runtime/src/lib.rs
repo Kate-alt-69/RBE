@@ -515,6 +515,24 @@ pub struct ServiceSnapshot {
     pub restart_attempts: u32,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceCallError {
+    #[error("unknown service {service:?}")]
+    Unknown { service: String },
+    #[error("service {service:?} is unavailable")]
+    Unavailable { service: String },
+    #[error("failed to inspect service {service:?}: {message}")]
+    Inspect { service: String, message: String },
+    #[error("service {service:?} IPC failed: {message}")]
+    Ipc { service: String, message: String },
+    #[error("service {service:?} returned {code}: {message}")]
+    Remote {
+        service: String,
+        code: String,
+        message: String,
+    },
+}
+
 impl ServiceManager {
     pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
         let manager = Self::default();
@@ -659,6 +677,63 @@ impl ServiceManager {
         }
     }
 
+    pub async fn call(
+        &self,
+        service_name: &str,
+        function: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, ServiceCallError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ServiceCallError::Unavailable {
+                service: service_name.to_string(),
+            });
+        }
+
+        let handle = self
+            .services
+            .read()
+            .await
+            .get(service_name)
+            .cloned()
+            .ok_or_else(|| ServiceCallError::Unknown {
+                service: service_name.to_string(),
+            })?;
+
+        let (address, token) = {
+            let mut service = handle.lock().await;
+            match service.child.try_wait() {
+                Ok(None) => (service.ready.address, service.token.clone()),
+                Ok(Some(_)) => {
+                    return Err(ServiceCallError::Unavailable {
+                        service: service_name.to_string(),
+                    });
+                }
+                Err(error) => {
+                    return Err(ServiceCallError::Inspect {
+                        service: service_name.to_string(),
+                        message: error.to_string(),
+                    });
+                }
+            }
+        };
+
+        let response = rpc(
+            address,
+            ServiceRequest::Call {
+                token,
+                function: function.to_string(),
+                args,
+            },
+        )
+        .await
+        .map_err(|error| ServiceCallError::Ipc {
+            service: service_name.to_string(),
+            message: error.to_string(),
+        })?;
+
+        map_call_response(service_name, response)
+    }
+
     pub async fn snapshot(&self) -> Vec<ServiceSnapshot> {
         let handles = self
             .services
@@ -707,6 +782,20 @@ impl ServiceManager {
             let mut service = handle.lock().await;
             stop_managed(&mut service).await;
         }
+    }
+}
+
+fn map_call_response(
+    service_name: &str,
+    response: ServiceResponse,
+) -> Result<Value, ServiceCallError> {
+    match response {
+        ServiceResponse::Ok { value } => Ok(value),
+        ServiceResponse::Error { code, message } => Err(ServiceCallError::Remote {
+            service: service_name.to_string(),
+            code,
+            message,
+        }),
     }
 }
 
@@ -997,5 +1086,47 @@ mod tests {
         assert_eq!(restart_delay(2, maximum), Duration::from_millis(500));
         assert_eq!(restart_delay(3, maximum), Duration::from_millis(1_000));
         assert_eq!(restart_delay(32, maximum), maximum);
+    }
+
+    #[tokio::test]
+    async fn unknown_service_call_is_typed() {
+        let error = ServiceManager::default()
+            .call("missing", "get", Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceCallError::Unknown { service } if service == "missing"
+        ));
+    }
+
+    #[test]
+    fn call_response_maps_success_and_remote_error() {
+        assert_eq!(
+            map_call_response(
+                "cache",
+                ServiceResponse::Ok {
+                    value: serde_json::json!(7),
+                },
+            )
+            .unwrap(),
+            serde_json::json!(7)
+        );
+
+        let error = map_call_response(
+            "cache",
+            ServiceResponse::Error {
+                code: "SVC4100".into(),
+                message: "pending evaluator".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceCallError::Remote { service, code, message }
+                if service == "cache"
+                    && code == "SVC4100"
+                    && message == "pending evaluator"
+        ));
     }
 }
