@@ -44,6 +44,18 @@ impl ServiceCaller for ServiceManager {
     }
 }
 
+pub type HostCapabilityFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Value>, ModuleEvalError>> + Send + 'a>>;
+
+pub trait HostCapabilityCaller: Send + Sync {
+    fn call<'a>(
+        &'a self,
+        module: &'a str,
+        function: &'a str,
+        args: Vec<Value>,
+    ) -> HostCapabilityFuture<'a>;
+}
+
 #[derive(Debug, Clone)]
 pub struct ModuleEvalError {
     pub code: &'static str,
@@ -70,6 +82,7 @@ impl std::error::Error for ModuleEvalError {}
 pub struct ModuleExecutor<'a> {
     program: &'a ModuleProgram,
     services: Option<Arc<dyn ServiceCaller>>,
+    host_capabilities: Option<Arc<dyn HostCapabilityCaller>>,
 }
 
 impl<'a> ModuleExecutor<'a> {
@@ -77,6 +90,7 @@ impl<'a> ModuleExecutor<'a> {
         Self {
             program,
             services: None,
+            host_capabilities: None,
         }
     }
 
@@ -91,7 +105,31 @@ impl<'a> ModuleExecutor<'a> {
         Self {
             program,
             services: Some(services),
+            host_capabilities: None,
         }
+    }
+
+    pub fn with_host_capabilities(
+        program: &'a ModuleProgram,
+        host_capabilities: Arc<dyn HostCapabilityCaller>,
+    ) -> Self {
+        Self {
+            program,
+            services: None,
+            host_capabilities: Some(host_capabilities),
+        }
+    }
+
+    async fn call_host_capability(
+        &self,
+        module: &str,
+        function: &str,
+        args: Vec<Value>,
+    ) -> Result<Option<Value>, ModuleEvalError> {
+        let Some(host_capabilities) = self.host_capabilities.as_ref() else {
+            return Ok(None);
+        };
+        host_capabilities.call(module, function, args).await
     }
 
     pub async fn call(
@@ -224,6 +262,8 @@ struct Frame<'exec, 'program> {
     executor: &'exec ModuleExecutor<'program>,
     file: Arc<ModuleFile>,
     modules: ModuleRegistry,
+    builtin_modules: HashMap<String, String>,
+    builtin_functions: HashMap<String, (String, String)>,
     custom_modules: HashMap<String, String>,
     custom_functions: HashMap<String, (String, String)>,
     service_modules: HashMap<String, String>,
@@ -235,6 +275,8 @@ struct Frame<'exec, 'program> {
 impl<'exec, 'program> Frame<'exec, 'program> {
     fn new(executor: &'exec ModuleExecutor<'program>, file: Arc<ModuleFile>, depth: usize) -> Self {
         let modules = ModuleRegistry::from_imports(&file.imports);
+        let mut builtin_modules = HashMap::new();
+        let mut builtin_functions = HashMap::new();
         let mut custom_modules = HashMap::new();
         let mut custom_functions = HashMap::new();
         let mut service_modules = HashMap::new();
@@ -242,6 +284,12 @@ impl<'exec, 'program> Frame<'exec, 'program> {
         for import in &file.imports {
             let binding = binding_name(import);
             match import_base(import) {
+                ImportTarget::Builtin(module) => {
+                    builtin_modules.insert(binding, module.clone());
+                }
+                ImportTarget::BuiltinFunction { module, function } => {
+                    builtin_functions.insert(binding, (module.clone(), function.clone()));
+                }
                 ImportTarget::Custom(path) => {
                     custom_modules.insert(binding, path.clone());
                 }
@@ -254,13 +302,15 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                 ImportTarget::ServiceFunction { service, function } => {
                     service_functions.insert(binding, (service.clone(), function.clone()));
                 }
-                _ => {}
+                ImportTarget::Aliased { .. } => unreachable!("import_base removes aliases"),
             }
         }
         Self {
             executor,
             file,
             modules,
+            builtin_modules,
+            builtin_functions,
             custom_modules,
             custom_functions,
             service_modules,
@@ -376,6 +426,17 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                     }
 
                     if let Expr::Ident(name) = callee.as_ref() {
+                        if let Some((module, function)) = self.builtin_functions.get(name).cloned()
+                        {
+                            if let Some(value) = self
+                                .executor
+                                .call_host_capability(&module, &function, args.clone())
+                                .await?
+                            {
+                                return Ok(value);
+                            }
+                        }
+
                         if let Some((service, function)) = self.service_functions.get(name).cloned()
                         {
                             return self.executor.call_service(&service, &function, args).await;
@@ -412,6 +473,16 @@ impl<'exec, 'program> Frame<'exec, 'program> {
 
                     if let Expr::Member(base, function_name) = callee.as_ref() {
                         if let Expr::Ident(module_name) = base.as_ref() {
+                            if let Some(module) = self.builtin_modules.get(module_name).cloned() {
+                                if let Some(value) = self
+                                    .executor
+                                    .call_host_capability(&module, function_name, args.clone())
+                                    .await?
+                                {
+                                    return Ok(value);
+                                }
+                            }
+
                             if let Some(service) = self.service_modules.get(module_name).cloned() {
                                 return self
                                     .executor
@@ -805,6 +876,46 @@ mod tests {
         .unwrap();
         assert!(matches!(value, Value::String(value) if value == "route-id"));
         assert_eq!(caller.calls.lock().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    struct TestHostCapability;
+
+    impl HostCapabilityCaller for TestHostCapability {
+        fn call<'a>(
+            &'a self,
+            module: &'a str,
+            function: &'a str,
+            args: Vec<Value>,
+        ) -> HostCapabilityFuture<'a> {
+            Box::pin(async move {
+                if module == "host" && function == "double" {
+                    let Some(Value::Number(value)) = args.into_iter().next() else {
+                        return Err(ModuleEvalError::new("TEST", "expected numeric argument"));
+                    };
+                    Ok(Some(Value::Number(value * 2.0)))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn host_capability_can_override_imported_builtin() {
+        let root = root();
+        fs::write(
+            root.join("module/hosted.module"),
+            ":import[host.double as twice]\nexport function run(value) { return twice(value); }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let executor =
+            ModuleExecutor::with_host_capabilities(&program, Arc::new(TestHostCapability));
+        let value =
+            block_on_ready(executor.call("./module/hosted", "run", vec![Value::Number(6.0)]))
+                .unwrap();
+        assert!(matches!(value, Value::Number(value) if value == 12.0));
         let _ = fs::remove_dir_all(root);
     }
 }
