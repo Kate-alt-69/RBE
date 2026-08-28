@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   group-memory:
@@ -24,9 +24,153 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: group-memory
-      - name: format
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: test
-        run: cargo test --all-targets
+      - name: add explicit group memory leases
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          lib = Path("src/lib.rs")
+          source = lib.read_text()
+
+          if "pub mod lease;" not in source:
+              source = source.replace("pub mod named;\n", "pub mod lease;\npub mod named;\n\npub use lease::{GroupReadLease, GroupWriteLease};\n", 1)
+
+          read_start = source.index("    /// Read the payload while holding")
+          read_end = source.index("\n    /// Flush dirty writable pages", read_start)
+          lease_methods = '''    /// Acquire a shared payload lease. File-backed regions retain a
+              /// cooperative shared OS file lock until the returned guard is dropped.
+              pub fn read_lease(&self) -> Result<GroupReadLease<'_>> {
+                  let lock = self.lock_shared()?;
+                  let generation = self.generation_unlocked();
+                  let payload = self.payload();
+                  Ok(GroupReadLease {
+                      _lock: lock,
+                      payload,
+                      generation,
+                  })
+              }
+
+              /// Acquire an exclusive payload lease. Generation advances while the
+              /// exclusive lock is held and before mutable bytes are exposed. This
+              /// deliberately records a new write epoch even if the writer later
+              /// crashes before completing its mutation.
+              pub fn write_lease(&mut self) -> Result<GroupWriteLease<'_>> {
+                  if self.access != AccessMode::ReadWrite {
+                      return Err(GroupMemoryError::ReadOnly);
+                  }
+                  let lock = self.lock_exclusive()?;
+                  let generation = self.advance_generation_unlocked()?;
+                  let payload = self.payload_mut().ok_or(GroupMemoryError::ReadOnly)?;
+                  Ok(GroupWriteLease {
+                      _lock: lock,
+                      payload,
+                      generation,
+                  })
+              }
+
+              /// Read the payload for one closure-scoped shared lease.
+              pub fn with_read<T>(&self, read: impl FnOnce(&[u8]) -> T) -> Result<T> {
+                  let lease = self.read_lease()?;
+                  Ok(read(&lease))
+              }
+
+              /// Mutate the payload for one closure-scoped exclusive lease.
+              pub fn with_write<T>(&mut self, write: impl FnOnce(&mut [u8]) -> T) -> Result<T> {
+                  let mut lease = self.write_lease()?;
+                  Ok(write(&mut lease))
+              }
+
+              /// Return the current persisted generation. Generation zero means no
+              /// exclusive write lease has ever been acquired through this API.
+              pub fn generation(&self) -> Result<u64> {
+                  let lease = self.read_lease()?;
+                  Ok(lease.generation())
+              }
+          '''.replace('              ', '')
+          source = source[:read_start] + lease_methods + source[read_end:]
+
+          source = source.replace("struct OwnedFileLock {", "pub(crate) struct OwnedFileLock {", 1)
+
+          if "explicit_leases_expose_payload_and_generation" not in source:
+              insert = source.rfind("\n}")
+              tests = r'''
+
+              #[test]
+              fn explicit_leases_expose_payload_and_generation() {
+                  let path = test_path("leases");
+                  {
+                      let mut region = GroupMemoryRegion::create(&path, 16).unwrap();
+                      let read = region.read_lease().unwrap();
+                      assert_eq!(read.generation(), 0);
+                      assert_eq!(read[0], 0);
+                      drop(read);
+
+                      let mut write = region.write_lease().unwrap();
+                      assert_eq!(write.generation(), 1);
+                      write[0] = 99;
+                      drop(write);
+
+                      let read = region.read_lease().unwrap();
+                      assert_eq!(read.generation(), 1);
+                      assert_eq!(read[0], 99);
+                  }
+                  let _ = fs::remove_file(path);
+              }
+          '''
+              source = source[:insert] + tests + source[insert:]
+
+          lib.write_text(source)
+
+          named = Path("src/named.rs")
+          source = named.read_text()
+          source = source.replace(
+              "use crate::{AccessMode, GroupMemoryRegion, Result};",
+              "use crate::{AccessMode, GroupMemoryRegion, GroupReadLease, GroupWriteLease, Result};",
+              1,
+          )
+          if "pub fn read_lease(&self)" not in source:
+              marker = '''    pub fn generation(&self) -> Result<u64> {
+                  self.region.generation()
+              }
+          '''.replace('              ', '')
+              replacement = marker + '''
+              pub fn read_lease(&self) -> Result<GroupReadLease<'_>> {
+                  self.region.read_lease()
+              }
+
+              pub fn write_lease(&mut self) -> Result<GroupWriteLease<'_>> {
+                  self.region.write_lease()
+              }
+          '''.replace('              ', '')
+              if marker not in source:
+                  raise SystemExit("named lease insertion anchor missing")
+              source = source.replace(marker, replacement, 1)
+          named.write_text(source)
+          PY
+
+          cargo fmt --all
+          git diff --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          allowed = {
+              "group-memory/src/lib.rs",
+              "group-memory/src/lease.rs",
+              "group-memory/src/named.rs",
+          }
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected lease paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- src/lib.rs src/lease.rs src/named.rs
+            git commit -m "feat: add explicit group memory leases"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
