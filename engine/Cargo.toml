@@ -9,6 +9,7 @@ members = [
     "crates/supervisor",
     "crates/logging",
     "crates/route-engine",
+    "crates/service-runtime",
 ]
 # `vault` used to be a workspace member here; it's now a standalone
 # shared crate at ../vault (project root), depended on via relative
