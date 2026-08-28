@@ -157,8 +157,11 @@ pub struct VideoManagerStatus {
 pub trait VideoDatabase: Send + Sync {
     fn kind(&self) -> &'static str;
     fn health(&self) -> DatabaseHealth;
-    fn create_asset(&self, database: &str, request: &CreateAssetRequest)
-        -> anyhow::Result<VideoAsset>;
+    fn create_asset(
+        &self,
+        database: &str,
+        request: &CreateAssetRequest,
+    ) -> anyhow::Result<VideoAsset>;
     fn insert_job(&self, job: &VideoJob) -> anyhow::Result<()>;
     fn get_asset(&self, database: &str, asset_id: &str) -> anyhow::Result<Option<VideoAsset>>;
 }
@@ -172,8 +175,12 @@ impl SqliteVideoDatabase {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create Video Manager database directory {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create Video Manager database directory {}",
+                    parent.display()
+                )
+            })?;
         }
         let connection = Connection::open(&path)
             .with_context(|| format!("open Video Manager database {}", path.display()))?;
@@ -198,23 +205,25 @@ impl VideoDatabase for SqliteVideoDatabase {
 
     fn health(&self) -> DatabaseHealth {
         match self.connection.lock() {
-            Ok(connection) => match connection.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)) {
-                Ok(1) => DatabaseHealth {
-                    ok: true,
-                    kind: self.kind().into(),
-                    detail: Some(self.path.display().to_string()),
-                },
-                Ok(_) => DatabaseHealth {
-                    ok: false,
-                    kind: self.kind().into(),
-                    detail: Some("SQLite health query returned unexpected value".into()),
-                },
-                Err(error) => DatabaseHealth {
-                    ok: false,
-                    kind: self.kind().into(),
-                    detail: Some(error.to_string()),
-                },
-            },
+            Ok(connection) => {
+                match connection.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)) {
+                    Ok(1) => DatabaseHealth {
+                        ok: true,
+                        kind: self.kind().into(),
+                        detail: Some(self.path.display().to_string()),
+                    },
+                    Ok(_) => DatabaseHealth {
+                        ok: false,
+                        kind: self.kind().into(),
+                        detail: Some("SQLite health query returned unexpected value".into()),
+                    },
+                    Err(error) => DatabaseHealth {
+                        ok: false,
+                        kind: self.kind().into(),
+                        detail: Some(error.to_string()),
+                    },
+                }
+            }
             Err(_) => DatabaseHealth {
                 ok: false,
                 kind: self.kind().into(),
@@ -501,10 +510,9 @@ impl VideoManager {
             .databases
             .read()
             .map_err(|_| anyhow::anyhow!("Video Manager database registry is poisoned"))?;
-        let database = databases
-            .get(name)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Video Manager database override {name:?} is not registered"))?;
+        let database = databases.get(name).cloned().ok_or_else(|| {
+            anyhow::anyhow!("Video Manager database override {name:?} is not registered")
+        })?;
         Ok((name.to_string(), database))
     }
 }
@@ -523,9 +531,9 @@ fn parse_source_type(value: &str) -> VideoSourceType {
 
 fn validate_segment(label: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty()
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
     {
         anyhow::bail!(
             "{label} must contain only ASCII letters, digits, '-', '_' or '.', got {value:?}"
