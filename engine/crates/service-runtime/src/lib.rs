@@ -495,11 +495,24 @@ pub struct ServiceManager {
     shutting_down: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceRuntimeState {
+    Running,
+    Restarting,
+    Stopped,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceSnapshot {
     pub name: String,
     pub title: String,
     pub pid: Option<u32>,
+    pub state: ServiceRuntimeState,
+    pub restart: RestartPolicy,
+    pub restart_attempts: u32,
 }
 
 impl ServiceManager {
@@ -657,11 +670,24 @@ impl ServiceManager {
         let mut out = Vec::new();
         for handle in handles {
             let mut service = handle.lock().await;
-            let alive = matches!(service.child.try_wait(), Ok(None));
+            let (pid, state) = match service.child.try_wait() {
+                Ok(None) => (service.child.id(), ServiceRuntimeState::Running),
+                Ok(Some(status))
+                    if service.exit_observed
+                        || !should_restart(service.file.restart, status.success()) =>
+                {
+                    (None, ServiceRuntimeState::Stopped)
+                }
+                Ok(Some(_)) => (None, ServiceRuntimeState::Restarting),
+                Err(_) => (None, ServiceRuntimeState::Unknown),
+            };
             out.push(ServiceSnapshot {
                 name: service.file.name.clone(),
                 title: service.file.title.clone(),
-                pid: if alive { service.child.id() } else { None },
+                pid,
+                state,
+                restart: service.file.restart,
+                restart_attempts: service.restart_attempts,
             });
         }
         out.sort_by(|left, right| left.name.cmp(&right.name));
