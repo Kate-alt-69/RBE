@@ -44,19 +44,10 @@ jobs:
                   continue;
               }
 
-              if let Some(process) = service.process.as_mut() {
+              let running_pid = if let Some(process) = service.process.as_mut() {
                   match process.child.try_wait() {
-                      Ok(None) => {
-                          service.restarting = false;
-                          tracing::debug!(
-                              service = %file.name,
-                              pid = process.child.id(),
-                              attempt,
-                              "scheduled service restart found a running replacement"
-                          );
-                          continue;
-                      }
-                      Ok(Some(_)) => {}
+                      Ok(None) => process.child.id(),
+                      Ok(Some(_)) => None,
                       Err(error) => {
                           tracing::warn!(
                               service = %file.name,
@@ -67,6 +58,18 @@ jobs:
                           continue;
                       }
                   }
+              } else {
+                  None
+              };
+              if let Some(pid) = running_pid {
+                  service.restarting = false;
+                  tracing::debug!(
+                      service = %file.name,
+                      pid,
+                      attempt,
+                      "scheduled service restart found a running replacement"
+                  );
+                  continue;
               }
 
               match spawn_process(&file).await {
