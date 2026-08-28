@@ -14,6 +14,7 @@ core-lib = { path = "../core" }
 config = { path = "../config" }
 supervisor = { path = "../supervisor" }
 logging = { path = "../logging" }
+service-runtime = { path = "../service-runtime" }
 vault-process = { path = "../../../vault-process" }
 atomic-io = { path = "../../../atomic-io" }
 runtime-paths = { path = "../../../runtime-paths" }
