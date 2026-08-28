@@ -166,7 +166,17 @@ impl Parser {
     fn parse_import_target(&mut self) -> Result<ImportTarget, ParseError> {
         match self.advance().kind {
             TokenKind::Ident(name) => {
-                if self.check(&TokenKind::Dot) {
+                if name == "service" && self.check(&TokenKind::Colon) {
+                    self.advance();
+                    let service = self.expect_ident()?;
+                    if self.check(&TokenKind::Dot) {
+                        self.advance();
+                        let function = self.expect_ident()?;
+                        Ok(ImportTarget::ServiceFunction { service, function })
+                    } else {
+                        Ok(ImportTarget::Service(service))
+                    }
+                } else if self.check(&TokenKind::Dot) {
                     self.advance();
                     let function = self.expect_ident()?;
                     Ok(ImportTarget::BuiltinFunction {
@@ -183,7 +193,21 @@ impl Parser {
                 }
             }
             TokenKind::String(path) => {
-                if self.check(&TokenKind::RBracket)
+                if let Some(service) = path.strip_prefix("service:") {
+                    if service.is_empty() {
+                        return Err(self.error_here("service import name cannot be empty"));
+                    }
+                    if self.check(&TokenKind::Dot) {
+                        self.advance();
+                        let function = self.expect_ident()?;
+                        Ok(ImportTarget::ServiceFunction {
+                            service: service.to_string(),
+                            function,
+                        })
+                    } else {
+                        Ok(ImportTarget::Service(service.to_string()))
+                    }
+                } else if self.check(&TokenKind::RBracket)
                     || self.check(&TokenKind::Comma)
                     || self.is_as_keyword()
                 {
@@ -195,8 +219,8 @@ impl Parser {
                 }
             }
             other => Err(self.error_here(&format!(
-                "expected builtin identifier or string path inside :import[...], got {other:?}"
-            ))),
+            "expected builtin, module path, or service import inside :import[...], got {other:?}"
+        ))),
         }
     }
 

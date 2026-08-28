@@ -86,6 +86,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_service_imports_for_modules() {
+        let tokens = Lexer::new(
+            r#":import[service:uac-cache as uac, service:search.find as lookup, "service:media"]
+            export function run(value) { return value; }"#,
+        )
+        .tokenize()
+        .expect("lex failed");
+        let file = Parser::new(tokens)
+            .parse_module_file()
+            .expect("module parse failed");
+        assert_eq!(file.imports.len(), 3);
+        assert_eq!(binding_name(&file.imports[0]), "uac");
+        assert_eq!(binding_name(&file.imports[1]), "lookup");
+        assert_eq!(binding_name(&file.imports[2]), "media");
+    }
+
+    #[test]
+    fn route_rejects_direct_service_imports() {
+        let file = parse(r#"
+            :import[service:uac-cache]
+            class Route {
+                get(req) { return { ok: true }; }
+            }
+        "#);
+        let diagnostics = analyze(&file);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "E3020"));
+    }
+
+    #[test]
     fn parses_multiple_import_entries_and_aliases() {
         let file = parse(r#"
             :import[response as resp, net, net.ping as ping]

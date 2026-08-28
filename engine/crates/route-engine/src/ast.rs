@@ -19,6 +19,11 @@ pub enum ImportTarget {
         path: String,
         function: String,
     },
+    Service(String),
+    ServiceFunction {
+        service: String,
+        function: String,
+    },
     Aliased {
         target: Box<ImportTarget>,
         alias: String,

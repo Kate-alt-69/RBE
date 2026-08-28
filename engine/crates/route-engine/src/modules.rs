@@ -5,24 +5,43 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ast::{ImportTarget, Value};
 
 #[derive(Debug)]
-pub struct ModuleError { pub message: String }
+pub struct ModuleError {
+    pub message: String,
+}
 
 impl fmt::Display for ModuleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.message) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
 }
 
 enum ModuleKind {
     Builtin(BuiltinModule),
-    CustomUnimplemented { source_path: String, resolved_path: std::path::PathBuf },
+    CustomUnimplemented {
+        source_path: String,
+        resolved_path: std::path::PathBuf,
+    },
 }
 
 #[derive(Clone, Copy)]
-enum BuiltinModule { Net, Env, Private, Json, Time, Log, Crypto, Http, Request, Security, Response }
+enum BuiltinModule {
+    Net,
+    Env,
+    Private,
+    Json,
+    Time,
+    Log,
+    Crypto,
+    Http,
+    Request,
+    Security,
+    Response,
+}
 
 pub struct ModuleRegistry {
     modules: HashMap<String, ModuleKind>,
@@ -36,7 +55,16 @@ pub struct ModuleRegistry {
 pub fn route_capability_allowed(name: &str) -> bool {
     matches!(
         name,
-        "net" | "json" | "crypto" | "time" | "http" | "request" | "log" | "security" | "response" | "private"
+        "net"
+            | "json"
+            | "crypto"
+            | "time"
+            | "http"
+            | "request"
+            | "log"
+            | "security"
+            | "response"
+            | "private"
     )
 }
 
@@ -62,8 +90,13 @@ pub fn binding_name(target: &ImportTarget) -> String {
         ImportTarget::Builtin(name) => name.clone(),
         ImportTarget::BuiltinFunction { function, .. } => function.clone(),
         ImportTarget::Custom(path) => std::path::Path::new(path)
-            .file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string(),
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path)
+            .to_string(),
         ImportTarget::CustomFunction { function, .. } => function.clone(),
+        ImportTarget::Service(name) => name.clone(),
+        ImportTarget::ServiceFunction { function, .. } => function.clone(),
     }
 }
 
@@ -120,29 +153,51 @@ impl ModuleRegistry {
                         },
                     };
                     modules.entry(module.clone()).or_insert(kind);
-                    direct_functions.insert(binding_name(target), (module.clone(), function.clone()));
+                    direct_functions
+                        .insert(binding_name(target), (module.clone(), function.clone()));
                 }
                 ImportTarget::Custom(path) => {
-                    let resolved = crate::paths::resolve_custom_import(&crate::paths::binary_dir(), path);
+                    let resolved =
+                        crate::paths::resolve_custom_import(&crate::paths::binary_dir(), path);
                     let name = binding_name(target);
-                    modules.insert(name, ModuleKind::CustomUnimplemented {
-                        source_path: path.clone(), resolved_path: resolved,
-                    });
+                    modules.insert(
+                        name,
+                        ModuleKind::CustomUnimplemented {
+                            source_path: path.clone(),
+                            resolved_path: resolved,
+                        },
+                    );
                 }
                 ImportTarget::CustomFunction { path, function } => {
-                    let resolved = crate::paths::resolve_custom_import(&crate::paths::binary_dir(), path);
+                    let resolved =
+                        crate::paths::resolve_custom_import(&crate::paths::binary_dir(), path);
                     let module_name = std::path::Path::new(path)
-                        .file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string();
-                    modules.entry(module_name.clone()).or_insert(ModuleKind::CustomUnimplemented {
-                        source_path: path.clone(), resolved_path: resolved,
-                    });
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(path)
+                        .to_string();
+                    modules
+                        .entry(module_name.clone())
+                        .or_insert(ModuleKind::CustomUnimplemented {
+                            source_path: path.clone(),
+                            resolved_path: resolved,
+                        });
                     direct_functions.insert(binding_name(target), (module_name, function.clone()));
                 }
-                ImportTarget::Aliased { .. } => unreachable!("base_target removes aliased import wrappers"),
+                ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => {
+                    // Service calls are async and are intentionally handled by ModuleExecutor,
+                    // never by the synchronous route capability registry.
+                }
+                ImportTarget::Aliased { .. } => {
+                    unreachable!("base_target removes aliased import wrappers")
+                }
             }
         }
 
-        Self { modules, direct_functions }
+        Self {
+            modules,
+            direct_functions,
+        }
     }
 
     pub fn call_direct(&self, binding: &str, args: &[Value]) -> Result<Value, ModuleError> {
@@ -178,11 +233,22 @@ impl ModuleRegistry {
             ModuleKind::Builtin(BuiltinModule::Time) => call_time(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Log) => call_log(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Crypto) => call_crypto(function_name, args),
-            ModuleKind::Builtin(BuiltinModule::Http) => Err(ModuleError { message: format!("{module_name}.{function_name}() is not implemented yet") }),
-            ModuleKind::Builtin(BuiltinModule::Request) => Err(ModuleError { message: format!("{module_name}.{function_name}() is not implemented yet") }),
-            ModuleKind::Builtin(BuiltinModule::Security) => Err(ModuleError { message: format!("{module_name}.{function_name}() is not implemented yet") }),
-            ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError { message: format!("{module_name}.{function_name}() is not implemented yet") }),
-            ModuleKind::CustomUnimplemented { source_path, resolved_path } => {
+            ModuleKind::Builtin(BuiltinModule::Http) => Err(ModuleError {
+                message: format!("{module_name}.{function_name}() is not implemented yet"),
+            }),
+            ModuleKind::Builtin(BuiltinModule::Request) => Err(ModuleError {
+                message: format!("{module_name}.{function_name}() is not implemented yet"),
+            }),
+            ModuleKind::Builtin(BuiltinModule::Security) => Err(ModuleError {
+                message: format!("{module_name}.{function_name}() is not implemented yet"),
+            }),
+            ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {
+                message: format!("{module_name}.{function_name}() is not implemented yet"),
+            }),
+            ModuleKind::CustomUnimplemented {
+                source_path,
+                resolved_path,
+            } => {
                 let note = if resolved_path.as_os_str().is_empty() {
                     String::new()
                 } else {
@@ -221,7 +287,10 @@ fn call_private(function_name: &str, _args: &[Value]) -> Result<Value, ModuleErr
         "health" => {
             let mut fields = HashMap::new();
             fields.insert("status".to_string(), Value::String("healthy".to_string()));
-            fields.insert("uptime".to_string(), Value::Number(runtime_start().elapsed().as_secs_f64()));
+            fields.insert(
+                "uptime".to_string(),
+                Value::Number(runtime_start().elapsed().as_secs_f64()),
+            );
             fields.insert("container".to_string(), Value::Null);
             fields.insert("vault".to_string(), Value::Bool(true));
             fields.insert("errorReporter".to_string(), Value::Null);
@@ -237,22 +306,31 @@ fn call_json(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> 
     match function_name {
         "parse" => {
             let Some(Value::String(input)) = args.first() else {
-                return Err(ModuleError { message: "json.parse(value) requires a string argument".into() });
+                return Err(ModuleError {
+                    message: "json.parse(value) requires a string argument".into(),
+                });
             };
-            let parsed: serde_json::Value = serde_json::from_str(input)
-                .map_err(|e| ModuleError { message: format!("json.parse() failed: {e}") })?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(input).map_err(|e| ModuleError {
+                    message: format!("json.parse() failed: {e}"),
+                })?;
             Ok(json_to_value(parsed))
         }
         "stringify" => {
             let Some(value) = args.first() else {
-                return Err(ModuleError { message: "json.stringify(value) requires an argument".into() });
+                return Err(ModuleError {
+                    message: "json.stringify(value) requires an argument".into(),
+                });
             };
             let json = value_to_json(value);
-            let text = serde_json::to_string(&json)
-                .map_err(|e| ModuleError { message: format!("json.stringify() failed: {e}") })?;
+            let text = serde_json::to_string(&json).map_err(|e| ModuleError {
+                message: format!("json.stringify() failed: {e}"),
+            })?;
             Ok(Value::String(text))
         }
-        other => Err(ModuleError { message: format!("json.{other}() does not exist") }),
+        other => Err(ModuleError {
+            message: format!("json.{other}() does not exist"),
+        }),
     }
 }
 
@@ -262,18 +340,30 @@ fn json_to_value(value: serde_json::Value) -> Value {
         serde_json::Value::Bool(v) => Value::Bool(v),
         serde_json::Value::Number(v) => Value::Number(v.as_f64().unwrap_or(0.0)),
         serde_json::Value::String(v) => Value::String(v),
-        serde_json::Value::Array(items) => Value::Array(items.into_iter().map(json_to_value).collect()),
-        serde_json::Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, json_to_value(v))).collect()),
+        serde_json::Value::Array(items) => {
+            Value::Array(items.into_iter().map(json_to_value).collect())
+        }
+        serde_json::Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, json_to_value(v)))
+                .collect(),
+        ),
     }
 }
 
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::String(v) => serde_json::Value::String(v.clone()),
-        Value::Number(v) => serde_json::Number::from_f64(*v).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+        Value::Number(v) => serde_json::Number::from_f64(*v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Value::Bool(v) => serde_json::Value::Bool(*v),
         Value::Null => serde_json::Value::Null,
-        Value::Object(map) => serde_json::Value::Object(map.iter().map(|(k, v)| (k.clone(), value_to_json(v))).collect()),
+        Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect(),
+        ),
         Value::Array(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
     }
 }
@@ -281,19 +371,35 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 fn call_time(function_name: &str, _args: &[Value]) -> Result<Value, ModuleError> {
     match function_name {
         "now" => {
-            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            let seconds = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
             Ok(Value::Number(seconds))
         }
-        other => Err(ModuleError { message: format!("time.{other}() does not exist") }),
+        other => Err(ModuleError {
+            message: format!("time.{other}() does not exist"),
+        }),
     }
 }
 
 fn call_log(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
-    let message = args.first().map(|value| format!("{value:?}")).unwrap_or_default();
+    let message = args
+        .first()
+        .map(|value| format!("{value:?}"))
+        .unwrap_or_default();
     match function_name {
-        "info" => { tracing::info!(message = %message, "route log"); Ok(Value::Null) }
-        "warn" => { tracing::warn!(message = %message, "route log"); Ok(Value::Null) }
-        other => Err(ModuleError { message: format!("log.{other}() does not exist") }),
+        "info" => {
+            tracing::info!(message = %message, "route log");
+            Ok(Value::Null)
+        }
+        "warn" => {
+            tracing::warn!(message = %message, "route log");
+            Ok(Value::Null)
+        }
+        other => Err(ModuleError {
+            message: format!("log.{other}() does not exist"),
+        }),
     }
 }
 
@@ -301,7 +407,9 @@ fn call_crypto(function_name: &str, args: &[Value]) -> Result<Value, ModuleError
     match function_name {
         "hash" => {
             let Some(Value::String(input)) = args.first() else {
-                return Err(ModuleError { message: "crypto.hash(value) requires a string argument".into() });
+                return Err(ModuleError {
+                    message: "crypto.hash(value) requires a string argument".into(),
+                });
             };
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
@@ -309,7 +417,9 @@ fn call_crypto(function_name: &str, args: &[Value]) -> Result<Value, ModuleError
             input.hash(&mut hasher);
             Ok(Value::String(format!("{:016x}", hasher.finish())))
         }
-        other => Err(ModuleError { message: format!("crypto.{other}() does not exist") }),
+        other => Err(ModuleError {
+            message: format!("crypto.{other}() does not exist"),
+        }),
     }
 }
 
@@ -317,7 +427,9 @@ fn call_env(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
     match function_name {
         "get" => {
             let Some(Value::String(key)) = args.first() else {
-                return Err(ModuleError { message: "env.get(key) requires a string argument".into() });
+                return Err(ModuleError {
+                    message: "env.get(key) requires a string argument".into(),
+                });
             };
             Ok(match std::env::var(key) {
                 Ok(v) => Value::String(v),
@@ -361,7 +473,10 @@ mod tests {
     #[test]
     fn private_health_reports_runtime_status() {
         let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("private".into())]);
-        let Value::Object(fields) = registry.call("private", "health", &[]).expect("health call") else {
+        let Value::Object(fields) = registry
+            .call("private", "health", &[])
+            .expect("health call")
+        else {
             panic!("expected health object");
         };
         assert!(matches!(fields.get("status"), Some(Value::String(status)) if status == "healthy"));
@@ -373,24 +488,41 @@ mod tests {
     #[test]
     fn json_parse_and_stringify_round_trip() {
         let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("json".into())]);
-        let parsed = registry.call("json", "parse", &[Value::String(r#"{"ok":true,"count":2}"#.into())]).expect("parse");
-        let Value::Object(fields) = &parsed else { panic!("expected object") };
+        let parsed = registry
+            .call(
+                "json",
+                "parse",
+                &[Value::String(r#"{"ok":true,"count":2}"#.into())],
+            )
+            .expect("parse");
+        let Value::Object(fields) = &parsed else {
+            panic!("expected object")
+        };
         assert!(matches!(fields.get("ok"), Some(Value::Bool(true))));
-        let Value::String(text) = registry.call("json", "stringify", &[parsed]).expect("stringify") else { panic!("expected string") };
+        let Value::String(text) = registry
+            .call("json", "stringify", &[parsed])
+            .expect("stringify")
+        else {
+            panic!("expected string")
+        };
         assert!(text.contains("\"ok\":true"));
     }
 
     #[test]
     fn time_now_returns_epoch_seconds() {
         let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("time".into())]);
-        let Value::Number(now) = registry.call("time", "now", &[]).expect("time.now") else { panic!("expected number") };
+        let Value::Number(now) = registry.call("time", "now", &[]).expect("time.now") else {
+            panic!("expected number")
+        };
         assert!(now > 0.0);
     }
 
     #[test]
     fn unknown_private_function_is_reported() {
         let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("private".into())]);
-        let error = registry.call("private", "missing", &[]).expect_err("missing function should fail");
+        let error = registry
+            .call("private", "missing", &[])
+            .expect_err("missing function should fail");
         assert!(error.message.contains("private.missing() does not exist"));
     }
 }

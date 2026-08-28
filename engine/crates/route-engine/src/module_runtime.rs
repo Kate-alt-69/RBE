@@ -275,6 +275,10 @@ fn import_source_key(import: &ImportTarget) -> String {
         ImportTarget::CustomFunction { path, function } => {
             format!("module:{path}.{function}")
         }
+        ImportTarget::Service(service) => format!("service:{service}"),
+        ImportTarget::ServiceFunction { service, function } => {
+            format!("service:{service}.{function}")
+        }
         ImportTarget::Aliased { .. } => unreachable!(),
     }
 }
@@ -402,6 +406,19 @@ mod tests {
 
         let error = ModuleProgram::load(&root.join("module")).unwrap_err();
         assert!(error.0.iter().any(|item| item.code == "MOD2007"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepts_service_imports_without_module_dependencies() {
+        let root = root();
+        fs::write(
+            root.join("module/cache.module"),
+            ":import[service:uac-cache, service:search.find as lookup]\nexport function run(value) { return value; }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        assert_eq!(program.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 }
