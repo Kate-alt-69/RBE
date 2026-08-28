@@ -29,23 +29,9 @@ jobs:
 
           runtime = Path("crates/service-runtime/src/lib.rs")
           source = runtime.read_text()
-          old = '''    let exports = source
-              .lines()
-              .filter_map(|line| {
-                  let rest = line.trim_start().strip_prefix("export function ")?;
-                  let name: String = rest
-                      .chars()
-                      .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
-                      .collect();
-                  (!name.is_empty()).then_some(name)
-              })
-              .collect();
-
-              Ok(ServiceFile {
-          '''
-          if old not in source:
-              raise SystemExit("service export scanner anchor missing")
-          new = '''    let exports = source
+          start = source.index("    let exports = source\n")
+          end = source.index("    Ok(ServiceFile {", start)
+          replacement = '''    let exports = source
               .lines()
               .filter_map(|line| {
                   let line = line.trim_start();
@@ -70,17 +56,16 @@ jobs:
                   ));
               }
 
-              Ok(ServiceFile {
           '''
-          source = source.replace(old, new, 1)
+          source = source[:start] + replacement + source[end:]
 
           if "metadata_accepts_async_exports" not in source:
               insert = source.rfind("\n}")
               tests = r'''
 
               fn temp_service_path(label: &str) -> PathBuf {
-                  let nonce = SystemTime::now()
-                      .duration_since(UNIX_EPOCH)
+                  let nonce = std::time::SystemTime::now()
+                      .duration_since(std::time::UNIX_EPOCH)
                       .unwrap_or_default()
                       .as_nanos();
                   std::env::temp_dir().join(format!(
@@ -121,13 +106,7 @@ jobs:
           boot = Path("crates/backend/src/service_boot.rs")
           source = boot.read_text()
           if "fn validate_executable_catalog" not in source:
-              source = source.replace(
-                  "use std::path::{Path, PathBuf};\n",
-                  "use std::path::{Path, PathBuf};\n\n",
-                  1,
-              )
-              anchor = "pub fn compile(\n"
-              at = source.index(anchor)
+              at = source.index("pub fn compile(\n")
               helpers = r'''fn validate_executable_catalog(catalog: &ServiceCatalog) -> Result<(), String> {
               let mut diagnostics = Vec::new();
               for service in catalog.services() {
@@ -177,53 +156,21 @@ jobs:
           '''
               source = source[:at] + helpers + source[at:]
 
-              old = '''        Ok(catalog) => {
-                  let error_path = compiler_error_path();
-                  if error_path.exists() {
-                      let _ = io.write_atomic(&error_path, b"");
-                  }
-          '''
-              if old not in source:
-                  raise SystemExit("service compile success anchor missing")
-              new = '''        Ok(catalog) => {
-                  if let Err(rendered) = validate_executable_catalog(&catalog) {
-                      report_compile_failure(&rendered, io);
-                      return Err(anyhow::anyhow!(".service executable compilation failed"));
-                  }
-                  let error_path = compiler_error_path();
-                  if error_path.exists() {
-                      let _ = io.write_atomic(&error_path, b"");
-                  }
-          '''
-              source = source.replace(old, new, 1)
-
-              old = '''        Err(errors) => {
-                  let rendered = errors.render();
-                  let error_path = compiler_error_path();
-                  if let Err(write_error) = io.write_atomic(&error_path, rendered.as_bytes()) {
-                      tracing::error!(
-                          error = %write_error,
-                          path = %error_path.display(),
-                          "failed to persist service compiler diagnostics"
-                      );
-                  }
-                  eprintln!(
-                      "backend couldn't start because a .service file failed to compile:\n{rendered}"
-                  );
-                  eprintln!("compiler log: {}", error_path.display());
-                  service_runtime::pause_for_interactive_exit();
-                  Err(anyhow::anyhow!(".service compilation failed"))
+              success = source.index("        Ok(catalog) => {", source.index("pub fn compile("))
+              error_path = source.index("            let error_path = compiler_error_path();", success)
+              source = source[:error_path] + '''            if let Err(rendered) = validate_executable_catalog(&catalog) {
+                  report_compile_failure(&rendered, io);
+                  return Err(anyhow::anyhow!(".service executable compilation failed"));
               }
-          '''
-              if old not in source:
-                  raise SystemExit("service compile error branch anchor missing")
-              new = '''        Err(errors) => {
+          ''' + source[error_path:]
+
+              err_start = source.index("        Err(errors) => {", success)
+              match_end = source.index("\n        }\n    }\n}", err_start) + len("\n        }")
+              source = source[:err_start] + '''        Err(errors) => {
                   let rendered = errors.render();
                   report_compile_failure(&rendered, io);
                   Err(anyhow::anyhow!(".service compilation failed"))
-              }
-          '''
-              source = source.replace(old, new, 1)
+              }''' + source[match_end:]
 
           if "executable_validation_reports_file_and_location" not in source:
               source += r'''
@@ -231,11 +178,10 @@ jobs:
           #[cfg(test)]
           mod tests {
               use super::*;
-              use std::time::{SystemTime, UNIX_EPOCH};
 
               fn temp_dir() -> PathBuf {
-                  let nonce = SystemTime::now()
-                      .duration_since(UNIX_EPOCH)
+                  let nonce = std::time::SystemTime::now()
+                      .duration_since(std::time::UNIX_EPOCH)
                       .unwrap_or_default()
                       .as_nanos();
                   let path = std::env::temp_dir().join(format!(
