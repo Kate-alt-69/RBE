@@ -6,7 +6,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::{AccessMode, GroupMemoryRegion, Result};
+use crate::{AccessMode, GroupMemoryRegion, GroupReadLease, GroupWriteLease, Result};
 
 const MAX_NAME_LEN: usize = 96;
 
@@ -166,6 +166,14 @@ impl GroupSegment {
 
     pub fn generation(&self) -> Result<u64> {
         self.region.generation()
+    }
+
+    pub fn read_lease(&self) -> Result<GroupReadLease<'_>> {
+        self.region.read_lease()
+    }
+
+    pub fn write_lease(&mut self) -> Result<GroupWriteLease<'_>> {
+        self.region.write_lease()
     }
 
     pub fn with_read<T>(&self, read: impl FnOnce(&[u8]) -> T) -> Result<T> {

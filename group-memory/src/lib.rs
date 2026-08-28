@@ -17,7 +17,10 @@ use fs2::FileExt;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use thiserror::Error;
 
+pub mod lease;
 pub mod named;
+
+pub use lease::{GroupReadLease, GroupWriteLease};
 
 const MAGIC: [u8; 8] = *b"RBEGRP01";
 const HEADER_LEN: usize = 64;
@@ -182,35 +185,54 @@ impl GroupMemoryRegion {
         self.path.as_deref()
     }
 
-    /// Read the payload while holding a cooperative shared lock for a
-    /// file-backed mapping. Anonymous mappings do not need an OS file lock.
-    pub fn with_read<T>(&self, read: impl FnOnce(&[u8]) -> T) -> Result<T> {
-        let _guard = self.lock_shared()?;
-        Ok(read(self.payload()))
+    /// Acquire a shared payload lease. File-backed regions retain a
+    /// cooperative shared OS file lock until the returned guard is dropped.
+    pub fn read_lease(&self) -> Result<GroupReadLease<'_>> {
+        let lock = self.lock_shared()?;
+        let generation = self.generation_unlocked();
+        let payload = self.payload();
+        Ok(GroupReadLease {
+            _lock: lock,
+            payload,
+            generation,
+        })
     }
 
-    /// Mutate the payload while holding a cooperative exclusive lock.
-    /// Changes become visible through other mappings according to the OS's
-    /// normal shared-mapping coherence rules. Call `flush` when disk durability
-    /// is required at a specific point.
-    pub fn with_write<T>(&mut self, write: impl FnOnce(&mut [u8]) -> T) -> Result<T> {
+    /// Acquire an exclusive payload lease. Generation advances while the
+    /// exclusive lock is held and before mutable bytes are exposed. This
+    /// deliberately records a new write epoch even if the writer later
+    /// crashes before completing its mutation.
+    pub fn write_lease(&mut self) -> Result<GroupWriteLease<'_>> {
         if self.access != AccessMode::ReadWrite {
             return Err(GroupMemoryError::ReadOnly);
         }
-        let _guard = self.lock_exclusive()?;
-        let output = {
-            let payload = self.payload_mut().ok_or(GroupMemoryError::ReadOnly)?;
-            write(payload)
-        };
-        self.advance_generation_unlocked()?;
-        Ok(output)
+        let lock = self.lock_exclusive()?;
+        let generation = self.advance_generation_unlocked()?;
+        let payload = self.payload_mut().ok_or(GroupMemoryError::ReadOnly)?;
+        Ok(GroupWriteLease {
+            _lock: lock,
+            payload,
+            generation,
+        })
     }
 
-    /// Return the current persisted generation. Generation zero means the
-    /// region has never completed a write through this API.
+    /// Read the payload for one closure-scoped shared lease.
+    pub fn with_read<T>(&self, read: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        let lease = self.read_lease()?;
+        Ok(read(&lease))
+    }
+
+    /// Mutate the payload for one closure-scoped exclusive lease.
+    pub fn with_write<T>(&mut self, write: impl FnOnce(&mut [u8]) -> T) -> Result<T> {
+        let mut lease = self.write_lease()?;
+        Ok(write(&mut lease))
+    }
+
+    /// Return the current persisted generation. Generation zero means no
+    /// exclusive write lease has ever been acquired through this API.
     pub fn generation(&self) -> Result<u64> {
-        let _guard = self.lock_shared()?;
-        Ok(self.generation_unlocked())
+        let lease = self.read_lease()?;
+        Ok(lease.generation())
     }
 
     /// Flush dirty writable pages to their backing file. Anonymous regions are
@@ -271,7 +293,7 @@ impl GroupMemoryRegion {
     }
 }
 
-struct OwnedFileLock {
+pub(crate) struct OwnedFileLock {
     file: File,
 }
 
@@ -456,6 +478,28 @@ mod tests {
 
             writer.with_write(|payload| payload[1] = 8).unwrap();
             assert_eq!(reader.generation().unwrap(), 2);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_leases_expose_payload_and_generation() {
+        let path = test_path("leases");
+        {
+            let mut region = GroupMemoryRegion::create(&path, 16).unwrap();
+            let read = region.read_lease().unwrap();
+            assert_eq!(read.generation(), 0);
+            assert_eq!(read[0], 0);
+            drop(read);
+
+            let mut write = region.write_lease().unwrap();
+            assert_eq!(write.generation(), 1);
+            write[0] = 99;
+            drop(write);
+
+            let read = region.read_lease().unwrap();
+            assert_eq!(read.generation(), 1);
+            assert_eq!(read[0], 99);
         }
         let _ = fs::remove_file(path);
     }
