@@ -30,9 +30,8 @@ jobs:
           evaluator = Path("crates/route-engine/src/module_eval.rs")
           source = evaluator.read_text()
           if "pub(crate) async fn call_inline" not in source:
-              anchor = "    async fn call_service(\n"
-              at = source.index(anchor, source.index("impl<'a> ModuleExecutor"))
-              method = r'''    pub(crate) async fn call_inline(
+              at = source.index("    async fn call_service(\n", source.index("impl<'a> ModuleExecutor"))
+              source = source[:at] + r'''    pub(crate) async fn call_inline(
               &self,
               file: Arc<ModuleFile>,
               function: &str,
@@ -41,12 +40,11 @@ jobs:
               self.call_function(file, function, args, 0).await
           }
 
-          '''
-              source = source[:at] + method + source[at:]
+          ''' + source[at:]
 
           if "inline_route_can_reach_module_service_chain" not in source:
               insert = source.rfind("\n}")
-              test = r'''
+              source = source[:insert] + r'''
 
               #[test]
               fn inline_route_can_reach_module_service_chain() {
@@ -59,7 +57,6 @@ jobs:
                   let program = ModuleProgram::load(&root.join("module")).unwrap();
                   let caller = Arc::new(FakeServices::default());
                   let executor = ModuleExecutor::with_service_caller(&program, caller.clone());
-
                   let route = Arc::new(ModuleFile {
                       imports: vec![ImportTarget::Custom("./module/bridge".into())],
                       functions: vec![crate::ast::FunctionDef {
@@ -90,8 +87,7 @@ jobs:
                   assert_eq!(caller.calls.lock().unwrap().len(), 1);
                   let _ = fs::remove_dir_all(root);
               }
-          '''
-              source = source[:insert] + test + source[insert:]
+          ''' + source[insert:]
           evaluator.write_text(source)
 
           discovery = Path("crates/route-engine/src/discovery.rs")
@@ -114,7 +110,7 @@ jobs:
 
           start = source.index("async fn execute(")
           end = source.index("\nfn compiler_error_path", start)
-          replacement = r'''const INLINE_ROUTE_HANDLER: &str = "\0rbe-route-handler";
+          source = source[:start] + r'''const INLINE_ROUTE_HANDLER: &str = "\0rbe-route-handler";
 
           fn request_value(method: &str, path: &str) -> Value {
               let mut fields = HashMap::new();
@@ -139,7 +135,6 @@ jobs:
                   Vec::new()
               };
               let executor = ModuleExecutor::with_services(module_program.as_ref(), state.services.clone());
-
               match executor.call_inline(inline_file, INLINE_ROUTE_HANDLER, args).await {
                   Ok(value) => Json(value_to_json(&value)).into_response(),
                   Err(err) => {
@@ -160,7 +155,6 @@ jobs:
               url_path: String,
           ) -> MethodRouter<AppState> {
               let mut router = MethodRouter::<AppState>::new();
-
               for method_def in &file.methods {
                   let mut functions = file.functions.clone();
                   functions.push(FunctionDef {
@@ -178,7 +172,6 @@ jobs:
                   let url_path = url_path.clone();
                   let verb = method_def.verb.clone();
                   let handler_verb = verb.clone();
-
                   let handler = move |State(state): State<AppState>| {
                       let inline_file = inline_file.clone();
                       let module_program = module_program.clone();
@@ -196,7 +189,6 @@ jobs:
                           .await
                       }
                   };
-
                   router = match verb.as_str() {
                       "get" => router.get(handler),
                       "post" => router.post(handler),
@@ -208,38 +200,27 @@ jobs:
                       _ => router,
                   };
               }
-
               router
           }
-          '''
-          source = source[:start] + replacement + source[end:]
+          ''' + source[end:]
 
           source = source.replace(
               "    let module_program = crate::module_runtime::ModuleProgram::load_default()?;\n",
               "    let module_program = Arc::new(ModuleProgram::load_default()?);\n",
               1,
           )
-          old = '''        let module_names: Arc<Vec<String>> =
-              Arc::new(route_file.imports.iter().map(binding_name).collect());
-          let modules = Arc::new(ModuleRegistry::from_imports(&route_file.imports));
-
-          '''
-          if old not in source:
-              raise SystemExit("build_routes old runtime binding block missing")
-          source = source.replace(old, "", 1)
-          old = '''        router = router.route(
-              &url_path,
-              build_method_router(&route_file, modules, module_names, url_path.clone()),
-          );
-          '''
-          if old not in source:
-              raise SystemExit("build_routes method router call missing")
-          new = '''        router = router.route(
+          build = source.index("pub fn build_routes(api_dir: &Path)")
+          loop_at = source.index("    for (path, route_file) in compiled {", build)
+          url_at = source.index("        let url_path = url_path_for(api_dir, &path);", loop_at)
+          url_end = source.index("\n", url_at) + 1
+          trace_at = source.index("        tracing::info!(", url_end)
+          source = source[:url_end] + "\n" + source[trace_at:]
+          route_at = source.index("        router = router.route(", trace_at)
+          route_end = source.index("        );", route_at) + len("        );")
+          source = source[:route_at] + '''        router = router.route(
               &url_path,
               build_method_router(&route_file, module_program.clone(), url_path.clone()),
-          );
-          '''
-          source = source.replace(old, new, 1)
+          );''' + source[route_end:]
           discovery.write_text(source)
           PY
 
