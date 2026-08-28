@@ -1,0 +1,36 @@
+name: Fix Module Service Contract Guard
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: constrain formatter spillover
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/module-service-contract-patch.yml')
+          source = path.read_text()
+          anchor = "          python - <<'PY'\n          import subprocess\n          changed = set(subprocess.check_output([\"git\", \"diff\", \"--name-only\", \"--relative\"], text=True).split())"
+          replacement = "          git checkout -- \\\n            crates/backend/src/error_reporter_daemon.rs \\\n            crates/backend/src/maintenance_notice.rs \\\n            crates/route-engine/src/cache.rs \\\n            crates/route-engine/src/interpreter.rs \\\n            crates/route-engine/src/lexer.rs \\\n            crates/route-engine/src/transpiled_support.rs\n\n" + anchor
+          if anchor not in source:
+              raise SystemExit('module-service guard anchor missing')
+          path.write_text(source.replace(anchor, replacement, 1))
+          PY
+          git diff --check
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- .github/workflows/module-service-contract-patch.yml
+            git commit -m "ci: constrain module service patch formatting"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
