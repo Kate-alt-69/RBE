@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   group-memory:
@@ -24,8 +24,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: group-memory
-      - name: format
-        run: cargo fmt --all -- --check
+      - name: format and checkpoint
+        shell: bash
+        run: |
+          cargo fmt --all
+          git diff --check
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          allowed = {"group-memory/src/lib.rs"}
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected formatter paths: " + ", ".join(sorted(unexpected)))
+          PY
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- src/lib.rs
+            git commit -m "style: format group memory crate"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: test
