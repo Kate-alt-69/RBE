@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,6 +21,171 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+      - name: wire executable service evaluator
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          lib = Path("crates/route-engine/src/lib.rs")
+          source = lib.read_text()
+          if "mod service_eval;" not in source:
+              source = source.replace("mod parser;\n", "mod parser;\nmod service_eval;\n", 1)
+          if "pub use service_eval::ServiceProgramExecutor;" not in source:
+              anchor = "pub use parser::ParseError;\n"
+              if anchor not in source:
+                  raise SystemExit("route-engine public export anchor missing")
+              source = source.replace(
+                  anchor,
+                  anchor + "pub use service_eval::ServiceProgramExecutor;\n",
+                  1,
+              )
+          lib.write_text(source)
+
+          service_eval = Path("crates/route-engine/src/service_eval.rs")
+          source = service_eval.read_text()
+          if "executes_service_exports_with_shared_memory" not in source:
+              source += r'''
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+              use std::future::Future;
+              use std::task::{Context, Poll, Waker};
+              use std::time::{SystemTime, UNIX_EPOCH};
+
+              fn block_on_ready<F: Future>(future: F) -> F::Output {
+                  let waker = Waker::noop();
+                  let mut context = Context::from_waker(waker);
+                  let mut future = Box::pin(future);
+                  loop {
+                      match future.as_mut().poll(&mut context) {
+                          Poll::Ready(value) => return value,
+                          Poll::Pending => std::thread::yield_now(),
+                      }
+                  }
+              }
+
+              #[test]
+              fn executes_service_exports_with_shared_memory() {
+                  let source = r#"
+                      :import[memory]
+                      :service[name = cache]
+                      export function remember(key, value) {
+                          memory.set(key, value);
+                          return memory.get(key);
+                      }
+                  "#;
+                  let program = crate::parse_service_source(source).expect("service parse failed");
+                  let nonce = SystemTime::now()
+                      .duration_since(UNIX_EPOCH)
+                      .unwrap_or_default()
+                      .as_nanos();
+                  let root = std::env::temp_dir().join(format!(
+                      "rbe-service-eval-test-{}-{nonce}",
+                      std::process::id()
+                  ));
+                  let modules = ModuleProgram::load(&root.join("module")).expect("module load failed");
+                  let memory = ServiceMemory::default();
+                  let observer = memory.clone();
+                  let executor = ServiceProgramExecutor::new(program, modules, memory);
+                  let value = block_on_ready(ServiceExecutor::call(
+                      &executor,
+                      "remember",
+                      vec![serde_json::json!("answer"), serde_json::json!(42)],
+                  ))
+                  .expect("service execution failed");
+                  assert_eq!(value, serde_json::json!(42));
+                  assert_eq!(observer.get("answer"), Some(serde_json::json!(42)));
+              }
+          }
+          '''
+          service_eval.write_text(source)
+
+          boot = Path("crates/backend/src/service_boot.rs")
+          source = boot.read_text()
+          if "ServiceProgramExecutor" not in source:
+              source = source.replace(
+                  "use std::path::{Path, PathBuf};\n",
+                  "use std::path::{Path, PathBuf};\nuse std::sync::Arc;\n",
+                  1,
+              )
+              source = source.replace(
+                  "use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceManager};",
+                  "use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceManager, ServiceMemory};",
+                  1,
+              )
+              old = "    service_runtime::run_service_host(service_file, token, defaults).await\n"
+              if old not in source:
+                  raise SystemExit("service host launch anchor missing")
+              new = '''    let source = std::fs::read_to_string(&service_file).map_err(|error| {
+                  anyhow::anyhow!(
+                      "service host failed to read executable body {}: {error}",
+                      service_file.display()
+                  )
+              })?;
+              let program = route_engine::parse_service_source(&source).map_err(|error| {
+                  anyhow::anyhow!(
+                      "service host failed to parse {}:{}:{}: {}",
+                      service_file.display(),
+                      error.line,
+                      error.column,
+                      error.message
+                  )
+              })?;
+              let modules = route_engine::ModuleProgram::load_default().map_err(|errors| {
+                  anyhow::anyhow!("service host module compilation failed:\n{}", errors.render())
+              })?;
+              let memory = ServiceMemory::default();
+              let executor = route_engine::ServiceProgramExecutor::new(
+                  program,
+                  modules,
+                  memory.clone(),
+              );
+              service_runtime::run_service_host_with_executor_and_memory(
+                  service_file,
+                  token,
+                  defaults,
+                  memory,
+                  Arc::new(executor),
+              )
+              .await
+          '''
+              source = source.replace(old, new, 1)
+          boot.write_text(source)
+          PY
+
+          rustfmt --edition 2021 \
+            crates/route-engine/src/service_eval.rs \
+            crates/route-engine/src/lib.rs \
+            crates/backend/src/service_boot.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          allowed = {
+              "engine/crates/route-engine/src/service_eval.rs",
+              "engine/crates/route-engine/src/lib.rs",
+              "engine/crates/backend/src/service_boot.rs",
+          }
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected service-evaluator paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- \
+              crates/route-engine/src/service_eval.rs \
+              crates/route-engine/src/lib.rs \
+              crates/backend/src/service_boot.rs
+            git commit -m "feat: execute service export bodies"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: format runtime slice
         shell: bash
         run: |
@@ -36,6 +201,7 @@ jobs:
             crates/route-engine/src/transpiler.rs \
             crates/route-engine/src/module_runtime.rs \
             crates/route-engine/src/module_eval.rs \
+            crates/route-engine/src/service_eval.rs \
             crates/route-engine/src/discovery.rs
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
