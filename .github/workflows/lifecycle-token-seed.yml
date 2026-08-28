@@ -1,3 +1,4 @@
+# One-shot lifecycle token seed; delete after lifecycle lands.
 name: Lifecycle Token Seed
 
 on:
