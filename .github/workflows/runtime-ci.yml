@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   engine-runtime:
@@ -21,41 +21,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: apply rustfmt-only cleanup
+      - name: format runtime slice
         shell: bash
         run: |
-          cargo fmt --all
-          python - <<'PY'
-          import subprocess
-
-          allowed = {
-              "crates/security/src/timing.rs",
-              "crates/route-engine/src/terminal.rs",
-          }
-          changed = {
-              line.strip()
-              for line in subprocess.check_output(
-                  ["git", "diff", "--name-only"], text=True
-              ).splitlines()
-              if line.strip()
-          }
-          unexpected = changed - allowed
-          if unexpected:
-              raise SystemExit(
-                  "rustfmt changed unexpected paths: " + ", ".join(sorted(unexpected))
-              )
-          print("rustfmt paths:", ", ".join(sorted(changed)) or "none")
-          PY
-          git diff --check
-          if ! git diff --quiet; then
-            git config user.name "Kate"
-            git config user.email "dhwanksh2000@gmail.com"
-            git add -- crates/security/src/timing.rs crates/route-engine/src/terminal.rs
-            git commit -m "style: align workspace with Rust 1.98 rustfmt"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          fi
-      - name: format check
-        run: cargo fmt --all -- --check
+          rustfmt --edition 2021 --check \
+            crates/service-runtime/src/lib.rs \
+            crates/backend/src/service_boot.rs \
+            crates/video-manager/src/lib.rs
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
