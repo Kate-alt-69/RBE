@@ -39,9 +39,7 @@ jobs:
           load_start = source.index("    pub fn load_default() -> Result<Self, ModuleCompileErrors> {")
           load_body_start = source.index("    pub fn load(module_dir: &Path) -> Result<Self, ModuleCompileErrors> {", load_start)
           load_body_end = source.index("\n    pub fn len(&self) -> usize {", load_body_start)
-          old_load = source[load_start:load_body_end]
           old_impl_body = source[load_body_start:load_body_end]
-          # Extract the existing load implementation body and convert validate_local call.
           internal = old_impl_body.replace(
               "    pub fn load(module_dir: &Path) -> Result<Self, ModuleCompileErrors> {",
               "    fn load_internal(\n        module_dir: &Path,\n        services: Option<&ServiceInterfaces>,\n    ) -> Result<Self, ModuleCompileErrors> {",
@@ -306,6 +304,14 @@ jobs:
           git diff --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
+
+          git checkout -- \
+            crates/backend/src/error_reporter_daemon.rs \
+            crates/backend/src/maintenance_notice.rs \
+            crates/route-engine/src/cache.rs \
+            crates/route-engine/src/interpreter.rs \
+            crates/route-engine/src/lexer.rs \
+            crates/route-engine/src/transpiled_support.rs
 
           python - <<'PY'
           import subprocess
