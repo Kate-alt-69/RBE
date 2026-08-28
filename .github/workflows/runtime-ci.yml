@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,6 +21,85 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+      - name: apply typed service runtime health
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/service-runtime/src/lib.rs")
+          source = path.read_text()
+
+          old = '''#[derive(Debug, Clone, Serialize)]
+          pub struct ServiceSnapshot {
+              pub name: String,
+              pub title: String,
+              pub pid: Option<u32>,
+          }'''
+          new = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+          #[serde(rename_all = "snake_case")]
+          pub enum ServiceRuntimeState {
+              Running,
+              Restarting,
+              Stopped,
+              Unknown,
+          }
+
+          #[derive(Debug, Clone, Serialize)]
+          #[serde(rename_all = "camelCase")]
+          pub struct ServiceSnapshot {
+              pub name: String,
+              pub title: String,
+              pub pid: Option<u32>,
+              pub state: ServiceRuntimeState,
+              pub restart: RestartPolicy,
+              pub restart_attempts: u32,
+          }'''
+          if old not in source and new not in source:
+              raise SystemExit("could not locate ServiceSnapshot")
+          source = source.replace(old, new, 1)
+
+          old_snapshot = '''            let mut service = handle.lock().await;
+              let alive = matches!(service.child.try_wait(), Ok(None));
+              out.push(ServiceSnapshot {
+                  name: service.file.name.clone(),
+                  title: service.file.title.clone(),
+                  pid: if alive { service.child.id() } else { None },
+              });'''
+          new_snapshot = '''            let mut service = handle.lock().await;
+              let (pid, state) = match service.child.try_wait() {
+                  Ok(None) => (service.child.id(), ServiceRuntimeState::Running),
+                  Ok(Some(status))
+                      if service.exit_observed
+                          || !should_restart(service.file.restart, status.success()) =>
+                  {
+                      (None, ServiceRuntimeState::Stopped)
+                  }
+                  Ok(Some(_)) => (None, ServiceRuntimeState::Restarting),
+                  Err(_) => (None, ServiceRuntimeState::Unknown),
+              };
+              out.push(ServiceSnapshot {
+                  name: service.file.name.clone(),
+                  title: service.file.title.clone(),
+                  pid,
+                  state,
+                  restart: service.file.restart,
+                  restart_attempts: service.restart_attempts,
+              });'''
+          if old_snapshot not in source and new_snapshot not in source:
+              raise SystemExit("could not locate snapshot body")
+          source = source.replace(old_snapshot, new_snapshot, 1)
+          path.write_text(source)
+          PY
+          rustfmt --edition 2021 crates/service-runtime/src/lib.rs
+          git diff --check
+          if ! git diff --quiet -- crates/service-runtime/src/lib.rs; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- crates/service-runtime/src/lib.rs
+            git commit -m "feat: expose service restart health"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: format runtime slice
         shell: bash
         run: |
