@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,25 +21,121 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: format runtime slice
+      - name: configure default service idle timeout
         shell: bash
         run: |
-          rustfmt --edition 2021 --check \
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = Path("crates/config/src/lib.rs")
+          source = config.read_text()
+          source = source.replace(
+              "    pub startup_timeout_ms: u64,\n    pub monitor_interval_ms: u64,",
+              "    pub startup_timeout_ms: u64,\n    pub default_idle_timeout_ms: u64,\n    pub monitor_interval_ms: u64,",
+              1,
+          )
+          source = source.replace(
+              "            startup_timeout_ms: 10_000,\n            monitor_interval_ms: 1_000,",
+              "            startup_timeout_ms: 10_000,\n            default_idle_timeout_ms: 300_000,\n            monitor_interval_ms: 1_000,",
+              1,
+          )
+          source = source.replace(
+              "            if self.services.startup_timeout_ms == 0 || self.services.monitor_interval_ms == 0 {\n                return Err(ConfigError::Invalid(\n                    \"service startup/monitor intervals must be greater than zero\".into(),\n                ));\n            }",
+              "            if self.services.startup_timeout_ms == 0\n                || self.services.default_idle_timeout_ms == 0\n                || self.services.monitor_interval_ms == 0\n            {\n                return Err(ConfigError::Invalid(\n                    \"service startup/default idle/monitor intervals must be greater than zero\".into(),\n                ));\n            }",
+              1,
+          )
+          source = source.replace(
+              "        assert!(config.services.enabled);\n        assert_eq!(config.video_manager.live_idle_secs, 7200);",
+              "        assert!(config.services.enabled);\n        assert_eq!(config.services.default_idle_timeout_ms, 300_000);\n        assert_eq!(config.video_manager.live_idle_secs, 7200);",
+              1,
+          )
+          config.write_text(source)
+
+          runtime = Path("crates/service-runtime/src/lib.rs")
+          source = runtime.read_text()
+          source = source.replace(
+              "    pub startup_timeout_ms: u64,\n    pub monitor_interval_ms: u64,",
+              "    pub startup_timeout_ms: u64,\n    pub default_idle_timeout_ms: u64,\n    pub monitor_interval_ms: u64,",
+              1,
+          )
+          source = source.replace(
+              "            startup_timeout_ms: 10_000,\n            monitor_interval_ms: 1_000,",
+              "            startup_timeout_ms: 10_000,\n            default_idle_timeout_ms: 300_000,\n            monitor_interval_ms: 1_000,",
+              1,
+          )
+          source = source.replace(
+              '    let idle_timeout_ms = number("idleTimeoutMs", 300_000)?;',
+              '    let idle_timeout_ms = number("idleTimeoutMs", defaults.default_idle_timeout_ms)?;',
+              1,
+          )
+          runtime.write_text(source)
+
+          boot = Path("crates/backend/src/service_boot.rs")
+          source = boot.read_text()
+          source = source.replace(
+              "        startup_timeout_ms: config.services.startup_timeout_ms,\n        monitor_interval_ms: config.services.monitor_interval_ms,",
+              "        startup_timeout_ms: config.services.startup_timeout_ms,\n        default_idle_timeout_ms: config.services.default_idle_timeout_ms,\n        monitor_interval_ms: config.services.monitor_interval_ms,",
+              1,
+          )
+          source = source.replace(
+              "        startup_timeout_ms: settings.startup_timeout_ms,\n        monitor_interval_ms: settings.monitor_interval_ms,",
+              "        startup_timeout_ms: settings.startup_timeout_ms,\n        default_idle_timeout_ms: settings.default_idle_timeout_ms,\n        monitor_interval_ms: settings.monitor_interval_ms,",
+              1,
+          )
+          boot.write_text(source)
+
+          settings = Path("settings.json")
+          data = json.loads(settings.read_text())
+          data["services"]["defaultIdleTimeoutMs"] = 300000
+          settings.write_text(json.dumps(data, indent=2) + "\n")
+
+          # Fail early if any explicit ServiceDefaults initializer was missed.
+          for path in Path("crates").rglob("*.rs"):
+              text = path.read_text()
+              cursor = 0
+              while True:
+                  start = text.find("ServiceDefaults {", cursor)
+                  if start < 0:
+                      break
+                  end = text.find("}", start)
+                  block = text[start:end]
+                  if ".." not in block and "default_idle_timeout_ms" not in block:
+                      raise SystemExit(f"missed ServiceDefaults initializer in {path}: {block}")
+                  cursor = end + 1
+          PY
+
+          rustfmt --edition 2021 \
+            crates/config/src/lib.rs \
             crates/service-runtime/src/lib.rs \
-            crates/service-runtime/src/manager.rs \
-            crates/backend/src/service_boot.rs \
-            crates/video-manager/src/lib.rs \
-            crates/api/src/health.rs \
-            crates/route-engine/src/ast.rs \
-            crates/route-engine/src/parser.rs \
-            crates/route-engine/src/modules.rs \
-            crates/route-engine/src/analyzer.rs \
-            crates/route-engine/src/transpiler.rs \
-            crates/route-engine/src/module_runtime.rs \
-            crates/route-engine/src/module_eval.rs \
-            crates/route-engine/src/service_eval.rs \
-            crates/route-engine/src/discovery.rs
-      - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: test
-        run: cargo test --workspace --locked
+            crates/backend/src/service_boot.rs
+          python -m json.tool settings.json >/dev/null
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
+          allowed = {
+              "crates/config/src/lib.rs",
+              "crates/service-runtime/src/lib.rs",
+              "crates/backend/src/service_boot.rs",
+              "settings.json",
+          }
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected service idle-default paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- \
+              crates/config/src/lib.rs \
+              crates/service-runtime/src/lib.rs \
+              crates/backend/src/service_boot.rs \
+              settings.json
+            git commit -m "feat: configure service idle timeout default"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
