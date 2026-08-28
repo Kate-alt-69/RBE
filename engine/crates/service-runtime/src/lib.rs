@@ -17,18 +17,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
     Always,
+    #[default]
     OnFailure,
     Never,
-}
-
-impl Default for RestartPolicy {
-    fn default() -> Self {
-        Self::OnFailure
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -199,8 +194,8 @@ fn parse_service(
         )
     })?;
     let line = source[..offset].lines().count().max(1);
-    let fields = key_values(&body)
-        .map_err(|message| compile_error("SVC1003", path, line, message))?;
+    let fields =
+        key_values(&body).map_err(|message| compile_error("SVC1003", path, line, message))?;
     let name = fields
         .get("name")
         .map(|value| unquote(value))
@@ -228,9 +223,7 @@ fn parse_service(
     {
         None => RestartPolicy::OnFailure,
         Some(value) if value == "always" => RestartPolicy::Always,
-        Some(value) if value == "on-failure" || value == "on_failure" => {
-            RestartPolicy::OnFailure
-        }
+        Some(value) if value == "on-failure" || value == "on_failure" => RestartPolicy::OnFailure,
         Some(value) if value == "never" => RestartPolicy::Never,
         Some(value) => {
             return Err(compile_error(
@@ -354,10 +347,7 @@ fn key_values(body: &str) -> Result<HashMap<String, String>, String> {
         let (key, value) = entry
             .split_once('=')
             .ok_or_else(|| format!("expected key = value, got {entry:?}"))?;
-        if out
-            .insert(key.trim().into(), value.trim().into())
-            .is_some()
-        {
+        if out.insert(key.trim().into(), value.trim().into()).is_some() {
             return Err(format!("duplicate field {:?}", key.trim()));
         }
     }
@@ -424,21 +414,33 @@ pub struct ServiceReady {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ServiceRequest {
-    Health { token: String },
+    Health {
+        token: String,
+    },
     Call {
         token: String,
         function: String,
         args: Vec<Value>,
     },
-    MemoryGet { token: String, key: String },
+    MemoryGet {
+        token: String,
+        key: String,
+    },
     MemorySet {
         token: String,
         key: String,
         value: Value,
     },
-    MemoryDelete { token: String, key: String },
-    MemoryClear { token: String },
-    Shutdown { token: String },
+    MemoryDelete {
+        token: String,
+        key: String,
+    },
+    MemoryClear {
+        token: String,
+    },
+    Shutdown {
+        token: String,
+    },
 }
 
 impl ServiceRequest {
