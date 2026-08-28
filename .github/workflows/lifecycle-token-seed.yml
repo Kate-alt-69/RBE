@@ -1,0 +1,49 @@
+name: Lifecycle Token Seed
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: seed event token arm
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("engine/crates/service-runtime/src/lib.rs")
+          source = path.read_text()
+          token_start = source.index("    fn token(&self) -> &str {")
+          token_end = source.index("\n    }\n}", token_start) + len("\n    }")
+          token_impl = '''    fn token(&self) -> &str {
+              match self {
+                  Self::Health { token }
+                  | Self::Call { token, .. }
+                  | Self::Event { token, .. }
+                  | Self::MemoryGet { token, .. }
+                  | Self::MemorySet { token, .. }
+                  | Self::MemoryDelete { token, .. }
+                  | Self::MemoryClear { token }
+                  | Self::Shutdown { token } => token,
+              }
+          }'''.replace('          ', '')
+          current = source[token_start:token_end]
+          if current != token_impl:
+              path.write_text(source[:token_start] + token_impl + source[token_end:])
+          PY
+
+          git diff --check
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- engine/crates/service-runtime/src/lib.rs
+            git commit -m "ci: seed lifecycle event token arm"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
