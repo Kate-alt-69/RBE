@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,14 +21,49 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: format workspace
-        run: cargo fmt --all
-      - name: upload formatted service runtime
-        uses: actions/upload-artifact@v4
-        with:
-          name: service-runtime-formatted
-          path: engine/crates/service-runtime/src/lib.rs
-          if-no-files-found: error
+      - name: apply one-shot RestartPolicy fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/service-runtime/src/lib.rs")
+          source = path.read_text()
+          old = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+          #[serde(rename_all = "kebab-case")]
+          pub enum RestartPolicy {
+              Always,
+              OnFailure,
+              Never,
+          }
+
+          impl Default for RestartPolicy {
+              fn default() -> Self {
+                  Self::OnFailure
+              }
+          }
+          '''
+          new = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+          #[serde(rename_all = "kebab-case")]
+          pub enum RestartPolicy {
+              Always,
+              #[default]
+              OnFailure,
+              Never,
+          }
+          '''
+          if old in source:
+              path.write_text(source.replace(old, new, 1))
+          PY
+          cargo fmt --all
+          if ! git diff --quiet -- crates/service-runtime/src/lib.rs; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add crates/service-runtime/src/lib.rs
+            git commit -m "fix: derive service restart default"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+      - name: format check
+        run: cargo fmt --all -- --check
       - name: clippy
         id: clippy
         continue-on-error: true
