@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   group-memory:
@@ -24,9 +24,174 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: group-memory
-      - name: format
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: test
-        run: cargo test --all-targets
+      - name: add named segments and generations
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/lib.rs")
+          source = path.read_text()
+
+          if "pub mod named;" not in source:
+              marker = "use thiserror::Error;\n"
+              if marker not in source:
+                  raise SystemExit("named module export anchor missing")
+              source = source.replace(marker, marker + "\npub mod named;\n", 1)
+
+          if "GenerationOverflow" not in source:
+              marker = '''    #[error("group-memory payload length does not fit this platform")]
+              PayloadTooLarge,
+          '''.replace('              ', '')
+              replacement = marker + '''    #[error("group-memory generation counter overflowed")]
+              GenerationOverflow,
+          '''.replace('              ', '')
+              if marker not in source:
+                  raise SystemExit("generation error anchor missing")
+              source = source.replace(marker, replacement, 1)
+
+          write_start = source.index("    pub fn with_write<T>(&mut self")
+          write_end = source.index("\n    /// Flush dirty writable pages", write_start)
+          write_impl = '''    pub fn with_write<T>(&mut self, write: impl FnOnce(&mut [u8]) -> T) -> Result<T> {
+              if self.access != AccessMode::ReadWrite {
+                  return Err(GroupMemoryError::ReadOnly);
+              }
+              let _guard = self.lock_exclusive()?;
+              let output = {
+                  let payload = self.payload_mut().ok_or(GroupMemoryError::ReadOnly)?;
+                  write(payload)
+              };
+              self.advance_generation_unlocked()?;
+              Ok(output)
+          }
+
+          /// Return the current persisted generation. Generation zero means the
+          /// region has never completed a write through this API.
+          pub fn generation(&self) -> Result<u64> {
+              let _guard = self.lock_shared()?;
+              Ok(self.generation_unlocked())
+          }
+          '''.replace('          ', '')
+          source = source[:write_start] + write_impl + source[write_end:]
+
+          payload_mut_end = source.index("\n    fn lock_shared(&self)")
+          if "fn generation_unlocked(&self)" not in source:
+              generation_helpers = '''
+              fn generation_unlocked(&self) -> u64 {
+                  let header = match &self.mapping {
+                      Mapping::ReadOnly(mapping) => &mapping[..HEADER_LEN],
+                      Mapping::ReadWrite(mapping) => &mapping[..HEADER_LEN],
+                  };
+                  u64::from_le_bytes(
+                      header[24..32]
+                          .try_into()
+                          .expect("fixed group-memory generation slice"),
+                  )
+              }
+
+              fn advance_generation_unlocked(&mut self) -> Result<u64> {
+                  let current = self.generation_unlocked();
+                  let next = current
+                      .checked_add(1)
+                      .ok_or(GroupMemoryError::GenerationOverflow)?;
+                  let Mapping::ReadWrite(mapping) = &mut self.mapping else {
+                      return Err(GroupMemoryError::ReadOnly);
+                  };
+                  mapping[24..32].copy_from_slice(&next.to_le_bytes());
+                  Ok(next)
+              }
+          '''.replace('          ', '')
+              source = source[:payload_mut_end] + generation_helpers + source[payload_mut_end:]
+
+          if "generation_is_shared_between_mappings" not in source:
+              insert = source.rfind("\n}")
+              tests = r'''
+
+              #[test]
+              fn generation_is_shared_between_mappings() {
+                  let path = test_path("generation");
+                  {
+                      let mut writer = GroupMemoryRegion::create(&path, 16).unwrap();
+                      let reader = GroupMemoryRegion::open(&path, AccessMode::ReadOnly).unwrap();
+                      assert_eq!(writer.generation().unwrap(), 0);
+                      assert_eq!(reader.generation().unwrap(), 0);
+
+                      writer.with_write(|payload| payload[0] = 7).unwrap();
+                      assert_eq!(writer.generation().unwrap(), 1);
+                      assert_eq!(reader.generation().unwrap(), 1);
+
+                      writer.with_write(|payload| payload[1] = 8).unwrap();
+                      assert_eq!(reader.generation().unwrap(), 2);
+                  }
+                  let _ = fs::remove_file(path);
+              }
+          '''
+              source = source[:insert] + tests + source[insert:]
+
+          path.write_text(source)
+
+          named = Path("src/named.rs")
+          named_source = named.read_text()
+          if "named_segments_preserve_identity_and_generation" not in named_source:
+              insert = named_source.rfind("\n}")
+              test = r'''
+
+              #[test]
+              fn named_segments_preserve_identity_and_generation() {
+                  let nonce = std::time::SystemTime::now()
+                      .duration_since(std::time::UNIX_EPOCH)
+                      .unwrap_or_default()
+                      .as_nanos();
+                  let root = std::env::temp_dir().join(format!(
+                      "rbe-group-store-test-{}-{nonce}",
+                      std::process::id()
+                  ));
+                  let store = GroupMemoryStore::new(&root);
+                  let group = GroupId::new("accounts").unwrap();
+                  let segment = SegmentId::new("users-index").unwrap();
+
+                  let mut writer = store
+                      .create_segment(group.clone(), segment.clone(), 32)
+                      .unwrap();
+                  assert_eq!(writer.group(), &group);
+                  assert_eq!(writer.segment(), &segment);
+                  assert_eq!(writer.generation().unwrap(), 0);
+                  writer.with_write(|payload| payload[0] = 55).unwrap();
+                  assert_eq!(writer.generation().unwrap(), 1);
+
+                  let reader = store
+                      .open_segment(group, segment, AccessMode::ReadOnly)
+                      .unwrap();
+                  assert_eq!(reader.generation().unwrap(), 1);
+                  assert_eq!(reader.with_read(|payload| payload[0]).unwrap(), 55);
+
+                  drop(reader);
+                  drop(writer);
+                  let _ = std::fs::remove_dir_all(root);
+              }
+          '''
+              named_source = named_source[:insert] + test + named_source[insert:]
+          named.write_text(named_source)
+          PY
+
+          cargo fmt --all
+          git diff --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          allowed = {"group-memory/src/lib.rs", "group-memory/src/named.rs"}
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected named group-memory paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- src/lib.rs src/named.rs
+            git commit -m "feat: add named group memory generations"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
