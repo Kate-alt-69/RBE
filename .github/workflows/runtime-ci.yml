@@ -21,185 +21,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: apply module compiler wiring
+      - name: refresh engine lockfile
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          ast = Path("crates/route-engine/src/ast.rs")
-          source = ast.read_text()
-          if "pub struct ModuleFile" not in source:
-              anchor = '''#[derive(Debug, Clone)]
-          pub struct FunctionDef {'''
-              insertion = '''#[derive(Debug, Clone)]
-          pub struct ModuleFile {
-              pub imports: Vec<ImportTarget>,
-              pub functions: Vec<FunctionDef>,
-              pub exports: Vec<String>,
-          }
-
-          #[derive(Debug, Clone)]
-          pub struct FunctionDef {'''
-              if anchor not in source:
-                  raise SystemExit("ast ModuleFile anchor missing")
-              source = source.replace(anchor, insertion, 1)
-              ast.write_text(source)
-
-          parser = Path("crates/route-engine/src/parser.rs")
-          source = parser.read_text()
-          old_use = "use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement};"
-          new_use = "use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, Statement};"
-          if old_use in source:
-              source = source.replace(old_use, new_use, 1)
-          if "pub fn parse_module_file" not in source:
-              anchor = "    /// Parse a route while retaining recoverable statement errors."
-              method = '''    pub fn parse_module_file(mut self) -> Result<ModuleFile, ParseError> {
-              let mut imports = Vec::new();
-              while self.check(&TokenKind::Colon) {
-                  imports.extend(self.parse_imports()?);
-              }
-
-              let mut functions = Vec::new();
-              let mut exports = Vec::new();
-              while !self.check(&TokenKind::Eof) {
-                  let exported = self.is_export_keyword();
-                  if exported {
-                      self.advance();
-                  }
-                  if self.check(&TokenKind::Async) {
-                      self.advance();
-                  }
-                  if !self.check(&TokenKind::Function) {
-                      return Err(self.error_here(
-                          "expected `function` or `export function` in .module file",
-                      ));
-                  }
-                  let function = self.parse_function()?;
-                  if exported {
-                      exports.push(function.name.clone());
-                  }
-                  functions.push(function);
-              }
-
-              Ok(ModuleFile {
-                  imports,
-                  functions,
-                  exports,
-              })
-          }
-
-          '''
-              if anchor not in source:
-                  raise SystemExit("parser module method anchor missing")
-              source = source.replace(anchor, method + anchor, 1)
-          if "fn is_export_keyword" not in source:
-              anchor = "    fn is_as_keyword(&self) -> bool {"
-              helper = '''    fn is_export_keyword(&self) -> bool {
-              matches!(
-                  self.tokens.get(self.pos).map(|token| &token.kind),
-                  Some(TokenKind::Ident(name)) if name == "export"
-              )
-          }
-
-          '''
-              if anchor not in source:
-                  raise SystemExit("parser export helper anchor missing")
-              source = source.replace(anchor, helper + anchor, 1)
-          parser.write_text(source)
-
-          lib = Path("crates/route-engine/src/lib.rs")
-          source = lib.read_text()
-          if "mod module_runtime;" not in source:
-              source = source.replace("mod modules;\n", "mod modules;\nmod module_runtime;\n", 1)
-          old = "pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement, Value};"
-          new = "pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, Statement, Value};"
-          if old in source:
-              source = source.replace(old, new, 1)
-          if "pub use module_runtime::" not in source:
-              source = source.replace(
-                  "pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};\n",
-                  "pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};\npub use module_runtime::{ModuleCompileError, ModuleCompileErrors, ModuleProgram};\n",
-                  1,
-              )
-          if "parses_module_exports" not in source:
-              anchor = "    #[test]\n    fn parses_multiple_import_entries_and_aliases()"
-              test = '''    #[test]
-              fn parses_module_exports() {
-                  let tokens = Lexer::new(
-                      r#":import[net]
-                      function hidden(value) { return value; }
-                      export async function visible(value) { return hidden(value); }"#,
-                  )
-                  .tokenize()
-                  .expect("lex failed");
-                  let file = Parser::new(tokens)
-                      .parse_module_file()
-                      .expect("module parse failed");
-                  assert_eq!(file.functions.len(), 2);
-                  assert_eq!(file.exports, vec!["visible"]);
-              }
-
-          '''
-              if anchor not in source:
-                  raise SystemExit("lib test anchor missing")
-              source = source.replace(anchor, test + anchor, 1)
-          lib.write_text(source)
-
-          discovery = Path("crates/route-engine/src/discovery.rs")
-          source = discovery.read_text()
-          if "ModuleProgram::load_default" not in source:
-              anchor = '''pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
-              let mut files = Vec::new();'''
-              replacement = '''pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
-              let module_program = crate::module_runtime::ModuleProgram::load_default()?;
-              tracing::info!(
-                  modules = module_program.len(),
-                  module_dir = %module_program.module_dir().display(),
-                  "validated .module files"
-              );
-
-              let mut files = Vec::new();'''
-              if anchor not in source:
-                  raise SystemExit("discovery build_routes anchor missing")
-              source = source.replace(anchor, replacement, 1)
-          discovery.write_text(source)
-          PY
-
-          rustfmt --edition 2021 \
-            crates/route-engine/src/ast.rs \
-            crates/route-engine/src/parser.rs \
-            crates/route-engine/src/module_runtime.rs \
-            crates/route-engine/src/discovery.rs
+          cargo generate-lockfile
           git diff --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
-
           python - <<'PY'
           import subprocess
-          allowed = {
-              "engine/crates/route-engine/src/ast.rs",
-              "engine/crates/route-engine/src/parser.rs",
-              "engine/crates/route-engine/src/module_runtime.rs",
-              "engine/crates/route-engine/src/lib.rs",
-              "engine/crates/route-engine/src/discovery.rs",
-          }
-          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
-          unexpected = changed - allowed
-          if unexpected:
-              raise SystemExit("unexpected changed paths: " + ", ".join(sorted(unexpected)))
+          changed = [line.strip() for line in subprocess.check_output(
+              ["git", "diff", "--name-only"], text=True
+          ).splitlines() if line.strip()]
+          if changed not in ([], ["engine/Cargo.lock"]):
+              raise SystemExit("unexpected lock refresh paths: " + ", ".join(changed))
           PY
-
-          if ! git diff --quiet; then
+          if ! git diff --quiet -- Cargo.lock; then
             git config user.name "Kate"
             git config user.email "dhwanksh2000@gmail.com"
-            git add -- \
-              crates/route-engine/src/ast.rs \
-              crates/route-engine/src/parser.rs \
-              crates/route-engine/src/module_runtime.rs \
-              crates/route-engine/src/lib.rs \
-              crates/route-engine/src/discovery.rs
-            git commit -m "feat: compile module files at boot"
+            git add -- Cargo.lock
+            git commit -m "chore: refresh engine lockfile"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
       - name: format runtime slice
@@ -209,11 +48,7 @@ jobs:
             crates/service-runtime/src/lib.rs \
             crates/backend/src/service_boot.rs \
             crates/video-manager/src/lib.rs \
-            crates/api/src/health.rs \
-            crates/route-engine/src/ast.rs \
-            crates/route-engine/src/parser.rs \
-            crates/route-engine/src/module_runtime.rs \
-            crates/route-engine/src/discovery.rs
+            crates/api/src/health.rs
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
