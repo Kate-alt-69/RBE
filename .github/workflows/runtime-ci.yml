@@ -30,7 +30,6 @@ jobs:
           runtime = Path("crates/service-runtime/src/lib.rs")
           s = runtime.read_text()
 
-          # Add the event IPC operation.
           s = s.replace(
               '''    Call {
                   token: String,
@@ -61,7 +60,6 @@ jobs:
               1,
           )
 
-          # Extend the executor contract with optional lifecycle methods.
           trait_start = s.index("pub type ServiceExecutionFuture")
           addressable_start = s.index("struct AddressableOnlyExecutor;", trait_start)
           executor_contract = '''pub type ServiceExecutionFuture<'a> =
@@ -107,27 +105,22 @@ jobs:
           '''.replace('          ', '')
           s = s[:trait_start] + executor_contract + s[addressable_start:]
 
-          # Run start() after resource limits/listener bind, but before readiness.
-          ready_anchor = '''    let listener = TcpListener::bind("127.0.0.1:0").await?;
-              let ready = ServiceReady {'''.replace('              ', '')
-          ready_replacement = '''    let listener = TcpListener::bind("127.0.0.1:0").await?;
-              if let Err(error) = executor
-                  .lifecycle(ServiceLifecycle::Start, lifecycle_context(&file))
-                  .await
-              {
-                  anyhow::bail!(
-                      "service {:?} start lifecycle failed with {}: {}",
-                      file.name,
-                      error.code,
-                      error.message
-                  );
-              }
-              let ready = ServiceReady {'''.replace('              ', '')
-          if ready_anchor not in s:
-              raise SystemExit("service start lifecycle anchor missing")
-          s = s.replace(ready_anchor, ready_replacement, 1)
+          ready_start = s.index('    let listener = TcpListener::bind("127.0.0.1:0").await?;')
+          ready_struct = s.index("    let ready = ServiceReady {", ready_start)
+          start_hook = '''    if let Err(error) = executor
+              .lifecycle(ServiceLifecycle::Start, lifecycle_context(&file))
+              .await
+          {
+              anyhow::bail!(
+                  "service {:?} start lifecycle failed with {}: {}",
+                  file.name,
+                  error.code,
+                  error.message
+              );
+          }
+          '''.replace('          ', '')
+          s = s[:ready_struct] + start_hook + s[ready_struct:]
 
-          # Replace dispatch so Health/Event/Shutdown execute lifecycle methods.
           dispatch_start = s.index("async fn dispatch(")
           dispatch_end = s.index("\n#[cfg(unix)]", dispatch_start)
           dispatch = r'''async fn dispatch(
@@ -256,7 +249,6 @@ jobs:
           '''
           s = s[:dispatch_start] + dispatch + s[dispatch_end:]
 
-          # Add a protocol-level lifecycle test.
           tests_end = s.rfind("\n}")
           lifecycle_test = r'''
 
@@ -428,8 +420,7 @@ jobs:
           '''
           s = s[:call_start] + invoke + s[activate_start:]
 
-          managed_anchor = "struct Managed {"
-          managed_start = s.index(managed_anchor)
+          managed_start = s.index("struct Managed {")
           operation = r'''enum ServiceOperation {
               Call { function: String, args: Vec<Value> },
               Event { event: Value },
@@ -459,16 +450,11 @@ jobs:
               "use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, ModuleFile, Statement, Value};",
               1,
           )
-          inline_anchor = '''    pub(crate) async fn call_inline(
-              &self,
-              file: Arc<ModuleFile>,
-              function: &str,
-              args: Vec<Value>,
-          ) -> Result<Value, ModuleEvalError> {
-              self.call_function(file, function, args, 0).await
-          }
-          '''.replace('          ', '')
-          inline_replacement = inline_anchor + '''
+          inline_start = s.index("    pub(crate) async fn call_inline(")
+          inline_end = s.index("\n    async fn call_service(", inline_start)
+          existing_inline = s[inline_start:inline_end]
+          inline_definition = '''
+
               pub(crate) async fn call_inline_definition(
                   &self,
                   file: Arc<ModuleFile>,
@@ -478,9 +464,7 @@ jobs:
                   self.execute_function(file, function, args, 0).await
               }
           '''.replace('              ', '')
-          if inline_anchor not in s:
-              raise SystemExit("module inline definition anchor missing")
-          s = s.replace(inline_anchor, inline_replacement, 1)
+          s = s[:inline_start] + existing_inline + inline_definition + s[inline_end:]
 
           arity_start = s.index("        if function.params.len() != args.len()", s.index("    async fn call_function("))
           impl_end = s.index("\n}\n\nimpl ModuleProgram", arity_start)
@@ -521,16 +505,12 @@ jobs:
 
           service_eval = Path("crates/route-engine/src/service_eval.rs")
           s = service_eval.read_text()
-          s = s.replace(
-              '''use service_runtime::{
-                  ServiceExecutionError, ServiceExecutionFuture, ServiceExecutor, ServiceMemory,
-              };'''.replace('              ', ''),
-              '''use service_runtime::{
-                  ServiceExecutionError, ServiceExecutionFuture, ServiceExecutor, ServiceLifecycle,
-                  ServiceLifecycleFuture, ServiceMemory,
-              };'''.replace('              ', ''),
-              1,
-          )
+          import_start = s.index("use service_runtime::{")
+          import_end = s.index("};", import_start) + 2
+          s = s[:import_start] + '''use service_runtime::{
+              ServiceExecutionError, ServiceExecutionFuture, ServiceExecutor, ServiceLifecycle,
+              ServiceLifecycleFuture, ServiceMemory,
+          };'''.replace('          ', '') + s[import_end:]
           s = s.replace(
               "use crate::ast::{ModuleFile, ServiceProgram, Value};",
               "use crate::ast::{FunctionDef, MethodDef, ModuleFile, ServiceProgram, Value};",
