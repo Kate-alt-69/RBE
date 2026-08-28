@@ -27,13 +27,23 @@ pub mod transpiled_support;
 pub mod transpiler;
 
 pub use analyzer::{analyze, Diagnostic, Severity};
-pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, Statement, Value};
+pub use ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram, Statement, Value};
 pub use discovery::{build_routes, RouteCache};
 pub use interpreter::{EvalError, Interpreter, RequestContext};
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
 pub use module_runtime::{ModuleCompileError, ModuleCompileErrors, ModuleProgram};
 pub use module_eval::{ModuleEvalError, ModuleExecutor};
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
+pub use parser::ParseError;
+
+pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
+    let tokens = lexer::Lexer::new(source).tokenize().map_err(|error| ParseError {
+        message: error.message,
+        line: error.line,
+        column: error.column,
+    })?;
+    parser::Parser::new(tokens).parse_service_file()
+}
 
 #[cfg(test)]
 mod tests {
@@ -83,6 +93,54 @@ mod tests {
             .expect("module parse failed");
         assert_eq!(file.functions.len(), 2);
         assert_eq!(file.exports, vec!["visible"]);
+    }
+
+    #[test]
+    fn parses_executable_service_program() {
+        let file = parse_service_source(r#"
+            :import[memory, json]
+            :service[
+                name = uac-cache
+                restart = on-failure
+                instances = 1
+            ]
+            function normalize(value) { return value; }
+            export async function get(id) { return normalize(id); }
+            class Service {
+                start(ctx) { return true; }
+                health() { return { ok: true }; }
+                stop(ctx) { return true; }
+            }
+        "#)
+        .expect("service parse failed");
+        assert_eq!(file.functions.len(), 2);
+        assert_eq!(file.exports, vec!["get"]);
+        assert_eq!(file.class_name.as_deref(), Some("Service"));
+        assert_eq!(
+            file.lifecycle.iter().map(|method| method.verb.as_str()).collect::<Vec<_>>(),
+            vec!["start", "health", "stop"]
+        );
+    }
+
+    #[test]
+    fn rejects_service_to_service_imports() {
+        let error = parse_service_source(r#"
+            :import[service:other]
+            :service[name = current]
+            export function run() { return true; }
+        "#)
+        .expect_err("service-to-service import should fail");
+        assert!(error.message.contains("service-to-service"));
+    }
+
+    #[test]
+    fn rejects_malformed_service_body() {
+        let error = parse_service_source(r#"
+            :service[name = broken]
+            export function run(value) { return value }
+        "#)
+        .expect_err("missing semicolon should fail");
+        assert!(error.message.contains("Semicolon") || error.message.contains("semicolon"));
     }
 
     #[test]

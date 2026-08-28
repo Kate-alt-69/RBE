@@ -46,6 +46,15 @@ pub struct ModuleFile {
 }
 
 #[derive(Debug, Clone)]
+pub struct ServiceProgram {
+    pub imports: Vec<ImportTarget>,
+    pub functions: Vec<FunctionDef>,
+    pub exports: Vec<String>,
+    pub class_name: Option<String>,
+    pub lifecycle: Vec<MethodDef>,
+}
+
+#[derive(Debug, Clone)]
 pub struct FunctionDef {
     pub name: String,
     pub params: Vec<String>,

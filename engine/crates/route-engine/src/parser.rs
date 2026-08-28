@@ -2,11 +2,20 @@
 //! The parser is intentionally strict and reports line/column information.
 
 use crate::ast::{
-    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, Statement,
+    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram,
+    Statement,
 };
 use crate::lexer::{Token, TokenKind};
 
 const KNOWN_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
+
+fn import_contains_service(import: &ImportTarget) -> bool {
+    match import {
+        ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => true,
+        ImportTarget::Aliased { target, .. } => import_contains_service(target),
+        _ => false,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ParseError {
@@ -70,6 +79,147 @@ impl Parser {
             functions,
             exports,
         })
+    }
+
+    pub fn parse_service_file(mut self) -> Result<ServiceProgram, ParseError> {
+        let mut imports = Vec::new();
+        while self.is_import_directive() {
+            imports.extend(self.parse_imports()?);
+        }
+
+        if imports.iter().any(import_contains_service) {
+            return Err(
+                self.error_here("service-to-service imports are not supported in .service files")
+            );
+        }
+
+        self.parse_service_directive()?;
+
+        let mut functions = Vec::new();
+        let mut exports = Vec::new();
+        while !self.check(&TokenKind::Class) && !self.check(&TokenKind::Eof) {
+            let exported = self.is_export_keyword();
+            if exported {
+                self.advance();
+            }
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
+            if !self.check(&TokenKind::Function) {
+                return Err(self.error_here(
+                    "expected `function`, `export function`, or `class Service` in .service file",
+                ));
+            }
+            let function = self.parse_function()?;
+            if exported {
+                if exports.iter().any(|name| name == &function.name) {
+                    return Err(
+                        self.error_here(&format!("duplicate service export {:?}", function.name))
+                    );
+                }
+                exports.push(function.name.clone());
+            }
+            functions.push(function);
+        }
+
+        let (class_name, lifecycle) = if self.check(&TokenKind::Class) {
+            let (name, methods) = self.parse_service_class()?;
+            (Some(name), methods)
+        } else {
+            (None, Vec::new())
+        };
+
+        if !self.check(&TokenKind::Eof) {
+            return Err(self.error_here("unexpected content after service program"));
+        }
+
+        Ok(ServiceProgram {
+            imports,
+            functions,
+            exports,
+            class_name,
+            lifecycle,
+        })
+    }
+
+    fn is_import_directive(&self) -> bool {
+        self.check(&TokenKind::Colon)
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|token| &token.kind),
+                Some(TokenKind::Import)
+            )
+    }
+
+    fn parse_service_directive(&mut self) -> Result<(), ParseError> {
+        self.expect(TokenKind::Colon)?;
+        match self.advance().kind {
+            TokenKind::Ident(name) if name == "service" => {}
+            other => {
+                return Err(self.error_here(&format!(
+                    "expected :service[...] declaration, got {other:?}"
+                )));
+            }
+        }
+        self.expect(TokenKind::LBracket)?;
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.advance().kind {
+                TokenKind::LBracket => depth = depth.saturating_add(1),
+                TokenKind::RBracket => depth -= 1,
+                TokenKind::Eof => {
+                    return Err(self.error_here("unterminated :service[...] declaration"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_service_class(&mut self) -> Result<(String, Vec<MethodDef>), ParseError> {
+        const LIFECYCLE: &[&str] = &["start", "event", "health", "stop"];
+
+        self.expect(TokenKind::Class)?;
+        let name = self.expect_ident()?;
+        if name != "Service" {
+            return Err(self.error_here(".service lifecycle class must be named `Service`"));
+        }
+        self.expect(TokenKind::LBrace)?;
+
+        let mut methods = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
+            let method_name = self.expect_ident()?;
+            let lifecycle_name = method_name.to_ascii_lowercase();
+            if !LIFECYCLE.contains(&lifecycle_name.as_str()) {
+                return Err(self.error_here(&format!(
+                "unsupported Service lifecycle method {method_name:?}; expected one of {LIFECYCLE:?}"
+            )));
+            }
+            if methods
+                .iter()
+                .any(|method: &MethodDef| method.verb == lifecycle_name)
+            {
+                return Err(self.error_here(&format!(
+                    "duplicate Service lifecycle method {lifecycle_name:?}"
+                )));
+            }
+            let params = self.parse_params()?;
+            if params.len() > 1 {
+                return Err(self.error_here(
+                    "Service lifecycle methods currently accept zero or one parameter",
+                ));
+            }
+            let body = self.parse_block()?;
+            methods.push(MethodDef {
+                verb: lifecycle_name,
+                param_name: params.into_iter().next(),
+                body,
+            });
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok((name, methods))
     }
 
     /// Parse a route while retaining recoverable statement errors. A valid
