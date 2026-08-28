@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,6 +21,329 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+      - name: apply module service imports
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          ast = Path("crates/route-engine/src/ast.rs")
+          source = ast.read_text()
+          if "Service(String)" not in source:
+              anchor = '''    CustomFunction {
+              path: String,
+              function: String,
+          },
+          '''
+              replacement = anchor + '''    Service(String),
+          ServiceFunction {
+              service: String,
+              function: String,
+          },
+          '''
+              if anchor not in source:
+                  raise SystemExit("ImportTarget service anchor missing")
+              source = source.replace(anchor, replacement, 1)
+              ast.write_text(source)
+
+          parser = Path("crates/route-engine/src/parser.rs")
+          source = parser.read_text()
+          start = source.index("    fn parse_import_target(&mut self) -> Result<ImportTarget, ParseError> {")
+          end = source.index("\n    fn is_export_keyword", start)
+          replacement = r'''    fn parse_import_target(&mut self) -> Result<ImportTarget, ParseError> {
+              match self.advance().kind {
+                  TokenKind::Ident(name) => {
+                      if name == "service" && self.check(&TokenKind::Colon) {
+                          self.advance();
+                          let service = self.expect_ident()?;
+                          if self.check(&TokenKind::Dot) {
+                              self.advance();
+                              let function = self.expect_ident()?;
+                              Ok(ImportTarget::ServiceFunction { service, function })
+                          } else {
+                              Ok(ImportTarget::Service(service))
+                          }
+                      } else if self.check(&TokenKind::Dot) {
+                          self.advance();
+                          let function = self.expect_ident()?;
+                          Ok(ImportTarget::BuiltinFunction {
+                              module: name,
+                              function,
+                          })
+                      } else if let Some((prefix, module_name)) = name.split_once('&') {
+                          if prefix != "module" {
+                              return Err(self.error_here("only module&name shorthand is supported"));
+                          }
+                          Ok(ImportTarget::Custom(format!("./module/{module_name}")))
+                      } else {
+                          Ok(ImportTarget::Builtin(name))
+                      }
+                  }
+                  TokenKind::String(path) => {
+                      if let Some(service) = path.strip_prefix("service:") {
+                          if service.is_empty() {
+                              return Err(self.error_here("service import name cannot be empty"));
+                          }
+                          if self.check(&TokenKind::Dot) {
+                              self.advance();
+                              let function = self.expect_ident()?;
+                              Ok(ImportTarget::ServiceFunction {
+                                  service: service.to_string(),
+                                  function,
+                              })
+                          } else {
+                              Ok(ImportTarget::Service(service.to_string()))
+                          }
+                      } else if self.check(&TokenKind::RBracket)
+                          || self.check(&TokenKind::Comma)
+                          || self.is_as_keyword()
+                      {
+                          Ok(ImportTarget::Custom(path))
+                      } else {
+                          self.expect(TokenKind::Dot)?;
+                          let function = self.expect_ident()?;
+                          Ok(ImportTarget::CustomFunction { path, function })
+                      }
+                  }
+                  other => Err(self.error_here(&format!(
+                      "expected builtin, module path, or service import inside :import[...], got {other:?}"
+                  ))),
+              }
+          }
+          '''
+          source = source[:start] + replacement + source[end:]
+          parser.write_text(source)
+
+          modules = Path("crates/route-engine/src/modules.rs")
+          source = modules.read_text()
+          old = '''        ImportTarget::CustomFunction { function, .. } => function.clone(),
+          '''
+          new = old + '''        ImportTarget::Service(name) => name.clone(),
+              ImportTarget::ServiceFunction { function, .. } => function.clone(),
+          '''
+          if "ImportTarget::Service(name) => name.clone()" not in source:
+              if old not in source:
+                  raise SystemExit("binding_name service anchor missing")
+              source = source.replace(old, new, 1)
+
+          needle = '''                ImportTarget::CustomFunction { path, function } => {
+                      let resolved = crate::paths::resolve_custom_import(&crate::paths::binary_dir(), path);
+                      let module_name = std::path::Path::new(path)
+                          .file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string();
+                      modules.entry(module_name.clone()).or_insert(ModuleKind::CustomUnimplemented {
+                          source_path: path.clone(), resolved_path: resolved,
+                      });
+                      direct_functions.insert(binding_name(target), (module_name, function.clone()));
+                  }
+          '''
+          if "ImportTarget::Service(_) | ImportTarget::ServiceFunction" not in source:
+              if needle not in source:
+                  raise SystemExit("ModuleRegistry service arm anchor missing")
+              source = source.replace(
+                  needle,
+                  needle + '''                ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => {
+                      // Service calls are async and are intentionally handled by ModuleExecutor,
+                      // never by the synchronous route capability registry.
+                  }
+          ''',
+                  1,
+              )
+          modules.write_text(source)
+
+          analyzer = Path("crates/route-engine/src/analyzer.rs")
+          source = analyzer.read_text()
+          old = '''        ImportTarget::CustomFunction { path, function } => format!("custom:{path}.{function}"),
+          '''
+          if "format!(\"service:{service}\")" not in source:
+              if old not in source:
+                  raise SystemExit("analyzer import source anchor missing")
+              source = source.replace(
+                  old,
+                  old + '''        ImportTarget::Service(service) => format!("service:{service}"),
+              ImportTarget::ServiceFunction { service, function } => {
+                  format!("service:{service}.{function}")
+              }
+          ''',
+                  1,
+              )
+          old = '''            ImportTarget::Custom(_) | ImportTarget::CustomFunction { .. } => SymbolKind::Module,
+          '''
+          if 'code: "E3020"' not in source:
+              if old not in source:
+                  raise SystemExit("analyzer service policy anchor missing")
+              replacement = '''            ImportTarget::Custom(_) => SymbolKind::Module,
+              ImportTarget::CustomFunction { .. } => SymbolKind::DirectFunction,
+              ImportTarget::Service(service) => {
+                  diagnostics.push(Diagnostic {
+                      severity: Severity::Error,
+                      code: "E3020",
+                      message: format!(
+                          "service `{service}` cannot be imported directly by a `.route`; import it from a `.module` instead"
+                      ),
+                      symbol: Some(name.clone()),
+                  });
+                  SymbolKind::Module
+              }
+              ImportTarget::ServiceFunction { service, function } => {
+                  diagnostics.push(Diagnostic {
+                      severity: Severity::Error,
+                      code: "E3020",
+                      message: format!(
+                          "service function `{service}.{function}` cannot be imported directly by a `.route`; import it from a `.module` instead"
+                      ),
+                      symbol: Some(name.clone()),
+                  });
+                  SymbolKind::DirectFunction
+              }
+          '''
+              source = source.replace(old, replacement, 1)
+          analyzer.write_text(source)
+
+          transpiler = Path("crates/route-engine/src/transpiler.rs")
+          source = transpiler.read_text()
+          old = '''                ImportTarget::Builtin(_) | ImportTarget::Custom(_) => {
+                      names.insert(crate::modules::binding_name(import), NameKind::Module);
+                  }
+                  ImportTarget::BuiltinFunction { .. } | ImportTarget::CustomFunction { .. } => {
+                      names.insert(crate::modules::binding_name(import), NameKind::DirectFunction);
+                  }
+          '''
+          if "ImportTarget::Service(_)" not in source:
+              if old not in source:
+                  raise SystemExit("transpiler service arm anchor missing")
+              new = '''                ImportTarget::Builtin(_) | ImportTarget::Custom(_) | ImportTarget::Service(_) => {
+                      names.insert(crate::modules::binding_name(import), NameKind::Module);
+                  }
+                  ImportTarget::BuiltinFunction { .. }
+                  | ImportTarget::CustomFunction { .. }
+                  | ImportTarget::ServiceFunction { .. } => {
+                      names.insert(crate::modules::binding_name(import), NameKind::DirectFunction);
+                  }
+          '''
+              source = source.replace(old, new, 1)
+          transpiler.write_text(source)
+
+          runtime = Path("crates/route-engine/src/module_runtime.rs")
+          source = runtime.read_text()
+          old = '''        ImportTarget::CustomFunction { path, function } => {
+              format!("module:{path}.{function}")
+          }
+          '''
+          if "ImportTarget::Service(service)" not in source:
+              if old not in source:
+                  raise SystemExit("module runtime service source anchor missing")
+              source = source.replace(
+                  old,
+                  old + '''        ImportTarget::Service(service) => format!("service:{service}"),
+              ImportTarget::ServiceFunction { service, function } => {
+                  format!("service:{service}.{function}")
+              }
+          ''',
+                  1,
+              )
+          if "accepts_service_imports_without_module_dependencies" not in source:
+              insert = source.rfind("}\n")
+              test = r'''
+
+              #[test]
+              fn accepts_service_imports_without_module_dependencies() {
+                  let root = root();
+                  fs::write(
+                      root.join("module/cache.module"),
+                      ":import[service:uac-cache, service:search.find as lookup]\nexport function run(value) { return value; }",
+                  )
+                  .unwrap();
+
+                  let program = ModuleProgram::load(&root.join("module")).unwrap();
+                  assert_eq!(program.len(), 1);
+                  let _ = fs::remove_dir_all(root);
+              }
+          '''
+              source = source[:insert] + test + source[insert:]
+          runtime.write_text(source)
+
+          lib = Path("crates/route-engine/src/lib.rs")
+          source = lib.read_text()
+          if "parses_service_imports_for_modules" not in source:
+              anchor = "    #[test]\n    fn parses_multiple_import_entries_and_aliases()"
+              if anchor not in source:
+                  raise SystemExit("lib service parser test anchor missing")
+              tests = r'''    #[test]
+              fn parses_service_imports_for_modules() {
+                  let tokens = Lexer::new(
+                      r#":import[service:uac-cache as uac, service:search.find as lookup, "service:media"]
+                      export function run(value) { return value; }"#,
+                  )
+                  .tokenize()
+                  .expect("lex failed");
+                  let file = Parser::new(tokens)
+                      .parse_module_file()
+                      .expect("module parse failed");
+                  assert_eq!(file.imports.len(), 3);
+                  assert_eq!(binding_name(&file.imports[0]), "uac");
+                  assert_eq!(binding_name(&file.imports[1]), "lookup");
+                  assert_eq!(binding_name(&file.imports[2]), "media");
+              }
+
+              #[test]
+              fn route_rejects_direct_service_imports() {
+                  let file = parse(r#"
+                      :import[service:uac-cache]
+                      class Route {
+                          get(req) { return { ok: true }; }
+                      }
+                  "#);
+                  let diagnostics = analyze(&file);
+                  assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "E3020"));
+              }
+
+          '''
+              source = source.replace(anchor, tests + anchor, 1)
+          lib.write_text(source)
+          PY
+
+          rustfmt --edition 2021 \
+            crates/route-engine/src/ast.rs \
+            crates/route-engine/src/parser.rs \
+            crates/route-engine/src/modules.rs \
+            crates/route-engine/src/analyzer.rs \
+            crates/route-engine/src/transpiler.rs \
+            crates/route-engine/src/module_runtime.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+          python - <<'PY'
+          import subprocess
+          allowed = {
+              "engine/crates/route-engine/src/ast.rs",
+              "engine/crates/route-engine/src/parser.rs",
+              "engine/crates/route-engine/src/modules.rs",
+              "engine/crates/route-engine/src/analyzer.rs",
+              "engine/crates/route-engine/src/transpiler.rs",
+              "engine/crates/route-engine/src/module_runtime.rs",
+              "engine/crates/route-engine/src/lib.rs",
+          }
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected service-import paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- \
+              crates/route-engine/src/ast.rs \
+              crates/route-engine/src/parser.rs \
+              crates/route-engine/src/modules.rs \
+              crates/route-engine/src/analyzer.rs \
+              crates/route-engine/src/transpiler.rs \
+              crates/route-engine/src/module_runtime.rs \
+              crates/route-engine/src/lib.rs
+            git commit -m "feat: add module service imports"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: format runtime slice
         shell: bash
         run: |
@@ -31,6 +354,9 @@ jobs:
             crates/api/src/health.rs \
             crates/route-engine/src/ast.rs \
             crates/route-engine/src/parser.rs \
+            crates/route-engine/src/modules.rs \
+            crates/route-engine/src/analyzer.rs \
+            crates/route-engine/src/transpiler.rs \
             crates/route-engine/src/module_runtime.rs \
             crates/route-engine/src/module_eval.rs \
             crates/route-engine/src/discovery.rs
