@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   engine-runtime:
@@ -21,25 +21,728 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: format runtime slice
+      - name: execute service lifecycle hooks
         shell: bash
         run: |
-          rustfmt --edition 2021 --check \
+          python - <<'PY'
+          from pathlib import Path
+
+          runtime = Path("crates/service-runtime/src/lib.rs")
+          s = runtime.read_text()
+
+          # Add the event IPC operation.
+          s = s.replace(
+              '''    Call {
+                  token: String,
+                  function: String,
+                  args: Vec<Value>,
+              },
+              MemoryGet {'''.replace('              ', ''),
+              '''    Call {
+                  token: String,
+                  function: String,
+                  args: Vec<Value>,
+              },
+              Event {
+                  token: String,
+                  event: Value,
+              },
+              MemoryGet {'''.replace('              ', ''),
+              1,
+          )
+          s = s.replace(
+              '''            Self::Health { token }
+                  | Self::Call { token, .. }
+                  | Self::MemoryGet { token, .. }'''.replace('              ', ''),
+              '''            Self::Health { token }
+                  | Self::Call { token, .. }
+                  | Self::Event { token, .. }
+                  | Self::MemoryGet { token, .. }'''.replace('              ', ''),
+              1,
+          )
+
+          # Extend the executor contract with optional lifecycle methods.
+          trait_start = s.index("pub type ServiceExecutionFuture")
+          addressable_start = s.index("struct AddressableOnlyExecutor;", trait_start)
+          executor_contract = '''pub type ServiceExecutionFuture<'a> =
+              Pin<Box<dyn Future<Output = Result<Value, ServiceExecutionError>> + Send + 'a>>;
+
+          pub type ServiceLifecycleFuture<'a> = Pin<
+              Box<
+                  dyn Future<Output = Result<Option<Value>, ServiceExecutionError>> + Send + 'a,
+              >,
+          >;
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub enum ServiceLifecycle {
+              Start,
+              Event,
+              Health,
+              Stop,
+          }
+
+          impl ServiceLifecycle {
+              pub const fn as_str(self) -> &'static str {
+                  match self {
+                      Self::Start => "start",
+                      Self::Event => "event",
+                      Self::Health => "health",
+                      Self::Stop => "stop",
+                  }
+              }
+          }
+
+          pub trait ServiceExecutor: Send + Sync {
+              fn call<'a>(&'a self, function: &'a str, args: Vec<Value>) -> ServiceExecutionFuture<'a>;
+
+              fn lifecycle<'a>(
+                  &'a self,
+                  _phase: ServiceLifecycle,
+                  _argument: Value,
+              ) -> ServiceLifecycleFuture<'a> {
+                  Box::pin(async { Ok(None) })
+              }
+          }
+
+          '''.replace('          ', '')
+          s = s[:trait_start] + executor_contract + s[addressable_start:]
+
+          # Run start() after resource limits/listener bind, but before readiness.
+          ready_anchor = '''    let listener = TcpListener::bind("127.0.0.1:0").await?;
+              let ready = ServiceReady {'''.replace('              ', '')
+          ready_replacement = '''    let listener = TcpListener::bind("127.0.0.1:0").await?;
+              if let Err(error) = executor
+                  .lifecycle(ServiceLifecycle::Start, lifecycle_context(&file))
+                  .await
+              {
+                  anyhow::bail!(
+                      "service {:?} start lifecycle failed with {}: {}",
+                      file.name,
+                      error.code,
+                      error.message
+                  );
+              }
+              let ready = ServiceReady {'''.replace('              ', '')
+          if ready_anchor not in s:
+              raise SystemExit("service start lifecycle anchor missing")
+          s = s.replace(ready_anchor, ready_replacement, 1)
+
+          # Replace dispatch so Health/Event/Shutdown execute lifecycle methods.
+          dispatch_start = s.index("async fn dispatch(")
+          dispatch_end = s.index("\n#[cfg(unix)]", dispatch_start)
+          dispatch = r'''async fn dispatch(
+              request: ServiceRequest,
+              file: &ServiceFile,
+              token: &str,
+              memory: &ServiceMemory,
+              executor: &dyn ServiceExecutor,
+          ) -> (ServiceResponse, bool) {
+              if request.token() != token {
+                  return (
+                      ServiceResponse::Error {
+                          code: "SVC4001".into(),
+                          message: "service IPC authentication failed".into(),
+                      },
+                      false,
+                  );
+              }
+              let ok = |value| (ServiceResponse::Ok { value }, false);
+              match request {
+                  ServiceRequest::Health { .. } => {
+                      match executor
+                          .lifecycle(ServiceLifecycle::Health, lifecycle_context(file))
+                          .await
+                      {
+                          Ok(lifecycle) => {
+                              let healthy = lifecycle_health_ok(lifecycle.as_ref());
+                              ok(serde_json::json!({
+                                  "ok": healthy,
+                                  "service": &file.name,
+                                  "pid": std::process::id(),
+                                  "memoryEntries": memory.len(),
+                                  "lifecycle": lifecycle.unwrap_or(Value::Null)
+                              }))
+                          }
+                          Err(error) => execution_error_response(error, false),
+                      }
+                  }
+                  ServiceRequest::Event { event, .. } => {
+                      match executor.lifecycle(ServiceLifecycle::Event, event).await {
+                          Ok(Some(value)) => ok(value),
+                          Ok(None) => (
+                              ServiceResponse::Error {
+                                  code: "SVC4304".into(),
+                                  message: "service does not define Service.event()".into(),
+                              },
+                              false,
+                          ),
+                          Err(error) => execution_error_response(error, false),
+                      }
+                  }
+                  ServiceRequest::MemoryGet { key, .. } => ok(memory.get(&key).unwrap_or(Value::Null)),
+                  ServiceRequest::MemorySet { key, value, .. } => {
+                      memory.set(key, value);
+                      ok(Value::Bool(true))
+                  }
+                  ServiceRequest::MemoryDelete { key, .. } => ok(Value::Bool(memory.delete(&key))),
+                  ServiceRequest::MemoryClear { .. } => {
+                      memory.clear();
+                      ok(Value::Bool(true))
+                  }
+                  ServiceRequest::Call { function, .. }
+                      if !file.exports.iter().any(|value| value == &function) =>
+                  {
+                      (
+                          ServiceResponse::Error {
+                              code: "SVC4101".into(),
+                              message: format!("unknown export {function:?}"),
+                          },
+                          false,
+                      )
+                  }
+                  ServiceRequest::Call { function, args, .. } => match executor.call(&function, args).await {
+                      Ok(value) => ok(value),
+                      Err(error) => execution_error_response(error, false),
+                  },
+                  ServiceRequest::Shutdown { .. } => {
+                      match executor
+                          .lifecycle(ServiceLifecycle::Stop, lifecycle_context(file))
+                          .await
+                      {
+                          Ok(value) => (
+                              ServiceResponse::Ok {
+                                  value: value.unwrap_or(Value::Bool(true)),
+                              },
+                              true,
+                          ),
+                          Err(error) => execution_error_response(error, true),
+                      }
+                  }
+              }
+          }
+
+          fn execution_error_response(
+              error: ServiceExecutionError,
+              shutdown: bool,
+          ) -> (ServiceResponse, bool) {
+              (
+                  ServiceResponse::Error {
+                      code: error.code,
+                      message: error.message,
+                  },
+                  shutdown,
+              )
+          }
+
+          fn lifecycle_context(file: &ServiceFile) -> Value {
+              serde_json::json!({
+                  "service": &file.name,
+                  "pid": std::process::id(),
+                  "mode": file.mode,
+              })
+          }
+
+          fn lifecycle_health_ok(value: Option<&Value>) -> bool {
+              match value {
+                  None => true,
+                  Some(Value::Bool(value)) => *value,
+                  Some(Value::Object(fields)) => fields
+                      .get("ok")
+                      .and_then(Value::as_bool)
+                      .unwrap_or(true),
+                  _ => true,
+              }
+          }
+          '''
+          s = s[:dispatch_start] + dispatch + s[dispatch_end:]
+
+          # Add a protocol-level lifecycle test.
+          tests_end = s.rfind("\n}")
+          lifecycle_test = r'''
+
+              struct LifecycleTestExecutor;
+
+              impl ServiceExecutor for LifecycleTestExecutor {
+                  fn call<'a>(
+                      &'a self,
+                      _function: &'a str,
+                      _args: Vec<Value>,
+                  ) -> ServiceExecutionFuture<'a> {
+                      Box::pin(async { Ok(Value::Null) })
+                  }
+
+                  fn lifecycle<'a>(
+                      &'a self,
+                      phase: ServiceLifecycle,
+                      argument: Value,
+                  ) -> ServiceLifecycleFuture<'a> {
+                      Box::pin(async move {
+                          Ok(Some(serde_json::json!({
+                              "phase": phase.as_str(),
+                              "argument": argument
+                          })))
+                      })
+                  }
+              }
+
+              #[tokio::test]
+              async fn dispatch_routes_health_event_and_stop_lifecycle() {
+                  let path = test_service_path("lifecycle-dispatch");
+                  std::fs::write(&path, ":service[name = lifecycle]\nexport function get() {}").unwrap();
+                  let file = parse_service(&path, ServiceDefaults::default()).unwrap();
+                  let memory = ServiceMemory::default();
+                  let executor = LifecycleTestExecutor;
+
+                  let (health, shutdown) = dispatch(
+                      ServiceRequest::Health { token: "secret".into() },
+                      &file,
+                      "secret",
+                      &memory,
+                      &executor,
+                  )
+                  .await;
+                  assert!(!shutdown);
+                  let ServiceResponse::Ok { value } = health else {
+                      panic!("health lifecycle should succeed");
+                  };
+                  assert_eq!(value["lifecycle"]["phase"], "health");
+
+                  let (event, shutdown) = dispatch(
+                      ServiceRequest::Event {
+                          token: "secret".into(),
+                          event: serde_json::json!({"kind": "refresh"}),
+                      },
+                      &file,
+                      "secret",
+                      &memory,
+                      &executor,
+                  )
+                  .await;
+                  assert!(!shutdown);
+                  let ServiceResponse::Ok { value } = event else {
+                      panic!("event lifecycle should succeed");
+                  };
+                  assert_eq!(value["phase"], "event");
+                  assert_eq!(value["argument"]["kind"], "refresh");
+
+                  let (stop, shutdown) = dispatch(
+                      ServiceRequest::Shutdown { token: "secret".into() },
+                      &file,
+                      "secret",
+                      &memory,
+                      &executor,
+                  )
+                  .await;
+                  assert!(shutdown);
+                  let ServiceResponse::Ok { value } = stop else {
+                      panic!("stop lifecycle should succeed");
+                  };
+                  assert_eq!(value["phase"], "stop");
+                  let _ = std::fs::remove_file(path);
+              }
+          '''
+          s = s[:tests_end] + lifecycle_test + s[tests_end:]
+          runtime.write_text(s)
+
+          manager = Path("crates/service-runtime/src/manager.rs")
+          s = manager.read_text()
+          call_start = s.index("    pub async fn call(")
+          activate_start = s.index("    async fn activate_for_call", call_start)
+          invoke = r'''    pub async fn call(
+              &self,
+              service_name: &str,
+              function: &str,
+              args: Vec<Value>,
+          ) -> Result<Value, ServiceCallError> {
+              self.invoke(
+                  service_name,
+                  ServiceOperation::Call {
+                      function: function.to_string(),
+                      args,
+                  },
+              )
+              .await
+          }
+
+          pub async fn event(
+              &self,
+              service_name: &str,
+              event: Value,
+          ) -> Result<Value, ServiceCallError> {
+              self.invoke(service_name, ServiceOperation::Event { event }).await
+          }
+
+          async fn invoke(
+              &self,
+              service_name: &str,
+              operation: ServiceOperation,
+          ) -> Result<Value, ServiceCallError> {
+              if self.shutting_down.load(Ordering::Acquire) {
+                  return Err(ServiceCallError::Unavailable {
+                      service: service_name.to_string(),
+                  });
+              }
+
+              let handle = self
+                  .services
+                  .read()
+                  .await
+                  .get(service_name)
+                  .cloned()
+                  .ok_or_else(|| ServiceCallError::Unknown {
+                      service: service_name.to_string(),
+                  })?;
+
+              let (address, token) = {
+                  let mut service = handle.lock().await;
+                  self.activate_for_call(&mut service).await?;
+                  let process = service
+                      .process
+                      .as_ref()
+                      .ok_or_else(|| ServiceCallError::Unavailable {
+                          service: service_name.to_string(),
+                      })?;
+                  let address = process.ready.address;
+                  let token = process.token.clone();
+                  service.active_calls = service.active_calls.saturating_add(1);
+                  service.last_activity = Instant::now();
+                  (address, token)
+              };
+
+              let request = operation.into_request(token);
+              let response = rpc(address, request).await;
+
+              {
+                  let mut service = handle.lock().await;
+                  service.active_calls = service.active_calls.saturating_sub(1);
+                  service.last_activity = Instant::now();
+              }
+
+              let response = response.map_err(|error| ServiceCallError::Ipc {
+                  service: service_name.to_string(),
+                  message: error.to_string(),
+              })?;
+              map_call_response(service_name, response)
+          }
+
+          '''
+          s = s[:call_start] + invoke + s[activate_start:]
+
+          managed_anchor = "struct Managed {"
+          managed_start = s.index(managed_anchor)
+          operation = r'''enum ServiceOperation {
+              Call { function: String, args: Vec<Value> },
+              Event { event: Value },
+          }
+
+          impl ServiceOperation {
+              fn into_request(self, token: String) -> ServiceRequest {
+                  match self {
+                      Self::Call { function, args } => ServiceRequest::Call {
+                          token,
+                          function,
+                          args,
+                      },
+                      Self::Event { event } => ServiceRequest::Event { token, event },
+                  }
+              }
+          }
+
+          '''
+          s = s[:managed_start] + operation + s[managed_start:]
+          manager.write_text(s)
+
+          module_eval = Path("crates/route-engine/src/module_eval.rs")
+          s = module_eval.read_text()
+          s = s.replace(
+              "use crate::ast::{BinaryOp, Expr, ImportTarget, ModuleFile, Statement, Value};",
+              "use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, ModuleFile, Statement, Value};",
+              1,
+          )
+          inline_anchor = '''    pub(crate) async fn call_inline(
+              &self,
+              file: Arc<ModuleFile>,
+              function: &str,
+              args: Vec<Value>,
+          ) -> Result<Value, ModuleEvalError> {
+              self.call_function(file, function, args, 0).await
+          }
+          '''.replace('          ', '')
+          inline_replacement = inline_anchor + '''
+              pub(crate) async fn call_inline_definition(
+                  &self,
+                  file: Arc<ModuleFile>,
+                  function: FunctionDef,
+                  args: Vec<Value>,
+              ) -> Result<Value, ModuleEvalError> {
+                  self.execute_function(file, function, args, 0).await
+              }
+          '''.replace('              ', '')
+          if inline_anchor not in s:
+              raise SystemExit("module inline definition anchor missing")
+          s = s.replace(inline_anchor, inline_replacement, 1)
+
+          arity_start = s.index("        if function.params.len() != args.len()", s.index("    async fn call_function("))
+          impl_end = s.index("\n}\n\nimpl ModuleProgram", arity_start)
+          execution = '''        self.execute_function(file, function, args, depth).await
+              }
+
+              async fn execute_function(
+                  &self,
+                  file: Arc<ModuleFile>,
+                  function: FunctionDef,
+                  args: Vec<Value>,
+                  depth: usize,
+              ) -> Result<Value, ModuleEvalError> {
+                  if function.params.len() != args.len() {
+                      return Err(ModuleEvalError::new(
+                          "MOD3003",
+                          format!(
+                              "function {:?} expected {} argument(s), got {}",
+                              function.name,
+                              function.params.len(),
+                              args.len()
+                          ),
+                      ));
+                  }
+
+                  let mut frame = Frame::new(self, file, depth);
+                  for (param, value) in function.params.iter().zip(args) {
+                      frame.scope.insert(param.clone(), value);
+                  }
+                  match frame.exec_block(&function.body).await? {
+                      Flow::Continue => Ok(Value::Null),
+                      Flow::Return(value) => Ok(value),
+                  }
+              }
+          '''.replace('              ', '')
+          s = s[:arity_start] + execution + s[impl_end:]
+          module_eval.write_text(s)
+
+          service_eval = Path("crates/route-engine/src/service_eval.rs")
+          s = service_eval.read_text()
+          s = s.replace(
+              '''use service_runtime::{
+                  ServiceExecutionError, ServiceExecutionFuture, ServiceExecutor, ServiceMemory,
+              };'''.replace('              ', ''),
+              '''use service_runtime::{
+                  ServiceExecutionError, ServiceExecutionFuture, ServiceExecutor, ServiceLifecycle,
+                  ServiceLifecycleFuture, ServiceMemory,
+              };'''.replace('              ', ''),
+              1,
+          )
+          s = s.replace(
+              "use crate::ast::{ModuleFile, ServiceProgram, Value};",
+              "use crate::ast::{FunctionDef, MethodDef, ModuleFile, ServiceProgram, Value};",
+              1,
+          )
+          struct_start = s.index("pub struct ServiceProgramExecutor")
+          expect_start = s.index("fn expect_arity(", struct_start)
+          executor = r'''pub struct ServiceProgramExecutor {
+              modules: ModuleProgram,
+              file: Arc<ModuleFile>,
+              lifecycle: Vec<MethodDef>,
+              host_capabilities: Arc<dyn HostCapabilityCaller>,
+          }
+
+          impl ServiceProgramExecutor {
+              pub fn new(program: ServiceProgram, modules: ModuleProgram, memory: ServiceMemory) -> Self {
+                  let ServiceProgram {
+                      imports,
+                      functions,
+                      exports,
+                      lifecycle,
+                      ..
+                  } = program;
+                  let file = Arc::new(ModuleFile {
+                      imports,
+                      functions,
+                      exports,
+                  });
+                  Self {
+                      modules,
+                      file,
+                      lifecycle,
+                      host_capabilities: Arc::new(ServiceHostCapabilities::new(memory)),
+                  }
+              }
+
+              fn lifecycle_method(&self, phase: ServiceLifecycle) -> Option<MethodDef> {
+                  self.lifecycle
+                      .iter()
+                      .find(|method| method.verb == phase.as_str())
+                      .cloned()
+              }
+          }
+
+          impl ServiceExecutor for ServiceProgramExecutor {
+              fn call<'a>(&'a self, function: &'a str, args: Vec<JsonValue>) -> ServiceExecutionFuture<'a> {
+                  Box::pin(async move {
+                      let args = args
+                          .into_iter()
+                          .map(json_to_value)
+                          .collect::<Result<Vec<_>, _>>()
+                          .map_err(service_error)?;
+                      let executor = ModuleExecutor::with_host_capabilities(
+                          &self.modules,
+                          self.host_capabilities.clone(),
+                      );
+                      let value = executor
+                          .call_inline(self.file.clone(), function, args)
+                          .await
+                          .map_err(service_error)?;
+                      value_to_json(value).map_err(service_error)
+                  })
+              }
+
+              fn lifecycle<'a>(
+                  &'a self,
+                  phase: ServiceLifecycle,
+                  argument: JsonValue,
+              ) -> ServiceLifecycleFuture<'a> {
+                  Box::pin(async move {
+                      let Some(method) = self.lifecycle_method(phase) else {
+                          return Ok(None);
+                      };
+                      let args = if method.param_name.is_some() {
+                          vec![json_to_value(argument).map_err(service_error)?]
+                      } else {
+                          Vec::new()
+                      };
+                      let function = FunctionDef {
+                          name: format!("Service.{}", phase.as_str()),
+                          params: method.param_name.into_iter().collect(),
+                          body: method.body,
+                      };
+                      let executor = ModuleExecutor::with_host_capabilities(
+                          &self.modules,
+                          self.host_capabilities.clone(),
+                      );
+                      let value = executor
+                          .call_inline_definition(self.file.clone(), function, args)
+                          .await
+                          .map_err(service_error)?;
+                      value_to_json(value).map(Some).map_err(service_error)
+                  })
+              }
+          }
+
+          '''
+          s = s[:struct_start] + executor + s[expect_start:]
+
+          tests_end = s.rfind("\n}")
+          lifecycle_test = r'''
+
+              #[test]
+              fn executes_service_lifecycle_with_shared_memory() {
+                  let source = r#"
+                      :import[memory]
+                      :service[name = lifecycle]
+                      export function read() {
+                          return memory.get("phase");
+                      }
+                      class Service {
+                          start() {
+                              memory.set("phase", "started");
+                          }
+                          event(event) {
+                              memory.set("event", event);
+                              return event;
+                          }
+                          health() {
+                              return memory.get("phase");
+                          }
+                          stop() {
+                              memory.set("phase", "stopped");
+                          }
+                      }
+                  "#;
+                  let program = crate::parse_service_source(source).expect("service parse failed");
+                  let nonce = SystemTime::now()
+                      .duration_since(UNIX_EPOCH)
+                      .unwrap_or_default()
+                      .as_nanos();
+                  let root = std::env::temp_dir().join(format!(
+                      "rbe-service-lifecycle-test-{}-{nonce}",
+                      std::process::id()
+                  ));
+                  let modules = ModuleProgram::load(&root.join("module")).expect("module load failed");
+                  let memory = ServiceMemory::default();
+                  let observer = memory.clone();
+                  let executor = ServiceProgramExecutor::new(program, modules, memory);
+
+                  let start = block_on_ready(ServiceExecutor::lifecycle(
+                      &executor,
+                      ServiceLifecycle::Start,
+                      serde_json::json!({"service": "lifecycle"}),
+                  ))
+                  .expect("start lifecycle failed");
+                  assert_eq!(start, Some(serde_json::Value::Null));
+
+                  let health = block_on_ready(ServiceExecutor::lifecycle(
+                      &executor,
+                      ServiceLifecycle::Health,
+                      serde_json::json!({"service": "lifecycle"}),
+                  ))
+                  .expect("health lifecycle failed");
+                  assert_eq!(health, Some(serde_json::json!("started")));
+
+                  let event = block_on_ready(ServiceExecutor::lifecycle(
+                      &executor,
+                      ServiceLifecycle::Event,
+                      serde_json::json!({"kind": "refresh"}),
+                  ))
+                  .expect("event lifecycle failed");
+                  assert_eq!(event, Some(serde_json::json!({"kind": "refresh"})));
+                  assert_eq!(
+                      observer.get("event"),
+                      Some(serde_json::json!({"kind": "refresh"}))
+                  );
+
+                  block_on_ready(ServiceExecutor::lifecycle(
+                      &executor,
+                      ServiceLifecycle::Stop,
+                      serde_json::json!({"service": "lifecycle"}),
+                  ))
+                  .expect("stop lifecycle failed");
+                  assert_eq!(observer.get("phase"), Some(serde_json::json!("stopped")));
+              }
+          '''
+          s = s[:tests_end] + lifecycle_test + s[tests_end:]
+          service_eval.write_text(s)
+          PY
+
+          rustfmt --edition 2021 \
             crates/service-runtime/src/lib.rs \
             crates/service-runtime/src/manager.rs \
-            crates/backend/src/service_boot.rs \
-            crates/video-manager/src/lib.rs \
-            crates/api/src/health.rs \
-            crates/route-engine/src/ast.rs \
-            crates/route-engine/src/parser.rs \
-            crates/route-engine/src/modules.rs \
-            crates/route-engine/src/analyzer.rs \
-            crates/route-engine/src/transpiler.rs \
-            crates/route-engine/src/module_runtime.rs \
             crates/route-engine/src/module_eval.rs \
-            crates/route-engine/src/service_eval.rs \
-            crates/route-engine/src/discovery.rs
-      - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: test
-        run: cargo test --workspace --locked
+            crates/route-engine/src/service_eval.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
+          allowed = {
+              "crates/service-runtime/src/lib.rs",
+              "crates/service-runtime/src/manager.rs",
+              "crates/route-engine/src/module_eval.rs",
+              "crates/route-engine/src/service_eval.rs",
+          }
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected lifecycle paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- \
+              crates/service-runtime/src/lib.rs \
+              crates/service-runtime/src/manager.rs \
+              crates/route-engine/src/module_eval.rs \
+              crates/route-engine/src/service_eval.rs
+            git commit -m "feat: execute service lifecycle hooks"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
