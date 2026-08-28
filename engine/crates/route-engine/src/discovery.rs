@@ -10,16 +10,18 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use axum::extract::State;
 use axum::response::{IntoResponse, Json};
 use axum::routing::MethodRouter;
 use axum::Router;
 use core_lib::AppState;
 
 use crate::analyzer::{analyze, Severity};
-use crate::ast::{FunctionDef, MethodDef, RouteFile, Value};
-use crate::interpreter::{Interpreter, RequestContext};
+use crate::ast::{FunctionDef, ModuleFile, RouteFile, Value};
 use crate::lexer::Lexer;
-use crate::modules::{binding_name, ModuleRegistry};
+use crate::module_eval::ModuleExecutor;
+use crate::module_runtime::ModuleProgram;
+use crate::modules::binding_name;
 use crate::parser::Parser;
 use crate::terminal::Terminal;
 use crate::transpiler::transpile_file;
@@ -144,27 +146,39 @@ fn append_runtime_error(path: &str, error: &str) {
     }
 }
 
+const INLINE_ROUTE_HANDLER: &str = "\0rbe-route-handler";
+
+fn request_value(method: &str, path: &str) -> Value {
+    let mut fields = HashMap::new();
+    fields.insert("method".into(), Value::String(method.to_string()));
+    fields.insert("path".into(), Value::String(path.to_string()));
+    fields.insert("params".into(), Value::Object(HashMap::new()));
+    fields.insert("query".into(), Value::Object(HashMap::new()));
+    Value::Object(fields)
+}
+
 async fn execute(
-    method_def: Arc<MethodDef>,
-    functions: Arc<Vec<FunctionDef>>,
-    modules: Arc<ModuleRegistry>,
-    module_names: Arc<Vec<String>>,
+    inline_file: Arc<ModuleFile>,
+    module_program: Arc<ModuleProgram>,
+    takes_request: bool,
+    state: AppState,
     http_method: String,
     path: String,
 ) -> axum::response::Response {
-    let req_ctx = RequestContext {
-        method: http_method,
-        path,
-        params: HashMap::new(),
-        query: HashMap::new(),
+    let args = if takes_request {
+        vec![request_value(&http_method, &path)]
+    } else {
+        Vec::new()
     };
-    let mut interpreter = Interpreter::new(&modules).with_functions(functions.as_ref());
-
-    match interpreter.run(&method_def, &req_ctx, &module_names) {
+    let executor = ModuleExecutor::with_services(module_program.as_ref(), state.services.clone());
+    match executor
+        .call_inline(inline_file, INLINE_ROUTE_HANDLER, args)
+        .await
+    {
         Ok(value) => Json(value_to_json(&value)).into_response(),
         Err(err) => {
-            tracing::error!(error = %err, path = %req_ctx.path, "route evaluation failed");
-            append_runtime_error(&req_ctx.path, &err.to_string());
+            tracing::error!(error = %err, path = %path, "route evaluation failed");
+            append_runtime_error(&path, &err.to_string());
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": err.to_string() })),
@@ -176,41 +190,44 @@ async fn execute(
 
 fn build_method_router(
     file: &RouteFile,
-    modules: Arc<ModuleRegistry>,
-    module_names: Arc<Vec<String>>,
+    module_program: Arc<ModuleProgram>,
     url_path: String,
 ) -> MethodRouter<AppState> {
     let mut router = MethodRouter::<AppState>::new();
-    let functions = Arc::new(file.functions.clone());
-
     for method_def in &file.methods {
-        let method_def = Arc::new(method_def.clone());
-        let modules = modules.clone();
-        let module_names = module_names.clone();
-        let functions = functions.clone();
+        let mut functions = file.functions.clone();
+        functions.push(FunctionDef {
+            name: INLINE_ROUTE_HANDLER.to_string(),
+            params: method_def.param_name.clone().into_iter().collect(),
+            body: method_def.body.clone(),
+        });
+        let inline_file = Arc::new(ModuleFile {
+            imports: file.imports.clone(),
+            functions,
+            exports: Vec::new(),
+        });
+        let takes_request = method_def.param_name.is_some();
+        let module_program = module_program.clone();
         let url_path = url_path.clone();
         let verb = method_def.verb.clone();
         let handler_verb = verb.clone();
-
-        let handler = move || {
-            let method_def = method_def.clone();
-            let modules = modules.clone();
-            let module_names = module_names.clone();
-            let functions = functions.clone();
+        let handler = move |State(state): State<AppState>| {
+            let inline_file = inline_file.clone();
+            let module_program = module_program.clone();
             let path = url_path.clone();
+            let method = handler_verb.to_uppercase();
             async move {
                 execute(
-                    method_def,
-                    functions,
-                    modules,
-                    module_names,
-                    handler_verb.to_uppercase(),
+                    inline_file,
+                    module_program,
+                    takes_request,
+                    state,
+                    method,
                     path,
                 )
                 .await
             }
         };
-
         router = match verb.as_str() {
             "get" => router.get(handler),
             "post" => router.post(handler),
@@ -222,7 +239,6 @@ fn build_method_router(
             _ => router,
         };
     }
-
     router
 }
 
@@ -618,7 +634,7 @@ fn boot_compile(
 /// and only then constructs the Axum router. A broken route fails the boot,
 /// but errors from every file are collected into compiler-error.txt first.
 pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
-    let module_program = crate::module_runtime::ModuleProgram::load_default()?;
+    let module_program = Arc::new(ModuleProgram::load_default()?);
     tracing::info!(
         modules = module_program.len(),
         module_dir = %module_program.module_dir().display(),
@@ -634,9 +650,6 @@ pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
 
     for (path, route_file) in compiled {
         let url_path = url_path_for(api_dir, &path);
-        let module_names: Arc<Vec<String>> =
-            Arc::new(route_file.imports.iter().map(binding_name).collect());
-        let modules = Arc::new(ModuleRegistry::from_imports(&route_file.imports));
 
         tracing::info!(
             path = %path.display(),
@@ -647,7 +660,7 @@ pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
 
         router = router.route(
             &url_path,
-            build_method_router(&route_file, modules, module_names, url_path.clone()),
+            build_method_router(&route_file, module_program.clone(), url_path.clone()),
         );
     }
 

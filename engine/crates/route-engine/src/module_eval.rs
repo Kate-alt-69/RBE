@@ -103,6 +103,15 @@ impl<'a> ModuleExecutor<'a> {
         self.call_export(raw_path, function, args, 0).await
     }
 
+    pub(crate) async fn call_inline(
+        &self,
+        file: Arc<ModuleFile>,
+        function: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, ModuleEvalError> {
+        self.call_function(file, function, args, 0).await
+    }
+
     async fn call_service(
         &self,
         service: &str,
@@ -754,6 +763,48 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(error.code, "MOD3400");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inline_route_can_reach_module_service_chain() {
+        let root = root();
+        fs::write(
+            root.join("module/bridge.module"),
+            ":import[service:uac-cache as cache]\nexport function lookup(id) { return cache.get(id); }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let caller = Arc::new(FakeServices::default());
+        let executor = ModuleExecutor::with_service_caller(&program, caller.clone());
+        let route = Arc::new(ModuleFile {
+            imports: vec![ImportTarget::Custom("./module/bridge".into())],
+            functions: vec![crate::ast::FunctionDef {
+                name: "\0route-test".into(),
+                params: vec!["req".into()],
+                body: vec![Statement::Return(Expr::Call(
+                    Box::new(Expr::Member(
+                        Box::new(Expr::Ident("bridge".into())),
+                        "lookup".into(),
+                    )),
+                    vec![Expr::Member(
+                        Box::new(Expr::Ident("req".into())),
+                        "id".into(),
+                    )],
+                ))],
+            }],
+            exports: Vec::new(),
+        });
+        let mut request = HashMap::new();
+        request.insert("id".into(), Value::String("route-id".into()));
+        let value = block_on_ready(executor.call_inline(
+            route,
+            "\0route-test",
+            vec![Value::Object(request)],
+        ))
+        .unwrap();
+        assert!(matches!(value, Value::String(value) if value == "route-id"));
+        assert_eq!(caller.calls.lock().unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 }
