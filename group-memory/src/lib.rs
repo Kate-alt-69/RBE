@@ -223,34 +223,36 @@ impl GroupMemoryRegion {
         }
     }
 
-    fn lock_shared(&self) -> Result<Option<FileLock<'_>>> {
-        self.file.as_ref().map(FileLock::shared).transpose()
+    fn lock_shared(&self) -> Result<Option<OwnedFileLock>> {
+        self.file.as_ref().map(OwnedFileLock::shared).transpose()
     }
 
-    fn lock_exclusive(&self) -> Result<Option<FileLock<'_>>> {
-        self.file.as_ref().map(FileLock::exclusive).transpose()
+    fn lock_exclusive(&self) -> Result<Option<OwnedFileLock>> {
+        self.file.as_ref().map(OwnedFileLock::exclusive).transpose()
     }
 }
 
-struct FileLock<'a> {
-    file: &'a File,
+struct OwnedFileLock {
+    file: File,
 }
 
-impl<'a> FileLock<'a> {
-    fn shared(file: &'a File) -> Result<Self> {
-        FileExt::lock_shared(file)?;
+impl OwnedFileLock {
+    fn shared(file: &File) -> Result<Self> {
+        let file = file.try_clone()?;
+        FileExt::lock_shared(&file)?;
         Ok(Self { file })
     }
 
-    fn exclusive(file: &'a File) -> Result<Self> {
-        FileExt::lock_exclusive(file)?;
+    fn exclusive(file: &File) -> Result<Self> {
+        let file = file.try_clone()?;
+        FileExt::lock_exclusive(&file)?;
         Ok(Self { file })
     }
 }
 
-impl Drop for FileLock<'_> {
+impl Drop for OwnedFileLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(self.file);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
