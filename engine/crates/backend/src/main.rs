@@ -345,16 +345,22 @@ async fn boot_and_run() -> anyhow::Result<()> {
                 max_bytes: config.video_manager.download_max_bytes,
                 ..Default::default()
             };
+            let ffmpeg_policy = video_manager::FfmpegPolicy::new(&ffmpeg);
+            let ffmpeg_capabilities =
+                video_manager::probe_ffmpeg_capabilities(&ffmpeg_policy).await?;
             let policy = video_manager::VideoWorkerPolicy {
                 download,
                 ffprobe: video_manager::FfprobePolicy::new(&ffprobe),
-                ffmpeg: video_manager::FfmpegPolicy::new(&ffmpeg),
+                ffmpeg: ffmpeg_policy,
                 recovery_scan: Duration::from_secs(config.video_manager.worker_recovery_scan_secs),
             };
             let task = manager.clone().spawn_download_worker(policy)?;
             tracing::info!(
                 ffprobe = %ffprobe.display(),
                 ffmpeg = %ffmpeg.display(),
+                software_h264 = ffmpeg_capabilities.software_h264,
+                aac = ffmpeg_capabilities.aac,
+                hardware_h264_encoders = ?ffmpeg_capabilities.hardware_h264_encoders,
                 recovery_scan_secs = config.video_manager.worker_recovery_scan_secs,
                 max_download_bytes = config.video_manager.download_max_bytes,
                 "Video Manager lazy download worker ready"

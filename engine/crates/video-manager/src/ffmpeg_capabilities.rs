@@ -34,7 +34,7 @@ pub async fn probe_ffmpeg_capabilities(
     policy: &FfmpegPolicy,
 ) -> anyhow::Result<FfmpegCapabilities> {
     policy.validate()?;
-    let output_cap = policy.max_log_bytes.min(MAX_CAPABILITY_OUTPUT_BYTES).max(1);
+    let output_cap = policy.max_log_bytes.clamp(1, MAX_CAPABILITY_OUTPUT_BYTES);
     let timeout = policy.timeout.min(CAPABILITY_PROBE_TIMEOUT);
     let listing = run_encoder_listing(policy, timeout, output_cap).await?;
     let capabilities = parse_encoder_listing(&listing);

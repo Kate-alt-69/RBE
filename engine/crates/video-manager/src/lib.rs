@@ -10,6 +10,7 @@ mod container_probe;
 mod download;
 mod download_worker;
 mod ffmpeg;
+mod ffmpeg_capabilities;
 mod ffprobe;
 mod normalization;
 mod pipeline;
@@ -24,6 +25,7 @@ pub use download::{
 };
 pub use download_worker::{DownloadPolicy, DownloadReceipt};
 pub use ffmpeg::{FfmpegPolicy, NormalizedMedia};
+pub use ffmpeg_capabilities::{probe_ffmpeg_capabilities, FfmpegCapabilities};
 pub use ffprobe::{FfprobePolicy, MediaProbe, VideoStreamProbe};
 pub use worker::{VideoWorkerHandle, VideoWorkerPolicy};
 
