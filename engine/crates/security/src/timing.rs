@@ -31,6 +31,7 @@ const MAX_ERROR_BUCKETS: usize = 16_384;
 
 static REQUEST_AUDIT_IO: OnceLock<AtomicIo> = OnceLock::new();
 static ERROR_STATUS_STATE: OnceLock<Mutex<HashMap<ErrorStatusKey, ErrorStatusBucket>>> = OnceLock::new();
+static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ErrorStatusKey {
@@ -184,7 +185,7 @@ pub async fn request_timing(
 }
 
 fn debug_enabled() -> bool {
-    std::env::args().any(|arg| arg == "-debug" || arg == "--debug")
+    *DEBUG_ENABLED.get_or_init(|| std::env::args().any(|arg| arg == "-debug" || arg == "--debug"))
 }
 
 fn header(headers: &HeaderMap, name: &str) -> Option<String> {
