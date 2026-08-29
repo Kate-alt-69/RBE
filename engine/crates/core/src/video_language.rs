@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use video_manager::{
-    CreateAssetRequest, QueueDownloadRequest, VideoAssetState, VideoManager, VideoSourceType,
-    VideoVariant,
+    CreateAssetRequest, QueueDownloadRequest, ReserveLiveSessionRequest, VideoAssetState,
+    VideoLiveSession, VideoManager, VideoSourceType, VideoVariant,
 };
 
 #[derive(Clone)]
@@ -99,6 +99,81 @@ impl VideoLanguage {
                 Ok(Value::Array(
                     variants.into_iter().map(public_variant_value).collect(),
                 ))
+            }
+            "reserveLive" | "reserve_live" => {
+                expect_arity_range(function, args, 1, 2)?;
+                let asset_id = required_string(args, 0, "asset id")?;
+                let database = optional_string(args.get(1), "database")?;
+                let asset = manager
+                    .get_asset(database.as_deref(), asset_id)
+                    .map_err(operation_error)?
+                    .ok_or_else(|| {
+                        VideoLanguageError::new(
+                            "VID3002",
+                            "Video Manager live asset does not exist",
+                        )
+                    })?;
+                ensure_owned(module_owner, &asset.namespace)?;
+                let session = manager
+                    .reserve_live_session(ReserveLiveSessionRequest {
+                        database,
+                        asset_id: asset_id.to_string(),
+                    })
+                    .map_err(operation_error)?;
+                Ok(public_live_session_value(session))
+            }
+            "liveSession" | "live_session" => {
+                expect_arity_range(function, args, 1, 2)?;
+                let session_id = required_string(args, 0, "live session id")?;
+                let database = optional_string(args.get(1), "database")?;
+                let Some(session) = manager
+                    .get_live_session(database.as_deref(), session_id)
+                    .map_err(operation_error)?
+                else {
+                    return Ok(Value::Null);
+                };
+                let asset = manager
+                    .get_asset(Some(&session.database), &session.asset_id)
+                    .map_err(operation_error)?
+                    .ok_or_else(|| {
+                        VideoLanguageError::new(
+                            "VID3002",
+                            "Video Manager live session references a missing asset",
+                        )
+                    })?;
+                ensure_owned(module_owner, &asset.namespace)?;
+                Ok(public_live_session_value(session))
+            }
+            "endLive" | "end_live" => {
+                expect_arity_range(function, args, 1, 2)?;
+                let session_id = required_string(args, 0, "live session id")?;
+                let database = optional_string(args.get(1), "database")?;
+                let Some(existing) = manager
+                    .get_live_session(database.as_deref(), session_id)
+                    .map_err(operation_error)?
+                else {
+                    return Ok(Value::Null);
+                };
+                let asset = manager
+                    .get_asset(Some(&existing.database), &existing.asset_id)
+                    .map_err(operation_error)?
+                    .ok_or_else(|| {
+                        VideoLanguageError::new(
+                            "VID3002",
+                            "Video Manager live session references a missing asset",
+                        )
+                    })?;
+                ensure_owned(module_owner, &asset.namespace)?;
+                let session = manager
+                    .request_end_live_session(Some(&existing.database), session_id)
+                    .map_err(operation_error)?
+                    .ok_or_else(|| {
+                        VideoLanguageError::new(
+                            "VID3002",
+                            "Video Manager live session disappeared during end request",
+                        )
+                    })?;
+                Ok(public_live_session_value(session))
             }
             "create" => {
                 expect_arity_range(function, args, 3, 6)?;
@@ -268,6 +343,16 @@ fn public_job_value(job: video_manager::VideoJob) -> Value {
         "failed": job.error.is_some(),
         "createdAtMs": job.created_at_ms,
         "updatedAtMs": job.updated_at_ms,
+    })
+}
+
+fn public_live_session_value(session: VideoLiveSession) -> Value {
+    serde_json::json!({
+        "id": session.id,
+        "assetId": session.asset_id,
+        "state": session.state,
+        "startedAtMs": session.started_at_ms,
+        "endedAtMs": session.ended_at_ms,
     })
 }
 
@@ -462,5 +547,53 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "VID3003");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_language_is_owner_scoped_and_cannot_self_activate_transport() {
+        let path = temp_db("live-owner");
+        let manager = Arc::new(VideoManager::open_default(&path, 7200).unwrap());
+        let language = VideoLanguage::new(Some(manager.clone()));
+        let asset = language
+            .call(
+                "stream.owner",
+                "create",
+                &[
+                    Value::String("live".into()),
+                    Value::String("Broadcast".into()),
+                    Value::String("live".into()),
+                ],
+            )
+            .unwrap();
+        let asset_id = asset["id"].as_str().unwrap().to_string();
+        let session = language
+            .call("stream.owner", "reserveLive", &[Value::String(asset_id)])
+            .unwrap();
+        assert_eq!(session["state"], "reserved");
+        assert!(session.get("ingestEndpoint").is_none());
+        assert!(session.get("playbackEndpoint").is_none());
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let denied = language
+            .call(
+                "other.module",
+                "liveSession",
+                &[Value::String(session_id.clone())],
+            )
+            .unwrap_err();
+        assert_eq!(denied.code, "VID3003");
+        let ended = language
+            .call(
+                "stream.owner",
+                "endLive",
+                &[Value::String(session_id.clone())],
+            )
+            .unwrap();
+        assert_eq!(ended["state"], "ended");
+        let stored = manager
+            .get_live_session(None, &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, video_manager::VideoLiveSessionState::Ended);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

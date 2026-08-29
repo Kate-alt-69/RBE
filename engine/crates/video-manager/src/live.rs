@@ -123,16 +123,34 @@ pub(crate) fn validate_live_transition(
 ) -> anyhow::Result<()> {
     let allowed = matches!(
         (from, to),
-        (VideoLiveSessionState::Reserved, VideoLiveSessionState::Starting)
-            | (VideoLiveSessionState::Reserved, VideoLiveSessionState::Ended)
-            | (VideoLiveSessionState::Reserved, VideoLiveSessionState::Failed)
-            | (VideoLiveSessionState::Starting, VideoLiveSessionState::Live)
-            | (VideoLiveSessionState::Starting, VideoLiveSessionState::Stopping)
-            | (VideoLiveSessionState::Starting, VideoLiveSessionState::Failed)
+        (
+            VideoLiveSessionState::Reserved,
+            VideoLiveSessionState::Starting
+        ) | (
+            VideoLiveSessionState::Reserved,
+            VideoLiveSessionState::Ended
+        ) | (
+            VideoLiveSessionState::Reserved,
+            VideoLiveSessionState::Failed
+        ) | (VideoLiveSessionState::Starting, VideoLiveSessionState::Live)
+            | (
+                VideoLiveSessionState::Starting,
+                VideoLiveSessionState::Stopping
+            )
+            | (
+                VideoLiveSessionState::Starting,
+                VideoLiveSessionState::Failed
+            )
             | (VideoLiveSessionState::Live, VideoLiveSessionState::Stopping)
             | (VideoLiveSessionState::Live, VideoLiveSessionState::Failed)
-            | (VideoLiveSessionState::Stopping, VideoLiveSessionState::Ended)
-            | (VideoLiveSessionState::Stopping, VideoLiveSessionState::Failed)
+            | (
+                VideoLiveSessionState::Stopping,
+                VideoLiveSessionState::Ended
+            )
+            | (
+                VideoLiveSessionState::Stopping,
+                VideoLiveSessionState::Failed
+            )
     );
     if allowed {
         Ok(())
@@ -164,9 +182,7 @@ impl VideoManager {
             anyhow::bail!("Video Manager live session requires a live source asset");
         }
         if asset.state != VideoAssetState::Reserved {
-            anyhow::bail!(
-                "Video Manager live asset must be reserved before session reservation"
-            );
+            anyhow::bail!("Video Manager live asset must be reserved before session reservation");
         }
         let session = VideoLiveSession {
             id: Uuid::new_v4().to_string(),

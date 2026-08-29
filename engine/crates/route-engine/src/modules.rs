@@ -92,6 +92,12 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
                 | "create"
                 | "queueDownload"
                 | "queue_download"
+                | "reserveLive"
+                | "reserve_live"
+                | "liveSession"
+                | "live_session"
+                | "endLive"
+                | "end_live"
         ),
         _ => false,
     }
