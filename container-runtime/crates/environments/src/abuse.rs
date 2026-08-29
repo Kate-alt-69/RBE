@@ -132,10 +132,10 @@ impl AbuseDetector {
             entry.usage = Usage::default();
         }
 
-        entry.usage.requests += 1;
-        entry.usage.cpu_ms += cpu_ms;
-        entry.usage.network_bytes += network_bytes;
-        entry.usage.disk_bytes += disk_bytes;
+        entry.usage.requests = entry.usage.requests.saturating_add(1);
+        entry.usage.cpu_ms = entry.usage.cpu_ms.saturating_add(cpu_ms);
+        entry.usage.network_bytes = entry.usage.network_bytes.saturating_add(network_bytes);
+        entry.usage.disk_bytes = entry.usage.disk_bytes.saturating_add(disk_bytes);
 
         if entry.usage.requests > self.thresholds.max_requests_per_window {
             return AbuseVerdict::Blocked(AbuseDimension::RequestRate);
@@ -205,6 +205,30 @@ mod tests {
         let detector = AbuseDetector::new(thresholds);
         let verdict = detector.record_execution("heavy-caller", 600, 1, 1);
         assert_eq!(verdict, AbuseVerdict::Blocked(AbuseDimension::CpuTime));
+    }
+
+    #[test]
+    fn cumulative_usage_saturates_instead_of_wrapping() {
+        let thresholds = AbuseThresholds {
+            max_requests_per_window: u32::MAX,
+            max_cpu_ms_per_window: u64::MAX - 1,
+            max_network_bytes_per_window: u64::MAX,
+            max_disk_bytes_per_window: u64::MAX,
+            ..AbuseThresholds::default()
+        };
+        let detector = AbuseDetector::new(thresholds);
+        assert_eq!(
+            detector.record_execution("overflow", u64::MAX - 1, 0, 0),
+            AbuseVerdict::Allowed
+        );
+        assert_eq!(
+            detector.record_execution("overflow", 1, 0, 0),
+            AbuseVerdict::Blocked(AbuseDimension::CpuTime)
+        );
+        assert_eq!(
+            detector.record_execution("overflow", 1, 0, 0),
+            AbuseVerdict::Blocked(AbuseDimension::CpuTime)
+        );
     }
 
     #[test]
