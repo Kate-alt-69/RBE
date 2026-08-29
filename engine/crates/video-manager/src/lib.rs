@@ -396,6 +396,7 @@ impl VideoDatabase for SqliteVideoDatabase {
 pub struct VideoManager {
     databases: RwLock<HashMap<String, Arc<dyn VideoDatabase>>>,
     default_database: String,
+    quarantine_root: PathBuf,
     live_idle_secs: u64,
 }
 
@@ -404,13 +405,31 @@ impl VideoManager {
         database_path: impl AsRef<Path>,
         live_idle_secs: u64,
     ) -> anyhow::Result<Self> {
-        let default: Arc<dyn VideoDatabase> =
-            Arc::new(SqliteVideoDatabase::open(database_path.as_ref())?);
+        let database_path = database_path.as_ref();
+        let default: Arc<dyn VideoDatabase> = Arc::new(SqliteVideoDatabase::open(database_path)?);
+        let data_dir = database_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let quarantine_root = data_dir.join("quarantine").join("downloads");
+        std::fs::create_dir_all(&quarantine_root).with_context(|| {
+            format!(
+                "create Video Manager quarantine directory {}",
+                quarantine_root.display()
+            )
+        })?;
+        let quarantine_root = std::fs::canonicalize(&quarantine_root).with_context(|| {
+            format!(
+                "canonicalize Video Manager quarantine directory {}",
+                quarantine_root.display()
+            )
+        })?;
         let mut databases = HashMap::new();
         databases.insert(DEFAULT_DATABASE_NAME.to_string(), default);
         Ok(Self {
             databases: RwLock::new(databases),
             default_database: DEFAULT_DATABASE_NAME.into(),
+            quarantine_root,
             live_idle_secs,
         })
     }
@@ -468,7 +487,11 @@ impl VideoManager {
             updated_at_ms: now,
         };
         let (_, database) = self.resolve_database(database_selection.as_deref())?;
-        database.insert_job(&job)?;
+        let quarantine_path = self.reserve_download_quarantine(&asset.id, &job.id)?;
+        if let Err(error) = database.insert_job(&job) {
+            let _ = std::fs::remove_file(&quarantine_path);
+            return Err(error);
+        }
         Ok(QueuedDownload { asset, job })
     }
 
@@ -506,6 +529,52 @@ impl VideoManager {
         })
     }
 
+    fn quarantine_path(&self, asset_id: &str, job_id: &str) -> anyhow::Result<PathBuf> {
+        validate_generated_uuid("asset id", asset_id)?;
+        validate_generated_uuid("job id", job_id)?;
+        Ok(self
+            .quarantine_root
+            .join(asset_id)
+            .join(format!("{job_id}.part")))
+    }
+
+    fn reserve_download_quarantine(&self, asset_id: &str, job_id: &str) -> anyhow::Result<PathBuf> {
+        let path = self.quarantine_path(asset_id, job_id)?;
+        let asset_dir = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Video Manager quarantine path has no parent"))?;
+        std::fs::create_dir_all(asset_dir).with_context(|| {
+            format!(
+                "create Video Manager asset quarantine directory {}",
+                asset_dir.display()
+            )
+        })?;
+        let canonical_asset_dir = std::fs::canonicalize(asset_dir).with_context(|| {
+            format!(
+                "canonicalize Video Manager asset quarantine directory {}",
+                asset_dir.display()
+            )
+        })?;
+        if !canonical_asset_dir.starts_with(&self.quarantine_root) {
+            anyhow::bail!("Video Manager quarantine directory escaped its storage root");
+        }
+        let canonical_path = canonical_asset_dir.join(
+            path.file_name()
+                .ok_or_else(|| anyhow::anyhow!("Video Manager quarantine path has no filename"))?,
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&canonical_path)
+            .with_context(|| {
+                format!(
+                    "reserve Video Manager quarantine file {}",
+                    canonical_path.display()
+                )
+            })?;
+        Ok(canonical_path)
+    }
+
     fn resolve_database(
         &self,
         requested: Option<&str>,
@@ -532,6 +601,15 @@ fn parse_source_type(value: &str) -> VideoSourceType {
         "recorded_live" => VideoSourceType::RecordedLive,
         _ => VideoSourceType::Local,
     }
+}
+
+fn validate_generated_uuid(label: &str, value: &str) -> anyhow::Result<()> {
+    let parsed = Uuid::parse_str(value)
+        .with_context(|| format!("Video Manager {label} is not a UUID: {value:?}"))?;
+    if parsed.hyphenated().to_string() != value {
+        anyhow::bail!("Video Manager {label} must use canonical lowercase UUID form");
+    }
+    Ok(())
 }
 
 fn validate_segment(label: &str, value: &str) -> anyhow::Result<()> {
@@ -686,6 +764,27 @@ mod tests {
         );
         assert_eq!(queued.job.job_type, "download");
         assert_eq!(queued.job.state, "queued");
+        let quarantine_path = manager
+            .quarantine_path(&queued.asset.id, &queued.job.id)
+            .unwrap();
+        assert!(quarantine_path.is_file());
+        assert_eq!(quarantine_path.metadata().unwrap().len(), 0);
+        let expected_root =
+            std::fs::canonicalize(path.parent().unwrap().join("quarantine").join("downloads"))
+                .unwrap();
+        assert!(quarantine_path.starts_with(expected_root));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn quarantine_paths_reject_noncanonical_generated_ids() {
+        let path = temp_db("quarantine-path");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let valid = Uuid::new_v4().to_string();
+        assert!(manager.quarantine_path("../escape", &valid).is_err());
+        assert!(manager
+            .quarantine_path(&valid.to_uppercase(), &valid)
+            .is_err());
         let _ = std::fs::remove_file(path);
     }
 
