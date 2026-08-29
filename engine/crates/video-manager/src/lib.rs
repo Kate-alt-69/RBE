@@ -5,9 +5,13 @@
 //! database, custom database adapter registration, and job records so heavy
 //! media workers can remain isolated and lazy.
 
+mod container_probe;
 mod download;
 mod download_worker;
 
+pub use container_probe::{
+    probe_quarantine_container, sniff_video_container, ContainerProbe, VideoContainerKind,
+};
 pub use download::{
     is_public_download_ip, parse_download_target, resolve_download_target, DownloadTarget,
     ResolvedDownloadTarget,

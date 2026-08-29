@@ -101,7 +101,9 @@ pub fn sniff_video_container(prefix: &[u8], size_bytes: u64) -> anyhow::Result<C
         });
     }
 
-    anyhow::bail!("Video Manager quarantine file has an unsupported or unrecognized container signature")
+    anyhow::bail!(
+        "Video Manager quarantine file has an unsupported or unrecognized container signature"
+    )
 }
 
 fn sniff_iso_bmff(prefix: &[u8]) -> Option<String> {
@@ -121,9 +123,9 @@ fn sniff_iso_bmff(prefix: &[u8]) -> Option<String> {
 
 fn supported_bmff_brand(brand: &[u8; 4]) -> bool {
     const BRANDS: &[[u8; 4]] = &[
-        *b"isom", *b"iso2", *b"iso3", *b"iso4", *b"iso5", *b"iso6", *b"mp41", *b"mp42",
-        *b"avc1", *b"M4V ", *b"qt  ", *b"3gp4", *b"3gp5", *b"3gp6", *b"3g2a", *b"3g2b",
-        *b"cmfc", *b"cmfs", *b"dash",
+        *b"isom", *b"iso2", *b"iso3", *b"iso4", *b"iso5", *b"iso6", *b"mp41", *b"mp42", *b"avc1",
+        *b"M4V ", *b"qt  ", *b"3gp4", *b"3gp5", *b"3gp6", *b"3g2a", *b"3g2b", *b"cmfc", *b"cmfs",
+        *b"dash",
     ];
     BRANDS.contains(brand)
 }
@@ -217,7 +219,9 @@ mod tests {
         m2ts[196] = 0x47;
         m2ts[388] = 0x47;
         assert_eq!(
-            sniff_video_container(&m2ts, m2ts.len() as u64).unwrap().kind,
+            sniff_video_container(&m2ts, m2ts.len() as u64)
+                .unwrap()
+                .kind,
             VideoContainerKind::MpegTransportStream
         );
     }
