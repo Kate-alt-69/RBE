@@ -24,7 +24,7 @@ jobs:
       - name: wire lazy Video Manager worker runtime
         shell: bash
         run: |
-          python ../.github/patches/video-worker-runtime.py
+          (cd .. && python .github/patches/video-worker-runtime.py)
           rustfmt --edition 2021 \
             crates/video-manager/src/lib.rs \
             crates/video-manager/src/worker.rs \
