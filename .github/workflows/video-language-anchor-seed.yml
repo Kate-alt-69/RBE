@@ -21,8 +21,6 @@ jobs:
           path = Path("engine/crates/route-engine/src/module_eval.rs")
           source = path.read_text()
 
-          # Keep the semantic patch's historical constructor anchor isolated
-          # to this temporary seed. The semantic patch immediately rustfmts it.
           normal_constructor = "    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {\n        Self::with_service_caller(program, Arc::new(services))\n    }\n"
           seeded_constructor = "    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {\n    Self::with_service_caller(program, Arc::new(services))\n}\n"
           if normal_constructor in source:
@@ -57,6 +55,18 @@ jobs:
           )
           if source[signature_start:signature_end] != seeded_test_signature:
               source = source[:signature_start] + seeded_test_signature + source[signature_end:]
+
+          # The semantic patch also has an indentation-sensitive replacement
+          # inside this test body. Seed exactly the shell-visible old form so
+          # the replacement both consumes `scope` and validates owner flow.
+          body_if = source.index('                if module == "host" && function == "double" {', test_region)
+          body_let = source.index("                    let Some(Value::Number(value))", body_if)
+          body_let_end = source.index(" else {", body_let) + len(" else {")
+          seeded_test_body = (
+              '  if module == "host" && function == "double" {\n'
+              '  let Some(Value::Number(value)) = args.into_iter().next() else {'
+          )
+          source = source[:body_if] + seeded_test_body + source[body_let_end:]
           path.write_text(source)
 
           path = Path("engine/crates/route-engine/src/service_eval.rs")
@@ -76,10 +86,6 @@ jobs:
               source = source[:signature_start] + seeded_service_signature + source[signature_end:]
           path.write_text(source)
 
-          # The semantic patch's databaseHealth conversion uses a multiline
-          # literal whose indentation is changed by YAML block stripping. Seed
-          # the exact shell-visible form so the old to_json call cannot survive
-          # after the helper is replaced with json_result.
           path = Path("engine/crates/core/src/video_language.rs")
           source = path.read_text()
           database_region = source.index('            "databaseHealth" | "database_health" => {')
@@ -95,6 +101,21 @@ jobs:
           if source[call_start:call_end] != seeded_database_health:
               source = source[:call_start] + seeded_database_health + source[call_end:]
           path.write_text(source)
+
+          # Seed the Response match arm to the semantic patch's shell-visible
+          # indentation so its Video fallback arm is actually inserted.
+          path = Path("engine/crates/route-engine/src/modules.rs")
+          source = path.read_text()
+          response_start = source.index("            ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {")
+          response_end = source.index("\n            }),", response_start) + len("\n            }),")
+          seeded_response = (
+              '            ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {\n'
+              '        message: format!("{module_name}.{function_name}() is not implemented yet"),\n'
+              '    }),'
+          )
+          if source[response_start:response_end] != seeded_response:
+              source = source[:response_start] + seeded_response + source[response_end:]
+          path.write_text(source)
           PY
           git diff --check
           if ! git diff --quiet; then
@@ -103,7 +124,8 @@ jobs:
             git add -- \
               engine/crates/route-engine/src/module_eval.rs \
               engine/crates/route-engine/src/service_eval.rs \
+              engine/crates/route-engine/src/modules.rs \
               engine/crates/core/src/video_language.rs
-            git commit -m "ci: seed video serialization anchor"
+            git commit -m "ci: seed video fallback anchors"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
