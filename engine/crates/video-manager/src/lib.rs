@@ -1,9 +1,10 @@
 //! Global RBE Video Manager control/data plane.
 //!
-//! This crate intentionally does **not** run FFmpeg, RTMP, or HLS yet. It owns
-//! stable video identity, quarantine-safe HTTP download transport, the default
-//! database, custom database adapter registration, and job records so heavy
-//! media workers can remain isolated and lazy.
+//! Trusted Rust owns stable video identity, quarantine-safe HTTP download,
+//! container inspection, FFprobe validation, fixed-profile FFmpeg normalization,
+//! database promotion, and job state. Arbitrary process execution is never
+//! exposed to route/module/service language code; live RTMP/HLS workers remain
+//! separate and lazy.
 
 mod container_probe;
 mod download;
@@ -11,6 +12,7 @@ mod download_worker;
 mod ffmpeg;
 mod ffprobe;
 mod normalization;
+mod pipeline;
 
 pub use container_probe::{
     probe_quarantine_container, sniff_video_container, ContainerProbe, VideoContainerKind,
