@@ -1,0 +1,78 @@
+name: Video FFprobe Core Patch
+
+on:
+  push:
+    branches:
+      - codex/service-runtime-video-manager
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/service-runtime-video-manager
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Wire trusted FFprobe worker core
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("engine/crates/video-manager/src/lib.rs")
+          text = path.read_text()
+          modules_old = "mod container_probe;\nmod download;\nmod download_worker;\n"
+          modules_new = "mod container_probe;\nmod download;\nmod download_worker;\nmod ffprobe;\n"
+          if "mod ffprobe;" not in text:
+              if modules_old not in text:
+                  raise SystemExit("Video Manager FFprobe module anchor missing")
+              text = text.replace(modules_old, modules_new, 1)
+
+          export_anchor = "pub use download_worker::{DownloadPolicy, DownloadReceipt};\n"
+          export_new = export_anchor + "pub use ffprobe::{FfprobePolicy, MediaProbe, VideoStreamProbe};\n"
+          if "pub use ffprobe::{" not in text:
+              if export_anchor not in text:
+                  raise SystemExit("Video Manager FFprobe export anchor missing")
+              text = text.replace(export_anchor, export_new, 1)
+          path.write_text(text)
+          PY
+      - name: Format Video Manager FFprobe core
+        working-directory: engine
+        run: rustfmt --edition 2021 crates/video-manager/src/lib.rs crates/video-manager/src/ffprobe.rs
+      - name: Clippy workspace locked
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace locked
+        working-directory: engine
+        run: cargo test --workspace --locked
+      - name: Commit validated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only)"
+          printf '%s\n' "$changed"
+          unexpected="$(printf '%s\n' "$changed" | grep -vE '^engine/crates/video-manager/src/(lib|ffprobe)\.rs$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected changed paths:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          if git diff --quiet; then
+            echo "No semantic source changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/crates/video-manager/src/lib.rs engine/crates/video-manager/src/ffprobe.rs
+          git commit -m "feat: add trusted ffprobe worker"
+          git push origin HEAD:codex/service-runtime-video-manager
