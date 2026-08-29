@@ -45,6 +45,13 @@ jobs:
           if count != 1:
               raise SystemExit(f"Video Manager DownloadPolicy lint anchor count={count}")
           path.write_text(source)
+
+          # backend/main.rs recursively formats child modules under rustfmt 1.98.
+          # Keep it out of permanent focused rustfmt just like route-engine/lib.rs.
+          workflow = Path("../.github/workflows/runtime-ci.yml")
+          text = workflow.read_text()
+          text = text.replace("            crates/backend/src/main.rs \\\n", "", 1)
+          workflow.write_text(text)
           PY
           rustfmt --edition 2021 \
             crates/video-manager/src/lib.rs \
@@ -54,6 +61,9 @@ jobs:
             crates/video-manager/src/ffmpeg.rs \
             crates/config/src/lib.rs \
             crates/backend/src/main.rs
+          git checkout -- \
+            crates/backend/src/error_reporter_daemon.rs \
+            crates/backend/src/maintenance_notice.rs
           python -m json.tool settings.json >/dev/null
           git diff --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
