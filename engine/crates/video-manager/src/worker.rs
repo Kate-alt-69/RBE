@@ -38,6 +38,7 @@ impl VideoManager {
         policy: VideoWorkerPolicy,
     ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
         policy.validate()?;
+        self.set_worker_state(crate::VideoWorkerState::Sleeping)?;
         Ok(tokio::spawn(async move {
             match self.recover_incomplete_downloads() {
                 Ok(0) => {}
@@ -45,15 +46,23 @@ impl VideoManager {
                     count,
                     "Video Manager re-queued interrupted download job(s) after restart"
                 ),
-                Err(error) => tracing::error!(
-                    error = %error,
-                    "Video Manager failed to complete startup download recovery"
-                ),
+                Err(error) => {
+                    let _ = self.set_worker_state(crate::VideoWorkerState::Degraded);
+                    tracing::error!(
+                        error = %error,
+                        "Video Manager failed to complete startup download recovery"
+                    );
+                }
             }
 
             loop {
                 match self.next_queued_download(None) {
                     Ok(Some(queued)) => {
+                        if let Err(error) =
+                            self.set_worker_state(crate::VideoWorkerState::Processing)
+                        {
+                            tracing::error!(error = %error, "Video Manager worker telemetry failed");
+                        }
                         let asset_id = queued.asset.id.clone();
                         let job_id = queued.job.id.clone();
                         match self
@@ -78,13 +87,25 @@ impl VideoManager {
                                 "Video Manager download pipeline failed"
                             ),
                         }
+                        if let Err(error) = self.set_worker_state(crate::VideoWorkerState::Sleeping)
+                        {
+                            tracing::error!(error = %error, "Video Manager worker telemetry failed");
+                        }
                         continue;
                     }
-                    Ok(None) => {}
-                    Err(error) => tracing::error!(
-                        error = %error,
-                        "Video Manager failed to discover queued download work"
-                    ),
+                    Ok(None) => {
+                        if let Err(error) = self.set_worker_state(crate::VideoWorkerState::Sleeping)
+                        {
+                            tracing::error!(error = %error, "Video Manager worker telemetry failed");
+                        }
+                    }
+                    Err(error) => {
+                        let _ = self.set_worker_state(crate::VideoWorkerState::Degraded);
+                        tracing::error!(
+                            error = %error,
+                            "Video Manager failed to discover queued download work"
+                        );
+                    }
                 }
 
                 tokio::select! {
