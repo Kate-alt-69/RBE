@@ -48,6 +48,14 @@ impl RateLimiters {
     }
 }
 
+/// Callers must agree on what is actually inside the API namespace.
+/// A raw `starts_with("/api")` also matches unrelated paths such as
+/// `/apiary` and `/apix`, incorrectly moving them from the global tier
+/// into the API-specific tier.
+fn is_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
+}
+
 /// Anything implementing this can hand back the shared rate-limiter
 /// state — implemented for `core_lib::AppState` so this crate doesn't
 /// need a hard dependency on that specific type. (Kept generic rather
@@ -77,7 +85,7 @@ where
     S: HasRateLimiters + Clone + Send + Sync + 'static,
 {
     let path = req.uri().path();
-    if path == "/health" || path.starts_with("/api") {
+    if path == "/health" || is_api_path(path) {
         return next.run(req).await;
     }
 
@@ -100,7 +108,7 @@ where
     S: HasRateLimiters + Clone + Send + Sync + 'static,
 {
     let path = req.uri().path();
-    if !path.starts_with("/api") {
+    if !is_api_path(path) {
         return next.run(req).await;
     }
 
@@ -115,4 +123,21 @@ where
     }
 
     next.run(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_api_path;
+
+    #[test]
+    fn api_path_matching_respects_segment_boundaries() {
+        assert!(is_api_path("/api"));
+        assert!(is_api_path("/api/"));
+        assert!(is_api_path("/api/users"));
+
+        assert!(!is_api_path("/"));
+        assert!(!is_api_path("/apiary"));
+        assert!(!is_api_path("/apix"));
+        assert!(!is_api_path("/v1/api"));
+    }
 }
