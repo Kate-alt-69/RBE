@@ -30,25 +30,22 @@ jobs:
           elif seeded_constructor not in source:
               raise SystemExit("with_services source anchor missing")
 
-          # Same issue for the private helper call: the semantic patch expects
-          # the arguments/closing paren shifted left. Rust accepts the whitespace;
-          # the semantic patch immediately replaces it and rustfmt restores it.
-          normal_helper = '''                                .call_function(
-                                    self.file.clone(),
-                                    &function.name,
-                                    args,
-                                    self.depth + 1,
-                                )'''
-          seeded_helper = '''                                .call_function(
-                            self.file.clone(),
-                            &function.name,
-                            args,
-                            self.depth + 1,
-                        )'''
-          if normal_helper in source:
-              source = source.replace(normal_helper, seeded_helper, 1)
-          elif seeded_helper not in source:
-              raise SystemExit("module helper source anchor missing")
+          # The main semantic guard also carries an old indentation-sensitive
+          # helper-call anchor. Find the actual helper call structurally and
+          # normalize only that call span to the exact string the guard expects.
+          helper_region = source.index("                        if let Some(function) = self")
+          call_start = source.index("                                .call_function(", helper_region)
+          call_end = source.index("\n                                .await;", call_start)
+          seeded_helper = (
+              "                                .call_function(\n"
+              "                            self.file.clone(),\n"
+              "                            &function.name,\n"
+              "                            args,\n"
+              "                            self.depth + 1,\n"
+              "                        )"
+          )
+          if source[call_start:call_end] != seeded_helper:
+              source = source[:call_start] + seeded_helper + source[call_end:]
 
           path.write_text(source)
           PY
