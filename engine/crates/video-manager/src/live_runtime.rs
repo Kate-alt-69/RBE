@@ -122,58 +122,81 @@ async fn run_live_runtime_coordinator(
         }
 
         if active && !demand {
-            let should_shutdown = tokio::select! {
-                _ = shutdown.notified() => true,
-                _ = manager.live_notify.notified() => false,
-                _ = tokio::time::sleep(idle_timeout) => {
-                    manager.live_runtime_demand().map(|demand| !demand).unwrap_or(false)
-                }
+            enum IdleSignal {
+                Shutdown,
+                Changed,
+                Expired,
+            }
+            let signal = tokio::select! {
+                _ = shutdown.notified() => IdleSignal::Shutdown,
+                _ = manager.live_notify.notified() => IdleSignal::Changed,
+                _ = tokio::time::sleep(idle_timeout) => IdleSignal::Expired,
             };
-            if !should_shutdown {
-                continue;
-            }
-            let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Draining);
-            match tokio::time::timeout(
-                LIVE_RUNTIME_STOP_TIMEOUT,
-                driver.stop(manager.clone()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    active = false;
-                    let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Sleeping);
-                    tracing::info!("Video Manager live runtime stopped after idle drain");
+            match signal {
+                IdleSignal::Changed => continue,
+                IdleSignal::Shutdown => {
+                    stop_live_runtime(&manager, driver.as_ref(), false).await;
+                    break;
                 }
-                Ok(Err(error)) => {
-                    tracing::error!(error = %error, "Video Manager live runtime failed to stop");
-                    let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Degraded);
-                    active = false;
-                }
-                Err(_) => {
-                    tracing::error!(
-                        timeout_secs = LIVE_RUNTIME_STOP_TIMEOUT.as_secs(),
-                        "Video Manager live runtime stop timed out"
-                    );
-                    let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Degraded);
-                    active = false;
+                IdleSignal::Expired => {
+                    match manager.live_runtime_demand() {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            stop_live_runtime(&manager, driver.as_ref(), true).await;
+                            active = false;
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "Video Manager failed to recheck live demand before idle shutdown"
+                            );
+                            let _ = manager
+                                .set_live_runtime_state(VideoLiveRuntimeState::Degraded);
+                            continue;
+                        }
+                    }
                 }
             }
-            if should_shutdown && shutdown_notified(&shutdown) {
-                break;
-            }
-            continue;
         }
 
         if wait_for_signal(&manager, &shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
             if active {
-                let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Draining);
-                let _ = tokio::time::timeout(
-                    LIVE_RUNTIME_STOP_TIMEOUT,
-                    driver.stop(manager.clone()),
-                )
-                .await;
+                stop_live_runtime(&manager, driver.as_ref(), false).await;
             }
             break;
+        }
+    }
+}
+
+async fn stop_live_runtime(
+    manager: &VideoManager,
+    driver: &dyn LiveRuntimeDriver,
+    idle_stop: bool,
+) {
+    let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Draining);
+    match tokio::time::timeout(
+        LIVE_RUNTIME_STOP_TIMEOUT,
+        driver.stop(Arc::new(manager.clone_for_live_runtime())),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Sleeping);
+            if idle_stop {
+                tracing::info!("Video Manager live runtime stopped after idle drain");
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "Video Manager live runtime failed to stop");
+            let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Degraded);
+        }
+        Err(_) => {
+            tracing::error!(
+                timeout_secs = LIVE_RUNTIME_STOP_TIMEOUT.as_secs(),
+                "Video Manager live runtime stop timed out"
+            );
+            let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Degraded);
         }
     }
 }
@@ -188,13 +211,6 @@ async fn wait_for_signal(
         _ = manager.live_notify.notified() => false,
         _ = tokio::time::sleep(scan) => false,
     }
-}
-
-fn shutdown_notified(_shutdown: &Notify) -> bool {
-    // `Notify` is edge-triggered and intentionally has no query API. This
-    // helper exists only to keep the coordinator state machine explicit; the
-    // outer select handles actual shutdown notification.
-    false
 }
 
 #[cfg(test)]
