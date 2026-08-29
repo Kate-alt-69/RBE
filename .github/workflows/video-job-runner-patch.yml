@@ -1,0 +1,95 @@
+name: Video Job Runner Patch
+
+on:
+  push:
+    branches:
+      - codex/service-runtime-video-manager
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/service-runtime-video-manager
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Wire claimed Video Manager download runner
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path("engine/crates/video-manager/src/lib.rs")
+          text = lib.read_text()
+          manager_anchor = "    pub fn get_asset(\n        &self,\n        database: Option<&str>,\n        asset_id: &str,\n    ) -> anyhow::Result<Option<VideoAsset>> {\n"
+          runner = "    /// Atomically claim and execute one queued download job. A successful HTTP\n    /// fetch remains quarantined until content validation explicitly accepts it.\n    pub async fn run_queued_download(\n        &self,\n        queued: &QueuedDownload,\n        policy: DownloadPolicy,\n    ) -> anyhow::Result<DownloadReceipt> {\n        if queued.asset.id != queued.job.asset_id || queued.job.job_type != \"download\" {\n            anyhow::bail!(\"Video Manager queued download identity/type mismatch\");\n        }\n        let (_, database) = self.resolve_database(Some(&queued.asset.database))?;\n        let claimed = database\n            .claim_job(&queued.job.id, \"queued\", \"downloading\")?\n            .ok_or_else(|| {\n                anyhow::anyhow!(\n                    \"Video Manager download job {:?} is not queued and cannot be claimed\",\n                    queued.job.id\n                )\n            })?;\n        if claimed.asset_id != queued.asset.id || claimed.job_type != \"download\" {\n            let detail = \"Video Manager claimed job does not match its queued download asset/type\";\n            let _ = database.update_job(&claimed.id, \"failed\", 0.0, Some(detail));\n            if claimed.job_type == \"download\" {\n                if let Ok(path) = self.quarantine_path(&claimed.asset_id, &claimed.id) {\n                    let _ = std::fs::remove_file(path);\n                }\n            }\n            anyhow::bail!(\"{detail}\");\n        }\n\n        let mut claimed_download = queued.clone();\n        claimed_download.job = claimed;\n        match self.execute_queued_download(&claimed_download, policy).await {\n            Ok(receipt) => {\n                database.update_job(&queued.job.id, \"downloaded\", 1.0, None)?;\n                Ok(receipt)\n            }\n            Err(error) => {\n                let detail = error.to_string();\n                if let Err(state_error) =\n                    database.update_job(&queued.job.id, \"failed\", 0.0, Some(&detail))\n                {\n                    return Err(anyhow::anyhow!(\n                        \"Video Manager download failed: {detail}; additionally failed to persist job failure: {state_error}\"\n                    ));\n                }\n                Err(error)\n            }\n        }\n    }\n\n"
+          if "pub async fn run_queued_download(" not in text:
+              pos = text.find(manager_anchor)
+              if pos < 0:
+                  raise SystemExit("VideoManager get_asset runner anchor missing")
+              text = text[:pos] + runner + text[pos:]
+
+          test_anchor = "    #[test]\n    fn explicit_unknown_database_does_not_fall_back() {\n"
+          tests = "    #[tokio::test]\n    async fn download_runner_records_preflight_failure_and_cleans_quarantine() {\n        let path = temp_db(\"runner-failure\");\n        let manager = VideoManager::open_default(&path, 7200).unwrap();\n        let queued = manager\n            .queue_download(QueueDownloadRequest {\n                database: None,\n                namespace_kind: \"module\".into(),\n                namespace_owner: \"worker\".into(),\n                group: \"failures\".into(),\n                title: \"Failure\".into(),\n                url: \"https://example.invalid/video.mp4\".into(),\n                metadata: serde_json::Value::Null,\n            })\n            .unwrap();\n        let quarantine = manager.quarantine_path(&queued.asset.id, &queued.job.id).unwrap();\n        let policy = DownloadPolicy {\n            max_bytes: 0,\n            ..DownloadPolicy::default()\n        };\n        assert!(manager.run_queued_download(&queued, policy).await.is_err());\n        let (_, database) = manager.resolve_database(None).unwrap();\n        let stored = database.get_job(&queued.job.id).unwrap().unwrap();\n        assert_eq!(stored.state, \"failed\");\n        assert_eq!(stored.attempts, 1);\n        assert!(stored\n            .error\n            .as_deref()\n            .is_some_and(|error| error.contains(\"byte limit\")));\n        assert!(!quarantine.exists());\n        let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();\n        assert_eq!(asset.state, VideoAssetState::Quarantined);\n        let _ = std::fs::remove_dir_all(path.parent().unwrap());\n    }\n\n    #[tokio::test]\n    async fn losing_download_claim_does_not_delete_quarantine() {\n        let path = temp_db(\"runner-claim\");\n        let manager = VideoManager::open_default(&path, 7200).unwrap();\n        let queued = manager\n            .queue_download(QueueDownloadRequest {\n                database: None,\n                namespace_kind: \"module\".into(),\n                namespace_owner: \"worker\".into(),\n                group: \"claims\".into(),\n                title: \"Claim\".into(),\n                url: \"https://example.invalid/video.mp4\".into(),\n                metadata: serde_json::Value::Null,\n            })\n            .unwrap();\n        let quarantine = manager.quarantine_path(&queued.asset.id, &queued.job.id).unwrap();\n        let (_, database) = manager.resolve_database(None).unwrap();\n        database\n            .claim_job(&queued.job.id, \"queued\", \"downloading\")\n            .unwrap()\n            .unwrap();\n        assert!(manager\n            .run_queued_download(&queued, DownloadPolicy::default())\n            .await\n            .is_err());\n        assert!(quarantine.exists());\n        let stored = database.get_job(&queued.job.id).unwrap().unwrap();\n        assert_eq!(stored.state, \"downloading\");\n        assert_eq!(stored.attempts, 1);\n        let _ = std::fs::remove_dir_all(path.parent().unwrap());\n    }\n\n"
+          if "fn download_runner_records_preflight_failure_and_cleans_quarantine()" not in text:
+              pos = text.find(test_anchor)
+              if pos < 0:
+                  raise SystemExit("Video Manager runner test anchor missing")
+              text = text[:pos] + tests + text[pos:]
+          lib.write_text(text)
+
+          worker = Path("engine/crates/video-manager/src/download_worker.rs")
+          worker_text = worker.read_text()
+          start = worker_text.find("    pub async fn execute_queued_download(\n")
+          next_fn = worker_text.find("\nasync fn download_into_quarantine", start)
+          if start < 0 or next_fn < 0:
+              raise SystemExit("download worker method boundary missing")
+          impl_close = worker_text.rfind("\n}", start, next_fn)
+          if impl_close < 0:
+              raise SystemExit("download worker impl closing brace missing")
+          current = worker_text[start:impl_close]
+          replacement = "    pub async fn execute_queued_download(\n        &self,\n        queued: &QueuedDownload,\n        policy: DownloadPolicy,\n    ) -> anyhow::Result<DownloadReceipt> {\n        let quarantine_path = self.quarantine_path(&queued.asset.id, &queued.job.id)?;\n        let result = async {\n            policy.validate()?;\n            if queued.asset.id != queued.job.asset_id {\n                anyhow::bail!(\"Video Manager queued download asset/job identity mismatch\");\n            }\n            let source_url = queued\n                .asset\n                .source_uri\n                .as_deref()\n                .ok_or_else(|| anyhow::anyhow!(\"Video Manager queued download has no source URL\"))?;\n            let target = parse_download_target(source_url)?;\n            match tokio::time::timeout(\n                policy.total_timeout,\n                download_into_quarantine(target, &quarantine_path, &policy),\n            )\n            .await\n            {\n                Ok(result) => result,\n                Err(_) => anyhow::bail!(\n                    \"Video Manager download exceeded total timeout of {:?}\",\n                    policy.total_timeout\n                ),\n            }\n        }\n        .await;\n\n        if result.is_err() {\n            let _ = tokio::fs::remove_file(&quarantine_path).await;\n        }\n        result\n    }\n"
+          if "let result = async {" not in current:
+              worker_text = worker_text[:start] + replacement + worker_text[impl_close:]
+          worker.write_text(worker_text)
+          PY
+      - name: Format Video Manager runner slice
+        working-directory: engine
+        run: rustfmt --edition 2021 crates/video-manager/src/lib.rs crates/video-manager/src/download_worker.rs
+      - name: Clippy workspace locked
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace locked
+        working-directory: engine
+        run: cargo test --workspace --locked
+      - name: Commit validated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only)"
+          printf '%s\n' "$changed"
+          unexpected="$(printf '%s\n' "$changed" | grep -vE '^engine/crates/video-manager/src/(lib|download_worker)\.rs$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected changed paths:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          if git diff --quiet; then
+            echo "No semantic source changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/crates/video-manager/src/lib.rs engine/crates/video-manager/src/download_worker.rs
+          git commit -m "feat: run claimed video downloads"
+          git push origin HEAD:codex/service-runtime-video-manager
