@@ -477,11 +477,11 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                             return self
                                 .executor
                                 .call_function(
-                                    self.file.clone(),
-                                    &function.name,
-                                    args,
-                                    self.depth + 1,
-                                )
+                            self.file.clone(),
+                            &function.name,
+                            args,
+                            self.depth + 1,
+                        )
                                 .await;
                         }
                         if self.modules.is_direct_function(name) {
