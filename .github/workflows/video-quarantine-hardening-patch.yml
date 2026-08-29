@@ -1,0 +1,46 @@
+name: Video Quarantine Hardening Patch
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: harden reserved quarantine reopen
+        shell: bash
+        run: |
+          (cd .. && python .github/patches/video-quarantine-hardening.py)
+          rustfmt --edition 2021 crates/video-manager/src/download_worker.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          python - <<'PY'
+          import subprocess
+          allowed = {"crates/video-manager/src/download_worker.rs"}
+          changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected quarantine hardening paths: " + ", ".join(sorted(unexpected)))
+          PY
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- crates/video-manager/src/download_worker.rs
+            git commit -m "fix: harden Video Manager quarantine reopen"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
