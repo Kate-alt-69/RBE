@@ -1,23 +1,39 @@
 # RBE Video Manager
 
-Video Manager is RBE's global media identity, metadata, database, and job-control subsystem. The current implementation establishes the durable control/data model first; heavyweight media workers are intentionally not embedded in this crate yet.
+Video Manager is RBE's global media identity, storage metadata, job-control, quarantine, validation, and normalization subsystem. Trusted Rust owns privileged network/media workers; the RBE language surface only receives capability-scoped control-plane operations.
 
-## Current responsibilities
+## Current pipeline
 
-The implemented Video Manager currently owns:
+The download path currently implements this state flow:
 
-- stable video asset identity
-- namespaces and groups
-- the built-in SQLite database
-- pluggable database adapter registration
-- asset metadata and state
-- variant table/schema
-- media job records
-- live-session table/schema
-- database health/status
-- creation of quarantined download jobs without performing network I/O
+```text
+queued
+  -> downloading
+  -> downloaded
+  -> inspecting
+  -> container_checked
+  -> probing
+  -> probed
+  -> normalizing
+  -> ready
+```
 
-It does **not** currently execute FFmpeg, FFprobe, RTMP, HLS, WHIP, or remote downloads.
+A failure at a privileged worker stage records the job as `failed`. Downloaded bytes remain quarantined until all validation stages pass and the normalized variant is committed.
+
+The implemented pipeline includes:
+
+- strict URL parsing and normalization
+- DNS resolution with special/private-address rejection
+- redirect revalidation
+- bounded HTTPS download execution
+- quarantine storage under generated UUID paths
+- cheap fail-closed container signature inspection
+- trusted FFprobe execution with bounded output and timeout
+- trusted FFmpeg normalization with a fixed local-only profile
+- atomic database promotion of the normalized variant, asset, and job
+- cleanup of quarantine after successful promotion
+
+RTMP, HLS, WHIP/WebRTC ingest, hardware-acceleration selection, and background worker scheduling are still pending.
 
 ## Stable identity
 
@@ -30,16 +46,18 @@ vm://<namespace-kind>:<namespace-owner>/<group>/<asset-id>
 Example:
 
 ```text
-vm://service:kastrick-learning/tutorials/550e8400-e29b-41d4-a716-446655440000
+vm://module:learning.catalog/tutorials/550e8400-e29b-41d4-a716-446655440000
 ```
 
-The URI is an RBE Video Manager identity, not a filesystem path or network URL.
+The URI is a Video Manager identity, not a filesystem path or network URL. Absolute media storage paths are not exposed through the language API. Normalized variants store controlled relative media paths such as:
 
-Namespace kind, owner, group, and custom database names currently accept ASCII letters, digits, `-`, `_`, and `.`.
+```text
+<asset-id>/primary.mp4
+```
 
-## Asset model
+## Asset and variant model
 
-Implemented source types are:
+Implemented source types:
 
 - `upload`
 - `download`
@@ -48,7 +66,7 @@ Implemented source types are:
 - `live`
 - `recorded_live`
 
-Implemented asset states are:
+Implemented asset states:
 
 - `reserved`
 - `quarantined`
@@ -57,13 +75,13 @@ Implemented asset states are:
 - `failed`
 - `deleted`
 
-An asset stores its ID, stable URI, selected database, namespace, group, title, source type, optional source URI, JSON metadata, and timestamps.
+The normalized download path currently produces a `standard` MP4 variant using H.264 video and AAC audio. The FFmpeg profile is owned by trusted Rust and is not supplied as arbitrary language/process arguments.
 
 ## Default database
 
-`VideoManager::open_default` registers the built-in SQLite adapter under the name `default`.
+`VideoManager::open_default` registers the built-in SQLite adapter as `default` and creates both quarantine and normalized-media roots adjacent to the database data directory.
 
-SQLite is opened with WAL journaling and foreign-key enforcement. The schema currently contains:
+SQLite uses WAL journaling and foreign-key enforcement. The schema contains:
 
 - `video_namespaces`
 - `video_groups`
@@ -72,108 +90,157 @@ SQLite is opened with WAL journaling and foreign-key enforcement. The schema cur
 - `video_jobs`
 - `video_live_sessions`
 
-The default adapter supports asset creation, asset lookup, job insertion, and a simple database health probe.
+The adapter supports asset creation/lookup, atomic job claiming and transitions, job updates, and an atomic ready-variant commit.
+
+Final normalized promotion is transactional at the metadata layer: the ready variant is inserted, the asset changes from `quarantined` to `ready`, and the job changes from `normalizing` to `ready` in one SQLite transaction. If that commit fails, the newly promoted media file is removed instead of leaving a falsely-ready asset.
 
 ## Database adapters
 
-`VideoDatabase` is the storage adapter contract. Additional adapters can be registered in-process under explicit names.
+`VideoDatabase` is the in-process storage adapter contract. Additional adapters can be registered under explicit names.
 
-Database selection is fail-closed: an explicit unknown database override returns an error. Video Manager does not silently fall back to `default` when a caller requested another database.
+Database selection is fail-closed. Requesting an unknown adapter returns an error; Video Manager does not silently fall back to `default`.
 
-The language-level/custom adapter surface is not wired yet; the Rust adapter registry is the implemented foundation.
+The full backend-configured custom-default-adapter path is not complete yet.
 
-## Download queue
+## Download security boundary
 
-`queue_download` currently accepts only an `https://` source string. It does **not** fetch that URL.
+`queue_download` does not hand arbitrary URLs directly to FFmpeg or a shell. It creates a quarantined asset/job and normalizes the target first.
 
-Calling it creates:
+The trusted download worker then applies network policy including:
 
-1. a `download` asset in `quarantined` state, and
-2. a `download` job in `queued` state with zero progress and zero attempts.
+- HTTP target normalization
+- credentials/fragment rejection
+- DNS answer vetting
+- rejection of loopback, private, link-local, multicast, metadata/special-use, and mapped disallowed addresses
+- mixed public/private DNS answer rejection
+- redirect destination revalidation
+- HTTPS downgrade prevention
+- response size limits and fail-closed `Content-Length` handling
+- bounded body streaming into the reserved quarantine file
 
-This separation is intentional. The future Download Worker is expected to consume queued jobs and perform security-sensitive network/media work outside the database/control-plane call.
+A completed network fetch is only `downloaded`; it is not yet a playable/ready asset.
 
-The current `https://` prefix check is only a queue-entry constraint, **not** the final download security policy.
+## Container inspection
 
-## Planned secure Download Worker
+After download, `inspect_download_container` claims `downloaded -> inspecting` and runs a cheap signature gate before expensive probing.
 
-The actual worker is still pending. Its responsibilities are expected to include, at minimum:
+The gate recognizes supported video-container families such as ISO-BMFF/MP4 and MPEG transport streams while rejecting obvious image/audio/FLV/random payloads. Failure deletes the quarantined bytes and records the job failure.
 
-- URL parsing and scheme policy
-- DNS resolution and re-resolution checks
-- SSRF protection against loopback, private, link-local, metadata, multicast, and otherwise disallowed destinations
-- redirect policy with destination revalidation
-- response/body byte limits
-- configured maximum download size
-- content/magic-byte inspection instead of trusting extensions or `Content-Type`
-- quarantine storage
-- FFprobe validation
-- isolated/sandboxed normalization where required
-- explicit job progress/failure transitions
+This signature gate is intentionally not treated as authoritative media decoding. FFprobe is the next required stage.
 
-Until that worker exists, a queued download must not be described as downloaded, validated, normalized, or safe for playback.
+## FFprobe
 
-## FFmpeg / FFprobe
+`probe_download_media` claims `container_checked -> probing` and launches only the configured trusted FFprobe executable.
 
-FFmpeg and FFprobe execution are not implemented in Video Manager yet.
+The FFprobe policy requires an absolute regular-file executable path and bounds both timeout and captured output. The invocation:
 
-The intended architecture is for trusted RBE-owned worker code to launch and supervise these binaries. `.service`, `.module`, and `.route` code should not receive a generic `process.spawn`, `exec`, or shell escape merely to reach FFmpeg.
+- reads only the quarantined local file
+- restricts allowed protocols to local/data-oriented protocols
+- captures bounded JSON output
+- rejects malformed output
+- requires at least one valid video stream
+- validates dimensions and frame-rate ranges
 
-Hardware-acceleration probing and codec/profile selection are also pending.
+Success records `probed`. Failure deletes quarantine and records the job as failed.
 
-## Live media
+## FFmpeg normalization
 
-The schema contains `video_live_sessions`, and status exposes the configured live idle duration, but there is no live media runtime yet.
+`normalize_download_media` claims `probed -> normalizing` and invokes the configured trusted FFmpeg executable through `FfmpegPolicy`.
 
-Current status deliberately reports:
+The current standard profile is deliberately fixed by RBE:
+
+- MP4 output
+- H.264 via `libx264`
+- AAC audio when present
+- `yuv420p`
+- CRF 23
+- medium preset
+- fast-start MP4 metadata
+- first video stream and optional first audio stream
+- subtitles/data streams excluded
+- local/data protocol whitelist only
+- stdin disabled
+- output overwrite disabled
+- bounded FFmpeg error output
+- bounded execution timeout
+
+Module/service code does **not** receive arbitrary FFmpeg switches, shell strings, process spawning, input paths, or output paths.
+
+FFmpeg writes into a private staging file under the generated asset directory. Only after FFmpeg succeeds is that staging file renamed to the final `primary.mp4`; the DB ready-variant transaction then publishes it. Quarantine is removed after that transaction succeeds.
+
+Hardware acceleration is not selected yet; the current profile intentionally uses the deterministic software encoder.
+
+## Language API
+
+Video Manager is a privileged **module-only** capability and must be imported explicitly. There is no global `video` object and `video` is not a compatibility alias.
+
+Supported import names are:
 
 ```text
-live_runtime = "sleeping"
+vm
+video-manager
 ```
 
-This does not mean an RTMP/HLS server exists in a suspended state. It means heavyweight live workers have not been activated/implemented by this control-plane slice.
+Examples:
 
-Planned live work includes RTMP/HLS and likely WHIP-style ingest where appropriate, with heavyweight workers started lazily and stopped after the configured idle period. The current default configuration target is 7,200 seconds (2 hours).
+```text
+:import[vm]
+```
 
-Node Media Server is not part of the intended architecture; trusted native/RBE-owned workers should own media subprocess and protocol lifecycle.
+or:
+
+```text
+:import[video-manager as media]
+```
+
+Direct function imports are also supported, for example:
+
+```text
+:import[video-manager.status as videoStatus]
+```
+
+Current language functions:
+
+- `status()`
+- `databaseHealth([database])` / `database_health([database])`
+- `get(assetId[, database])`
+- `create(group, title, sourceType[, sourceUri[, metadata[, database]]])`
+- `queueDownload(group, title, url[, metadata[, database]])`
+- `queue_download(...)`
+
+Using `:import[video]` fails module boot with `MOD2010` and directs the developer to `vm` or `video-manager`.
+
+`.route` files cannot directly import `vm` or `video-manager`; privileged Video Manager access must go through a `.module`. Host capabilities are import-gated, so merely having the backend capability object present does not create a global language binding.
+
+Mutating calls are namespace-scoped to the resolved module identity. A module such as `module/learning/catalog.module` operates in namespace `module:learning.catalog` and cannot claim another module/service namespace. `get` also enforces ownership before returning an asset.
+
+The generic `create(..., "download")` path is rejected; modules must use `queueDownload()` so remote content enters the quarantine pipeline.
 
 ## Backend integration
 
-When Video Manager is enabled, the backend opens its configured data directory and the built-in `video-manager.db`, then exposes Video Manager status as part of backend `/health`.
+When enabled, the backend owns one `VideoManager` in shared application state. `/health` includes Video Manager status, and an unhealthy default database contributes to backend health failure.
 
-The backend currently expects the configured default database name to be the built-in `default`. Runtime registration of additional Rust adapters exists, but selecting a custom configured default through the full backend/language configuration path is not complete yet.
+The language layer receives a narrow `VideoLanguage` facade rather than the raw manager/database/filesystem objects.
 
-Video Manager health is currently based on the default database health. A failed default database makes the Video Manager status unhealthy and therefore contributes to backend `/health` failure.
+## Live media
 
-## Language integration
+The schema contains `video_live_sessions`, and status includes the configured live idle duration, but a live protocol runtime has not landed yet. Current `live_runtime = "sleeping"` means no heavyweight live worker is active; it should not be interpreted as an implemented RTMP/HLS server merely suspended in memory.
 
-A first-class `video` language capability is still pending. Do not assume `.module` or `.service` code can call Video Manager merely because the Rust control plane exists.
+Planned live work includes lazy worker activation, RTMP/HLS and potentially WHIP/WebRTC ingest, with worker shutdown after the configured idle period.
 
-The intended language layer should expose capability-scoped operations rather than raw database handles, filesystem paths, or FFmpeg process access. It should preserve namespace ownership and allow an explicit database selection only when that database is registered and authorized.
+## Still pending
 
-## Security boundary
+The following remain intentionally unfinished:
 
-Video Manager is designed as the authority that separates untrusted/request-driven media intent from privileged media execution.
-
-Today the implemented boundary is the durable identity/database/job layer. Future network download, probing, transcoding, and live workers must remain behind trusted RBE-owned APIs and must not broaden the route/module/service languages into arbitrary OS process execution.
-
-## Not implemented yet
-
-The following are explicitly pending:
-
-- network download execution
-- complete SSRF/DNS/redirect policy
-- quarantine file pipeline
-- magic-byte/media validation
-- FFprobe worker
-- FFmpeg transcode/normalization worker
-- hardware acceleration detection
+- automatic/background job scheduling that drives every queued job through the pipeline without an explicit trusted Rust caller
+- FFmpeg hardware-acceleration probing and safe encoder selection
+- additional normalization profiles/variants
+- upload/local/generated media ingestion workers beyond metadata creation
 - RTMP ingest
 - HLS generation/serving
 - WHIP/WebRTC ingest
-- lazy live-worker activation and the actual 2-hour idle shutdown timer
-- language-level `video` capability
+- lazy live-worker activation and actual idle shutdown
 - backend-configured custom default database adapters
-- upload/local/generated media ingestion workers beyond asset metadata creation
+- service-to-mother Video Manager capability channel
 
-The current implementation should therefore be described as the Video Manager **control/data-plane foundation**, not a finished media server.
+The implemented download path is now substantially more than a control-plane stub, but Video Manager is not yet a complete live/media server.
