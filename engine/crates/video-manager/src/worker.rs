@@ -21,6 +21,7 @@ impl VideoWorkerPolicy {
                 MAX_RECOVERY_SCAN
             );
         }
+        self.download.validate()?;
         self.ffprobe.validate()?;
         self.ffmpeg.validate()?;
         Ok(())
@@ -38,6 +39,18 @@ impl VideoManager {
     ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
         policy.validate()?;
         Ok(tokio::spawn(async move {
+            match self.recover_incomplete_downloads() {
+                Ok(0) => {}
+                Ok(count) => tracing::warn!(
+                    count,
+                    "Video Manager re-queued interrupted download job(s) after restart"
+                ),
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "Video Manager failed to complete startup download recovery"
+                ),
+            }
+
             loop {
                 match self.next_queued_download(None) {
                     Ok(Some(queued)) => {

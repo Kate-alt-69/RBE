@@ -34,7 +34,7 @@ impl Default for DownloadPolicy {
 }
 
 impl DownloadPolicy {
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.max_bytes == 0 {
             anyhow::bail!("Video Manager download byte limit must be greater than zero");
         }

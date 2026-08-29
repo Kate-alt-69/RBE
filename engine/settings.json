@@ -68,7 +68,11 @@
     "dataDir": "data/video",
     "defaultDatabase": "default",
     "liveIdleSecs": 7200,
-    "downloadMaxBytes": 8589934592
+    "downloadMaxBytes": 8589934592,
+    "downloadWorkerEnabled": false,
+    "ffprobeExecutable": "",
+    "ffmpegExecutable": "",
+    "workerRecoveryScanSecs": 30
   },
   "containers": {
     "environments": 5,

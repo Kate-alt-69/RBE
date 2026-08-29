@@ -322,7 +322,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
 
     let service_manager = service_boot::start(service_catalog.as_ref()).await?;
 
-    let video_manager = if config.video_manager.enabled {
+    let (video_manager, video_worker_task) = if config.video_manager.enabled {
         if config.video_manager.default_database != video_manager::DEFAULT_DATABASE_NAME {
             anyhow::bail!(
                 "videoManager.defaultDatabase {:?} is not registered at boot; built-in default is {:?}",
@@ -332,19 +332,49 @@ async fn boot_and_run() -> anyhow::Result<()> {
         }
         let data_dir = service_boot::resolve_runtime_path(&config.video_manager.data_dir);
         let database_path = data_dir.join("video-manager.db");
-        let manager = video_manager::VideoManager::open_default(
+        let manager = Arc::new(video_manager::VideoManager::open_default(
             &database_path,
             config.video_manager.live_idle_secs,
-        )?;
+        )?);
+        let worker_task = if config.video_manager.download_worker_enabled {
+            let ffprobe =
+                service_boot::resolve_runtime_path(config.video_manager.ffprobe_executable.trim());
+            let ffmpeg =
+                service_boot::resolve_runtime_path(config.video_manager.ffmpeg_executable.trim());
+            let download = video_manager::DownloadPolicy {
+                max_bytes: config.video_manager.download_max_bytes,
+                ..Default::default()
+            };
+            let policy = video_manager::VideoWorkerPolicy {
+                download,
+                ffprobe: video_manager::FfprobePolicy::new(&ffprobe),
+                ffmpeg: video_manager::FfmpegPolicy::new(&ffmpeg),
+                recovery_scan: Duration::from_secs(config.video_manager.worker_recovery_scan_secs),
+            };
+            let task = manager.clone().spawn_download_worker(policy)?;
+            tracing::info!(
+                ffprobe = %ffprobe.display(),
+                ffmpeg = %ffmpeg.display(),
+                recovery_scan_secs = config.video_manager.worker_recovery_scan_secs,
+                max_download_bytes = config.video_manager.download_max_bytes,
+                "Video Manager lazy download worker ready"
+            );
+            Some(task)
+        } else {
+            tracing::info!(
+                "Video Manager download worker disabled; queued downloads remain quarantined until a trusted worker is configured"
+            );
+            None
+        };
         tracing::info!(
             database = %database_path.display(),
             live_idle_secs = config.video_manager.live_idle_secs,
-            "Video Manager control plane ready; heavy live/media workers sleeping"
+            "Video Manager control plane ready; live media workers sleeping"
         );
-        Some(Arc::new(manager))
+        (Some(manager), worker_task)
     } else {
         tracing::info!("Video Manager disabled by configuration");
-        None
+        (None, None)
     };
 
     let app_state = AppState::new(
@@ -432,6 +462,10 @@ async fn boot_and_run() -> anyhow::Result<()> {
 
     lifecycle.set(BackendState::Stopping);
     service_manager.shutdown_all().await;
+    if let Some(task) = video_worker_task {
+        task.abort();
+        let _ = task.await;
+    }
     container_refresh_task.abort();
     vault_refresh_task.abort();
     error_reporter_task.abort();

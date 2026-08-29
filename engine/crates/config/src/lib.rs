@@ -337,6 +337,10 @@ pub struct VideoManagerConfig {
     pub default_database: String,
     pub live_idle_secs: u64,
     pub download_max_bytes: u64,
+    pub download_worker_enabled: bool,
+    pub ffprobe_executable: String,
+    pub ffmpeg_executable: String,
+    pub worker_recovery_scan_secs: u64,
 }
 
 impl Default for VideoManagerConfig {
@@ -347,6 +351,10 @@ impl Default for VideoManagerConfig {
             default_database: "default".into(),
             live_idle_secs: 2 * 60 * 60,
             download_max_bytes: 8 * 1024 * 1024 * 1024,
+            download_worker_enabled: false,
+            ffprobe_executable: String::new(),
+            ffmpeg_executable: String::new(),
+            worker_recovery_scan_secs: 30,
         }
     }
 }
@@ -558,6 +566,27 @@ impl Config {
                     "videoManager.liveIdleSecs must be greater than zero".into(),
                 ));
             }
+            if self.video_manager.download_max_bytes == 0 {
+                return Err(ConfigError::Invalid(
+                    "videoManager.downloadMaxBytes must be greater than zero".into(),
+                ));
+            }
+            if self.video_manager.worker_recovery_scan_secs == 0
+                || self.video_manager.worker_recovery_scan_secs > 3600
+            {
+                return Err(ConfigError::Invalid(
+                    "videoManager.workerRecoveryScanSecs must be between 1 and 3600".into(),
+                ));
+            }
+            if self.video_manager.download_worker_enabled
+                && (self.video_manager.ffprobe_executable.trim().is_empty()
+                    || self.video_manager.ffmpeg_executable.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "videoManager download worker requires ffprobeExecutable and ffmpegExecutable"
+                        .into(),
+                ));
+            }
         }
         if !self.dashboards.admin_path_prefix.starts_with('/') {
             return Err(ConfigError::Invalid(
@@ -582,6 +611,8 @@ mod tests {
         assert!(config.services.enabled);
         assert_eq!(config.services.default_idle_timeout_ms, 300_000);
         assert_eq!(config.video_manager.live_idle_secs, 7200);
+        assert!(!config.video_manager.download_worker_enabled);
+        assert_eq!(config.video_manager.worker_recovery_scan_secs, 30);
     }
 
     #[test]
@@ -606,5 +637,19 @@ mod tests {
             r#"{ "api": { "host": "0.0.0.0", "port": 8080 }, "typo_field": true }"#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn video_worker_requires_explicit_trusted_executables() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "api": { "host": "0.0.0.0", "port": 8080 },
+                "videoManager": { "downloadWorkerEnabled": true }
+            }"#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("ffprobeExecutable"));
+        assert!(error.contains("ffmpegExecutable"));
     }
 }

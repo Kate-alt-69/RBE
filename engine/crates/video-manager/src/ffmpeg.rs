@@ -28,7 +28,7 @@ impl FfmpegPolicy {
         }
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if !self.executable.is_absolute() {
             anyhow::bail!("Video Manager FFmpeg executable path must be absolute");
         }
