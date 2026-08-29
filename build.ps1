@@ -156,6 +156,7 @@ function Invoke-Build([string]$Package, [string]$Target, [bool]$IsRelease) {
 
 foreach ($target in $targets) {
     Write-Host ""; Write-Host "=== Building for $target ===" -ForegroundColor Green
+    if ($target -notmatch '^[A-Za-z0-9._-]+$' -or $target -eq '.' -or $target -eq '..') { throw "Unsafe build target name: $target" }
     $outDir = Join-Path $DistRoot $target; $depDir = Join-Path $outDir 'dep'
     if (Test-Path -LiteralPath $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $depDir | Out-Null
