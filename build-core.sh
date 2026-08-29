@@ -99,7 +99,8 @@ fi
 DIST_ROOT="$REPO_ROOT/dist"; ENGINE_DIR="$REPO_ROOT/engine"; CONTAINER_DIR="$REPO_ROOT/container-runtime"
 for target in "${targets[@]}"; do
     echo ""; echo "=== Building for $target ===" >&2
-    out_dir="$DIST_ROOT/$target"; dep_dir="$out_dir/dep"; rm -rf "$out_dir"; mkdir -p "$dep_dir"
+    if [[ ! "$target" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$target" = "." ] || [ "$target" = ".." ]; then echo "ERROR: unsafe target name '$target'" >&2; exit 1; fi
+    out_dir="$DIST_ROOT/$target"; dep_dir="$out_dir/dep"; rm -rf -- "$out_dir"; mkdir -p "$dep_dir"
 
     echo "-- container-bin ($target) --" >&2
     (cd "$CONTAINER_DIR" && invoke_cargo_build container-bin "$target" "$RELEASE")
