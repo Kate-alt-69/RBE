@@ -1,10 +1,10 @@
 # RBE Video Manager
 
-Video Manager is RBE's global media identity, storage metadata, job-control, quarantine, validation, and normalization subsystem. Trusted Rust owns privileged network/media workers; the RBE language surface only receives capability-scoped control-plane operations.
+Video Manager is RBE's global media identity, storage metadata, job-control, quarantine, validation, normalization, and lazy-worker subsystem. Trusted Rust owns privileged network/media workers; the RBE language surface only receives capability-scoped control-plane operations.
 
 ## Current pipeline
 
-The download path currently implements this state flow:
+The download path implements this state flow:
 
 ```text
 queued
@@ -32,8 +32,12 @@ The implemented pipeline includes:
 - trusted FFmpeg normalization with a fixed local-only profile
 - atomic database promotion of the normalized variant, asset, and job
 - cleanup of quarantine after successful promotion
+- mother-owned lazy background scheduling for queued downloads
+- startup recovery for interrupted download/validation/normalization jobs
+- worker state and aggregate queue-depth reporting
+- bounded graceful worker shutdown with safe restart recovery fallback
 
-RTMP, HLS, WHIP/WebRTC ingest, hardware-acceleration selection, and background worker scheduling are still pending.
+RTMP, HLS, WHIP/WebRTC ingest, hardware-acceleration selection, and additional ingestion/normalization profiles are still pending.
 
 ## Stable identity
 
@@ -49,13 +53,15 @@ Example:
 vm://module:learning.catalog/tutorials/550e8400-e29b-41d4-a716-446655440000
 ```
 
-The URI is a Video Manager identity, not a filesystem path or network URL. Absolute media storage paths are not exposed through the language API. Normalized variants store controlled relative media paths such as:
+The URI is a Video Manager identity, not a filesystem path or network URL. Absolute media storage paths are not exposed through the language API. Normalized variants store controlled relative media paths internally such as:
 
 ```text
 <asset-id>/primary.mp4
 ```
 
-## Asset and variant model
+That relative storage path is also stripped from the module-facing variant view.
+
+## Asset, job, and variant model
 
 Implemented source types:
 
@@ -75,6 +81,18 @@ Implemented asset states:
 - `failed`
 - `deleted`
 
+Download jobs expose stage progress. Current aggregate milestones are approximately:
+
+- `queued`: `0.00`
+- `downloading`: `0.05`
+- `downloaded`: `0.45`
+- `container_checked`: `0.55`
+- `probed`: `0.70`
+- `normalizing`: `0.75`
+- `ready`: `1.00`
+
+These are pipeline-stage progress values, not byte-perfect FFmpeg progress percentages.
+
 The normalized download path currently produces a `standard` MP4 variant using H.264 video and AAC audio. The FFmpeg profile is owned by trusted Rust and is not supplied as arbitrary language/process arguments.
 
 ## Default database
@@ -90,7 +108,7 @@ SQLite uses WAL journaling and foreign-key enforcement. The schema contains:
 - `video_jobs`
 - `video_live_sessions`
 
-The adapter supports asset creation/lookup, atomic job claiming and transitions, job updates, and an atomic ready-variant commit.
+The adapter supports asset creation/lookup, job lookup, queued-job discovery, aggregate queue depth, startup recovery, atomic job claiming/transitions, variant listing, and atomic ready-variant commit.
 
 Final normalized promotion is transactional at the metadata layer: the ready variant is inserted, the asset changes from `quarantined` to `ready`, and the job changes from `normalizing` to `ready` in one SQLite transaction. If that commit fails, the newly promoted media file is removed instead of leaving a falsely-ready asset.
 
@@ -100,7 +118,48 @@ Final normalized promotion is transactional at the metadata layer: the ready var
 
 Database selection is fail-closed. Requesting an unknown adapter returns an error; Video Manager does not silently fall back to `default`.
 
+Worker-oriented adapter hooks have safe no-work defaults, so a custom adapter must explicitly implement queued-job discovery/recovery if it wants the mother-owned download worker to consume its jobs.
+
 The full backend-configured custom-default-adapter path is not complete yet.
+
+## Lazy download worker
+
+The backend can start one mother-owned download worker. It is deliberately event-driven rather than a hot polling loop:
+
+1. `queueDownload()` persists the quarantined asset/job.
+2. Video Manager calls its internal `Notify` wakeup.
+3. the sleeping worker discovers the oldest queued download and runs the trusted pipeline.
+4. when the queue is empty it returns to `sleeping`.
+5. a bounded periodic recovery scan catches work restored after restart or inserted through another adapter/process.
+
+A second worker spawn is rejected so two consumers cannot accidentally race the same queue through one `VideoManager` instance.
+
+Worker state is reported as:
+
+- `disabled`
+- `sleeping`
+- `processing`
+- `degraded`
+
+`degraded` contributes to Video Manager `/health` failure. Status also reports aggregate queued-download depth.
+
+### Worker configuration
+
+The relevant `videoManager` settings are:
+
+```json
+{
+  "downloadWorkerEnabled": false,
+  "ffprobeExecutable": "",
+  "ffmpegExecutable": "",
+  "workerRecoveryScanSecs": 30,
+  "downloadMaxBytes": 8589934592
+}
+```
+
+The worker is disabled by default. When enabled, FFprobe and FFmpeg must be explicitly configured. Relative executable paths are resolved against the backend binary/runtime root; Video Manager does not search the shell `PATH` and does not accept executable paths from module/route input.
+
+At backend shutdown the worker first receives a graceful stop signal. An in-flight pipeline item may finish within `runtime.gracefulShutdownTimeoutMs`. If it exceeds that budget the task is aborted; the next startup's recovery pass re-queues the interrupted job. Retried downloads identity-check and truncate their reserved quarantine file before writing, so stale partial bytes do not contaminate the retry.
 
 ## Download security boundary
 
@@ -117,6 +176,7 @@ The trusted download worker then applies network policy including:
 - HTTPS downgrade prevention
 - response size limits and fail-closed `Content-Length` handling
 - bounded body streaming into the reserved quarantine file
+- reserved-file identity checks before truncation/write
 
 A completed network fetch is only `downloaded`; it is not yet a playable/ready asset.
 
@@ -132,7 +192,7 @@ This signature gate is intentionally not treated as authoritative media decoding
 
 `probe_download_media` claims `container_checked -> probing` and launches only the configured trusted FFprobe executable.
 
-The FFprobe policy requires an absolute regular-file executable path and bounds both timeout and captured output. The invocation:
+The FFprobe policy requires an absolute regular-file executable path after runtime-path resolution and bounds both timeout and captured output. The invocation:
 
 - reads only the quarantined local file
 - restricts allowed protocols to local/data-oriented protocols
@@ -204,23 +264,29 @@ Current language functions:
 - `status()`
 - `databaseHealth([database])` / `database_health([database])`
 - `get(assetId[, database])`
+- `job(jobId[, database])`
+- `variants(assetId[, database])`
 - `create(group, title, sourceType[, sourceUri[, metadata[, database]]])`
 - `queueDownload(group, title, url[, metadata[, database]])`
 - `queue_download(...)`
+
+`job()` returns ownership-scoped job state/progress/attempt metadata but deliberately omits the internal error string, which may contain privileged worker or filesystem diagnostics. `variants()` also strips internal storage paths before returning variant information to module code.
 
 Using `:import[video]` fails module boot with `MOD2010` and directs the developer to `vm` or `video-manager`.
 
 `.route` files cannot directly import `vm` or `video-manager`; privileged Video Manager access must go through a `.module`. Host capabilities are import-gated, so merely having the backend capability object present does not create a global language binding.
 
-Mutating calls are namespace-scoped to the resolved module identity. A module such as `module/learning/catalog.module` operates in namespace `module:learning.catalog` and cannot claim another module/service namespace. `get` also enforces ownership before returning an asset.
+Mutating calls are namespace-scoped to the resolved module identity. A module such as `module/learning/catalog.module` operates in namespace `module:learning.catalog` and cannot claim another module/service namespace. `get`, `job`, and `variants` enforce ownership before returning asset-derived data.
 
 The generic `create(..., "download")` path is rejected; modules must use `queueDownload()` so remote content enters the quarantine pipeline.
 
 ## Backend integration
 
-When enabled, the backend owns one `VideoManager` in shared application state. `/health` includes Video Manager status, and an unhealthy default database contributes to backend health failure.
+When enabled, the backend owns one `VideoManager` in shared application state. `/health` includes database health plus download-worker state/queue depth. An unhealthy default database or a degraded download worker contributes to backend health failure.
 
-The language layer receives a narrow `VideoLanguage` facade rather than the raw manager/database/filesystem objects.
+The language layer receives a narrow `VideoLanguage` facade rather than raw manager/database/filesystem objects.
+
+The worker is optional. With `downloadWorkerEnabled = false`, queueing remains available but jobs stay quarantined/queued until a trusted worker is enabled or another trusted Rust caller processes them.
 
 ## Live media
 
@@ -232,7 +298,6 @@ Planned live work includes lazy worker activation, RTMP/HLS and potentially WHIP
 
 The following remain intentionally unfinished:
 
-- automatic/background job scheduling that drives every queued job through the pipeline without an explicit trusted Rust caller
 - FFmpeg hardware-acceleration probing and safe encoder selection
 - additional normalization profiles/variants
 - upload/local/generated media ingestion workers beyond metadata creation
@@ -243,4 +308,4 @@ The following remain intentionally unfinished:
 - backend-configured custom default database adapters
 - service-to-mother Video Manager capability channel
 
-The implemented download path is now substantially more than a control-plane stub, but Video Manager is not yet a complete live/media server.
+The download path now includes both the secure media pipeline and its lazy mother-owned scheduler, but Video Manager is not yet a complete live/media server.
