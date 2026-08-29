@@ -298,11 +298,16 @@ mod tests {
 
     #[test]
     fn policy_rejects_unbounded_values() {
-        let mut policy = DownloadPolicy::default();
-        policy.max_bytes = 0;
+        let policy = DownloadPolicy {
+            max_bytes: 0,
+            ..DownloadPolicy::default()
+        };
         assert!(policy.validate().is_err());
-        policy.max_bytes = 1;
-        policy.max_redirects = MAX_REDIRECTS_HARD_LIMIT + 1;
+        let policy = DownloadPolicy {
+            max_bytes: 1,
+            max_redirects: MAX_REDIRECTS_HARD_LIMIT + 1,
+            ..DownloadPolicy::default()
+        };
         assert!(policy.validate().is_err());
     }
 }
