@@ -29,8 +29,8 @@ pub use ffmpeg::{FfmpegPolicy, FfmpegVideoEncoder, NormalizedMedia};
 pub use ffmpeg_capabilities::{probe_ffmpeg_capabilities, FfmpegCapabilities};
 pub use ffprobe::{FfprobePolicy, MediaProbe, VideoStreamProbe};
 pub use live::{
-    ReserveLiveSessionRequest, VideoLiveRuntimeState, VideoLiveSession, VideoLiveSessionCounts,
-    VideoLiveSessionState,
+    ReserveLiveSessionRequest, VideoLiveBinding, VideoLiveIngestProtocol, VideoLiveRuntimeState,
+    VideoLiveSession, VideoLiveSessionCounts, VideoLiveSessionState,
 };
 pub use worker::{VideoWorkerHandle, VideoWorkerPolicy};
 
@@ -293,6 +293,14 @@ pub trait VideoDatabase: Send + Sync {
         _next: VideoLiveSessionState,
     ) -> anyhow::Result<Option<VideoLiveSession>> {
         anyhow::bail!("Video Manager database adapter does not support live session transitions")
+    }
+    fn bind_live_session(
+        &self,
+        _database: &str,
+        _session_id: &str,
+        _binding: &VideoLiveBinding,
+    ) -> anyhow::Result<Option<VideoLiveSession>> {
+        anyhow::bail!("Video Manager database adapter does not support live session binding")
     }
     fn live_session_counts(&self) -> anyhow::Result<VideoLiveSessionCounts> {
         Ok(VideoLiveSessionCounts::default())
@@ -953,6 +961,77 @@ impl VideoDatabase for SqliteVideoDatabase {
         let changed = transaction.execute(
             "UPDATE video_live_sessions SET state = ?1, started_at_ms = COALESCE(started_at_ms, ?2), ended_at_ms = COALESCE(ended_at_ms, ?3) WHERE id = ?4 AND state = ?5",
             params![next.as_str(), started, ended, session_id, expected.as_str()],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let row = transaction
+            .query_row(
+                "SELECT id, asset_id, state, ingest_protocol, ingest_endpoint, playback_endpoint, started_at_ms, ended_at_ms FROM video_live_sessions WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        transaction.commit()?;
+        row.map(
+            |(
+                id,
+                asset_id,
+                state,
+                ingest_protocol,
+                ingest_endpoint,
+                playback_endpoint,
+                started_at_ms,
+                ended_at_ms,
+            )| {
+                Ok(VideoLiveSession {
+                    id,
+                    asset_id,
+                    database: database.to_string(),
+                    state: VideoLiveSessionState::parse(&state)?,
+                    ingest_protocol,
+                    ingest_endpoint,
+                    playback_endpoint,
+                    started_at_ms,
+                    ended_at_ms,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    fn bind_live_session(
+        &self,
+        database: &str,
+        session_id: &str,
+        binding: &VideoLiveBinding,
+    ) -> anyhow::Result<Option<VideoLiveSession>> {
+        validate_generated_uuid("live session id", session_id)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
+        let transaction = connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE video_live_sessions SET state = 'starting', ingest_protocol = ?1, ingest_endpoint = ?2, playback_endpoint = ?3 WHERE id = ?4 AND state = 'reserved' AND ingest_protocol IS NULL AND ingest_endpoint IS NULL",
+            params![
+                binding.ingest_protocol.as_str(),
+                binding.ingest_endpoint,
+                binding.playback_endpoint,
+                session_id,
+            ],
         )?;
         if changed == 0 {
             transaction.commit()?;
@@ -2507,6 +2586,63 @@ mod tests {
                 asset_id: asset.id,
             })
             .is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn trusted_live_binding_atomically_moves_reservation_to_starting() {
+        let path = temp_db("live-binding");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let asset = manager
+            .create_asset(CreateAssetRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "streamer".into(),
+                group: "live".into(),
+                title: "Bound".into(),
+                source_type: VideoSourceType::Live,
+                source_uri: None,
+                metadata: serde_json::Value::Null,
+                initial_state: VideoAssetState::Reserved,
+            })
+            .unwrap();
+        let session = manager
+            .reserve_live_session(ReserveLiveSessionRequest {
+                database: None,
+                asset_id: asset.id,
+            })
+            .unwrap();
+        let bound = manager
+            .bind_live_session_trusted(
+                None,
+                &session.id,
+                VideoLiveBinding {
+                    ingest_protocol: VideoLiveIngestProtocol::Rtmp,
+                    ingest_endpoint: "rtmp://127.0.0.1:1935/live/opaque-key".into(),
+                    playback_endpoint: Some("https://cdn.example.invalid/live/index.m3u8".into()),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.state, VideoLiveSessionState::Starting);
+        assert_eq!(bound.ingest_protocol.as_deref(), Some("rtmp"));
+        assert!(manager
+            .bind_live_session_trusted(
+                None,
+                &session.id,
+                VideoLiveBinding {
+                    ingest_protocol: VideoLiveIngestProtocol::Rtmp,
+                    ingest_endpoint: "rtmp://127.0.0.1:1935/live/another".into(),
+                    playback_endpoint: None,
+                },
+            )
+            .unwrap()
+            .is_none());
+        let live = manager
+            .mark_live_session_ready_trusted(None, &session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.state, VideoLiveSessionState::Live);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
