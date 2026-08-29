@@ -5,6 +5,13 @@
 //! database adapter registration, and job records so media workers can remain
 //! isolated and lazy.
 
+mod download;
+
+pub use download::{
+    is_public_download_ip, parse_download_target, resolve_download_target, DownloadTarget,
+    ResolvedDownloadTarget,
+};
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -435,9 +442,7 @@ impl VideoManager {
     /// that performs DNS/IP policy, byte limits, magic-byte inspection,
     /// FFprobe, and sandboxed FFmpeg normalization is intentionally separate.
     pub fn queue_download(&self, request: QueueDownloadRequest) -> anyhow::Result<QueuedDownload> {
-        if !request.url.starts_with("https://") {
-            anyhow::bail!("Video Manager downloads currently require an https:// URL");
-        }
+        let target = parse_download_target(&request.url)?;
         let database_selection = request.database.clone();
         let asset = self.create_asset(CreateAssetRequest {
             database: database_selection.clone(),
@@ -446,7 +451,7 @@ impl VideoManager {
             group: request.group,
             title: request.title,
             source_type: VideoSourceType::Download,
-            source_uri: Some(request.url),
+            source_uri: Some(target.normalized_url().to_string()),
             metadata: request.metadata,
             initial_state: VideoAssetState::Quarantined,
         })?;
@@ -670,11 +675,15 @@ mod tests {
                 namespace_owner: "uac".into(),
                 group: "avatars".into(),
                 title: "Avatar".into(),
-                url: "https://example.invalid/avatar.mp4".into(),
+                url: "HTTPS://Example.INVALID:443/avatar.mp4".into(),
                 metadata: serde_json::Value::Null,
             })
             .unwrap();
         assert_eq!(queued.asset.state, VideoAssetState::Quarantined);
+        assert_eq!(
+            queued.asset.source_uri.as_deref(),
+            Some("https://example.invalid/avatar.mp4")
+        );
         assert_eq!(queued.job.job_type, "download");
         assert_eq!(queued.job.state, "queued");
         let _ = std::fs::remove_file(path);

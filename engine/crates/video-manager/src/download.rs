@@ -66,7 +66,9 @@ pub fn parse_download_target(input: &str) -> anyhow::Result<DownloadTarget> {
             .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
         || input.contains('\\')
     {
-        anyhow::bail!("video download URL contains unsupported whitespace, Unicode, or backslashes");
+        anyhow::bail!(
+            "video download URL contains unsupported whitespace, Unicode, or backslashes"
+        );
     }
     if input.contains('#') {
         anyhow::bail!("video download URL fragments are not allowed");
@@ -219,7 +221,11 @@ fn normalize_dns_host(raw_host: &str) -> anyhow::Result<String> {
     }
 
     let labels = host.split('.').collect::<Vec<_>>();
-    if labels.len() < 2 || labels.iter().any(|label| label.is_empty() || label.len() > 63) {
+    if labels.len() < 2
+        || labels
+            .iter()
+            .any(|label| label.is_empty() || label.len() > 63)
+    {
         anyhow::bail!("video download DNS host must be a fully-qualified, valid hostname");
     }
     for label in &labels {
@@ -238,7 +244,10 @@ fn normalize_dns_host(raw_host: &str) -> anyhow::Result<String> {
             anyhow::bail!("video download URL contains an invalid DNS label {label:?}");
         }
     }
-    if labels.iter().all(|label| looks_numeric_host_component(label)) {
+    if labels
+        .iter()
+        .all(|label| looks_numeric_host_component(label))
+    {
         anyhow::bail!("video download URL rejects ambiguous non-canonical numeric hosts");
     }
 
@@ -330,12 +339,8 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
 
     !matches!(
         (segments[0], segments[1]),
-        (0x2001, 0x0000)
-            | (0x2001, 0x0002)
-            | (0x2001, 0x0db8)
-            | (0x2002, _)
-    ) && !(segments[0] == 0x2001
-        && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020))
+        (0x2001, 0x0000) | (0x2001, 0x0002) | (0x2001, 0x0db8) | (0x2002, _)
+    ) && !(segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020))
         && !(segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
 }
 
@@ -371,7 +376,10 @@ mod tests {
             "https://example.com\\@127.0.0.1/video",
             "ftp://example.com/video",
         ] {
-            assert!(parse_download_target(url).is_err(), "{url} should be rejected");
+            assert!(
+                parse_download_target(url).is_err(),
+                "{url} should be rejected"
+            );
         }
     }
 
@@ -395,7 +403,10 @@ mod tests {
             "255.255.255.255",
         ] {
             let address = address.parse::<IpAddr>().unwrap();
-            assert!(!is_public_download_ip(address), "{address} should be blocked");
+            assert!(
+                !is_public_download_ip(address),
+                "{address} should be blocked"
+            );
         }
         assert!(is_public_download_ip("1.1.1.1".parse().unwrap()));
         assert!(is_public_download_ip("8.8.8.8".parse().unwrap()));
@@ -418,7 +429,10 @@ mod tests {
             "ff02::1",
         ] {
             let address = address.parse::<IpAddr>().unwrap();
-            assert!(!is_public_download_ip(address), "{address} should be blocked");
+            assert!(
+                !is_public_download_ip(address),
+                "{address} should be blocked"
+            );
         }
         assert!(is_public_download_ip(
             "2606:4700:4700::1111".parse().unwrap()
