@@ -13,6 +13,7 @@ mod ffmpeg;
 mod ffmpeg_capabilities;
 mod ffprobe;
 mod live;
+mod live_runtime;
 mod normalization;
 mod pipeline;
 mod worker;
@@ -32,10 +33,12 @@ pub use live::{
     ReserveLiveSessionRequest, VideoLiveBinding, VideoLiveIngestProtocol, VideoLiveRuntimeState,
     VideoLiveSession, VideoLiveSessionCounts, VideoLiveSessionState,
 };
+pub use live_runtime::{LiveRuntimeDriver, LiveRuntimeFuture, LiveRuntimeHandle};
 pub use worker::{VideoWorkerHandle, VideoWorkerPolicy};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1206,6 +1209,9 @@ pub struct VideoManager {
     work_notify: tokio::sync::Notify,
     worker_state: Mutex<VideoWorkerState>,
     worker_encoder: Mutex<Option<FfmpegVideoEncoder>>,
+    live_notify: tokio::sync::Notify,
+    live_runtime_state: Mutex<VideoLiveRuntimeState>,
+    live_runtime_claimed: AtomicBool,
     live_idle_secs: u64,
 }
 
@@ -1256,6 +1262,9 @@ impl VideoManager {
             work_notify: tokio::sync::Notify::new(),
             worker_state: Mutex::new(VideoWorkerState::Disabled),
             worker_encoder: Mutex::new(None),
+            live_notify: tokio::sync::Notify::new(),
+            live_runtime_state: Mutex::new(VideoLiveRuntimeState::Disabled),
+            live_runtime_claimed: AtomicBool::new(false),
             live_idle_secs,
         })
     }
@@ -1664,6 +1673,30 @@ impl VideoManager {
         Ok(database.health())
     }
 
+    pub(crate) fn set_live_runtime_state(
+        &self,
+        state: VideoLiveRuntimeState,
+    ) -> anyhow::Result<()> {
+        let mut current = self
+            .live_runtime_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager live runtime state mutex is poisoned"))?;
+        *current = state;
+        Ok(())
+    }
+
+    pub fn live_runtime_state(&self) -> anyhow::Result<VideoLiveRuntimeState> {
+        self.live_runtime_state
+            .lock()
+            .map(|state| *state)
+            .map_err(|_| anyhow::anyhow!("Video Manager live runtime state mutex is poisoned"))
+    }
+
+    pub(crate) fn live_runtime_demand(&self) -> anyhow::Result<bool> {
+        let counts = self.live_session_counts()?;
+        Ok(counts.reserved > 0 || counts.starting > 0 || counts.live > 0 || counts.stopping > 0)
+    }
+
     pub fn status(&self) -> anyhow::Result<VideoManagerStatus> {
         let databases = self
             .databases
@@ -1679,9 +1712,9 @@ impl VideoManager {
         let worker_state = self.worker_state()?;
         let queued_downloads = self.queued_download_count()?;
         let live_sessions = self.live_session_counts()?;
-        let live_runtime = VideoLiveRuntimeState::from_counts(live_sessions);
+        let live_runtime = self.live_runtime_state()?;
         Ok(VideoManagerStatus {
-            ok: default_ok && worker_state != VideoWorkerState::Degraded,
+            ok: default_ok && worker_state != VideoWorkerState::Degraded && live_runtime.healthy(),
             databases: names,
             default_database: self.default_database.clone(),
             download_worker: VideoDownloadWorkerStatus {
@@ -2533,7 +2566,7 @@ mod tests {
         assert_eq!(live.state, VideoLiveSessionState::Live);
         assert!(live.started_at_ms.is_some());
         let status = manager.status().unwrap();
-        assert_eq!(status.live_runtime, VideoLiveRuntimeState::Active);
+        assert_eq!(status.live_runtime, VideoLiveRuntimeState::Disabled);
         assert_eq!(status.live_sessions.live, 1);
         let stopping = manager
             .request_end_live_session(None, &session.id)
@@ -2552,7 +2585,7 @@ mod tests {
         assert!(ended.ended_at_ms.is_some());
         assert_eq!(
             manager.status().unwrap().live_runtime,
-            VideoLiveRuntimeState::Sleeping
+            VideoLiveRuntimeState::Disabled
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

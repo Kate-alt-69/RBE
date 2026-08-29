@@ -156,23 +156,17 @@ impl VideoLiveSessionCounts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoLiveRuntimeState {
+    Disabled,
     Sleeping,
     Starting,
     Active,
     Draining,
+    Degraded,
 }
 
 impl VideoLiveRuntimeState {
-    pub(crate) fn from_counts(counts: VideoLiveSessionCounts) -> Self {
-        if counts.live > 0 {
-            Self::Active
-        } else if counts.starting > 0 {
-            Self::Starting
-        } else if counts.stopping > 0 {
-            Self::Draining
-        } else {
-            Self::Sleeping
-        }
+    pub fn healthy(self) -> bool {
+        self != Self::Degraded
     }
 }
 
@@ -255,6 +249,7 @@ impl VideoManager {
             ended_at_ms: None,
         };
         database.insert_live_session(&database_name, &session)?;
+        self.live_notify.notify_waiters();
         Ok(session)
     }
 
@@ -318,7 +313,11 @@ impl VideoManager {
         crate::validate_generated_uuid("live session id", session_id)?;
         validate_live_binding(&binding)?;
         let (database_name, database) = self.resolve_database(database)?;
-        database.bind_live_session(&database_name, session_id, &binding)
+        let result = database.bind_live_session(&database_name, session_id, &binding)?;
+        if result.is_some() {
+            self.live_notify.notify_waiters();
+        }
+        Ok(result)
     }
 
     pub fn mark_live_session_ready_trusted(
@@ -360,7 +359,12 @@ impl VideoManager {
         crate::validate_generated_uuid("live session id", session_id)?;
         validate_live_transition(expected, next)?;
         let (database_name, database) = self.resolve_database(database)?;
-        database.transition_live_session(&database_name, session_id, expected, next)
+        let result =
+            database.transition_live_session(&database_name, session_id, expected, next)?;
+        if result.is_some() {
+            self.live_notify.notify_waiters();
+        }
+        Ok(result)
     }
 
     pub fn live_session_counts(&self) -> anyhow::Result<VideoLiveSessionCounts> {

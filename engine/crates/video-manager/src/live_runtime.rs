@@ -11,8 +11,7 @@ const LIVE_RUNTIME_RECOVERY_SCAN: Duration = Duration::from_secs(30);
 const LIVE_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(60);
 const LIVE_RUNTIME_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub type LiveRuntimeFuture<'a> =
-    Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+pub type LiveRuntimeFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
 /// Trusted protocol runtime boundary for RTMP/WHIP/HLS implementations.
 ///
@@ -42,7 +41,8 @@ impl VideoManager {
         self: Arc<Self>,
         driver: Arc<dyn LiveRuntimeDriver>,
     ) -> anyhow::Result<LiveRuntimeHandle> {
-        self.spawn_live_runtime_with_idle(driver, Duration::from_secs(self.live_idle_secs))
+        let idle_timeout = Duration::from_secs(self.live_idle_secs);
+        self.spawn_live_runtime_with_idle(driver, idle_timeout)
     }
 
     fn spawn_live_runtime_with_idle(
@@ -50,21 +50,35 @@ impl VideoManager {
         driver: Arc<dyn LiveRuntimeDriver>,
         idle_timeout: Duration,
     ) -> anyhow::Result<LiveRuntimeHandle> {
-        self.set_live_runtime_state(VideoLiveRuntimeState::Sleeping)?;
+        if self
+            .live_runtime_claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            anyhow::bail!("Video Manager live runtime coordinator is already running");
+        }
+        if let Err(error) = self.set_live_runtime_state(VideoLiveRuntimeState::Sleeping) {
+            self.live_runtime_claimed
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Err(error);
+        }
         let shutdown = Arc::new(Notify::new());
         let shutdown_task = shutdown.clone();
         let manager = self.clone();
         let join = tokio::spawn(async move {
-            run_live_runtime_coordinator(
-                manager.clone(),
-                driver,
-                idle_timeout,
-                shutdown_task,
-            )
-            .await;
+            run_live_runtime_coordinator(manager.clone(), driver, idle_timeout, shutdown_task)
+                .await;
             if let Err(error) = manager.set_live_runtime_state(VideoLiveRuntimeState::Disabled) {
                 tracing::error!(error = %error, "Video Manager live runtime exit telemetry failed");
             }
+            manager
+                .live_runtime_claimed
+                .store(false, std::sync::atomic::Ordering::Release);
         });
         Ok(LiveRuntimeHandle { shutdown, join })
     }
@@ -93,11 +107,8 @@ async fn run_live_runtime_coordinator(
 
         if demand && !active {
             let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Starting);
-            match tokio::time::timeout(
-                LIVE_RUNTIME_START_TIMEOUT,
-                driver.start(manager.clone()),
-            )
-            .await
+            match tokio::time::timeout(LIVE_RUNTIME_START_TIMEOUT, driver.start(manager.clone()))
+                .await
             {
                 Ok(Ok(())) => {
                     active = true;
@@ -135,34 +146,31 @@ async fn run_live_runtime_coordinator(
             match signal {
                 IdleSignal::Changed => continue,
                 IdleSignal::Shutdown => {
-                    stop_live_runtime(&manager, driver.as_ref(), false).await;
+                    stop_live_runtime(manager.clone(), driver.as_ref(), false).await;
                     break;
                 }
-                IdleSignal::Expired => {
-                    match manager.live_runtime_demand() {
-                        Ok(true) => continue,
-                        Ok(false) => {
-                            stop_live_runtime(&manager, driver.as_ref(), true).await;
-                            active = false;
-                            continue;
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                error = %error,
-                                "Video Manager failed to recheck live demand before idle shutdown"
-                            );
-                            let _ = manager
-                                .set_live_runtime_state(VideoLiveRuntimeState::Degraded);
-                            continue;
-                        }
+                IdleSignal::Expired => match manager.live_runtime_demand() {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        stop_live_runtime(manager.clone(), driver.as_ref(), true).await;
+                        active = false;
+                        continue;
                     }
-                }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "Video Manager failed to recheck live demand before idle shutdown"
+                        );
+                        let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Degraded);
+                        continue;
+                    }
+                },
             }
         }
 
         if wait_for_signal(&manager, &shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
             if active {
-                stop_live_runtime(&manager, driver.as_ref(), false).await;
+                stop_live_runtime(manager.clone(), driver.as_ref(), false).await;
             }
             break;
         }
@@ -170,17 +178,12 @@ async fn run_live_runtime_coordinator(
 }
 
 async fn stop_live_runtime(
-    manager: &VideoManager,
+    manager: Arc<VideoManager>,
     driver: &dyn LiveRuntimeDriver,
     idle_stop: bool,
 ) {
     let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Draining);
-    match tokio::time::timeout(
-        LIVE_RUNTIME_STOP_TIMEOUT,
-        driver.stop(Arc::new(manager.clone_for_live_runtime())),
-    )
-    .await
-    {
+    match tokio::time::timeout(LIVE_RUNTIME_STOP_TIMEOUT, driver.stop(manager.clone())).await {
         Ok(Ok(())) => {
             let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Sleeping);
             if idle_stop {
@@ -201,11 +204,7 @@ async fn stop_live_runtime(
     }
 }
 
-async fn wait_for_signal(
-    manager: &VideoManager,
-    shutdown: &Notify,
-    scan: Duration,
-) -> bool {
+async fn wait_for_signal(manager: &VideoManager, shutdown: &Notify, scan: Duration) -> bool {
     tokio::select! {
         _ = shutdown.notified() => true,
         _ = manager.live_notify.notified() => false,
@@ -216,9 +215,7 @@ async fn wait_for_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        CreateAssetRequest, ReserveLiveSessionRequest, VideoAssetState, VideoSourceType,
-    };
+    use crate::{CreateAssetRequest, ReserveLiveSessionRequest, VideoAssetState, VideoSourceType};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
@@ -245,10 +242,8 @@ mod tests {
     }
 
     fn temp_db(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rbe-video-live-runtime-{name}-{}",
-            Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rbe-video-live-runtime-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("video.db")
     }

@@ -218,7 +218,7 @@ mod tests {
     use super::*;
     use crate::{
         CreateAssetRequest, DatabaseHealth, QueuedDownload, VideoAsset, VideoDatabase, VideoJob,
-        VideoVariant, DEFAULT_DATABASE_NAME,
+        VideoLiveRuntimeState, VideoVariant, DEFAULT_DATABASE_NAME,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -403,6 +403,9 @@ mod tests {
             work_notify: tokio::sync::Notify::new(),
             worker_state: Mutex::new(VideoWorkerState::Disabled),
             worker_encoder: Mutex::new(None),
+            live_notify: tokio::sync::Notify::new(),
+            live_runtime_state: Mutex::new(VideoLiveRuntimeState::Disabled),
+            live_runtime_claimed: AtomicBool::new(false),
             live_idle_secs: 7200,
         });
         let mut worker_policy = policy(&root);
