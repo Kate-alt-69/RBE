@@ -25,6 +25,16 @@ jobs:
         shell: bash
         run: |
           (cd .. && python .github/patches/video-ffmpeg-capabilities.py)
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/video-manager/src/ffmpeg_capabilities.rs")
+          source = path.read_text()
+          old = "policy.max_log_bytes.min(MAX_CAPABILITY_OUTPUT_BYTES).max(1)"
+          new = "policy.max_log_bytes.clamp(1, MAX_CAPABILITY_OUTPUT_BYTES)"
+          if old not in source:
+              raise SystemExit("FFmpeg capability clamp anchor missing")
+          path.write_text(source.replace(old, new, 1))
+          PY
           rustfmt --edition 2021 crates/video-manager/src/ffmpeg_capabilities.rs
           git diff --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
