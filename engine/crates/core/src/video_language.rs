@@ -37,10 +37,10 @@ impl VideoLanguage {
                 expect_arity_range(function, args, 0, 1)?;
                 let database = optional_string(args.first(), "database")?;
                 to_json(
-                    manager
-                        .database_health(database.as_deref())
-                        .map_err(operation_error)?,
-                )
+          manager
+              .database_health(database.as_deref())
+              .map_err(operation_error)?,
+      )
             }
             "get" => {
                 expect_arity_range(function, args, 1, 2)?;
