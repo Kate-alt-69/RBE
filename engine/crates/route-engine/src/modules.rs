@@ -243,8 +243,8 @@ impl ModuleRegistry {
                 message: format!("{module_name}.{function_name}() is not implemented yet"),
             }),
             ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {
-                message: format!("{module_name}.{function_name}() is not implemented yet"),
-            }),
+        message: format!("{module_name}.{function_name}() is not implemented yet"),
+    }),
             ModuleKind::CustomUnimplemented {
                 source_path,
                 resolved_path,

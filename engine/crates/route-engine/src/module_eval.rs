@@ -909,8 +909,8 @@ mod tests {
         args: Vec<Value>,
     ) -> HostCapabilityFuture<'a> {
             Box::pin(async move {
-                if module == "host" && function == "double" {
-                    let Some(Value::Number(value)) = args.into_iter().next() else {
+  if module == "host" && function == "double" {
+  let Some(Value::Number(value)) = args.into_iter().next() else {
                         return Err(ModuleEvalError::new("TEST", "expected numeric argument"));
                     };
                     Ok(Some(Value::Number(value * 2.0)))
