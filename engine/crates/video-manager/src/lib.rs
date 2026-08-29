@@ -1,16 +1,18 @@
 //! Global RBE Video Manager control/data plane.
 //!
-//! This crate intentionally does **not** run FFmpeg, RTMP, HLS, or arbitrary
-//! downloads yet. It owns stable video identity, the default database, custom
-//! database adapter registration, and job records so media workers can remain
-//! isolated and lazy.
+//! This crate intentionally does **not** run FFmpeg, RTMP, or HLS yet. It owns
+//! stable video identity, quarantine-safe HTTP download transport, the default
+//! database, custom database adapter registration, and job records so heavy
+//! media workers can remain isolated and lazy.
 
 mod download;
+mod download_worker;
 
 pub use download::{
     is_public_download_ip, parse_download_target, resolve_download_target, DownloadTarget,
     ResolvedDownloadTarget,
 };
+pub use download_worker::{DownloadPolicy, DownloadReceipt};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

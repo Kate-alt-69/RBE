@@ -39,9 +39,7 @@ impl DownloadPolicy {
             anyhow::bail!("Video Manager download byte limit must be greater than zero");
         }
         if self.max_redirects > MAX_REDIRECTS_HARD_LIMIT {
-            anyhow::bail!(
-                "Video Manager redirect limit cannot exceed {MAX_REDIRECTS_HARD_LIMIT}"
-            );
+            anyhow::bail!("Video Manager redirect limit cannot exceed {MAX_REDIRECTS_HARD_LIMIT}");
         }
         if self.connect_timeout.is_zero() || self.total_timeout.is_zero() {
             anyhow::bail!("Video Manager download timeouts must be greater than zero");
@@ -75,11 +73,10 @@ impl VideoManager {
         if queued.asset.id != queued.job.asset_id {
             anyhow::bail!("Video Manager queued download asset/job identity mismatch");
         }
-        let source_url = queued
-            .asset
-            .source_uri
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Video Manager queued download has no source URL"))?;
+        let source_url =
+            queued.asset.source_uri.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("Video Manager queued download has no source URL")
+            })?;
         let target = parse_download_target(source_url)?;
         let quarantine_path = self.quarantine_path(&queued.asset.id, &queued.job.id)?;
 
@@ -115,11 +112,10 @@ async fn download_into_quarantine(
 
     loop {
         let target_for_resolution = target.clone();
-        let resolved = tokio::task::spawn_blocking(move || {
-            resolve_download_target(&target_for_resolution)
-        })
-        .await
-        .context("Video Manager DNS validation task failed")??;
+        let resolved =
+            tokio::task::spawn_blocking(move || resolve_download_target(&target_for_resolution))
+                .await
+                .context("Video Manager DNS validation task failed")??;
 
         let mut client_builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -158,10 +154,7 @@ async fn download_into_quarantine(
         }
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Video Manager download returned HTTP {}",
-                response.status()
-            );
+            anyhow::bail!("Video Manager download returned HTTP {}", response.status());
         }
 
         validate_content_length(response.headers().get(CONTENT_LENGTH), policy.max_bytes)?;
@@ -261,9 +254,7 @@ fn validate_content_length(
         .parse::<u64>()
         .context("Video Manager Content-Length is not a valid integer")?;
     if bytes > max_bytes {
-        anyhow::bail!(
-            "Video Manager Content-Length {bytes} exceeds byte limit of {max_bytes}"
-        );
+        anyhow::bail!("Video Manager Content-Length {bytes} exceeds byte limit of {max_bytes}");
     }
     Ok(())
 }
