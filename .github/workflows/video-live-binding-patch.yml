@@ -1,0 +1,50 @@
+name: Video Live Binding Patch
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: wire trusted live transport binding
+        shell: bash
+        run: |
+          python ../.github/patches/video-live-binding.py
+          rustfmt --edition 2021 crates/video-manager/src/live.rs
+          rustfmt --edition 2021 --config skip_children=true crates/video-manager/src/lib.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          python - <<'PY'
+          import subprocess
+          allowed = {
+              "crates/video-manager/src/live.rs",
+              "crates/video-manager/src/lib.rs",
+          }
+          changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected Video Manager live-binding paths: " + ", ".join(sorted(unexpected)))
+          PY
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- crates/video-manager/src/live.rs crates/video-manager/src/lib.rs
+            git commit -m "feat: add trusted live transport binding"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
