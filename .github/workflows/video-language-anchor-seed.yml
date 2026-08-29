@@ -30,9 +30,8 @@ jobs:
           elif seeded_constructor not in source:
               raise SystemExit("with_services source anchor missing")
 
-          # The main semantic guard also carries an old indentation-sensitive
-          # helper-call anchor. Find the actual helper call structurally and
-          # normalize only that call span to the exact string the guard expects.
+          # Normalize the private helper call to the semantic guard's old
+          # indentation-sensitive anchor.
           helper_region = source.index("                        if let Some(function) = self")
           call_start = source.index("                                .call_function(", helper_region)
           call_end = source.index("\n                                .await;", call_start)
@@ -47,13 +46,50 @@ jobs:
           if source[call_start:call_end] != seeded_helper:
               source = source[:call_start] + seeded_helper + source[call_end:]
 
+          # The guard's test signature literal removes fourteen spaces before
+          # matching. Seed that exact pre-patch form by structure.
+          test_region = source.index("    impl HostCapabilityCaller for TestHostCapability")
+          signature_start = source.index("        fn call<'a>(", test_region)
+          signature_end = source.index("\n            Box::pin", signature_start)
+          seeded_test_signature = (
+              "        fn call<'a>(\n"
+              "    &'a self,\n"
+              "    module: &'a str,\n"
+              "    function: &'a str,\n"
+              "    args: Vec<Value>,\n"
+              ") -> HostCapabilityFuture<'a> {"
+          )
+          if source[signature_start:signature_end] != seeded_test_signature:
+              source = source[:signature_start] + seeded_test_signature + source[signature_end:]
+
+          path.write_text(source)
+
+          # Same fourteen-space quirk exists in the service-local host
+          # capability signature checked by the semantic guard.
+          path = Path("engine/crates/route-engine/src/service_eval.rs")
+          source = path.read_text()
+          service_region = source.index("impl HostCapabilityCaller for ServiceHostCapabilities")
+          signature_start = source.index("    fn call<'a>(", service_region)
+          signature_end = source.index("\n        Box::pin", signature_start)
+          seeded_service_signature = (
+              "    fn call<'a>(\n"
+              "    &'a self,\n"
+              "    module: &'a str,\n"
+              "    function: &'a str,\n"
+              "    args: Vec<Value>,\n"
+              ") -> HostCapabilityFuture<'a> {"
+          )
+          if source[signature_start:signature_end] != seeded_service_signature:
+              source = source[:signature_start] + seeded_service_signature + source[signature_end:]
           path.write_text(source)
           PY
           git diff --check
           if ! git diff --quiet; then
             git config user.name "Kate"
             git config user.email "dhwanksh2000@gmail.com"
-            git add -- engine/crates/route-engine/src/module_eval.rs
-            git commit -m "ci: seed video language anchors"
+            git add -- \
+              engine/crates/route-engine/src/module_eval.rs \
+              engine/crates/route-engine/src/service_eval.rs
+            git commit -m "ci: seed remaining video language anchors"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
