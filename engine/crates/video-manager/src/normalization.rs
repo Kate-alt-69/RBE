@@ -35,7 +35,8 @@ impl VideoManager {
         let (staging, final_path, stored_path) =
             self.normalized_paths(&transitioned.asset_id, &transitioned.id)?;
 
-        let normalized = match crate::ffmpeg::run_ffmpeg_normalize(&quarantine, &staging, policy).await
+        let normalized = match crate::ffmpeg::run_ffmpeg_normalize(&quarantine, &staging, policy)
+            .await
         {
             Ok(normalized) => normalized,
             Err(error) => {
@@ -141,10 +142,6 @@ impl VideoManager {
         if staging.exists() || final_path.exists() {
             anyhow::bail!("Video Manager normalized output path already exists");
         }
-        Ok((
-            staging,
-            final_path,
-            format!("{asset_id}/primary.mp4"),
-        ))
+        Ok((staging, final_path, format!("{asset_id}/primary.mp4")))
     }
 }

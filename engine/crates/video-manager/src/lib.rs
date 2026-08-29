@@ -8,7 +8,9 @@
 mod container_probe;
 mod download;
 mod download_worker;
+mod ffmpeg;
 mod ffprobe;
+mod normalization;
 
 pub use container_probe::{
     probe_quarantine_container, sniff_video_container, ContainerProbe, VideoContainerKind,
@@ -18,6 +20,7 @@ pub use download::{
     ResolvedDownloadTarget,
 };
 pub use download_worker::{DownloadPolicy, DownloadReceipt};
+pub use ffmpeg::{FfmpegPolicy, NormalizedMedia};
 pub use ffprobe::{FfprobePolicy, MediaProbe, VideoStreamProbe};
 
 use std::collections::HashMap;
@@ -120,6 +123,23 @@ pub struct VideoJob {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoVariant {
+    pub id: String,
+    pub asset_id: String,
+    pub profile: String,
+    pub codec: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f64>,
+    pub bitrate: Option<u64>,
+    pub size_bytes: u64,
+    pub path: String,
+    pub state: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateAssetRequest {
     pub database: Option<String>,
@@ -198,6 +218,11 @@ pub trait VideoDatabase: Send + Sync {
         next_state: &str,
     ) -> anyhow::Result<Option<VideoJob>>;
     fn get_job(&self, job_id: &str) -> anyhow::Result<Option<VideoJob>>;
+    fn commit_ready_variant(
+        &self,
+        job_id: &str,
+        variant: &VideoVariant,
+    ) -> anyhow::Result<Option<VideoJob>>;
     fn get_asset(&self, database: &str, asset_id: &str) -> anyhow::Result<Option<VideoAsset>>;
 }
 
@@ -467,6 +492,110 @@ impl VideoDatabase for SqliteVideoDatabase {
             .optional()?)
     }
 
+    fn commit_ready_variant(
+        &self,
+        job_id: &str,
+        variant: &VideoVariant,
+    ) -> anyhow::Result<Option<VideoJob>> {
+        validate_generated_uuid("job id", job_id)?;
+        validate_generated_uuid("variant id", &variant.id)?;
+        validate_generated_uuid("variant asset id", &variant.asset_id)?;
+        validate_segment("variant profile", &variant.profile)?;
+        validate_job_state(&variant.state)?;
+        if variant.state != "ready" {
+            anyhow::bail!("Video Manager committed variant state must be ready");
+        }
+        if let Some(codec) = &variant.codec {
+            validate_segment("variant codec", codec)?;
+        }
+        if variant
+            .fps
+            .is_some_and(|fps| !fps.is_finite() || fps <= 0.0)
+        {
+            anyhow::bail!("Video Manager variant fps must be finite and positive");
+        }
+        let bitrate = variant
+            .bitrate
+            .map(i64::try_from)
+            .transpose()
+            .context("Video Manager variant bitrate exceeds SQLite integer range")?;
+        let size_bytes = i64::try_from(variant.size_bytes)
+            .context("Video Manager variant size exceeds SQLite integer range")?;
+        validate_relative_media_path(&variant.path)?;
+
+        let now = now_ms();
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
+        let transaction = connection.unchecked_transaction()?;
+        let job = transaction
+            .query_row(
+                "SELECT id, asset_id, job_type, state, progress, attempts, error, created_at_ms, updated_at_ms FROM video_jobs WHERE id = ?1",
+                params![job_id],
+                read_video_job,
+            )
+            .optional()?;
+        let Some(job) = job else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if job.state != "normalizing"
+            || job.asset_id != variant.asset_id
+            || job.job_type != "download"
+        {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        transaction.execute(
+            "INSERT INTO video_variants (id, asset_id, profile, codec, width, height, fps, bitrate, size_bytes, path, state, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                variant.id,
+                variant.asset_id,
+                variant.profile,
+                variant.codec,
+                variant.width.map(i64::from),
+                variant.height.map(i64::from),
+                variant.fps,
+                bitrate,
+                size_bytes,
+                variant.path,
+                variant.state,
+                variant.created_at_ms,
+                variant.updated_at_ms,
+            ],
+        )?;
+        let asset_changed = transaction.execute(
+            "UPDATE video_assets SET state = 'ready', updated_at_ms = ?1 WHERE id = ?2 AND state = 'quarantined'",
+            params![now, variant.asset_id],
+        )?;
+        if asset_changed != 1 {
+            anyhow::bail!(
+                "Video Manager asset {:?} is not quarantined and cannot be promoted",
+                variant.asset_id
+            );
+        }
+        let job_changed = transaction.execute(
+            "UPDATE video_jobs SET state = 'ready', progress = 1.0, error = NULL, updated_at_ms = ?1 WHERE id = ?2 AND state = 'normalizing'",
+            params![now, job_id],
+        )?;
+        if job_changed != 1 {
+            anyhow::bail!(
+                "Video Manager normalization job {job_id:?} lost its state during commit"
+            );
+        }
+        let committed = transaction
+            .query_row(
+                "SELECT id, asset_id, job_type, state, progress, attempts, error, created_at_ms, updated_at_ms FROM video_jobs WHERE id = ?1",
+                params![job_id],
+                read_video_job,
+            )
+            .optional()?;
+        transaction.commit()?;
+        Ok(committed)
+    }
+
     fn get_asset(&self, database: &str, asset_id: &str) -> anyhow::Result<Option<VideoAsset>> {
         let connection = self
             .connection
@@ -558,6 +687,7 @@ pub struct VideoManager {
     databases: RwLock<HashMap<String, Arc<dyn VideoDatabase>>>,
     default_database: String,
     quarantine_root: PathBuf,
+    media_root: PathBuf,
     live_idle_secs: u64,
 }
 
@@ -585,12 +715,26 @@ impl VideoManager {
                 quarantine_root.display()
             )
         })?;
+        let media_root = data_dir.join("media").join("assets");
+        std::fs::create_dir_all(&media_root).with_context(|| {
+            format!(
+                "create Video Manager media directory {}",
+                media_root.display()
+            )
+        })?;
+        let media_root = std::fs::canonicalize(&media_root).with_context(|| {
+            format!(
+                "canonicalize Video Manager media directory {}",
+                media_root.display()
+            )
+        })?;
         let mut databases = HashMap::new();
         databases.insert(DEFAULT_DATABASE_NAME.to_string(), default);
         Ok(Self {
             databases: RwLock::new(databases),
             default_database: DEFAULT_DATABASE_NAME.into(),
             quarantine_root,
+            media_root,
             live_idle_secs,
         })
     }
@@ -916,6 +1060,19 @@ fn validate_generated_uuid(label: &str, value: &str) -> anyhow::Result<()> {
         .with_context(|| format!("Video Manager {label} is not a UUID: {value:?}"))?;
     if parsed.hyphenated().to_string() != value {
         anyhow::bail!("Video Manager {label} must use canonical lowercase UUID form");
+    }
+    Ok(())
+}
+
+fn validate_relative_media_path(value: &str) -> anyhow::Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("Video Manager media path must be a non-empty relative normal path");
     }
     Ok(())
 }
@@ -1377,5 +1534,71 @@ mod tests {
         let error = manager.database_health(Some("custom")).unwrap_err();
         assert!(error.to_string().contains("not registered"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ready_variant_commit_atomically_promotes_asset_and_job() {
+        let path = temp_db("ready-variant");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "normalization".into(),
+                title: "Ready".into(),
+                url: "https://example.invalid/video.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let (_, database) = manager.resolve_database(None).unwrap();
+        database
+            .claim_job(&queued.job.id, "queued", "downloading")
+            .unwrap()
+            .unwrap();
+        database
+            .update_job(&queued.job.id, "downloaded", 1.0, None)
+            .unwrap();
+        for (from, to) in [
+            ("downloaded", "inspecting"),
+            ("inspecting", "container_checked"),
+            ("container_checked", "probing"),
+            ("probing", "probed"),
+            ("probed", "normalizing"),
+        ] {
+            database
+                .transition_job(&queued.job.id, from, to)
+                .unwrap()
+                .unwrap();
+        }
+        let now = now_ms();
+        let variant = VideoVariant {
+            id: Uuid::new_v4().to_string(),
+            asset_id: queued.asset.id.clone(),
+            profile: "standard".into(),
+            codec: Some("h264".into()),
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30.0),
+            bitrate: Some(4_000_000),
+            size_bytes: 1_000_000,
+            path: format!("{}/primary.mp4", queued.asset.id),
+            state: "ready".into(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let committed = database
+            .commit_ready_variant(&queued.job.id, &variant)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.state, "ready");
+        assert_eq!(committed.progress, 1.0);
+        let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();
+        assert_eq!(asset.state, VideoAssetState::Ready);
+        assert!(database
+            .commit_ready_variant(&queued.job.id, &variant)
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

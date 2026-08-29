@@ -143,7 +143,12 @@ async fn validate_paths(input_path: &Path, output_path: &Path) -> anyhow::Result
     }
     let input_metadata = tokio::fs::symlink_metadata(input_path)
         .await
-        .with_context(|| format!("inspect Video Manager FFmpeg input {}", input_path.display()))?;
+        .with_context(|| {
+            format!(
+                "inspect Video Manager FFmpeg input {}",
+                input_path.display()
+            )
+        })?;
     if !input_metadata.file_type().is_file() || input_metadata.len() == 0 {
         anyhow::bail!("Video Manager FFmpeg input must be a non-empty regular file");
     }
@@ -265,13 +270,18 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["-protocol_whitelist", "file,crypto,data"]));
         assert!(!rendered.iter().any(|arg| arg.contains("http")));
-        assert_eq!(rendered.last().map(|value| value.as_ref()), Some("/output.mp4"));
+        assert_eq!(
+            rendered.last().map(|value| value.as_ref()),
+            Some("/output.mp4")
+        );
     }
 
     #[test]
     fn policy_rejects_relative_executable_before_spawn() {
         let policy = FfmpegPolicy::new("ffmpeg");
-        let error = policy.validate().expect_err("relative executable must fail");
+        let error = policy
+            .validate()
+            .expect_err("relative executable must fail");
         assert!(error.to_string().contains("absolute"));
     }
 

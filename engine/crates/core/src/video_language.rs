@@ -104,7 +104,7 @@ impl VideoLanguage {
             }
             other => Err(VideoLanguageError::new(
                 "VID3001",
-                format!("unknown video language function {other:?}"),
+                format!("unknown Video Manager language function {other:?}"),
             )),
         }
     }
@@ -160,7 +160,7 @@ fn parse_source_type(value: &str) -> Result<VideoSourceType, VideoLanguageError>
         "recorded_live" | "recordedLive" => Ok(VideoSourceType::RecordedLive),
         "download" => Err(VideoLanguageError::new(
             "VID3004",
-            "use video.queueDownload() for download assets so they enter quarantine",
+            "use vm.queueDownload() or video-manager.queueDownload() for download assets so they enter quarantine",
         )),
         other => Err(VideoLanguageError::new(
             "VID3004",
@@ -181,7 +181,7 @@ fn expect_arity_range(
         Err(VideoLanguageError::new(
             "VID3001",
             format!(
-                "video.{function}() expects {minimum}..={maximum} argument(s), got {}",
+                "Video Manager {function}() expects {minimum}..={maximum} argument(s), got {}",
                 args.len()
             ),
         ))
@@ -197,7 +197,7 @@ fn required_string<'a>(
         Some(Value::String(value)) => Ok(value),
         _ => Err(VideoLanguageError::new(
             "VID3001",
-            format!("video argument {index} ({label}) must be a string"),
+            format!("Video Manager argument {index} ({label}) must be a string"),
         )),
     }
 }
@@ -211,7 +211,7 @@ fn optional_string(
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => Err(VideoLanguageError::new(
             "VID3001",
-            format!("optional video {label} must be a string or null"),
+            format!("optional Video Manager {label} must be a string or null"),
         )),
     }
 }
