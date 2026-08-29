@@ -4,6 +4,7 @@ mod dashboard;
 mod health;
 mod routes;
 
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::Path;
 use std::time::Instant;
 
@@ -46,10 +47,49 @@ pub fn build_router(state: AppState, api_dir: &Path) -> anyhow::Result<Router> {
         .nest("/api/maintenance", routes::maintenance::routes());
 
     if state.config.dashboards.enabled {
-        router = router.nest(&state.config.dashboards.admin_path_prefix, dashboard::routes());
+        start_dashboard_server(state.clone())?;
+        let prefix = state.config.dashboards.admin_path_prefix.clone();
+        // Keep the old API-port URL useful for auto-open/bookmarks, but do not
+        // serve the control room there. It only redirects to the isolated local
+        // dashboard listener on 127.0.0.1:5799.
+        router = router.nest(&prefix, dashboard::redirect_routes());
     }
 
     Ok(router.layer(middleware).with_state(state))
+}
+
+fn start_dashboard_server(state: AppState) -> anyhow::Result<()> {
+    let address = SocketAddr::from(([127, 0, 0, 1], dashboard::DASHBOARD_PORT));
+    let listener = StdTcpListener::bind(address)
+        .map_err(|error| anyhow::anyhow!("failed to bind RBE dashboard to {address}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| anyhow::anyhow!("failed to set RBE dashboard listener nonblocking: {error}"))?;
+    let listener = tokio::net::TcpListener::from_std(listener)
+        .map_err(|error| anyhow::anyhow!("failed to register RBE dashboard listener with Tokio: {error}"))?;
+
+    let prefix = state.config.dashboards.admin_path_prefix.clone();
+    let dashboard_router = Router::new()
+        .nest(&prefix, dashboard::routes())
+        .layer(axum::middleware::from_fn_with_state(
+            state.config.clone(),
+            security::security_headers,
+        ))
+        .with_state(state);
+
+    tracing::info!(%address, path = %prefix, "RBE dashboard listener ready");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(
+            listener,
+            dashboard_router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
+            tracing::error!(%address, error = %error, "RBE dashboard listener stopped unexpectedly");
+        }
+    });
+
+    Ok(())
 }
 
 async fn request_metrics(State(state): State<AppState>, request: Request, next: Next) -> Response {
