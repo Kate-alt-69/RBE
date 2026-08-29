@@ -32,6 +32,7 @@ impl ServiceHostCapabilities {
 impl HostCapabilityCaller for ServiceHostCapabilities {
     fn call<'a>(
         &'a self,
+        _scope: Option<String>,
         module: &'a str,
         function: &'a str,
         args: Vec<Value>,

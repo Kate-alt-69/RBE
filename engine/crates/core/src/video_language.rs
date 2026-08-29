@@ -31,16 +31,18 @@ impl VideoLanguage {
         match function {
             "status" => {
                 expect_arity_range(function, args, 0, 0)?;
-                to_json(manager.status().map_err(operation_error)?)
+                json_result(serde_json::to_value(
+                    manager.status().map_err(operation_error)?,
+                ))
             }
             "databaseHealth" | "database_health" => {
                 expect_arity_range(function, args, 0, 1)?;
                 let database = optional_string(args.first(), "database")?;
-                to_json(
-          manager
-              .database_health(database.as_deref())
-              .map_err(operation_error)?,
-      )
+                json_result(serde_json::to_value(
+                    manager
+                        .database_health(database.as_deref())
+                        .map_err(operation_error)?,
+                ))
             }
             "get" => {
                 expect_arity_range(function, args, 1, 2)?;
@@ -53,7 +55,7 @@ impl VideoLanguage {
                     None => Ok(Value::Null),
                     Some(asset) => {
                         ensure_owned(module_owner, &asset.namespace)?;
-                        to_json(asset)
+                        json_result(serde_json::to_value(asset))
                     }
                 }
             }
@@ -78,7 +80,7 @@ impl VideoLanguage {
                         initial_state: VideoAssetState::Reserved,
                     })
                     .map_err(operation_error)?;
-                to_json(asset)
+                json_result(serde_json::to_value(asset))
             }
             "queueDownload" | "queue_download" => {
                 expect_arity_range(function, args, 3, 5)?;
@@ -98,7 +100,7 @@ impl VideoLanguage {
                         metadata,
                     })
                     .map_err(operation_error)?;
-                to_json(queued)
+                json_result(serde_json::to_value(queued))
             }
             other => Err(VideoLanguageError::new(
                 "VID3001",
@@ -218,9 +220,8 @@ fn operation_error(error: anyhow::Error) -> VideoLanguageError {
     VideoLanguageError::new("VID3002", error.to_string())
 }
 
-fn to_json(value: impl serde::Serialize) -> Result<Value, VideoLanguageError> {
-    serde_json::to_value(value)
-        .map_err(|error| VideoLanguageError::new("VID3002", error.to_string()))
+fn json_result(value: serde_json::Result<Value>) -> Result<Value, VideoLanguageError> {
+    value.map_err(|error| VideoLanguageError::new("VID3002", error.to_string()))
 }
 
 #[cfg(test)]
@@ -261,7 +262,11 @@ mod tests {
         assert_eq!(created["namespace"], "module:learning.catalog");
         let asset_id = created["id"].as_str().unwrap().to_string();
         let loaded = language
-            .call("learning.catalog", "get", &[Value::String(asset_id.clone())])
+            .call(
+                "learning.catalog",
+                "get",
+                &[Value::String(asset_id.clone())],
+            )
             .unwrap();
         assert_eq!(loaded["id"], asset_id);
         let error = language

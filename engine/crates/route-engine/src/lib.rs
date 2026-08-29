@@ -26,6 +26,7 @@ mod terminal;
 pub mod cache;
 pub mod transpiled_support;
 pub mod transpiler;
+mod video_host;
 
 pub use analyzer::{analyze, Diagnostic, Severity};
 pub use ast::{

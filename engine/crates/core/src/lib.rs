@@ -5,6 +5,7 @@
 
 mod container_client;
 mod metrics;
+mod video_language;
 
 use std::sync::Arc;
 
@@ -16,7 +17,10 @@ use tokio::sync::watch;
 use video_manager::VideoManager;
 
 pub use container_client::{ContainerClient, ContainerEndpointSnapshot};
-pub use metrics::{BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot};
+pub use metrics::{
+    BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
+};
+pub use video_language::{VideoLanguage, VideoLanguageError};
 
 /// Shared application state, cloned cheaply into every Axum handler.
 #[derive(Clone)]

@@ -41,6 +41,7 @@ enum BuiltinModule {
     Request,
     Security,
     Response,
+    Video,
 }
 
 pub struct ModuleRegistry {
@@ -80,6 +81,16 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
         "log" => matches!(function, "info" | "warn"),
         "crypto" => matches!(function, "hash"),
         "env" => matches!(function, "get"),
+        "video" => matches!(
+            function,
+            "status"
+                | "databaseHealth"
+                | "database_health"
+                | "get"
+                | "create"
+                | "queueDownload"
+                | "queue_download"
+        ),
         _ => false,
     }
 }
@@ -127,6 +138,7 @@ impl ModuleRegistry {
                         "request" => ModuleKind::Builtin(BuiltinModule::Request),
                         "security" => ModuleKind::Builtin(BuiltinModule::Security),
                         "response" => ModuleKind::Builtin(BuiltinModule::Response),
+                        "video" => ModuleKind::Builtin(BuiltinModule::Video),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{name}"),
                             resolved_path: std::path::PathBuf::new(),
@@ -147,6 +159,7 @@ impl ModuleRegistry {
                         "request" => ModuleKind::Builtin(BuiltinModule::Request),
                         "security" => ModuleKind::Builtin(BuiltinModule::Security),
                         "response" => ModuleKind::Builtin(BuiltinModule::Response),
+                        "video" => ModuleKind::Builtin(BuiltinModule::Video),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{module}"),
                             resolved_path: std::path::PathBuf::new(),
@@ -243,8 +256,13 @@ impl ModuleRegistry {
                 message: format!("{module_name}.{function_name}() is not implemented yet"),
             }),
             ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {
-        message: format!("{module_name}.{function_name}() is not implemented yet"),
-    }),
+                message: format!("{module_name}.{function_name}() is not implemented yet"),
+            }),
+            ModuleKind::Builtin(BuiltinModule::Video) => Err(ModuleError {
+                message: format!(
+            "{module_name}.{function_name}() requires the privileged module Video host capability"
+        ),
+            }),
             ModuleKind::CustomUnimplemented {
                 source_path,
                 resolved_path,

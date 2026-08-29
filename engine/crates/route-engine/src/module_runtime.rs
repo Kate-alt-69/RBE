@@ -169,8 +169,13 @@ impl ModuleProgram {
     }
 
     pub fn resolve(&self, raw_path: &str) -> Option<Arc<ModuleFile>> {
+        self.resolve_scoped(raw_path).map(|(_, file)| file)
+    }
+
+    pub fn resolve_scoped(&self, raw_path: &str) -> Option<(String, Arc<ModuleFile>)> {
         let path = normalize(&resolve_custom_import(&self.binary_root, raw_path));
-        self.modules.get(&path).cloned()
+        let owner = module_owner(&self.module_dir, &path);
+        self.modules.get(&path).cloned().map(|file| (owner, file))
     }
 }
 
@@ -351,6 +356,40 @@ fn normalize(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn module_owner(module_dir: &Path, path: &Path) -> String {
+    let root = normalize(module_dir);
+    let relative = path.strip_prefix(&root).unwrap_or(path).with_extension("");
+    let parts = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => {
+                Some(encode_owner_segment(&value.to_string_lossy()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "root".into()
+    } else {
+        parts.join(".")
+    }
+}
+
+fn encode_owner_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.') {
+            out.push(*byte as char);
+        } else {
+            out.push('_');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VisitState {
     Visiting,
@@ -516,6 +555,23 @@ mod tests {
         services.insert("search".into(), HashSet::from(["find".into()]));
         ModuleProgram::load_with_services(&root.join("module"), &services)
             .expect("registered service interfaces should validate");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_resolution_uses_canonical_nested_module_identity() {
+        let root = root();
+        fs::create_dir_all(root.join("module/learning")).unwrap();
+        fs::write(
+            root.join("module/learning/catalog.module"),
+            "export function run() { return true; }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let (owner, _) = program
+            .resolve_scoped("./module/learning/catalog")
+            .expect("nested module should resolve");
+        assert_eq!(owner, "learning.catalog");
         let _ = fs::remove_dir_all(root);
     }
 }

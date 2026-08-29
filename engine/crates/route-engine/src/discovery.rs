@@ -25,6 +25,7 @@ use crate::modules::binding_name;
 use crate::parser::Parser;
 use crate::terminal::Terminal;
 use crate::transpiler::transpile_file;
+use crate::video_host::VideoHostCapabilities;
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -170,7 +171,11 @@ async fn execute(
     } else {
         Vec::new()
     };
-    let executor = ModuleExecutor::with_services(module_program.as_ref(), state.services.clone());
+    let executor = ModuleExecutor::with_services_and_host_capabilities(
+        module_program.as_ref(),
+        state.services.clone(),
+        Arc::new(VideoHostCapabilities::from_state(&state)),
+    );
     match executor
         .call_inline(inline_file, INLINE_ROUTE_HANDLER, args)
         .await

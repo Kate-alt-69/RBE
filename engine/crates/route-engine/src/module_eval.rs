@@ -50,6 +50,7 @@ pub type HostCapabilityFuture<'a> =
 pub trait HostCapabilityCaller: Send + Sync {
     fn call<'a>(
         &'a self,
+        scope: Option<String>,
         module: &'a str,
         function: &'a str,
         args: Vec<Value>,
@@ -95,8 +96,20 @@ impl<'a> ModuleExecutor<'a> {
     }
 
     pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {
-    Self::with_service_caller(program, Arc::new(services))
-}
+        Self::with_service_caller(program, Arc::new(services))
+    }
+
+    pub fn with_services_and_host_capabilities(
+        program: &'a ModuleProgram,
+        services: ServiceManager,
+        host_capabilities: Arc<dyn HostCapabilityCaller>,
+    ) -> Self {
+        Self {
+            program,
+            services: Some(Arc::new(services)),
+            host_capabilities: Some(host_capabilities),
+        }
+    }
 
     pub fn with_service_caller(
         program: &'a ModuleProgram,
@@ -122,6 +135,7 @@ impl<'a> ModuleExecutor<'a> {
 
     async fn call_host_capability(
         &self,
+        scope: Option<String>,
         module: &str,
         function: &str,
         args: Vec<Value>,
@@ -129,7 +143,7 @@ impl<'a> ModuleExecutor<'a> {
         let Some(host_capabilities) = self.host_capabilities.as_ref() else {
             return Ok(None);
         };
-        host_capabilities.call(module, function, args).await
+        host_capabilities.call(scope, module, function, args).await
     }
 
     pub async fn call(
@@ -147,7 +161,7 @@ impl<'a> ModuleExecutor<'a> {
         function: &str,
         args: Vec<Value>,
     ) -> Result<Value, ModuleEvalError> {
-        self.call_function(file, function, args, 0).await
+        self.call_function(file, function, args, 0, None).await
     }
 
     pub(crate) async fn call_inline_definition(
@@ -156,7 +170,7 @@ impl<'a> ModuleExecutor<'a> {
         function: FunctionDef,
         args: Vec<Value>,
     ) -> Result<Value, ModuleEvalError> {
-        self.execute_function(file, function, args, 0).await
+        self.execute_function(file, function, args, 0, None).await
     }
 
     async fn call_service(
@@ -194,7 +208,7 @@ impl<'a> ModuleExecutor<'a> {
         args: Vec<Value>,
         depth: usize,
     ) -> Result<Value, ModuleEvalError> {
-        let file = self.program.resolve(raw_path).ok_or_else(|| {
+        let (owner, file) = self.program.resolve_scoped(raw_path).ok_or_else(|| {
             ModuleEvalError::new("MOD3000", format!("module {raw_path:?} is not loaded"))
         })?;
         if !file.exports.iter().any(|name| name == function) {
@@ -203,7 +217,8 @@ impl<'a> ModuleExecutor<'a> {
                 format!("module {raw_path:?} does not export {function:?}"),
             ));
         }
-        self.call_function(file, function, args, depth).await
+        self.call_function(file, function, args, depth, Some(owner))
+            .await
     }
 
     async fn call_function(
@@ -212,6 +227,7 @@ impl<'a> ModuleExecutor<'a> {
         function_name: &str,
         args: Vec<Value>,
         depth: usize,
+        capability_scope: Option<String>,
     ) -> Result<Value, ModuleEvalError> {
         if depth >= MAX_MODULE_CALL_DEPTH {
             return Err(ModuleEvalError::new(
@@ -227,7 +243,8 @@ impl<'a> ModuleExecutor<'a> {
             .ok_or_else(|| {
                 ModuleEvalError::new("MOD3002", format!("function {function_name:?} has no body"))
             })?;
-        self.execute_function(file, function, args, depth).await
+        self.execute_function(file, function, args, depth, capability_scope)
+            .await
     }
 
     async fn execute_function(
@@ -236,6 +253,7 @@ impl<'a> ModuleExecutor<'a> {
         function: FunctionDef,
         args: Vec<Value>,
         depth: usize,
+        capability_scope: Option<String>,
     ) -> Result<Value, ModuleEvalError> {
         if function.params.len() != args.len() {
             return Err(ModuleEvalError::new(
@@ -249,7 +267,7 @@ impl<'a> ModuleExecutor<'a> {
             ));
         }
 
-        let mut frame = Frame::new(self, file, depth);
+        let mut frame = Frame::new(self, file, depth, capability_scope);
         for (param, value) in function.params.iter().zip(args) {
             frame.scope.insert(param.clone(), value);
         }
@@ -290,10 +308,16 @@ struct Frame<'exec, 'program> {
     service_functions: HashMap<String, (String, String)>,
     scope: HashMap<String, Value>,
     depth: usize,
+    capability_scope: Option<String>,
 }
 
 impl<'exec, 'program> Frame<'exec, 'program> {
-    fn new(executor: &'exec ModuleExecutor<'program>, file: Arc<ModuleFile>, depth: usize) -> Self {
+    fn new(
+        executor: &'exec ModuleExecutor<'program>,
+        file: Arc<ModuleFile>,
+        depth: usize,
+        capability_scope: Option<String>,
+    ) -> Self {
         let modules = ModuleRegistry::from_imports(&file.imports);
         let mut builtin_modules = HashMap::new();
         let mut builtin_functions = HashMap::new();
@@ -337,6 +361,7 @@ impl<'exec, 'program> Frame<'exec, 'program> {
             service_functions,
             scope: HashMap::new(),
             depth,
+            capability_scope,
         }
     }
 
@@ -450,7 +475,12 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                         {
                             if let Some(value) = self
                                 .executor
-                                .call_host_capability(&module, &function, args.clone())
+                                .call_host_capability(
+                                    self.capability_scope.clone(),
+                                    &module,
+                                    &function,
+                                    args.clone(),
+                                )
                                 .await?
                             {
                                 return Ok(value);
@@ -477,11 +507,12 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                             return self
                                 .executor
                                 .call_function(
-                            self.file.clone(),
-                            &function.name,
-                            args,
-                            self.depth + 1,
-                        )
+                                    self.file.clone(),
+                                    &function.name,
+                                    args,
+                                    self.depth + 1,
+                                    self.capability_scope.clone(),
+                                )
                                 .await;
                         }
                         if self.modules.is_direct_function(name) {
@@ -496,7 +527,12 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                             if let Some(module) = self.builtin_modules.get(module_name).cloned() {
                                 if let Some(value) = self
                                     .executor
-                                    .call_host_capability(&module, function_name, args.clone())
+                                    .call_host_capability(
+                                        self.capability_scope.clone(),
+                                        &module,
+                                        function_name,
+                                        args.clone(),
+                                    )
                                     .await?
                                 {
                                     return Ok(value);
@@ -903,14 +939,21 @@ mod tests {
 
     impl HostCapabilityCaller for TestHostCapability {
         fn call<'a>(
-        &'a self,
-        module: &'a str,
-        function: &'a str,
-        args: Vec<Value>,
-    ) -> HostCapabilityFuture<'a> {
+            &'a self,
+            scope: Option<String>,
+            module: &'a str,
+            function: &'a str,
+            args: Vec<Value>,
+        ) -> HostCapabilityFuture<'a> {
             Box::pin(async move {
-  if module == "host" && function == "double" {
-  let Some(Value::Number(value)) = args.into_iter().next() else {
+                if module == "host" && function == "double" {
+                    if scope.as_deref() != Some("hosted") {
+                        return Err(ModuleEvalError::new(
+                            "TEST",
+                            "unexpected module capability scope",
+                        ));
+                    }
+                    let Some(Value::Number(value)) = args.into_iter().next() else {
                         return Err(ModuleEvalError::new("TEST", "expected numeric argument"));
                     };
                     Ok(Some(Value::Number(value * 2.0)))
