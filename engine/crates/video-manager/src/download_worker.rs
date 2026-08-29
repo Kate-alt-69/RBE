@@ -69,37 +69,35 @@ impl VideoManager {
         queued: &QueuedDownload,
         policy: DownloadPolicy,
     ) -> anyhow::Result<DownloadReceipt> {
-        policy.validate()?;
-        if queued.asset.id != queued.job.asset_id {
-            anyhow::bail!("Video Manager queued download asset/job identity mismatch");
-        }
-        let source_url =
-            queued.asset.source_uri.as_deref().ok_or_else(|| {
+        let quarantine_path = self.quarantine_path(&queued.asset.id, &queued.job.id)?;
+        let result = async {
+            policy.validate()?;
+            if queued.asset.id != queued.job.asset_id {
+                anyhow::bail!("Video Manager queued download asset/job identity mismatch");
+            }
+            let source_url = queued.asset.source_uri.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("Video Manager queued download has no source URL")
             })?;
-        let target = parse_download_target(source_url)?;
-        let quarantine_path = self.quarantine_path(&queued.asset.id, &queued.job.id)?;
-
-        let result = tokio::time::timeout(
-            policy.total_timeout,
-            download_into_quarantine(target, &quarantine_path, &policy),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(receipt)) => Ok(receipt),
-            Ok(Err(error)) => {
-                let _ = tokio::fs::remove_file(&quarantine_path).await;
-                Err(error)
-            }
-            Err(_) => {
-                let _ = tokio::fs::remove_file(&quarantine_path).await;
-                anyhow::bail!(
+            let target = parse_download_target(source_url)?;
+            match tokio::time::timeout(
+                policy.total_timeout,
+                download_into_quarantine(target, &quarantine_path, &policy),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => anyhow::bail!(
                     "Video Manager download exceeded total timeout of {:?}",
                     policy.total_timeout
-                );
+                ),
             }
         }
+        .await;
+
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&quarantine_path).await;
+        }
+        result
     }
 }
 

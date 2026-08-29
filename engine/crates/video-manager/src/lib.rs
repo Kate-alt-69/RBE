@@ -611,6 +611,60 @@ impl VideoManager {
         Ok(QueuedDownload { asset, job })
     }
 
+    /// Atomically claim and execute one queued download job. A successful HTTP
+    /// fetch remains quarantined until content validation explicitly accepts it.
+    pub async fn run_queued_download(
+        &self,
+        queued: &QueuedDownload,
+        policy: DownloadPolicy,
+    ) -> anyhow::Result<DownloadReceipt> {
+        if queued.asset.id != queued.job.asset_id || queued.job.job_type != "download" {
+            anyhow::bail!("Video Manager queued download identity/type mismatch");
+        }
+        let (_, database) = self.resolve_database(Some(&queued.asset.database))?;
+        let claimed = database
+            .claim_job(&queued.job.id, "queued", "downloading")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Video Manager download job {:?} is not queued and cannot be claimed",
+                    queued.job.id
+                )
+            })?;
+        if claimed.asset_id != queued.asset.id || claimed.job_type != "download" {
+            let detail = "Video Manager claimed job does not match its queued download asset/type";
+            let _ = database.update_job(&claimed.id, "failed", 0.0, Some(detail));
+            if claimed.job_type == "download" {
+                if let Ok(path) = self.quarantine_path(&claimed.asset_id, &claimed.id) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            anyhow::bail!("{detail}");
+        }
+
+        let mut claimed_download = queued.clone();
+        claimed_download.job = claimed;
+        match self
+            .execute_queued_download(&claimed_download, policy)
+            .await
+        {
+            Ok(receipt) => {
+                database.update_job(&queued.job.id, "downloaded", 1.0, None)?;
+                Ok(receipt)
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                if let Err(state_error) =
+                    database.update_job(&queued.job.id, "failed", 0.0, Some(&detail))
+                {
+                    return Err(anyhow::anyhow!(
+                        "Video Manager download failed: {detail}; additionally failed to persist job failure: {state_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn get_asset(
         &self,
         database: Option<&str>,
@@ -936,6 +990,77 @@ mod tests {
         let stored = database.get_job(&queued.job.id).unwrap().unwrap();
         assert_eq!(stored.state, "downloaded");
         assert_eq!(stored.progress, 1.0);
+        assert_eq!(stored.attempts, 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn download_runner_records_preflight_failure_and_cleans_quarantine() {
+        let path = temp_db("runner-failure");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "failures".into(),
+                title: "Failure".into(),
+                url: "https://example.invalid/video.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let quarantine = manager
+            .quarantine_path(&queued.asset.id, &queued.job.id)
+            .unwrap();
+        let policy = DownloadPolicy {
+            max_bytes: 0,
+            ..DownloadPolicy::default()
+        };
+        assert!(manager.run_queued_download(&queued, policy).await.is_err());
+        let (_, database) = manager.resolve_database(None).unwrap();
+        let stored = database.get_job(&queued.job.id).unwrap().unwrap();
+        assert_eq!(stored.state, "failed");
+        assert_eq!(stored.attempts, 1);
+        assert!(stored
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("byte limit")));
+        assert!(!quarantine.exists());
+        let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();
+        assert_eq!(asset.state, VideoAssetState::Quarantined);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn losing_download_claim_does_not_delete_quarantine() {
+        let path = temp_db("runner-claim");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "claims".into(),
+                title: "Claim".into(),
+                url: "https://example.invalid/video.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let quarantine = manager
+            .quarantine_path(&queued.asset.id, &queued.job.id)
+            .unwrap();
+        let (_, database) = manager.resolve_database(None).unwrap();
+        database
+            .claim_job(&queued.job.id, "queued", "downloading")
+            .unwrap()
+            .unwrap();
+        assert!(manager
+            .run_queued_download(&queued, DownloadPolicy::default())
+            .await
+            .is_err());
+        assert!(quarantine.exists());
+        let stored = database.get_job(&queued.job.id).unwrap().unwrap();
+        assert_eq!(stored.state, "downloading");
         assert_eq!(stored.attempts, 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
