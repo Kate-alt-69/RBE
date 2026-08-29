@@ -21,8 +21,8 @@ jobs:
           path = Path("engine/crates/route-engine/src/module_eval.rs")
           source = path.read_text()
 
-          # The semantic patch currently expects its constructor body one
-          # indentation level left. Keep that quirk isolated to this seed.
+          # Keep the semantic patch's historical constructor anchor isolated
+          # to this temporary seed. The semantic patch immediately rustfmts it.
           normal_constructor = "    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {\n        Self::with_service_caller(program, Arc::new(services))\n    }\n"
           seeded_constructor = "    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {\n    Self::with_service_caller(program, Arc::new(services))\n}\n"
           if normal_constructor in source:
@@ -30,8 +30,8 @@ jobs:
           elif seeded_constructor not in source:
               raise SystemExit("with_services source anchor missing")
 
-          # Normalize the private helper call to the semantic guard's old
-          # indentation-sensitive anchor.
+          # Normalize the private helper call to the exact pre-patch span used
+          # by the semantic guard.
           helper_region = source.index("                        if let Some(function) = self")
           call_start = source.index("                                .call_function(", helper_region)
           call_end = source.index("\n                                .await;", call_start)
@@ -46,26 +46,25 @@ jobs:
           if source[call_start:call_end] != seeded_helper:
               source = source[:call_start] + seeded_helper + source[call_end:]
 
-          # The guard's test signature literal removes fourteen spaces before
-          # matching. Seed that exact pre-patch form by structure.
+          # These signatures intentionally match the strings visible inside
+          # the Actions shell after YAML indentation stripping. Do not infer
+          # them from the raw workflow indentation.
           test_region = source.index("    impl HostCapabilityCaller for TestHostCapability")
           signature_start = source.index("        fn call<'a>(", test_region)
           signature_end = source.index("\n            Box::pin", signature_start)
           seeded_test_signature = (
               "        fn call<'a>(\n"
-              "    &'a self,\n"
-              "    module: &'a str,\n"
-              "    function: &'a str,\n"
-              "    args: Vec<Value>,\n"
-              ") -> HostCapabilityFuture<'a> {"
+              "        &'a self,\n"
+              "        module: &'a str,\n"
+              "        function: &'a str,\n"
+              "        args: Vec<Value>,\n"
+              "    ) -> HostCapabilityFuture<'a> {"
           )
           if source[signature_start:signature_end] != seeded_test_signature:
               source = source[:signature_start] + seeded_test_signature + source[signature_end:]
 
           path.write_text(source)
 
-          # Same fourteen-space quirk exists in the service-local host
-          # capability signature checked by the semantic guard.
           path = Path("engine/crates/route-engine/src/service_eval.rs")
           source = path.read_text()
           service_region = source.index("impl HostCapabilityCaller for ServiceHostCapabilities")
@@ -73,11 +72,11 @@ jobs:
           signature_end = source.index("\n        Box::pin", signature_start)
           seeded_service_signature = (
               "    fn call<'a>(\n"
-              "    &'a self,\n"
-              "    module: &'a str,\n"
-              "    function: &'a str,\n"
-              "    args: Vec<Value>,\n"
-              ") -> HostCapabilityFuture<'a> {"
+              "        &'a self,\n"
+              "        module: &'a str,\n"
+              "        function: &'a str,\n"
+              "        args: Vec<Value>,\n"
+              "    ) -> HostCapabilityFuture<'a> {"
           )
           if source[signature_start:signature_end] != seeded_service_signature:
               source = source[:signature_start] + seeded_service_signature + source[signature_end:]
@@ -90,6 +89,6 @@ jobs:
             git add -- \
               engine/crates/route-engine/src/module_eval.rs \
               engine/crates/route-engine/src/service_eval.rs
-            git commit -m "ci: seed remaining video language anchors"
+            git commit -m "ci: correct video host signature anchors"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
