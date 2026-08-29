@@ -252,6 +252,9 @@ pub trait VideoDatabase: Send + Sync {
         job_id: &str,
         variant: &VideoVariant,
     ) -> anyhow::Result<Option<VideoJob>>;
+    fn list_variants(&self, _asset_id: &str) -> anyhow::Result<Vec<VideoVariant>> {
+        Ok(Vec::new())
+    }
     fn get_asset(&self, database: &str, asset_id: &str) -> anyhow::Result<Option<VideoAsset>>;
 }
 
@@ -700,6 +703,82 @@ impl VideoDatabase for SqliteVideoDatabase {
             .optional()?;
         transaction.commit()?;
         Ok(committed)
+    }
+
+    fn list_variants(&self, asset_id: &str) -> anyhow::Result<Vec<VideoVariant>> {
+        validate_generated_uuid("asset id", asset_id)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
+        let mut statement = connection.prepare(
+            "SELECT id, asset_id, profile, codec, width, height, fps, bitrate, size_bytes, path, state, created_at_ms, updated_at_ms FROM video_variants WHERE asset_id = ?1 ORDER BY created_at_ms ASC, id ASC",
+        )?;
+        let rows = statement
+            .query_map(params![asset_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<f64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    asset_id,
+                    profile,
+                    codec,
+                    width,
+                    height,
+                    fps,
+                    bitrate,
+                    size_bytes,
+                    path,
+                    state,
+                    created_at_ms,
+                    updated_at_ms,
+                )| {
+                    Ok(VideoVariant {
+                        id,
+                        asset_id,
+                        profile,
+                        codec,
+                        width: width
+                            .map(u32::try_from)
+                            .transpose()
+                            .context("Video Manager variant width is outside u32 range")?,
+                        height: height
+                            .map(u32::try_from)
+                            .transpose()
+                            .context("Video Manager variant height is outside u32 range")?,
+                        fps,
+                        bitrate: bitrate
+                            .map(u64::try_from)
+                            .transpose()
+                            .context("Video Manager variant bitrate is negative")?,
+                        size_bytes: u64::try_from(size_bytes)
+                            .context("Video Manager variant size is negative")?,
+                        path,
+                        state,
+                        created_at_ms,
+                        updated_at_ms,
+                    })
+                },
+            )
+            .collect()
     }
 
     fn get_asset(&self, database: &str, asset_id: &str) -> anyhow::Result<Option<VideoAsset>> {
@@ -1187,6 +1266,15 @@ impl VideoManager {
     ) -> anyhow::Result<Option<VideoAsset>> {
         let (database_name, database) = self.resolve_database(database)?;
         database.get_asset(&database_name, asset_id)
+    }
+
+    pub fn list_variants(
+        &self,
+        database: Option<&str>,
+        asset_id: &str,
+    ) -> anyhow::Result<Vec<VideoVariant>> {
+        let (_, database) = self.resolve_database(database)?;
+        database.list_variants(asset_id)
     }
 
     pub fn database_health(&self, database: Option<&str>) -> anyhow::Result<DatabaseHealth> {
@@ -1833,6 +1921,11 @@ mod tests {
             .unwrap();
         assert_eq!(committed.state, "ready");
         assert_eq!(committed.progress, 1.0);
+        let variants = manager.list_variants(None, &queued.asset.id).unwrap();
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].id, variant.id);
+        assert_eq!(variants[0].path, variant.path);
+        assert_eq!(variants[0].size_bytes, variant.size_bytes);
         let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();
         assert_eq!(asset.state, VideoAssetState::Ready);
         assert!(database

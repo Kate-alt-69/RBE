@@ -9,6 +9,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use video_manager::{
     CreateAssetRequest, QueueDownloadRequest, VideoAssetState, VideoManager, VideoSourceType,
+    VideoVariant,
 };
 
 #[derive(Clone)]
@@ -58,6 +59,24 @@ impl VideoLanguage {
                         json_result(serde_json::to_value(asset))
                     }
                 }
+            }
+            "variants" => {
+                expect_arity_range(function, args, 1, 2)?;
+                let asset_id = required_string(args, 0, "asset id")?;
+                let database = optional_string(args.get(1), "database")?;
+                let asset = manager
+                    .get_asset(database.as_deref(), asset_id)
+                    .map_err(operation_error)?;
+                let Some(asset) = asset else {
+                    return Ok(Value::Null);
+                };
+                ensure_owned(module_owner, &asset.namespace)?;
+                let variants = manager
+                    .list_variants(database.as_deref(), asset_id)
+                    .map_err(operation_error)?;
+                Ok(Value::Array(
+                    variants.into_iter().map(public_variant_value).collect(),
+                ))
             }
             "create" => {
                 expect_arity_range(function, args, 3, 6)?;
@@ -216,6 +235,23 @@ fn optional_string(
     }
 }
 
+fn public_variant_value(variant: VideoVariant) -> Value {
+    serde_json::json!({
+        "id": variant.id,
+        "assetId": variant.asset_id,
+        "profile": variant.profile,
+        "codec": variant.codec,
+        "width": variant.width,
+        "height": variant.height,
+        "fps": variant.fps,
+        "bitrate": variant.bitrate,
+        "sizeBytes": variant.size_bytes,
+        "state": variant.state,
+        "createdAtMs": variant.created_at_ms,
+        "updatedAtMs": variant.updated_at_ms,
+    })
+}
+
 fn operation_error(error: anyhow::Error) -> VideoLanguageError {
     VideoLanguageError::new("VID3002", error.to_string())
 }
@@ -294,6 +330,53 @@ mod tests {
             .unwrap();
         assert_eq!(queued["asset"]["state"], "quarantined");
         assert_eq!(queued["job"]["state"], "queued");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn variant_language_view_never_exposes_storage_path() {
+        let variant = VideoVariant {
+            id: "variant-id".into(),
+            asset_id: "asset-id".into(),
+            profile: "standard".into(),
+            codec: Some("h264".into()),
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30.0),
+            bitrate: Some(4_000_000),
+            size_bytes: 1_000_000,
+            path: "secret/internal/primary.mp4".into(),
+            state: "ready".into(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let value = public_variant_value(variant);
+        assert!(value.get("path").is_none());
+        assert_eq!(value["profile"], "standard");
+        assert_eq!(value["assetId"], "asset-id");
+    }
+
+    #[test]
+    fn variants_enforces_asset_namespace_ownership() {
+        let path = temp_db("variant-ownership");
+        let manager = Arc::new(VideoManager::open_default(&path, 7200).unwrap());
+        let language = VideoLanguage::new(Some(manager));
+        let created = language
+            .call(
+                "owner.module",
+                "create",
+                &[
+                    Value::String("clips".into()),
+                    Value::String("Private".into()),
+                    Value::String("generated".into()),
+                ],
+            )
+            .unwrap();
+        let asset_id = created["id"].as_str().unwrap().to_string();
+        let error = language
+            .call("other.module", "variants", &[Value::String(asset_id)])
+            .unwrap_err();
+        assert_eq!(error.code, "VID3003");
         let _ = std::fs::remove_file(path);
     }
 }

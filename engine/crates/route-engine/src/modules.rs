@@ -87,6 +87,7 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
                 | "databaseHealth"
                 | "database_health"
                 | "get"
+                | "variants"
                 | "create"
                 | "queueDownload"
                 | "queue_download"
@@ -492,6 +493,7 @@ mod tests {
     fn video_manager_uses_only_explicit_supported_import_names() {
         assert!(builtin_function_exists("vm", "status"));
         assert!(builtin_function_exists("video-manager", "queueDownload"));
+        assert!(builtin_function_exists("vm", "variants"));
         assert!(!builtin_function_exists("video", "status"));
         assert!(!route_capability_allowed("vm"));
         assert!(!route_capability_allowed("video-manager"));
