@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde::Serialize;
@@ -11,6 +11,10 @@ use crate::FfmpegPolicy;
 
 const MAX_CAPABILITY_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const HARDWARE_PROBE_BUDGET: Duration = Duration::from_secs(10);
+const HARDWARE_ENCODER_TIMEOUT: Duration = Duration::from_secs(3);
+const HARDWARE_ENCODER_LOG_BYTES: usize = 64 * 1024;
+const ERROR_TEXT_BYTES: usize = 8 * 1024;
 const HARDWARE_H264_ENCODERS: &[&str] = &[
     "h264_nvenc",
     "h264_qsv",
@@ -21,6 +25,13 @@ const HARDWARE_H264_ENCODERS: &[&str] = &[
     "h264_rkmpp",
     "h264_mf",
 ];
+const AUTO_VERIFIABLE_H264_ENCODERS: &[&str] = &[
+    "h264_nvenc",
+    "h264_qsv",
+    "h264_amf",
+    "h264_videotoolbox",
+    "h264_mf",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +39,7 @@ pub struct FfmpegCapabilities {
     pub software_h264: bool,
     pub aac: bool,
     pub hardware_h264_encoders: Vec<String>,
+    pub verified_hardware_h264_encoders: Vec<String>,
 }
 
 pub async fn probe_ffmpeg_capabilities(
@@ -37,8 +49,10 @@ pub async fn probe_ffmpeg_capabilities(
     let output_cap = policy.max_log_bytes.clamp(1, MAX_CAPABILITY_OUTPUT_BYTES);
     let timeout = policy.timeout.min(CAPABILITY_PROBE_TIMEOUT);
     let listing = run_encoder_listing(policy, timeout, output_cap).await?;
-    let capabilities = parse_encoder_listing(&listing);
+    let mut capabilities = parse_encoder_listing(&listing);
     validate_required_capabilities(&capabilities)?;
+    capabilities.verified_hardware_h264_encoders =
+        verify_hardware_encoders(policy, &capabilities.hardware_h264_encoders).await;
     Ok(capabilities)
 }
 
@@ -104,6 +118,109 @@ async fn run_encoder_listing(
     Ok(String::from_utf8_lossy(&combined).into_owned())
 }
 
+async fn verify_hardware_encoders(policy: &FfmpegPolicy, advertised: &[String]) -> Vec<String> {
+    let started = Instant::now();
+    let mut verified = Vec::new();
+    for encoder in advertised
+        .iter()
+        .filter(|encoder| auto_verifiable_hardware_encoder(encoder))
+    {
+        let remaining = HARDWARE_PROBE_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let timeout = remaining.min(HARDWARE_ENCODER_TIMEOUT);
+        match smoke_test_hardware_encoder(policy, encoder, timeout).await {
+            Ok(true) => verified.push(encoder.clone()),
+            Ok(false) => {}
+            Err(error) => tracing::debug!(
+                encoder = %encoder,
+                error = %error,
+                "Video Manager hardware encoder smoke test failed"
+            ),
+        }
+    }
+    verified
+}
+
+fn auto_verifiable_hardware_encoder(encoder: &str) -> bool {
+    AUTO_VERIFIABLE_H264_ENCODERS.contains(&encoder)
+}
+
+async fn smoke_test_hardware_encoder(
+    policy: &FfmpegPolicy,
+    encoder: &str,
+    timeout: Duration,
+) -> anyhow::Result<bool> {
+    if !auto_verifiable_hardware_encoder(encoder) {
+        return Ok(false);
+    }
+
+    let mut command = Command::new(&policy.executable);
+    command
+        .arg("-nostdin")
+        .arg("-hide_banner")
+        .arg("-v")
+        .arg("error")
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg("color=c=black:s=64x64:r=1")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-an")
+        .arg("-c:v")
+        .arg(encoder)
+        .arg("-f")
+        .arg("null")
+        .arg("-")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "spawn configured FFmpeg hardware probe {}",
+            policy.executable.display()
+        )
+    })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Video Manager FFmpeg hardware probe stderr unavailable"))?;
+    let stderr_task = tokio::spawn(read_bounded_output(stderr, HARDWARE_ENCODER_LOG_BYTES));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(result) => result.context("wait for Video Manager FFmpeg hardware probe")?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            tracing::debug!(
+                encoder,
+                timeout_ms = timeout.as_millis(),
+                "Video Manager hardware encoder smoke test timed out"
+            );
+            return Ok(false);
+        }
+    };
+
+    let stderr = stderr_task
+        .await
+        .context("join Video Manager FFmpeg hardware probe stderr reader")??;
+    if status.success() {
+        Ok(true)
+    } else {
+        tracing::debug!(
+            encoder,
+            detail = %bounded_text(&stderr),
+            "Video Manager hardware encoder is advertised but unusable"
+        );
+        Ok(false)
+    }
+}
+
 fn parse_encoder_listing(listing: &str) -> FfmpegCapabilities {
     let mut names = HashSet::new();
     for line in listing.lines() {
@@ -127,6 +244,7 @@ fn parse_encoder_listing(listing: &str) -> FfmpegCapabilities {
             .filter(|encoder| names.contains(**encoder))
             .map(|encoder| (*encoder).to_string())
             .collect(),
+        verified_hardware_h264_encoders: Vec::new(),
     }
 }
 
@@ -171,7 +289,8 @@ where
 }
 
 fn bounded_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).trim().to_string()
+    let end = bytes.len().min(ERROR_TEXT_BYTES);
+    String::from_utf8_lossy(&bytes[..end]).trim().to_string()
 }
 
 #[cfg(test)]
@@ -196,7 +315,24 @@ Encoders:
             capabilities.hardware_h264_encoders,
             vec!["h264_nvenc".to_string(), "h264_qsv".to_string()]
         );
+        assert!(capabilities.verified_hardware_h264_encoders.is_empty());
         validate_required_capabilities(&capabilities).unwrap();
+    }
+
+    #[test]
+    fn only_direct_hardware_encoders_are_auto_verifiable() {
+        for encoder in [
+            "h264_nvenc",
+            "h264_qsv",
+            "h264_amf",
+            "h264_videotoolbox",
+            "h264_mf",
+        ] {
+            assert!(auto_verifiable_hardware_encoder(encoder));
+        }
+        for encoder in ["h264_vaapi", "h264_v4l2m2m", "h264_rkmpp"] {
+            assert!(!auto_verifiable_hardware_encoder(encoder));
+        }
     }
 
     #[test]
@@ -205,6 +341,7 @@ Encoders:
             software_h264: false,
             aac: true,
             hardware_h264_encoders: Vec::new(),
+            verified_hardware_h264_encoders: Vec::new(),
         };
         let error = validate_required_capabilities(&capabilities).unwrap_err();
         assert!(error.to_string().contains("libx264"));

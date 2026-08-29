@@ -361,6 +361,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
                 software_h264 = ffmpeg_capabilities.software_h264,
                 aac = ffmpeg_capabilities.aac,
                 hardware_h264_encoders = ?ffmpeg_capabilities.hardware_h264_encoders,
+                verified_hardware_h264_encoders = ?ffmpeg_capabilities.verified_hardware_h264_encoders,
                 recovery_scan_secs = config.video_manager.worker_recovery_scan_secs,
                 max_download_bytes = config.video_manager.download_max_bytes,
                 "Video Manager lazy download worker ready"

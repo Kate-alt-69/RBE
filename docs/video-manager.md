@@ -228,7 +228,9 @@ Module/service code does **not** receive arbitrary FFmpeg switches, shell string
 
 FFmpeg writes into a private staging file under the generated asset directory. Only after FFmpeg succeeds is that staging file renamed to the final `primary.mp4`; the DB ready-variant transaction then publishes it. Quarantine is removed after that transaction succeeds.
 
-Hardware acceleration is not selected yet; the current profile intentionally uses the deterministic software encoder.
+At worker boot, RBE parses the configured FFmpeg encoder table and requires the software `libx264` and AAC encoders used by the standard profile. Advertised H.264 hardware candidates are recorded from a strict RBE allowlist. Directly testable candidates (currently NVENC, Quick Sync, AMF, VideoToolbox, and Media Foundation) then receive a bounded one-frame synthetic smoke test; only encoders that actually initialize and encode successfully are reported as verified. Device-bound candidates such as VAAPI, V4L2 M2M, and RKMPP remain advertised-only until explicit device handling lands.
+
+Hardware acceleration is still not selected for real normalization yet; the current profile intentionally uses deterministic `libx264`. The verified candidate set is the safety foundation for automatic selection rather than trusting FFmpeg's advertised encoder list.
 
 ## Language API
 
@@ -298,7 +300,7 @@ Planned live work includes lazy worker activation, RTMP/HLS and potentially WHIP
 
 The following remain intentionally unfinished:
 
-- FFmpeg hardware-acceleration probing and safe encoder selection
+- automatic selection/use of verified FFmpeg hardware encoders
 - additional normalization profiles/variants
 - upload/local/generated media ingestion workers beyond metadata creation
 - RTMP ingest
