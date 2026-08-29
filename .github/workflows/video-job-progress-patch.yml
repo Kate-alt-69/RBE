@@ -25,6 +25,37 @@ jobs:
         shell: bash
         run: |
           (cd .. && python .github/patches/video-job-progress.py)
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/video-manager/src/lib.rs")
+          source = path.read_text()
+          old = '''    #[test]
+              fn job_lookup_and_progress_constants_form_a_monotonic_pipeline() {
+                  assert_eq!(PROGRESS_QUEUED, 0.0);
+                  assert!(PROGRESS_QUEUED < PROGRESS_DOWNLOADING);
+                  assert!(PROGRESS_DOWNLOADING < PROGRESS_DOWNLOADED);
+                  assert!(PROGRESS_DOWNLOADED < PROGRESS_CONTAINER_CHECKED);
+                  assert!(PROGRESS_CONTAINER_CHECKED < PROGRESS_PROBED);
+                  assert!(PROGRESS_PROBED < PROGRESS_NORMALIZING);
+                  assert!(PROGRESS_NORMALIZING < 1.0);
+          '''.replace('              ', '')
+          new = '''    const _: () = {
+              assert!(PROGRESS_QUEUED < PROGRESS_DOWNLOADING);
+              assert!(PROGRESS_DOWNLOADING < PROGRESS_DOWNLOADED);
+              assert!(PROGRESS_DOWNLOADED < PROGRESS_CONTAINER_CHECKED);
+              assert!(PROGRESS_CONTAINER_CHECKED < PROGRESS_PROBED);
+              assert!(PROGRESS_PROBED < PROGRESS_NORMALIZING);
+              assert!(PROGRESS_NORMALIZING < 1.0);
+          };
+
+          #[test]
+          fn job_lookup_and_progress_constants_form_a_monotonic_pipeline() {
+              assert_eq!(PROGRESS_QUEUED, 0.0);
+          '''.replace('          ', '')
+          if old not in source:
+              raise SystemExit("Video Manager progress test anchor missing")
+          path.write_text(source.replace(old, new, 1))
+          PY
           rustfmt --edition 2021 \
             crates/video-manager/src/lib.rs \
             crates/video-manager/src/normalization.rs \
