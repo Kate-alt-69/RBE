@@ -157,6 +157,7 @@ function Invoke-Build([string]$Package, [string]$Target, [bool]$IsRelease) {
 foreach ($target in $targets) {
     Write-Host ""; Write-Host "=== Building for $target ===" -ForegroundColor Green
     $outDir = Join-Path $DistRoot $target; $depDir = Join-Path $outDir 'dep'
+    if (Test-Path -LiteralPath $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $depDir | Out-Null
 
     Write-Host "-- container-bin ($target) --" -ForegroundColor Cyan
