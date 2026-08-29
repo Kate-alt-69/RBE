@@ -35,6 +35,7 @@ jobs:
             crates/video-manager/src/container_probe.rs \
             crates/video-manager/src/ffprobe.rs \
             crates/video-manager/src/ffmpeg.rs \
+            crates/video-manager/src/ffmpeg_capabilities.rs \
             crates/video-manager/src/normalization.rs \
             crates/video-manager/src/pipeline.rs \
             crates/video-manager/src/worker.rs \
