@@ -28,6 +28,7 @@ jobs:
           python ../.github/patches/video-live-runtime-fix.py
           rustfmt --edition 2021 crates/video-manager/src/live_runtime.rs
           rustfmt --edition 2021 crates/video-manager/src/live.rs
+          rustfmt --edition 2021 crates/video-manager/src/worker.rs
           rustfmt --edition 2021 --config skip_children=true crates/video-manager/src/lib.rs
           git diff --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -37,6 +38,7 @@ jobs:
           allowed = {
               "crates/video-manager/src/live_runtime.rs",
               "crates/video-manager/src/live.rs",
+              "crates/video-manager/src/worker.rs",
               "crates/video-manager/src/lib.rs",
           }
           changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
@@ -50,6 +52,7 @@ jobs:
             git add -- \
               crates/video-manager/src/live_runtime.rs \
               crates/video-manager/src/live.rs \
+              crates/video-manager/src/worker.rs \
               crates/video-manager/src/lib.rs
             git commit -m "feat: add lazy live runtime coordinator"
             git push origin "HEAD:${GITHUB_REF_NAME}"

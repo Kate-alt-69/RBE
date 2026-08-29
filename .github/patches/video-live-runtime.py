@@ -176,7 +176,6 @@ source = path.read_text()
 source = replace_once(source, "mod live;\n", "mod live;\nmod live_runtime;\n", "live runtime module")
 live_export_start = source.index("pub use live::{")
 live_export_end = source.index("};", live_export_start) + 2
-live_export = source[live_export_start:live_export_end]
 source = source[:live_export_end] + '''
 pub use live_runtime::{LiveRuntimeDriver, LiveRuntimeFuture, LiveRuntimeHandle};''' + source[live_export_end:]
 source = replace_once(
@@ -281,5 +280,36 @@ source = replace_once(
         );
 ''',
     "DB-only live test sleeping status",
+)
+path.write_text(source)
+
+# worker.rs: the recovery test intentionally constructs VideoManager directly;
+# keep that internal test fixture in sync with the coordinator-owned fields.
+path = Path("crates/video-manager/src/worker.rs")
+source = path.read_text()
+source = replace_once(
+    source,
+    '''        CreateAssetRequest, DatabaseHealth, QueuedDownload, VideoAsset, VideoDatabase, VideoJob,
+        VideoVariant, DEFAULT_DATABASE_NAME,
+''',
+    '''        CreateAssetRequest, DatabaseHealth, QueuedDownload, VideoAsset, VideoDatabase, VideoJob,
+        VideoLiveRuntimeState, VideoVariant, DEFAULT_DATABASE_NAME,
+''',
+    "worker test live runtime import",
+)
+source = replace_once(
+    source,
+    '''            worker_state: Mutex::new(VideoWorkerState::Disabled),
+            worker_encoder: Mutex::new(None),
+            live_idle_secs: 7200,
+''',
+    '''            worker_state: Mutex::new(VideoWorkerState::Disabled),
+            worker_encoder: Mutex::new(None),
+            live_notify: tokio::sync::Notify::new(),
+            live_runtime_state: Mutex::new(VideoLiveRuntimeState::Disabled),
+            live_runtime_claimed: AtomicBool::new(false),
+            live_idle_secs: 7200,
+''',
+    "worker test VideoManager live runtime initializer",
 )
 path.write_text(source)
