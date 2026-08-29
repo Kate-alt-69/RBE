@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{watch, Notify};
+use tokio::sync::watch;
 
 use crate::{VideoLiveRuntimeState, VideoManager};
 
