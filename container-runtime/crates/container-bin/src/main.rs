@@ -225,7 +225,7 @@ fn process_exists(pid: u32) -> bool {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle == 0 { return false; }
+        if handle.is_null() { return false; }
         let mut exit_code = 0u32;
         let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
         unsafe { CloseHandle(handle); }
