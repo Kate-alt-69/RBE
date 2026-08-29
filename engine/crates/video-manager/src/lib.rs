@@ -172,6 +172,20 @@ pub trait VideoDatabase: Send + Sync {
         request: &CreateAssetRequest,
     ) -> anyhow::Result<VideoAsset>;
     fn insert_job(&self, job: &VideoJob) -> anyhow::Result<()>;
+    fn claim_job(
+        &self,
+        job_id: &str,
+        expected_state: &str,
+        claimed_state: &str,
+    ) -> anyhow::Result<Option<VideoJob>>;
+    fn update_job(
+        &self,
+        job_id: &str,
+        state: &str,
+        progress: f64,
+        error: Option<&str>,
+    ) -> anyhow::Result<()>;
+    fn get_job(&self, job_id: &str) -> anyhow::Result<Option<VideoJob>>;
     fn get_asset(&self, database: &str, asset_id: &str) -> anyhow::Result<Option<VideoAsset>>;
 }
 
@@ -313,6 +327,7 @@ impl VideoDatabase for SqliteVideoDatabase {
     }
 
     fn insert_job(&self, job: &VideoJob) -> anyhow::Result<()> {
+        validate_job_state(&job.state)?;
         let connection = self
             .connection
             .lock()
@@ -332,6 +347,79 @@ impl VideoDatabase for SqliteVideoDatabase {
             ],
         )?;
         Ok(())
+    }
+
+    fn claim_job(
+        &self,
+        job_id: &str,
+        expected_state: &str,
+        claimed_state: &str,
+    ) -> anyhow::Result<Option<VideoJob>> {
+        validate_job_state(expected_state)?;
+        validate_job_state(claimed_state)?;
+        let now = now_ms();
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
+        let transaction = connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE video_jobs SET state = ?1, attempts = attempts + 1, error = NULL, updated_at_ms = ?2 WHERE id = ?3 AND state = ?4",
+            params![claimed_state, now, job_id, expected_state],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let job = transaction
+            .query_row(
+                "SELECT id, asset_id, job_type, state, progress, attempts, error, created_at_ms, updated_at_ms FROM video_jobs WHERE id = ?1",
+                params![job_id],
+                read_video_job,
+            )
+            .optional()?;
+        transaction.commit()?;
+        Ok(job)
+    }
+
+    fn update_job(
+        &self,
+        job_id: &str,
+        state: &str,
+        progress: f64,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        validate_job_state(state)?;
+        if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {
+            anyhow::bail!("Video Manager job progress must be finite and between 0 and 1");
+        }
+        let now = now_ms();
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
+        let changed = connection.execute(
+            "UPDATE video_jobs SET state = ?1, progress = ?2, error = ?3, updated_at_ms = ?4 WHERE id = ?5",
+            params![state, progress, error, now, job_id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("Video Manager job {job_id:?} does not exist");
+        }
+        Ok(())
+    }
+
+    fn get_job(&self, job_id: &str) -> anyhow::Result<Option<VideoJob>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
+        Ok(connection
+            .query_row(
+                "SELECT id, asset_id, job_type, state, progress, attempts, error, created_at_ms, updated_at_ms FROM video_jobs WHERE id = ?1",
+                params![job_id],
+                read_video_job,
+            )
+            .optional()?)
     }
 
     fn get_asset(&self, database: &str, asset_id: &str) -> anyhow::Result<Option<VideoAsset>> {
@@ -393,6 +481,32 @@ impl VideoDatabase for SqliteVideoDatabase {
             })
             .pipe(Ok)
     }
+}
+
+fn read_video_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<VideoJob> {
+    Ok(VideoJob {
+        id: row.get(0)?,
+        asset_id: row.get(1)?,
+        job_type: row.get(2)?,
+        state: row.get(3)?,
+        progress: row.get(4)?,
+        attempts: row.get(5)?,
+        error: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
+}
+
+fn validate_job_state(state: &str) -> anyhow::Result<()> {
+    if state.is_empty()
+        || state.len() > 64
+        || !state.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+    {
+        anyhow::bail!("Video Manager job state is not a valid state token: {state:?}");
+    }
+    Ok(())
 }
 
 pub struct VideoManager {
@@ -788,6 +902,42 @@ mod tests {
             .quarantine_path(&valid.to_uppercase(), &valid)
             .is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_job_claim_is_atomic() {
+        let path = temp_db("claim");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "claims".into(),
+                title: "Claim".into(),
+                url: "https://example.invalid/video.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let (_, database) = manager.resolve_database(None).unwrap();
+        let claimed = database
+            .claim_job(&queued.job.id, "queued", "downloading")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.state, "downloading");
+        assert_eq!(claimed.attempts, 1);
+        assert!(database
+            .claim_job(&queued.job.id, "queued", "downloading")
+            .unwrap()
+            .is_none());
+        database
+            .update_job(&queued.job.id, "downloaded", 1.0, None)
+            .unwrap();
+        let stored = database.get_job(&queued.job.id).unwrap().unwrap();
+        assert_eq!(stored.state, "downloaded");
+        assert_eq!(stored.progress, 1.0);
+        assert_eq!(stored.attempts, 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
