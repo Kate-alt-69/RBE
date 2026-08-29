@@ -37,8 +37,7 @@ jobs:
           PY
           rustfmt --edition 2021 \
             crates/video-manager/src/worker.rs \
-            crates/video-manager/src/lib.rs \
-            crates/backend/src/main.rs
+            crates/video-manager/src/lib.rs
           git diff --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
