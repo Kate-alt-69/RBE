@@ -1,0 +1,265 @@
+name: Video Manager Import Alias Patch
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: require vm or video-manager imports
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # Capability registry: expose only vm / video-manager, never legacy video.
+          path = Path("crates/route-engine/src/modules.rs")
+          source = path.read_text()
+          source = source.replace("    Video,\n}", "    VideoManager,\n}", 1)
+          old = '''        "video" => matches!(
+              function,
+              "status"
+                  | "databaseHealth"
+                  | "database_health"
+                  | "get"
+                  | "create"
+                  | "queueDownload"
+                  | "queue_download"
+          ),'''.replace('              ', '')
+          new = '''        "vm" | "video-manager" => matches!(
+              function,
+              "status"
+                  | "databaseHealth"
+                  | "database_health"
+                  | "get"
+                  | "create"
+                  | "queueDownload"
+                  | "queue_download"
+          ),'''.replace('              ', '')
+          if old not in source:
+              raise SystemExit("video builtin function anchor missing")
+          source = source.replace(old, new, 1)
+          if source.count('"video" => ModuleKind::Builtin(BuiltinModule::Video),') != 2:
+              raise SystemExit("expected two legacy video registry anchors")
+          source = source.replace(
+              '"video" => ModuleKind::Builtin(BuiltinModule::Video),',
+              '"vm" | "video-manager" => ModuleKind::Builtin(BuiltinModule::VideoManager),',
+          )
+          old = '''            ModuleKind::Builtin(BuiltinModule::Video) => Err(ModuleError {
+              message: format!(
+                  "{module_name}.{function_name}() requires the privileged module Video host capability"
+              ),
+          }),'''.replace('              ', '')
+          new = '''            ModuleKind::Builtin(BuiltinModule::VideoManager) => Err(ModuleError {
+              message: format!(
+                  "{module_name}.{function_name}() requires the privileged module Video Manager host capability"
+              ),
+          }),'''.replace('              ', '')
+          if old not in source:
+              raise SystemExit("video registry dispatch anchor missing")
+          source = source.replace(old, new, 1)
+          test_anchor = '''    #[test]
+              fn private_health_reports_runtime_status() {'''.replace('              ', '')
+          tests = '''    #[test]
+          fn video_manager_uses_only_explicit_supported_import_names() {
+              assert!(builtin_function_exists("vm", "status"));
+              assert!(builtin_function_exists("video-manager", "queueDownload"));
+              assert!(!builtin_function_exists("video", "status"));
+              assert!(!route_capability_allowed("vm"));
+              assert!(!route_capability_allowed("video-manager"));
+              assert!(!route_capability_allowed("video"));
+          }
+
+          #[test]
+          fn private_health_reports_runtime_status() {'''.replace('          ', '')
+          if test_anchor not in source:
+              raise SystemExit("modules test insertion anchor missing")
+          source = source.replace(test_anchor, tests, 1)
+          path.write_text(source)
+
+          # Host bridge accepts exactly the two public import names.
+          path = Path("crates/route-engine/src/video_host.rs")
+          source = path.read_text()
+          old = '''            if module != "video" {
+                  return Ok(None);
+              }'''.replace('              ', '')
+          new = '''            if !matches!(module, "vm" | "video-manager") {
+                  return Ok(None);
+              }'''.replace('              ', '')
+          if old not in source:
+              raise SystemExit("video host module name anchor missing")
+          source = source.replace(old, new, 1)
+          source = source.replace(
+              'message: "video capability requires a resolved .module identity".into(),',
+              'message: "Video Manager capability requires a resolved .module identity".into(),',
+              1,
+          )
+          path.write_text(source)
+
+          # Boot validation: legacy :import[video] must fail immediately with guidance.
+          path = Path("crates/route-engine/src/module_runtime.rs")
+          source = path.read_text()
+          anchor = '''        let Some(services) = services else {
+              continue;
+          };
+          match import_base(import) {'''.replace('              ', '')
+          replacement = '''        match import_base(import) {
+              ImportTarget::Builtin(module) if module == "video" => {
+                  errors.push(ModuleCompileError {
+                      code: "MOD2010",
+                      path: path.to_path_buf(),
+                      line: 1,
+                      column: 1,
+                      message: "Video Manager must be imported as `vm` or `video-manager`; legacy `video` is not a capability".into(),
+                  });
+              }
+              ImportTarget::BuiltinFunction { module, .. } if module == "video" => {
+                  errors.push(ModuleCompileError {
+                      code: "MOD2010",
+                      path: path.to_path_buf(),
+                      line: 1,
+                      column: 1,
+                      message: "Video Manager must be imported as `vm` or `video-manager`; legacy `video` is not a capability".into(),
+                  });
+              }
+              _ => {}
+          }
+
+          let Some(services) = services else {
+              continue;
+          };
+          match import_base(import) {'''.replace('          ', '')
+          if anchor not in source:
+              raise SystemExit("module runtime service validation anchor missing")
+          source = source.replace(anchor, replacement, 1)
+          tests_end = source.rfind("\n}")
+          test = r'''
+
+              #[test]
+              fn rejects_legacy_video_capability_name_at_boot() {
+                  let root = root();
+                  fs::write(
+                      root.join("module/video.module"),
+                      ":import[video]\nexport function run() { return true; }",
+                  )
+                  .unwrap();
+                  let errors = ModuleProgram::load(&root.join("module"))
+                      .expect_err("legacy video capability name must fail module boot");
+                  assert!(errors.0.iter().any(|error| error.code == "MOD2010"));
+                  let _ = fs::remove_dir_all(root);
+              }
+          '''.replace('              ', '')
+          source = source[:tests_end] + test + source[tests_end:]
+          path.write_text(source)
+
+          # Evaluator regression: host capabilities are import-gated, never global.
+          path = Path("crates/route-engine/src/module_eval.rs")
+          source = path.read_text()
+          tests_end = source.rfind("\n}")
+          test = r'''
+
+              #[test]
+              fn host_capability_is_not_global_without_import() {
+                  let root = root();
+                  fs::write(
+                      root.join("module/unimported.module"),
+                      "export function run(value) { return host.double(value); }",
+                  )
+                  .unwrap();
+                  let program = ModuleProgram::load(&root.join("module")).unwrap();
+                  let executor =
+                      ModuleExecutor::with_host_capabilities(&program, Arc::new(TestHostCapability));
+                  let error = block_on_ready(executor.call(
+                      "./module/unimported",
+                      "run",
+                      vec![Value::Number(6.0)],
+                  ))
+                  .expect_err("host capability must require an explicit import");
+                  assert_eq!(error.code, "MOD3201");
+                  let _ = fs::remove_dir_all(root);
+              }
+          '''.replace('              ', '')
+          source = source[:tests_end] + test + source[tests_end:]
+          path.write_text(source)
+
+          # Parser regression: the long hyphenated import form and short alias both parse.
+          path = Path("crates/route-engine/src/lib.rs")
+          source = path.read_text()
+          anchor = '''    #[test]
+              fn parses_executable_service_program() {'''.replace('              ', '')
+          test = r'''    #[test]
+          fn parses_video_manager_import_names_for_modules() {
+              let tokens = Lexer::new(
+                  r#":import[vm as short, video-manager as media, video-manager.status as status]
+                  export function run() { return status(); }"#,
+              )
+              .tokenize()
+              .expect("lex failed");
+              let file = Parser::new(tokens)
+                  .parse_module_file()
+                  .expect("module parse failed");
+              assert_eq!(file.imports.len(), 3);
+              assert_eq!(binding_name(&file.imports[0]), "short");
+              assert_eq!(binding_name(&file.imports[1]), "media");
+              assert_eq!(binding_name(&file.imports[2]), "status");
+          }
+
+          #[test]
+          fn parses_executable_service_program() {'''.replace('          ', '')
+          if anchor not in source:
+              raise SystemExit("route-engine parser test insertion anchor missing")
+          source = source.replace(anchor, test, 1)
+          path.write_text(source)
+          PY
+
+          rustfmt --edition 2021 \
+            crates/route-engine/src/modules.rs \
+            crates/route-engine/src/video_host.rs \
+            crates/route-engine/src/module_runtime.rs \
+            crates/route-engine/src/module_eval.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+          python - <<'PY'
+          import subprocess
+          allowed = {
+              "crates/route-engine/src/modules.rs",
+              "crates/route-engine/src/video_host.rs",
+              "crates/route-engine/src/module_runtime.rs",
+              "crates/route-engine/src/module_eval.rs",
+              "crates/route-engine/src/lib.rs",
+          }
+          changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected Video Manager import alias paths: " + ", ".join(sorted(unexpected)))
+          PY
+
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- \
+              crates/route-engine/src/modules.rs \
+              crates/route-engine/src/video_host.rs \
+              crates/route-engine/src/module_runtime.rs \
+              crates/route-engine/src/module_eval.rs \
+              crates/route-engine/src/lib.rs
+            git commit -m "feat: require Video Manager imports"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
