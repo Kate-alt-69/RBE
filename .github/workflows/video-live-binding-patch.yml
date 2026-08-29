@@ -24,6 +24,24 @@ jobs:
       - name: wire trusted live transport binding
         shell: bash
         run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/video-manager/src/lib.rs")
+          source = path.read_text()
+          current = '''pub use live::{
+              ReserveLiveSessionRequest, VideoLiveRuntimeState, VideoLiveSession, VideoLiveSessionCounts,
+              VideoLiveSessionState,
+          };
+          '''.replace('          ', '')
+          expected = '''pub use live::{
+              ReserveLiveSessionRequest, VideoLiveRuntimeState, VideoLiveSession,
+              VideoLiveSessionCounts, VideoLiveSessionState,
+          };
+          '''.replace('          ', '')
+          if current not in source:
+              raise SystemExit("live export normalization anchor missing")
+          path.write_text(source.replace(current, expected, 1))
+          PY
           python ../.github/patches/video-live-binding.py
           rustfmt --edition 2021 crates/video-manager/src/live.rs
           rustfmt --edition 2021 --config skip_children=true crates/video-manager/src/lib.rs
