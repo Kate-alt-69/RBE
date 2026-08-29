@@ -25,7 +25,7 @@ pub use download::{
 pub use download_worker::{DownloadPolicy, DownloadReceipt};
 pub use ffmpeg::{FfmpegPolicy, NormalizedMedia};
 pub use ffprobe::{FfprobePolicy, MediaProbe, VideoStreamProbe};
-pub use worker::VideoWorkerPolicy;
+pub use worker::{VideoWorkerHandle, VideoWorkerPolicy};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

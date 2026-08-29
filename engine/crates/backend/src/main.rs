@@ -462,9 +462,12 @@ async fn boot_and_run() -> anyhow::Result<()> {
 
     lifecycle.set(BackendState::Stopping);
     service_manager.shutdown_all().await;
-    if let Some(task) = video_worker_task {
-        task.abort();
-        let _ = task.await;
+    if let Some(worker) = video_worker_task {
+        worker
+            .shutdown(Duration::from_millis(
+                config.runtime.graceful_shutdown_timeout_ms.max(1),
+            ))
+            .await;
     }
     container_refresh_task.abort();
     vault_refresh_task.abort();
