@@ -87,6 +87,7 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
                 | "databaseHealth"
                 | "database_health"
                 | "get"
+                | "job"
                 | "variants"
                 | "create"
                 | "queueDownload"
@@ -494,6 +495,7 @@ mod tests {
         assert!(builtin_function_exists("vm", "status"));
         assert!(builtin_function_exists("video-manager", "queueDownload"));
         assert!(builtin_function_exists("vm", "variants"));
+        assert!(builtin_function_exists("video-manager", "job"));
         assert!(!builtin_function_exists("video", "status"));
         assert!(!route_capability_allowed("vm"));
         assert!(!route_capability_allowed("video-manager"));

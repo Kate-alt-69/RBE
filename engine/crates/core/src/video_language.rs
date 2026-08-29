@@ -60,6 +60,28 @@ impl VideoLanguage {
                     }
                 }
             }
+            "job" => {
+                expect_arity_range(function, args, 1, 2)?;
+                let job_id = required_string(args, 0, "job id")?;
+                let database = optional_string(args.get(1), "database")?;
+                let job = manager
+                    .get_job(database.as_deref(), job_id)
+                    .map_err(operation_error)?;
+                let Some(job) = job else {
+                    return Ok(Value::Null);
+                };
+                let asset = manager
+                    .get_asset(database.as_deref(), &job.asset_id)
+                    .map_err(operation_error)?
+                    .ok_or_else(|| {
+                        VideoLanguageError::new(
+                            "VID3002",
+                            "Video Manager job references a missing asset",
+                        )
+                    })?;
+                ensure_owned(module_owner, &asset.namespace)?;
+                Ok(public_job_value(job))
+            }
             "variants" => {
                 expect_arity_range(function, args, 1, 2)?;
                 let asset_id = required_string(args, 0, "asset id")?;
@@ -235,6 +257,20 @@ fn optional_string(
     }
 }
 
+fn public_job_value(job: video_manager::VideoJob) -> Value {
+    serde_json::json!({
+        "id": job.id,
+        "assetId": job.asset_id,
+        "jobType": job.job_type,
+        "state": job.state,
+        "progress": job.progress,
+        "attempts": job.attempts,
+        "failed": job.error.is_some(),
+        "createdAtMs": job.created_at_ms,
+        "updatedAtMs": job.updated_at_ms,
+    })
+}
+
 fn public_variant_value(variant: VideoVariant) -> Value {
     serde_json::json!({
         "id": variant.id,
@@ -375,6 +411,54 @@ mod tests {
         let asset_id = created["id"].as_str().unwrap().to_string();
         let error = language
             .call("other.module", "variants", &[Value::String(asset_id)])
+            .unwrap_err();
+        assert_eq!(error.code, "VID3003");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn job_language_view_hides_internal_error_text() {
+        let job = video_manager::VideoJob {
+            id: "job-id".into(),
+            asset_id: "asset-id".into(),
+            job_type: "download".into(),
+            state: "failed".into(),
+            progress: 0.45,
+            attempts: 1,
+            error: Some("/secret/internal/path ffmpeg failed".into()),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let value = public_job_value(job);
+        assert!(value.get("error").is_none());
+        assert_eq!(value["failed"], true);
+        assert_eq!(value["progress"], 0.45);
+    }
+
+    #[test]
+    fn job_lookup_enforces_asset_namespace_ownership() {
+        let path = temp_db("job-ownership");
+        let manager = Arc::new(VideoManager::open_default(&path, 7200).unwrap());
+        let language = VideoLanguage::new(Some(manager));
+        let queued = language
+            .call(
+                "owner.module",
+                "queueDownload",
+                &[
+                    Value::String("clips".into()),
+                    Value::String("Private".into()),
+                    Value::String("https://example.invalid/private.mp4".into()),
+                ],
+            )
+            .unwrap();
+        let job_id = queued["job"]["id"].as_str().unwrap().to_string();
+        let own = language
+            .call("owner.module", "job", &[Value::String(job_id.clone())])
+            .unwrap();
+        assert_eq!(own["id"], job_id);
+        assert!(own.get("error").is_none());
+        let error = language
+            .call("other.module", "job", &[Value::String(job_id)])
             .unwrap_err();
         assert_eq!(error.code, "VID3003");
         let _ = std::fs::remove_file(path);

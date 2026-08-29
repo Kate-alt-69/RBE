@@ -39,6 +39,13 @@ use uuid::Uuid;
 
 pub const DEFAULT_DATABASE_NAME: &str = "default";
 
+pub(crate) const PROGRESS_QUEUED: f64 = 0.0;
+pub(crate) const PROGRESS_DOWNLOADING: f64 = 0.05;
+pub(crate) const PROGRESS_DOWNLOADED: f64 = 0.45;
+pub(crate) const PROGRESS_CONTAINER_CHECKED: f64 = 0.55;
+pub(crate) const PROGRESS_PROBED: f64 = 0.70;
+pub(crate) const PROGRESS_NORMALIZING: f64 = 0.75;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoSourceType {
@@ -974,7 +981,7 @@ impl VideoManager {
             asset_id: asset.id.clone(),
             job_type: "download".into(),
             state: "queued".into(),
-            progress: 0.0,
+            progress: PROGRESS_QUEUED,
             attempts: 0,
             error: None,
             created_at_ms: now,
@@ -1011,7 +1018,7 @@ impl VideoManager {
             })?;
         if claimed.asset_id != queued.asset.id || claimed.job_type != "download" {
             let detail = "Video Manager claimed job does not match its queued download asset/type";
-            let _ = database.update_job(&claimed.id, "failed", 0.0, Some(detail));
+            let _ = database.update_job(&claimed.id, "failed", PROGRESS_DOWNLOADING, Some(detail));
             if claimed.job_type == "download" {
                 if let Ok(path) = self.quarantine_path(&claimed.asset_id, &claimed.id) {
                     let _ = std::fs::remove_file(path);
@@ -1020,6 +1027,7 @@ impl VideoManager {
             anyhow::bail!("{detail}");
         }
 
+        database.update_job(&claimed.id, "downloading", PROGRESS_DOWNLOADING, None)?;
         let mut claimed_download = queued.clone();
         claimed_download.job = claimed;
         match self
@@ -1027,14 +1035,17 @@ impl VideoManager {
             .await
         {
             Ok(receipt) => {
-                database.update_job(&queued.job.id, "downloaded", 1.0, None)?;
+                database.update_job(&queued.job.id, "downloaded", PROGRESS_DOWNLOADED, None)?;
                 Ok(receipt)
             }
             Err(error) => {
                 let detail = error.to_string();
-                if let Err(state_error) =
-                    database.update_job(&queued.job.id, "failed", 0.0, Some(&detail))
-                {
+                if let Err(state_error) = database.update_job(
+                    &queued.job.id,
+                    "failed",
+                    PROGRESS_DOWNLOADING,
+                    Some(&detail),
+                ) {
                     return Err(anyhow::anyhow!(
                         "Video Manager download failed: {detail}; additionally failed to persist job failure: {state_error}"
                     ));
@@ -1065,22 +1076,35 @@ impl VideoManager {
             })?;
         if transitioned.asset_id != queued.asset.id || transitioned.job_type != "download" {
             let detail = "Video Manager transitioned job does not match its download asset/type";
-            let _ = database.update_job(&transitioned.id, "failed", 1.0, Some(detail));
+            let _ = database.update_job(
+                &transitioned.id,
+                "failed",
+                PROGRESS_DOWNLOADED,
+                Some(detail),
+            );
             anyhow::bail!("{detail}");
         }
 
         let quarantine = self.quarantine_path(&transitioned.asset_id, &transitioned.id)?;
         match probe_quarantine_container(&quarantine).await {
             Ok(probe) => {
-                database.update_job(&transitioned.id, "container_checked", 1.0, None)?;
+                database.update_job(
+                    &transitioned.id,
+                    "container_checked",
+                    PROGRESS_CONTAINER_CHECKED,
+                    None,
+                )?;
                 Ok(probe)
             }
             Err(error) => {
                 let detail = error.to_string();
                 let _ = tokio::fs::remove_file(&quarantine).await;
-                if let Err(state_error) =
-                    database.update_job(&transitioned.id, "failed", 1.0, Some(&detail))
-                {
+                if let Err(state_error) = database.update_job(
+                    &transitioned.id,
+                    "failed",
+                    PROGRESS_DOWNLOADED,
+                    Some(&detail),
+                ) {
                     return Err(anyhow::anyhow!(
                         "Video Manager container inspection failed: {detail}; additionally failed to persist job failure: {state_error}"
                     ));
@@ -1112,22 +1136,30 @@ impl VideoManager {
             })?;
         if transitioned.asset_id != queued.asset.id || transitioned.job_type != "download" {
             let detail = "Video Manager FFprobe job does not match its download asset/type";
-            let _ = database.update_job(&transitioned.id, "failed", 1.0, Some(detail));
+            let _ = database.update_job(
+                &transitioned.id,
+                "failed",
+                PROGRESS_CONTAINER_CHECKED,
+                Some(detail),
+            );
             anyhow::bail!("{detail}");
         }
 
         let quarantine = self.quarantine_path(&transitioned.asset_id, &transitioned.id)?;
         match ffprobe::run_ffprobe(&quarantine, policy).await {
             Ok(probe) => {
-                database.update_job(&transitioned.id, "probed", 1.0, None)?;
+                database.update_job(&transitioned.id, "probed", PROGRESS_PROBED, None)?;
                 Ok(probe)
             }
             Err(error) => {
                 let detail = error.to_string();
                 let _ = tokio::fs::remove_file(&quarantine).await;
-                if let Err(state_error) =
-                    database.update_job(&transitioned.id, "failed", 1.0, Some(&detail))
-                {
+                if let Err(state_error) = database.update_job(
+                    &transitioned.id,
+                    "failed",
+                    PROGRESS_CONTAINER_CHECKED,
+                    Some(&detail),
+                ) {
                     return Err(anyhow::anyhow!(
                         "Video Manager FFprobe failed: {detail}; additionally failed to persist job failure: {state_error}"
                     ));
@@ -1266,6 +1298,15 @@ impl VideoManager {
     ) -> anyhow::Result<Option<VideoAsset>> {
         let (database_name, database) = self.resolve_database(database)?;
         database.get_asset(&database_name, asset_id)
+    }
+
+    pub fn get_job(
+        &self,
+        database: Option<&str>,
+        job_id: &str,
+    ) -> anyhow::Result<Option<VideoJob>> {
+        let (_, database) = self.resolve_database(database)?;
+        database.get_job(job_id)
     }
 
     pub fn list_variants(
@@ -2051,6 +2092,42 @@ mod tests {
         let degraded = manager.status().unwrap();
         assert_eq!(degraded.download_worker.state, VideoWorkerState::Degraded);
         assert!(!degraded.ok);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    const _: () = {
+        assert!(PROGRESS_QUEUED < PROGRESS_DOWNLOADING);
+        assert!(PROGRESS_DOWNLOADING < PROGRESS_DOWNLOADED);
+        assert!(PROGRESS_DOWNLOADED < PROGRESS_CONTAINER_CHECKED);
+        assert!(PROGRESS_CONTAINER_CHECKED < PROGRESS_PROBED);
+        assert!(PROGRESS_PROBED < PROGRESS_NORMALIZING);
+        assert!(PROGRESS_NORMALIZING < 1.0);
+    };
+
+    #[test]
+    fn job_lookup_and_progress_constants_form_a_monotonic_pipeline() {
+        assert_eq!(PROGRESS_QUEUED, 0.0);
+
+        let path = temp_db("job-lookup");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "progress".into(),
+                group: "queue".into(),
+                title: "Progress".into(),
+                url: "https://example.invalid/progress.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let job = manager.get_job(None, &queued.job.id).unwrap().unwrap();
+        assert_eq!(job.id, queued.job.id);
+        assert_eq!(job.progress, PROGRESS_QUEUED);
+        assert!(manager
+            .get_job(None, &Uuid::new_v4().to_string())
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

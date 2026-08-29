@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use anyhow::Context;
 use uuid::Uuid;
 
-use crate::{FfmpegPolicy, QueuedDownload, VideoManager, VideoVariant};
+use crate::{
+    FfmpegPolicy, QueuedDownload, VideoManager, VideoVariant, PROGRESS_NORMALIZING, PROGRESS_PROBED,
+};
 
 impl VideoManager {
     /// Normalize a probed quarantined download into the fixed standard profile,
@@ -27,10 +29,11 @@ impl VideoManager {
             })?;
         if transitioned.asset_id != queued.asset.id || transitioned.job_type != "download" {
             let detail = "Video Manager normalization job does not match its download asset/type";
-            let _ = database.update_job(&transitioned.id, "failed", 1.0, Some(detail));
+            let _ = database.update_job(&transitioned.id, "failed", PROGRESS_PROBED, Some(detail));
             anyhow::bail!("{detail}");
         }
 
+        database.update_job(&transitioned.id, "normalizing", PROGRESS_NORMALIZING, None)?;
         let quarantine = self.quarantine_path(&transitioned.asset_id, &transitioned.id)?;
         let (staging, final_path, stored_path) =
             self.normalized_paths(&transitioned.asset_id, &transitioned.id)?;
@@ -42,9 +45,12 @@ impl VideoManager {
             Err(error) => {
                 let detail = error.to_string();
                 let _ = tokio::fs::remove_file(&staging).await;
-                if let Err(state_error) =
-                    database.update_job(&transitioned.id, "failed", 1.0, Some(&detail))
-                {
+                if let Err(state_error) = database.update_job(
+                    &transitioned.id,
+                    "failed",
+                    PROGRESS_NORMALIZING,
+                    Some(&detail),
+                ) {
                     return Err(anyhow::anyhow!(
                         "Video Manager normalization failed: {detail}; additionally failed to persist job failure: {state_error}"
                     ));
@@ -57,9 +63,12 @@ impl VideoManager {
             let detail = format!("promote normalized Video Manager output: {error}");
             let _ = tokio::fs::remove_file(&staging).await;
             let _ = tokio::fs::remove_file(&final_path).await;
-            if let Err(state_error) =
-                database.update_job(&transitioned.id, "failed", 1.0, Some(&detail))
-            {
+            if let Err(state_error) = database.update_job(
+                &transitioned.id,
+                "failed",
+                PROGRESS_NORMALIZING,
+                Some(&detail),
+            ) {
                 return Err(anyhow::anyhow!(
                     "{detail}; additionally failed to persist job failure: {state_error}"
                 ));
@@ -102,9 +111,12 @@ impl VideoManager {
             Err(error) => {
                 let _ = tokio::fs::remove_file(&final_path).await;
                 let detail = error.to_string();
-                if let Err(state_error) =
-                    database.update_job(&transitioned.id, "failed", 1.0, Some(&detail))
-                {
+                if let Err(state_error) = database.update_job(
+                    &transitioned.id,
+                    "failed",
+                    PROGRESS_NORMALIZING,
+                    Some(&detail),
+                ) {
                     return Err(anyhow::anyhow!(
                         "Video Manager normalization commit failed: {detail}; additionally failed to persist job failure: {state_error}"
                     ));
