@@ -25,6 +25,7 @@ jobs:
         shell: bash
         run: |
           python ../.github/patches/video-live-runtime.py
+          python ../.github/patches/video-live-runtime-fix.py
           rustfmt --edition 2021 crates/video-manager/src/live_runtime.rs
           rustfmt --edition 2021 crates/video-manager/src/live.rs
           rustfmt --edition 2021 --config skip_children=true crates/video-manager/src/lib.rs
