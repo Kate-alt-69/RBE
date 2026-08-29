@@ -70,7 +70,8 @@ impl VideoManager {
         let (shutdown, shutdown_task) = watch::channel(false);
         let manager = self.clone();
         let join = tokio::spawn(async move {
-            run_live_runtime_coordinator(manager.clone(), driver, idle_timeout, shutdown_task).await;
+            run_live_runtime_coordinator(manager.clone(), driver, idle_timeout, shutdown_task)
+                .await;
             if let Err(error) = manager.set_live_runtime_state(VideoLiveRuntimeState::Disabled) {
                 tracing::error!(error = %error, "Video Manager live runtime exit telemetry failed");
             }
