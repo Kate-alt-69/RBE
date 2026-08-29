@@ -1,0 +1,97 @@
+name: Video Container Stage Patch
+
+on:
+  push:
+    branches:
+      - codex/service-runtime-video-manager
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/service-runtime-video-manager
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Wire container validation stage
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("engine/crates/video-manager/src/lib.rs")
+          text = path.read_text()
+
+          trait_anchor = "    fn update_job(\n        &self,\n        job_id: &str,\n        state: &str,\n        progress: f64,\n        error: Option<&str>,\n    ) -> anyhow::Result<()>;\n"
+          trait_new = trait_anchor + "    fn transition_job(\n        &self,\n        job_id: &str,\n        expected_state: &str,\n        next_state: &str,\n    ) -> anyhow::Result<Option<VideoJob>>;\n"
+          if "fn transition_job(" not in text:
+              if trait_anchor not in text:
+                  raise SystemExit("VideoDatabase transition trait anchor missing")
+              text = text.replace(trait_anchor, trait_new, 1)
+
+          get_job_anchor = "    fn get_job(&self, job_id: &str) -> anyhow::Result<Option<VideoJob>> {\n"
+          sqlite_transition = "    fn transition_job(\n        &self,\n        job_id: &str,\n        expected_state: &str,\n        next_state: &str,\n    ) -> anyhow::Result<Option<VideoJob>> {\n        validate_job_state(expected_state)?;\n        validate_job_state(next_state)?;\n        let now = now_ms();\n        let connection = self\n            .connection\n            .lock()\n            .map_err(|_| anyhow::anyhow!(\"Video Manager database mutex is poisoned\"))?;\n        let transaction = connection.unchecked_transaction()?;\n        let changed = transaction.execute(\n            \"UPDATE video_jobs SET state = ?1, error = NULL, updated_at_ms = ?2 WHERE id = ?3 AND state = ?4\",\n            params![next_state, now, job_id, expected_state],\n        )?;\n        if changed == 0 {\n            transaction.commit()?;\n            return Ok(None);\n        }\n        let job = transaction\n            .query_row(\n                \"SELECT id, asset_id, job_type, state, progress, attempts, error, created_at_ms, updated_at_ms FROM video_jobs WHERE id = ?1\",\n                params![job_id],\n                read_video_job,\n            )\n            .optional()?;\n        transaction.commit()?;\n        Ok(job)\n    }\n\n"
+          if "validate_job_state(next_state)?;" not in text:
+              pos = text.find(get_job_anchor)
+              if pos < 0:
+                  raise SystemExit("SQLite get_job transition anchor missing")
+              text = text[:pos] + sqlite_transition + text[pos:]
+
+          manager_anchor = "    pub fn get_asset(\n        &self,\n        database: Option<&str>,\n        asset_id: &str,\n    ) -> anyhow::Result<Option<VideoAsset>> {\n"
+          stage = "    /// Run the cheap fail-closed container signature gate on a completed download.\n    /// Passing this stage does not mark the asset ready; FFprobe still has to prove\n    /// that the object contains a decodable video stream.\n    pub async fn inspect_download_container(\n        &self,\n        queued: &QueuedDownload,\n    ) -> anyhow::Result<ContainerProbe> {\n        if queued.asset.id != queued.job.asset_id || queued.job.job_type != \"download\" {\n            anyhow::bail!(\"Video Manager container inspection identity/type mismatch\");\n        }\n        let (_, database) = self.resolve_database(Some(&queued.asset.database))?;\n        let transitioned = database\n            .transition_job(&queued.job.id, \"downloaded\", \"inspecting\")?\n            .ok_or_else(|| {\n                anyhow::anyhow!(\n                    \"Video Manager download job {:?} is not downloaded and cannot be inspected\",\n                    queued.job.id\n                )\n            })?;\n        if transitioned.asset_id != queued.asset.id || transitioned.job_type != \"download\" {\n            let detail = \"Video Manager transitioned job does not match its download asset/type\";\n            let _ = database.update_job(&transitioned.id, \"failed\", 1.0, Some(detail));\n            anyhow::bail!(\"{detail}\");\n        }\n\n        let quarantine = self.quarantine_path(&transitioned.asset_id, &transitioned.id)?;\n        match probe_quarantine_container(&quarantine).await {\n            Ok(probe) => {\n                database.update_job(&transitioned.id, \"container_checked\", 1.0, None)?;\n                Ok(probe)\n            }\n            Err(error) => {\n                let detail = error.to_string();\n                let _ = tokio::fs::remove_file(&quarantine).await;\n                if let Err(state_error) =\n                    database.update_job(&transitioned.id, \"failed\", 1.0, Some(&detail))\n                {\n                    return Err(anyhow::anyhow!(\n                        \"Video Manager container inspection failed: {detail}; additionally failed to persist job failure: {state_error}\"\n                    ));\n                }\n                Err(error)\n            }\n        }\n    }\n\n"
+          if "pub async fn inspect_download_container(" not in text:
+              pos = text.find(manager_anchor)
+              if pos < 0:
+                  raise SystemExit("VideoManager container-stage anchor missing")
+              text = text[:pos] + stage + text[pos:]
+
+          test_anchor = "    #[test]\n    fn explicit_unknown_database_does_not_fall_back() {\n"
+          tests = "    fn mark_downloaded(manager: &VideoManager, queued: &QueuedDownload) -> Arc<dyn VideoDatabase> {\n        let (_, database) = manager.resolve_database(None).unwrap();\n        database\n            .claim_job(&queued.job.id, \"queued\", \"downloading\")\n            .unwrap()\n            .unwrap();\n        database\n            .update_job(&queued.job.id, \"downloaded\", 1.0, None)\n            .unwrap();\n        database\n    }\n\n    #[tokio::test]\n    async fn container_stage_accepts_mp4_without_incrementing_attempts() {\n        let path = temp_db(\"container-pass\");\n        let manager = VideoManager::open_default(&path, 7200).unwrap();\n        let queued = manager\n            .queue_download(QueueDownloadRequest {\n                database: None,\n                namespace_kind: \"module\".into(),\n                namespace_owner: \"worker\".into(),\n                group: \"validation\".into(),\n                title: \"MP4\".into(),\n                url: \"https://example.invalid/video.mp4\".into(),\n                metadata: serde_json::Value::Null,\n            })\n            .unwrap();\n        let database = mark_downloaded(&manager, &queued);\n        let quarantine = manager.quarantine_path(&queued.asset.id, &queued.job.id).unwrap();\n        std::fs::write(\n            &quarantine,\n            b\"\\x00\\x00\\x00\\x18ftypmp42\\x00\\x00\\x00\\x00mp42isom\",\n        )\n        .unwrap();\n        let probe = manager.inspect_download_container(&queued).await.unwrap();\n        assert_eq!(probe.kind, VideoContainerKind::IsoBmff);\n        let stored = database.get_job(&queued.job.id).unwrap().unwrap();\n        assert_eq!(stored.state, \"container_checked\");\n        assert_eq!(stored.attempts, 1);\n        assert!(quarantine.exists());\n        let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();\n        assert_eq!(asset.state, VideoAssetState::Quarantined);\n        let _ = std::fs::remove_dir_all(path.parent().unwrap());\n    }\n\n    #[tokio::test]\n    async fn container_stage_rejects_unknown_bytes_and_deletes_quarantine() {\n        let path = temp_db(\"container-reject\");\n        let manager = VideoManager::open_default(&path, 7200).unwrap();\n        let queued = manager\n            .queue_download(QueueDownloadRequest {\n                database: None,\n                namespace_kind: \"module\".into(),\n                namespace_owner: \"worker\".into(),\n                group: \"validation\".into(),\n                title: \"Bad\".into(),\n                url: \"https://example.invalid/video.mp4\".into(),\n                metadata: serde_json::Value::Null,\n            })\n            .unwrap();\n        let database = mark_downloaded(&manager, &queued);\n        let quarantine = manager.quarantine_path(&queued.asset.id, &queued.job.id).unwrap();\n        std::fs::write(&quarantine, b\"definitely not a video container\").unwrap();\n        assert!(manager.inspect_download_container(&queued).await.is_err());\n        let stored = database.get_job(&queued.job.id).unwrap().unwrap();\n        assert_eq!(stored.state, \"failed\");\n        assert_eq!(stored.attempts, 1);\n        assert!(stored\n            .error\n            .as_deref()\n            .is_some_and(|error| error.contains(\"container signature\")));\n        assert!(!quarantine.exists());\n        let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();\n        assert_eq!(asset.state, VideoAssetState::Quarantined);\n        let _ = std::fs::remove_dir_all(path.parent().unwrap());\n    }\n\n"
+          if "fn container_stage_accepts_mp4_without_incrementing_attempts()" not in text:
+              pos = text.find(test_anchor)
+              if pos < 0:
+                  raise SystemExit("Video Manager container-stage test anchor missing")
+              text = text[:pos] + tests + text[pos:]
+
+          path.write_text(text)
+          PY
+      - name: Format Video Manager container stage
+        working-directory: engine
+        run: rustfmt --edition 2021 crates/video-manager/src/lib.rs crates/video-manager/src/container_probe.rs
+      - name: Clippy workspace locked
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace locked
+        working-directory: engine
+        run: cargo test --workspace --locked
+      - name: Commit validated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only)"
+          printf '%s\n' "$changed"
+          unexpected="$(printf '%s\n' "$changed" | grep -vE '^engine/crates/video-manager/src/(lib|container_probe)\.rs$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected changed paths:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          if git diff --quiet; then
+            echo "No semantic source changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/crates/video-manager/src/lib.rs engine/crates/video-manager/src/container_probe.rs
+          git commit -m "feat: gate downloads by container signature"
+          git push origin HEAD:codex/service-runtime-video-manager
