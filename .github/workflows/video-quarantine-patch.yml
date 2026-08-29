@@ -1,0 +1,115 @@
+name: Video Quarantine Patch
+
+on:
+  push:
+    branches:
+      - codex/service-runtime-video-manager
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/service-runtime-video-manager
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Add guarded quarantine storage
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("engine/crates/video-manager/src/lib.rs")
+          text = path.read_text()
+
+          old_struct = "pub struct VideoManager {\n    databases: RwLock<HashMap<String, Arc<dyn VideoDatabase>>>,\n    default_database: String,\n    live_idle_secs: u64,\n}\n"
+          new_struct = "pub struct VideoManager {\n    databases: RwLock<HashMap<String, Arc<dyn VideoDatabase>>>,\n    default_database: String,\n    quarantine_root: PathBuf,\n    live_idle_secs: u64,\n}\n"
+          if old_struct in text:
+              text = text.replace(old_struct, new_struct, 1)
+          elif new_struct not in text:
+              raise SystemExit("video manager quarantine field anchor missing")
+
+          old_open = "        let default: Arc<dyn VideoDatabase> =\n            Arc::new(SqliteVideoDatabase::open(database_path.as_ref())?);\n        let mut databases = HashMap::new();\n        databases.insert(DEFAULT_DATABASE_NAME.to_string(), default);\n        Ok(Self {\n            databases: RwLock::new(databases),\n            default_database: DEFAULT_DATABASE_NAME.into(),\n            live_idle_secs,\n        })\n"
+          new_open = "        let database_path = database_path.as_ref();\n        let default: Arc<dyn VideoDatabase> = Arc::new(SqliteVideoDatabase::open(database_path)?);\n        let data_dir = database_path\n            .parent()\n            .filter(|parent| !parent.as_os_str().is_empty())\n            .unwrap_or_else(|| Path::new(\".\"));\n        let quarantine_root = data_dir.join(\"quarantine\").join(\"downloads\");\n        std::fs::create_dir_all(&quarantine_root).with_context(|| {\n            format!(\n                \"create Video Manager quarantine directory {}\",\n                quarantine_root.display()\n            )\n        })?;\n        let quarantine_root = std::fs::canonicalize(&quarantine_root).with_context(|| {\n            format!(\n                \"canonicalize Video Manager quarantine directory {}\",\n                quarantine_root.display()\n            )\n        })?;\n        let mut databases = HashMap::new();\n        databases.insert(DEFAULT_DATABASE_NAME.to_string(), default);\n        Ok(Self {\n            databases: RwLock::new(databases),\n            default_database: DEFAULT_DATABASE_NAME.into(),\n            quarantine_root,\n            live_idle_secs,\n        })\n"
+          if old_open in text:
+              text = text.replace(old_open, new_open, 1)
+          elif "quarantine_root," not in text:
+              raise SystemExit("video manager open quarantine anchor missing")
+
+          old_insert = "        let (_, database) = self.resolve_database(database_selection.as_deref())?;\n        database.insert_job(&job)?;\n        Ok(QueuedDownload { asset, job })\n"
+          new_insert = "        let (_, database) = self.resolve_database(database_selection.as_deref())?;\n        let quarantine_path = self.reserve_download_quarantine(&asset.id, &job.id)?;\n        if let Err(error) = database.insert_job(&job) {\n            let _ = std::fs::remove_file(&quarantine_path);\n            return Err(error);\n        }\n        Ok(QueuedDownload { asset, job })\n"
+          if old_insert in text:
+              text = text.replace(old_insert, new_insert, 1)
+          elif "reserve_download_quarantine(&asset.id, &job.id)" not in text:
+              raise SystemExit("video queue quarantine reservation anchor missing")
+
+          method_anchor = "    fn resolve_database(\n"
+          methods = "    fn quarantine_path(&self, asset_id: &str, job_id: &str) -> anyhow::Result<PathBuf> {\n        validate_generated_uuid(\"asset id\", asset_id)?;\n        validate_generated_uuid(\"job id\", job_id)?;\n        Ok(self\n            .quarantine_root\n            .join(asset_id)\n            .join(format!(\"{job_id}.part\")))\n    }\n\n    fn reserve_download_quarantine(\n        &self,\n        asset_id: &str,\n        job_id: &str,\n    ) -> anyhow::Result<PathBuf> {\n        let path = self.quarantine_path(asset_id, job_id)?;\n        let asset_dir = path\n            .parent()\n            .ok_or_else(|| anyhow::anyhow!(\"Video Manager quarantine path has no parent\"))?;\n        std::fs::create_dir_all(asset_dir).with_context(|| {\n            format!(\n                \"create Video Manager asset quarantine directory {}\",\n                asset_dir.display()\n            )\n        })?;\n        let canonical_asset_dir = std::fs::canonicalize(asset_dir).with_context(|| {\n            format!(\n                \"canonicalize Video Manager asset quarantine directory {}\",\n                asset_dir.display()\n            )\n        })?;\n        if !canonical_asset_dir.starts_with(&self.quarantine_root) {\n            anyhow::bail!(\"Video Manager quarantine directory escaped its storage root\");\n        }\n        let canonical_path = canonical_asset_dir.join(\n            path.file_name()\n                .ok_or_else(|| anyhow::anyhow!(\"Video Manager quarantine path has no filename\"))?,\n        );\n        std::fs::OpenOptions::new()\n            .write(true)\n            .create_new(true)\n            .open(&canonical_path)\n            .with_context(|| {\n                format!(\n                    \"reserve Video Manager quarantine file {}\",\n                    canonical_path.display()\n                )\n            })?;\n        Ok(canonical_path)\n    }\n\n"
+          if "fn reserve_download_quarantine(" not in text:
+              if method_anchor not in text:
+                  raise SystemExit("video quarantine method anchor missing")
+              text = text.replace(method_anchor, methods + method_anchor, 1)
+
+          segment_anchor = "fn validate_segment(label: &str, value: &str) -> anyhow::Result<()> {\n"
+          uuid_helper = "fn validate_generated_uuid(label: &str, value: &str) -> anyhow::Result<()> {\n    let parsed = Uuid::parse_str(value)\n        .with_context(|| format!(\"Video Manager {label} is not a UUID: {value:?}\"))?;\n    if parsed.hyphenated().to_string() != value {\n        anyhow::bail!(\"Video Manager {label} must use canonical lowercase UUID form\");\n    }\n    Ok(())\n}\n\n"
+          if "fn validate_generated_uuid(" not in text:
+              if segment_anchor not in text:
+                  raise SystemExit("video generated UUID helper anchor missing")
+              text = text.replace(segment_anchor, uuid_helper + segment_anchor, 1)
+
+          job_assert = '        assert_eq!(queued.job.state, "queued");\n'
+          quarantine_assert = '        assert_eq!(queued.job.state, "queued");\n        let quarantine_path = manager\n            .quarantine_path(&queued.asset.id, &queued.job.id)\n            .unwrap();\n        assert!(quarantine_path.is_file());\n        assert_eq!(quarantine_path.metadata().unwrap().len(), 0);\n        let expected_root = std::fs::canonicalize(\n            path.parent().unwrap().join("quarantine").join("downloads"),\n        )\n        .unwrap();\n        assert!(quarantine_path.starts_with(expected_root));\n'
+          if "let quarantine_path = manager" not in text:
+              if job_assert not in text:
+                  raise SystemExit("video quarantine integration assertion anchor missing")
+              text = text.replace(job_assert, quarantine_assert, 1)
+
+          unknown_test = "    #[test]\n    fn explicit_unknown_database_does_not_fall_back() {\n"
+          path_test = "    #[test]\n    fn quarantine_paths_reject_noncanonical_generated_ids() {\n        let path = temp_db(\"quarantine-path\");\n        let manager = VideoManager::open_default(&path, 7200).unwrap();\n        let valid = Uuid::new_v4().to_string();\n        assert!(manager.quarantine_path(\"../escape\", &valid).is_err());\n        assert!(manager.quarantine_path(&valid.to_uppercase(), &valid).is_err());\n        let _ = std::fs::remove_file(path);\n    }\n\n"
+          if "fn quarantine_paths_reject_noncanonical_generated_ids()" not in text:
+              if unknown_test not in text:
+                  raise SystemExit("video quarantine path test anchor missing")
+              text = text.replace(unknown_test, path_test + unknown_test, 1)
+
+          path.write_text(text)
+          PY
+      - name: Format Video Manager quarantine slice
+        working-directory: engine
+        run: rustfmt --edition 2021 crates/video-manager/src/lib.rs crates/video-manager/src/download.rs
+      - name: Clippy workspace
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace
+        working-directory: engine
+        run: cargo test --workspace --locked
+      - name: Commit validated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only)"
+          printf '%s\n' "$changed"
+          unexpected="$(printf '%s\n' "$changed" | grep -vE '^engine/crates/video-manager/src/(lib|download)\.rs$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected changed paths:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          if git diff --quiet; then
+            echo "No semantic source changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/crates/video-manager/src/lib.rs engine/crates/video-manager/src/download.rs
+          git commit -m "feat: reserve video download quarantine files"
+          git push origin HEAD:codex/service-runtime-video-manager
