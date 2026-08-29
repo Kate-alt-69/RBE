@@ -159,8 +159,8 @@ pub async fn run_ffprobe(
         anyhow::bail!("Video Manager FFprobe exited with {status}: {detail}");
     }
 
-    let raw: RawProbe = serde_json::from_slice(&stdout)
-        .context("parse Video Manager FFprobe JSON output")?;
+    let raw: RawProbe =
+        serde_json::from_slice(&stdout).context("parse Video Manager FFprobe JSON output")?;
     build_media_probe(raw)
 }
 
@@ -249,13 +249,16 @@ fn build_media_probe(raw: RawProbe) -> anyhow::Result<MediaProbe> {
         let height = stream
             .height
             .filter(|value| *value > 0 && *value <= MAX_VIDEO_DIMENSION)
-            .ok_or_else(|| anyhow::anyhow!("Video Manager FFprobe reported invalid video height"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Video Manager FFprobe reported invalid video height")
+            })?;
         let frame_rate = stream
             .avg_frame_rate
             .as_deref()
             .and_then(parse_ratio)
             .or_else(|| stream.r_frame_rate.as_deref().and_then(parse_ratio));
-        if frame_rate.is_some_and(|rate| !rate.is_finite() || rate <= 0.0 || rate > MAX_VIDEO_FRAME_RATE)
+        if frame_rate
+            .is_some_and(|rate| !rate.is_finite() || rate <= 0.0 || rate > MAX_VIDEO_FRAME_RATE)
         {
             anyhow::bail!("Video Manager FFprobe reported invalid video frame rate");
         }

@@ -8,6 +8,7 @@
 mod container_probe;
 mod download;
 mod download_worker;
+mod ffprobe;
 
 pub use container_probe::{
     probe_quarantine_container, sniff_video_container, ContainerProbe, VideoContainerKind,
@@ -17,6 +18,7 @@ pub use download::{
     ResolvedDownloadTarget,
 };
 pub use download_worker::{DownloadPolicy, DownloadReceipt};
+pub use ffprobe::{FfprobePolicy, MediaProbe, VideoStreamProbe};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -754,6 +756,53 @@ impl VideoManager {
         }
     }
 
+    /// Run trusted FFprobe only after the cheap container gate accepted the file.
+    /// A successful probe still leaves the asset quarantined; normalization and final
+    /// promotion are separate stages.
+    pub async fn probe_download_media(
+        &self,
+        queued: &QueuedDownload,
+        policy: &FfprobePolicy,
+    ) -> anyhow::Result<MediaProbe> {
+        if queued.asset.id != queued.job.asset_id || queued.job.job_type != "download" {
+            anyhow::bail!("Video Manager FFprobe identity/type mismatch");
+        }
+        let (_, database) = self.resolve_database(Some(&queued.asset.database))?;
+        let transitioned = database
+            .transition_job(&queued.job.id, "container_checked", "probing")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Video Manager download job {:?} has not passed container validation",
+                    queued.job.id
+                )
+            })?;
+        if transitioned.asset_id != queued.asset.id || transitioned.job_type != "download" {
+            let detail = "Video Manager FFprobe job does not match its download asset/type";
+            let _ = database.update_job(&transitioned.id, "failed", 1.0, Some(detail));
+            anyhow::bail!("{detail}");
+        }
+
+        let quarantine = self.quarantine_path(&transitioned.asset_id, &transitioned.id)?;
+        match ffprobe::run_ffprobe(&quarantine, policy).await {
+            Ok(probe) => {
+                database.update_job(&transitioned.id, "probed", 1.0, None)?;
+                Ok(probe)
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                let _ = tokio::fs::remove_file(&quarantine).await;
+                if let Err(state_error) =
+                    database.update_job(&transitioned.id, "failed", 1.0, Some(&detail))
+                {
+                    return Err(anyhow::anyhow!(
+                        "Video Manager FFprobe failed: {detail}; additionally failed to persist job failure: {state_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn get_asset(
         &self,
         database: Option<&str>,
@@ -1232,6 +1281,92 @@ mod tests {
         assert!(!quarantine.exists());
         let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();
         assert_eq!(asset.state, VideoAssetState::Quarantined);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ffprobe_stage_records_worker_failure_and_deletes_quarantine() {
+        let path = temp_db("ffprobe-failure");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "validation".into(),
+                title: "Probe".into(),
+                url: "https://example.invalid/video.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let database = mark_downloaded(&manager, &queued);
+        let quarantine = manager
+            .quarantine_path(&queued.asset.id, &queued.job.id)
+            .unwrap();
+        std::fs::write(
+            &quarantine,
+            b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom",
+        )
+        .unwrap();
+        manager.inspect_download_container(&queued).await.unwrap();
+        let missing = std::env::temp_dir().join(format!("rbe-missing-ffprobe-{}", Uuid::new_v4()));
+        let policy = FfprobePolicy::new(missing);
+        assert!(manager
+            .probe_download_media(&queued, &policy)
+            .await
+            .is_err());
+        let stored = database.get_job(&queued.job.id).unwrap().unwrap();
+        assert_eq!(stored.state, "failed");
+        assert_eq!(stored.attempts, 1);
+        assert!(stored
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("FFprobe executable")));
+        assert!(!quarantine.exists());
+        let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();
+        assert_eq!(asset.state, VideoAssetState::Quarantined);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn losing_ffprobe_transition_preserves_quarantine() {
+        let path = temp_db("ffprobe-claim");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "validation".into(),
+                title: "Probe Claim".into(),
+                url: "https://example.invalid/video.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let database = mark_downloaded(&manager, &queued);
+        let quarantine = manager
+            .quarantine_path(&queued.asset.id, &queued.job.id)
+            .unwrap();
+        std::fs::write(
+            &quarantine,
+            b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom",
+        )
+        .unwrap();
+        manager.inspect_download_container(&queued).await.unwrap();
+        database
+            .transition_job(&queued.job.id, "container_checked", "probing")
+            .unwrap()
+            .unwrap();
+        let missing = std::env::temp_dir().join(format!("rbe-missing-ffprobe-{}", Uuid::new_v4()));
+        let policy = FfprobePolicy::new(missing);
+        assert!(manager
+            .probe_download_media(&queued, &policy)
+            .await
+            .is_err());
+        assert!(quarantine.exists());
+        let stored = database.get_job(&queued.job.id).unwrap().unwrap();
+        assert_eq!(stored.state, "probing");
+        assert_eq!(stored.attempts, 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
