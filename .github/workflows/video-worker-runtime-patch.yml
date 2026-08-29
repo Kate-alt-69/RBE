@@ -27,19 +27,24 @@ jobs:
           (cd .. && python .github/patches/video-worker-runtime.py)
           python - <<'PY'
           from pathlib import Path
+          import re
           path = Path("crates/backend/src/main.rs")
           source = path.read_text()
-          old = '''            let mut download = video_manager::DownloadPolicy::default();
-                      download.max_bytes = config.video_manager.download_max_bytes;
-          '''.replace('          ', '')
-          new = '''            let download = video_manager::DownloadPolicy {
-                      max_bytes: config.video_manager.download_max_bytes,
-                      ..Default::default()
-                  };
-          '''.replace('          ', '')
-          if old not in source:
-              raise SystemExit("Video Manager DownloadPolicy lint anchor missing")
-          path.write_text(source.replace(old, new, 1))
+          pattern = re.compile(
+              r'(?m)^(?P<indent>\s*)let mut download = video_manager::DownloadPolicy::default\(\);\n(?P=indent)download\.max_bytes = config\.video_manager\.download_max_bytes;'
+          )
+          def replacement(match):
+              indent = match.group('indent')
+              return (
+                  f"{indent}let download = video_manager::DownloadPolicy {{\n"
+                  f"{indent}    max_bytes: config.video_manager.download_max_bytes,\n"
+                  f"{indent}    ..Default::default()\n"
+                  f"{indent}}};"
+              )
+          source, count = pattern.subn(replacement, source, count=1)
+          if count != 1:
+              raise SystemExit(f"Video Manager DownloadPolicy lint anchor count={count}")
+          path.write_text(source)
           PY
           rustfmt --edition 2021 \
             crates/video-manager/src/lib.rs \
