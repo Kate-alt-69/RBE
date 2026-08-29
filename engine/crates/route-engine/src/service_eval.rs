@@ -31,11 +31,11 @@ impl ServiceHostCapabilities {
 
 impl HostCapabilityCaller for ServiceHostCapabilities {
     fn call<'a>(
-        &'a self,
-        module: &'a str,
-        function: &'a str,
-        args: Vec<Value>,
-    ) -> HostCapabilityFuture<'a> {
+    &'a self,
+    module: &'a str,
+    function: &'a str,
+    args: Vec<Value>,
+) -> HostCapabilityFuture<'a> {
         Box::pin(async move {
             if module != "memory" {
                 return Ok(None);

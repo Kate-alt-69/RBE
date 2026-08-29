@@ -903,11 +903,11 @@ mod tests {
 
     impl HostCapabilityCaller for TestHostCapability {
         fn call<'a>(
-            &'a self,
-            module: &'a str,
-            function: &'a str,
-            args: Vec<Value>,
-        ) -> HostCapabilityFuture<'a> {
+    &'a self,
+    module: &'a str,
+    function: &'a str,
+    args: Vec<Value>,
+) -> HostCapabilityFuture<'a> {
             Box::pin(async move {
                 if module == "host" && function == "double" {
                     let Some(Value::Number(value)) = args.into_iter().next() else {
