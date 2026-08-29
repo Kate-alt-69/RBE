@@ -25,6 +25,16 @@ jobs:
         shell: bash
         run: |
           (cd .. && python .github/patches/video-worker-shutdown.py)
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/video-manager/src/worker.rs")
+          source = path.read_text()
+          old = 'VideoManager::open_default(&root.join("video-manager.db"), 7200)'
+          new = 'VideoManager::open_default(root.join("video-manager.db"), 7200)'
+          if old not in source:
+              raise SystemExit("Video Manager shutdown test lint anchor missing")
+          path.write_text(source.replace(old, new, 1))
+          PY
           rustfmt --edition 2021 \
             crates/video-manager/src/worker.rs \
             crates/video-manager/src/lib.rs \
