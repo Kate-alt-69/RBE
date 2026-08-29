@@ -1,0 +1,97 @@
+name: Video Download Worker Patch
+
+on:
+  push:
+    branches:
+      - codex/service-runtime-video-manager
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/service-runtime-video-manager
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Wire quarantined download worker
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cargo = Path("engine/crates/video-manager/Cargo.toml")
+          cargo_text = cargo.read_text()
+          dependency_anchor = "anyhow = { workspace = true }\n"
+          dependencies = "anyhow = { workspace = true }\nreqwest = { version = \"0.12\", default-features = false, features = [\"rustls-tls\", \"stream\"] }\ntokio = { workspace = true }\n"
+          if "reqwest =" not in cargo_text:
+              if dependency_anchor not in cargo_text:
+                  raise SystemExit("video-manager dependency anchor missing")
+              cargo_text = cargo_text.replace(dependency_anchor, dependencies, 1)
+          cargo.write_text(cargo_text)
+
+          lib = Path("engine/crates/video-manager/src/lib.rs")
+          text = lib.read_text()
+          module_anchor = "mod download;\n\npub use download::{\n"
+          module_replacement = "mod download;\nmod download_worker;\n\npub use download::{\n"
+          if "mod download_worker;" not in text:
+              if module_anchor not in text:
+                  raise SystemExit("video download worker module anchor missing")
+              text = text.replace(module_anchor, module_replacement, 1)
+
+          export_anchor = "    ResolvedDownloadTarget,\n};\n\nuse std::collections::HashMap;\n"
+          export_replacement = "    ResolvedDownloadTarget,\n};\npub use download_worker::{DownloadPolicy, DownloadReceipt};\n\nuse std::collections::HashMap;\n"
+          if "pub use download_worker::{DownloadPolicy, DownloadReceipt};" not in text:
+              if export_anchor not in text:
+                  raise SystemExit("video download worker export anchor missing")
+              text = text.replace(export_anchor, export_replacement, 1)
+
+          old_doc = "//! This crate intentionally does **not** run FFmpeg, RTMP, HLS, or arbitrary\n//! downloads yet. It owns stable video identity, the default database, custom\n//! database adapter registration, and job records so media workers can remain\n//! isolated and lazy.\n"
+          new_doc = "//! This crate intentionally does **not** run FFmpeg, RTMP, or HLS yet. It owns\n//! stable video identity, quarantine-safe HTTP download transport, the default\n//! database, custom database adapter registration, and job records so heavy\n//! media workers can remain isolated and lazy.\n"
+          if old_doc in text:
+              text = text.replace(old_doc, new_doc, 1)
+
+          lib.write_text(text)
+          PY
+      - name: Refresh lockfile for worker dependencies
+        working-directory: engine
+        run: cargo check -p video-manager
+      - name: Format Video Manager worker slice
+        working-directory: engine
+        run: rustfmt --edition 2021 crates/video-manager/src/lib.rs crates/video-manager/src/download.rs crates/video-manager/src/download_worker.rs
+      - name: Clippy workspace locked
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace locked
+        working-directory: engine
+        run: cargo test --workspace --locked
+      - name: Commit validated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only)"
+          printf '%s\n' "$changed"
+          unexpected="$(printf '%s\n' "$changed" | grep -vE '^engine/(Cargo\.lock|crates/video-manager/(Cargo\.toml|src/(lib|download|download_worker)\.rs))$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected changed paths:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          if git diff --quiet; then
+            echo "No semantic source changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/Cargo.lock engine/crates/video-manager/Cargo.toml engine/crates/video-manager/src/lib.rs engine/crates/video-manager/src/download.rs engine/crates/video-manager/src/download_worker.rs
+          git commit -m "feat: fetch video downloads into quarantine"
+          git push origin HEAD:codex/service-runtime-video-manager
