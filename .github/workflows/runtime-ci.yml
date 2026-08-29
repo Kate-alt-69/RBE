@@ -35,6 +35,7 @@ jobs:
             crates/video-manager/src/ffprobe.rs \
             crates/video-manager/src/ffmpeg.rs \
             crates/video-manager/src/normalization.rs \
+            crates/video-manager/src/pipeline.rs \
             crates/core/src/video_language.rs \
             crates/api/src/health.rs \
             crates/route-engine/src/ast.rs \
