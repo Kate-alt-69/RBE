@@ -74,7 +74,8 @@ impl VideoManager {
                 run_live_runtime_coordinator(manager.clone(), driver, idle_timeout, shutdown_task)
                     .await;
             if clean_exit {
-                if let Err(error) = manager.set_live_runtime_state(VideoLiveRuntimeState::Disabled) {
+                if let Err(error) = manager.set_live_runtime_state(VideoLiveRuntimeState::Disabled)
+                {
                     tracing::error!(error = %error, "Video Manager live runtime exit telemetry failed");
                 }
                 manager
