@@ -12,34 +12,51 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: seed constructor anchor
+      - name: seed video language anchors
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
+
           path = Path("engine/crates/route-engine/src/module_eval.rs")
           source = path.read_text()
-          normal = '''    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {
-                  Self::with_service_caller(program, Arc::new(services))
-              }
-          '''.replace('          ', '')
-          seeded = '''    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {
-              Self::with_service_caller(program, Arc::new(services))
-          }
-          '''.replace('          ', '')
-          # The main guard accidentally expects its inner line/brace one indentation level left.
-          normal = "    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {\n        Self::with_service_caller(program, Arc::new(services))\n    }\n"
-          seeded = "    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {\n    Self::with_service_caller(program, Arc::new(services))\n}\n"
-          if normal in source:
-              path.write_text(source.replace(normal, seeded, 1))
-          elif seeded not in source:
+
+          # The semantic patch currently expects its constructor body one
+          # indentation level left. Keep that quirk isolated to this seed.
+          normal_constructor = "    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {\n        Self::with_service_caller(program, Arc::new(services))\n    }\n"
+          seeded_constructor = "    pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {\n    Self::with_service_caller(program, Arc::new(services))\n}\n"
+          if normal_constructor in source:
+              source = source.replace(normal_constructor, seeded_constructor, 1)
+          elif seeded_constructor not in source:
               raise SystemExit("with_services source anchor missing")
+
+          # Same issue for the private helper call: the semantic patch expects
+          # the arguments/closing paren shifted left. Rust accepts the whitespace;
+          # the semantic patch immediately replaces it and rustfmt restores it.
+          normal_helper = '''                                .call_function(
+                                    self.file.clone(),
+                                    &function.name,
+                                    args,
+                                    self.depth + 1,
+                                )'''
+          seeded_helper = '''                                .call_function(
+                            self.file.clone(),
+                            &function.name,
+                            args,
+                            self.depth + 1,
+                        )'''
+          if normal_helper in source:
+              source = source.replace(normal_helper, seeded_helper, 1)
+          elif seeded_helper not in source:
+              raise SystemExit("module helper source anchor missing")
+
+          path.write_text(source)
           PY
           git diff --check
           if ! git diff --quiet; then
             git config user.name "Kate"
             git config user.email "dhwanksh2000@gmail.com"
             git add -- engine/crates/route-engine/src/module_eval.rs
-            git commit -m "ci: seed video constructor anchor"
+            git commit -m "ci: seed video language anchors"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
