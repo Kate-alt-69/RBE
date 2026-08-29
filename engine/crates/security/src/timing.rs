@@ -89,6 +89,10 @@ pub async fn request_timing(
     let duration_ms = elapsed.as_secs_f64() * 1000.0;
     let status = response.status().as_u16();
 
+    if let Ok(value) = HeaderValue::from_str(&format!("total;dur={duration_ms:.3}")) {
+        response.headers_mut().insert("server-timing", value);
+    }
+
     let response_cors_origin = header(response.headers(), "access-control-allow-origin");
     let response_cors_methods = header(response.headers(), "access-control-allow-methods");
     let response_cors_headers = header(response.headers(), "access-control-allow-headers");
@@ -175,10 +179,6 @@ pub async fn request_timing(
                 0,
             );
         }
-    }
-
-    if let Ok(value) = HeaderValue::from_str(&format!("total;dur={duration_ms:.3}")) {
-        response.headers_mut().insert("server-timing", value);
     }
 
     response
