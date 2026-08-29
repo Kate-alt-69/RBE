@@ -33,28 +33,14 @@ jobs:
           text = path.read_text()
 
           module_anchor = "use std::collections::HashMap;\n"
-          module_block = """mod download;
-
-pub use download::{
-    is_public_download_ip, parse_download_target, resolve_download_target, DownloadTarget,
-    ResolvedDownloadTarget,
-};
-
-use std::collections::HashMap;
-"""
+          module_block = "mod download;\n\npub use download::{\n    is_public_download_ip, parse_download_target, resolve_download_target, DownloadTarget,\n    ResolvedDownloadTarget,\n};\n\nuse std::collections::HashMap;\n"
           if "mod download;" not in text:
               if module_anchor not in text:
                   raise SystemExit("video download module anchor missing")
               text = text.replace(module_anchor, module_block, 1)
 
-          old_guard = """        if !request.url.starts_with(\"https://\") {
-            anyhow::bail!(\"Video Manager downloads currently require an https:// URL\");
-        }
-        let database_selection = request.database.clone();
-"""
-          new_guard = """        let target = parse_download_target(&request.url)?;
-        let database_selection = request.database.clone();
-"""
+          old_guard = "        if !request.url.starts_with(\"https://\") {\n            anyhow::bail!(\"Video Manager downloads currently require an https:// URL\");\n        }\n        let database_selection = request.database.clone();\n"
+          new_guard = "        let target = parse_download_target(&request.url)?;\n        let database_selection = request.database.clone();\n"
           if old_guard in text:
               text = text.replace(old_guard, new_guard, 1)
           elif new_guard not in text:
@@ -75,13 +61,8 @@ use std::collections::HashMap;
               raise SystemExit("video queue normalization test anchor missing")
 
           state_assert = "        assert_eq!(queued.asset.state, VideoAssetState::Quarantined);\n"
-          source_assert = """        assert_eq!(queued.asset.state, VideoAssetState::Quarantined);
-        assert_eq!(
-            queued.asset.source_uri.as_deref(),
-            Some(\"https://example.invalid/avatar.mp4\")
-        );
-"""
-          if "Some(\"https://example.invalid/avatar.mp4\")" not in text:
+          source_assert = "        assert_eq!(queued.asset.state, VideoAssetState::Quarantined);\n        assert_eq!(\n            queued.asset.source_uri.as_deref(),\n            Some(\"https://example.invalid/avatar.mp4\")\n        );\n"
+          if 'Some("https://example.invalid/avatar.mp4")' not in text:
               if state_assert not in text:
                   raise SystemExit("video queue source assertion anchor missing")
               text = text.replace(state_assert, source_assert, 1)
