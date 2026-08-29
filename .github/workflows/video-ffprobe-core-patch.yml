@@ -1,4 +1,4 @@
-name: Video FFprobe Core Patch
+name: Video FFprobe Pipeline Patch
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: Wire trusted FFprobe worker core
+      - name: Wire trusted FFprobe pipeline
         shell: bash
         run: |
           python3 - <<'PY'
@@ -44,9 +44,26 @@ jobs:
               if export_anchor not in text:
                   raise SystemExit("Video Manager FFprobe export anchor missing")
               text = text.replace(export_anchor, export_new, 1)
+
+          manager_anchor = "    pub fn get_asset(\n        &self,\n        database: Option<&str>,\n        asset_id: &str,\n    ) -> anyhow::Result<Option<VideoAsset>> {\n"
+          stage = "    /// Run trusted FFprobe only after the cheap container gate accepted the file.\n    /// A successful probe still leaves the asset quarantined; normalization and final\n    /// promotion are separate stages.\n    pub async fn probe_download_media(\n        &self,\n        queued: &QueuedDownload,\n        policy: &FfprobePolicy,\n    ) -> anyhow::Result<MediaProbe> {\n        if queued.asset.id != queued.job.asset_id || queued.job.job_type != \"download\" {\n            anyhow::bail!(\"Video Manager FFprobe identity/type mismatch\");\n        }\n        let (_, database) = self.resolve_database(Some(&queued.asset.database))?;\n        let transitioned = database\n            .transition_job(&queued.job.id, \"container_checked\", \"probing\")?\n            .ok_or_else(|| {\n                anyhow::anyhow!(\n                    \"Video Manager download job {:?} has not passed container validation\",\n                    queued.job.id\n                )\n            })?;\n        if transitioned.asset_id != queued.asset.id || transitioned.job_type != \"download\" {\n            let detail = \"Video Manager FFprobe job does not match its download asset/type\";\n            let _ = database.update_job(&transitioned.id, \"failed\", 1.0, Some(detail));\n            anyhow::bail!(\"{detail}\");\n        }\n\n        let quarantine = self.quarantine_path(&transitioned.asset_id, &transitioned.id)?;\n        match ffprobe::run_ffprobe(&quarantine, policy).await {\n            Ok(probe) => {\n                database.update_job(&transitioned.id, \"probed\", 1.0, None)?;\n                Ok(probe)\n            }\n            Err(error) => {\n                let detail = error.to_string();\n                let _ = tokio::fs::remove_file(&quarantine).await;\n                if let Err(state_error) =\n                    database.update_job(&transitioned.id, \"failed\", 1.0, Some(&detail))\n                {\n                    return Err(anyhow::anyhow!(\n                        \"Video Manager FFprobe failed: {detail}; additionally failed to persist job failure: {state_error}\"\n                    ));\n                }\n                Err(error)\n            }\n        }\n    }\n\n"
+          if "pub async fn probe_download_media(" not in text:
+              pos = text.find(manager_anchor)
+              if pos < 0:
+                  raise SystemExit("Video Manager FFprobe stage anchor missing")
+              text = text[:pos] + stage + text[pos:]
+
+          test_anchor = "    #[test]\n    fn explicit_unknown_database_does_not_fall_back() {\n"
+          tests = "    #[tokio::test]\n    async fn ffprobe_stage_records_worker_failure_and_deletes_quarantine() {\n        let path = temp_db(\"ffprobe-failure\");\n        let manager = VideoManager::open_default(&path, 7200).unwrap();\n        let queued = manager\n            .queue_download(QueueDownloadRequest {\n                database: None,\n                namespace_kind: \"module\".into(),\n                namespace_owner: \"worker\".into(),\n                group: \"validation\".into(),\n                title: \"Probe\".into(),\n                url: \"https://example.invalid/video.mp4\".into(),\n                metadata: serde_json::Value::Null,\n            })\n            .unwrap();\n        let database = mark_downloaded(&manager, &queued);\n        let quarantine = manager.quarantine_path(&queued.asset.id, &queued.job.id).unwrap();\n        std::fs::write(\n            &quarantine,\n            b\"\\x00\\x00\\x00\\x18ftypmp42\\x00\\x00\\x00\\x00mp42isom\",\n        )\n        .unwrap();\n        manager.inspect_download_container(&queued).await.unwrap();\n        let missing = std::env::temp_dir().join(format!(\n            \"rbe-missing-ffprobe-{}\",\n            Uuid::new_v4()\n        ));\n        let policy = FfprobePolicy::new(missing);\n        assert!(manager.probe_download_media(&queued, &policy).await.is_err());\n        let stored = database.get_job(&queued.job.id).unwrap().unwrap();\n        assert_eq!(stored.state, \"failed\");\n        assert_eq!(stored.attempts, 1);\n        assert!(stored\n            .error\n            .as_deref()\n            .is_some_and(|error| error.contains(\"FFprobe executable\")));\n        assert!(!quarantine.exists());\n        let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();\n        assert_eq!(asset.state, VideoAssetState::Quarantined);\n        let _ = std::fs::remove_dir_all(path.parent().unwrap());\n    }\n\n    #[tokio::test]\n    async fn losing_ffprobe_transition_preserves_quarantine() {\n        let path = temp_db(\"ffprobe-claim\");\n        let manager = VideoManager::open_default(&path, 7200).unwrap();\n        let queued = manager\n            .queue_download(QueueDownloadRequest {\n                database: None,\n                namespace_kind: \"module\".into(),\n                namespace_owner: \"worker\".into(),\n                group: \"validation\".into(),\n                title: \"Probe Claim\".into(),\n                url: \"https://example.invalid/video.mp4\".into(),\n                metadata: serde_json::Value::Null,\n            })\n            .unwrap();\n        let database = mark_downloaded(&manager, &queued);\n        let quarantine = manager.quarantine_path(&queued.asset.id, &queued.job.id).unwrap();\n        std::fs::write(\n            &quarantine,\n            b\"\\x00\\x00\\x00\\x18ftypmp42\\x00\\x00\\x00\\x00mp42isom\",\n        )\n        .unwrap();\n        manager.inspect_download_container(&queued).await.unwrap();\n        database\n            .transition_job(&queued.job.id, \"container_checked\", \"probing\")\n            .unwrap()\n            .unwrap();\n        let missing = std::env::temp_dir().join(format!(\n            \"rbe-missing-ffprobe-{}\",\n            Uuid::new_v4()\n        ));\n        let policy = FfprobePolicy::new(missing);\n        assert!(manager.probe_download_media(&queued, &policy).await.is_err());\n        assert!(quarantine.exists());\n        let stored = database.get_job(&queued.job.id).unwrap().unwrap();\n        assert_eq!(stored.state, \"probing\");\n        assert_eq!(stored.attempts, 1);\n        let _ = std::fs::remove_dir_all(path.parent().unwrap());\n    }\n\n"
+          if "fn ffprobe_stage_records_worker_failure_and_deletes_quarantine()" not in text:
+              pos = text.find(test_anchor)
+              if pos < 0:
+                  raise SystemExit("Video Manager FFprobe test anchor missing")
+              text = text[:pos] + tests + text[pos:]
+
           path.write_text(text)
           PY
-      - name: Format Video Manager FFprobe core
+      - name: Format Video Manager FFprobe pipeline
         working-directory: engine
         run: rustfmt --edition 2021 crates/video-manager/src/lib.rs crates/video-manager/src/ffprobe.rs
       - name: Clippy workspace locked
@@ -74,5 +91,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add engine/crates/video-manager/src/lib.rs engine/crates/video-manager/src/ffprobe.rs
-          git commit -m "feat: add trusted ffprobe worker"
+          git commit -m "feat: probe quarantined video media"
           git push origin HEAD:codex/service-runtime-video-manager
