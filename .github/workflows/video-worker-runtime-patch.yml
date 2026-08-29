@@ -25,6 +25,9 @@ jobs:
         shell: bash
         run: |
           (cd .. && python .github/patches/video-worker-runtime.py)
+          # Permanent workflow coverage is updated separately through the GitHub
+          # connector because Actions tokens cannot write workflow files.
+          git checkout -- ../.github/workflows/runtime-ci.yml
           python - <<'PY'
           from pathlib import Path
           import re
@@ -45,13 +48,6 @@ jobs:
           if count != 1:
               raise SystemExit(f"Video Manager DownloadPolicy lint anchor count={count}")
           path.write_text(source)
-
-          # backend/main.rs recursively formats child modules under rustfmt 1.98.
-          # Keep it out of permanent focused rustfmt just like route-engine/lib.rs.
-          workflow = Path("../.github/workflows/runtime-ci.yml")
-          text = workflow.read_text()
-          text = text.replace("            crates/backend/src/main.rs \\\n", "", 1)
-          workflow.write_text(text)
           PY
           rustfmt --edition 2021 \
             crates/video-manager/src/lib.rs \
@@ -79,7 +75,6 @@ jobs:
               "crates/config/src/lib.rs",
               "crates/backend/src/main.rs",
               "settings.json",
-              "../.github/workflows/runtime-ci.yml",
           }
           changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
           unexpected = changed - allowed
@@ -97,8 +92,7 @@ jobs:
               crates/video-manager/src/ffmpeg.rs \
               crates/config/src/lib.rs \
               crates/backend/src/main.rs \
-              settings.json \
-              ../.github/workflows/runtime-ci.yml
+              settings.json
             git commit -m "feat: run lazy Video Manager download worker"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
