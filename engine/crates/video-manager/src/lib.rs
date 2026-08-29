@@ -189,6 +189,12 @@ pub trait VideoDatabase: Send + Sync {
         progress: f64,
         error: Option<&str>,
     ) -> anyhow::Result<()>;
+    fn transition_job(
+        &self,
+        job_id: &str,
+        expected_state: &str,
+        next_state: &str,
+    ) -> anyhow::Result<Option<VideoJob>>;
     fn get_job(&self, job_id: &str) -> anyhow::Result<Option<VideoJob>>;
     fn get_asset(&self, database: &str, asset_id: &str) -> anyhow::Result<Option<VideoAsset>>;
 }
@@ -410,6 +416,39 @@ impl VideoDatabase for SqliteVideoDatabase {
             anyhow::bail!("Video Manager job {job_id:?} does not exist");
         }
         Ok(())
+    }
+
+    fn transition_job(
+        &self,
+        job_id: &str,
+        expected_state: &str,
+        next_state: &str,
+    ) -> anyhow::Result<Option<VideoJob>> {
+        validate_job_state(expected_state)?;
+        validate_job_state(next_state)?;
+        let now = now_ms();
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
+        let transaction = connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE video_jobs SET state = ?1, error = NULL, updated_at_ms = ?2 WHERE id = ?3 AND state = ?4",
+            params![next_state, now, job_id, expected_state],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let job = transaction
+            .query_row(
+                "SELECT id, asset_id, job_type, state, progress, attempts, error, created_at_ms, updated_at_ms FROM video_jobs WHERE id = ?1",
+                params![job_id],
+                read_video_job,
+            )
+            .optional()?;
+        transaction.commit()?;
+        Ok(job)
     }
 
     fn get_job(&self, job_id: &str) -> anyhow::Result<Option<VideoJob>> {
@@ -662,6 +701,52 @@ impl VideoManager {
                 {
                     return Err(anyhow::anyhow!(
                         "Video Manager download failed: {detail}; additionally failed to persist job failure: {state_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Run the cheap fail-closed container signature gate on a completed download.
+    /// Passing this stage does not mark the asset ready; FFprobe still has to prove
+    /// that the object contains a decodable video stream.
+    pub async fn inspect_download_container(
+        &self,
+        queued: &QueuedDownload,
+    ) -> anyhow::Result<ContainerProbe> {
+        if queued.asset.id != queued.job.asset_id || queued.job.job_type != "download" {
+            anyhow::bail!("Video Manager container inspection identity/type mismatch");
+        }
+        let (_, database) = self.resolve_database(Some(&queued.asset.database))?;
+        let transitioned = database
+            .transition_job(&queued.job.id, "downloaded", "inspecting")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Video Manager download job {:?} is not downloaded and cannot be inspected",
+                    queued.job.id
+                )
+            })?;
+        if transitioned.asset_id != queued.asset.id || transitioned.job_type != "download" {
+            let detail = "Video Manager transitioned job does not match its download asset/type";
+            let _ = database.update_job(&transitioned.id, "failed", 1.0, Some(detail));
+            anyhow::bail!("{detail}");
+        }
+
+        let quarantine = self.quarantine_path(&transitioned.asset_id, &transitioned.id)?;
+        match probe_quarantine_container(&quarantine).await {
+            Ok(probe) => {
+                database.update_job(&transitioned.id, "container_checked", 1.0, None)?;
+                Ok(probe)
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                let _ = tokio::fs::remove_file(&quarantine).await;
+                if let Err(state_error) =
+                    database.update_job(&transitioned.id, "failed", 1.0, Some(&detail))
+                {
+                    return Err(anyhow::anyhow!(
+                        "Video Manager container inspection failed: {detail}; additionally failed to persist job failure: {state_error}"
                     ));
                 }
                 Err(error)
@@ -1066,6 +1151,87 @@ mod tests {
         let stored = database.get_job(&queued.job.id).unwrap().unwrap();
         assert_eq!(stored.state, "downloading");
         assert_eq!(stored.attempts, 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    fn mark_downloaded(manager: &VideoManager, queued: &QueuedDownload) -> Arc<dyn VideoDatabase> {
+        let (_, database) = manager.resolve_database(None).unwrap();
+        database
+            .claim_job(&queued.job.id, "queued", "downloading")
+            .unwrap()
+            .unwrap();
+        database
+            .update_job(&queued.job.id, "downloaded", 1.0, None)
+            .unwrap();
+        database
+    }
+
+    #[tokio::test]
+    async fn container_stage_accepts_mp4_without_incrementing_attempts() {
+        let path = temp_db("container-pass");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "validation".into(),
+                title: "MP4".into(),
+                url: "https://example.invalid/video.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let database = mark_downloaded(&manager, &queued);
+        let quarantine = manager
+            .quarantine_path(&queued.asset.id, &queued.job.id)
+            .unwrap();
+        std::fs::write(
+            &quarantine,
+            b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom",
+        )
+        .unwrap();
+        let probe = manager.inspect_download_container(&queued).await.unwrap();
+        assert_eq!(probe.kind, VideoContainerKind::IsoBmff);
+        let stored = database.get_job(&queued.job.id).unwrap().unwrap();
+        assert_eq!(stored.state, "container_checked");
+        assert_eq!(stored.attempts, 1);
+        assert!(quarantine.exists());
+        let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();
+        assert_eq!(asset.state, VideoAssetState::Quarantined);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn container_stage_rejects_unknown_bytes_and_deletes_quarantine() {
+        let path = temp_db("container-reject");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "validation".into(),
+                title: "Bad".into(),
+                url: "https://example.invalid/video.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let database = mark_downloaded(&manager, &queued);
+        let quarantine = manager
+            .quarantine_path(&queued.asset.id, &queued.job.id)
+            .unwrap();
+        std::fs::write(&quarantine, b"definitely not a video container").unwrap();
+        assert!(manager.inspect_download_container(&queued).await.is_err());
+        let stored = database.get_job(&queued.job.id).unwrap().unwrap();
+        assert_eq!(stored.state, "failed");
+        assert_eq!(stored.attempts, 1);
+        assert!(stored
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("container signature")));
+        assert!(!quarantine.exists());
+        let asset = manager.get_asset(None, &queued.asset.id).unwrap().unwrap();
+        assert_eq!(asset.state, VideoAssetState::Quarantined);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
