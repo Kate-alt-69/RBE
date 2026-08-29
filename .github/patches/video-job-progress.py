@@ -22,7 +22,6 @@ pub(crate) const PROGRESS_DOWNLOADED: f64 = 0.45;
 pub(crate) const PROGRESS_CONTAINER_CHECKED: f64 = 0.55;
 pub(crate) const PROGRESS_PROBED: f64 = 0.70;
 pub(crate) const PROGRESS_NORMALIZING: f64 = 0.75;
-pub(crate) const PROGRESS_READY: f64 = 1.0;
 '''
 source = replace_once(source, const_anchor, consts, "Video Manager progress constants")
 
@@ -213,8 +212,7 @@ source = source[:tests_end] + r'''
         assert!(PROGRESS_DOWNLOADED < PROGRESS_CONTAINER_CHECKED);
         assert!(PROGRESS_CONTAINER_CHECKED < PROGRESS_PROBED);
         assert!(PROGRESS_PROBED < PROGRESS_NORMALIZING);
-        assert!(PROGRESS_NORMALIZING < PROGRESS_READY);
-        assert_eq!(PROGRESS_READY, 1.0);
+        assert!(PROGRESS_NORMALIZING < 1.0);
 
         let path = temp_db("job-lookup");
         let manager = VideoManager::open_default(&path, 7200).unwrap();
@@ -412,7 +410,9 @@ source = source[:tests_end] + r'''
 ''' + source[tests_end:]
 path.write_text(source)
 
+# ---------------------------------------------------------------------------
 # Boot-time registry.
+# ---------------------------------------------------------------------------
 path = Path("engine/crates/route-engine/src/modules.rs")
 source = path.read_text()
 source = replace_once(
