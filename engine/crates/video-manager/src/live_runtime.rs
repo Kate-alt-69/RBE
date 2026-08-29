@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 use crate::{VideoLiveRuntimeState, VideoManager};
 
@@ -23,13 +23,13 @@ pub trait LiveRuntimeDriver: Send + Sync + 'static {
 }
 
 pub struct LiveRuntimeHandle {
-    shutdown: Arc<Notify>,
+    shutdown: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
 }
 
 impl LiveRuntimeHandle {
     pub async fn shutdown(self) {
-        self.shutdown.notify_waiters();
+        let _ = self.shutdown.send(true);
         let _ = self.join.await;
     }
 }
@@ -67,12 +67,10 @@ impl VideoManager {
                 .store(false, std::sync::atomic::Ordering::Release);
             return Err(error);
         }
-        let shutdown = Arc::new(Notify::new());
-        let shutdown_task = shutdown.clone();
+        let (shutdown, shutdown_task) = watch::channel(false);
         let manager = self.clone();
         let join = tokio::spawn(async move {
-            run_live_runtime_coordinator(manager.clone(), driver, idle_timeout, shutdown_task)
-                .await;
+            run_live_runtime_coordinator(manager.clone(), driver, idle_timeout, shutdown_task).await;
             if let Err(error) = manager.set_live_runtime_state(VideoLiveRuntimeState::Disabled) {
                 tracing::error!(error = %error, "Video Manager live runtime exit telemetry failed");
             }
@@ -88,7 +86,7 @@ async fn run_live_runtime_coordinator(
     manager: Arc<VideoManager>,
     driver: Arc<dyn LiveRuntimeDriver>,
     idle_timeout: Duration,
-    shutdown: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut active = false;
 
@@ -98,7 +96,7 @@ async fn run_live_runtime_coordinator(
             Err(error) => {
                 tracing::error!(error = %error, "Video Manager failed to inspect live runtime demand");
                 let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Degraded);
-                if wait_for_signal(&manager, &shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
+                if wait_for_signal(&manager, &mut shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
                     break;
                 }
                 continue;
@@ -126,7 +124,7 @@ async fn run_live_runtime_coordinator(
                 ),
             }
             let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Degraded);
-            if wait_for_signal(&manager, &shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
+            if wait_for_signal(&manager, &mut shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
                 break;
             }
             continue;
@@ -138,8 +136,18 @@ async fn run_live_runtime_coordinator(
                 Changed,
                 Expired,
             }
+            if *shutdown.borrow() {
+                stop_live_runtime(manager.clone(), driver.as_ref(), false).await;
+                break;
+            }
             let signal = tokio::select! {
-                _ = shutdown.notified() => IdleSignal::Shutdown,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        IdleSignal::Shutdown
+                    } else {
+                        IdleSignal::Changed
+                    }
+                }
                 _ = manager.live_notify.notified() => IdleSignal::Changed,
                 _ = tokio::time::sleep(idle_timeout) => IdleSignal::Expired,
             };
@@ -168,7 +176,7 @@ async fn run_live_runtime_coordinator(
             }
         }
 
-        if wait_for_signal(&manager, &shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
+        if wait_for_signal(&manager, &mut shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
             if active {
                 stop_live_runtime(manager.clone(), driver.as_ref(), false).await;
             }
@@ -204,9 +212,16 @@ async fn stop_live_runtime(
     }
 }
 
-async fn wait_for_signal(manager: &VideoManager, shutdown: &Notify, scan: Duration) -> bool {
+async fn wait_for_signal(
+    manager: &VideoManager,
+    shutdown: &mut watch::Receiver<bool>,
+    scan: Duration,
+) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
     tokio::select! {
-        _ = shutdown.notified() => true,
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
         _ = manager.live_notify.notified() => false,
         _ = tokio::time::sleep(scan) => false,
     }
@@ -229,6 +244,28 @@ mod tests {
         fn start<'a>(&'a self, _manager: Arc<VideoManager>) -> LiveRuntimeFuture<'a> {
             Box::pin(async move {
                 self.starts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn stop<'a>(&'a self, _manager: Arc<VideoManager>) -> LiveRuntimeFuture<'a> {
+            Box::pin(async move {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    struct DelayedStartRuntime {
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+    }
+
+    impl LiveRuntimeDriver for DelayedStartRuntime {
+        fn start<'a>(&'a self, _manager: Arc<VideoManager>) -> LiveRuntimeFuture<'a> {
+            Box::pin(async move {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(75)).await;
                 Ok(())
             })
         }
@@ -364,6 +401,51 @@ mod tests {
             .unwrap();
         wait_until(|| driver.stops.load(Ordering::SeqCst) == 1).await;
         handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_is_retained_while_driver_start_is_in_flight() {
+        let path = temp_db("shutdown-during-start");
+        let manager = Arc::new(VideoManager::open_default(&path, 7200).unwrap());
+        let asset = manager
+            .create_asset(CreateAssetRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "runtime-test".into(),
+                group: "live".into(),
+                title: "Shutdown".into(),
+                source_type: VideoSourceType::Live,
+                source_uri: None,
+                metadata: serde_json::Value::Null,
+                initial_state: VideoAssetState::Reserved,
+            })
+            .unwrap();
+        manager
+            .reserve_live_session(ReserveLiveSessionRequest {
+                database: None,
+                asset_id: asset.id,
+            })
+            .unwrap();
+        let driver = Arc::new(DelayedStartRuntime {
+            starts: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let handle = manager
+            .clone()
+            .spawn_live_runtime_with_idle(driver.clone(), Duration::from_secs(1))
+            .unwrap();
+
+        wait_until(|| driver.starts.load(Ordering::SeqCst) == 1).await;
+        tokio::time::timeout(Duration::from_millis(500), handle.shutdown())
+            .await
+            .expect("live runtime shutdown signal was lost during driver start");
+
+        assert_eq!(driver.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.live_runtime_state().unwrap(),
+            VideoLiveRuntimeState::Disabled
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
