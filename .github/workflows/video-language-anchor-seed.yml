@@ -56,17 +56,15 @@ jobs:
           if source[signature_start:signature_end] != seeded_test_signature:
               source = source[:signature_start] + seeded_test_signature + source[signature_end:]
 
-          # The semantic patch also has an indentation-sensitive replacement
-          # inside this test body. Seed exactly the shell-visible old form so
-          # the replacement both consumes `scope` and validates owner flow.
-          body_if = source.index('                if module == "host" && function == "double" {', test_region)
-          body_let = source.index("                    let Some(Value::Number(value))", body_if)
-          body_let_end = source.index(" else {", body_let) + len(" else {")
           seeded_test_body = (
               '  if module == "host" && function == "double" {\n'
               '  let Some(Value::Number(value)) = args.into_iter().next() else {'
           )
-          source = source[:body_if] + seeded_test_body + source[body_let_end:]
+          if seeded_test_body not in source:
+              body_if = source.index('                if module == "host" && function == "double" {', test_region)
+              body_let = source.index("                    let Some(Value::Number(value))", body_if)
+              body_let_end = source.index(" else {", body_let) + len(" else {")
+              source = source[:body_if] + seeded_test_body + source[body_let_end:]
           path.write_text(source)
 
           path = Path("engine/crates/route-engine/src/service_eval.rs")
@@ -88,9 +86,6 @@ jobs:
 
           path = Path("engine/crates/core/src/video_language.rs")
           source = path.read_text()
-          database_region = source.index('            "databaseHealth" | "database_health" => {')
-          call_start = source.index("to_json(", database_region)
-          call_end = source.index("\n                )", call_start) + len("\n                )")
           seeded_database_health = (
               "to_json(\n"
               "          manager\n"
@@ -98,22 +93,23 @@ jobs:
               "              .map_err(operation_error)?,\n"
               "      )"
           )
-          if source[call_start:call_end] != seeded_database_health:
+          if seeded_database_health not in source:
+              database_region = source.index('            "databaseHealth" | "database_health" => {')
+              call_start = source.index("to_json(", database_region)
+              call_end = source.index("\n                )", call_start) + len("\n                )")
               source = source[:call_start] + seeded_database_health + source[call_end:]
           path.write_text(source)
 
-          # Seed the Response match arm to the semantic patch's shell-visible
-          # indentation so its Video fallback arm is actually inserted.
           path = Path("engine/crates/route-engine/src/modules.rs")
           source = path.read_text()
-          response_start = source.index("            ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {")
-          response_end = source.index("\n            }),", response_start) + len("\n            }),")
           seeded_response = (
               '            ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {\n'
               '        message: format!("{module_name}.{function_name}() is not implemented yet"),\n'
               '    }),'
           )
-          if source[response_start:response_end] != seeded_response:
+          if seeded_response not in source:
+              response_start = source.index("            ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {")
+              response_end = source.index("\n            }),", response_start) + len("\n            }),")
               source = source[:response_start] + seeded_response + source[response_end:]
           path.write_text(source)
           PY
