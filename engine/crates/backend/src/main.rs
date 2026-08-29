@@ -348,6 +348,8 @@ async fn boot_and_run() -> anyhow::Result<()> {
             let ffmpeg_policy = video_manager::FfmpegPolicy::new(&ffmpeg);
             let ffmpeg_capabilities =
                 video_manager::probe_ffmpeg_capabilities(&ffmpeg_policy).await?;
+            let selected_video_encoder = ffmpeg_capabilities.preferred_video_encoder();
+            let ffmpeg_policy = ffmpeg_policy.with_video_encoder(selected_video_encoder);
             let policy = video_manager::VideoWorkerPolicy {
                 download,
                 ffprobe: video_manager::FfprobePolicy::new(&ffprobe),
@@ -362,6 +364,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
                 aac = ffmpeg_capabilities.aac,
                 hardware_h264_encoders = ?ffmpeg_capabilities.hardware_h264_encoders,
                 verified_hardware_h264_encoders = ?ffmpeg_capabilities.verified_hardware_h264_encoders,
+                selected_video_encoder = ?selected_video_encoder,
                 recovery_scan_secs = config.video_manager.worker_recovery_scan_secs,
                 max_download_bytes = config.video_manager.download_max_bytes,
                 "Video Manager lazy download worker ready"

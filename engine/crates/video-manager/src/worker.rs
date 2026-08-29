@@ -62,6 +62,9 @@ impl VideoWorkerHandle {
         if let Err(error) = self.manager.set_worker_state(VideoWorkerState::Disabled) {
             tracing::error!(error = %error, "Video Manager worker shutdown telemetry failed");
         }
+        if let Err(error) = self.manager.set_worker_encoder(None) {
+            tracing::error!(error = %error, "Video Manager worker encoder cleanup failed");
+        }
     }
 }
 
@@ -102,6 +105,7 @@ impl VideoManager {
             }
             *state = VideoWorkerState::Sleeping;
         }
+        self.set_worker_encoder(Some(policy.ffmpeg.video_encoder))?;
 
         let manager = self.clone();
         let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -195,6 +199,9 @@ impl VideoManager {
 
             if let Err(error) = self.set_worker_state(VideoWorkerState::Disabled) {
                 tracing::error!(error = %error, "Video Manager worker exit telemetry failed");
+            }
+            if let Err(error) = self.set_worker_encoder(None) {
+                tracing::error!(error = %error, "Video Manager worker encoder exit cleanup failed");
             }
         });
 
@@ -395,6 +402,7 @@ mod tests {
             media_root: std::fs::canonicalize(&media_root).unwrap(),
             work_notify: tokio::sync::Notify::new(),
             worker_state: Mutex::new(VideoWorkerState::Disabled),
+            worker_encoder: Mutex::new(None),
             live_idle_secs: 7200,
         });
         let mut worker_policy = policy(&root);

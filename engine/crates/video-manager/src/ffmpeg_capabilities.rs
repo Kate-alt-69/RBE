@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use crate::FfmpegPolicy;
+use crate::{FfmpegPolicy, FfmpegVideoEncoder};
 
 const MAX_CAPABILITY_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -40,6 +40,28 @@ pub struct FfmpegCapabilities {
     pub aac: bool,
     pub hardware_h264_encoders: Vec<String>,
     pub verified_hardware_h264_encoders: Vec<String>,
+}
+
+impl FfmpegCapabilities {
+    pub fn preferred_video_encoder(&self) -> FfmpegVideoEncoder {
+        for name in &self.verified_hardware_h264_encoders {
+            if let Some(encoder) = typed_hardware_encoder(name) {
+                return encoder;
+            }
+        }
+        FfmpegVideoEncoder::Software
+    }
+}
+
+fn typed_hardware_encoder(name: &str) -> Option<FfmpegVideoEncoder> {
+    match name {
+        "h264_nvenc" => Some(FfmpegVideoEncoder::NvidiaNvenc),
+        "h264_qsv" => Some(FfmpegVideoEncoder::IntelQsv),
+        "h264_amf" => Some(FfmpegVideoEncoder::AmdAmf),
+        "h264_videotoolbox" => Some(FfmpegVideoEncoder::AppleVideoToolbox),
+        "h264_mf" => Some(FfmpegVideoEncoder::WindowsMediaFoundation),
+        _ => None,
+    }
 }
 
 pub async fn probe_ffmpeg_capabilities(
@@ -345,5 +367,27 @@ Encoders:
         };
         let error = validate_required_capabilities(&capabilities).unwrap_err();
         assert!(error.to_string().contains("libx264"));
+    }
+
+    #[test]
+    fn prefers_first_verified_typed_hardware_encoder_and_falls_back_to_software() {
+        let capabilities = FfmpegCapabilities {
+            software_h264: true,
+            aac: true,
+            hardware_h264_encoders: vec!["h264_nvenc".into(), "h264_qsv".into()],
+            verified_hardware_h264_encoders: vec!["h264_qsv".into()],
+        };
+        assert_eq!(
+            capabilities.preferred_video_encoder(),
+            FfmpegVideoEncoder::IntelQsv
+        );
+        let software = FfmpegCapabilities {
+            verified_hardware_h264_encoders: Vec::new(),
+            ..capabilities
+        };
+        assert_eq!(
+            software.preferred_video_encoder(),
+            FfmpegVideoEncoder::Software
+        );
     }
 }

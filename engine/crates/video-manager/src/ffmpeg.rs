@@ -12,11 +12,40 @@ const MAX_FFMPEG_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_FFMPEG_LOG_BYTES: usize = 4 * 1024 * 1024;
 const ERROR_TEXT_BYTES: usize = 16 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FfmpegVideoEncoder {
+    Software,
+    NvidiaNvenc,
+    IntelQsv,
+    AmdAmf,
+    AppleVideoToolbox,
+    WindowsMediaFoundation,
+}
+
+impl FfmpegVideoEncoder {
+    pub fn ffmpeg_name(self) -> &'static str {
+        match self {
+            Self::Software => "libx264",
+            Self::NvidiaNvenc => "h264_nvenc",
+            Self::IntelQsv => "h264_qsv",
+            Self::AmdAmf => "h264_amf",
+            Self::AppleVideoToolbox => "h264_videotoolbox",
+            Self::WindowsMediaFoundation => "h264_mf",
+        }
+    }
+
+    pub fn is_hardware(self) -> bool {
+        self != Self::Software
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FfmpegPolicy {
     pub executable: PathBuf,
     pub timeout: Duration,
     pub max_log_bytes: usize,
+    pub video_encoder: FfmpegVideoEncoder,
 }
 
 impl FfmpegPolicy {
@@ -25,7 +54,13 @@ impl FfmpegPolicy {
             executable: executable.into(),
             timeout: Duration::from_secs(15 * 60),
             max_log_bytes: 1024 * 1024,
+            video_encoder: FfmpegVideoEncoder::Software,
         }
+    }
+
+    pub fn with_video_encoder(mut self, video_encoder: FfmpegVideoEncoder) -> Self {
+        self.video_encoder = video_encoder;
+        self
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
@@ -62,6 +97,7 @@ pub struct NormalizedMedia {
     pub profile: &'static str,
     pub container: &'static str,
     pub video_codec: &'static str,
+    pub video_encoder: FfmpegVideoEncoder,
     pub audio_codec: &'static str,
     pub size_bytes: u64,
 }
@@ -74,7 +110,42 @@ pub async fn run_ffmpeg_normalize(
     policy.validate()?;
     validate_paths(input_path, output_path).await?;
 
-    let args = normalization_args(input_path, output_path);
+    let selected = policy.video_encoder;
+    match run_ffmpeg_once(input_path, output_path, policy, selected).await {
+        Ok(media) => Ok(media),
+        Err(hardware_error) if selected.is_hardware() => {
+            let _ = tokio::fs::remove_file(output_path).await;
+            tracing::warn!(
+                encoder = selected.ffmpeg_name(),
+                error = %hardware_error,
+                "Video Manager hardware normalization failed; retrying with libx264"
+            );
+            match run_ffmpeg_once(
+                input_path,
+                output_path,
+                policy,
+                FfmpegVideoEncoder::Software,
+            )
+            .await
+            {
+                Ok(media) => Ok(media),
+                Err(software_error) => Err(anyhow::anyhow!(
+                    "Video Manager hardware normalization with {} failed: {hardware_error}; software fallback failed: {software_error}",
+                    selected.ffmpeg_name()
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn run_ffmpeg_once(
+    input_path: &Path,
+    output_path: &Path,
+    policy: &FfmpegPolicy,
+    encoder: FfmpegVideoEncoder,
+) -> anyhow::Result<NormalizedMedia> {
+    let args = normalization_args(input_path, output_path, encoder);
     let mut command = Command::new(&policy.executable);
     command
         .args(&args)
@@ -112,7 +183,10 @@ pub async fn run_ffmpeg_normalize(
     if !status.success() {
         let _ = tokio::fs::remove_file(output_path).await;
         let detail = bounded_error_text(&stderr);
-        anyhow::bail!("Video Manager FFmpeg exited with {status}: {detail}");
+        anyhow::bail!(
+            "Video Manager FFmpeg encoder {} exited with {status}: {detail}",
+            encoder.ffmpeg_name()
+        );
     }
 
     let metadata = tokio::fs::symlink_metadata(output_path)
@@ -132,6 +206,7 @@ pub async fn run_ffmpeg_normalize(
         profile: "standard",
         container: "mp4",
         video_codec: "h264",
+        video_encoder: encoder,
         audio_codec: "aac",
         size_bytes: metadata.len(),
     })
@@ -180,8 +255,12 @@ async fn validate_paths(input_path: &Path, output_path: &Path) -> anyhow::Result
     Ok(())
 }
 
-fn normalization_args(input_path: &Path, output_path: &Path) -> Vec<OsString> {
-    [
+fn normalization_args(
+    input_path: &Path,
+    output_path: &Path,
+    encoder: FfmpegVideoEncoder,
+) -> Vec<OsString> {
+    let mut args = vec![
         OsString::from("-nostdin"),
         OsString::from("-hide_banner"),
         OsString::from("-v"),
@@ -198,11 +277,28 @@ fn normalization_args(input_path: &Path, output_path: &Path) -> Vec<OsString> {
         OsString::from("-sn"),
         OsString::from("-dn"),
         OsString::from("-c:v"),
-        OsString::from("libx264"),
-        OsString::from("-preset"),
-        OsString::from("medium"),
-        OsString::from("-crf"),
-        OsString::from("23"),
+        OsString::from(encoder.ffmpeg_name()),
+    ];
+    if encoder == FfmpegVideoEncoder::Software {
+        args.extend([
+            OsString::from("-preset"),
+            OsString::from("medium"),
+            OsString::from("-crf"),
+            OsString::from("23"),
+        ]);
+    } else {
+        // Generic AVCodec rate-control options are used intentionally instead
+        // of exposing vendor-specific flags to callers.
+        args.extend([
+            OsString::from("-b:v"),
+            OsString::from("5M"),
+            OsString::from("-maxrate"),
+            OsString::from("6M"),
+            OsString::from("-bufsize"),
+            OsString::from("10M"),
+        ]);
+    }
+    args.extend([
         OsString::from("-pix_fmt"),
         OsString::from("yuv420p"),
         OsString::from("-c:a"),
@@ -214,9 +310,8 @@ fn normalization_args(input_path: &Path, output_path: &Path) -> Vec<OsString> {
         OsString::from("-f"),
         OsString::from("mp4"),
         output_path.as_os_str().to_os_string(),
-    ]
-    .into_iter()
-    .collect()
+    ]);
+    args
 }
 
 async fn read_bounded_output<R>(mut reader: R, max_bytes: usize) -> anyhow::Result<Vec<u8>>
@@ -259,7 +354,11 @@ mod tests {
 
     #[test]
     fn normalization_profile_is_fixed_and_local_only() {
-        let args = normalization_args(Path::new("/input.part"), Path::new("/output.mp4"));
+        let args = normalization_args(
+            Path::new("/input.part"),
+            Path::new("/output.mp4"),
+            FfmpegVideoEncoder::Software,
+        );
         let rendered = args
             .iter()
             .map(|value| value.to_string_lossy())
@@ -274,6 +373,23 @@ mod tests {
             rendered.last().map(|value| value.as_ref()),
             Some("/output.mp4")
         );
+    }
+
+    #[test]
+    fn hardware_profile_uses_only_fixed_internal_flags() {
+        let args = normalization_args(
+            Path::new("/input.part"),
+            Path::new("/output.mp4"),
+            FfmpegVideoEncoder::IntelQsv,
+        );
+        let rendered = args
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(rendered.windows(2).any(|pair| pair == ["-c:v", "h264_qsv"]));
+        assert!(rendered.windows(2).any(|pair| pair == ["-b:v", "5M"]));
+        assert!(!rendered.iter().any(|value| value == "-crf"));
+        assert!(!rendered.iter().any(|value| value == "-preset"));
     }
 
     #[test]

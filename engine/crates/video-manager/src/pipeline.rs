@@ -15,7 +15,8 @@ impl VideoManager {
     ) -> anyhow::Result<VideoVariant> {
         self.run_queued_download(queued, download_policy).await?;
         self.inspect_download_container(queued).await?;
-        self.probe_download_media(queued, ffprobe_policy).await?;
-        self.normalize_download_media(queued, ffmpeg_policy).await
+        let probe = self.probe_download_media(queued, ffprobe_policy).await?;
+        self.normalize_download_media(queued, &probe, ffmpeg_policy)
+            .await
     }
 }

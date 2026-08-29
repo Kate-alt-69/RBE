@@ -4,7 +4,8 @@ use anyhow::Context;
 use uuid::Uuid;
 
 use crate::{
-    FfmpegPolicy, QueuedDownload, VideoManager, VideoVariant, PROGRESS_NORMALIZING, PROGRESS_PROBED,
+    FfmpegPolicy, MediaProbe, QueuedDownload, VideoManager, VideoVariant, PROGRESS_NORMALIZING,
+    PROGRESS_PROBED,
 };
 
 impl VideoManager {
@@ -13,6 +14,7 @@ impl VideoManager {
     pub async fn normalize_download_media(
         &self,
         queued: &QueuedDownload,
+        probe: &MediaProbe,
         policy: &FfmpegPolicy,
     ) -> anyhow::Result<VideoVariant> {
         if queued.asset.id != queued.job.asset_id || queued.job.job_type != "download" {
@@ -76,16 +78,28 @@ impl VideoManager {
             anyhow::bail!("{detail}");
         }
 
+        let stream = probe.video_streams.first().ok_or_else(|| {
+            anyhow::anyhow!("Video Manager normalization probe contains no video stream")
+        })?;
+        let output_bitrate = probe.duration_secs.and_then(|duration| {
+            if duration.is_finite() && duration > 0.0 {
+                let bits_per_second = (normalized.size_bytes as f64 * 8.0) / duration;
+                (bits_per_second.is_finite() && bits_per_second > 0.0)
+                    .then(|| bits_per_second.round() as u64)
+            } else {
+                None
+            }
+        });
         let now = crate::now_ms();
         let variant = VideoVariant {
             id: Uuid::new_v4().to_string(),
             asset_id: transitioned.asset_id.clone(),
             profile: normalized.profile.to_string(),
             codec: Some(normalized.video_codec.to_string()),
-            width: None,
-            height: None,
-            fps: None,
-            bitrate: None,
+            width: Some(stream.width),
+            height: Some(stream.height),
+            fps: stream.frame_rate,
+            bitrate: output_bitrate,
             size_bytes: normalized.size_bytes,
             path: stored_path,
             state: "ready".into(),

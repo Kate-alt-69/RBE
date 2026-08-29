@@ -24,7 +24,7 @@ pub use download::{
     ResolvedDownloadTarget,
 };
 pub use download_worker::{DownloadPolicy, DownloadReceipt};
-pub use ffmpeg::{FfmpegPolicy, NormalizedMedia};
+pub use ffmpeg::{FfmpegPolicy, FfmpegVideoEncoder, NormalizedMedia};
 pub use ffmpeg_capabilities::{probe_ffmpeg_capabilities, FfmpegCapabilities};
 pub use ffprobe::{FfprobePolicy, MediaProbe, VideoStreamProbe};
 pub use worker::{VideoWorkerHandle, VideoWorkerPolicy};
@@ -203,6 +203,7 @@ pub enum VideoWorkerState {
 pub struct VideoDownloadWorkerStatus {
     pub state: VideoWorkerState,
     pub queued_downloads: u64,
+    pub video_encoder: Option<FfmpegVideoEncoder>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -884,6 +885,7 @@ pub struct VideoManager {
     media_root: PathBuf,
     work_notify: tokio::sync::Notify,
     worker_state: Mutex<VideoWorkerState>,
+    worker_encoder: Mutex<Option<FfmpegVideoEncoder>>,
     live_idle_secs: u64,
 }
 
@@ -933,6 +935,7 @@ impl VideoManager {
             media_root,
             work_notify: tokio::sync::Notify::new(),
             worker_state: Mutex::new(VideoWorkerState::Disabled),
+            worker_encoder: Mutex::new(None),
             live_idle_secs,
         })
     }
@@ -1208,6 +1211,22 @@ impl VideoManager {
             .map_err(|_| anyhow::anyhow!("Video Manager worker state mutex is poisoned"))
     }
 
+    fn set_worker_encoder(&self, encoder: Option<FfmpegVideoEncoder>) -> anyhow::Result<()> {
+        let mut current = self
+            .worker_encoder
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager worker encoder mutex is poisoned"))?;
+        *current = encoder;
+        Ok(())
+    }
+
+    fn worker_encoder(&self) -> anyhow::Result<Option<FfmpegVideoEncoder>> {
+        self.worker_encoder
+            .lock()
+            .map(|encoder| *encoder)
+            .map_err(|_| anyhow::anyhow!("Video Manager worker encoder mutex is poisoned"))
+    }
+
     fn next_queued_download(
         &self,
         requested_database: Option<&str>,
@@ -1346,6 +1365,7 @@ impl VideoManager {
             download_worker: VideoDownloadWorkerStatus {
                 state: worker_state,
                 queued_downloads,
+                video_encoder: self.worker_encoder()?,
             },
             live_runtime: "sleeping",
             live_idle_secs: self.live_idle_secs,
