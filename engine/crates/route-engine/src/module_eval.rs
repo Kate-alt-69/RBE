@@ -981,4 +981,22 @@ mod tests {
         assert!(matches!(value, Value::Number(value) if value == 12.0));
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn host_capability_is_not_global_without_import() {
+        let root = root();
+        fs::write(
+            root.join("module/unimported.module"),
+            "export function run(value) { return host.double(value); }",
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let executor =
+            ModuleExecutor::with_host_capabilities(&program, Arc::new(TestHostCapability));
+        let error =
+            block_on_ready(executor.call("./module/unimported", "run", vec![Value::Number(6.0)]))
+                .expect_err("host capability must require an explicit import");
+        assert_eq!(error.code, "MOD3201");
+        let _ = fs::remove_dir_all(root);
+    }
 }

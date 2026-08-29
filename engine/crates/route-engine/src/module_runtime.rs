@@ -279,6 +279,28 @@ fn validate_local(
             });
         }
 
+        match import_base(import) {
+            ImportTarget::Builtin(module) if module == "video" => {
+                errors.push(ModuleCompileError {
+                    code: "MOD2010",
+                    path: path.to_path_buf(),
+                    line: 1,
+                    column: 1,
+                    message: "Video Manager must be imported as `vm` or `video-manager`; legacy `video` is not a capability".into(),
+                });
+            }
+            ImportTarget::BuiltinFunction { module, .. } if module == "video" => {
+                errors.push(ModuleCompileError {
+                    code: "MOD2010",
+                    path: path.to_path_buf(),
+                    line: 1,
+                    column: 1,
+                    message: "Video Manager must be imported as `vm` or `video-manager`; legacy `video` is not a capability".into(),
+                });
+            }
+            _ => {}
+        }
+
         let Some(services) = services else {
             continue;
         };
@@ -572,6 +594,20 @@ mod tests {
             .resolve_scoped("./module/learning/catalog")
             .expect("nested module should resolve");
         assert_eq!(owner, "learning.catalog");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_legacy_video_capability_name_at_boot() {
+        let root = root();
+        fs::write(
+            root.join("module/video.module"),
+            ":import[video]\nexport function run() { return true; }",
+        )
+        .unwrap();
+        let errors = ModuleProgram::load(&root.join("module"))
+            .expect_err("legacy video capability name must fail module boot");
+        assert!(errors.0.iter().any(|error| error.code == "MOD2010"));
         let _ = fs::remove_dir_all(root);
     }
 }

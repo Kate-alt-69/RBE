@@ -41,7 +41,7 @@ enum BuiltinModule {
     Request,
     Security,
     Response,
-    Video,
+    VideoManager,
 }
 
 pub struct ModuleRegistry {
@@ -81,7 +81,7 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
         "log" => matches!(function, "info" | "warn"),
         "crypto" => matches!(function, "hash"),
         "env" => matches!(function, "get"),
-        "video" => matches!(
+        "vm" | "video-manager" => matches!(
             function,
             "status"
                 | "databaseHealth"
@@ -138,7 +138,7 @@ impl ModuleRegistry {
                         "request" => ModuleKind::Builtin(BuiltinModule::Request),
                         "security" => ModuleKind::Builtin(BuiltinModule::Security),
                         "response" => ModuleKind::Builtin(BuiltinModule::Response),
-                        "video" => ModuleKind::Builtin(BuiltinModule::Video),
+                        "vm" | "video-manager" => ModuleKind::Builtin(BuiltinModule::VideoManager),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{name}"),
                             resolved_path: std::path::PathBuf::new(),
@@ -159,7 +159,7 @@ impl ModuleRegistry {
                         "request" => ModuleKind::Builtin(BuiltinModule::Request),
                         "security" => ModuleKind::Builtin(BuiltinModule::Security),
                         "response" => ModuleKind::Builtin(BuiltinModule::Response),
-                        "video" => ModuleKind::Builtin(BuiltinModule::Video),
+                        "vm" | "video-manager" => ModuleKind::Builtin(BuiltinModule::VideoManager),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{module}"),
                             resolved_path: std::path::PathBuf::new(),
@@ -258,9 +258,9 @@ impl ModuleRegistry {
             ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {
                 message: format!("{module_name}.{function_name}() is not implemented yet"),
             }),
-            ModuleKind::Builtin(BuiltinModule::Video) => Err(ModuleError {
+            ModuleKind::Builtin(BuiltinModule::VideoManager) => Err(ModuleError {
                 message: format!(
-            "{module_name}.{function_name}() requires the privileged module Video host capability"
+            "{module_name}.{function_name}() requires the privileged module Video Manager host capability"
         ),
             }),
             ModuleKind::CustomUnimplemented {
@@ -486,6 +486,16 @@ mod tests {
         assert!(!route_capability_allowed("vault"));
         assert!(!route_capability_allowed("storage"));
         assert!(!route_capability_allowed("cache"));
+    }
+
+    #[test]
+    fn video_manager_uses_only_explicit_supported_import_names() {
+        assert!(builtin_function_exists("vm", "status"));
+        assert!(builtin_function_exists("video-manager", "queueDownload"));
+        assert!(!builtin_function_exists("video", "status"));
+        assert!(!route_capability_allowed("vm"));
+        assert!(!route_capability_allowed("video-manager"));
+        assert!(!route_capability_allowed("video"));
     }
 
     #[test]

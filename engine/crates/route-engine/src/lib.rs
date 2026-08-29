@@ -108,6 +108,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_video_manager_import_names_for_modules() {
+        let tokens = Lexer::new(
+            r#":import[vm as short, video-manager as media, video-manager.status as status]
+            export function run() { return status(); }"#,
+        )
+        .tokenize()
+        .expect("lex failed");
+        let file = Parser::new(tokens)
+            .parse_module_file()
+            .expect("module parse failed");
+        assert_eq!(file.imports.len(), 3);
+        assert_eq!(binding_name(&file.imports[0]), "short");
+        assert_eq!(binding_name(&file.imports[1]), "media");
+        assert_eq!(binding_name(&file.imports[2]), "status");
+    }
+
+    #[test]
     fn parses_executable_service_program() {
         let file = parse_service_source(
             r#"

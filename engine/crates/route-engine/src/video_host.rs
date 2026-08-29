@@ -26,12 +26,12 @@ impl HostCapabilityCaller for VideoHostCapabilities {
         args: Vec<Value>,
     ) -> HostCapabilityFuture<'a> {
         Box::pin(async move {
-            if module != "video" {
+            if !matches!(module, "vm" | "video-manager") {
                 return Ok(None);
             }
             let owner = scope.ok_or_else(|| ModuleEvalError {
                 code: "VID3003",
-                message: "video capability requires a resolved .module identity".into(),
+                message: "Video Manager capability requires a resolved .module identity".into(),
             })?;
             let args = args.into_iter().map(value_to_json).collect::<Vec<_>>();
             let value =
