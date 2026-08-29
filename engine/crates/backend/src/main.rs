@@ -111,9 +111,12 @@ async fn boot_and_run() -> anyhow::Result<()> {
     boot_trace(format!("exe={}", std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|err| format!("<unavailable: {err}>"))));
     boot_trace(format!("cwd={}", std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|err| format!("<unavailable: {err}>"))));
 
-    let settings_path = std::env::var("SETTINGS_PATH").unwrap_or_else(|_| "settings.json".to_string());
-    boot_trace(format!("settings path={settings_path}"));
-    let config = config::Config::load(&settings_path).map_err(|err| anyhow::anyhow!("failed to load {settings_path}: {err}"))?;
+    let settings_path = std::env::var_os("SETTINGS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_paths::binary_dir().join("settings.json"));
+    boot_trace(format!("settings path={}", settings_path.display()));
+    let config = config::Config::load(&settings_path)
+        .map_err(|err| anyhow::anyhow!("failed to load {}: {err}", settings_path.display()))?;
     let config = Arc::new(config);
     let refresh_interval = Duration::from_secs(config.runtime.process_refresh_hours.saturating_mul(3600));
     let maintenance = Arc::new(MaintenanceMetrics::new(config.runtime.process_refresh_hours));
@@ -123,9 +126,6 @@ async fn boot_and_run() -> anyhow::Result<()> {
     logging::terminal::init(&config.logging)?;
     boot_trace("logging initialized");
 
-    // Reclaim stale/crashed prior backend listeners BEFORE the temporary
-    // responder starts. The responder is this same executable, so running the
-    // old image-name based reclaim after it binds would mistake it for stale RBE.
     if config.runtime.reclaim_port {
         port_guard::reclaim_port_if_needed(config.api.port);
     }
@@ -148,7 +148,10 @@ async fn boot_and_run() -> anyhow::Result<()> {
     error_client::init(io.clone(), &admin_dir);
     error_client::install_panic_hook();
     boot_trace("error-client initialized, panic hook installed");
-    tracing::info!(path = %settings_path, refresh_hours = config.runtime.process_refresh_hours, "configuration loaded");
+    tracing::info!(path = %settings_path.display(), refresh_hours = config.runtime.process_refresh_hours, "configuration loaded");
+
+    let (lifecycle_tx, lifecycle_rx) = tokio::sync::watch::channel(BackendState::ConfigurationLoaded);
+    let _ = lifecycle_tx.send(BackendState::ServicesStarting);
 
     let error_reporter_task = spawn_error_reporter_daemon_process(maintenance.clone(), refresh_interval)?;
 
@@ -185,12 +188,11 @@ async fn boot_and_run() -> anyhow::Result<()> {
     );
 
     let mut supervisor = Supervisor::new(RestartPolicy::default());
-    supervisor.set_state(BackendState::Initializing);
-    let state_rx = supervisor.subscribe_state();
+    supervisor.set_state(BackendState::ServicesStarting);
     tokio::spawn(async move { supervisor.run().await; });
     boot_trace("supervisor spawned");
 
-    let app_state = AppState::new(config.clone(), state_rx, vault_instance, container_client, maintenance);
+    let app_state = AppState::new(config.clone(), lifecycle_rx, vault_instance, container_client, maintenance);
     boot_trace("app state created");
     {
         let rate_limiters = app_state.rate_limiters.clone();
@@ -215,22 +217,26 @@ async fn boot_and_run() -> anyhow::Result<()> {
     }
 
     let router = api::build_router(app_state, &api_dir)?;
+    let _ = lifecycle_tx.send(BackendState::Ready);
     boot_trace("router built; handing API port to real backend");
     let addr = format!("{}:{}", config.api.host, config.api.port);
 
     maintenance_notice.stop().await;
     let listener = bind_backend_listener(addr.as_str()).await?;
+    let _ = lifecycle_tx.send(BackendState::Running);
     tracing::info!(%addr, "backend ready");
     maybe_open_dashboard(&config);
 
     let result = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(lifecycle_tx.clone()))
         .await;
 
+    let _ = lifecycle_tx.send(BackendState::Stopping);
     container_refresh_task.abort();
     vault_refresh_task.abort();
     error_reporter_task.abort();
     drop(container_process);
+    let _ = lifecycle_tx.send(BackendState::Stopped);
 
     result.map_err(|err| anyhow::anyhow!("server error: {err}"))?;
     Ok(())
@@ -301,21 +307,33 @@ fn spawn_container_refresh(
                     client.update_endpoint(address, token, pid);
                     maintenance.record_container_refresh();
                     tracing::info!(pid, %address, "replacement container healthy; IPC switched to new process");
-                    // The old process has already stopped accepting work and is
-                    // confirmed idle. This short grace only lets in-flight
-                    // health/inspection IPC calls release their old socket.
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     drop(old);
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "scheduled container replacement failed; resuming existing healthy container");
-                    if let Err(resume_err) = client.resume().await {
+                    if let Err(resume_err) = resume_container_with_retry(&client).await {
                         tracing::error!(error = %resume_err, "failed to resume existing container after replacement failure");
                     }
                 }
             }
         }
     })
+}
+
+async fn resume_container_with_retry(client: &ContainerClient) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for attempt in 1..=5 {
+        match client.resume().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(attempt, error = %error, "container resume attempt failed");
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("container resume failed without an error")))
 }
 
 fn spawn_vault_refresh(
@@ -383,12 +401,13 @@ fn boot_debug_log_path() -> PathBuf { std::env::var_os("RBE_BOOT_LOG").map(PathB
 fn truthy_env(name: &str) -> bool { std::env::var(name).map(|value| truthy(&value)).unwrap_or(false) }
 fn truthy(value: &str) -> bool { matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(lifecycle_tx: tokio::sync::watch::Sender<BackendState>) {
     let ctrl_c = async { tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler"); };
     #[cfg(unix)]
     let terminate = async { tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("failed to install SIGTERM handler").recv().await; };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+    let _ = lifecycle_tx.send(BackendState::ShutdownRequested);
     tracing::info!("shutdown signal received");
 }

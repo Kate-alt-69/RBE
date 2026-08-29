@@ -95,6 +95,13 @@ impl ArtifactCache {
         }
     }
 
+    pub fn contains_artifact(&self, artifact_hash: &str) -> bool {
+        if self.artifacts.lock().expect("artifact cache poisoned").contains_key(artifact_hash) {
+            return true;
+        }
+        valid_artifact_name(artifact_hash) && artifact_dir().join(format!("{artifact_hash}.wasm")).is_file()
+    }
+
     pub fn artifact(&self, artifact_hash: &str) -> Option<Vec<u8>> {
         if let Some(bytes) = self.artifacts.lock().expect("artifact cache poisoned").get(artifact_hash).cloned() { return Some(bytes); }
         if !valid_artifact_name(artifact_hash) { return None; }

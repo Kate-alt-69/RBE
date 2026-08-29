@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      RBE_CONFIG_HOME: ${{ runner.temp }}/rbe-config
+      RBE_CONFIG_HOME: ${{ github.workspace }}/.rbe-ci-config
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -69,8 +69,6 @@ jobs:
           test -f "$APP_DIR/settings.json"
           test -f "$APP_DIR/api/health.route"
 
-          # Give Vault a real session bus on the headless runner so this checks
-          # normal Secret Service startup rather than package-install fallback.
           export XDG_RUNTIME_DIR="$RUNNER_TEMP/rbe-xdg-runtime"
           mkdir -p "$XDG_RUNTIME_DIR"
           chmod 700 "$XDG_RUNTIME_DIR"
@@ -100,8 +98,17 @@ jobs:
 
             if curl --fail --silent --show-error --max-time 2 \
               http://127.0.0.1:8080/health -o "$LOG_DIR/health.json"; then
-              READY=1
-              break
+              if python3 - "$LOG_DIR/health.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "r", encoding="utf-8") as f:
+              health = json.load(f)
+          if health.get("ok") is not True:
+              raise SystemExit(1)
+          PY
+              then
+                READY=1
+                break
+              fi
             fi
             sleep 1
           done
@@ -119,10 +126,11 @@ jobs:
               health = json.load(f)
           if health.get("ok") is not True:
               raise SystemExit(f"/health did not report ok=true: {health!r}")
+          if health.get("state") not in {"ready", "running"}:
+              raise SystemExit(f"/health returned unexpected lifecycle state: {health!r}")
           print("RBE health check:", json.dumps(health, sort_keys=True))
           PY
 
-          # Give the error-reporter daemon time to drain anything queued during boot.
           sleep 2
 
           for report in \
@@ -143,8 +151,6 @@ jobs:
             exit 1
           fi
 
-          # Linux supports SIGTERM through backend::shutdown_signal(), so require
-          # the smoke-test process to shut down cleanly as well.
           kill -TERM "$BACKEND_PID"
           if ! wait "$BACKEND_PID"; then
             echo "RBE returned a failure status during graceful shutdown." >&2
@@ -168,7 +174,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 25
     env:
-      RBE_CONFIG_HOME: ${{ runner.temp }}/rbe-config
+      RBE_CONFIG_HOME: ${{ github.workspace }}/.rbe-ci-config
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -232,13 +238,12 @@ jobs:
                 if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
                   $response.Content | Set-Content -LiteralPath $healthJson -Encoding utf8
                   $health = $response.Content | ConvertFrom-Json
-                  if ($health.ok -eq $true) {
+                  if ($health.ok -eq $true -and $health.state -in @('ready', 'running')) {
                     $ready = $true
                     break
                   }
                 }
               } catch {
-                # Expected while the backend is still booting.
               }
               Start-Sleep -Seconds 1
             }
@@ -275,9 +280,6 @@ jobs:
           finally {
             $proc.Refresh()
             if (-not $proc.HasExited) {
-              # Windows has no portable way to inject the console Ctrl+C event
-              # into a Start-Process child from Actions, so terminate it after
-              # the successful live-health/error-report checks.
               Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
               $proc.WaitForExit()
             }

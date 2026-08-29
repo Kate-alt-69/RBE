@@ -124,7 +124,7 @@ impl<'a> Lexer<'a> {
                 '/' => { self.bump(); TokenKind::Slash }
                 '%' => { self.bump(); TokenKind::Percent }
                 '"' | '\'' => self.read_string(c, line, column)?,
-                c if c.is_ascii_digit() => self.read_number(),
+                c if c.is_ascii_digit() => self.read_number(line, column)?,
                 c if c.is_alphabetic() || c == '_' => self.read_ident_or_keyword(),
                 other => {
                     return Err(LexError {
@@ -192,12 +192,34 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_number(&mut self) -> TokenKind {
+    fn read_number(&mut self, line: usize, column: usize) -> Result<TokenKind, LexError> {
         let mut out = String::new();
+        let mut seen_dot = false;
         while let Some(&c) = self.chars.peek() {
-            if c.is_ascii_digit() || c == '.' { out.push(c); self.bump(); } else { break; }
+            if c.is_ascii_digit() {
+                out.push(c);
+                self.bump();
+            } else if c == '.' {
+                if seen_dot {
+                    return Err(LexError {
+                        message: format!("malformed numeric literal {out}."),
+                        line,
+                        column,
+                    });
+                }
+                seen_dot = true;
+                out.push(c);
+                self.bump();
+            } else {
+                break;
+            }
         }
-        TokenKind::Number(out.parse().unwrap_or(0.0))
+        let value = out.parse::<f64>().map_err(|_| LexError {
+            message: format!("malformed numeric literal {out}"),
+            line,
+            column,
+        })?;
+        Ok(TokenKind::Number(value))
     }
 
     fn read_ident_or_keyword(&mut self) -> TokenKind {
@@ -251,5 +273,11 @@ mod tests {
         let tokens = Lexer::new("const café = 1;").tokenize().unwrap();
         let ident = tokens.iter().find(|token| matches!(&token.kind, TokenKind::Ident(name) if name == "café")).unwrap();
         assert_eq!(&"const café = 1;"[ident.start..ident.end], "café");
+    }
+
+    #[test]
+    fn rejects_multiple_decimal_points() {
+        let error = Lexer::new("const value = 1.2.3;").tokenize().unwrap_err();
+        assert!(error.message.contains("malformed numeric literal"));
     }
 }

@@ -1,11 +1,11 @@
 //! Real WASM execution for container workers.
 //!
 //! The first execution ABI is intentionally small: an approved module exports
-//! `run() -> i32`. Resource limits are applied through Wasmtime fuel here and
-//! through the OS sandbox/resource layer around the worker process.
+//! `run() -> i32`. Resource limits are applied through Wasmtime fuel and store
+//! limits here, plus the OS sandbox/resource layer around the worker process.
 
 use anyhow::Result;
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionLimits {
@@ -42,7 +42,14 @@ impl WasmExecutor {
     pub fn execute(&self, wasm: &[u8], limits: ExecutionLimits) -> Result<ExecutionResult> {
         let module = Module::new(&self.engine, wasm)
             .map_err(|error| anyhow::anyhow!("compile WASM artifact: {error}"))?;
-        let mut store = Store::new(&self.engine, ());
+
+        let memory_limit = usize::try_from(limits.max_memory_bytes)
+            .map_err(|_| anyhow::anyhow!("WASM memory limit does not fit this platform's address space"))?;
+        let store_limits: StoreLimits = StoreLimitsBuilder::new()
+            .memory_size(memory_limit)
+            .build();
+        let mut store = Store::new(&self.engine, store_limits);
+        store.limiter(|state| state);
         store
             .set_fuel(limits.fuel)
             .map_err(|error| anyhow::anyhow!("configure WASM fuel limit: {error}"))?;

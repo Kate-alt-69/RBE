@@ -7,6 +7,7 @@ use supervisor::BackendState;
 
 #[derive(Serialize)]
 struct HealthResponse {
+    ok: bool,
     state: BackendState,
 }
 
@@ -15,7 +16,9 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let lifecycle = state.backend_state();
     Json(HealthResponse {
-        state: state.backend_state(),
+        ok: matches!(lifecycle, BackendState::Ready | BackendState::Running),
+        state: lifecycle,
     })
 }

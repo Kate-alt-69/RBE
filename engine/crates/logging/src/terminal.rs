@@ -32,7 +32,7 @@ where
     ) -> fmt::Result {
         use tracing::Level;
 
-        write!(writer, "{}", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6fZ"))?;
+        write!(writer, "{}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ"))?;
 
         if self.ansi {
             let level = match *event.metadata().level() {

@@ -178,17 +178,20 @@ impl Default for ContainersConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default, rename_all = "camelCase")]
 pub struct BootstrapConfig { pub services: Vec<String> }
-impl Default for BootstrapConfig { fn default() -> Self { Self { services: vec!["email".into()] } } }
+impl Default for BootstrapConfig { fn default() -> Self { Self { services: vec!["email".into()] } }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default, rename_all = "camelCase")]
 pub struct LoggingConfig { pub level: String, pub format: String }
-impl Default for LoggingConfig { fn default() -> Self { Self { level: "info".into(), format: "json".into() } } }
+impl Default for LoggingConfig { fn default() -> Self { Self { level: "info".into(), format: "json".into() } }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default, rename_all = "camelCase")]
 pub struct DashboardsConfig { pub enabled: bool, pub auto_open: bool, pub admin_path_prefix: String }
-impl Default for DashboardsConfig { fn default() -> Self { Self { enabled: true, auto_open: true, admin_path_prefix: "/admin".into() } } }
+impl Default for DashboardsConfig { fn default() -> Self { Self { enabled: true, auto_open: true, admin_path_prefix: "/admin".into() } }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -226,16 +229,37 @@ impl Config {
         if !matches!(self.logging.level.as_str(), "trace" | "debug" | "info" | "warn" | "error") {
             return Err(ConfigError::Invalid(format!("invalid logging.level {:?}", self.logging.level)));
         }
+        if !matches!(self.logging.format.as_str(), "json" | "pretty") {
+            return Err(ConfigError::Invalid(format!("logging.format must be \"json\" or \"pretty\", got {:?}", self.logging.format)));
+        }
         if self.api.port == 0 { return Err(ConfigError::Invalid("api.port must be a nonzero port".into())); }
+        if self.api.request_timeout_ms == 0 { return Err(ConfigError::Invalid("api.requestTimeoutMs must be greater than zero".into())); }
+        if self.api.max_body_size_bytes == 0 { return Err(ConfigError::Invalid("api.maxBodySizeBytes must be greater than zero".into())); }
+        if self.security.max_json_payload_bytes == 0 { return Err(ConfigError::Invalid("security.maxJsonPayloadBytes must be greater than zero".into())); }
+        for (name, tier) in [("globalRateLimit", self.security.global_rate_limit), ("apiRateLimit", self.security.api_rate_limit)] {
+            if tier.window_secs == 0 { return Err(ConfigError::Invalid(format!("security.{name}.windowSecs must be greater than zero"))); }
+            if tier.max_requests == 0 { return Err(ConfigError::Invalid(format!("security.{name}.maxRequests must be greater than zero"))); }
+        }
+        if self.security.ip_ban.strike_threshold == 0 { return Err(ConfigError::Invalid("security.ipBan.strikeThreshold must be greater than zero".into())); }
+        if self.security.ip_ban.strike_window_secs == 0 { return Err(ConfigError::Invalid("security.ipBan.strikeWindowSecs must be greater than zero".into())); }
+        if self.security.ip_ban.ban_duration_secs == 0 { return Err(ConfigError::Invalid("security.ipBan.banDurationSecs must be greater than zero".into())); }
         if self.runtime.process_refresh_hours == 0 { return Err(ConfigError::Invalid("runtime.processRefreshHours must be greater than zero".into())); }
         if !(1..=5).contains(&self.containers.environments) {
             return Err(ConfigError::Invalid("containers.environments must be between 1 and 5 general environments; payment is always separate".into()));
         }
         for (name, value) in [("swampsPerEnvironment", self.containers.swamps_per_environment), ("workersPerSwamp", self.containers.workers_per_swamp)] {
             if let Some(value) = value.fixed() {
-                if value == 0 || value > 4096 { return Err(ConfigError::Invalid(format!("containers.{name} must be auto or 1..=4096"))); }
+                if value == 0 || value > 256 { return Err(ConfigError::Invalid(format!("containers.{name} must be auto or 1..=256"))); }
             }
         }
+        if let (Some(swamps), Some(workers)) = (self.containers.swamps_per_environment.fixed(), self.containers.workers_per_swamp.fixed()) {
+            if swamps.saturating_mul(workers) > 1024 {
+                return Err(ConfigError::Invalid("containers.swampsPerEnvironment * containers.workersPerSwamp must not exceed 1024 worker slots per environment".into()));
+            }
+        }
+        if self.containers.max_concurrent == 0 { return Err(ConfigError::Invalid("containers.maxConcurrent must be greater than zero".into())); }
+        if self.containers.default_timeout_ms == 0 { return Err(ConfigError::Invalid("containers.defaultTimeoutMs must be greater than zero".into())); }
+        if self.containers.memory_limit_mb == 0 { return Err(ConfigError::Invalid("containers.memoryLimitMb must be greater than zero".into())); }
         if !self.dashboards.admin_path_prefix.starts_with('/') {
             return Err(ConfigError::Invalid("dashboards.adminPathPrefix must start with '/'".into()));
         }
@@ -266,5 +290,20 @@ mod tests {
     fn rejects_unknown_top_level_field() {
         let result: Result<Config, _> = serde_json::from_str(r#"{ "api": { "host": "0.0.0.0", "port": 8080 }, "typo_field": true }"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_zero_security_windows() {
+        let mut config: Config = serde_json::from_str(r#"{ "api": { "host": "0.0.0.0", "port": 8080 } }"#).unwrap();
+        config.security.global_rate_limit.window_secs = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_explosive_fixed_worker_topology() {
+        let mut config: Config = serde_json::from_str(r#"{ "api": { "host": "0.0.0.0", "port": 8080 } }"#).unwrap();
+        config.containers.swamps_per_environment = AutoCount::Fixed(256);
+        config.containers.workers_per_swamp = AutoCount::Fixed(256);
+        assert!(config.validate().is_err());
     }
 }

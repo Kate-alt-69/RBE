@@ -5,13 +5,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use environments::EnvironmentId;
 use execution_engine::WasmExecutor;
 use resource_limits::ResourceLimits;
 use sandbox_primitives::SandboxPolicy;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::cache::ArtifactCache;
 use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot, EnvironmentStorage};
@@ -187,7 +188,7 @@ pub struct Runtime {
     config: RuntimeConfig,
     next_execution: AtomicU64,
     global_queue: Mutex<VecDeque<(EnvironmentId, ExecutionTask)>>,
-    cancelled: Mutex<HashSet<String>>,
+    cancelled: Arc<Mutex<HashSet<String>>>,
     generations: Mutex<HashMap<EnvironmentId, u64>>,
     environments: Vec<EnvironmentRuntime>,
     cache: Arc<ArtifactCache>,
@@ -214,13 +215,13 @@ impl Runtime {
             let cache = Arc::clone(&cache);
             let cancelled = Arc::clone(&cancelled);
             Arc::new(move |task| {
-                if cancelled.lock().expect("cancel table poisoned").contains(&task.id.to_string()) { return Err("execution cancelled before start".into()); }
-                if cache.artifact(&task.artifact_hash).is_some() {
-                    run_isolated_worker(task).map_err(|error| error.to_string())?;
+                if is_cancelled(&cancelled, task) { return Err("execution cancelled before start".into()); }
+                if cache.contains_artifact(&task.artifact_hash) {
+                    run_isolated_worker(task, &cancelled)?;
                 } else if task.work_ms > 0 {
-                    thread::sleep(Duration::from_millis(task.work_ms));
+                    run_simulated_work(task, &cancelled)?;
                 }
-                if cancelled.lock().expect("cancel table poisoned").contains(&task.id.to_string()) { return Err("execution cancelled".into()); }
+                if is_cancelled(&cancelled, task) { return Err("execution cancelled".into()); }
                 Ok(())
             })
         };
@@ -230,8 +231,11 @@ impl Runtime {
             let cancelled = Arc::clone(&cancelled);
             let journal = Arc::clone(&journal);
             Arc::new(move |task, elapsed_ms, result| {
-                cache.record(&task.artifact_hash, elapsed_ms, task.declared_cost);
+                let succeeded = result.is_ok();
                 let was_cancelled = cancelled.lock().expect("cancel table poisoned").remove(&task.id.to_string());
+                if succeeded && !was_cancelled {
+                    cache.record(&task.artifact_hash, elapsed_ms, task.declared_cost);
+                }
                 journal.append(JournalEvent {
                     kind: if was_cancelled { "cancel".into() } else { "done".into() },
                     epoch_ns: task.id.epoch_ns(), sequence: task.id.sequence(), environment: task.environment.clone(), artifact_hash: task.artifact_hash.clone(),
@@ -259,7 +263,7 @@ impl Runtime {
             config,
             next_execution: AtomicU64::new(max_sequence.saturating_add(1).max(1)),
             global_queue: Mutex::new(VecDeque::new()),
-            cancelled: Mutex::new(HashSet::new()),
+            cancelled: Arc::clone(&cancelled),
             generations: Mutex::new(generations),
             environments,
             cache,
@@ -293,8 +297,17 @@ impl Runtime {
     }
 
     pub fn submit_with_policy(&self, environment: EnvironmentId, artifact_hash: impl Into<String>, cost: WorkCost, limits: ResourceLimits, sandbox: SandboxPolicy, work_ms: u64, payload: Vec<u8>) -> ExecutionId {
-        let artifact_hash = artifact_hash.into();
-        if !payload.is_empty() { self.cache.put_artifact(artifact_hash.clone(), payload); }
+        let claimed_artifact_hash = artifact_hash.into();
+        let artifact_hash = if payload.is_empty() {
+            claimed_artifact_hash
+        } else {
+            let computed = hex::encode(Sha256::digest(&payload));
+            if !claimed_artifact_hash.is_empty() && claimed_artifact_hash != computed {
+                tracing::warn!(claimed = %claimed_artifact_hash, computed = %computed, "artifact hash did not match payload; using content hash");
+            }
+            self.cache.put_artifact(computed.clone(), payload);
+            computed
+        };
         let id = ExecutionId::new(self.next_execution.fetch_add(1, Ordering::Relaxed));
         self.journal.append(JournalEvent {
             kind: "queued".into(), epoch_ns: id.epoch_ns(), sequence: id.sequence(), environment: environment.to_string(), artifact_hash: artifact_hash.clone(),
@@ -307,7 +320,14 @@ impl Runtime {
         id
     }
 
-    pub fn register_artifact(&self, artifact_hash: impl Into<String>, wasm: Vec<u8>) { self.cache.put_artifact(artifact_hash, wasm); }
+    pub fn register_artifact(&self, artifact_hash: impl Into<String>, wasm: Vec<u8>) {
+        let claimed = artifact_hash.into();
+        let computed = hex::encode(Sha256::digest(&wasm));
+        if !claimed.is_empty() && claimed != computed {
+            tracing::warn!(claimed = %claimed, computed = %computed, "registered artifact hash did not match content; storing by content hash only");
+        }
+        self.cache.put_artifact(computed, wasm);
+    }
 
     pub fn cancel(&self, execution_id: &str) -> bool {
         let mut removed_queued = false;
@@ -431,13 +451,49 @@ fn parse_execution_id(value: &str) -> Result<(u64, u64), ()> {
     Ok((epoch_ns, sequence))
 }
 
-fn run_isolated_worker(task: &ExecutionTask) -> Result<(), String> {
+fn is_cancelled(cancelled: &Arc<Mutex<HashSet<String>>>, task: &ExecutionTask) -> bool {
+    cancelled.lock().expect("cancel table poisoned").contains(&task.id.to_string())
+}
+
+fn run_simulated_work(task: &ExecutionTask, cancelled: &Arc<Mutex<HashSet<String>>>) -> Result<(), String> {
+    let started = Instant::now();
+    let work = Duration::from_millis(task.work_ms);
+    let timeout = Duration::from_millis(task.limits.wall_time_ms.max(1));
+    loop {
+        if is_cancelled(cancelled, task) { return Err("execution cancelled".into()); }
+        let elapsed = started.elapsed();
+        if elapsed >= work { return Ok(()); }
+        if elapsed >= timeout { return Err(format!("execution timed out after {} ms", task.limits.wall_time_ms)); }
+        thread::sleep(Duration::from_millis(10).min(work.saturating_sub(elapsed)));
+    }
+}
+
+fn run_isolated_worker(task: &ExecutionTask, cancelled: &Arc<Mutex<HashSet<String>>>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let artifact = &task.artifact_hash;
     let fuel = task.limits.cpu_millis.saturating_mul(10_000).max(1_000_000);
     let memory = task.limits.memory_bytes.max(64 * 1024);
     let mut command = std::process::Command::new(exe);
     command.args(["--worker", "--artifact", artifact, "--fuel", &fuel.to_string(), "--memory", &memory.to_string()]);
-    let status = command.status().map_err(|e| e.to_string())?;
-    if status.success() { Ok(()) } else { Err(format!("isolated worker exited with status {status}")) }
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let timeout = Duration::from_millis(task.limits.wall_time_ms.max(1));
+
+    loop {
+        if is_cancelled(cancelled, task) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("execution cancelled".into());
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("execution timed out after {} ms", task.limits.wall_time_ms));
+        }
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => return Err(format!("isolated worker exited with status {status}")),
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }

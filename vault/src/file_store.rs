@@ -3,19 +3,10 @@
 //! realistic case — see `lib.rs`'s startup probe). AES-256-GCM,
 //! per-entry nonce, matching the encryption scheme named in the
 //! design discussion.
-//!
-//! **This is the highest-risk file in this crate, and arguably in the
-//! whole codebase so far.** Cryptographic code is exactly where subtle
-//! mistakes are most dangerous (nonce reuse, wrong key handling), and
-//! this was written with no compiler available to verify it against —
-//! see the round-trip and tamper-detection tests below, which are the
-//! best verification available right now, but **do not treat this as
-//! production-ready until it's actually been built, and ideally
-//! reviewed by someone who does cryptographic code review, not just
-//! compiled successfully.**
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -25,12 +16,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct StoredEntry {
-    /// Hex-encoded 12-byte nonce. Generated fresh per encryption call
-    /// (see `encrypt`) — never reused across entries or across
-    /// updates to the same entry, which is the one hard rule GCM mode
-    /// requires to stay secure.
     nonce: String,
-    /// Hex-encoded ciphertext (includes the GCM auth tag).
     ciphertext: String,
 }
 
@@ -41,18 +27,12 @@ pub struct FileStore {
 }
 
 impl FileStore {
-    /// `io` is meant to be the same shared `AtomicIo` instance used
-    /// elsewhere in the process (constructed once in `main.rs`), not a
-    /// fresh one per call — sharing it means the lock registry and
-    /// stats actually reflect *all* disk I/O, not just this store's.
     pub fn open(io: AtomicIo, dir: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(dir)?;
-        let key = read_or_create_key(&io, &dir.join("vault-master.key"))?;
-        Ok(Self {
-            io,
-            store_path: dir.join("vault-store.json"),
-            key,
-        })
+        let store_path = dir.join("vault-store.json");
+        let key_path = dir.join("vault-master.key");
+        let key = read_or_create_key(&io, &key_path, &store_path)?;
+        Ok(Self { io, store_path, key })
     }
 
     pub fn get(&self, name: &str) -> anyhow::Result<String> {
@@ -116,6 +96,10 @@ impl FileStore {
 
     fn decrypt(&self, entry: &StoredEntry) -> anyhow::Result<String> {
         let nonce_bytes = hex::decode(&entry.nonce)?;
+        let nonce_len = nonce_bytes.len();
+        let nonce_bytes: [u8; 12] = nonce_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("vault: stored nonce is {nonce_len} bytes, expected exactly 12"))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = hex::decode(&entry.ciphertext)?;
 
@@ -124,8 +108,7 @@ impl FileStore {
             .decrypt(nonce, ciphertext.as_ref())
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "vault: decryption failed — wrong key, or the stored entry was tampered \
-                     with (GCM auth tag mismatch): {e}"
+                    "vault: decryption failed — wrong key, or the stored entry was tampered with (GCM auth tag mismatch): {e}"
                 )
             })?;
 
@@ -133,20 +116,34 @@ impl FileStore {
     }
 }
 
-fn read_or_create_key(io: &AtomicIo, key_path: &Path) -> anyhow::Result<[u8; 32]> {
-    if let Ok(existing) = fs::read_to_string(key_path) {
-        let trimmed = existing.trim();
-        if let Ok(bytes) = hex::decode(trimmed) {
-            if bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                return Ok(key);
+fn read_or_create_key(io: &AtomicIo, key_path: &Path, store_path: &Path) -> anyhow::Result<[u8; 32]> {
+    match fs::read_to_string(key_path) {
+        Ok(existing) => {
+            let trimmed = existing.trim();
+            let bytes = hex::decode(trimmed)
+                .map_err(|error| anyhow::anyhow!("vault master key {} is malformed: {error}", key_path.display()))?;
+            if bytes.len() != 32 {
+                anyhow::bail!(
+                    "vault master key {} is {} bytes, expected exactly 32; refusing to replace a key that may protect existing credentials",
+                    key_path.display(),
+                    bytes.len()
+                );
             }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
         }
-        tracing::warn!(
-            path = %key_path.display(),
-            "vault master key file exists but is malformed — regenerating (previously \
-             encrypted entries will become unreadable)"
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!("failed to read vault master key {}: {error}", key_path.display()));
+        }
+    }
+
+    if store_path.exists() {
+        anyhow::bail!(
+            "vault credential store {} exists but master key {} is missing; refusing to generate a replacement key that would make existing credentials unrecoverable",
+            store_path.display(),
+            key_path.display()
         );
     }
 
@@ -199,18 +196,36 @@ mod tests {
         let dir = temp_dir("tamper");
         let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
         store.set("secret", "sensitive-value").unwrap();
-
-        // Directly corrupt the stored ciphertext on disk and confirm
-        // decryption fails loudly (GCM auth tag check) rather than
-        // silently returning garbage.
         let mut map = store.load_map().unwrap();
         let entry = map.get_mut("secret").unwrap();
         let mut bytes = hex::decode(&entry.ciphertext).unwrap();
         bytes[0] ^= 0xFF;
         entry.ciphertext = hex::encode(bytes);
         store.save_map(&map).unwrap();
-
         assert!(store.get("secret").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_nonce_is_an_error_not_a_panic() {
+        let dir = temp_dir("bad-nonce");
+        let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
+        store.set("secret", "value").unwrap();
+        let mut map = store.load_map().unwrap();
+        map.get_mut("secret").unwrap().nonce = "00".repeat(8);
+        store.save_map(&map).unwrap();
+        assert!(store.get("secret").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_store_without_key_fails_closed() {
+        let dir = temp_dir("missing-master-key");
+        let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
+        store.set("secret", "value").unwrap();
+        drop(store);
+        fs::remove_file(dir.join("vault-master.key")).unwrap();
+        assert!(FileStore::open(AtomicIo::new(), &dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
