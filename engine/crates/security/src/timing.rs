@@ -27,10 +27,11 @@ use crate::real_ip::extract_real_ip;
 const CLIENT_ERROR_SUPPRESSION: Duration = Duration::from_secs(10);
 const SERVER_ERROR_SUPPRESSION: Duration = Duration::from_secs(3);
 const ERROR_STATE_TTL: Duration = Duration::from_secs(60);
+const ERROR_STATE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_ERROR_BUCKETS: usize = 16_384;
 
 static REQUEST_AUDIT_IO: OnceLock<AtomicIo> = OnceLock::new();
-static ERROR_STATUS_STATE: OnceLock<Mutex<HashMap<ErrorStatusKey, ErrorStatusBucket>>> = OnceLock::new();
+static ERROR_STATUS_STATE: OnceLock<Mutex<ErrorStatusState>> = OnceLock::new();
 static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -45,6 +46,12 @@ struct ErrorStatusKey {
 struct ErrorStatusBucket {
     last_logged: Instant,
     suppressed: u64,
+}
+
+#[derive(Debug)]
+struct ErrorStatusState {
+    buckets: HashMap<ErrorStatusKey, ErrorStatusBucket>,
+    last_sweep: Instant,
 }
 
 enum ErrorAuditDecision {
@@ -223,7 +230,13 @@ fn error_audit_decision(
         return ErrorAuditDecision::NotApplicable;
     };
 
-    let state = ERROR_STATUS_STATE.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    let state = ERROR_STATUS_STATE.get_or_init(|| {
+        Mutex::new(ErrorStatusState {
+            buckets: HashMap::new(),
+            last_sweep: now,
+        })
+    });
     let key = ErrorStatusKey {
         client_ip: client_ip.to_string(),
         method: method.to_string(),
@@ -231,20 +244,25 @@ fn error_audit_decision(
         status,
     };
 
-    let now = Instant::now();
-    let Ok(mut buckets) = state.lock() else {
+    let Ok(mut state) = state.lock() else {
         return ErrorAuditDecision::Log { suppressed: 0 };
     };
 
-    buckets.retain(|_, bucket| now.duration_since(bucket.last_logged) <= ERROR_STATE_TTL);
-
-    if buckets.len() >= MAX_ERROR_BUCKETS && !buckets.contains_key(&key) {
-        buckets.clear();
+    if now.duration_since(state.last_sweep) >= ERROR_STATE_SWEEP_INTERVAL {
+        state
+            .buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_logged) <= ERROR_STATE_TTL);
+        state.last_sweep = now;
     }
 
-    match buckets.get_mut(&key) {
+    if state.buckets.len() >= MAX_ERROR_BUCKETS && !state.buckets.contains_key(&key) {
+        state.buckets.clear();
+        state.last_sweep = now;
+    }
+
+    match state.buckets.get_mut(&key) {
         None => {
-            buckets.insert(
+            state.buckets.insert(
                 key,
                 ErrorStatusBucket {
                     last_logged: now,
@@ -340,10 +358,6 @@ fn write_request_audit(
             ));
         }
 
-        // Error-status records intentionally stay compact. No raw request
-        // headers, response headers, geo bundles, or proxy bundles are
-        // persisted unless they provide a concrete extra debugging signal
-        // below.
         if let Some(correlation_id) = header(response_headers, "x-correlation-id") {
             entry.insert("correlation_id".into(), json!(correlation_id));
         }
