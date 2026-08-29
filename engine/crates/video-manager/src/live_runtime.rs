@@ -17,6 +17,9 @@ pub type LiveRuntimeFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>>
 ///
 /// Implementations own listeners/processes/protocol resources. The language
 /// runtime never receives this trait object and cannot call it directly.
+/// `stop` must be idempotent and safe to call after a failed or timed-out
+/// `start`, because the coordinator uses it to clean partially started runtime
+/// resources before any future start attempt.
 pub trait LiveRuntimeDriver: Send + Sync + 'static {
     fn start<'a>(&'a self, manager: Arc<VideoManager>) -> LiveRuntimeFuture<'a>;
     fn stop<'a>(&'a self, manager: Arc<VideoManager>) -> LiveRuntimeFuture<'a>;
@@ -136,6 +139,15 @@ async fn run_live_runtime_coordinator(
                     timeout_secs = LIVE_RUNTIME_START_TIMEOUT.as_secs(),
                     "Video Manager live runtime start timed out"
                 ),
+            }
+
+            // A failed or timed-out start can still have created listeners,
+            // subprocesses, sockets, or protocol state before it failed. Never
+            // retry start until the trusted driver has proved those resources
+            // are gone. If cleanup itself is uncertain, retain coordinator
+            // ownership and fail closed instead of risking a duplicate runtime.
+            if !stop_live_runtime(manager.clone(), driver.as_ref(), false).await {
+                return false;
             }
             let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Degraded);
             if wait_for_signal(&manager, &mut shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
@@ -295,6 +307,31 @@ mod tests {
         }
     }
 
+    struct FailingStartRuntime {
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+        fail_cleanup: bool,
+    }
+
+    impl LiveRuntimeDriver for FailingStartRuntime {
+        fn start<'a>(&'a self, _manager: Arc<VideoManager>) -> LiveRuntimeFuture<'a> {
+            Box::pin(async move {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("simulated partial live runtime start failure")
+            })
+        }
+
+        fn stop<'a>(&'a self, _manager: Arc<VideoManager>) -> LiveRuntimeFuture<'a> {
+            Box::pin(async move {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+                if self.fail_cleanup {
+                    anyhow::bail!("simulated partial live runtime cleanup failure");
+                }
+                Ok(())
+            })
+        }
+    }
+
     struct FailingStopRuntime {
         starts: AtomicUsize,
         stops: AtomicUsize,
@@ -449,6 +486,65 @@ mod tests {
             manager.live_runtime_state().unwrap(),
             VideoLiveRuntimeState::Disabled
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_start_is_cleaned_before_runtime_can_retry() {
+        let path = temp_db("start-cleanup");
+        let manager = Arc::new(VideoManager::open_default(&path, 7200).unwrap());
+        make_live_session(&manager, "Partial start");
+        let driver = Arc::new(FailingStartRuntime {
+            starts: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            fail_cleanup: false,
+        });
+        let handle = manager
+            .clone()
+            .spawn_live_runtime_with_idle(driver.clone(), Duration::from_millis(25))
+            .unwrap();
+
+        wait_until(|| driver.stops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(driver.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.live_runtime_state().unwrap(),
+            VideoLiveRuntimeState::Degraded
+        );
+
+        assert!(handle.shutdown().await);
+        assert_eq!(
+            manager.live_runtime_state().unwrap(),
+            VideoLiveRuntimeState::Disabled
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_start_cleanup_keeps_runtime_owned_fail_closed() {
+        let path = temp_db("start-cleanup-fail-closed");
+        let manager = Arc::new(VideoManager::open_default(&path, 7200).unwrap());
+        make_live_session(&manager, "Unsafe partial start");
+        let driver = Arc::new(FailingStartRuntime {
+            starts: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            fail_cleanup: true,
+        });
+        let handle = manager
+            .clone()
+            .spawn_live_runtime_with_idle(driver.clone(), Duration::from_millis(25))
+            .unwrap();
+
+        wait_until(|| driver.stops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(driver.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.live_runtime_state().unwrap(),
+            VideoLiveRuntimeState::Degraded
+        );
+        assert!(!handle.shutdown().await);
+        assert!(manager
+            .clone()
+            .spawn_live_runtime_with_idle(driver.clone(), Duration::from_millis(25))
+            .is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
