@@ -28,6 +28,7 @@ jobs:
             crates/service-runtime/src/lib.rs \
             crates/service-runtime/src/manager.rs \
             crates/backend/src/service_boot.rs \
+            crates/config/src/lib.rs \
             crates/video-manager/src/lib.rs \
             crates/video-manager/src/download.rs \
             crates/video-manager/src/download_worker.rs \
@@ -36,6 +37,7 @@ jobs:
             crates/video-manager/src/ffmpeg.rs \
             crates/video-manager/src/normalization.rs \
             crates/video-manager/src/pipeline.rs \
+            crates/video-manager/src/worker.rs \
             crates/core/src/video_language.rs \
             crates/api/src/health.rs \
             crates/route-engine/src/ast.rs \
