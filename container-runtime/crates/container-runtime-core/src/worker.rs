@@ -21,7 +21,8 @@ pub struct WorkerSnapshot {
 struct WorkerCommand { task: ExecutionTask }
 
 pub type Runner = Arc<dyn Fn(&ExecutionTask) -> Result<(), String> + Send + Sync + 'static>;
-type Completion = Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>;
+pub(crate) type Completion = Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>;
+type Availability = Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub struct Worker {
     id: usize,
@@ -34,7 +35,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(id: usize, runner: Runner, on_complete: Completion) -> Self {
+    pub fn new(id: usize, runner: Runner, on_complete: Completion, on_available: Availability) -> Self {
         let (tx, rx) = mpsc::channel::<WorkerCommand>();
         let state = Arc::new(Mutex::new(WorkerState::Idle));
         let current = Arc::new(Mutex::new(None));
@@ -61,11 +62,18 @@ impl Worker {
                     else { thread_failed.fetch_add(1, Ordering::Relaxed); }
                     thread_total_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
                     on_complete(&command.task, elapsed_ms, result);
-                    *thread_current.lock().expect("worker current poisoned") = None;
-                    *thread_state.lock().expect("worker state poisoned") = WorkerState::Idle;
+                    {
+                        let mut state = thread_state.lock().expect("worker state poisoned");
+                        let mut current = thread_current.lock().expect("worker current poisoned");
+                        *current = None;
+                        *state = WorkerState::Idle;
+                    }
+                    on_available();
                 }
-                *thread_current.lock().expect("worker current poisoned") = None;
-                *thread_state.lock().expect("worker state poisoned") = WorkerState::Stopped;
+                let mut state = thread_state.lock().expect("worker state poisoned");
+                let mut current = thread_current.lock().expect("worker current poisoned");
+                *current = None;
+                *state = WorkerState::Stopped;
             })
             .expect("failed to start worker thread");
 
@@ -76,20 +84,22 @@ impl Worker {
         *self.state.lock().expect("worker state poisoned") == WorkerState::Idle
     }
 
-    pub fn try_send(&self, task: ExecutionTask) -> bool {
+    pub fn try_send(&self, task: ExecutionTask) -> Option<ExecutionTask> {
         let execution_id = task.id;
         {
             let mut state = self.state.lock().expect("worker state poisoned");
-            if *state != WorkerState::Idle { return false; }
+            if *state != WorkerState::Idle { return Some(task); }
             *state = WorkerState::Running;
             *self.current.lock().expect("worker current poisoned") = Some(execution_id);
         }
-        if self.tx.send(WorkerCommand { task }).is_ok() {
-            true
-        } else {
-            *self.current.lock().expect("worker current poisoned") = None;
-            *self.state.lock().expect("worker state poisoned") = WorkerState::Stopped;
-            false
+        match self.tx.send(WorkerCommand { task }) {
+            Ok(()) => None,
+            Err(error) => {
+                let mut state = self.state.lock().expect("worker state poisoned");
+                *self.current.lock().expect("worker current poisoned") = None;
+                *state = WorkerState::Stopped;
+                Some(error.0.task)
+            }
         }
     }
 

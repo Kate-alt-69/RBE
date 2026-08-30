@@ -6,9 +6,7 @@ use environments::EnvironmentId;
 
 use crate::execution::ExecutionTask;
 use crate::swamp::{Swamp, SwampSnapshot};
-use crate::worker::Runner;
-
-type Completion = Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>;
+use crate::worker::{Completion, Runner};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EnvironmentStorage {
