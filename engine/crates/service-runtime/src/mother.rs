@@ -130,7 +130,9 @@ impl ServiceMotherClient {
             ServiceMotherResponse::Error { code, message } => {
                 anyhow::bail!("Service Mother returned {code}: {message}")
             }
-            other => anyhow::bail!("Service Mother returned unexpected snapshot response: {other:?}"),
+            other => {
+                anyhow::bail!("Service Mother returned unexpected snapshot response: {other:?}")
+            }
         }
     }
 
@@ -147,7 +149,9 @@ impl ServiceMotherClient {
             ServiceMotherResponse::Error { code, message } => {
                 anyhow::bail!("Service Mother returned {code}: {message}")
             }
-            other => anyhow::bail!("Service Mother returned unexpected shutdown response: {other:?}"),
+            other => {
+                anyhow::bail!("Service Mother returned unexpected shutdown response: {other:?}")
+            }
         }
     }
 }
@@ -158,12 +162,12 @@ fn map_value_response(
 ) -> Result<Value, ServiceCallError> {
     match response {
         ServiceMotherResponse::Value { value } => Ok(value),
-        ServiceMotherResponse::Error { code, message } if code == "SVCM404" => {
+        ServiceMotherResponse::Error { code, message: _ } if code == "SVCM404" => {
             Err(ServiceCallError::Unknown {
                 service: service.to_string(),
             })
         }
-        ServiceMotherResponse::Error { code, message } if code == "SVCM503" => {
+        ServiceMotherResponse::Error { code, message: _ } if code == "SVCM503" => {
             Err(ServiceCallError::Unavailable {
                 service: service.to_string(),
             })
@@ -285,7 +289,9 @@ async fn handle_connection(
 
 fn wire_service_error(error: ServiceCallError) -> ServiceMotherResponse {
     let (code, message) = match error {
-        ServiceCallError::Unknown { service } => ("SVCM404", format!("unknown service {service:?}")),
+        ServiceCallError::Unknown { service } => {
+            ("SVCM404", format!("unknown service {service:?}"))
+        }
         ServiceCallError::Unavailable { service } => {
             ("SVCM503", format!("service {service:?} is unavailable"))
         }

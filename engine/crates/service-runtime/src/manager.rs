@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rand::RngCore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -19,6 +19,7 @@ use super::{
     RestartPolicy, ServiceCatalog, ServiceFile, ServiceMode, ServiceReady, ServiceRequest,
     ServiceResponse,
 };
+use crate::mother::ServiceMotherClient;
 
 const RESTART_BASE_DELAY_MS: u64 = 250;
 const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
@@ -100,9 +101,10 @@ impl Managed {
 pub struct ServiceManager {
     services: Arc<AsyncRwLock<HashMap<String, Arc<Mutex<Managed>>>>>,
     shutting_down: Arc<AtomicBool>,
+    mother: Option<ServiceMotherClient>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceRuntimeState {
     Dormant,
@@ -112,7 +114,7 @@ pub enum ServiceRuntimeState {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceSnapshot {
     pub name: String,
@@ -152,6 +154,19 @@ pub enum ServiceCallError {
 }
 
 impl ServiceManager {
+    pub fn remote(address: SocketAddr, auth: String) -> anyhow::Result<Self> {
+        if !address.ip().is_loopback() {
+            anyhow::bail!("Service Mother endpoint must be loopback");
+        }
+        if auth.len() != 64 || !auth.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("Service Mother authentication value must be 256-bit hexadecimal");
+        }
+        Ok(Self {
+            mother: Some(ServiceMotherClient::new(address, auth)),
+            ..Self::default()
+        })
+    }
+
     pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
         let manager = Self::default();
         for file in catalog.services() {
@@ -413,6 +428,14 @@ impl ServiceManager {
                 service: service_name.to_string(),
             });
         }
+        if let Some(mother) = &self.mother {
+            return match operation {
+                ServiceOperation::Call { function, args } => {
+                    mother.call(service_name, &function, args).await
+                }
+                ServiceOperation::Event { event } => mother.event(service_name, event).await,
+            };
+        }
 
         let handle = self
             .services
@@ -511,6 +534,25 @@ impl ServiceManager {
     }
 
     pub async fn snapshot(&self) -> Vec<ServiceSnapshot> {
+        if let Some(mother) = &self.mother {
+            return match mother.snapshot().await {
+                Ok(services) => services,
+                Err(error) => vec![ServiceSnapshot {
+                    name: "service-mother".into(),
+                    title: "RBE Service Mother".into(),
+                    pid: None,
+                    state: ServiceRuntimeState::Unknown,
+                    mode: ServiceMode::Resident,
+                    restart: RestartPolicy::OnFailure,
+                    restart_attempts: 0,
+                    idle_timeout_ms: 0,
+                    ready: false,
+                    health_checked: true,
+                    health: None,
+                    health_error: Some(error.to_string()),
+                }],
+            };
+        }
         let handles = self
             .services
             .read()
@@ -599,6 +641,12 @@ impl ServiceManager {
 
     pub async fn shutdown_all(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        if let Some(mother) = &self.mother {
+            if let Err(error) = mother.shutdown().await {
+                tracing::warn!(error = %error, "Service Mother shutdown RPC failed");
+            }
+            return;
+        }
         let handles = self
             .services
             .read()

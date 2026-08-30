@@ -14,7 +14,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 mod manager;
+mod mother;
 pub use manager::{ServiceCallError, ServiceManager, ServiceRuntimeState, ServiceSnapshot};
+pub use mother::{new_service_mother_token, run_service_mother, ServiceMotherReady};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
