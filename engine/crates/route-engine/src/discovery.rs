@@ -24,6 +24,16 @@ use crate::parser::Parser;
 use crate::terminal::Terminal;
 use crate::transpiler::transpile_file;
 
+const RESERVED_NATIVE_API_PREFIXES: &[&str] = &[
+    "/api/account",
+    "/api/admin",
+    "/api/auth",
+    "/api/broadcast",
+    "/api/contact",
+    "/api/maintenance",
+    "/api/streaming",
+];
+
 pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -109,6 +119,93 @@ pub(crate) fn url_path_for(api_dir: &Path, file_path: &Path) -> String {
         segments.pop();
     }
     format!("/api/{}", segments.join("/"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteCollision {
+    path: PathBuf,
+    message: String,
+}
+
+fn is_in_native_namespace(url_path: &str, prefix: &str) -> bool {
+    url_path == prefix
+        || url_path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn find_route_collisions(
+    api_dir: &Path,
+    compiled: &[(PathBuf, Arc<RouteFile>)],
+) -> Vec<RouteCollision> {
+    let mut owners: HashMap<(String, String), PathBuf> = HashMap::new();
+    let mut collisions = Vec::new();
+
+    for (path, file) in compiled {
+        let url_path = url_path_for(api_dir, path);
+
+        if let Some(prefix) = RESERVED_NATIVE_API_PREFIXES
+            .iter()
+            .find(|prefix| is_in_native_namespace(&url_path, prefix))
+        {
+            collisions.push(RouteCollision {
+                path: path.clone(),
+                message: format!(
+                    "route URL `{url_path}` conflicts with native API namespace `{prefix}`"
+                ),
+            });
+            continue;
+        }
+
+        for method in &file.methods {
+            let key = (url_path.clone(), method.verb.clone());
+            if let Some(existing) = owners.get(&key) {
+                collisions.push(RouteCollision {
+                    path: path.clone(),
+                    message: format!(
+                        "route {} `{}` conflicts with {}",
+                        method.verb.to_uppercase(),
+                        url_path,
+                        existing.display()
+                    ),
+                });
+            } else {
+                owners.insert(key, path.clone());
+            }
+        }
+    }
+
+    collisions
+}
+
+fn reject_route_collisions(
+    api_dir: &Path,
+    compiled: &[(PathBuf, Arc<RouteFile>)],
+) -> anyhow::Result<()> {
+    let collisions = find_route_collisions(api_dir, compiled);
+    if collisions.is_empty() {
+        return Ok(());
+    }
+
+    let error_path = compiler_error_path();
+    if let Some(parent) = error_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut error_file = fs::File::create(&error_path)?;
+    for collision in &collisions {
+        writeln!(
+            error_file,
+            "E3013: {}: {}",
+            collision.path.display(),
+            collision.message
+        )?;
+    }
+
+    Err(anyhow::anyhow!(
+        "route compiler found {} route collision(s); see {}",
+        collisions.len(),
+        error_path.display()
+    ))
 }
 
 fn value_to_json(value: &Value) -> serde_json::Value {
@@ -538,6 +635,7 @@ pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
     files.sort();
 
     let compiled = boot_compile(api_dir, &files)?;
+    reject_route_collisions(api_dir, &compiled)?;
     let mut router: Router<AppState> = Router::new();
 
     for (path, route_file) in compiled {
@@ -565,4 +663,71 @@ pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
     }
 
     Ok(router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route_file(methods: &[&str]) -> Arc<RouteFile> {
+        Arc::new(RouteFile {
+            imports: Vec::new(),
+            functions: Vec::new(),
+            class_name: "Route".into(),
+            methods: methods
+                .iter()
+                .map(|verb| MethodDef {
+                    verb: (*verb).into(),
+                    param_name: None,
+                    body: Vec::new(),
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn catches_index_and_sibling_route_method_collision() {
+        let api_dir = Path::new("api");
+        let compiled = vec![
+            (PathBuf::from("api/foo.route"), route_file(&["get"])),
+            (PathBuf::from("api/foo/index.route"), route_file(&["get"])),
+        ];
+
+        let collisions = find_route_collisions(api_dir, &compiled);
+        assert_eq!(collisions.len(), 1);
+        assert!(collisions[0].message.contains("GET `/api/foo`"));
+        assert!(collisions[0].message.contains("api/foo.route"));
+    }
+
+    #[test]
+    fn allows_different_methods_on_the_same_normalized_url() {
+        let api_dir = Path::new("api");
+        let compiled = vec![
+            (PathBuf::from("api/foo.route"), route_file(&["get"])),
+            (PathBuf::from("api/foo/index.route"), route_file(&["post"])),
+        ];
+
+        assert!(find_route_collisions(api_dir, &compiled).is_empty());
+    }
+
+    #[test]
+    fn rejects_route_files_inside_native_api_namespaces() {
+        let api_dir = Path::new("api");
+        let compiled = vec![(
+            PathBuf::from("api/admin/users.route"),
+            route_file(&["get"]),
+        )];
+
+        let collisions = find_route_collisions(api_dir, &compiled);
+        assert_eq!(collisions.len(), 1);
+        assert!(collisions[0]
+            .message
+            .contains("native API namespace `/api/admin`"));
+    }
+
+    #[test]
+    fn native_prefix_matching_is_segment_aware() {
+        assert!(is_in_native_namespace("/api/admin/users", "/api/admin"));
+        assert!(!is_in_native_namespace("/api/administrator", "/api/admin"));
+    }
 }
