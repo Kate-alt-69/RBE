@@ -3,7 +3,7 @@ use std::fs::{create_dir_all, read_to_string, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -188,6 +188,7 @@ pub struct Runtime {
     config: RuntimeConfig,
     next_execution: AtomicU64,
     global_queue: Mutex<VecDeque<(EnvironmentId, ExecutionTask)>>,
+    global_queue_changed: Condvar,
     cancelled: Arc<Mutex<HashSet<String>>>,
     generations: Mutex<HashMap<EnvironmentId, u64>>,
     environments: Vec<EnvironmentRuntime>,
@@ -263,6 +264,7 @@ impl Runtime {
             config,
             next_execution: AtomicU64::new(max_sequence.saturating_add(1).max(1)),
             global_queue: Mutex::new(VecDeque::new()),
+            global_queue_changed: Condvar::new(),
             cancelled: Arc::clone(&cancelled),
             generations: Mutex::new(generations),
             environments,
@@ -286,7 +288,15 @@ impl Runtime {
         thread::Builder::new().name("rbe-runtime-scheduler".to_string()).spawn(move || {
             while let Some(runtime) = weak.upgrade() {
                 runtime.rebalance_once();
-                thread::sleep(Duration::from_millis(interval));
+                let has_queued_work = runtime.snapshots().iter().any(|environment| environment.queued != 0);
+                if has_queued_work {
+                    thread::sleep(Duration::from_millis(interval));
+                    continue;
+                }
+                let queue = runtime.global_queue.lock().expect("global queue poisoned");
+                if queue.is_empty() {
+                    drop(runtime.global_queue_changed.wait_timeout(queue, Duration::from_secs(1)).expect("global queue poisoned"));
+                }
             }
         }).expect("failed to start runtime scheduler");
         runtime
@@ -317,6 +327,7 @@ impl Runtime {
             limit_wall_time_ms: limits.wall_time_ms,
         });
         self.global_queue.lock().expect("global queue poisoned").push_back((environment, ExecutionTask { id, environment: environment.to_string(), artifact_hash, declared_cost: cost, limits, sandbox, work_ms, payload: Vec::new() }));
+        self.global_queue_changed.notify_one();
         id
     }
 
@@ -365,6 +376,8 @@ impl Runtime {
         if count != 0 {
             let mut queue = self.global_queue.lock().expect("global queue poisoned");
             for task in pending { queue.push_back((id, task)); }
+            drop(queue);
+            self.global_queue_changed.notify_one();
         }
         *self.generations.lock().expect("generation table poisoned").entry(id).or_default() += 1;
         count
