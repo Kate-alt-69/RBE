@@ -199,7 +199,7 @@ async fn settings(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<
 #[allow(dead_code)]
 fn _is_loopback(ip: IpAddr) -> bool { ip.is_loopback() }
 
-const DASHBOARD_HTML: &str = r#"<!doctype html>
+const DASHBOARD_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -432,7 +432,7 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()}
 tick();
 </script>
 </body>
-</html>"#;
+</html>"##;
 
 const DASHBOARD_CSS: &str = r#"
 :root{
