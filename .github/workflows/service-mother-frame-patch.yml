@@ -1,0 +1,38 @@
+name: Service Mother Frame Patch
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: bound Service Mother IPC frames
+        shell: bash
+        run: |
+          python ../.github/patches/service-mother-frame.py
+          rustfmt --edition 2021 crates/service-runtime/src/mother.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- crates/service-runtime/src/mother.rs
+            git commit -m "FIX | BUG-SVC-001 bound Service Mother IPC frames"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
