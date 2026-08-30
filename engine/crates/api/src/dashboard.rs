@@ -25,11 +25,11 @@ pub fn redirect_routes() -> Router<AppState> {
     Router::new().route("/dashboard", get(dashboard_redirect))
 }
 
-fn local_only(peer: SocketAddr) -> Result<(), Response> {
+fn local_only(peer: SocketAddr) -> Option<Response> {
     if peer.ip().is_loopback() {
-        Ok(())
+        None
     } else {
-        Err((StatusCode::FORBIDDEN, "RBE dashboard is loopback-only").into_response())
+        Some((StatusCode::FORBIDDEN, "RBE dashboard is loopback-only").into_response())
     }
 }
 
@@ -37,23 +37,23 @@ async fn dashboard_redirect(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    if let Err(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) { return response; }
     let prefix = state.config.dashboards.admin_path_prefix.trim_end_matches('/');
     Redirect::temporary(&format!("http://127.0.0.1:{DASHBOARD_PORT}{prefix}/dashboard")).into_response()
 }
 
 async fn dashboard_html(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Err(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) { return response; }
     Html(DASHBOARD_HTML).into_response()
 }
 
 async fn dashboard_css(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Err(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) { return response; }
     ([(CONTENT_TYPE, "text/css; charset=utf-8")], DASHBOARD_CSS).into_response()
 }
 
 async fn overview(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Err(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) { return response; }
     let metrics = state.backend_metrics.snapshot();
     let maintenance = state.maintenance.snapshot();
     let endpoint = state.container.endpoint_snapshot();
@@ -91,7 +91,7 @@ async fn overview(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<
 }
 
 async fn backend(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Err(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) { return response; }
     let metrics = state.backend_metrics.snapshot();
     Json(json!({
         "pid": std::process::id(),
@@ -121,7 +121,7 @@ async fn backend(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<S
 }
 
 async fn container(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Err(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) { return response; }
     let endpoint = state.container.endpoint_snapshot();
     match state.container.inspect().await {
         Ok(body) => Json(json!({
@@ -141,7 +141,7 @@ async fn container(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo
 }
 
 async fn security(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Err(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) { return response; }
     let bans = state.ip_strikes.ban_snapshots().into_iter().map(|entry| json!({
         "ip": entry.ip,
         "age_secs": entry.age_secs,
@@ -169,7 +169,7 @@ async fn security(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<
 }
 
 async fn settings(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Err(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) { return response; }
     let endpoint = state.container.endpoint_snapshot();
     let resolved = state.container.inspect().await.ok().and_then(|value| value.get("config").cloned()).unwrap_or(Value::Null);
     Json(json!({

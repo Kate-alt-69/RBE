@@ -284,7 +284,10 @@ mod tests {
     fn zero_work_starts_with_an_empty_bar() {
         let total = 0usize;
         let width = 30usize;
-        let filled = if total == 0 { 0 } else { 1usize.saturating_mul(width) / total };
+        let filled = 1usize
+            .saturating_mul(width)
+            .checked_div(total)
+            .unwrap_or(0);
         assert_eq!(filled, 0);
     }
 

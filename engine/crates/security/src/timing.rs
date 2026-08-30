@@ -60,6 +60,28 @@ enum ErrorAuditDecision {
     NotApplicable,
 }
 
+struct RequestAudit<'a> {
+    config: &'a Config,
+    request_headers: &'a HeaderMap,
+    response_headers: &'a HeaderMap,
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+    peer: SocketAddr,
+    client_ip: String,
+    duration_ms: f64,
+    status: u16,
+    origin: Option<String>,
+    preflight: bool,
+    request_cors_method: Option<String>,
+    request_cors_headers: Option<String>,
+    response_cors_origin: Option<String>,
+    response_cors_methods: Option<String>,
+    response_cors_headers: Option<String>,
+    response_cors_credentials: Option<String>,
+    cors_blocked: bool,
+}
+
 pub async fn request_timing(
     State(config): State<std::sync::Arc<Config>>,
     request: Request,
@@ -136,18 +158,24 @@ pub async fn request_timing(
         );
     }
 
-    match error_audit_decision(&client_ip.to_string(), method.as_str(), &path, status) {
-        ErrorAuditDecision::Suppress => {}
-        ErrorAuditDecision::Log { suppressed } => {
-            write_request_audit(
-                &config,
-                &headers,
-                response.headers(),
-                &method.to_string(),
-                &path,
-                &query,
+    let client_ip = client_ip.to_string();
+    let suppressed = match error_audit_decision(&client_ip, method.as_str(), &path, status) {
+        ErrorAuditDecision::Suppress => None,
+        ErrorAuditDecision::Log { suppressed } => Some(suppressed),
+        ErrorAuditDecision::NotApplicable => Some(0),
+    };
+
+    if let Some(suppressed) = suppressed {
+        write_request_audit(
+            RequestAudit {
+                config: &config,
+                request_headers: &headers,
+                response_headers: response.headers(),
+                method: method.as_str(),
+                path: &path,
+                query: &query,
                 peer,
-                client_ip.to_string(),
+                client_ip,
                 duration_ms,
                 status,
                 origin,
@@ -159,33 +187,9 @@ pub async fn request_timing(
                 response_cors_headers,
                 response_cors_credentials,
                 cors_blocked,
-                suppressed,
-            );
-        }
-        ErrorAuditDecision::NotApplicable => {
-            write_request_audit(
-                &config,
-                &headers,
-                response.headers(),
-                &method.to_string(),
-                &path,
-                &query,
-                peer,
-                client_ip.to_string(),
-                duration_ms,
-                status,
-                origin,
-                preflight,
-                request_cors_method,
-                request_cors_headers,
-                response_cors_origin,
-                response_cors_methods,
-                response_cors_headers,
-                response_cors_credentials,
-                cors_blocked,
-                0,
-            );
-        }
+            },
+            suppressed,
+        );
     }
 
     response
@@ -291,28 +295,28 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn write_request_audit(
-    config: &Config,
-    request_headers: &HeaderMap,
-    response_headers: &HeaderMap,
-    method: &str,
-    path: &str,
-    query: &str,
-    peer: SocketAddr,
-    client_ip: String,
-    duration_ms: f64,
-    status: u16,
-    origin: Option<String>,
-    preflight: bool,
-    request_cors_method: Option<String>,
-    request_cors_headers: Option<String>,
-    response_cors_origin: Option<String>,
-    response_cors_methods: Option<String>,
-    response_cors_headers: Option<String>,
-    response_cors_credentials: Option<String>,
-    cors_blocked: bool,
-    suppressed: u64,
-) {
+fn write_request_audit(audit: RequestAudit<'_>, suppressed: u64) {
+    let RequestAudit {
+        config,
+        request_headers,
+        response_headers,
+        method,
+        path,
+        query,
+        peer,
+        client_ip,
+        duration_ms,
+        status,
+        origin,
+        preflight,
+        request_cors_method,
+        request_cors_headers,
+        response_cors_origin,
+        response_cors_methods,
+        response_cors_headers,
+        response_cors_credentials,
+        cors_blocked,
+    } = audit;
     let mut entry = Map::new();
     entry.insert("ts_ms".into(), json!(now_ms()));
     entry.insert("method".into(), json!(method));

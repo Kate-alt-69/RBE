@@ -97,7 +97,6 @@ impl ContainerProcess {
         Ok(())
     }
 
-    pub fn pid(&self) -> Option<u32> { self.child.id() }
     pub fn endpoint(&self) -> (SocketAddr, String, Option<u32>) { (self.address, self.token.clone(), self.child.id()) }
 }
 

@@ -451,9 +451,9 @@ mod tests {
 
     #[test]
     fn unknown_builtin_import_gets_e3010() {
-        let file = parse(r#":import[vault.import] class Route { get(req) { return req.path; } }"#);
+        let file = parse(r#":import[vault.unknown] class Route { get(req) { return req.path; } }"#);
         let diagnostics = analyze(&file);
-        assert!(diagnostics.iter().any(|d| d.code == "E3010" && d.message.contains("vault.import does not exist as a import")));
+        assert!(diagnostics.iter().any(|d| d.code == "E3010" && d.message.contains("vault.unknown does not exist as a import")));
     }
 
     #[test]

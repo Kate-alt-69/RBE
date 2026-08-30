@@ -21,14 +21,11 @@ pub struct Config {
     #[serde(default)] pub dashboards: DashboardsConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AutoCount {
+    #[default]
     Auto,
     Fixed(usize),
-}
-
-impl Default for AutoCount {
-    fn default() -> Self { Self::Auto }
 }
 
 impl AutoCount {

@@ -71,7 +71,9 @@ dependencies = [
  "route-engine",
  "security",
  "serde",
+ "serde_json",
  "supervisor",
+ "tokio",
  "tower 0.4.13",
  "tower-http",
  "tracing",
@@ -335,6 +337,7 @@ dependencies = [
  "logging",
  "rand",
  "route-engine",
+ "runtime-paths",
  "serde",
  "serde_json",
  "sha2",
@@ -507,8 +510,11 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 name = "core-lib"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "config",
+ "ipc-protocol",
  "security",
+ "serde_json",
  "supervisor",
  "tokio",
  "tracing",
@@ -1573,6 +1579,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-paths"
+version = "0.1.0"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1675,6 +1685,7 @@ dependencies = [
  "axum",
  "config",
  "http",
+ "runtime-paths",
  "serde_json",
  "tower 0.4.13",
  "tracing",
