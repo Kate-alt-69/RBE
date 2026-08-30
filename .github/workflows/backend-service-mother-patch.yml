@@ -1,0 +1,47 @@
+name: Backend Service Mother Patch
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: switch backend to separate Service Mother
+        shell: bash
+        run: |
+          python ../.github/patches/backend-service-mother.py
+          rustfmt --edition 2021 crates/backend/src/service_mother.rs
+          rustfmt --edition 2021 --config skip_children=true crates/backend/src/main.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          python - <<'PY'
+          import subprocess
+          allowed = {"crates/backend/src/main.rs", "crates/backend/src/service_mother.rs"}
+          changed = set(subprocess.check_output(["git", "diff", "--name-only", "--relative"], text=True).split())
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit("unexpected backend Service Mother paths: " + ", ".join(sorted(unexpected)))
+          PY
+          if ! git diff --quiet; then
+            git config user.name "Kate"
+            git config user.email "dhwanksh2000@gmail.com"
+            git add -- crates/backend/src/main.rs crates/backend/src/service_mother.rs
+            git commit -m "feat: run services under separate Service Mother"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
