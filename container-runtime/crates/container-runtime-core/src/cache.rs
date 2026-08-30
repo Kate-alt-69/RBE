@@ -111,6 +111,7 @@ impl ArtifactCache {
     }
 
     pub fn len(&self) -> usize { self.profiles.lock().expect("artifact cache poisoned").len() }
+    pub fn is_empty(&self) -> bool { self.profiles.lock().expect("artifact cache poisoned").is_empty() }
     pub fn artifact_count(&self) -> usize {
         let memory = self.artifacts.lock().expect("artifact cache poisoned").len();
         let disk = fs::read_dir(artifact_dir()).map(|entries| entries.flatten().filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("wasm")).count()).unwrap_or(0);

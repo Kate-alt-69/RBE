@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::cache::ArtifactCache;
 use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot, EnvironmentStorage};
 use crate::execution::{ExecutionId, ExecutionTask, WorkCost};
-use crate::worker::{Runner, WorkerState};
+use crate::worker::{Completion, Runner, WorkerState};
 
 const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 const JOURNAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -227,7 +227,7 @@ impl Runtime {
             })
         };
 
-        let completion: Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static> = {
+        let completion: Completion = {
             let cache = Arc::clone(&cache);
             let cancelled = Arc::clone(&cancelled);
             let journal = Arc::clone(&journal);
@@ -306,6 +306,7 @@ impl Runtime {
         self.submit_with_policy(environment, artifact_hash, cost, ResourceLimits::default(), SandboxPolicy::default(), work_ms, Vec::new())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_with_policy(&self, environment: EnvironmentId, artifact_hash: impl Into<String>, cost: WorkCost, limits: ResourceLimits, sandbox: SandboxPolicy, work_ms: u64, payload: Vec<u8>) -> ExecutionId {
         let claimed_artifact_hash = artifact_hash.into();
         let artifact_hash = if payload.is_empty() {
