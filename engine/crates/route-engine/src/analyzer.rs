@@ -58,6 +58,7 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut globals = Scope::new();
     let mut imported_sources = HashSet::new();
+    let mut route_verbs = HashSet::new();
 
     for import in &file.imports {
         let name = binding_name(import);
@@ -121,6 +122,20 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
                 code: "E2002",
                 message: format!("duplicate top-level function `{}`", function.name),
                 symbol: Some(function.name.clone()),
+            });
+        }
+    }
+
+    for method in &file.methods {
+        if !route_verbs.insert(method.verb.as_str()) {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E3012",
+                message: format!(
+                    "duplicate route method `{}`; each HTTP verb may only be defined once per file",
+                    method.verb
+                ),
+                symbol: Some(method.verb.clone()),
             });
         }
     }
@@ -393,6 +408,22 @@ mod tests {
             d.code == "E3001"
                 && d.message.contains("duplicate import source")
                 && d.symbol.as_deref() == Some("second")
+        }));
+    }
+
+    #[test]
+    fn rejects_duplicate_route_methods() {
+        let file = parse(
+            r#"class Route {
+                get(req) { return req.path; }
+                get(req) { return req.method; }
+            }"#,
+        );
+        let diagnostics = analyze(&file);
+        assert!(diagnostics.iter().any(|d| {
+            d.code == "E3012"
+                && d.message.contains("duplicate route method `get`")
+                && d.symbol.as_deref() == Some("get")
         }));
     }
 
