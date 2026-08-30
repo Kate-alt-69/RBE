@@ -11,6 +11,12 @@ struct DispatchSignal {
     changed: Condvar,
 }
 
+#[derive(Default)]
+struct SwampQueue {
+    tasks: VecDeque<ExecutionTask>,
+    cost: u64,
+}
+
 impl DispatchSignal {
     fn new() -> Self { Self { generation: Mutex::new(0), changed: Condvar::new() } }
 
@@ -43,7 +49,7 @@ pub struct SwampSnapshot {
 
 pub struct Swamp {
     id: usize,
-    queue: Arc<Mutex<VecDeque<ExecutionTask>>>,
+    queue: Arc<Mutex<SwampQueue>>,
     dispatch_signal: Arc<DispatchSignal>,
     started: Instant,
     workers: Vec<Worker>,
@@ -61,38 +67,55 @@ impl Swamp {
             let signal = Arc::clone(&dispatch_signal);
             Worker::new(worker_id, Arc::clone(&runner), Arc::clone(&on_complete), Arc::new(move || signal.notify()))
         }).collect::<Vec<_>>();
-        let swamp = Arc::new(Self { id, queue: Arc::new(Mutex::new(VecDeque::new())), dispatch_signal, started: Instant::now(), workers });
+        let swamp = Arc::new(Self { id, queue: Arc::new(Mutex::new(SwampQueue::default())), dispatch_signal, started: Instant::now(), workers });
         Self::start_dispatcher(&swamp);
         swamp
     }
 
     pub fn enqueue(&self, task: ExecutionTask) {
-        self.queue.lock().expect("swamp queue poisoned").push_back(task);
+        let mut queue = self.queue.lock().expect("swamp queue poisoned");
+        queue.cost = queue.cost.saturating_add(task.declared_cost.scalar());
+        queue.tasks.push_back(task);
+        drop(queue);
         self.dispatch_signal.notify();
     }
     pub fn drain(&self, count: usize) -> Vec<ExecutionTask> {
         let mut queue = self.queue.lock().expect("swamp queue poisoned");
-        let drain_count = count.min(queue.len());
-        queue.drain(..drain_count).collect()
+        let drain_count = count.min(queue.tasks.len());
+        let drained = queue.tasks.drain(..drain_count).collect::<Vec<_>>();
+        let drained_cost = drained.iter().fold(0u64, |cost, task| cost.saturating_add(task.declared_cost.scalar()));
+        queue.cost = queue.cost.saturating_sub(drained_cost);
+        drained
     }
-    pub fn drain_all(&self) -> Vec<ExecutionTask> { self.queue.lock().expect("swamp queue poisoned").drain(..).collect() }
+    pub fn drain_all(&self) -> Vec<ExecutionTask> {
+        let mut queue = self.queue.lock().expect("swamp queue poisoned");
+        queue.cost = 0;
+        queue.tasks.drain(..).collect()
+    }
 
     pub fn remove_execution_string(&self, id: &str) -> bool {
         let mut queue = self.queue.lock().expect("swamp queue poisoned");
-        let before = queue.len();
-        queue.retain(|task| task.id.to_string() != id);
-        before != queue.len()
+        let before = queue.tasks.len();
+        queue.tasks.retain(|task| task.id.to_string() != id);
+        if before == queue.tasks.len() { return false; }
+        queue.cost = queue.tasks.iter().fold(0u64, |cost, task| cost.saturating_add(task.declared_cost.scalar()));
+        true
     }
 
-    pub fn queued(&self) -> usize { self.queue.lock().expect("swamp queue poisoned").len() }
-    pub fn queued_cost(&self) -> u64 { self.queue.lock().expect("swamp queue poisoned").iter().map(|task| task.declared_cost.scalar()).sum() }
+    fn queue_stats(&self) -> (usize, u64) {
+        let queue = self.queue.lock().expect("swamp queue poisoned");
+        (queue.tasks.len(), queue.cost)
+    }
+
+    pub fn queued_cost(&self) -> u64 { self.queue.lock().expect("swamp queue poisoned").cost }
 
     pub fn snapshot(&self) -> SwampSnapshot {
+        let (queued, queued_cost) = self.queue_stats();
         let workers = self.workers.iter().map(Worker::snapshot).collect::<Vec<_>>();
         let completed = workers.iter().map(|worker| worker.completed).sum::<u64>();
         let failed = workers.iter().map(|worker| worker.failed).sum::<u64>();
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
-        SwampSnapshot { id: self.id, queued: self.queued(), queued_cost: self.queued_cost(), completed, failed, throughput_per_sec: completed as f64 / elapsed, workers }
+        SwampSnapshot { id: self.id, queued, queued_cost, completed, failed, throughput_per_sec: completed as f64 / elapsed, workers }
     }
 
     fn start_dispatcher(swamp: &Arc<Self>) {
@@ -105,11 +128,22 @@ impl Swamp {
                 let mut progressed = false;
                 for worker in &swamp.workers {
                     if !worker.is_idle() { continue; }
-                    let task = swamp.queue.lock().expect("swamp queue poisoned").pop_front();
+                    let task = {
+                        let mut queue = swamp.queue.lock().expect("swamp queue poisoned");
+                        let task = queue.tasks.pop_front();
+                        if let Some(task) = &task {
+                            queue.cost = queue.cost.saturating_sub(task.declared_cost.scalar());
+                        }
+                        task
+                    };
                     let Some(task) = task else { break; };
                     match worker.try_send(task) {
                         None => progressed = true,
-                        Some(task) => swamp.queue.lock().expect("swamp queue poisoned").push_front(task),
+                        Some(task) => {
+                            let mut queue = swamp.queue.lock().expect("swamp queue poisoned");
+                            queue.cost = queue.cost.saturating_add(task.declared_cost.scalar());
+                            queue.tasks.push_front(task);
+                        }
                     }
                 }
                 drop(swamp);
@@ -134,12 +168,12 @@ mod tests {
     use crate::execution::{ExecutionId, ExecutionTask, WorkCost};
     use crate::worker::{Completion, Runner};
 
-    fn task(sequence: u64) -> ExecutionTask {
+    fn task(sequence: u64, cost: u64) -> ExecutionTask {
         ExecutionTask {
             id: ExecutionId::from_parts(1, sequence),
             environment: "general-1".into(),
             artifact_hash: "test".into(),
-            declared_cost: WorkCost { cpu: sequence, ..WorkCost::default() },
+            declared_cost: WorkCost { cpu: cost, ..WorkCost::default() },
             limits: ResourceLimits::default(),
             sandbox: SandboxPolicy::default(),
             work_ms: 0,
@@ -172,14 +206,16 @@ mod tests {
         };
         let swamp = Swamp::new(0, 1, runner, completion);
 
-        swamp.enqueue(task(1));
+        swamp.enqueue(task(1, 1));
         let first_started_by = Instant::now() + Duration::from_secs(1);
         while swamp.snapshot().workers[0].current.is_none() && Instant::now() < first_started_by {
             std::thread::yield_now();
         }
         assert_eq!(swamp.snapshot().workers[0].current, Some(ExecutionId::from_parts(1, 1)));
-        swamp.enqueue(task(2));
-        assert_eq!(swamp.snapshot().queued, 1);
+        swamp.enqueue(task(2, 7));
+        let snapshot = swamp.snapshot();
+        assert_eq!(snapshot.queued, 1);
+        assert_eq!(snapshot.queued_cost, 7);
 
         let (lock, changed) = &*gate;
         *lock.lock().expect("gate poisoned") = true;
@@ -189,5 +225,8 @@ mod tests {
         let completed = lock.lock().expect("completion count poisoned");
         let (completed, _) = changed.wait_timeout_while(completed, Duration::from_secs(1), |count| *count < 2).expect("completion count poisoned");
         assert_eq!(*completed, 2);
+        let snapshot = swamp.snapshot();
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.queued_cost, 0);
     }
 }
