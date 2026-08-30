@@ -81,3 +81,18 @@ if old not in source:
     raise SystemExit("backend service shutdown anchor missing")
 source = source.replace(old, new, 1)
 path.write_text(source)
+
+# The old in-process launcher is obsolete once backend ownership switches.
+path = Path("crates/backend/src/service_boot.rs")
+source = path.read_text()
+source = source.replace(
+    "use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceManager, ServiceMemory};",
+    "use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceMemory};",
+    1,
+)
+start = source.find("pub async fn start(catalog: Option<&ServiceCatalog>)")
+end = source.find("pub fn resolve_runtime_path", start)
+if start < 0 or end < 0:
+    raise SystemExit("obsolete service_boot::start block missing")
+source = source[:start] + source[end:]
+path.write_text(source)
