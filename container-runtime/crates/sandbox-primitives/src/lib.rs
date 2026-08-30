@@ -87,7 +87,7 @@ impl SandboxLauncher {
             ]);
             if matches!(policy.network, NetworkPolicy::DenyAll) { command.arg("--net"); }
             command.arg("--").arg(program).args(args);
-            return Ok(command);
+            Ok(command)
         }
         #[cfg(not(target_os = "linux"))]
         {

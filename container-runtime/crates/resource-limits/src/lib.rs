@@ -80,7 +80,7 @@ impl CgroupHandle {
             write_file(&path, "pids.max", limits.max_processes.to_string())?;
             let quota = limits.cpu_millis.saturating_mul(100);
             write_file(&path, "cpu.max", format!("{quota} 100000"))?;
-            return Ok(Self { path });
+            Ok(Self { path })
         }
 
         #[cfg(not(target_os = "linux"))]
