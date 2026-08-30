@@ -12,16 +12,14 @@ pub fn spawn(address: String, token: String, runtime: Arc<Runtime>) -> anyhow::R
     thread::Builder::new()
         .name("container-dashboard".into())
         .spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(stream) = stream {
-                    let token = token.clone();
-                    let runtime = Arc::clone(&runtime);
-                    thread::spawn(move || {
-                        if let Err(error) = handle(stream, &token, &runtime) {
-                            tracing::debug!(%error, "dashboard connection closed");
-                        }
-                    });
-                }
+            for stream in listener.incoming().flatten() {
+                let token = token.clone();
+                let runtime = Arc::clone(&runtime);
+                thread::spawn(move || {
+                    if let Err(error) = handle(stream, &token, &runtime) {
+                        tracing::debug!(%error, "dashboard connection closed");
+                    }
+                });
             }
         })?;
     Ok(())
@@ -122,8 +120,8 @@ fn overview_json(runtime: &Runtime) -> String {
         swamps_total += environment.swamps.len();
         for swamp in &environment.swamps {
             throughput_per_sec += swamp.throughput_per_sec;
-            completed += swamp.completed as u64;
-            failed += swamp.failed as u64;
+            completed += swamp.completed;
+            failed += swamp.failed;
 
             if swamp.queued > 0 || swamp.workers.iter().any(|worker| worker.current.is_some()) {
                 swamps_active += 1;
@@ -333,7 +331,7 @@ fn respond(
 ) -> anyhow::Result<()> {
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.as_bytes().len()
+        body.len()
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body.as_bytes())?;
