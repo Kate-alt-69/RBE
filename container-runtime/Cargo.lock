@@ -415,11 +415,13 @@ dependencies = [
  "ipc-protocol",
  "libc",
  "resource-limits",
+ "runtime-paths",
  "sandbox-primitives",
  "serde_json",
  "tracing",
  "tracing-subscriber",
  "vault",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -427,13 +429,17 @@ name = "container-runtime-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atomic-io",
  "environments",
  "execution-engine",
+ "hex",
  "ipc-protocol",
  "resource-limits",
+ "runtime-paths",
  "sandbox-primitives",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
 ]
 
@@ -1601,6 +1607,10 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "resource-limits"
+version = "0.1.0"
+
+[[package]]
+name = "runtime-paths"
 version = "0.1.0"
 
 [[package]]
