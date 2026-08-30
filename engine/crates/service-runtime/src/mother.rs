@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{ServiceCallError, ServiceManager, ServiceSnapshot};
@@ -239,12 +239,7 @@ async fn handle_connection(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> anyhow::Result<()> {
     let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line).await?;
-    if bytes == 0 || bytes > 4 * 1024 * 1024 {
-        anyhow::bail!("Service Mother request is empty or too large");
-    }
+    let line = read_bounded_line(read, 4 * 1024 * 1024, "request").await?;
     let request: ServiceMotherRequest = serde_json::from_str(line.trim())?;
     if !constant_time_eq(request.token().as_bytes(), token.as_bytes()) {
         write_response(
@@ -327,13 +322,30 @@ async fn mother_rpc(
         .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
         .await?;
     write.shutdown().await?;
-    let mut reader = BufReader::new(read);
+    let line = read_bounded_line(read, 8 * 1024 * 1024, "response").await?;
+    Ok(serde_json::from_str(line.trim())?)
+}
+
+async fn read_bounded_line<R>(reader: R, max_bytes: usize, label: &str) -> anyhow::Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut reader = BufReader::new(reader).take(limit);
     let mut line = String::new();
     let bytes = reader.read_line(&mut line).await?;
-    if bytes == 0 || bytes > 8 * 1024 * 1024 {
-        anyhow::bail!("Service Mother response is empty or too large");
+    if bytes == 0 {
+        anyhow::bail!("Service Mother {label} is empty");
     }
-    Ok(serde_json::from_str(line.trim())?)
+    if bytes > max_bytes {
+        anyhow::bail!("Service Mother {label} exceeded {max_bytes} bytes");
+    }
+    if !line.ends_with('\n') {
+        anyhow::bail!("Service Mother {label} is not newline terminated");
+    }
+    Ok(line)
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -363,5 +375,15 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[tokio::test]
+    async fn bounded_frame_reader_rejects_oversized_and_unterminated_frames() {
+        assert!(read_bounded_line(&b"abcd\n"[..], 3, "test").await.is_err());
+        assert!(read_bounded_line(&b"abc"[..], 3, "test").await.is_err());
+        assert_eq!(
+            read_bounded_line(&b"abc\n"[..], 4, "test").await.unwrap(),
+            "abc\n"
+        );
     }
 }
