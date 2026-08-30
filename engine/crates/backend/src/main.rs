@@ -17,11 +17,20 @@ mod error_reporter_daemon;
 mod maintenance_notice;
 mod port_guard;
 mod service_boot;
+mod service_mother;
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
+
+    if has("--service-mother") {
+        if let Err(error) = service_mother::run_child(&args).await {
+            eprintln!("fatal service-mother error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // This must branch before normal backend boot. A user .service process is
     // the same binary in a restricted host mode, not a second mother backend.
@@ -320,7 +329,14 @@ async fn boot_and_run() -> anyhow::Result<()> {
         refresh_interval,
     );
 
-    let service_manager = service_boot::start(service_catalog.as_ref()).await?;
+    let service_mother = match service_catalog.as_ref() {
+        Some(_) => Some(service_mother::spawn(&settings_path).await?),
+        None => None,
+    };
+    let service_manager = service_mother
+        .as_ref()
+        .map(|mother| mother.manager())
+        .unwrap_or_default();
 
     let (video_manager, video_worker_task) = if config.video_manager.enabled {
         if config.video_manager.default_database != video_manager::DEFAULT_DATABASE_NAME {
@@ -471,7 +487,12 @@ async fn boot_and_run() -> anyhow::Result<()> {
     .await;
 
     lifecycle.set(BackendState::Stopping);
-    service_manager.shutdown_all().await;
+    let shutdown_budget = Duration::from_millis(config.runtime.graceful_shutdown_timeout_ms.max(1));
+    if let Some(mother) = service_mother {
+        mother.shutdown(shutdown_budget).await;
+    } else {
+        service_manager.shutdown_all().await;
+    }
     if let Some(worker) = video_worker_task {
         worker
             .shutdown(Duration::from_millis(

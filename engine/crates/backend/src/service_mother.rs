@@ -22,8 +22,22 @@ impl ServiceMotherProcess {
     }
 
     pub async fn shutdown(mut self, timeout: Duration) {
-        self.manager.shutdown_all().await;
-        match tokio::time::timeout(timeout, self.child.wait()).await {
+        let started = tokio::time::Instant::now();
+        if tokio::time::timeout(timeout, self.manager.shutdown_all())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis(),
+                "Service Mother shutdown RPC exceeded graceful shutdown budget"
+            );
+            let _ = self.child.kill().await;
+            let _ = self.child.wait().await;
+            let _ = std::fs::remove_file(&self.alias);
+            return;
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, self.child.wait()).await {
             Ok(Ok(status)) => {
                 tracing::info!(%status, "Service Mother exited after shutdown");
             }
@@ -46,14 +60,20 @@ impl ServiceMotherProcess {
 pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
     let token = flag_value(args, "--service-token")
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("backend --service-mother requires --service-token <token>"))?;
-    if !args.iter().any(|arg| arg == "--launch-separate" || arg == "--launch-saperate") {
+        .ok_or_else(|| {
+            anyhow::anyhow!("backend --service-mother requires --service-token <token>")
+        })?;
+    if !args
+        .iter()
+        .any(|arg| arg == "--launch-separate" || arg == "--launch-saperate")
+    {
         anyhow::bail!("backend --service-mother requires --launch-separate");
     }
 
     let settings_path = std::env::var("SETTINGS_PATH").unwrap_or_else(|_| "settings.json".into());
-    let config = config::Config::load(&settings_path)
-        .map_err(|error| anyhow::anyhow!("Service Mother failed to load {settings_path}: {error}"))?;
+    let config = config::Config::load(&settings_path).map_err(|error| {
+        anyhow::anyhow!("Service Mother failed to load {settings_path}: {error}")
+    })?;
     let io = atomic_io::AtomicIo::new();
     let catalog = crate::service_boot::compile(&config.services, &io)?;
     let manager = match catalog.as_ref() {
@@ -62,7 +82,10 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
     };
     tracing::info!(
         pid = std::process::id(),
-        services = catalog.as_ref().map(|catalog| catalog.services().len()).unwrap_or(0),
+        services = catalog
+            .as_ref()
+            .map(|catalog| catalog.services().len())
+            .unwrap_or(0),
         "Service Mother runtime ready"
     );
     run_service_mother(manager, token).await
@@ -87,9 +110,8 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
     ));
     let _ = std::fs::remove_file(&alias);
     if std::fs::hard_link(&exe, &alias).is_err() {
-        std::fs::copy(&exe, &alias).with_context(|| {
-            format!("create Service Mother process alias {}", alias.display())
-        })?;
+        std::fs::copy(&exe, &alias)
+            .with_context(|| format!("create Service Mother process alias {}", alias.display()))?;
     }
 
     let settings_path = std::fs::canonicalize(settings_path.as_ref()).with_context(|| {
@@ -122,17 +144,18 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
         .ok_or_else(|| anyhow::anyhow!("Service Mother stdout unavailable"))?;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    let bytes = match tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line)).await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
-            return Err(error.into());
-        }
-        Err(_) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
-            anyhow::bail!("Service Mother readiness timed out");
-        }
-    };
+    let bytes =
+        match tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                cleanup_failed_spawn(&alias, &mut child).await;
+                return Err(error.into());
+            }
+            Err(_) => {
+                cleanup_failed_spawn(&alias, &mut child).await;
+                anyhow::bail!("Service Mother readiness timed out");
+            }
+        };
     if bytes == 0 {
         cleanup_failed_spawn(&alias, &mut child).await;
         anyhow::bail!("Service Mother exited before readiness");
@@ -173,7 +196,7 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
         }
     });
 
-    let manager = ServiceManager::remote(ready.address, token);
+    let manager = ServiceManager::remote(ready.address, token)?;
     tracing::info!(
         pid = ready.pid,
         address = %ready.address,

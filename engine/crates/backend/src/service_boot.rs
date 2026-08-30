@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceManager, ServiceMemory};
+use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceMemory};
 
 pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let value = |flag: &str| {
@@ -149,23 +149,6 @@ pub fn compile(
             Err(anyhow::anyhow!(".service compilation failed"))
         }
     }
-}
-
-pub async fn start(catalog: Option<&ServiceCatalog>) -> anyhow::Result<ServiceManager> {
-    let Some(catalog) = catalog else {
-        return Ok(ServiceManager::default());
-    };
-    let manager = ServiceManager::spawn_all(catalog).await?;
-    let snapshots = manager.snapshot().await;
-    tracing::info!(
-        services = snapshots.len(),
-        running = snapshots
-            .iter()
-            .filter(|service| service.pid.is_some())
-            .count(),
-        "user .service processes ready"
-    );
-    Ok(manager)
 }
 
 pub fn resolve_runtime_path(path: impl AsRef<Path>) -> PathBuf {
