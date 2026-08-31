@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 
 use crate::{ServiceCallError, ServiceManager, ServiceSnapshot};
 
@@ -68,6 +69,11 @@ enum ServiceMotherResponse {
 
 #[derive(Clone)]
 pub(crate) struct ServiceMotherClient {
+    endpoint: Arc<RwLock<Option<ServiceMotherEndpoint>>>,
+}
+
+#[derive(Clone)]
+struct ServiceMotherEndpoint {
     address: SocketAddr,
     token: Arc<str>,
 }
@@ -75,9 +81,28 @@ pub(crate) struct ServiceMotherClient {
 impl ServiceMotherClient {
     pub(crate) fn new(address: SocketAddr, token: String) -> Self {
         Self {
+            endpoint: Arc::new(RwLock::new(Some(ServiceMotherEndpoint {
+                address,
+                token: Arc::<str>::from(token),
+            }))),
+        }
+    }
+
+    pub(crate) async fn replace(&self, address: SocketAddr, token: String) -> anyhow::Result<()> {
+        validate_mother_endpoint(address, &token)?;
+        *self.endpoint.write().await = Some(ServiceMotherEndpoint {
             address,
             token: Arc::<str>::from(token),
-        }
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate(&self) {
+        *self.endpoint.write().await = None;
+    }
+
+    async fn current(&self) -> Option<ServiceMotherEndpoint> {
+        self.endpoint.read().await.clone()
     }
 
     pub(crate) async fn call(
@@ -86,10 +111,16 @@ impl ServiceMotherClient {
         function: &str,
         args: Vec<Value>,
     ) -> Result<Value, ServiceCallError> {
+        let endpoint = self
+            .current()
+            .await
+            .ok_or_else(|| ServiceCallError::Unavailable {
+                service: service.to_string(),
+            })?;
         let response = mother_rpc(
-            self.address,
+            endpoint.address,
             ServiceMotherRequest::Call {
-                token: self.token.to_string(),
+                token: endpoint.token.to_string(),
                 service: service.to_string(),
                 function: function.to_string(),
                 args,
@@ -108,10 +139,16 @@ impl ServiceMotherClient {
         service: &str,
         event: Value,
     ) -> Result<Value, ServiceCallError> {
+        let endpoint = self
+            .current()
+            .await
+            .ok_or_else(|| ServiceCallError::Unavailable {
+                service: service.to_string(),
+            })?;
         let response = mother_rpc(
-            self.address,
+            endpoint.address,
             ServiceMotherRequest::Event {
-                token: self.token.to_string(),
+                token: endpoint.token.to_string(),
                 service: service.to_string(),
                 event,
             },
@@ -125,10 +162,14 @@ impl ServiceMotherClient {
     }
 
     pub(crate) async fn snapshot(&self) -> anyhow::Result<Vec<ServiceSnapshot>> {
+        let endpoint = self
+            .current()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Service Mother is restarting"))?;
         match mother_rpc(
-            self.address,
+            endpoint.address,
             ServiceMotherRequest::Snapshot {
-                token: self.token.to_string(),
+                token: endpoint.token.to_string(),
             },
         )
         .await?
@@ -144,10 +185,13 @@ impl ServiceMotherClient {
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+        let Some(endpoint) = self.current().await else {
+            return Ok(());
+        };
         match mother_rpc(
-            self.address,
+            endpoint.address,
             ServiceMotherRequest::Shutdown {
-                token: self.token.to_string(),
+                token: endpoint.token.to_string(),
             },
         )
         .await?
@@ -189,6 +233,16 @@ fn map_value_response(
             message: format!("unexpected Service Mother response: {other:?}"),
         }),
     }
+}
+
+fn validate_mother_endpoint(address: SocketAddr, token: &str) -> anyhow::Result<()> {
+    if !address.ip().is_loopback() {
+        anyhow::bail!("Service Mother endpoint must be loopback");
+    }
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("Service Mother authentication value must be 256-bit hexadecimal");
+    }
+    Ok(())
 }
 
 pub fn new_service_mother_token() -> String {
@@ -405,6 +459,20 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mother_client_retarget_is_shared_across_clones() {
+        let first = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10001);
+        let second = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10002);
+        let client = ServiceMotherClient::new(first, "a".repeat(64));
+        let clone = client.clone();
+        client.invalidate().await;
+        assert!(clone.current().await.is_none());
+        client.replace(second, "b".repeat(64)).await.unwrap();
+        let endpoint = clone.current().await.unwrap();
+        assert_eq!(endpoint.address, second);
+        assert_eq!(endpoint.token.as_ref(), "b".repeat(64));
+    }
 
     #[test]
     fn mother_tokens_are_256_bit_hex() {

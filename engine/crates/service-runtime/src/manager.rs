@@ -169,6 +169,20 @@ impl ServiceManager {
         })
     }
 
+    pub async fn replace_remote(&self, address: SocketAddr, auth: String) -> anyhow::Result<()> {
+        let mother = self
+            .mother
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ServiceManager is not backed by Service Mother"))?;
+        mother.replace(address, auth).await
+    }
+
+    pub async fn invalidate_remote(&self) {
+        if let Some(mother) = &self.mother {
+            mother.invalidate().await;
+        }
+    }
+
     pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
         let manager = Self::default();
         for file in catalog.services() {
