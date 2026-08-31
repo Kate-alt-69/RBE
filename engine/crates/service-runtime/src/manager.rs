@@ -562,80 +562,19 @@ impl ServiceManager {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut out = Vec::new();
+        let mut snapshots = tokio::task::JoinSet::new();
         for handle in handles {
-            let (mut snapshot, health_target) = {
-                let mut service = handle.lock().await;
-                let restarting = service.restarting;
-                let wakeable = service.wakeable();
-                let exit_observed = service.exit_observed;
-                let restart = service.file.restart;
-                let (pid, state, health_target) = match service.process.as_mut() {
-                    None if restarting => (None, ServiceRuntimeState::Restarting, None),
-                    None if wakeable && !exit_observed => {
-                        (None, ServiceRuntimeState::Dormant, None)
-                    }
-                    None => (None, ServiceRuntimeState::Stopped, None),
-                    Some(process) => match process.child.try_wait() {
-                        Ok(None) => (
-                            process.child.id(),
-                            ServiceRuntimeState::Running,
-                            Some((process.ready.address, process.token.clone())),
-                        ),
-                        Ok(Some(_)) if restarting => (None, ServiceRuntimeState::Restarting, None),
-                        Ok(Some(status))
-                            if exit_observed || !should_restart(restart, status.success()) =>
-                        {
-                            (None, ServiceRuntimeState::Stopped, None)
-                        }
-                        Ok(Some(_)) => (None, ServiceRuntimeState::Restarting, None),
-                        Err(_) => (None, ServiceRuntimeState::Unknown, None),
-                    },
-                };
-                if health_target.is_some() {
-                    service.active_calls = service.active_calls.saturating_add(1);
-                }
-                (
-                    ServiceSnapshot {
-                        name: service.file.name.clone(),
-                        title: service.file.title.clone(),
-                        pid,
-                        state,
-                        mode: service.file.mode,
-                        restart: service.file.restart,
-                        restart_attempts: service.restart_attempts,
-                        idle_timeout_ms: service.file.idle_timeout_ms,
-                        ready: state == ServiceRuntimeState::Dormant,
-                        health_checked: false,
-                        health: None,
-                        health_error: None,
-                    },
-                    health_target,
-                )
-            };
-
-            if let Some((address, token)) = health_target {
-                snapshot.health_checked = true;
-                let response = rpc(address, ServiceRequest::Health { token }).await;
-                {
-                    let mut service = handle.lock().await;
-                    service.active_calls = service.active_calls.saturating_sub(1);
-                }
-                match response {
-                    Ok(ServiceResponse::Ok { value }) => {
-                        snapshot.ready = health_value_ready(&value);
-                        snapshot.health = Some(value);
-                    }
-                    Ok(ServiceResponse::Error { code, message }) => {
-                        snapshot.health_error = Some(format!("{code}: {message}"));
-                    }
-                    Err(error) => {
-                        snapshot.health_error = Some(error.to_string());
-                    }
-                }
+            snapshots.spawn(snapshot_managed_service(handle));
+        }
+        let mut out = Vec::new();
+        while let Some(result) = snapshots.join_next().await {
+            match result {
+                Ok(snapshot) => out.push(snapshot),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "service snapshot task failed"
+                ),
             }
-
-            out.push(snapshot);
         }
         out.sort_by(|left, right| left.name.cmp(&right.name));
         out
@@ -665,6 +604,76 @@ impl ServiceManager {
             service.restarting = false;
         }
     }
+}
+
+async fn snapshot_managed_service(handle: Arc<Mutex<Managed>>) -> ServiceSnapshot {
+    let (mut snapshot, health_target) = {
+        let mut service = handle.lock().await;
+        let restarting = service.restarting;
+        let wakeable = service.wakeable();
+        let exit_observed = service.exit_observed;
+        let restart = service.file.restart;
+        let (pid, state, health_target) = match service.process.as_mut() {
+            None if restarting => (None, ServiceRuntimeState::Restarting, None),
+            None if wakeable && !exit_observed => (None, ServiceRuntimeState::Dormant, None),
+            None => (None, ServiceRuntimeState::Stopped, None),
+            Some(process) => match process.child.try_wait() {
+                Ok(None) => (
+                    process.child.id(),
+                    ServiceRuntimeState::Running,
+                    Some((process.ready.address, process.token.clone())),
+                ),
+                Ok(Some(_)) if restarting => (None, ServiceRuntimeState::Restarting, None),
+                Ok(Some(status)) if exit_observed || !should_restart(restart, status.success()) => {
+                    (None, ServiceRuntimeState::Stopped, None)
+                }
+                Ok(Some(_)) => (None, ServiceRuntimeState::Restarting, None),
+                Err(_) => (None, ServiceRuntimeState::Unknown, None),
+            },
+        };
+        if health_target.is_some() {
+            service.active_calls = service.active_calls.saturating_add(1);
+        }
+        (
+            ServiceSnapshot {
+                name: service.file.name.clone(),
+                title: service.file.title.clone(),
+                pid,
+                state,
+                mode: service.file.mode,
+                restart: service.file.restart,
+                restart_attempts: service.restart_attempts,
+                idle_timeout_ms: service.file.idle_timeout_ms,
+                ready: state == ServiceRuntimeState::Dormant,
+                health_checked: false,
+                health: None,
+                health_error: None,
+            },
+            health_target,
+        )
+    };
+
+    if let Some((address, token)) = health_target {
+        snapshot.health_checked = true;
+        let response = rpc(address, ServiceRequest::Health { token }).await;
+        {
+            let mut service = handle.lock().await;
+            service.active_calls = service.active_calls.saturating_sub(1);
+        }
+        match response {
+            Ok(ServiceResponse::Ok { value }) => {
+                snapshot.ready = health_value_ready(&value);
+                snapshot.health = Some(value);
+            }
+            Ok(ServiceResponse::Error { code, message }) => {
+                snapshot.health_error = Some(format!("{code}: {message}"));
+            }
+            Err(error) => {
+                snapshot.health_error = Some(error.to_string());
+            }
+        }
+    }
+    snapshot
 }
 
 fn health_value_ready(value: &Value) -> bool {
