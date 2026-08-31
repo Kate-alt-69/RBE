@@ -196,7 +196,7 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
         cleanup_failed_spawn(&alias, &mut child).await;
         anyhow::bail!("Service Mother advertised a non-loopback endpoint");
     }
-    if child.id().is_some_and(|pid| pid != ready.pid) {
+    if child.id() != Some(ready.pid) {
         cleanup_failed_spawn(&alias, &mut child).await;
         anyhow::bail!("Service Mother readiness PID does not match child process");
     }

@@ -813,6 +813,14 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
         cleanup_failed_spawn(&alias, &mut child).await;
         anyhow::bail!("service readiness identity mismatch");
     }
+    if !ready.address.ip().is_loopback() {
+        cleanup_failed_spawn(&alias, &mut child).await;
+        anyhow::bail!("service readiness advertised a non-loopback endpoint");
+    }
+    if child.id() != Some(ready.pid) {
+        cleanup_failed_spawn(&alias, &mut child).await;
+        anyhow::bail!("service readiness PID does not match child process");
+    }
 
     let service_name = file.name.clone();
     tokio::spawn(async move {
