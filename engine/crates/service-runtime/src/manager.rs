@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 
 use super::{
@@ -26,6 +26,7 @@ const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
 
 struct ServiceProcess {
     child: Child,
+    _liveness: ChildStdin,
     alias: PathBuf,
     ready: ServiceReady,
     token: String,
@@ -750,6 +751,8 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
         .arg("--service-token")
         .arg(&token)
         .current_dir(parent)
+        .env("RBE_PARENT_LIVENESS_PIPE", "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
@@ -762,6 +765,13 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
         }
     };
 
+    let liveness = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            anyhow::bail!("service {:?} parent liveness pipe unavailable", file.name);
+        }
+    };
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -826,6 +836,7 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
 
     Ok(ServiceProcess {
         child,
+        _liveness: liveness,
         alias,
         ready,
         token,

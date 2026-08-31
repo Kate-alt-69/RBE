@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -657,8 +657,36 @@ pub async fn run_service_host_with_executor_and_memory(
     };
     println!("{}", serde_json::to_string(&ready)?);
     std::io::stdout().flush()?;
+    let mut parent_liveness = parent_liveness_signal_if_configured()?;
     loop {
-        let (stream, _) = listener.accept().await?;
+        let accepted = match parent_liveness.as_mut() {
+            Some(parent_liveness) => {
+                tokio::select! {
+                    accepted = listener.accept() => Some(accepted),
+                    _ = parent_liveness => None,
+                }
+            }
+            None => Some(listener.accept().await),
+        };
+        let Some(accepted) = accepted else {
+            tracing::warn!(
+                service = %file.name,
+                "service parent liveness pipe closed; stopping orphaned worker"
+            );
+            if let Err(error) = executor
+                .lifecycle(ServiceLifecycle::Stop, lifecycle_context(&file))
+                .await
+            {
+                tracing::warn!(
+                    service = %file.name,
+                    code = %error.code,
+                    message = %error.message,
+                    "service stop lifecycle failed after parent loss"
+                );
+            }
+            return Ok(());
+        };
+        let (stream, _) = accepted?;
         let (read, mut write) = stream.into_split();
         let mut reader = BufReader::new(read);
         let mut line = String::new();
@@ -817,6 +845,33 @@ fn apply_memory_limit(memory_limit_mb: u64) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn apply_memory_limit(_memory_limit_mb: u64) -> anyhow::Result<()> {
     Ok(())
+}
+
+pub fn parent_liveness_signal_if_configured(
+) -> anyhow::Result<Option<tokio::sync::oneshot::Receiver<()>>> {
+    if std::env::var_os("RBE_PARENT_LIVENESS_PIPE").is_none() {
+        return Ok(None);
+    }
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("rbe-parent-liveness".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            let mut buffer = [0u8; 64];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) | Err(_) => {
+                        let _ = sender.send(());
+                        return;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("spawn parent liveness watcher: {error}"))?;
+    Ok(Some(receiver))
 }
 
 pub fn pause_for_interactive_exit() {

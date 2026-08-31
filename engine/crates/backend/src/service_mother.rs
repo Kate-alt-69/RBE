@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 
 use service_runtime::{
     new_service_mother_token, run_service_mother, ServiceManager, ServiceMotherReady,
@@ -13,6 +13,7 @@ use service_runtime::{
 pub struct ServiceMotherProcess {
     manager: ServiceManager,
     child: Child,
+    _liveness: ChildStdin,
     alias: PathBuf,
 }
 
@@ -88,7 +89,22 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
             .unwrap_or(0),
         "Service Mother runtime ready"
     );
-    run_service_mother(manager, token).await
+    let mut parent_liveness = service_runtime::parent_liveness_signal_if_configured()?;
+    match parent_liveness.as_mut() {
+        Some(parent_liveness) => {
+            tokio::select! {
+                result = run_service_mother(manager.clone(), token) => result,
+                _ = parent_liveness => {
+                    tracing::warn!(
+                        "Service Mother parent liveness pipe closed; shutting down managed services"
+                    );
+                    manager.shutdown_all().await;
+                    Ok(())
+                }
+            }
+        }
+        None => run_service_mother(manager, token).await,
+    }
 }
 
 pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMotherProcess> {
@@ -126,6 +142,8 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
         .arg(&token)
         .current_dir(parent)
         .env("SETTINGS_PATH", &settings_path)
+        .env("RBE_PARENT_LIVENESS_PIPE", "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
@@ -138,6 +156,13 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
         }
     };
 
+    let liveness = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            anyhow::bail!("Service Mother parent liveness pipe unavailable");
+        }
+    };
     let stdout = child
         .stdout
         .take()
@@ -206,6 +231,7 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
     Ok(ServiceMotherProcess {
         manager,
         child,
+        _liveness: liveness,
         alias,
     })
 }
