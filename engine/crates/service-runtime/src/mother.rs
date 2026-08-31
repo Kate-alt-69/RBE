@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,12 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{ServiceCallError, ServiceManager, ServiceSnapshot};
+
+const MOTHER_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
+const MOTHER_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const MOTHER_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+const MOTHER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_MOTHER_CONNECTIONS: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -203,6 +210,7 @@ pub async fn run_service_mother(manager: ServiceManager, token: String) -> anyho
     std::io::stdout().flush()?;
 
     let token: Arc<str> = Arc::<str>::from(token);
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_MOTHER_CONNECTIONS));
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     loop {
         tokio::select! {
@@ -217,10 +225,19 @@ pub async fn run_service_mother(manager: ServiceManager, token: String) -> anyho
                     tracing::warn!(%peer, "Service Mother rejected non-loopback peer");
                     continue;
                 }
+                let permit = match connections.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(%peer, limit = MAX_MOTHER_CONNECTIONS, "Service Mother connection limit reached");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let manager = manager.clone();
                 let token = token.clone();
                 let shutdown_tx = shutdown_tx.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = handle_connection(stream, manager, token, shutdown_tx).await {
                         tracing::warn!(error = %error, "Service Mother request failed");
                     }
@@ -239,7 +256,12 @@ async fn handle_connection(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> anyhow::Result<()> {
     let (read, mut write) = stream.into_split();
-    let line = read_bounded_line(read, 4 * 1024 * 1024, "request").await?;
+    let line = tokio::time::timeout(
+        MOTHER_FRAME_TIMEOUT,
+        read_bounded_line(read, MOTHER_REQUEST_MAX_BYTES, "request"),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Service Mother request frame timed out"))??;
     let request: ServiceMotherRequest = serde_json::from_str(line.trim())?;
     if !constant_time_eq(request.token().as_bytes(), token.as_bytes()) {
         write_response(
@@ -302,10 +324,17 @@ async fn write_response(
     write: &mut tokio::net::tcp::OwnedWriteHalf,
     response: &ServiceMotherResponse,
 ) -> anyhow::Result<()> {
-    write
-        .write_all(format!("{}\n", serde_json::to_string(response)?).as_bytes())
-        .await?;
-    write.shutdown().await?;
+    let mut payload = serde_json::to_vec(response)?;
+    if payload.len().saturating_add(1) > MOTHER_RESPONSE_MAX_BYTES {
+        anyhow::bail!("Service Mother response exceeded {MOTHER_RESPONSE_MAX_BYTES} bytes");
+    }
+    payload.push(b'\n');
+    tokio::time::timeout(MOTHER_FRAME_TIMEOUT, async {
+        write.write_all(&payload).await?;
+        write.shutdown().await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Service Mother response write timed out"))??;
     Ok(())
 }
 
@@ -316,13 +345,27 @@ async fn mother_rpc(
     if !address.ip().is_loopback() {
         anyhow::bail!("Service Mother endpoint must be loopback");
     }
-    let stream = TcpStream::connect(address).await?;
+    let mut payload = serde_json::to_vec(&request)?;
+    if payload.len().saturating_add(1) > MOTHER_REQUEST_MAX_BYTES {
+        anyhow::bail!("Service Mother request exceeded {MOTHER_REQUEST_MAX_BYTES} bytes");
+    }
+    payload.push(b'\n');
+    let stream = tokio::time::timeout(MOTHER_FRAME_TIMEOUT, TcpStream::connect(address))
+        .await
+        .map_err(|_| anyhow::anyhow!("Service Mother connect timed out"))??;
     let (read, mut write) = stream.into_split();
-    write
-        .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
-        .await?;
-    write.shutdown().await?;
-    let line = read_bounded_line(read, 8 * 1024 * 1024, "response").await?;
+    tokio::time::timeout(MOTHER_FRAME_TIMEOUT, async {
+        write.write_all(&payload).await?;
+        write.shutdown().await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Service Mother request write timed out"))??;
+    let line = tokio::time::timeout(
+        MOTHER_RESPONSE_TIMEOUT,
+        read_bounded_line(read, MOTHER_RESPONSE_MAX_BYTES, "response"),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Service Mother response timed out"))??;
     Ok(serde_json::from_str(line.trim())?)
 }
 
