@@ -7,14 +7,19 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 mod manager;
 mod mother;
+
+pub(crate) const SERVICE_IPC_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const SERVICE_IPC_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const SERVICE_IPC_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub use manager::{ServiceCallError, ServiceManager, ServiceRuntimeState, ServiceSnapshot};
 pub use mother::{new_service_mother_token, run_service_mother, ServiceMotherReady};
 
@@ -686,18 +691,55 @@ pub async fn run_service_host_with_executor_and_memory(
             }
             return Ok(());
         };
-        let (stream, _) = accepted?;
+        let (stream, peer) = accepted?;
+        if !peer.ip().is_loopback() {
+            tracing::warn!(%peer, service = %file.name, "service IPC rejected non-loopback peer");
+            continue;
+        }
         let (read, mut write) = stream.into_split();
-        let mut reader = BufReader::new(read);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        let request: ServiceRequest = serde_json::from_str(line.trim())?;
+        let line = match tokio::time::timeout(
+            SERVICE_IPC_TIMEOUT,
+            read_bounded_line(read, SERVICE_IPC_REQUEST_MAX_BYTES, "service request"),
+        )
+        .await
+        {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => {
+                tracing::warn!(service = %file.name, error = %error, "invalid service IPC frame");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(service = %file.name, "service IPC request timed out");
+                continue;
+            }
+        };
+        let request: ServiceRequest = match serde_json::from_str(line.trim()) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(service = %file.name, error = %error, "invalid service IPC JSON");
+                continue;
+            }
+        };
         let (response, shutdown) =
             dispatch(request, &file, &token, &memory, executor.as_ref()).await;
-        write
-            .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-            .await?;
-        write.shutdown().await?;
+        let mut payload = serde_json::to_vec(&response)?;
+        if payload.len().saturating_add(1) > SERVICE_IPC_RESPONSE_MAX_BYTES {
+            payload = serde_json::to_vec(&ServiceResponse::Error {
+                code: "SVC4002".into(),
+                message: "service IPC response exceeded frame limit".into(),
+            })?;
+        }
+        payload.push(b'\n');
+        if let Err(error) = tokio::time::timeout(SERVICE_IPC_TIMEOUT, async {
+            write.write_all(&payload).await?;
+            write.shutdown().await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("service IPC response write timed out"))
+        .and_then(|result| result.map_err(anyhow::Error::from))
+        {
+            tracing::warn!(service = %file.name, error = %error, "service IPC response write failed");
+        }
         if shutdown {
             return Ok(());
         }
@@ -711,7 +753,7 @@ async fn dispatch(
     memory: &ServiceMemory,
     executor: &dyn ServiceExecutor,
 ) -> (ServiceResponse, bool) {
-    if request.token() != token {
+    if !constant_time_eq(request.token().as_bytes(), token.as_bytes()) {
         return (
             ServiceResponse::Error {
                 code: "SVC4001".into(),
@@ -793,6 +835,43 @@ async fn dispatch(
             }
         }
     }
+}
+
+pub(crate) async fn read_bounded_line<R>(
+    reader: R,
+    max_bytes: usize,
+    label: &str,
+) -> anyhow::Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut reader = BufReader::new(reader).take(limit);
+    let mut line = String::new();
+    let bytes = reader.read_line(&mut line).await?;
+    if bytes == 0 {
+        anyhow::bail!("{label} is empty");
+    }
+    if bytes > max_bytes {
+        anyhow::bail!("{label} exceeded {max_bytes} bytes");
+    }
+    if !line.ends_with('\n') {
+        anyhow::bail!("{label} is not newline terminated");
+    }
+    Ok(line)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&left, &right) in left.iter().zip(right.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 fn execution_error_response(
@@ -896,6 +975,23 @@ mod tests {
             "rbe-service-runtime-{name}-{}-{nonce}.service",
             std::process::id()
         ))
+    }
+
+    #[tokio::test]
+    async fn service_frame_reader_rejects_oversized_and_unterminated_frames() {
+        assert!(read_bounded_line(&b"abcd\n"[..], 3, "test").await.is_err());
+        assert!(read_bounded_line(&b"abc"[..], 3, "test").await.is_err());
+        assert_eq!(
+            read_bounded_line(&b"abc\n"[..], 4, "test").await.unwrap(),
+            "abc\n"
+        );
+    }
+
+    #[test]
+    fn service_token_compare_checks_content_and_length() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreu"));
+        assert!(!constant_time_eq(b"secret", b"short"));
     }
 
     #[test]

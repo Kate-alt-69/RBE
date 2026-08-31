@@ -16,8 +16,9 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 
 use super::{
-    RestartPolicy, ServiceCatalog, ServiceFile, ServiceMode, ServiceReady, ServiceRequest,
-    ServiceResponse,
+    read_bounded_line, RestartPolicy, ServiceCatalog, ServiceFile, ServiceMode, ServiceReady,
+    ServiceRequest, ServiceResponse, SERVICE_IPC_REQUEST_MAX_BYTES, SERVICE_IPC_RESPONSE_MAX_BYTES,
+    SERVICE_IPC_TIMEOUT,
 };
 use crate::mother::ServiceMotherClient;
 
@@ -869,17 +870,34 @@ fn random_token() -> String {
 }
 
 async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<ServiceResponse> {
-    let stream = TcpStream::connect(address).await?;
-    let (read, mut write) = stream.into_split();
-    write
-        .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
-        .await?;
-    write.shutdown().await?;
-    let mut reader = BufReader::new(read);
-    let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+    if !address.ip().is_loopback() {
+        anyhow::bail!("service IPC endpoint must be loopback");
+    }
+    let mut payload = serde_json::to_vec(&request)?;
+    if payload.len().saturating_add(1) > SERVICE_IPC_REQUEST_MAX_BYTES {
+        anyhow::bail!(
+            "service IPC request exceeded {} bytes",
+            SERVICE_IPC_REQUEST_MAX_BYTES
+        );
+    }
+    payload.push(b'\n');
+
+    let stream = tokio::time::timeout(SERVICE_IPC_TIMEOUT, TcpStream::connect(address))
         .await
-        .map_err(|_| anyhow::anyhow!("service IPC timeout"))??;
+        .map_err(|_| anyhow::anyhow!("service IPC connect timeout"))??;
+    let (read, mut write) = stream.into_split();
+    tokio::time::timeout(SERVICE_IPC_TIMEOUT, async {
+        write.write_all(&payload).await?;
+        write.shutdown().await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("service IPC write timeout"))??;
+    let line = tokio::time::timeout(
+        SERVICE_IPC_TIMEOUT,
+        read_bounded_line(read, SERVICE_IPC_RESPONSE_MAX_BYTES, "service response"),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("service IPC response timeout"))??;
     Ok(serde_json::from_str(line.trim())?)
 }
 
