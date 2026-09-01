@@ -67,7 +67,28 @@ tests = r'''
         let path = temp_db("live-duplicate-migration");
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch(SCHEMA).unwrap();
+        let namespace = "module:legacy-live";
+        let group_id = Uuid::new_v4().to_string();
         let asset_id = Uuid::new_v4().to_string();
+        let now = now_ms();
+        connection
+            .execute(
+                "INSERT INTO video_namespaces (id, kind, owner, created_at_ms) VALUES (?1, 'module', 'legacy-live', ?2)",
+                params![namespace, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO video_groups (id, namespace_id, name, created_at_ms) VALUES (?1, ?2, 'streams', ?3)",
+                params![group_id, namespace, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO video_assets (id, group_id, title, state, source_type, metadata_json, created_at_ms, updated_at_ms) VALUES (?1, ?2, 'Legacy', 'reserved', 'live', '{}', ?3, ?3)",
+                params![asset_id, group_id, now],
+            )
+            .unwrap();
         for _ in 0..2 {
             connection
                 .execute(
