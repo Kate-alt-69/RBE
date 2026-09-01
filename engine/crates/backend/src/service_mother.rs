@@ -98,11 +98,15 @@ impl ServiceMotherProcess {
 }
 
 pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
-    let token = flag_value(args, "--service-token")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("backend --service-mother requires --service-token <token>")
-        })?;
+    let token = match service_runtime::read_parent_bootstrap_secret_if_configured("Service Mother")?
+    {
+        Some(token) => token,
+        None => flag_value(args, "--service-token")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("backend --service-mother requires parent authentication")
+            })?,
+    };
     if !args
         .iter()
         .any(|arg| arg == "--launch-separate" || arg == "--launch-saperate")
@@ -180,8 +184,7 @@ async fn spawn_process(
     })?;
     let token = new_service_mother_token();
     let mut child = match Command::new(&alias)
-        .args(["--service-mother", "--launch-separate", "--service-token"])
-        .arg(&token)
+        .args(["--service-mother", "--launch-separate"])
         .current_dir(parent)
         .env("SETTINGS_PATH", &settings_path)
         .env("RBE_PARENT_LIVENESS_PIPE", "1")
@@ -198,13 +201,20 @@ async fn spawn_process(
         }
     };
 
-    let liveness = match child.stdin.take() {
+    let mut liveness = match child.stdin.take() {
         Some(stdin) => stdin,
         None => {
             cleanup_failed_spawn(&alias, &mut child).await;
             anyhow::bail!("Service Mother parent liveness pipe unavailable");
         }
     };
+    if let Err(error) = service_runtime::write_parent_bootstrap_secret(&mut liveness, &token).await
+    {
+        cleanup_failed_spawn(&alias, &mut child).await;
+        return Err(anyhow::anyhow!(
+            "send Service Mother parent bootstrap secret: {error}"
+        ));
+    }
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {

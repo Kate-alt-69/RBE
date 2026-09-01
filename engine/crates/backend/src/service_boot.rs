@@ -12,11 +12,14 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let service_file = value("--service-file")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("backend --service-host requires --service-file <path>"))?;
-    let token = value("--service-token")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("backend --service-host requires --service-token <token>")
-        })?;
+    let token = match service_runtime::read_parent_bootstrap_secret_if_configured("service host")? {
+        Some(token) => token,
+        None => value("--service-token")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("backend --service-host requires parent authentication")
+            })?,
+    };
 
     // Service children load the same typed settings as the mother process so
     // configurable defaults stay consistent even when the .service file omits

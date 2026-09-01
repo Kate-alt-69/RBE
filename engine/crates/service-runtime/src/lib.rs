@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -926,6 +926,59 @@ fn apply_memory_limit(_memory_limit_mb: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_parent_bootstrap_secret(secret: &str) -> anyhow::Result<()> {
+    if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("parent bootstrap secret must be a 256-bit hexadecimal value");
+    }
+    Ok(())
+}
+
+fn read_parent_bootstrap_secret<R: BufRead>(reader: &mut R, label: &str) -> anyhow::Result<String> {
+    // 64 hex bytes plus optional CR and required LF. `take` prevents a
+    // malformed parent from making the child allocate an unbounded line.
+    let mut limited = reader.take(66);
+    let mut line = String::new();
+    let bytes = limited.read_line(&mut line)?;
+    if bytes == 0 {
+        anyhow::bail!("{label} parent bootstrap pipe closed before authentication");
+    }
+    if !line.ends_with('\n') {
+        anyhow::bail!("{label} parent bootstrap secret is not newline terminated");
+    }
+    line.pop();
+    if line.ends_with('\r') {
+        line.pop();
+    }
+    validate_parent_bootstrap_secret(&line)?;
+    Ok(line)
+}
+
+/// Read a one-time authentication value from the same inherited stdin pipe
+/// that remains open afterward as the parent-liveness signal. Returns `None`
+/// for direct/manual process launches that did not configure that pipe.
+pub fn read_parent_bootstrap_secret_if_configured(label: &str) -> anyhow::Result<Option<String>> {
+    if std::env::var_os("RBE_PARENT_LIVENESS_PIPE").is_none() {
+        return Ok(None);
+    }
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    read_parent_bootstrap_secret(&mut stdin, label).map(Some)
+}
+
+/// Send the one-time child authentication value without exposing it in the
+/// process command line or environment. The caller must retain `writer` after
+/// this returns so EOF continues to mean parent death to the child.
+pub async fn write_parent_bootstrap_secret<W>(writer: &mut W, secret: &str) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    validate_parent_bootstrap_secret(secret)?;
+    writer.write_all(secret.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 pub fn parent_liveness_signal_if_configured(
 ) -> anyhow::Result<Option<tokio::sync::oneshot::Receiver<()>>> {
     if std::env::var_os("RBE_PARENT_LIVENESS_PIPE").is_none() {
@@ -985,6 +1038,22 @@ mod tests {
             read_bounded_line(&b"abc\n"[..], 4, "test").await.unwrap(),
             "abc\n"
         );
+    }
+
+    #[test]
+    fn parent_bootstrap_secret_reader_is_bounded_and_validates_token() {
+        let token = "ab".repeat(32);
+        let mut valid = std::io::Cursor::new(format!("{token}\n").into_bytes());
+        assert_eq!(
+            read_parent_bootstrap_secret(&mut valid, "test").unwrap(),
+            token
+        );
+
+        let mut short = std::io::Cursor::new(b"abcd\n".to_vec());
+        assert!(read_parent_bootstrap_secret(&mut short, "test").is_err());
+
+        let mut oversized = std::io::Cursor::new(format!("{}\n", "a".repeat(80)).into_bytes());
+        assert!(read_parent_bootstrap_secret(&mut oversized, "test").is_err());
     }
 
     #[test]

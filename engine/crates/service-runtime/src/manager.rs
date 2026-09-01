@@ -772,8 +772,6 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
     let mut child = match Command::new(&alias)
         .args(["--service-host", "--service-file"])
         .arg(&file.path)
-        .arg("--service-token")
-        .arg(&token)
         .current_dir(parent)
         .env("RBE_PARENT_LIVENESS_PIPE", "1")
         .stdin(Stdio::piped())
@@ -789,13 +787,20 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
         }
     };
 
-    let liveness = match child.stdin.take() {
+    let mut liveness = match child.stdin.take() {
         Some(stdin) => stdin,
         None => {
             cleanup_failed_spawn(&alias, &mut child).await;
             anyhow::bail!("service {:?} parent liveness pipe unavailable", file.name);
         }
     };
+    if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, &token).await {
+        cleanup_failed_spawn(&alias, &mut child).await;
+        return Err(anyhow::anyhow!(
+            "send service {:?} parent bootstrap secret: {error}",
+            file.name
+        ));
+    }
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
