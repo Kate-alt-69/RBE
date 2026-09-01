@@ -1,0 +1,47 @@
+name: Live Session Invariant Fix
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: enforce one active live session per asset
+        shell: bash
+        run: |
+          python ../.github/patches/live-session-invariant.py
+          rustfmt --edition 2021 crates/video-manager/src/lib.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(
+              ["git", "diff", "--name-only", "--relative"], text=True
+          ).split())
+          expected = {"crates/video-manager/src/lib.rs"}
+          if changed != expected:
+              raise SystemExit(
+                  "unexpected live-session invariant paths: " + ", ".join(sorted(changed))
+              )
+          PY
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add -- crates/video-manager/src/lib.rs
+          git commit -m "FIX | BUG-VM-003 enforce one active live session per asset"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
