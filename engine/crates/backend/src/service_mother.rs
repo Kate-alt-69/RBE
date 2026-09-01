@@ -26,6 +26,7 @@ pub struct ServiceMotherSupervisor {
     manager: ServiceManager,
     shutdown: Option<tokio::sync::oneshot::Sender<Duration>>,
     task: tokio::task::JoinHandle<()>,
+    alias: PathBuf,
 }
 
 impl ServiceMotherSupervisor {
@@ -48,8 +49,10 @@ impl ServiceMotherSupervisor {
                     "Service Mother supervisor exceeded shutdown budget; aborting task"
                 );
                 self.task.abort();
+                let _ = (&mut self.task).await;
             }
         }
+        let _ = tokio::fs::remove_file(&self.alias).await;
     }
 }
 
@@ -202,10 +205,13 @@ async fn spawn_process(
             anyhow::bail!("Service Mother parent liveness pipe unavailable");
         }
     };
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Service Mother stdout unavailable"))?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            anyhow::bail!("Service Mother stdout unavailable");
+        }
+    };
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     let bytes =
@@ -260,12 +266,19 @@ async fn spawn_process(
         }
     });
 
-    let manager = match existing_manager {
-        Some(manager) => {
-            manager.replace_remote(ready.address, token).await?;
-            manager.clone()
+    let manager_result = match existing_manager {
+        Some(manager) => manager
+            .replace_remote(ready.address, token)
+            .await
+            .map(|()| manager.clone()),
+        None => ServiceManager::remote(ready.address, token),
+    };
+    let manager = match manager_result {
+        Ok(manager) => manager,
+        Err(error) => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            return Err(error);
         }
-        None => ServiceManager::remote(ready.address, token)?,
     };
     tracing::info!(
         pid = ready.pid,
@@ -290,6 +303,7 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
         )
     })?;
     let initial = spawn_process(&settings_path, None).await?;
+    let alias = initial.alias.clone();
     let manager = initial.manager();
     let supervisor_manager = manager.clone();
     let supervisor_settings = settings_path.clone();
@@ -307,6 +321,7 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
         manager,
         shutdown: Some(shutdown_tx),
         task,
+        alias,
     })
 }
 
