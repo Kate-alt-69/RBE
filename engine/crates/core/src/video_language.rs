@@ -39,11 +39,13 @@ impl VideoLanguage {
             "databaseHealth" | "database_health" => {
                 expect_arity_range(function, args, 0, 1)?;
                 let database = optional_string(args.first(), "database")?;
-                json_result(serde_json::to_value(
-                    manager
-                        .database_health(database.as_deref())
-                        .map_err(operation_error)?,
-                ))
+                let health = manager
+                    .database_health(database.as_deref())
+                    .map_err(operation_error)?;
+                Ok(serde_json::json!({
+                    "ok": health.ok,
+                    "kind": health.kind,
+                }))
             }
             "get" => {
                 expect_arity_range(function, args, 1, 2)?;
@@ -595,5 +597,20 @@ mod tests {
             .unwrap();
         assert_eq!(stored.state, video_manager::VideoLiveSessionState::Ended);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn database_health_hides_host_filesystem_details() {
+        let path = temp_db("health-redaction");
+        let manager = Arc::new(VideoManager::open_default(&path, 7200).unwrap());
+        let language = VideoLanguage::new(Some(manager));
+        let health = language
+            .call("learning.catalog", "databaseHealth", &[])
+            .unwrap();
+        assert_eq!(health["ok"], true);
+        assert!(health.get("kind").is_some());
+        assert!(health.get("detail").is_none());
+        assert!(!health.to_string().contains(path.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_file(path);
     }
 }
