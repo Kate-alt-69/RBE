@@ -1,0 +1,47 @@
+name: Video Manager Language Redaction
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: redact trusted Video Manager language internals
+        shell: bash
+        run: |
+          python ../.github/patches/video-language-redaction.py
+          rustfmt --edition 2021 crates/core/src/video_language.rs
+          git diff --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(
+              ["git", "diff", "--name-only", "--relative"], text=True
+          ).split())
+          expected = {"crates/core/src/video_language.rs"}
+          if changed != expected:
+              raise SystemExit(
+                  "unexpected Video Manager language redaction paths: " + ", ".join(sorted(changed))
+              )
+          PY
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add -- crates/core/src/video_language.rs
+          git commit -m "FIX | BUG-VM-005 redact Video Manager language internals"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
