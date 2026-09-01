@@ -9,7 +9,8 @@ if old not in source:
     raise SystemExit("SQLite open schema anchor missing")
 source = source.replace(old, new, 1)
 
-fn_start = source.index("    fn insert_live_session(\n")
+sqlite_impl = source.index("impl VideoDatabase for SqliteVideoDatabase {")
+fn_start = source.index("    fn insert_live_session(\n", sqlite_impl)
 fn_end = source.index("\n    fn get_live_session(", fn_start)
 block = source[fn_start:fn_end]
 old_tx = '''        let connection = self
