@@ -130,6 +130,14 @@ source = replace_once(
     "with_write commit",
 )
 
+# The explicit write lease now obtains its mutable payload directly from a
+# split header/payload mapping, so the old payload_mut helper is obsolete.
+payload_mut_start = source.find("    fn payload_mut(&mut self) -> Option<&mut [u8]> {\n")
+payload_mut_end = source.find("    fn generation_unlocked(&self) -> u64 {\n", payload_mut_start)
+if payload_mut_start < 0 or payload_mut_end < 0:
+    raise SystemExit("obsolete payload_mut helper boundaries missing")
+source = source[:payload_mut_start] + source[payload_mut_end:]
+
 # Replace generation mutator helper with dirty-state reader; write lease now
 # updates generation and marker together after checking overflow.
 start = source.find("    fn advance_generation_unlocked(&mut self) -> Result<u64> {\n")
