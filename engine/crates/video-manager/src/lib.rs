@@ -1657,14 +1657,33 @@ impl VideoManager {
             return Ok(None);
         }
         let start = self.worker_database_cursor.fetch_add(1, Ordering::Relaxed) % names.len();
+        let mut failures = Vec::new();
         for offset in 0..names.len() {
             let name = &names[(start + offset) % names.len()];
             let (_, database) = self.resolve_database(Some(name))?;
-            if let Some(queued) = database.next_queued_download(name)? {
-                return Ok(Some(queued));
+            match database.next_queued_download(name) {
+                Ok(Some(queued)) => {
+                    if !failures.is_empty() {
+                        tracing::warn!(
+                            failed_databases = ?failures,
+                            database = %name,
+                            "Video Manager isolated queue discovery failure and continued with healthy database"
+                        );
+                    }
+                    return Ok(Some(queued));
+                }
+                Ok(None) => {}
+                Err(error) => failures.push(format!("{name}: {error}")),
             }
         }
-        Ok(None)
+        if failures.is_empty() {
+            Ok(None)
+        } else {
+            anyhow::bail!(
+                "Video Manager queue discovery failed for database adapter(s): {}",
+                failures.join("; ")
+            )
+        }
     }
 
     fn recover_incomplete_downloads(&self) -> anyhow::Result<usize> {
@@ -2035,6 +2054,113 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbe-video-manager-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("video.db")
+    }
+
+    struct FailingQueueDatabase;
+
+    impl VideoDatabase for FailingQueueDatabase {
+        fn kind(&self) -> &'static str {
+            "failing-test"
+        }
+
+        fn health(&self) -> DatabaseHealth {
+            DatabaseHealth {
+                ok: false,
+                kind: self.kind().into(),
+                detail: Some("intentional test failure".into()),
+            }
+        }
+
+        fn create_asset(
+            &self,
+            _database: &str,
+            _request: &CreateAssetRequest,
+        ) -> anyhow::Result<VideoAsset> {
+            anyhow::bail!("unsupported test operation")
+        }
+
+        fn insert_job(&self, _job: &VideoJob) -> anyhow::Result<()> {
+            anyhow::bail!("unsupported test operation")
+        }
+
+        fn claim_job(
+            &self,
+            _job_id: &str,
+            _expected_state: &str,
+            _claimed_state: &str,
+        ) -> anyhow::Result<Option<VideoJob>> {
+            anyhow::bail!("unsupported test operation")
+        }
+
+        fn update_job(
+            &self,
+            _job_id: &str,
+            _state: &str,
+            _progress: f64,
+            _error: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unsupported test operation")
+        }
+
+        fn transition_job(
+            &self,
+            _job_id: &str,
+            _expected_state: &str,
+            _next_state: &str,
+        ) -> anyhow::Result<Option<VideoJob>> {
+            anyhow::bail!("unsupported test operation")
+        }
+
+        fn get_job(&self, _job_id: &str) -> anyhow::Result<Option<VideoJob>> {
+            anyhow::bail!("unsupported test operation")
+        }
+
+        fn next_queued_download(&self, _database: &str) -> anyhow::Result<Option<QueuedDownload>> {
+            anyhow::bail!("intentional queue discovery failure")
+        }
+
+        fn commit_ready_variant(
+            &self,
+            _job_id: &str,
+            _variant: &VideoVariant,
+        ) -> anyhow::Result<Option<VideoJob>> {
+            anyhow::bail!("unsupported test operation")
+        }
+
+        fn get_asset(
+            &self,
+            _database: &str,
+            _asset_id: &str,
+        ) -> anyhow::Result<Option<VideoAsset>> {
+            anyhow::bail!("unsupported test operation")
+        }
+    }
+
+    #[test]
+    fn broken_database_does_not_block_healthy_queued_download() {
+        let path = temp_db("queue-isolation");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        manager
+            .register_database("broken", Arc::new(FailingQueueDatabase))
+            .unwrap();
+        manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "isolation".into(),
+                group: "downloads".into(),
+                title: "Healthy".into(),
+                url: "https://example.invalid/healthy.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+
+        // Start on the broken adapter so the healthy default database is only
+        // reachable if discovery isolates the adapter error and keeps scanning.
+        manager.worker_database_cursor.store(1, Ordering::Relaxed);
+        let queued = manager.next_queued_download(None).unwrap().unwrap();
+        assert_eq!(queued.asset.database, DEFAULT_DATABASE_NAME);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
