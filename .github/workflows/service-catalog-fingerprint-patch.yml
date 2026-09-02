@@ -27,7 +27,10 @@ jobs:
           python ../.github/patches/service-catalog-fingerprint.py
           cargo check
           rustfmt --edition 2021 --config skip_children=true crates/service-runtime/src/lib.rs
-          rustfmt --edition 2021 crates/backend/src/service_mother.rs crates/backend/src/main.rs
+          rustfmt --edition 2021 \
+            crates/service-runtime/src/manager.rs \
+            crates/backend/src/service_mother.rs \
+            crates/backend/src/main.rs
           git diff --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
@@ -37,6 +40,7 @@ jobs:
               "Cargo.lock",
               "crates/service-runtime/Cargo.toml",
               "crates/service-runtime/src/lib.rs",
+              "crates/service-runtime/src/manager.rs",
               "crates/backend/src/service_mother.rs",
               "crates/backend/src/main.rs",
           }
@@ -51,6 +55,12 @@ jobs:
           PY
           git config user.name "Kate"
           git config user.email "dhwanksh2000@gmail.com"
-          git add -- Cargo.lock crates/service-runtime/Cargo.toml crates/service-runtime/src/lib.rs crates/backend/src/service_mother.rs crates/backend/src/main.rs
+          git add -- \
+            Cargo.lock \
+            crates/service-runtime/Cargo.toml \
+            crates/service-runtime/src/lib.rs \
+            crates/service-runtime/src/manager.rs \
+            crates/backend/src/service_mother.rs \
+            crates/backend/src/main.rs
           git commit -m "FIX | BUG-SVC-022 bind Service Mother to validated catalog"
           git push origin "HEAD:${GITHUB_REF_NAME}"
