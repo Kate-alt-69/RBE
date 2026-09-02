@@ -176,12 +176,16 @@ impl GroupSegment {
         self.region.write_lease()
     }
 
+    pub fn repair_lease(&mut self) -> Result<GroupWriteLease<'_>> {
+        self.region.repair_lease()
+    }
+
     pub fn with_read<T>(&self, read: impl FnOnce(&[u8]) -> T) -> Result<T> {
         self.region.with_read(read)
     }
 
-    /// Mutating a segment advances its persisted generation after the closure
-    /// completes while the same exclusive mapping lock is still held.
+    /// Mutating a segment reserves a new generation before the closure and
+    /// commits that generation only after the closure returns normally.
     pub fn with_write<T>(&mut self, write: impl FnOnce(&mut [u8]) -> T) -> Result<T> {
         self.region.with_write(write)
     }

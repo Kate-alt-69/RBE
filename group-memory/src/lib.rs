@@ -24,6 +24,7 @@ pub use lease::{GroupReadLease, GroupWriteLease};
 
 const MAGIC: [u8; 8] = *b"RBEGRP01";
 const HEADER_LEN: usize = 64;
+const WRITE_IN_PROGRESS_OFFSET: usize = 32;
 pub const FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,8 @@ pub enum GroupMemoryError {
     PayloadTooLarge,
     #[error("group-memory generation counter overflowed")]
     GenerationOverflow,
+    #[error("group-memory generation {generation} was left by an interrupted writer; acquire repair_lease() before reading or writing")]
+    UncleanWrite { generation: u64 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -197,6 +200,9 @@ impl GroupMemoryRegion {
     pub fn read_lease(&self) -> Result<GroupReadLease<'_>> {
         let lock = self.lock_shared()?;
         let generation = self.generation_unlocked();
+        if self.write_in_progress_unlocked() {
+            return Err(GroupMemoryError::UncleanWrite { generation });
+        }
         let payload = self.payload();
         Ok(GroupReadLease {
             _lock: lock,
@@ -205,21 +211,54 @@ impl GroupMemoryRegion {
         })
     }
 
-    /// Acquire an exclusive payload lease. Generation advances while the
-    /// exclusive lock is held and before mutable bytes are exposed. This
-    /// deliberately records a new write epoch even if the writer later
-    /// crashes before completing its mutation.
+    /// Acquire an exclusive payload lease. Generation advances and a persistent
+    /// write-in-progress marker is set before mutable bytes are exposed.
+    ///
+    /// Explicit lease users must call [`GroupWriteLease::commit`] after their
+    /// mutation is coherent. Dropping an uncommitted lease deliberately leaves
+    /// the marker set, so task cancellation, panic unwinding, or process death
+    /// cannot silently publish a partial payload as valid.
     pub fn write_lease(&mut self) -> Result<GroupWriteLease<'_>> {
+        self.begin_write_lease(false)
+    }
+
+    /// Acquire the exclusive recovery lease for a region left dirty by an
+    /// interrupted writer. This is the only API that may intentionally mutate
+    /// an unclean region. Repair still advances generation and must be
+    /// explicitly committed before ordinary reads/writes are allowed again.
+    pub fn repair_lease(&mut self) -> Result<GroupWriteLease<'_>> {
+        self.begin_write_lease(true)
+    }
+
+    fn begin_write_lease(&mut self, allow_unclean: bool) -> Result<GroupWriteLease<'_>> {
         if self.access != AccessMode::ReadWrite {
             return Err(GroupMemoryError::ReadOnly);
         }
         let lock = self.lock_exclusive()?;
-        let generation = self.advance_generation_unlocked()?;
-        let payload = self.payload_mut().ok_or(GroupMemoryError::ReadOnly)?;
+        let current = self.generation_unlocked();
+        if self.write_in_progress_unlocked() && !allow_unclean {
+            return Err(GroupMemoryError::UncleanWrite {
+                generation: current,
+            });
+        }
+        let next = current
+            .checked_add(1)
+            .ok_or(GroupMemoryError::GenerationOverflow)?;
+        let payload_len = self.payload_len;
+        let Mapping::ReadWrite(mapping) = &mut self.mapping else {
+            return Err(GroupMemoryError::ReadOnly);
+        };
+        let (header, payload_area) = mapping.split_at_mut(HEADER_LEN);
+        header[24..32].copy_from_slice(&next.to_le_bytes());
+        header[WRITE_IN_PROGRESS_OFFSET] = 1;
+        let dirty_marker = &mut header[WRITE_IN_PROGRESS_OFFSET];
+        let payload = &mut payload_area[..payload_len];
         Ok(GroupWriteLease {
             _lock: lock,
             payload,
-            generation,
+            generation: next,
+            dirty_marker,
+            committed: false,
         })
     }
 
@@ -232,7 +271,9 @@ impl GroupMemoryRegion {
     /// Mutate the payload for one closure-scoped exclusive lease.
     pub fn with_write<T>(&mut self, write: impl FnOnce(&mut [u8]) -> T) -> Result<T> {
         let mut lease = self.write_lease()?;
-        Ok(write(&mut lease))
+        let result = write(&mut lease);
+        lease.commit();
+        Ok(result)
     }
 
     /// Return the current persisted generation. Generation zero means no
@@ -258,15 +299,6 @@ impl GroupMemoryRegion {
         }
     }
 
-    fn payload_mut(&mut self) -> Option<&mut [u8]> {
-        match &mut self.mapping {
-            Mapping::ReadOnly(_) => None,
-            Mapping::ReadWrite(mapping) => {
-                Some(&mut mapping[HEADER_LEN..HEADER_LEN + self.payload_len])
-            }
-        }
-    }
-
     fn generation_unlocked(&self) -> u64 {
         let header = match &self.mapping {
             Mapping::ReadOnly(mapping) => &mapping[..HEADER_LEN],
@@ -279,16 +311,12 @@ impl GroupMemoryRegion {
         )
     }
 
-    fn advance_generation_unlocked(&mut self) -> Result<u64> {
-        let current = self.generation_unlocked();
-        let next = current
-            .checked_add(1)
-            .ok_or(GroupMemoryError::GenerationOverflow)?;
-        let Mapping::ReadWrite(mapping) = &mut self.mapping else {
-            return Err(GroupMemoryError::ReadOnly);
+    fn write_in_progress_unlocked(&self) -> bool {
+        let header = match &self.mapping {
+            Mapping::ReadOnly(mapping) => &mapping[..HEADER_LEN],
+            Mapping::ReadWrite(mapping) => &mapping[..HEADER_LEN],
         };
-        mapping[24..32].copy_from_slice(&next.to_le_bytes());
-        Ok(next)
+        header[WRITE_IN_PROGRESS_OFFSET] != 0
     }
 
     fn lock_shared(&self) -> Result<Option<OwnedFileLock>> {
@@ -502,7 +530,7 @@ mod tests {
             let mut write = region.write_lease().unwrap();
             assert_eq!(write.generation(), 1);
             write[0] = 99;
-            drop(write);
+            write.commit();
 
             let read = region.read_lease().unwrap();
             assert_eq!(read.generation(), 1);
@@ -546,6 +574,53 @@ mod tests {
         drop(lock);
         assert!(receiver.recv_timeout(Duration::from_secs(2)).unwrap());
         handle.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn interrupted_write_fails_closed_until_explicit_repair() {
+        let path = test_path("unclean-write");
+        {
+            let mut region = GroupMemoryRegion::create(&path, 16).unwrap();
+            {
+                let mut interrupted = region.write_lease().unwrap();
+                interrupted[0] = 41;
+                // Intentionally do not commit: this simulates cancellation or
+                // process death after some bytes were already mutated.
+            }
+
+            assert!(matches!(
+                region.read_lease(),
+                Err(GroupMemoryError::UncleanWrite { generation: 1 })
+            ));
+            assert!(matches!(
+                region.write_lease(),
+                Err(GroupMemoryError::UncleanWrite { generation: 1 })
+            ));
+
+            let mut repair = region.repair_lease().unwrap();
+            assert_eq!(repair.generation(), 2);
+            repair.fill(0);
+            repair[0] = 99;
+            repair.commit();
+
+            let read = region.read_lease().unwrap();
+            assert_eq!(read.generation(), 2);
+            assert_eq!(read[0], 99);
+        }
+
+        let reader = GroupMemoryRegion::open(&path, AccessMode::ReadOnly).unwrap();
+        assert_eq!(reader.with_read(|payload| payload[0]).unwrap(), 99);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn closure_write_commits_only_after_callback_returns() {
+        let path = test_path("closure-commit");
+        let mut region = GroupMemoryRegion::create(&path, 8).unwrap();
+        region.with_write(|payload| payload[0] = 7).unwrap();
+        assert_eq!(region.with_read(|payload| payload[0]).unwrap(), 7);
+        assert_eq!(region.generation().unwrap(), 1);
         let _ = fs::remove_file(path);
     }
 }
