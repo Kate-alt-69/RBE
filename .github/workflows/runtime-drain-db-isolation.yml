@@ -1,0 +1,51 @@
+name: Runtime Drain and DB Isolation
+
+on:
+  push:
+    paths:
+      - .ci-runtime-drain-db-isolation-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: apply and validate shutdown/database fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+
+          python ../.github/patches/runtime-drain-db-isolation.py svc-shutdown
+          rustfmt --edition 2021 crates/service-runtime/src/manager.rs
+          git diff --check
+          cargo test -p service-runtime --locked service_shutdown_drain_
+          cargo clippy -p service-runtime --all-targets --locked -- -D warnings
+          git add -- crates/service-runtime/src/manager.rs
+          git commit -m "FIX | BUG-SVC-025 drain service calls before concurrent shutdown"
+
+          python ../.github/patches/runtime-drain-db-isolation.py video-db-isolation
+          rustfmt --edition 2021 --config skip_children=true crates/video-manager/src/lib.rs
+          git diff --check
+          cargo test -p video-manager --locked broken_database_does_not_block_healthy_queued_download
+          cargo clippy -p video-manager --all-targets --locked -- -D warnings
+          git add -- crates/video-manager/src/lib.rs
+          git commit -m "FIX | BUG-VID-003 isolate Video Manager queue adapter failures"
+
+          git diff --exit-code
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          git push origin "HEAD:${GITHUB_REF_NAME}"
