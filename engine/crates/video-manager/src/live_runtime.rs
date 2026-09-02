@@ -187,6 +187,14 @@ async fn run_live_runtime_coordinator(
                     Ok(false) => {
                         if stop_live_runtime(manager.clone(), driver.clone(), true).await {
                             active = false;
+                        } else if wait_for_signal(
+                            &manager,
+                            &mut shutdown,
+                            LIVE_RUNTIME_RECOVERY_SCAN,
+                        )
+                        .await
+                        {
+                            return stop_live_runtime(manager.clone(), driver.clone(), false).await;
                         }
                         continue;
                     }
@@ -633,6 +641,11 @@ mod tests {
             .spawn_live_runtime_with_idle(driver.clone(), Duration::from_millis(25))
             .is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_live_stop_recovery_is_faster_than_default_idle_window() {
+        assert!(LIVE_RUNTIME_RECOVERY_SCAN < Duration::from_secs(2 * 60 * 60));
     }
 
     #[tokio::test]
