@@ -985,6 +985,7 @@ mod tests {
             idle_timeout_ms: 5_000,
             imports: Vec::new(),
             exports: vec!["get".into()],
+            source_digest: [0; 32],
         };
         manager.services.write().await.insert(
             file.name.clone(),

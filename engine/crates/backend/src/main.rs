@@ -330,7 +330,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
     );
 
     let service_mother = match service_catalog.as_ref() {
-        Some(_) => Some(service_mother::spawn(&settings_path).await?),
+        Some(catalog) => Some(service_mother::spawn(&settings_path, &catalog.fingerprint()).await?),
         None => None,
     };
     let service_manager = service_mother

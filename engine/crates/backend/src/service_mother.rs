@@ -120,6 +120,24 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
     })?;
     let io = atomic_io::AtomicIo::new();
     let catalog = crate::service_boot::compile(&config.services, &io)?;
+    let actual_fingerprint = catalog
+        .as_ref()
+        .map(|catalog| catalog.fingerprint())
+        .unwrap_or_default();
+    let expected_fingerprint = flag_value(args, "--service-catalog-fingerprint");
+    if std::env::var_os("RBE_PARENT_LIVENESS_PIPE").is_some() && expected_fingerprint.is_none() {
+        anyhow::bail!("Service Mother requires the parent service catalog fingerprint");
+    }
+    if let Some(expected) = expected_fingerprint {
+        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("Service Mother parent catalog fingerprint is malformed");
+        }
+        if !expected.eq_ignore_ascii_case(&actual_fingerprint) {
+            anyhow::bail!(
+                "Service Mother catalog changed after parent validation (expected {expected}, compiled {actual_fingerprint})"
+            );
+        }
+    }
     let manager = match catalog.as_ref() {
         Some(catalog) => ServiceManager::spawn_all(catalog).await?,
         None => ServiceManager::default(),
@@ -152,8 +170,16 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
 
 async fn spawn_process(
     settings_path: impl AsRef<Path>,
+    expected_catalog_fingerprint: &str,
     existing_manager: Option<&ServiceManager>,
 ) -> anyhow::Result<ServiceMotherProcess> {
+    if expected_catalog_fingerprint.len() != 64
+        || !expected_catalog_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("Service Mother expected catalog fingerprint is malformed");
+    }
     let exe = std::env::current_exe().context("resolve backend executable for Service Mother")?;
     let parent = exe
         .parent()
@@ -185,6 +211,8 @@ async fn spawn_process(
     let token = new_service_mother_token();
     let mut child = match Command::new(&alias)
         .args(["--service-mother", "--launch-separate"])
+        .arg("--service-catalog-fingerprint")
+        .arg(expected_catalog_fingerprint)
         .current_dir(parent)
         .env("SETTINGS_PATH", &settings_path)
         .env("RBE_PARENT_LIVENESS_PIPE", "1")
@@ -305,23 +333,29 @@ async fn spawn_process(
     })
 }
 
-pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMotherSupervisor> {
+pub async fn spawn(
+    settings_path: impl AsRef<Path>,
+    expected_catalog_fingerprint: &str,
+) -> anyhow::Result<ServiceMotherSupervisor> {
     let settings_path = std::fs::canonicalize(settings_path.as_ref()).with_context(|| {
         format!(
             "canonicalize Service Mother supervisor settings path {}",
             settings_path.as_ref().display()
         )
     })?;
-    let initial = spawn_process(&settings_path, None).await?;
+    let expected_catalog_fingerprint = expected_catalog_fingerprint.to_string();
+    let initial = spawn_process(&settings_path, &expected_catalog_fingerprint, None).await?;
     let alias = initial.alias.clone();
     let manager = initial.manager();
     let supervisor_manager = manager.clone();
     let supervisor_settings = settings_path.clone();
+    let supervisor_fingerprint = expected_catalog_fingerprint.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<Duration>();
     let task = tokio::spawn(async move {
         supervise(
             initial,
             supervisor_settings,
+            supervisor_fingerprint,
             supervisor_manager,
             &mut shutdown_rx,
         )
@@ -338,6 +372,7 @@ pub async fn spawn(settings_path: impl AsRef<Path>) -> anyhow::Result<ServiceMot
 async fn supervise(
     mut process: ServiceMotherProcess,
     settings_path: PathBuf,
+    expected_catalog_fingerprint: String,
     manager: ServiceManager,
     shutdown_rx: &mut tokio::sync::oneshot::Receiver<Duration>,
 ) {
@@ -380,7 +415,13 @@ async fn supervise(
                 _ = tokio::time::sleep(delay) => {}
             }
 
-            match spawn_process(&settings_path, Some(&manager)).await {
+            match spawn_process(
+                &settings_path,
+                &expected_catalog_fingerprint,
+                Some(&manager),
+            )
+            .await
+            {
                 Ok(replacement) => {
                     tracing::info!(
                         attempt = restart_attempts,
@@ -427,6 +468,16 @@ async fn cleanup_failed_spawn(alias: &Path, child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_fingerprint_argument_is_fixed_size_hex() {
+        let valid = "ab".repeat(32);
+        assert_eq!(valid.len(), 64);
+        assert!(valid.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!("not-a-fingerprint"
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn mother_restart_backoff_is_exponential_and_capped() {

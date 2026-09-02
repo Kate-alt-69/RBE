@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -53,6 +54,7 @@ pub struct ServiceFile {
     pub idle_timeout_ms: u64,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
+    source_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,6 +138,37 @@ impl ServiceCatalog {
         &self.services
     }
 
+    /// Stable SHA-256 contract for the exact service programs and compiled
+    /// policies this backend validated. Service Mother must reproduce this
+    /// value before advertising readiness, preventing parent/child boot TOCTOU.
+    pub fn fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"RBE_SERVICE_CATALOG_V1");
+        fingerprint_u64(&mut digest, self.monitor_interval_ms);
+        fingerprint_u64(&mut digest, self.max_restart_backoff_ms);
+        fingerprint_u64(&mut digest, self.services.len() as u64);
+        for service in &self.services {
+            fingerprint_field(&mut digest, service.name.as_bytes());
+            fingerprint_field(&mut digest, service.title.as_bytes());
+            fingerprint_field(&mut digest, service_mode_label(service.mode).as_bytes());
+            fingerprint_field(
+                &mut digest,
+                restart_policy_label(service.restart).as_bytes(),
+            );
+            fingerprint_u64(&mut digest, service.memory_limit_mb);
+            fingerprint_u64(&mut digest, service.startup_timeout_ms);
+            fingerprint_u64(&mut digest, service.idle_timeout_ms);
+            fingerprint_field(&mut digest, &service.source_digest);
+        }
+        let bytes = digest.finalize();
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        out
+    }
+
     pub fn compile_dir(
         dir: &Path,
         defaults: ServiceDefaults,
@@ -176,6 +209,31 @@ impl ServiceCatalog {
         } else {
             Err(ServiceCompileErrors(errors))
         }
+    }
+}
+
+fn fingerprint_field(digest: &mut Sha256, value: &[u8]) {
+    fingerprint_u64(digest, value.len() as u64);
+    digest.update(value);
+}
+
+fn fingerprint_u64(digest: &mut Sha256, value: u64) {
+    digest.update(value.to_le_bytes());
+}
+
+const fn service_mode_label(mode: ServiceMode) -> &'static str {
+    match mode {
+        ServiceMode::Resident => "resident",
+        ServiceMode::OnDemand => "on-demand",
+        ServiceMode::Hybrid => "hybrid",
+    }
+}
+
+const fn restart_policy_label(policy: RestartPolicy) -> &'static str {
+    match policy {
+        RestartPolicy::Always => "always",
+        RestartPolicy::OnFailure => "on-failure",
+        RestartPolicy::Never => "never",
     }
 }
 
@@ -354,6 +412,7 @@ fn parse_service(
         idle_timeout_ms,
         imports,
         exports,
+        source_digest: Sha256::digest(source.as_bytes()).into(),
     })
 }
 
@@ -1187,5 +1246,40 @@ mod tests {
         };
         assert_eq!(value["phase"], "stop");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn service_catalog_fingerprint_tracks_source_and_compiled_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "rbe-service-fingerprint-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let service = root.join("demo.service");
+        std::fs::write(
+            &service,
+            ":service[name = demo]\nexport function run() { return 1; }\n",
+        )
+        .unwrap();
+        let first = ServiceCatalog::compile_dir(&root, ServiceDefaults::default()).unwrap();
+        let same = ServiceCatalog::compile_dir(&root, ServiceDefaults::default()).unwrap();
+        assert_eq!(first.fingerprint(), same.fingerprint());
+        assert_eq!(first.fingerprint().len(), 64);
+
+        std::fs::write(
+            &service,
+            ":service[name = demo]\nexport function run() { return 2; }\n",
+        )
+        .unwrap();
+        let changed_source =
+            ServiceCatalog::compile_dir(&root, ServiceDefaults::default()).unwrap();
+        assert_ne!(first.fingerprint(), changed_source.fingerprint());
+
+        let mut defaults = ServiceDefaults::default();
+        defaults.monitor_interval_ms += 1;
+        let changed_policy = ServiceCatalog::compile_dir(&root, defaults).unwrap();
+        assert_ne!(changed_source.fingerprint(), changed_policy.fingerprint());
+        let _ = std::fs::remove_dir_all(root);
     }
 }
