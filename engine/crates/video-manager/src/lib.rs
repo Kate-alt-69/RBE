@@ -38,7 +38,7 @@ pub use worker::{VideoWorkerHandle, VideoWorkerPolicy};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1294,6 +1294,7 @@ pub struct VideoManager {
     work_notify: tokio::sync::Notify,
     worker_state: Mutex<VideoWorkerState>,
     worker_encoder: Mutex<Option<FfmpegVideoEncoder>>,
+    worker_database_cursor: AtomicUsize,
     live_notify: tokio::sync::Notify,
     live_runtime_state: Mutex<VideoLiveRuntimeState>,
     live_runtime_claimed: AtomicBool,
@@ -1347,6 +1348,7 @@ impl VideoManager {
             work_notify: tokio::sync::Notify::new(),
             worker_state: Mutex::new(VideoWorkerState::Disabled),
             worker_encoder: Mutex::new(None),
+            worker_database_cursor: AtomicUsize::new(0),
             live_notify: tokio::sync::Notify::new(),
             live_runtime_state: Mutex::new(VideoLiveRuntimeState::Disabled),
             live_runtime_claimed: AtomicBool::new(false),
@@ -1645,13 +1647,20 @@ impl VideoManager {
         &self,
         requested_database: Option<&str>,
     ) -> anyhow::Result<Option<QueuedDownload>> {
-        let names = match requested_database {
-            Some(name) => vec![name.to_string()],
-            None => self.database_names()?,
-        };
-        for name in names {
-            let (_, database) = self.resolve_database(Some(&name))?;
-            if let Some(queued) = database.next_queued_download(&name)? {
+        if let Some(name) = requested_database {
+            let (_, database) = self.resolve_database(Some(name))?;
+            return database.next_queued_download(name);
+        }
+
+        let names = self.database_names()?;
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let start = self.worker_database_cursor.fetch_add(1, Ordering::Relaxed) % names.len();
+        for offset in 0..names.len() {
+            let name = &names[(start + offset) % names.len()];
+            let (_, database) = self.resolve_database(Some(name))?;
+            if let Some(queued) = database.next_queued_download(name)? {
                 return Ok(Some(queued));
             }
         }
@@ -2026,6 +2035,52 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbe-video-manager-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("video.db")
+    }
+
+    #[test]
+    fn queued_download_selection_rotates_between_registered_databases() {
+        let default_path = temp_db("queue-fair-default");
+        let archive_path = temp_db("queue-fair-archive");
+        let manager = VideoManager::open_default(&default_path, 7200).unwrap();
+        manager
+            .register_database(
+                "archive",
+                Arc::new(SqliteVideoDatabase::open(&archive_path).unwrap()),
+            )
+            .unwrap();
+
+        manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "fairness".into(),
+                group: "downloads".into(),
+                title: "Default".into(),
+                url: "https://example.invalid/default.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        manager
+            .queue_download(QueueDownloadRequest {
+                database: Some("archive".into()),
+                namespace_kind: "module".into(),
+                namespace_owner: "fairness".into(),
+                group: "downloads".into(),
+                title: "Archive".into(),
+                url: "https://example.invalid/archive.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+
+        let first = manager.next_queued_download(None).unwrap().unwrap();
+        let second = manager.next_queued_download(None).unwrap().unwrap();
+        assert_ne!(first.asset.database, second.asset.database);
+        let mut databases = vec![first.asset.database, second.asset.database];
+        databases.sort();
+        assert_eq!(databases, vec!["archive", DEFAULT_DATABASE_NAME]);
+
+        let _ = std::fs::remove_dir_all(default_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(archive_path.parent().unwrap());
     }
 
     #[test]
