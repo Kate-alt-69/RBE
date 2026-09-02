@@ -1,0 +1,44 @@
+name: Group Memory Dirty Write Patch
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: group-memory
+      - name: fail closed after interrupted Group Memory writes
+        shell: bash
+        run: |
+          python .github/patches/group-memory-dirty-write.py
+          cargo fmt --manifest-path group-memory/Cargo.toml --all
+          git diff --check
+          cargo clippy --manifest-path group-memory/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path group-memory/Cargo.toml --all-targets
+          python - <<'PY'
+          import subprocess
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).split())
+          expected = {
+              "group-memory/src/lib.rs",
+              "group-memory/src/lease.rs",
+              "group-memory/src/named.rs",
+          }
+          if changed != expected:
+              raise SystemExit("unexpected Group Memory dirty-write paths: " + ", ".join(sorted(changed)))
+          PY
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add -- group-memory/src/lib.rs group-memory/src/lease.rs group-memory/src/named.rs
+          git commit -m "FIX | BUG-GMEM-002 detect interrupted Group Memory writes"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
