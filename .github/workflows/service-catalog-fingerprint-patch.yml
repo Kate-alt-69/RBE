@@ -27,10 +27,8 @@ jobs:
           python ../.github/patches/service-catalog-fingerprint.py
           cargo check
           rustfmt --edition 2021 --config skip_children=true crates/service-runtime/src/lib.rs
-          rustfmt --edition 2021 \
-            crates/service-runtime/src/manager.rs \
-            crates/backend/src/service_mother.rs \
-            crates/backend/src/main.rs
+          rustfmt --edition 2021 crates/service-runtime/src/manager.rs crates/backend/src/service_mother.rs
+          rustfmt --edition 2021 --config skip_children=true crates/backend/src/main.rs
           git diff --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
