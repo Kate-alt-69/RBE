@@ -1,6 +1,6 @@
 from pathlib import Path
 
-path = Path("../group-memory/src/lib.rs")
+path = Path("group-memory/src/lib.rs")
 source = path.read_text()
 
 create_anchor = '''        let file = FsOpenOptions::new()
