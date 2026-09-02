@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,7 +58,7 @@ struct Managed {
     restart_attempts: u32,
     exit_observed: bool,
     restarting: bool,
-    active_calls: u32,
+    active_calls: Arc<AtomicU32>,
     last_activity: Instant,
 }
 
@@ -70,7 +70,7 @@ impl Managed {
             restart_attempts: 0,
             exit_observed: false,
             restarting: false,
-            active_calls: 0,
+            active_calls: Arc::new(AtomicU32::new(0)),
             last_activity: Instant::now(),
         }
     }
@@ -82,7 +82,7 @@ impl Managed {
             restart_attempts: 0,
             exit_observed: false,
             restarting: false,
-            active_calls: 0,
+            active_calls: Arc::new(AtomicU32::new(0)),
             last_activity: Instant::now(),
         }
     }
@@ -93,9 +93,30 @@ impl Managed {
 
     fn idle_due(&self) -> bool {
         self.wakeable()
-            && self.active_calls == 0
+            && self.active_calls.load(Ordering::Acquire) == 0
             && self.last_activity.elapsed()
                 >= Duration::from_millis(self.file.idle_timeout_ms.max(1))
+    }
+}
+
+struct ActiveCallGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl ActiveCallGuard {
+    fn acquire(counter: Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Drop for ActiveCallGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            });
     }
 }
 
@@ -463,7 +484,7 @@ impl ServiceManager {
                 service: service_name.to_string(),
             })?;
 
-        let (address, token) = {
+        let (address, token, active_call) = {
             let mut service = handle.lock().await;
             self.activate_for_call(&mut service).await?;
             let process =
@@ -475,9 +496,9 @@ impl ServiceManager {
                     })?;
             let address = process.ready.address;
             let token = process.token.clone();
-            service.active_calls = service.active_calls.saturating_add(1);
             service.last_activity = Instant::now();
-            (address, token)
+            let active_call = ActiveCallGuard::acquire(service.active_calls.clone());
+            (address, token, active_call)
         };
 
         let request = operation.into_request(token);
@@ -485,9 +506,9 @@ impl ServiceManager {
 
         {
             let mut service = handle.lock().await;
-            service.active_calls = service.active_calls.saturating_sub(1);
             service.last_activity = Instant::now();
         }
+        drop(active_call);
 
         let response = response.map_err(|error| ServiceCallError::Ipc {
             service: service_name.to_string(),
@@ -621,7 +642,7 @@ impl ServiceManager {
 }
 
 async fn snapshot_managed_service(handle: Arc<Mutex<Managed>>) -> ServiceSnapshot {
-    let (mut snapshot, health_target) = {
+    let (mut snapshot, health_target, active_call) = {
         let mut service = handle.lock().await;
         let restarting = service.restarting;
         let wakeable = service.wakeable();
@@ -645,9 +666,9 @@ async fn snapshot_managed_service(handle: Arc<Mutex<Managed>>) -> ServiceSnapsho
                 Err(_) => (None, ServiceRuntimeState::Unknown, None),
             },
         };
-        if health_target.is_some() {
-            service.active_calls = service.active_calls.saturating_add(1);
-        }
+        let active_call = health_target
+            .as_ref()
+            .map(|_| ActiveCallGuard::acquire(service.active_calls.clone()));
         (
             ServiceSnapshot {
                 name: service.file.name.clone(),
@@ -664,16 +685,14 @@ async fn snapshot_managed_service(handle: Arc<Mutex<Managed>>) -> ServiceSnapsho
                 health_error: None,
             },
             health_target,
+            active_call,
         )
     };
 
     if let Some((address, token)) = health_target {
         snapshot.health_checked = true;
         let response = rpc(address, ServiceRequest::Health { token }).await;
-        {
-            let mut service = handle.lock().await;
-            service.active_calls = service.active_calls.saturating_sub(1);
-        }
+        drop(active_call);
         match response {
             Ok(ServiceResponse::Ok { value }) => {
                 snapshot.ready = health_value_ready(&value);
@@ -940,6 +959,16 @@ async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<Ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_call_guard_releases_counter_when_dropped() {
+        let counter = Arc::new(AtomicU32::new(0));
+        {
+            let _guard = ActiveCallGuard::acquire(counter.clone());
+            assert_eq!(counter.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn service_process_alias_preserves_distinct_legal_names() {
