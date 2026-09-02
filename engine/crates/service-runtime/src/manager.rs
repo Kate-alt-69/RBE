@@ -890,7 +890,7 @@ async fn cleanup_failed_spawn(alias: &Path, child: &mut Child) {
 fn process_name(name: &str) -> String {
     name.chars()
         .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
                 character
             } else {
                 '-'
@@ -940,6 +940,13 @@ async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<Ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_process_alias_preserves_distinct_legal_names() {
+        assert_eq!(process_name("cache.v1"), "cache.v1");
+        assert_eq!(process_name("cache-v1"), "cache-v1");
+        assert_ne!(process_name("cache.v1"), process_name("cache-v1"));
+    }
 
     #[test]
     fn restart_policy_distinguishes_clean_and_failed_exits() {
