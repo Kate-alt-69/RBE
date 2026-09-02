@@ -167,6 +167,27 @@ source = source[:tests_end] + test + source[tests_end:]
 path.write_text(source)
 
 
+# Existing manager-only fixture constructs a ServiceFile directly; its source
+# digest is irrelevant to that dormancy test but must satisfy the new internal
+# compiler field.
+path = Path("crates/service-runtime/src/manager.rs")
+source = path.read_text()
+source = replace_once(
+    source,
+    '''            imports: Vec::new(),
+            exports: vec!["get".into()],
+        };
+''',
+    '''            imports: Vec::new(),
+            exports: vec!["get".into()],
+            source_digest: [0; 32],
+        };
+''',
+    "manager ServiceFile test fixture source digest",
+)
+path.write_text(source)
+
+
 # Service Mother child validates the exact parent catalog before readiness;
 # parent and every supervised replacement carry the same expected digest.
 path = Path("crates/backend/src/service_mother.rs")
@@ -309,7 +330,6 @@ source = replace_once(
     "replacement mother fingerprint",
 )
 
-# Add a focused validation helper test without needing to spawn the backend.
 tests_anchor = '''    #[test]
     fn mother_restart_backoff_is_exponential_and_capped() {
 '''
