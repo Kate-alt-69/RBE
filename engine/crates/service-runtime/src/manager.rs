@@ -23,6 +23,8 @@ use super::{
 use crate::mother::ServiceMotherClient;
 
 const RESTART_BASE_DELAY_MS: u64 = 250;
+const SERVICE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+const SERVICE_SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(10);
 const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
 
 struct ServiceProcess {
@@ -486,6 +488,11 @@ impl ServiceManager {
 
         let (address, token, active_call) = {
             let mut service = handle.lock().await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(ServiceCallError::Unavailable {
+                    service: service_name.to_string(),
+                });
+            }
             self.activate_for_call(&mut service).await?;
             let process =
                 service
@@ -597,9 +604,10 @@ impl ServiceManager {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let probe_health = !self.shutting_down.load(Ordering::Acquire);
         let mut snapshots = tokio::task::JoinSet::new();
         for handle in handles {
-            snapshots.spawn(snapshot_managed_service(handle));
+            snapshots.spawn(snapshot_managed_service(handle, probe_health));
         }
         let mut out = Vec::new();
         while let Some(result) = snapshots.join_next().await {
@@ -630,18 +638,52 @@ impl ServiceManager {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+
+        // Acquire every service lock once after raising `shutting_down`. This
+        // closes the race with a call that passed the outer check but had not
+        // yet acquired its activity guard.
+        let mut activity = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            let service = handle.lock().await;
+            activity.push(service.active_calls.clone());
+        }
+        if !wait_for_service_drain(&activity, SERVICE_SHUTDOWN_DRAIN_TIMEOUT).await {
+            tracing::warn!(
+                active_calls = total_active_calls(&activity),
+                timeout_ms = SERVICE_SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64,
+                "service shutdown drain timed out; forcing remaining service processes to stop"
+            );
+        }
+
+        let mut stops = tokio::task::JoinSet::new();
         for handle in handles {
-            let mut service = handle.lock().await;
-            if let Some(mut process) = service.process.take() {
-                stop_process(&service.file.name, &mut process).await;
+            let process = {
+                let mut service = handle.lock().await;
+                service.exit_observed = true;
+                service.restarting = false;
+                service
+                    .process
+                    .take()
+                    .map(|process| (service.file.name.clone(), process))
+            };
+            if let Some((name, mut process)) = process {
+                stops.spawn(async move {
+                    stop_process(&name, &mut process).await;
+                });
             }
-            service.exit_observed = true;
-            service.restarting = false;
+        }
+        while let Some(result) = stops.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!(error = %error, "service shutdown task failed");
+            }
         }
     }
 }
 
-async fn snapshot_managed_service(handle: Arc<Mutex<Managed>>) -> ServiceSnapshot {
+async fn snapshot_managed_service(
+    handle: Arc<Mutex<Managed>>,
+    probe_health: bool,
+) -> ServiceSnapshot {
     let (mut snapshot, health_target, active_call) = {
         let mut service = handle.lock().await;
         let restarting = service.restarting;
@@ -666,6 +708,7 @@ async fn snapshot_managed_service(handle: Arc<Mutex<Managed>>) -> ServiceSnapsho
                 Err(_) => (None, ServiceRuntimeState::Unknown, None),
             },
         };
+        let health_target = probe_health.then_some(health_target).flatten();
         let active_call = health_target
             .as_ref()
             .map(|_| ActiveCallGuard::acquire(service.active_calls.clone()));
@@ -707,6 +750,27 @@ async fn snapshot_managed_service(handle: Arc<Mutex<Managed>>) -> ServiceSnapsho
         }
     }
     snapshot
+}
+
+fn total_active_calls(activity: &[Arc<AtomicU32>]) -> u64 {
+    activity
+        .iter()
+        .map(|counter| u64::from(counter.load(Ordering::Acquire)))
+        .sum()
+}
+
+async fn wait_for_service_drain(activity: &[Arc<AtomicU32>], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if total_active_calls(activity) == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep(SERVICE_SHUTDOWN_DRAIN_POLL.min(deadline - now)).await;
+    }
 }
 
 fn health_value_ready(value: &Value) -> bool {
@@ -959,6 +1023,23 @@ async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<Ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn service_shutdown_drain_waits_for_active_call() {
+        let counter = Arc::new(AtomicU32::new(1));
+        let released = counter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            released.store(0, Ordering::Release);
+        });
+        assert!(wait_for_service_drain(&[counter], Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn service_shutdown_drain_is_bounded() {
+        let counter = Arc::new(AtomicU32::new(1));
+        assert!(!wait_for_service_drain(&[counter], Duration::from_millis(20)).await);
+    }
 
     #[test]
     fn active_call_guard_releases_counter_when_dropped() {
