@@ -4,6 +4,7 @@
 //! files. Host-only capabilities (`memory` and `quickDB`) are injected
 //! explicitly instead of becoming ambient powers of the language runtime.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -12,7 +13,9 @@ use service_runtime::{
     ServiceLifecycleFuture, ServiceMemory,
 };
 
-use crate::ast::{FunctionDef, MethodDef, ModuleFile, ServiceProgram, Value};
+use crate::ast::{
+    FunctionDef, MethodDef, ModuleFile, ServiceClassDef, ServiceProgram, Value,
+};
 use crate::module_eval::{
     HostCapabilityCaller, HostCapabilityFuture, ModuleEvalError, ModuleExecutor,
 };
@@ -26,14 +29,55 @@ use quickdb::{FilterConfig, FilterKind, FilterStats, QuickDb, QuickDbError};
 struct ServiceHostCapabilities {
     memory: ServiceMemory,
     quick_db: QuickDb,
+    quick_db_classes: HashSet<String>,
+    quick_db_init_errors: Vec<(String, String)>,
 }
 
 impl ServiceHostCapabilities {
-    fn new(memory: ServiceMemory) -> Self {
+    fn new(memory: ServiceMemory, classes: &HashMap<String, ServiceClassDef>) -> Self {
+        let quick_db = QuickDb::default();
+        let mut quick_db_classes = HashSet::new();
+        let mut quick_db_init_errors = Vec::new();
+
+        let mut class_names = classes.keys().cloned().collect::<Vec<_>>();
+        class_names.sort();
+        for class_name in class_names {
+            let Some(class) = classes.get(&class_name) else {
+                continue;
+            };
+            if !class.bindings.contains_key("set") {
+                continue;
+            }
+            quick_db_classes.insert(class_name.clone());
+            if let Err(error) = quick_db_class_config(class)
+                .and_then(|config| quick_db.create(&class_name, config))
+            {
+                quick_db_init_errors.push((class_name, error.to_string()));
+            }
+        }
+
         Self {
             memory,
-            quick_db: QuickDb::default(),
+            quick_db,
+            quick_db_classes,
+            quick_db_init_errors,
         }
+    }
+
+    fn ensure_initialized(&self) -> Result<(), ModuleEvalError> {
+        if self.quick_db_init_errors.is_empty() {
+            return Ok(());
+        }
+        let details = self
+            .quick_db_init_errors
+            .iter()
+            .map(|(class, error)| format!("{class}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(eval_error(
+            "SVC4214",
+            format!("quickDB class initialization failed: {details}"),
+        ))
     }
 
     fn call_memory(&self, function: &str, args: &[Value]) -> Result<Value, ModuleEvalError> {
@@ -81,8 +125,48 @@ impl ServiceHostCapabilities {
         }
     }
 
-    fn call_quick_db(&self, function: &str, args: &[Value]) -> Result<Value, ModuleEvalError> {
+    fn quick_db_target(
+        &self,
+        scope: Option<&str>,
+        function: &str,
+        args: &[Value],
+        explicit_arity: usize,
+        scoped_arity: usize,
+    ) -> Result<(String, usize), ModuleEvalError> {
         const MODULE: &str = "quickDB";
+        if let Some(scope) = scope.filter(|scope| self.quick_db_classes.contains(*scope)) {
+            expect_arity(MODULE, function, args, scoped_arity)?;
+            return Ok((scope.to_string(), 0));
+        }
+
+        expect_arity(MODULE, function, args, explicit_arity)?;
+        let name = expect_string(MODULE, function, &args[0], 0)?.to_string();
+        Ok((name, 1))
+    }
+
+    fn quick_db_string_values<'a>(
+        &self,
+        function: &str,
+        args: &'a [Value],
+        index: usize,
+    ) -> Result<Vec<&'a str>, ModuleEvalError> {
+        const MODULE: &str = "quickDB";
+        let values = expect_array(MODULE, function, &args[index], index)?;
+        let mut strings = Vec::with_capacity(values.len());
+        for (item_index, value) in values.iter().enumerate() {
+            strings.push(expect_string(MODULE, function, value, item_index)?);
+        }
+        Ok(strings)
+    }
+
+    fn call_quick_db(
+        &self,
+        scope: Option<&str>,
+        function: &str,
+        args: &[Value],
+    ) -> Result<Value, ModuleEvalError> {
+        const MODULE: &str = "quickDB";
+        self.ensure_initialized()?;
         match function {
             "create" => {
                 expect_arity(MODULE, function, args, 2)?;
@@ -109,12 +193,7 @@ impl ServiceHostCapabilities {
                     .get("falsePositiveRate")
                     .or_else(|| options.get("false_positive_rate"))
                     .map(|value| {
-                        expect_probability(
-                            MODULE,
-                            function,
-                            value,
-                            "falsePositiveRate",
-                        )
+                        expect_probability(MODULE, function, value, "falsePositiveRate")
                     })
                     .transpose()?
                     .unwrap_or(0.01);
@@ -135,70 +214,79 @@ impl ServiceHostCapabilities {
                     .map_err(quick_db_error)
             }
             "add" => {
-                expect_arity(MODULE, function, args, 2)?;
-                let name = expect_string(MODULE, function, &args[0], 0)?;
-                let value = expect_string(MODULE, function, &args[1], 1)?;
-                self.quick_db.add(name, value).map_err(quick_db_error)?;
+                let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
+                let value = expect_string(MODULE, function, &args[value_index], value_index)?;
+                self.quick_db.add(&name, value).map_err(quick_db_error)?;
                 Ok(Value::Bool(true))
             }
             "addMany" | "add_many" => {
-                expect_arity(MODULE, function, args, 2)?;
-                let name = expect_string(MODULE, function, &args[0], 0)?;
-                let values = expect_array(MODULE, function, &args[1], 1)?;
-                let mut strings = Vec::with_capacity(values.len());
-                for (index, value) in values.iter().enumerate() {
-                    strings.push(expect_string(MODULE, function, value, index + 1)?);
-                }
+                let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
+                let strings = self.quick_db_string_values(function, args, value_index)?;
                 self.quick_db
-                    .add_many(name, strings)
+                    .add_many(&name, strings)
                     .map(|added| Value::Number(added as f64))
                     .map_err(quick_db_error)
             }
+            "load" => {
+                let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
+                if self.quick_db.is_ready(&name).map_err(quick_db_error)? {
+                    return Err(eval_error(
+                        "SVC4215",
+                        "quickDB.load() requires an unready filter; use rebuild() to replace a ready filter",
+                    ));
+                }
+                let strings = self.quick_db_string_values(function, args, value_index)?;
+                let added = self.quick_db.add_many(&name, strings).map_err(quick_db_error)?;
+                self.quick_db.seal(&name).map_err(quick_db_error)?;
+                Ok(Value::Number(added as f64))
+            }
+            "rebuild" => {
+                let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
+                let strings = self.quick_db_string_values(function, args, value_index)?;
+                self.quick_db.clear(&name).map_err(quick_db_error)?;
+                let added = self.quick_db.add_many(&name, strings).map_err(quick_db_error)?;
+                self.quick_db.seal(&name).map_err(quick_db_error)?;
+                Ok(Value::Number(added as f64))
+            }
             "seal" => {
-                expect_arity(MODULE, function, args, 1)?;
-                let name = expect_string(MODULE, function, &args[0], 0)?;
-                self.quick_db.seal(name).map_err(quick_db_error)?;
+                let (name, _) = self.quick_db_target(scope, function, args, 1, 0)?;
+                self.quick_db.seal(&name).map_err(quick_db_error)?;
                 Ok(Value::Bool(true))
             }
             "isReady" | "is_ready" => {
-                expect_arity(MODULE, function, args, 1)?;
-                let name = expect_string(MODULE, function, &args[0], 0)?;
+                let (name, _) = self.quick_db_target(scope, function, args, 1, 0)?;
                 self.quick_db
-                    .is_ready(name)
+                    .is_ready(&name)
                     .map(Value::Bool)
                     .map_err(quick_db_error)
             }
-            "mightContain" | "might_contain" => {
-                expect_arity(MODULE, function, args, 2)?;
-                let name = expect_string(MODULE, function, &args[0], 0)?;
-                let value = expect_string(MODULE, function, &args[1], 1)?;
+            "mightContain" | "might_contain" | "mightHave" | "might_have" => {
+                let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
+                let value = expect_string(MODULE, function, &args[value_index], value_index)?;
                 self.quick_db
-                    .might_contain(name, value)
+                    .might_contain(&name, value)
                     .map(Value::Bool)
                     .map_err(quick_db_error)
             }
-            "definitelyMissing" | "definitely_missing" => {
-                expect_arity(MODULE, function, args, 2)?;
-                let name = expect_string(MODULE, function, &args[0], 0)?;
-                let value = expect_string(MODULE, function, &args[1], 1)?;
+            "definitelyMissing" | "definitely_missing" | "missing" => {
+                let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
+                let value = expect_string(MODULE, function, &args[value_index], value_index)?;
                 self.quick_db
-                    .definitely_missing(name, value)
+                    .definitely_missing(&name, value)
                     .map(Value::Bool)
                     .map_err(quick_db_error)
             }
-            "remove" => {
-                expect_arity(MODULE, function, args, 2)?;
-                let name = expect_string(MODULE, function, &args[0], 0)?;
-                let value = expect_string(MODULE, function, &args[1], 1)?;
+            "remove" | "removeKnown" | "remove_known" => {
+                let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
+                let value = expect_string(MODULE, function, &args[value_index], value_index)?;
                 self.quick_db
-                    .remove(name, value)
+                    .remove(&name, value)
                     .map(Value::Bool)
                     .map_err(quick_db_error)
             }
             "clear" => {
-                expect_arity(MODULE, function, args, 1)?;
-                let name = expect_string(MODULE, function, &args[0], 0)?;
-                self.quick_db.clear(name).map_err(quick_db_error)?;
+                let (name, _) = self.quick_db_target(scope, function, args, 1, 0)?;
+                self.quick_db.clear(&name).map_err(quick_db_error)?;
                 Ok(Value::Bool(true))
             }
             "drop" | "dropFilter" | "drop_filter" => {
@@ -210,13 +298,18 @@ impl ServiceHostCapabilities {
                     .map_err(quick_db_error)
             }
             "stats" => {
-                expect_arity(MODULE, function, args, 1)?;
-                let name = expect_string(MODULE, function, &args[0], 0)?;
-                let stats = self.quick_db.stats(name).map_err(quick_db_error)?;
-                let ready = self.quick_db.is_ready(name).map_err(quick_db_error)?;
+                let (name, _) = self.quick_db_target(scope, function, args, 1, 0)?;
+                let stats = self.quick_db.stats(&name).map_err(quick_db_error)?;
+                let ready = self.quick_db.is_ready(&name).map_err(quick_db_error)?;
                 Ok(quick_db_stats_value(stats, ready))
             }
             "len" => {
+                if scope.is_some_and(|scope| self.quick_db_classes.contains(scope)) {
+                    return Err(eval_error(
+                        "SVC4212",
+                        "quickDB.len() is registry-wide; use Class.stats() for a bound filter",
+                    ));
+                }
                 expect_arity(MODULE, function, args, 0)?;
                 self.quick_db
                     .len()
@@ -234,7 +327,7 @@ impl ServiceHostCapabilities {
 impl HostCapabilityCaller for ServiceHostCapabilities {
     fn call<'a>(
         &'a self,
-        _scope: Option<String>,
+        scope: Option<String>,
         module: &'a str,
         function: &'a str,
         args: Vec<Value>,
@@ -242,7 +335,7 @@ impl HostCapabilityCaller for ServiceHostCapabilities {
         Box::pin(async move {
             let value = match module {
                 "memory" => self.call_memory(function, &args)?,
-                "quickDB" => self.call_quick_db(function, &args)?,
+                "quickDB" => self.call_quick_db(scope.as_deref(), function, &args)?,
                 _ => return Ok(None),
             };
             Ok(Some(value))
@@ -257,7 +350,8 @@ pub struct ServiceProgramExecutor {
     modules: ModuleProgram,
     file: Arc<ModuleFile>,
     lifecycle: Vec<MethodDef>,
-    host_capabilities: Arc<dyn HostCapabilityCaller>,
+    classes: Arc<HashMap<String, ServiceClassDef>>,
+    host_capabilities: Arc<ServiceHostCapabilities>,
 }
 
 impl ServiceProgramExecutor {
@@ -267,6 +361,7 @@ impl ServiceProgramExecutor {
             functions,
             exports,
             lifecycle,
+            classes,
             ..
         } = program;
         let file = Arc::new(ModuleFile {
@@ -274,11 +369,19 @@ impl ServiceProgramExecutor {
             functions,
             exports,
         });
+        let classes = Arc::new(
+            classes
+                .into_iter()
+                .map(|class| (class.name.clone(), class))
+                .collect::<HashMap<_, _>>(),
+        );
+        let host_capabilities = Arc::new(ServiceHostCapabilities::new(memory, &classes));
         Self {
             modules,
             file,
             lifecycle,
-            host_capabilities: Arc::new(ServiceHostCapabilities::new(memory)),
+            classes,
+            host_capabilities,
         }
     }
 
@@ -288,20 +391,28 @@ impl ServiceProgramExecutor {
             .find(|method| method.verb == phase.as_str())
             .cloned()
     }
+
+    fn module_executor(&self) -> ModuleExecutor<'_> {
+        ModuleExecutor::with_host_capabilities_and_classes(
+            &self.modules,
+            self.host_capabilities.clone(),
+            self.classes.clone(),
+        )
+    }
 }
 
 impl ServiceExecutor for ServiceProgramExecutor {
     fn call<'a>(&'a self, function: &'a str, args: Vec<JsonValue>) -> ServiceExecutionFuture<'a> {
         Box::pin(async move {
+            self.host_capabilities
+                .ensure_initialized()
+                .map_err(service_error)?;
             let args = args
                 .into_iter()
                 .map(json_to_value)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(service_error)?;
-            let executor = ModuleExecutor::with_host_capabilities(
-                &self.modules,
-                self.host_capabilities.clone(),
-            );
+            let executor = self.module_executor();
             let value = executor
                 .call_inline(self.file.clone(), function, args)
                 .await
@@ -316,6 +427,9 @@ impl ServiceExecutor for ServiceProgramExecutor {
         argument: JsonValue,
     ) -> ServiceLifecycleFuture<'a> {
         Box::pin(async move {
+            self.host_capabilities
+                .ensure_initialized()
+                .map_err(service_error)?;
             let Some(method) = self.lifecycle_method(phase) else {
                 return Ok(None);
             };
@@ -329,10 +443,7 @@ impl ServiceExecutor for ServiceProgramExecutor {
                 params: method.param_name.into_iter().collect(),
                 body: method.body,
             };
-            let executor = ModuleExecutor::with_host_capabilities(
-                &self.modules,
-                self.host_capabilities.clone(),
-            );
+            let executor = self.module_executor();
             let value = executor
                 .call_inline_definition(self.file.clone(), function, args)
                 .await
@@ -340,6 +451,62 @@ impl ServiceExecutor for ServiceProgramExecutor {
             value_to_json(value).map(Some).map_err(service_error)
         })
     }
+}
+
+fn quick_db_class_config(class: &ServiceClassDef) -> Result<FilterConfig, QuickDbError> {
+    let set = match class.bindings.get("set") {
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => {
+            return Err(QuickDbError::new(
+                "bound constant `set` must be a string such as \"bloom\"",
+            ));
+        }
+        None => return Err(QuickDbError::new("bound constant `set` is required")),
+    };
+    let kind = match set {
+        "bloom" => FilterKind::Bloom,
+        "counting" | "countingBloom" | "counting-bloom" => FilterKind::CountingBloom,
+        "scalable" | "scalableBloom" | "scalable-bloom" => FilterKind::ScalableBloom,
+        other => {
+            return Err(QuickDbError::new(format!(
+                "unsupported bound quickDB set {other:?}; expected bloom, countingBloom, or scalableBloom"
+            )));
+        }
+    };
+
+    let capacity = match class.bindings.get("capacity") {
+        Some(Value::Number(value))
+            if value.is_finite()
+                && *value > 0.0
+                && value.fract() == 0.0
+                && *value <= usize::MAX as f64 => *value as usize,
+        Some(_) => {
+            return Err(QuickDbError::new(
+                "bound constant `capacity` must be a positive integer",
+            ));
+        }
+        None => {
+            return Err(QuickDbError::new(
+                "bound quickDB classes require `const <= capacity => ...;`",
+            ));
+        }
+    };
+
+    let false_positive_rate = match class.bindings.get("falsePositiveRate") {
+        Some(Value::Number(value)) if value.is_finite() && *value > 0.0 && *value < 1.0 => *value,
+        Some(_) => {
+            return Err(QuickDbError::new(
+                "bound constant `falsePositiveRate` must be greater than 0 and less than 1",
+            ));
+        }
+        None => 0.01,
+    };
+
+    Ok(FilterConfig {
+        kind,
+        capacity,
+        false_positive_rate,
+    })
 }
 
 fn expect_arity(
@@ -639,6 +806,87 @@ mod tests {
         let ready = block_on_ready(ServiceExecutor::call(&executor, "ready", vec![]))
             .expect("quickDB ready check failed");
         assert_eq!(ready, serde_json::json!(true));
+    }
+
+    #[test]
+    fn executes_bound_quick_db_class_facade() {
+        let source = r#"
+            :import[quickDB]
+            :service[name = user-index]
+
+            class Usernames {
+                const <= set => "bloom";
+                const <= capacity => 10000;
+                const <= falsePositiveRate => 0.01;
+                const <= tag => "auth-usernames";
+
+                function known(name) {
+                    return Usernames.mightHave(name);
+                }
+            }
+
+            export function warm(values) {
+                return Usernames.load(values);
+            }
+
+            export function known(name) {
+                return Usernames.known(name);
+            }
+
+            export function tag() {
+                return Usernames.tag;
+            }
+        "#;
+        let program = crate::parse_service_source(source).expect("service parse failed");
+        let modules = modules_for_test("quick-db-class");
+        let executor =
+            ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
+
+        let loaded = block_on_ready(ServiceExecutor::call(
+            &executor,
+            "warm",
+            vec![serde_json::json!(["kate", "k8"])],
+        ))
+        .expect("bound quickDB load failed");
+        assert_eq!(loaded, serde_json::json!(2.0));
+
+        let known = block_on_ready(ServiceExecutor::call(
+            &executor,
+            "known",
+            vec![serde_json::json!("kate")],
+        ))
+        .expect("bound quickDB custom method failed");
+        assert_eq!(known, serde_json::json!(true));
+
+        let tag = block_on_ready(ServiceExecutor::call(&executor, "tag", vec![]))
+            .expect("bound class metadata read failed");
+        assert_eq!(tag, serde_json::json!("auth-usernames"));
+    }
+
+    #[test]
+    fn bound_quick_db_class_fails_closed_before_load() {
+        let source = r#"
+            :import[quickDB]
+            :service[name = user-index]
+            class Usernames {
+                const <= set => "bloom";
+                const <= capacity => 1000;
+            }
+            export function check(name) {
+                return Usernames.missing(name);
+            }
+        "#;
+        let program = crate::parse_service_source(source).expect("service parse failed");
+        let modules = modules_for_test("quick-db-class-unready");
+        let executor =
+            ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
+        let error = block_on_ready(ServiceExecutor::call(
+            &executor,
+            "check",
+            vec![serde_json::json!("kate")],
+        ))
+        .expect_err("unloaded bound quickDB class must fail closed");
+        assert!(error.to_string().contains("quickDB.seal"));
     }
 
     #[test]

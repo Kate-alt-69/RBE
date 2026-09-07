@@ -1,9 +1,11 @@
 //! Recursive-descent / precedence parser for the RBE `.route` language.
 //! The parser is intentionally strict and reports line/column information.
 
+use std::collections::HashMap;
+
 use crate::ast::{
-    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram,
-    Statement,
+    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceClassDef,
+    ServiceProgram, Statement, Value,
 };
 use crate::lexer::{Token, TokenKind};
 
@@ -13,6 +15,16 @@ fn import_contains_service(import: &ImportTarget) -> bool {
     match import {
         ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => true,
         ImportTarget::Aliased { target, .. } => import_contains_service(target),
+        _ => false,
+    }
+}
+
+fn import_is_builtin(import: &ImportTarget, expected: &str) -> bool {
+    match import {
+        ImportTarget::Builtin(name) | ImportTarget::BuiltinFunction { module: name, .. } => {
+            name == expected
+        }
+        ImportTarget::Aliased { target, .. } => import_is_builtin(target, expected),
         _ => false,
     }
 }
@@ -97,7 +109,41 @@ impl Parser {
 
         let mut functions = Vec::new();
         let mut exports = Vec::new();
-        while !self.check(&TokenKind::Class) && !self.check(&TokenKind::Eof) {
+        let mut classes = Vec::new();
+        let mut class_name = None;
+        let mut lifecycle = Vec::new();
+
+        while !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::Class) {
+                let Some(TokenKind::Ident(next_name)) =
+                    self.tokens.get(self.pos + 1).map(|token| token.kind.clone())
+                else {
+                    return Err(self.error_here("expected class name after `class`"));
+                };
+
+                if next_name == "Service" {
+                    if class_name.is_some() {
+                        return Err(self.error_here("duplicate `class Service` in .service file"));
+                    }
+                    let (name, methods) = self.parse_service_class()?;
+                    class_name = Some(name);
+                    lifecycle = methods;
+                } else {
+                    let class = self.parse_service_namespace_class()?;
+                    if classes
+                        .iter()
+                        .any(|existing: &ServiceClassDef| existing.name == class.name)
+                    {
+                        return Err(self.error_here(&format!(
+                            "duplicate service-local class {:?}",
+                            class.name
+                        )));
+                    }
+                    classes.push(class);
+                }
+                continue;
+            }
+
             let exported = self.is_export_keyword();
             if exported {
                 self.advance();
@@ -107,10 +153,19 @@ impl Parser {
             }
             if !self.check(&TokenKind::Function) {
                 return Err(self.error_here(
-                    "expected `function`, `export function`, or `class Service` in .service file",
+                    "expected `function`, `export function`, or `class` in .service file",
                 ));
             }
             let function = self.parse_function()?;
+            if functions
+                .iter()
+                .any(|existing: &FunctionDef| existing.name == function.name)
+            {
+                return Err(self.error_here(&format!(
+                    "duplicate service function {:?}",
+                    function.name
+                )));
+            }
             if exported {
                 if exports.iter().any(|name| name == &function.name) {
                     return Err(
@@ -122,15 +177,17 @@ impl Parser {
             functions.push(function);
         }
 
-        let (class_name, lifecycle) = if self.check(&TokenKind::Class) {
-            let (name, methods) = self.parse_service_class()?;
-            (Some(name), methods)
-        } else {
-            (None, Vec::new())
-        };
-
-        if !self.check(&TokenKind::Eof) {
-            return Err(self.error_here("unexpected content after service program"));
+        let quick_db_imported = imports
+            .iter()
+            .any(|import| import_is_builtin(import, "quickDB"));
+        if !quick_db_imported
+            && classes
+                .iter()
+                .any(|class| class.bindings.contains_key("set"))
+        {
+            return Err(self.error_here(
+                "service-local classes using `const <= set => ...` require `:import[quickDB]`",
+            ));
         }
 
         Ok(ServiceProgram {
@@ -139,6 +196,7 @@ impl Parser {
             exports,
             class_name,
             lifecycle,
+            classes,
         })
     }
 
@@ -220,6 +278,96 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace)?;
         Ok((name, methods))
+    }
+
+    fn parse_service_namespace_class(&mut self) -> Result<ServiceClassDef, ParseError> {
+        self.expect(TokenKind::Class)?;
+        let name = self.expect_ident()?;
+        if name == "Service" {
+            return Err(self.error_here("`Service` is reserved for the .service lifecycle class"));
+        }
+        self.expect(TokenKind::LBrace)?;
+
+        let mut bindings = HashMap::new();
+        let mut methods = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::Const) {
+                self.advance();
+                self.expect(TokenKind::LtEq)?;
+                let binding = self.expect_ident()?;
+                // `=>` intentionally reuses the existing Eq + Gt tokens so
+                // this class-only declarative syntax does not alter ordinary
+                // expression parsing.
+                self.expect(TokenKind::Eq)?;
+                self.expect(TokenKind::Gt)?;
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::Semicolon)?;
+                let value = self.bound_constant_value(&expr)?;
+                if bindings.insert(binding.clone(), value).is_some() {
+                    return Err(self.error_here(&format!(
+                        "duplicate bound constant {binding:?} in class {name:?}"
+                    )));
+                }
+                continue;
+            }
+
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
+            let function = if self.check(&TokenKind::Function) {
+                self.parse_function()?
+            } else {
+                let method_name = self.expect_ident()?;
+                let params = self.parse_params()?;
+                let body = self.parse_block()?;
+                FunctionDef {
+                    name: method_name,
+                    params,
+                    body,
+                }
+            };
+            if methods
+                .iter()
+                .any(|existing: &FunctionDef| existing.name == function.name)
+            {
+                return Err(self.error_here(&format!(
+                    "duplicate class method {:?} in class {name:?}",
+                    function.name
+                )));
+            }
+            methods.push(function);
+        }
+        self.expect(TokenKind::RBrace)?;
+
+        Ok(ServiceClassDef {
+            name,
+            bindings,
+            methods,
+        })
+    }
+
+    fn bound_constant_value(&self, expr: &Expr) -> Result<Value, ParseError> {
+        match expr {
+            Expr::String(value) => Ok(Value::String(value.clone())),
+            Expr::Number(value) => Ok(Value::Number(*value)),
+            Expr::Bool(value) => Ok(Value::Bool(*value)),
+            Expr::Null => Ok(Value::Null),
+            Expr::Array(items) => items
+                .iter()
+                .map(|item| self.bound_constant_value(item))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array),
+            Expr::Object(fields) => {
+                let mut out = HashMap::new();
+                for (key, value) in fields {
+                    out.insert(key.clone(), self.bound_constant_value(value)?);
+                }
+                Ok(Value::Object(out))
+            }
+            _ => Err(self.error_here(
+                "class bound constants must be literal values, arrays, or objects",
+            )),
+        }
     }
 
     /// Parse a route while retaining recoverable statement errors. A valid

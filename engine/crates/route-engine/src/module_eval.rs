@@ -8,7 +8,9 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 use service_runtime::ServiceManager;
 
-use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, ModuleFile, Statement, Value};
+use crate::ast::{
+    BinaryOp, Expr, FunctionDef, ImportTarget, ModuleFile, ServiceClassDef, Statement, Value,
+};
 use crate::module_runtime::ModuleProgram;
 use crate::modules::{binding_name, ModuleRegistry};
 
@@ -84,6 +86,7 @@ pub struct ModuleExecutor<'a> {
     program: &'a ModuleProgram,
     services: Option<Arc<dyn ServiceCaller>>,
     host_capabilities: Option<Arc<dyn HostCapabilityCaller>>,
+    classes: Arc<HashMap<String, ServiceClassDef>>,
 }
 
 impl<'a> ModuleExecutor<'a> {
@@ -92,6 +95,7 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: None,
             host_capabilities: None,
+            classes: Arc::new(HashMap::new()),
         }
     }
 
@@ -108,6 +112,7 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: Some(Arc::new(services)),
             host_capabilities: Some(host_capabilities),
+            classes: Arc::new(HashMap::new()),
         }
     }
 
@@ -119,6 +124,7 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: Some(services),
             host_capabilities: None,
+            classes: Arc::new(HashMap::new()),
         }
     }
 
@@ -130,6 +136,20 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: None,
             host_capabilities: Some(host_capabilities),
+            classes: Arc::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn with_host_capabilities_and_classes(
+        program: &'a ModuleProgram,
+        host_capabilities: Arc<dyn HostCapabilityCaller>,
+        classes: Arc<HashMap<String, ServiceClassDef>>,
+    ) -> Self {
+        Self {
+            program,
+            services: None,
+            host_capabilities: Some(host_capabilities),
+            classes,
         }
     }
 
@@ -199,6 +219,54 @@ impl<'a> ModuleExecutor<'a> {
                 )
             })?;
         value_from_json(value)
+    }
+
+    async fn call_class_method(
+        &self,
+        file: Arc<ModuleFile>,
+        class_name: &str,
+        function_name: &str,
+        args: Vec<Value>,
+        depth: usize,
+    ) -> Result<Value, ModuleEvalError> {
+        if depth >= MAX_MODULE_CALL_DEPTH {
+            return Err(ModuleEvalError::new(
+                "MOD3004",
+                format!("module call depth exceeded {MAX_MODULE_CALL_DEPTH}"),
+            ));
+        }
+        let class = self.classes.get(class_name).ok_or_else(|| {
+            ModuleEvalError::new("MOD3500", format!("service class {class_name:?} is not loaded"))
+        })?;
+        if let Some(function) = class
+            .methods
+            .iter()
+            .find(|candidate| candidate.name == function_name)
+            .cloned()
+        {
+            return self
+                .execute_function(file, function, args, depth, Some(class_name.to_string()))
+                .await;
+        }
+
+        if class.bindings.contains_key("set") {
+            if let Some(value) = self
+                .call_host_capability(
+                    Some(class_name.to_string()),
+                    "quickDB",
+                    function_name,
+                    args,
+                )
+                .await?
+            {
+                return Ok(value);
+            }
+        }
+
+        Err(ModuleEvalError::new(
+            "MOD3501",
+            format!("service class {class_name:?} has no method {function_name:?}"),
+        ))
     }
 
     async fn call_export(
@@ -422,6 +490,12 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                             format!("function {name:?} must be called, not used as a value"),
                         ));
                     }
+                    if self.executor.classes.contains_key(name) {
+                        return Err(ModuleEvalError::new(
+                            "MOD3105",
+                            format!("service class {name:?} must be accessed through a member"),
+                        ));
+                    }
                     if self.is_import_binding(name) {
                         return Err(ModuleEvalError::new(
                             "MOD3101",
@@ -449,6 +523,23 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                 }
                 Expr::Member(base, field) => {
                     if let Expr::Ident(name) = base.as_ref() {
+                        if let Some(class) = self.executor.classes.get(name) {
+                            if let Some(value) = class.bindings.get(field) {
+                                return Ok(value.clone());
+                            }
+                            if class.methods.iter().any(|method| method.name == *field)
+                                || class.bindings.contains_key("set")
+                            {
+                                return Err(ModuleEvalError::new(
+                                    "MOD3106",
+                                    format!("{name}.{field} must be called"),
+                                ));
+                            }
+                            return Err(ModuleEvalError::new(
+                                "MOD3107",
+                                format!("service class {name:?} has no member {field:?}"),
+                            ));
+                        }
                         if self.is_import_binding(name) {
                             return Err(ModuleEvalError::new(
                                 "MOD3103",
@@ -524,6 +615,18 @@ impl<'exec, 'program> Frame<'exec, 'program> {
 
                     if let Expr::Member(base, function_name) = callee.as_ref() {
                         if let Expr::Ident(module_name) = base.as_ref() {
+                            if self.executor.classes.contains_key(module_name) {
+                                return self
+                                    .executor
+                                    .call_class_method(
+                                        self.file.clone(),
+                                        module_name,
+                                        function_name,
+                                        args,
+                                        self.depth + 1,
+                                    )
+                                    .await;
+                            }
                             if let Some(module) = self.builtin_modules.get(module_name).cloned() {
                                 if let Some(value) = self
                                     .executor

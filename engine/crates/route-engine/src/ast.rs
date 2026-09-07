@@ -52,6 +52,18 @@ pub struct ServiceProgram {
     pub exports: Vec<String>,
     pub class_name: Option<String>,
     pub lifecycle: Vec<MethodDef>,
+    pub(crate) classes: Vec<ServiceClassDef>,
+}
+
+/// Service-local namespace class. These are static/object-like namespaces, not
+/// heap-allocated instances. `bindings` come from RBE's class-bound constant
+/// syntax (`const <= key => value;`) and methods are reusable from any service
+/// function, lifecycle method, or other service-local class.
+#[derive(Debug, Clone)]
+pub(crate) struct ServiceClassDef {
+    pub name: String,
+    pub bindings: HashMap<String, Value>,
+    pub methods: Vec<FunctionDef>,
 }
 
 #[derive(Debug, Clone)]
