@@ -165,9 +165,9 @@ impl VideoManager {
             if *state != VideoWorkerState::Disabled {
                 anyhow::bail!("Video Manager download worker is already active");
             }
+            self.set_worker_encoder(Some(policy.ffmpeg.video_encoder))?;
             *state = VideoWorkerState::Sleeping;
         }
-        self.set_worker_encoder(Some(policy.ffmpeg.video_encoder))?;
 
         let manager = self.clone();
         let task_manager = self.clone();
@@ -483,6 +483,30 @@ mod tests {
             ffmpeg: FfmpegPolicy::new(ffmpeg),
             recovery_scan: Duration::from_secs(60),
         }
+    }
+
+    #[test]
+    fn encoder_telemetry_failure_does_not_claim_worker_slot() {
+        let root = temp_root("encoder-startup-failure");
+        let manager =
+            Arc::new(VideoManager::open_default(root.join("video-manager.db"), 7200).unwrap());
+        let poison_target = manager.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_target.worker_encoder.lock().unwrap();
+            panic!("intentional encoder telemetry poison");
+        }));
+
+        let error = manager
+            .clone()
+            .spawn_download_worker(policy(&root))
+            .err()
+            .expect("poisoned encoder telemetry must reject worker startup");
+        assert!(error.to_string().contains("worker encoder mutex is poisoned"));
+        assert_eq!(
+            *manager.worker_state.lock().unwrap(),
+            VideoWorkerState::Disabled
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
