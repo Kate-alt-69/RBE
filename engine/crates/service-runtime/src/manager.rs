@@ -10,7 +10,7 @@ use anyhow::Context;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
@@ -26,6 +26,7 @@ const RESTART_BASE_DELAY_MS: u64 = 250;
 const SERVICE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const SERVICE_SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(10);
 const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
+const SERVICE_READY_MAX_BYTES: usize = 4 * 1024;
 
 struct ServiceProcess {
     child: Child,
@@ -833,6 +834,40 @@ async fn stop_process(service_name: &str, process: &mut ServiceProcess) {
     let _ = std::fs::remove_file(&process.alias);
 }
 
+async fn read_bounded_buffered_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+    label: &str,
+) -> anyhow::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_bytes.min(1024));
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            anyhow::bail!("{label} is not newline terminated");
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        if bytes.len().saturating_add(consumed) > max_bytes {
+            reader.consume(consumed);
+            anyhow::bail!("{label} exceeded {max_bytes} bytes");
+        }
+        bytes.extend_from_slice(&buffer[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|error| anyhow::anyhow!("{label} is not valid UTF-8: {error}"));
+        }
+    }
+}
+
 async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
     let exe = std::env::current_exe().context("resolve backend executable")?;
     let parent = exe.parent().context("backend executable has no parent")?;
@@ -895,27 +930,26 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
         }
     };
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    let bytes = match tokio::time::timeout(
+    let line = match tokio::time::timeout(
         Duration::from_millis(file.startup_timeout_ms.max(1)),
-        reader.read_line(&mut line),
+        read_bounded_buffered_line(&mut reader, SERVICE_READY_MAX_BYTES, "service readiness"),
     )
     .await
     {
-        Ok(Ok(bytes)) => bytes,
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            anyhow::bail!("service {:?} exited before readiness", file.name);
+        }
         Ok(Err(error)) => {
             cleanup_failed_spawn(&alias, &mut child).await;
-            return Err(error.into());
+            return Err(error);
         }
         Err(_) => {
             cleanup_failed_spawn(&alias, &mut child).await;
             anyhow::bail!("service {:?} startup timeout", file.name);
         }
     };
-    if bytes == 0 {
-        cleanup_failed_spawn(&alias, &mut child).await;
-        anyhow::bail!("service {:?} exited before readiness", file.name);
-    }
     let ready: ServiceReady = match serde_json::from_str(line.trim()) {
         Ok(ready) => ready,
         Err(error) => {
@@ -1084,6 +1118,28 @@ mod tests {
         assert_eq!(restart_delay(2, maximum), Duration::from_millis(500));
         assert_eq!(restart_delay(3, maximum), Duration::from_millis(1_000));
         assert_eq!(restart_delay(32, maximum), maximum);
+    }
+
+    #[tokio::test]
+    async fn service_readiness_reader_is_bounded_and_preserves_following_output() {
+        let payload = b"{\"service\":\"demo\"}\nfirst-log-line\n";
+        let mut reader = BufReader::new(&payload[..]);
+        let readiness = read_bounded_buffered_line(&mut reader, 64, "readiness")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(readiness, "{\"service\":\"demo\"}\n");
+
+        let mut next = String::new();
+        reader.read_line(&mut next).await.unwrap();
+        assert_eq!(next, "first-log-line\n");
+
+        let oversized = format!("{}\n", "x".repeat(65));
+        let mut oversized_reader = BufReader::new(oversized.as_bytes());
+        let error = read_bounded_buffered_line(&mut oversized_reader, 64, "readiness")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded 64 bytes"));
     }
 
     #[tokio::test]
