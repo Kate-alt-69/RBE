@@ -132,6 +132,7 @@ impl QuickDb {
             ManagedFilter {
                 filter,
                 ready: false,
+                poisoned: false,
             },
         );
         Ok(())
@@ -147,6 +148,7 @@ impl QuickDb {
             .ok_or_else(|| missing_filter(name))?;
         if let Err(error) = managed.filter.add(value.as_bytes()) {
             managed.ready = false;
+            managed.poisoned = true;
             return Err(error);
         }
         Ok(())
@@ -168,6 +170,7 @@ impl QuickDb {
         for value in values {
             if let Err(error) = managed.filter.add(value.as_bytes()) {
                 managed.ready = false;
+                managed.poisoned = true;
                 return Err(error);
             }
             added = added.saturating_add(1);
@@ -211,6 +214,7 @@ impl QuickDb {
             .ok_or_else(|| missing_filter(name))?;
         managed.filter.clear();
         managed.ready = false;
+        managed.poisoned = false;
         Ok(())
     }
 
@@ -239,6 +243,11 @@ impl QuickDb {
         let managed = filters
             .get_mut(name)
             .ok_or_else(|| missing_filter(name))?;
+        if managed.poisoned {
+            return Err(QuickDbError::new(format!(
+                "quickDB filter {name:?} cannot be sealed after a failed mutation; clear or rebuild it from the authoritative database first"
+            )));
+        }
         managed.ready = true;
         Ok(())
     }
@@ -291,6 +300,7 @@ fn missing_filter(name: &str) -> QuickDbError {
 struct ManagedFilter {
     filter: Filter,
     ready: bool,
+    poisoned: bool,
 }
 
 enum Filter {
@@ -726,6 +736,34 @@ mod tests {
         assert!(db.might_contain("emails", "kate@example.test").unwrap());
         assert!(db.remove("emails", "kate@example.test").unwrap());
         assert!(db.definitely_missing("emails", "kate@example.test").unwrap());
+    }
+
+    #[test]
+    fn failed_mutation_requires_rebuild_before_reseal() {
+        let db = QuickDb::default();
+        db.create("emails", config(FilterKind::CountingBloom, 1))
+            .unwrap();
+        {
+            let mut filters = db.filters.write().unwrap();
+            let managed = filters.get_mut("emails").unwrap();
+            let Filter::CountingBloom(filter) = &mut managed.filter else {
+                panic!("expected counting-bloom filter");
+            };
+            for index in 0..filter.slot_len {
+                filter.set_counter(index, 15);
+            }
+        }
+        db.seal("emails").unwrap();
+
+        let error = db.add("emails", "new@example.test").unwrap_err();
+        assert!(error.to_string().contains("counter saturated"));
+        assert!(!db.is_ready("emails").unwrap());
+        let error = db.seal("emails").unwrap_err();
+        assert!(error.to_string().contains("clear or rebuild"));
+
+        db.clear("emails").unwrap();
+        db.seal("emails").unwrap();
+        assert!(db.is_ready("emails").unwrap());
     }
 
     #[test]
