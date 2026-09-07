@@ -286,7 +286,9 @@ async fn run_download_worker_loop(
         known_databases = current_databases;
 
         if recovery_required || newly_registered {
-            if database_names.len() == 1 && recovered_databases.is_empty() {
+            if database_names.len() == 1
+                && (recovery_required || recovered_databases.is_empty())
+            {
                 let name = &database_names[0];
                 match manager.recover_incomplete_downloads() {
                     Ok(count) => {
@@ -299,15 +301,18 @@ async fn run_download_worker_loop(
                             );
                         }
                     }
-                    Err(error) => tracing::error!(
-                        database = %name,
-                        error = %error,
-                        "Video Manager database recovery failed; this adapter remains blocked until recovery succeeds"
-                    ),
+                    Err(error) => {
+                        recovered_databases.remove(name);
+                        tracing::error!(
+                            database = %name,
+                            error = %error,
+                            "Video Manager database recovery failed; this adapter remains blocked until recovery succeeds"
+                        );
+                    }
                 }
             } else {
                 for name in &database_names {
-                    if recovered_databases.contains(name) {
+                    if !recovery_required && recovered_databases.contains(name) {
                         continue;
                     }
                     match manager.recover_worker_database(name) {
@@ -323,6 +328,7 @@ async fn run_download_worker_loop(
                             );
                         }
                         Err(error) => {
+                            recovered_databases.remove(name);
                             tracing::error!(
                                 database = %name,
                                 error = %error,
@@ -720,7 +726,8 @@ mod tests {
 
         for _ in 0..100 {
             if healthy.discoveries.load(Ordering::SeqCst) > 0
-                && broken.recovery_attempts.load(Ordering::SeqCst) > 0
+                && healthy.recovery_attempts.load(Ordering::SeqCst) >= 2
+                && broken.recovery_attempts.load(Ordering::SeqCst) >= 2
             {
                 break;
             }
@@ -728,10 +735,11 @@ mod tests {
         }
 
         assert!(healthy.recovery_succeeded.load(Ordering::SeqCst));
+        assert!(healthy.recovery_attempts.load(Ordering::SeqCst) >= 2);
         assert!(healthy.discoveries.load(Ordering::SeqCst) > 0);
         assert!(!healthy.discovery_before_recovery.load(Ordering::SeqCst));
         assert!(!broken.recovery_succeeded.load(Ordering::SeqCst));
-        assert!(broken.recovery_attempts.load(Ordering::SeqCst) > 0);
+        assert!(broken.recovery_attempts.load(Ordering::SeqCst) >= 2);
         assert_eq!(broken.discoveries.load(Ordering::SeqCst), 0);
         assert_eq!(
             manager.status().unwrap().download_worker.state,
