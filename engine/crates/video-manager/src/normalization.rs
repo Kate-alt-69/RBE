@@ -22,6 +22,9 @@ impl VideoManager {
             anyhow::bail!("Video Manager normalization identity/type mismatch");
         }
         let (width, height, fps) = normalization_video_metadata(probe)?;
+        let quarantine = self.quarantine_path(&queued.asset.id, &queued.job.id)?;
+        let (staging, final_path, stored_path) =
+            self.normalized_paths(&queued.asset.id, &queued.job.id)?;
         let (_, database) = self.resolve_database(Some(&queued.asset.database))?;
         let transitioned = database
             .transition_job(&queued.job.id, "probed", "normalizing")?
@@ -38,9 +41,6 @@ impl VideoManager {
         }
 
         database.update_job(&transitioned.id, "normalizing", PROGRESS_NORMALIZING, None)?;
-        let quarantine = self.quarantine_path(&transitioned.asset_id, &transitioned.id)?;
-        let (staging, final_path, stored_path) =
-            self.normalized_paths(&transitioned.asset_id, &transitioned.id)?;
 
         let normalized = match crate::ffmpeg::run_ffmpeg_normalize(&quarantine, &staging, policy)
             .await
@@ -254,6 +254,7 @@ fn normalization_video_metadata(probe: &MediaProbe) -> anyhow::Result<(u32, u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{QueueDownloadRequest, VideoStreamProbe};
 
     fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -265,18 +266,70 @@ mod tests {
         root
     }
 
-    #[test]
-    fn invalid_probe_is_rejected_before_normalization_can_claim_a_job() {
-        let probe = MediaProbe {
+    fn valid_probe() -> MediaProbe {
+        MediaProbe {
             format_names: vec!["mp4".into()],
             duration_secs: Some(1.0),
-            bit_rate: None,
-            video_streams: Vec::new(),
-            audio_streams: 0,
-        };
+            bit_rate: Some(1_000_000),
+            video_streams: vec![VideoStreamProbe {
+                index: 0,
+                codec: "h264".into(),
+                width: 1280,
+                height: 720,
+                pixel_format: Some("yuv420p".into()),
+                frame_rate: Some(30.0),
+                bit_rate: Some(900_000),
+                duration_secs: Some(1.0),
+            }],
+            audio_streams: 1,
+        }
+    }
+
+    #[test]
+    fn invalid_probe_is_rejected_before_normalization_can_claim_a_job() {
+        let mut probe = valid_probe();
+        probe.video_streams.clear();
         let error = normalization_video_metadata(&probe)
             .expect_err("empty probe must be rejected before state transition");
         assert!(error.to_string().contains("no video stream"));
+    }
+
+    #[tokio::test]
+    async fn path_preflight_failure_keeps_job_probed() {
+        let root = temp_root("preflight-state");
+        let manager = VideoManager::open_default(root.join("video-manager.db"), 7200).unwrap();
+        let queued = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "normalization".into(),
+                group: "preflight".into(),
+                title: "Preflight".into(),
+                url: "https://example.invalid/video.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let (_, database) = manager.resolve_database(None).unwrap();
+        database
+            .update_job(&queued.job.id, "probed", PROGRESS_PROBED, None)
+            .unwrap();
+        let asset_dir = manager.media_root.join(&queued.asset.id);
+        std::fs::create_dir_all(&asset_dir).unwrap();
+        std::fs::write(asset_dir.join("primary.mp4"), b"winner").unwrap();
+
+        let error = manager
+            .normalize_download_media(
+                &queued,
+                &valid_probe(),
+                &FfmpegPolicy::new(root.join("unused-ffmpeg")),
+            )
+            .await
+            .expect_err("existing final output must fail preflight");
+        assert!(error.to_string().contains("already exists"));
+        let job = database.get_job(&queued.job.id).unwrap().unwrap();
+        assert_eq!(job.state, "probed");
+        assert_eq!(std::fs::read(asset_dir.join("primary.mp4")).unwrap(), b"winner");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
