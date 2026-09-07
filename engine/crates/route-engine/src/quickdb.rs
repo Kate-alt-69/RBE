@@ -178,6 +178,71 @@ impl QuickDb {
         Ok(added)
     }
 
+    pub fn load_snapshot<'a>(
+        &self,
+        name: &str,
+        values: impl IntoIterator<Item = &'a str>,
+    ) -> Result<usize, QuickDbError> {
+        let mut filters = self
+            .filters
+            .write()
+            .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
+        let managed = filters
+            .get_mut(name)
+            .ok_or_else(|| missing_filter(name))?;
+        if managed.ready {
+            return Err(QuickDbError::new(
+                "quickDB.load() requires an unready filter; use rebuild() to replace a ready filter",
+            ));
+        }
+        if managed.poisoned {
+            return Err(QuickDbError::new(format!(
+                "quickDB filter {name:?} cannot load into a failed snapshot; clear or rebuild it from the authoritative database first"
+            )));
+        }
+
+        let mut added = 0usize;
+        for value in values {
+            if let Err(error) = managed.filter.add(value.as_bytes()) {
+                managed.ready = false;
+                managed.poisoned = true;
+                return Err(error);
+            }
+            added = added.saturating_add(1);
+        }
+        managed.ready = true;
+        Ok(added)
+    }
+
+    pub fn rebuild_snapshot<'a>(
+        &self,
+        name: &str,
+        values: impl IntoIterator<Item = &'a str>,
+    ) -> Result<usize, QuickDbError> {
+        let mut filters = self
+            .filters
+            .write()
+            .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
+        let managed = filters
+            .get_mut(name)
+            .ok_or_else(|| missing_filter(name))?;
+        managed.filter.clear();
+        managed.ready = false;
+        managed.poisoned = false;
+
+        let mut added = 0usize;
+        for value in values {
+            if let Err(error) = managed.filter.add(value.as_bytes()) {
+                managed.ready = false;
+                managed.poisoned = true;
+                return Err(error);
+            }
+            added = added.saturating_add(1);
+        }
+        managed.ready = true;
+        Ok(added)
+    }
+
     pub fn might_contain(&self, name: &str, value: &str) -> Result<bool, QuickDbError> {
         let filters = self
             .filters
@@ -772,6 +837,33 @@ mod tests {
         db.clear("emails").unwrap();
         db.seal("emails").unwrap();
         assert!(db.is_ready("emails").unwrap());
+    }
+
+    #[test]
+    fn snapshot_helpers_finish_ready_under_one_registry_write() {
+        let db = QuickDb::default();
+        db.create("users", config(FilterKind::Bloom, 1_000)).unwrap();
+        assert_eq!(
+            db.load_snapshot("users", ["old-a", "old-b"].into_iter())
+                .unwrap(),
+            2
+        );
+        assert!(db.is_ready("users").unwrap());
+        assert!(db.might_contain("users", "old-a").unwrap());
+        assert!(db
+            .load_snapshot("users", ["duplicate"].into_iter())
+            .unwrap_err()
+            .to_string()
+            .contains("unready filter"));
+
+        assert_eq!(
+            db.rebuild_snapshot("users", ["new-a", "new-b", "new-c"].into_iter())
+                .unwrap(),
+            3
+        );
+        assert!(db.is_ready("users").unwrap());
+        assert!(db.might_contain("users", "new-a").unwrap());
+        assert_eq!(db.stats("users").unwrap().writes, 3);
     }
 
     #[test]
