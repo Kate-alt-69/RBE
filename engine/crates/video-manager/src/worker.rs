@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::{DownloadPolicy, FfmpegPolicy, FfprobePolicy, QueuedDownload, VideoManager, VideoWorkerState};
+use crate::{
+    DownloadPolicy, FfmpegPolicy, FfprobePolicy, QueuedDownload, VideoManager, VideoWorkerState,
+};
 
 const MAX_RECOVERY_SCAN: Duration = Duration::from_secs(60 * 60);
 const WORKER_RESTART_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -284,28 +286,49 @@ async fn run_download_worker_loop(
         known_databases = current_databases;
 
         if recovery_required || newly_registered {
-            for name in &database_names {
-                if recovered_databases.contains(name) {
-                    continue;
-                }
-                match manager.recover_worker_database(name) {
-                    Ok(0) => {
-                        recovered_databases.insert(name.clone());
-                    }
+            if database_names.len() == 1 && recovered_databases.is_empty() {
+                let name = &database_names[0];
+                match manager.recover_incomplete_downloads() {
                     Ok(count) => {
                         recovered_databases.insert(name.clone());
-                        tracing::warn!(
-                            database = %name,
-                            count,
-                            "Video Manager re-queued interrupted download job(s)"
-                        );
+                        if count > 0 {
+                            tracing::warn!(
+                                database = %name,
+                                count,
+                                "Video Manager re-queued interrupted download job(s)"
+                            );
+                        }
                     }
-                    Err(error) => {
-                        tracing::error!(
-                            database = %name,
-                            error = %error,
-                            "Video Manager isolated database recovery failure; this adapter remains blocked until recovery succeeds"
-                        );
+                    Err(error) => tracing::error!(
+                        database = %name,
+                        error = %error,
+                        "Video Manager database recovery failed; this adapter remains blocked until recovery succeeds"
+                    ),
+                }
+            } else {
+                for name in &database_names {
+                    if recovered_databases.contains(name) {
+                        continue;
+                    }
+                    match manager.recover_worker_database(name) {
+                        Ok(0) => {
+                            recovered_databases.insert(name.clone());
+                        }
+                        Ok(count) => {
+                            recovered_databases.insert(name.clone());
+                            tracing::warn!(
+                                database = %name,
+                                count,
+                                "Video Manager re-queued interrupted download job(s)"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                database = %name,
+                                error = %error,
+                                "Video Manager isolated database recovery failure; this adapter remains blocked until recovery succeeds"
+                            );
+                        }
                     }
                 }
             }
@@ -319,7 +342,12 @@ async fn run_download_worker_loop(
             let _ = manager.set_worker_state(VideoWorkerState::Degraded);
         }
 
-        match manager.next_recovered_queued_download(&recovered_databases) {
+        let queued = if recovery_blocked {
+            manager.next_recovered_queued_download(&recovered_databases)
+        } else {
+            manager.next_queued_download(None)
+        };
+        match queued {
             Ok(Some(queued)) => {
                 if let Err(error) = manager.set_worker_state(VideoWorkerState::Processing) {
                     tracing::error!(error = %error, "Video Manager worker telemetry failed");
