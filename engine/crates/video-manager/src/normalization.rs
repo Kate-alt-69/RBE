@@ -20,6 +20,7 @@ impl VideoManager {
         if queued.asset.id != queued.job.asset_id || queued.job.job_type != "download" {
             anyhow::bail!("Video Manager normalization identity/type mismatch");
         }
+        let (width, height, fps) = normalization_video_metadata(probe)?;
         let (_, database) = self.resolve_database(Some(&queued.asset.database))?;
         let transitioned = database
             .transition_job(&queued.job.id, "probed", "normalizing")?
@@ -78,9 +79,6 @@ impl VideoManager {
             anyhow::bail!("{detail}");
         }
 
-        let stream = probe.video_streams.first().ok_or_else(|| {
-            anyhow::anyhow!("Video Manager normalization probe contains no video stream")
-        })?;
         let output_bitrate = probe.duration_secs.and_then(|duration| {
             if duration.is_finite() && duration > 0.0 {
                 let bits_per_second = (normalized.size_bytes as f64 * 8.0) / duration;
@@ -96,9 +94,9 @@ impl VideoManager {
             asset_id: transitioned.asset_id.clone(),
             profile: normalized.profile.to_string(),
             codec: Some(normalized.video_codec.to_string()),
-            width: Some(stream.width),
-            height: Some(stream.height),
-            fps: stream.frame_rate,
+            width: Some(width),
+            height: Some(height),
+            fps,
             bitrate: output_bitrate,
             size_bytes: normalized.size_bytes,
             path: stored_path,
@@ -169,5 +167,31 @@ impl VideoManager {
             anyhow::bail!("Video Manager normalized output path already exists");
         }
         Ok((staging, final_path, format!("{asset_id}/primary.mp4")))
+    }
+}
+
+fn normalization_video_metadata(probe: &MediaProbe) -> anyhow::Result<(u32, u32, Option<f64>)> {
+    let stream = probe.video_streams.first().ok_or_else(|| {
+        anyhow::anyhow!("Video Manager normalization probe contains no video stream")
+    })?;
+    Ok((stream.width, stream.height, stream.frame_rate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_probe_is_rejected_before_normalization_can_claim_a_job() {
+        let probe = MediaProbe {
+            format_names: vec!["mp4".into()],
+            duration_secs: Some(1.0),
+            bit_rate: None,
+            video_streams: Vec::new(),
+            audio_streams: 0,
+        };
+        let error = normalization_video_metadata(&probe)
+            .expect_err("empty probe must be rejected before state transition");
+        assert!(error.to_string().contains("no video stream"));
     }
 }
