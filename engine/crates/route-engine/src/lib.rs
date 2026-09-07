@@ -20,6 +20,7 @@ mod module_runtime;
 mod modules;
 mod parser;
 mod paths;
+mod route_collision;
 mod service_eval;
 mod terminal;
 
@@ -33,7 +34,7 @@ pub use ast::{
     BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram,
     Statement, Value,
 };
-pub use discovery::{build_routes, RouteCache};
+pub use discovery::RouteCache;
 pub use interpreter::{EvalError, Interpreter, RequestContext};
 pub use module_eval::{ModuleEvalError, ModuleExecutor};
 pub use module_runtime::{
@@ -43,6 +44,14 @@ pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleReg
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
 pub use service_eval::ServiceProgramExecutor;
+
+pub fn build_routes(
+    api_dir: &std::path::Path,
+    service_interfaces: &ServiceInterfaces,
+) -> anyhow::Result<axum::Router<core_lib::AppState>> {
+    route_collision::validate(api_dir)?;
+    discovery::build_routes(api_dir, service_interfaces)
+}
 
 pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
     let tokens = lexer::Lexer::new(source)
