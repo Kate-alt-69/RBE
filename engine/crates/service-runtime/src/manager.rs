@@ -27,6 +27,7 @@ const SERVICE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const SERVICE_SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(10);
 const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
 const SERVICE_READY_MAX_BYTES: usize = 4 * 1024;
+const SERVICE_STDOUT_LINE_MAX_BYTES: usize = 64 * 1024;
 
 struct ServiceProcess {
     child: Child,
@@ -868,6 +869,60 @@ where
     }
 }
 
+enum ServiceStdoutLine {
+    Line(String),
+    Oversized,
+    InvalidUtf8,
+}
+
+async fn read_service_stdout_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<ServiceStdoutLine>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_bytes.min(1024));
+    let mut oversized = false;
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            if bytes.is_empty() && !oversized {
+                return Ok(None);
+            }
+            if oversized {
+                return Ok(Some(ServiceStdoutLine::Oversized));
+            }
+            return Ok(Some(match String::from_utf8(bytes) {
+                Ok(line) => ServiceStdoutLine::Line(line),
+                Err(_) => ServiceStdoutLine::InvalidUtf8,
+            }));
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        if !oversized {
+            if bytes.len().saturating_add(consumed) > max_bytes {
+                oversized = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(&buffer[..consumed]);
+            }
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            if oversized {
+                return Ok(Some(ServiceStdoutLine::Oversized));
+            }
+            return Ok(Some(match String::from_utf8(bytes) {
+                Ok(line) => ServiceStdoutLine::Line(line),
+                Err(_) => ServiceStdoutLine::InvalidUtf8,
+            }));
+        }
+    }
+}
+
 async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
     let exe = std::env::current_exe().context("resolve backend executable")?;
     let parent = exe.parent().context("backend executable has no parent")?;
@@ -972,17 +1027,24 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
 
     let service_name = file.name.clone();
     tokio::spawn(async move {
-        let mut line = String::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => return,
-                Ok(_) => {
+            match read_service_stdout_line(&mut reader, SERVICE_STDOUT_LINE_MAX_BYTES).await {
+                Ok(None) => return,
+                Ok(Some(ServiceStdoutLine::Line(line))) => {
                     let output = line.trim_end();
                     if !output.is_empty() {
                         tracing::info!(service = %service_name, %output, ".service stdout");
                     }
                 }
+                Ok(Some(ServiceStdoutLine::Oversized)) => tracing::warn!(
+                    service = %service_name,
+                    max_bytes = SERVICE_STDOUT_LINE_MAX_BYTES,
+                    "discarded oversized .service stdout line"
+                ),
+                Ok(Some(ServiceStdoutLine::InvalidUtf8)) => tracing::warn!(
+                    service = %service_name,
+                    "discarded non-UTF-8 .service stdout line"
+                ),
                 Err(error) => {
                     tracing::warn!(service = %service_name, %error, "failed to drain .service stdout");
                     return;
@@ -1140,6 +1202,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeded 64 bytes"));
+    }
+
+    #[tokio::test]
+    async fn service_stdout_reader_discards_oversized_lines_and_keeps_draining() {
+        let payload = format!("{}\nnext-line\n", "x".repeat(65));
+        let mut reader = BufReader::new(payload.as_bytes());
+        assert!(matches!(
+            read_service_stdout_line(&mut reader, 64).await.unwrap(),
+            Some(ServiceStdoutLine::Oversized)
+        ));
+        match read_service_stdout_line(&mut reader, 64).await.unwrap() {
+            Some(ServiceStdoutLine::Line(line)) => assert_eq!(line, "next-line\n"),
+            _ => panic!("stdout reader should continue with the next bounded line"),
+        }
     }
 
     #[tokio::test]
