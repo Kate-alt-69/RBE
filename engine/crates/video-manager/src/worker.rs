@@ -250,10 +250,14 @@ async fn run_download_worker_loop(
     let mut known_databases = HashSet::new();
     let mut recovered_databases = HashSet::new();
     let mut recovery_required = true;
+    let mut next_recovery_at = Instant::now();
 
     loop {
         if *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err() {
             break;
+        }
+        if Instant::now() >= next_recovery_at {
+            recovery_required = true;
         }
 
         let database_names = match manager.database_names() {
@@ -264,16 +268,15 @@ async fn run_download_worker_loop(
                     error = %error,
                     "Video Manager could not inspect database registry during worker recovery"
                 );
+                recovery_required = true;
+                next_recovery_at = Instant::now() + policy.recovery_scan;
                 tokio::select! {
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
-                    _ = manager.work_notify.notified() => {}
-                    _ = tokio::time::sleep(policy.recovery_scan) => {
-                        recovery_required = true;
-                    }
+                    _ = tokio::time::sleep(policy.recovery_scan) => {}
                 }
                 continue;
             }
@@ -286,8 +289,9 @@ async fn run_download_worker_loop(
         known_databases = current_databases;
 
         if recovery_required || newly_registered {
+            let periodic_recovery = recovery_required;
             if database_names.len() == 1
-                && (recovery_required || recovered_databases.is_empty())
+                && (periodic_recovery || recovered_databases.is_empty())
             {
                 let name = &database_names[0];
                 match manager.recover_incomplete_downloads() {
@@ -312,7 +316,7 @@ async fn run_download_worker_loop(
                 }
             } else {
                 for name in &database_names {
-                    if !recovery_required && recovered_databases.contains(name) {
+                    if !periodic_recovery && recovered_databases.contains(name) {
                         continue;
                     }
                     match manager.recover_worker_database(name) {
@@ -337,6 +341,9 @@ async fn run_download_worker_loop(
                         }
                     }
                 }
+            }
+            if periodic_recovery {
+                next_recovery_at = Instant::now() + policy.recovery_scan;
             }
             recovery_required = false;
         }
@@ -414,6 +421,7 @@ async fn run_download_worker_loop(
             }
         }
 
+        let recovery_delay = next_recovery_at.saturating_duration_since(Instant::now());
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -421,7 +429,7 @@ async fn run_download_worker_loop(
                 }
             }
             _ = manager.work_notify.notified() => {}
-            _ = tokio::time::sleep(policy.recovery_scan) => {
+            _ = tokio::time::sleep(recovery_delay) => {
                 recovery_required = true;
             }
         }
@@ -445,8 +453,8 @@ fn worker_restart_delay(attempt: u32) -> Duration {
 mod tests {
     use super::*;
     use crate::{
-        CreateAssetRequest, DatabaseHealth, VideoAsset, VideoDatabase, VideoJob,
-        VideoLiveRuntimeState, VideoVariant, DEFAULT_DATABASE_NAME,
+        CreateAssetRequest, DatabaseHealth, VideoAsset, VideoAssetState, VideoDatabase, VideoJob,
+        VideoLiveRuntimeState, VideoSourceType, VideoVariant, DEFAULT_DATABASE_NAME,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -505,6 +513,7 @@ mod tests {
         panic_first: bool,
         fail_first: bool,
         fail_forever: bool,
+        busy_queue: bool,
     }
 
     impl FlakyRecoveryDatabase {
@@ -517,6 +526,7 @@ mod tests {
                 panic_first: false,
                 fail_first: true,
                 fail_forever: false,
+                busy_queue: false,
             }
         }
 
@@ -538,6 +548,14 @@ mod tests {
             Self {
                 fail_first: false,
                 fail_forever: true,
+                ..Self::new()
+            }
+        }
+
+        fn busy() -> Self {
+            Self {
+                fail_first: false,
+                busy_queue: true,
                 ..Self::new()
             }
         }
@@ -604,12 +622,42 @@ mod tests {
             Ok(0)
         }
 
-        fn next_queued_download(&self, _database: &str) -> anyhow::Result<Option<QueuedDownload>> {
+        fn next_queued_download(&self, database: &str) -> anyhow::Result<Option<QueuedDownload>> {
             if !self.recovery_succeeded.load(Ordering::SeqCst) {
                 self.discovery_before_recovery.store(true, Ordering::SeqCst);
             }
             self.discoveries.fetch_add(1, Ordering::SeqCst);
-            Ok(None)
+            if !self.busy_queue {
+                return Ok(None);
+            }
+            let asset_id = Uuid::new_v4().to_string();
+            Ok(Some(QueuedDownload {
+                asset: VideoAsset {
+                    id: asset_id.clone(),
+                    uri: format!("vm://test:test/busy/{asset_id}"),
+                    database: database.into(),
+                    namespace: "test:test".into(),
+                    group: "busy".into(),
+                    title: "busy".into(),
+                    state: VideoAssetState::Quarantined,
+                    source_type: VideoSourceType::Download,
+                    source_uri: Some("https://example.com/video.mp4".into()),
+                    metadata: serde_json::json!({}),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+                job: VideoJob {
+                    id: Uuid::new_v4().to_string(),
+                    asset_id,
+                    job_type: "download".into(),
+                    state: "queued".into(),
+                    progress: 0.0,
+                    attempts: 0,
+                    error: None,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            }))
         }
 
         fn recover_incomplete_downloads(
@@ -746,6 +794,54 @@ mod tests {
             VideoWorkerState::Degraded
         );
 
+        handle.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn busy_queue_cannot_starve_recovery_deadline() {
+        let root = temp_root("recovery-busy");
+        let quarantine_root = root.join("quarantine");
+        let media_root = root.join("media");
+        std::fs::create_dir_all(&quarantine_root).unwrap();
+        std::fs::create_dir_all(&media_root).unwrap();
+        let busy = Arc::new(FlakyRecoveryDatabase::busy());
+        let recovering = Arc::new(FlakyRecoveryDatabase::new());
+        let mut databases: HashMap<String, Arc<dyn VideoDatabase>> = HashMap::new();
+        databases.insert(DEFAULT_DATABASE_NAME.into(), busy.clone());
+        databases.insert("recovering".into(), recovering.clone());
+        let manager = Arc::new(VideoManager {
+            databases: RwLock::new(databases),
+            default_database: DEFAULT_DATABASE_NAME.into(),
+            quarantine_root: std::fs::canonicalize(&quarantine_root).unwrap(),
+            media_root: std::fs::canonicalize(&media_root).unwrap(),
+            work_notify: tokio::sync::Notify::new(),
+            worker_state: Mutex::new(VideoWorkerState::Disabled),
+            worker_encoder: Mutex::new(None),
+            worker_database_cursor: AtomicUsize::new(0),
+            live_notify: tokio::sync::Notify::new(),
+            live_runtime_state: Mutex::new(VideoLiveRuntimeState::Disabled),
+            live_runtime_claimed: AtomicBool::new(false),
+            live_idle_secs: 7200,
+        });
+        let mut worker_policy = policy(&root);
+        worker_policy.recovery_scan = Duration::from_millis(20);
+        let handle = manager
+            .clone()
+            .spawn_download_worker(worker_policy)
+            .unwrap();
+
+        for _ in 0..100 {
+            if recovering.recovery_attempts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(busy.discoveries.load(Ordering::SeqCst) > 0);
+        assert!(recovering.recovery_attempts.load(Ordering::SeqCst) >= 2);
+        assert!(recovering.recovery_succeeded.load(Ordering::SeqCst));
+        assert!(!recovering.discovery_before_recovery.load(Ordering::SeqCst));
         handle.shutdown(Duration::from_secs(1)).await;
         let _ = std::fs::remove_dir_all(root);
     }
