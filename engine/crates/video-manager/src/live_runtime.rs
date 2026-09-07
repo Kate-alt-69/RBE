@@ -187,14 +187,18 @@ async fn run_live_runtime_coordinator(
                     Ok(false) => {
                         if stop_live_runtime(manager.clone(), driver.clone(), true).await {
                             active = false;
-                        } else if wait_for_signal(
-                            &manager,
-                            &mut shutdown,
-                            LIVE_RUNTIME_RECOVERY_SCAN,
-                        )
-                        .await
-                        {
-                            return stop_live_runtime(manager.clone(), driver.clone(), false).await;
+                        } else {
+                            match recover_failed_live_stop(
+                                manager.clone(),
+                                driver.clone(),
+                                &mut shutdown,
+                                LIVE_RUNTIME_RECOVERY_SCAN,
+                            )
+                            .await
+                            {
+                                FailedStopRecovery::Stopped => active = false,
+                                FailedStopRecovery::Shutdown(clean_exit) => return clean_exit,
+                            }
                         }
                         continue;
                     }
@@ -231,6 +235,30 @@ impl LiveDriverPhase {
         match self {
             Self::Start => "start",
             Self::Stop => "stop",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedStopRecovery {
+    Stopped,
+    Shutdown(bool),
+}
+
+async fn recover_failed_live_stop(
+    manager: Arc<VideoManager>,
+    driver: Arc<dyn LiveRuntimeDriver>,
+    shutdown: &mut watch::Receiver<bool>,
+    recovery_scan: Duration,
+) -> FailedStopRecovery {
+    loop {
+        if wait_for_signal(&manager, shutdown, recovery_scan).await {
+            return FailedStopRecovery::Shutdown(
+                stop_live_runtime(manager.clone(), driver.clone(), false).await,
+            );
+        }
+        if stop_live_runtime(manager.clone(), driver.clone(), true).await {
+            return FailedStopRecovery::Stopped;
         }
     }
 }
@@ -402,6 +430,26 @@ mod tests {
             Box::pin(async move {
                 self.stops.fetch_add(1, Ordering::SeqCst);
                 anyhow::bail!("simulated live runtime stop failure")
+            })
+        }
+    }
+
+    struct FailOnceStopRuntime {
+        stops: AtomicUsize,
+    }
+
+    impl LiveRuntimeDriver for FailOnceStopRuntime {
+        fn start<'a>(&'a self, _manager: Arc<VideoManager>) -> LiveRuntimeFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop<'a>(&'a self, _manager: Arc<VideoManager>) -> LiveRuntimeFuture<'a> {
+            Box::pin(async move {
+                let attempt = self.stops.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("simulated first live runtime stop failure")
+                }
+                Ok(())
             })
         }
     }
@@ -643,9 +691,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    #[test]
-    fn failed_live_stop_recovery_is_faster_than_default_idle_window() {
-        assert!(LIVE_RUNTIME_RECOVERY_SCAN < Duration::from_secs(2 * 60 * 60));
+    #[tokio::test]
+    async fn failed_live_stop_retries_on_recovery_scan_without_idle_window() {
+        let path = temp_db("stop-retry");
+        let manager = Arc::new(VideoManager::open_default(&path, 7200).unwrap());
+        let driver = Arc::new(FailOnceStopRuntime {
+            stops: AtomicUsize::new(0),
+        });
+
+        assert!(!stop_live_runtime(manager.clone(), driver.clone(), true).await);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let recovery = tokio::time::timeout(
+            Duration::from_millis(200),
+            recover_failed_live_stop(
+                manager.clone(),
+                driver.clone(),
+                &mut shutdown_rx,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("failed live stop did not retry on the recovery scan");
+
+        assert_eq!(recovery, FailedStopRecovery::Stopped);
+        assert_eq!(driver.stops.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            manager.live_runtime_state().unwrap(),
+            VideoLiveRuntimeState::Sleeping
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]
