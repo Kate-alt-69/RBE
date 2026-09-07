@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::{DownloadPolicy, FfmpegPolicy, FfprobePolicy, VideoManager, VideoWorkerState};
+use crate::{DownloadPolicy, FfmpegPolicy, FfprobePolicy, QueuedDownload, VideoManager, VideoWorkerState};
 
 const MAX_RECOVERY_SCAN: Duration = Duration::from_secs(60 * 60);
 const WORKER_RESTART_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -72,21 +73,76 @@ impl VideoWorkerHandle {
 }
 
 impl VideoManager {
-    fn recover_worker_downloads(&self) -> bool {
-        match self.recover_incomplete_downloads() {
-            Ok(0) => true,
-            Ok(count) => {
-                tracing::warn!(count, "Video Manager re-queued interrupted download job(s)");
-                true
+    fn recover_worker_database(&self, name: &str) -> anyhow::Result<usize> {
+        let (_, database) = self.resolve_database(Some(name))?;
+        let mut count = 0usize;
+        for queued in database.recover_incomplete_downloads(name)? {
+            match self.cleanup_recovered_download_artifacts(&queued.asset.id, &queued.job.id) {
+                Ok(()) => count += 1,
+                Err(error) => {
+                    let detail = format!(
+                        "Video Manager could not safely recover interrupted download: {error}"
+                    );
+                    database.update_job(&queued.job.id, "failed", 0.0, Some(&detail))?;
+                    tracing::error!(
+                        database = %name,
+                        asset_id = %queued.asset.id,
+                        job_id = %queued.job.id,
+                        error = %error,
+                        "Video Manager failed closed while recovering interrupted download"
+                    );
+                }
             }
-            Err(error) => {
-                let _ = self.set_worker_state(VideoWorkerState::Degraded);
-                tracing::error!(
-                    error = %error,
-                    "Video Manager download recovery failed; worker will not process new jobs until recovery succeeds"
-                );
-                false
+        }
+        if count > 0 {
+            self.work_notify.notify_one();
+        }
+        Ok(count)
+    }
+
+    fn next_recovered_queued_download(
+        &self,
+        recovered_databases: &HashSet<String>,
+    ) -> anyhow::Result<Option<QueuedDownload>> {
+        let names = self
+            .database_names()?
+            .into_iter()
+            .filter(|name| recovered_databases.contains(name))
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(None);
+        }
+
+        let start = self
+            .worker_database_cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % names.len();
+        let mut failures = Vec::new();
+        for offset in 0..names.len() {
+            let name = &names[(start + offset) % names.len()];
+            let (_, database) = self.resolve_database(Some(name))?;
+            match database.next_queued_download(name) {
+                Ok(Some(queued)) => {
+                    if !failures.is_empty() {
+                        tracing::warn!(
+                            failed_databases = ?failures,
+                            database = %name,
+                            "Video Manager isolated queue discovery failure and continued with recovered database"
+                        );
+                    }
+                    return Ok(Some(queued));
+                }
+                Ok(None) => {}
+                Err(error) => failures.push(format!("{name}: {error}")),
             }
+        }
+        if failures.is_empty() {
+            Ok(None)
+        } else {
+            anyhow::bail!(
+                "Video Manager queue discovery failed for recovered database adapter(s): {}",
+                failures.join("; ")
+            )
         }
     }
 
@@ -189,16 +245,23 @@ async fn run_download_worker_loop(
     policy: VideoWorkerPolicy,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut known_databases = HashSet::new();
+    let mut recovered_databases = HashSet::new();
     let mut recovery_required = true;
+
     loop {
         if *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err() {
             break;
         }
 
-        if recovery_required {
-            if manager.recover_worker_downloads() {
-                recovery_required = false;
-            } else {
+        let database_names = match manager.database_names() {
+            Ok(names) => names,
+            Err(error) => {
+                let _ = manager.set_worker_state(VideoWorkerState::Degraded);
+                tracing::error!(
+                    error = %error,
+                    "Video Manager could not inspect database registry during worker recovery"
+                );
                 tokio::select! {
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() {
@@ -206,13 +269,57 @@ async fn run_download_worker_loop(
                         }
                     }
                     _ = manager.work_notify.notified() => {}
-                    _ = tokio::time::sleep(policy.recovery_scan) => {}
+                    _ = tokio::time::sleep(policy.recovery_scan) => {
+                        recovery_required = true;
+                    }
                 }
                 continue;
             }
+        };
+        let current_databases = database_names.iter().cloned().collect::<HashSet<_>>();
+        recovered_databases.retain(|name| current_databases.contains(name));
+        let newly_registered = database_names
+            .iter()
+            .any(|name| !known_databases.contains(name));
+        known_databases = current_databases;
+
+        if recovery_required || newly_registered {
+            for name in &database_names {
+                if recovered_databases.contains(name) {
+                    continue;
+                }
+                match manager.recover_worker_database(name) {
+                    Ok(0) => {
+                        recovered_databases.insert(name.clone());
+                    }
+                    Ok(count) => {
+                        recovered_databases.insert(name.clone());
+                        tracing::warn!(
+                            database = %name,
+                            count,
+                            "Video Manager re-queued interrupted download job(s)"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            database = %name,
+                            error = %error,
+                            "Video Manager isolated database recovery failure; this adapter remains blocked until recovery succeeds"
+                        );
+                    }
+                }
+            }
+            recovery_required = false;
         }
 
-        match manager.next_queued_download(None) {
+        let recovery_blocked = database_names
+            .iter()
+            .any(|name| !recovered_databases.contains(name));
+        if recovery_blocked {
+            let _ = manager.set_worker_state(VideoWorkerState::Degraded);
+        }
+
+        match manager.next_recovered_queued_download(&recovered_databases) {
             Ok(Some(queued)) => {
                 if let Err(error) = manager.set_worker_state(VideoWorkerState::Processing) {
                     tracing::error!(error = %error, "Video Manager worker telemetry failed");
@@ -244,13 +351,23 @@ async fn run_download_worker_loop(
                 if *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err() {
                     break;
                 }
-                if let Err(error) = manager.set_worker_state(VideoWorkerState::Sleeping) {
+                let idle_state = if recovery_blocked {
+                    VideoWorkerState::Degraded
+                } else {
+                    VideoWorkerState::Sleeping
+                };
+                if let Err(error) = manager.set_worker_state(idle_state) {
                     tracing::error!(error = %error, "Video Manager worker telemetry failed");
                 }
                 continue;
             }
             Ok(None) => {
-                if let Err(error) = manager.set_worker_state(VideoWorkerState::Sleeping) {
+                let idle_state = if recovery_blocked {
+                    VideoWorkerState::Degraded
+                } else {
+                    VideoWorkerState::Sleeping
+                };
+                if let Err(error) = manager.set_worker_state(idle_state) {
                     tracing::error!(error = %error, "Video Manager worker telemetry failed");
                 }
             }
@@ -294,7 +411,7 @@ fn worker_restart_delay(attempt: u32) -> Duration {
 mod tests {
     use super::*;
     use crate::{
-        CreateAssetRequest, DatabaseHealth, QueuedDownload, VideoAsset, VideoDatabase, VideoJob,
+        CreateAssetRequest, DatabaseHealth, VideoAsset, VideoDatabase, VideoJob,
         VideoLiveRuntimeState, VideoVariant, DEFAULT_DATABASE_NAME,
     };
     use std::collections::HashMap;
@@ -352,6 +469,8 @@ mod tests {
         discovery_before_recovery: AtomicBool,
         discoveries: AtomicUsize,
         panic_first: bool,
+        fail_first: bool,
+        fail_forever: bool,
     }
 
     impl FlakyRecoveryDatabase {
@@ -362,12 +481,29 @@ mod tests {
                 discovery_before_recovery: AtomicBool::new(false),
                 discoveries: AtomicUsize::new(0),
                 panic_first: false,
+                fail_first: true,
+                fail_forever: false,
             }
         }
 
         fn panicking() -> Self {
             Self {
                 panic_first: true,
+                ..Self::new()
+            }
+        }
+
+        fn healthy() -> Self {
+            Self {
+                fail_first: false,
+                ..Self::new()
+            }
+        }
+
+        fn broken() -> Self {
+            Self {
+                fail_first: false,
+                fail_forever: true,
                 ..Self::new()
             }
         }
@@ -450,7 +586,7 @@ mod tests {
             if attempt == 0 && self.panic_first {
                 panic!("intentional recovery panic");
             }
-            if attempt == 0 {
+            if self.fail_forever || (attempt == 0 && self.fail_first) {
                 anyhow::bail!("intentional recovery failure")
             }
             self.recovery_succeeded.store(true, Ordering::SeqCst);
@@ -475,7 +611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_failure_blocks_discovery_until_periodic_retry_succeeds() {
+    async fn recovery_failure_blocks_only_that_database_until_retry_succeeds() {
         let root = temp_root("recovery");
         let quarantine_root = root.join("quarantine");
         let media_root = root.join("media");
@@ -517,6 +653,63 @@ mod tests {
         assert!(database.recovery_attempts.load(Ordering::SeqCst) >= 2);
         assert!(database.discoveries.load(Ordering::SeqCst) > 0);
         assert!(!database.discovery_before_recovery.load(Ordering::SeqCst));
+        handle.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn broken_recovery_adapter_does_not_block_healthy_database_discovery() {
+        let root = temp_root("recovery-isolation");
+        let quarantine_root = root.join("quarantine");
+        let media_root = root.join("media");
+        std::fs::create_dir_all(&quarantine_root).unwrap();
+        std::fs::create_dir_all(&media_root).unwrap();
+        let healthy = Arc::new(FlakyRecoveryDatabase::healthy());
+        let broken = Arc::new(FlakyRecoveryDatabase::broken());
+        let mut databases: HashMap<String, Arc<dyn VideoDatabase>> = HashMap::new();
+        databases.insert(DEFAULT_DATABASE_NAME.into(), healthy.clone());
+        databases.insert("broken".into(), broken.clone());
+        let manager = Arc::new(VideoManager {
+            databases: RwLock::new(databases),
+            default_database: DEFAULT_DATABASE_NAME.into(),
+            quarantine_root: std::fs::canonicalize(&quarantine_root).unwrap(),
+            media_root: std::fs::canonicalize(&media_root).unwrap(),
+            work_notify: tokio::sync::Notify::new(),
+            worker_state: Mutex::new(VideoWorkerState::Disabled),
+            worker_encoder: Mutex::new(None),
+            worker_database_cursor: AtomicUsize::new(0),
+            live_notify: tokio::sync::Notify::new(),
+            live_runtime_state: Mutex::new(VideoLiveRuntimeState::Disabled),
+            live_runtime_claimed: AtomicBool::new(false),
+            live_idle_secs: 7200,
+        });
+        let mut worker_policy = policy(&root);
+        worker_policy.recovery_scan = Duration::from_millis(20);
+        let handle = manager
+            .clone()
+            .spawn_download_worker(worker_policy)
+            .unwrap();
+
+        for _ in 0..100 {
+            if healthy.discoveries.load(Ordering::SeqCst) > 0
+                && broken.recovery_attempts.load(Ordering::SeqCst) > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(healthy.recovery_succeeded.load(Ordering::SeqCst));
+        assert!(healthy.discoveries.load(Ordering::SeqCst) > 0);
+        assert!(!healthy.discovery_before_recovery.load(Ordering::SeqCst));
+        assert!(!broken.recovery_succeeded.load(Ordering::SeqCst));
+        assert!(broken.recovery_attempts.load(Ordering::SeqCst) > 0);
+        assert_eq!(broken.discoveries.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            manager.status().unwrap().download_worker.state,
+            VideoWorkerState::Degraded
+        );
+
         handle.shutdown(Duration::from_secs(1)).await;
         let _ = std::fs::remove_dir_all(root);
     }
