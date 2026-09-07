@@ -398,10 +398,7 @@ impl VideoManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        DatabaseHealth, QueuedDownload, VideoAsset, VideoDatabase, VideoJob, VideoVariant,
-    };
-    use std::path::PathBuf;
+    use crate::{DatabaseHealth, VideoAsset, VideoDatabase, VideoJob, VideoVariant};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
