@@ -229,24 +229,19 @@ impl ServiceHostCapabilities {
             }
             "load" => {
                 let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
-                if self.quick_db.is_ready(&name).map_err(quick_db_error)? {
-                    return Err(eval_error(
-                        "SVC4215",
-                        "quickDB.load() requires an unready filter; use rebuild() to replace a ready filter",
-                    ));
-                }
                 let strings = self.quick_db_string_values(function, args, value_index)?;
-                let added = self.quick_db.add_many(&name, strings).map_err(quick_db_error)?;
-                self.quick_db.seal(&name).map_err(quick_db_error)?;
-                Ok(Value::Number(added as f64))
+                self.quick_db
+                    .load_snapshot(&name, strings)
+                    .map(|added| Value::Number(added as f64))
+                    .map_err(quick_db_error)
             }
             "rebuild" => {
                 let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
                 let strings = self.quick_db_string_values(function, args, value_index)?;
-                self.quick_db.clear(&name).map_err(quick_db_error)?;
-                let added = self.quick_db.add_many(&name, strings).map_err(quick_db_error)?;
-                self.quick_db.seal(&name).map_err(quick_db_error)?;
-                Ok(Value::Number(added as f64))
+                self.quick_db
+                    .rebuild_snapshot(&name, strings)
+                    .map(|added| Value::Number(added as f64))
+                    .map_err(quick_db_error)
             }
             "seal" => {
                 let (name, _) = self.quick_db_target(scope, function, args, 1, 0)?;
@@ -829,6 +824,10 @@ mod tests {
                 return Usernames.load(values);
             }
 
+            export function refresh(values) {
+                return Usernames.rebuild(values);
+            }
+
             export function known(name) {
                 return Usernames.known(name);
             }
@@ -856,6 +855,22 @@ mod tests {
             vec![serde_json::json!("kate")],
         ))
         .expect("bound quickDB custom method failed");
+        assert_eq!(known, serde_json::json!(true));
+
+        let refreshed = block_on_ready(ServiceExecutor::call(
+            &executor,
+            "refresh",
+            vec![serde_json::json!(["new-kate"])],
+        ))
+        .expect("bound quickDB rebuild failed");
+        assert_eq!(refreshed, serde_json::json!(1.0));
+
+        let known = block_on_ready(ServiceExecutor::call(
+            &executor,
+            "known",
+            vec![serde_json::json!("new-kate")],
+        ))
+        .expect("rebuilt bound quickDB lookup failed");
         assert_eq!(known, serde_json::json!(true));
 
         let tag = block_on_ready(ServiceExecutor::call(&executor, "tag", vec![]))
