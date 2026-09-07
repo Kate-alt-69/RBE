@@ -342,10 +342,8 @@ impl ServiceManager {
                 .as_ref()
                 .map(|process| process.started_at.elapsed() >= SERVICE_STABLE_WINDOW)
                 .unwrap_or(false);
-            if stable {
-                service.restart_attempts = 0;
-            }
-            service.restart_attempts = service.restart_attempts.saturating_add(1);
+            service.restart_attempts =
+                next_restart_attempt(service.restart_attempts, stable, service.restarting);
             let attempt = service.restart_attempts;
             let delay = restart_delay(attempt, max_restart_backoff);
             let file = service.file.clone();
@@ -799,6 +797,11 @@ fn should_restart(policy: RestartPolicy, success: bool) -> bool {
     }
 }
 
+fn next_restart_attempt(current: u32, stable: bool, retry_in_progress: bool) -> u32 {
+    let base = if stable && !retry_in_progress { 0 } else { current };
+    base.saturating_add(1)
+}
+
 fn restart_delay(attempt: u32, maximum: Duration) -> Duration {
     let exponent = attempt.saturating_sub(1).min(16);
     let factor = 1u32 << exponent;
@@ -1065,6 +1068,13 @@ mod tests {
         assert!(!should_restart(RestartPolicy::OnFailure, true));
         assert!(should_restart(RestartPolicy::OnFailure, false));
         assert!(!should_restart(RestartPolicy::Never, false));
+    }
+
+    #[test]
+    fn restart_attempt_only_resets_on_new_stable_exit() {
+        assert_eq!(next_restart_attempt(4, true, false), 1);
+        assert_eq!(next_restart_attempt(1, true, true), 2);
+        assert_eq!(next_restart_attempt(2, false, true), 3);
     }
 
     #[test]
