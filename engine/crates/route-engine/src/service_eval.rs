@@ -233,7 +233,7 @@ impl ServiceHostCapabilities {
                 self.quick_db
                     .load_snapshot(&name, strings)
                     .map(|added| Value::Number(added as f64))
-                    .map_err(quick_db_error)
+                    .map_err(quick_db_load_error)
             }
             "rebuild" => {
                 let (name, value_index) = self.quick_db_target(scope, function, args, 2, 1)?;
@@ -643,6 +643,15 @@ fn quick_db_stats_value(stats: FilterStats, ready: bool) -> Value {
     );
     fields.insert("ready".to_string(), Value::Bool(ready));
     Value::Object(fields)
+}
+
+fn quick_db_load_error(error: QuickDbError) -> ModuleEvalError {
+    let message = error.to_string();
+    if message.starts_with("quickDB.load() requires an unready filter") {
+        eval_error("SVC4215", message)
+    } else {
+        eval_error("SVC4213", message)
+    }
 }
 
 fn quick_db_error(error: QuickDbError) -> ModuleEvalError {
