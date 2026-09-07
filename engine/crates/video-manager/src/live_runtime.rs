@@ -145,10 +145,18 @@ async fn run_live_runtime_coordinator(
             // A failed or timed-out start can still have created listeners,
             // subprocesses, sockets, or protocol state before it failed. Never
             // retry start until the trusted driver has proved those resources
-            // are gone. If cleanup itself is uncertain, retain coordinator
-            // ownership and fail closed instead of risking a duplicate runtime.
-            if !stop_live_runtime(manager.clone(), driver.clone(), false).await {
-                return false;
+            // are gone. Transient cleanup failures are retried while ownership
+            // remains claimed; persistent failures still fail closed.
+            match cleanup_failed_live_start(
+                manager.clone(),
+                driver.clone(),
+                &mut shutdown,
+                LIVE_RUNTIME_RECOVERY_SCAN,
+            )
+            .await
+            {
+                FailedStopRecovery::Stopped => {}
+                FailedStopRecovery::Shutdown(clean_exit) => return clean_exit,
             }
             let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Degraded);
             if wait_for_signal(&manager, &mut shutdown, LIVE_RUNTIME_RECOVERY_SCAN).await {
@@ -243,6 +251,19 @@ impl LiveDriverPhase {
 enum FailedStopRecovery {
     Stopped,
     Shutdown(bool),
+}
+
+async fn cleanup_failed_live_start(
+    manager: Arc<VideoManager>,
+    driver: Arc<dyn LiveRuntimeDriver>,
+    shutdown: &mut watch::Receiver<bool>,
+    recovery_scan: Duration,
+) -> FailedStopRecovery {
+    if stop_live_runtime(manager.clone(), driver.clone(), false).await {
+        FailedStopRecovery::Stopped
+    } else {
+        recover_failed_live_stop(manager, driver, shutdown, recovery_scan).await
+    }
 }
 
 async fn recover_failed_live_stop(
@@ -658,6 +679,36 @@ mod tests {
         assert_eq!(
             manager.live_runtime_state().unwrap(),
             VideoLiveRuntimeState::Disabled
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_start_cleanup_retries_transient_stop_failure() {
+        let path = temp_db("start-cleanup-retry");
+        let manager = Arc::new(VideoManager::open_default(&path, 7200).unwrap());
+        let driver = Arc::new(FailOnceStopRuntime {
+            stops: AtomicUsize::new(0),
+        });
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let recovery = tokio::time::timeout(
+            Duration::from_millis(200),
+            cleanup_failed_live_start(
+                manager.clone(),
+                driver.clone(),
+                &mut shutdown_rx,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("transient failed-start cleanup did not retry");
+
+        assert_eq!(recovery, FailedStopRecovery::Stopped);
+        assert_eq!(driver.stops.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            manager.live_runtime_state().unwrap(),
+            VideoLiveRuntimeState::Sleeping
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
