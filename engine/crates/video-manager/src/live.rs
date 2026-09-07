@@ -3,6 +3,8 @@ use uuid::Uuid;
 
 use crate::{VideoAssetState, VideoManager, VideoSourceType};
 
+const LIVE_END_TRANSITION_RETRIES: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoLiveSessionState {
@@ -272,33 +274,49 @@ impl VideoManager {
         database: Option<&str>,
         session_id: &str,
     ) -> anyhow::Result<Option<VideoLiveSession>> {
-        let current = match self.get_live_session(database, session_id)? {
-            Some(session) => session,
-            None => return Ok(None),
-        };
-        match current.state {
-            VideoLiveSessionState::Reserved => self.transition_live_session_trusted(
+        for attempt in 0..LIVE_END_TRANSITION_RETRIES {
+            let current = match self.get_live_session(database, session_id)? {
+                Some(session) => session,
+                None => return Ok(None),
+            };
+            let transition = match current.state {
+                VideoLiveSessionState::Reserved => Some((
+                    VideoLiveSessionState::Reserved,
+                    VideoLiveSessionState::Ended,
+                )),
+                VideoLiveSessionState::Starting => Some((
+                    VideoLiveSessionState::Starting,
+                    VideoLiveSessionState::Stopping,
+                )),
+                VideoLiveSessionState::Live => Some((
+                    VideoLiveSessionState::Live,
+                    VideoLiveSessionState::Stopping,
+                )),
+                VideoLiveSessionState::Stopping
+                | VideoLiveSessionState::Ended
+                | VideoLiveSessionState::Failed => return Ok(Some(current)),
+            };
+            let (expected, next) = transition.expect("nonterminal live state has end transition");
+            if let Some(updated) = self.transition_live_session_trusted(
                 Some(&current.database),
                 session_id,
-                VideoLiveSessionState::Reserved,
-                VideoLiveSessionState::Ended,
-            ),
-            VideoLiveSessionState::Starting => self.transition_live_session_trusted(
-                Some(&current.database),
-                session_id,
-                VideoLiveSessionState::Starting,
-                VideoLiveSessionState::Stopping,
-            ),
-            VideoLiveSessionState::Live => self.transition_live_session_trusted(
-                Some(&current.database),
-                session_id,
-                VideoLiveSessionState::Live,
-                VideoLiveSessionState::Stopping,
-            ),
-            VideoLiveSessionState::Stopping
-            | VideoLiveSessionState::Ended
-            | VideoLiveSessionState::Failed => Ok(Some(current)),
+                expected,
+                next,
+            )? {
+                return Ok(Some(updated));
+            }
+
+            // The trusted runtime can advance reserved -> starting -> live
+            // concurrently with an end request. A lost compare-and-swap is not
+            // a successful stop: re-read the monotonic state and request the
+            // appropriate end transition again instead of silently dropping it.
+            if attempt + 1 == LIVE_END_TRANSITION_RETRIES {
+                anyhow::bail!(
+                    "Video Manager live session changed state repeatedly while end was requested"
+                );
+            }
         }
+        unreachable!("live end transition retry loop always returns or errors")
     }
 
     /// Trusted media-runtime binding. Language code never receives this API and
@@ -380,6 +398,12 @@ impl VideoManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        DatabaseHealth, QueuedDownload, VideoAsset, VideoDatabase, VideoJob, VideoVariant,
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn live_state_machine_is_fail_closed() {
@@ -435,5 +459,176 @@ mod tests {
             playback_endpoint: Some("https://cdn.example.com/live/index.m3u8".into()),
         })
         .is_ok());
+    }
+
+    struct RacingEndDatabase {
+        session_id: String,
+        asset_id: String,
+        state: Mutex<VideoLiveSessionState>,
+        transition_attempts: AtomicUsize,
+    }
+
+    impl RacingEndDatabase {
+        fn session(&self, database: &str) -> VideoLiveSession {
+            VideoLiveSession {
+                id: self.session_id.clone(),
+                asset_id: self.asset_id.clone(),
+                database: database.into(),
+                state: *self.state.lock().unwrap(),
+                ingest_protocol: None,
+                ingest_endpoint: None,
+                playback_endpoint: None,
+                started_at_ms: None,
+                ended_at_ms: None,
+            }
+        }
+    }
+
+    impl VideoDatabase for RacingEndDatabase {
+        fn kind(&self) -> &'static str {
+            "racing-end-test"
+        }
+
+        fn health(&self) -> DatabaseHealth {
+            DatabaseHealth {
+                ok: true,
+                kind: self.kind().into(),
+                detail: None,
+            }
+        }
+
+        fn create_asset(
+            &self,
+            _database: &str,
+            _request: &crate::CreateAssetRequest,
+        ) -> anyhow::Result<VideoAsset> {
+            anyhow::bail!("unused test operation")
+        }
+
+        fn insert_job(&self, _job: &VideoJob) -> anyhow::Result<()> {
+            anyhow::bail!("unused test operation")
+        }
+
+        fn claim_job(
+            &self,
+            _job_id: &str,
+            _expected_state: &str,
+            _claimed_state: &str,
+        ) -> anyhow::Result<Option<VideoJob>> {
+            anyhow::bail!("unused test operation")
+        }
+
+        fn update_job(
+            &self,
+            _job_id: &str,
+            _state: &str,
+            _progress: f64,
+            _error: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused test operation")
+        }
+
+        fn transition_job(
+            &self,
+            _job_id: &str,
+            _expected_state: &str,
+            _next_state: &str,
+        ) -> anyhow::Result<Option<VideoJob>> {
+            anyhow::bail!("unused test operation")
+        }
+
+        fn get_job(&self, _job_id: &str) -> anyhow::Result<Option<VideoJob>> {
+            Ok(None)
+        }
+
+        fn commit_ready_variant(
+            &self,
+            _job_id: &str,
+            _variant: &VideoVariant,
+        ) -> anyhow::Result<Option<VideoJob>> {
+            Ok(None)
+        }
+
+        fn get_asset(
+            &self,
+            _database: &str,
+            _asset_id: &str,
+        ) -> anyhow::Result<Option<VideoAsset>> {
+            Ok(None)
+        }
+
+        fn get_live_session(
+            &self,
+            database: &str,
+            session_id: &str,
+        ) -> anyhow::Result<Option<VideoLiveSession>> {
+            if session_id != self.session_id {
+                return Ok(None);
+            }
+            Ok(Some(self.session(database)))
+        }
+
+        fn transition_live_session(
+            &self,
+            database: &str,
+            session_id: &str,
+            expected: VideoLiveSessionState,
+            next: VideoLiveSessionState,
+        ) -> anyhow::Result<Option<VideoLiveSession>> {
+            if session_id != self.session_id {
+                return Ok(None);
+            }
+            let attempt = self.transition_attempts.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            if attempt == 0
+                && expected == VideoLiveSessionState::Starting
+                && next == VideoLiveSessionState::Stopping
+                && *state == VideoLiveSessionState::Starting
+            {
+                *state = VideoLiveSessionState::Live;
+                return Ok(None);
+            }
+            if *state != expected {
+                return Ok(None);
+            }
+            *state = next;
+            drop(state);
+            Ok(Some(self.session(database)))
+        }
+    }
+
+    #[test]
+    fn end_request_retries_when_runtime_advances_session_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbe-video-live-end-race-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = VideoManager::open_default(dir.join("video.db"), 7200).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        let database = Arc::new(RacingEndDatabase {
+            session_id: session_id.clone(),
+            asset_id: Uuid::new_v4().to_string(),
+            state: Mutex::new(VideoLiveSessionState::Starting),
+            transition_attempts: AtomicUsize::new(0),
+        });
+        manager
+            .register_database("race", database.clone())
+            .unwrap();
+
+        let stopped = manager
+            .request_end_live_session(Some("race"), &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.state, VideoLiveSessionState::Stopping);
+        assert_eq!(
+            database.transition_attempts.load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            *database.state.lock().unwrap(),
+            VideoLiveSessionState::Stopping
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
