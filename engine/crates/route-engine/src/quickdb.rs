@@ -18,8 +18,8 @@ impl FilterKind {
     pub fn parse(value: &str) -> Result<Self, QuickDbError> {
         match value {
             "bloom" => Ok(Self::Bloom),
-            "counting-bloom" | "countingBloom" => Ok(Self::CountingBloom),
-            "scalable-bloom" | "scalableBloom" => Ok(Self::ScalableBloom),
+            "counting" | "counting-bloom" | "countingBloom" => Ok(Self::CountingBloom),
+            "scalable" | "scalable-bloom" | "scalableBloom" => Ok(Self::ScalableBloom),
             other => Err(QuickDbError::new(format!(
                 "unsupported quickDB filter kind {other:?}; expected bloom, counting-bloom, or scalable-bloom"
             ))),
@@ -707,6 +707,14 @@ mod tests {
             capacity,
             false_positive_rate: 0.01,
         }
+    }
+
+    #[test]
+    fn filter_kind_parser_accepts_public_aliases() {
+        assert_eq!(FilterKind::parse("counting").unwrap(), FilterKind::CountingBloom);
+        assert_eq!(FilterKind::parse("countingBloom").unwrap(), FilterKind::CountingBloom);
+        assert_eq!(FilterKind::parse("scalable").unwrap(), FilterKind::ScalableBloom);
+        assert_eq!(FilterKind::parse("scalableBloom").unwrap(), FilterKind::ScalableBloom);
     }
 
     #[test]
