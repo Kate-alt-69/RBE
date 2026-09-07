@@ -10,29 +10,22 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use axum::extract::State;
 use axum::response::{IntoResponse, Json};
 use axum::routing::MethodRouter;
 use axum::Router;
 use core_lib::AppState;
 
 use crate::analyzer::{analyze, Severity};
-use crate::ast::{FunctionDef, MethodDef, RouteFile, Value};
-use crate::interpreter::{Interpreter, RequestContext};
+use crate::ast::{FunctionDef, ModuleFile, RouteFile, Value};
 use crate::lexer::Lexer;
-use crate::modules::{binding_name, ModuleRegistry};
+use crate::module_eval::ModuleExecutor;
+use crate::module_runtime::{ModuleProgram, ServiceInterfaces};
+use crate::modules::binding_name;
 use crate::parser::Parser;
 use crate::terminal::Terminal;
 use crate::transpiler::transpile_file;
-
-const RESERVED_NATIVE_API_PREFIXES: &[&str] = &[
-    "/api/account",
-    "/api/admin",
-    "/api/auth",
-    "/api/broadcast",
-    "/api/contact",
-    "/api/maintenance",
-    "/api/streaming",
-];
+use crate::video_host::VideoHostCapabilities;
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -121,93 +114,6 @@ pub(crate) fn url_path_for(api_dir: &Path, file_path: &Path) -> String {
     format!("/api/{}", segments.join("/"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RouteCollision {
-    path: PathBuf,
-    message: String,
-}
-
-fn is_in_native_namespace(url_path: &str, prefix: &str) -> bool {
-    url_path == prefix
-        || url_path
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-fn find_route_collisions(
-    api_dir: &Path,
-    compiled: &[(PathBuf, Arc<RouteFile>)],
-) -> Vec<RouteCollision> {
-    let mut owners: HashMap<(String, String), PathBuf> = HashMap::new();
-    let mut collisions = Vec::new();
-
-    for (path, file) in compiled {
-        let url_path = url_path_for(api_dir, path);
-
-        if let Some(prefix) = RESERVED_NATIVE_API_PREFIXES
-            .iter()
-            .find(|prefix| is_in_native_namespace(&url_path, prefix))
-        {
-            collisions.push(RouteCollision {
-                path: path.clone(),
-                message: format!(
-                    "route URL `{url_path}` conflicts with native API namespace `{prefix}`"
-                ),
-            });
-            continue;
-        }
-
-        for method in &file.methods {
-            let key = (url_path.clone(), method.verb.clone());
-            if let Some(existing) = owners.get(&key) {
-                collisions.push(RouteCollision {
-                    path: path.clone(),
-                    message: format!(
-                        "route {} `{}` conflicts with {}",
-                        method.verb.to_uppercase(),
-                        url_path,
-                        existing.display()
-                    ),
-                });
-            } else {
-                owners.insert(key, path.clone());
-            }
-        }
-    }
-
-    collisions
-}
-
-fn reject_route_collisions(
-    api_dir: &Path,
-    compiled: &[(PathBuf, Arc<RouteFile>)],
-) -> anyhow::Result<()> {
-    let collisions = find_route_collisions(api_dir, compiled);
-    if collisions.is_empty() {
-        return Ok(());
-    }
-
-    let error_path = compiler_error_path();
-    if let Some(parent) = error_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut error_file = fs::File::create(&error_path)?;
-    for collision in &collisions {
-        writeln!(
-            error_file,
-            "E3013: {}: {}",
-            collision.path.display(),
-            collision.message
-        )?;
-    }
-
-    Err(anyhow::anyhow!(
-        "route compiler found {} route collision(s); see {}",
-        collisions.len(),
-        error_path.display()
-    ))
-}
-
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::String(s) => serde_json::Value::String(s.clone()),
@@ -223,9 +129,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             }
             serde_json::Value::Object(obj)
         }
-        Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
-        }
+        Value::Array(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
     }
 }
 
@@ -234,32 +138,52 @@ fn append_runtime_error(path: &str, error: &str) {
     if let Some(parent) = error_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&error_path) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&error_path)
+    {
         let _ = writeln!(file, "E4000: route evaluation failed at {path}: {error}");
     }
 }
 
+const INLINE_ROUTE_HANDLER: &str = "\0rbe-route-handler";
+
+fn request_value(method: &str, path: &str) -> Value {
+    let mut fields = HashMap::new();
+    fields.insert("method".into(), Value::String(method.to_string()));
+    fields.insert("path".into(), Value::String(path.to_string()));
+    fields.insert("params".into(), Value::Object(HashMap::new()));
+    fields.insert("query".into(), Value::Object(HashMap::new()));
+    Value::Object(fields)
+}
+
 async fn execute(
-    method_def: Arc<MethodDef>,
-    functions: Arc<Vec<FunctionDef>>,
-    modules: Arc<ModuleRegistry>,
-    module_names: Arc<Vec<String>>,
+    inline_file: Arc<ModuleFile>,
+    module_program: Arc<ModuleProgram>,
+    takes_request: bool,
+    state: AppState,
     http_method: String,
     path: String,
 ) -> axum::response::Response {
-    let req_ctx = RequestContext {
-        method: http_method,
-        path,
-        params: HashMap::new(),
-        query: HashMap::new(),
+    let args = if takes_request {
+        vec![request_value(&http_method, &path)]
+    } else {
+        Vec::new()
     };
-    let mut interpreter = Interpreter::new(&modules).with_functions(functions.as_ref());
-
-    match interpreter.run(&method_def, &req_ctx, &module_names) {
+    let executor = ModuleExecutor::with_services_and_host_capabilities(
+        module_program.as_ref(),
+        state.services.clone(),
+        Arc::new(VideoHostCapabilities::from_state(&state)),
+    );
+    match executor
+        .call_inline(inline_file, INLINE_ROUTE_HANDLER, args)
+        .await
+    {
         Ok(value) => Json(value_to_json(&value)).into_response(),
         Err(err) => {
-            tracing::error!(error = %err, path = %req_ctx.path, "route evaluation failed");
-            append_runtime_error(&req_ctx.path, &err.to_string());
+            tracing::error!(error = %err, path = %path, "route evaluation failed");
+            append_runtime_error(&path, &err.to_string());
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": err.to_string() })),
@@ -271,41 +195,44 @@ async fn execute(
 
 fn build_method_router(
     file: &RouteFile,
-    modules: Arc<ModuleRegistry>,
-    module_names: Arc<Vec<String>>,
+    module_program: Arc<ModuleProgram>,
     url_path: String,
 ) -> MethodRouter<AppState> {
     let mut router = MethodRouter::<AppState>::new();
-    let functions = Arc::new(file.functions.clone());
-
     for method_def in &file.methods {
-        let method_def = Arc::new(method_def.clone());
-        let modules = modules.clone();
-        let module_names = module_names.clone();
-        let functions = functions.clone();
+        let mut functions = file.functions.clone();
+        functions.push(FunctionDef {
+            name: INLINE_ROUTE_HANDLER.to_string(),
+            params: method_def.param_name.clone().into_iter().collect(),
+            body: method_def.body.clone(),
+        });
+        let inline_file = Arc::new(ModuleFile {
+            imports: file.imports.clone(),
+            functions,
+            exports: Vec::new(),
+        });
+        let takes_request = method_def.param_name.is_some();
+        let module_program = module_program.clone();
         let url_path = url_path.clone();
         let verb = method_def.verb.clone();
         let handler_verb = verb.clone();
-
-        let handler = move || {
-            let method_def = method_def.clone();
-            let modules = modules.clone();
-            let module_names = module_names.clone();
-            let functions = functions.clone();
+        let handler = move |State(state): State<AppState>| {
+            let inline_file = inline_file.clone();
+            let module_program = module_program.clone();
             let path = url_path.clone();
+            let method = handler_verb.to_uppercase();
             async move {
                 execute(
-                    method_def,
-                    functions,
-                    modules,
-                    module_names,
-                    handler_verb.to_uppercase(),
+                    inline_file,
+                    module_program,
+                    takes_request,
+                    state,
+                    method,
                     path,
                 )
                 .await
             }
         };
-
         router = match verb.as_str() {
             "get" => router.get(handler),
             "post" => router.post(handler),
@@ -317,12 +244,13 @@ fn build_method_router(
             _ => router,
         };
     }
-
     router
 }
 
 fn compiler_error_path() -> PathBuf {
-    PathBuf::from("data").join("admin").join("compiler-error.txt")
+    PathBuf::from("data")
+        .join("admin")
+        .join("compiler-error.txt")
 }
 
 fn find_symbol_location(source: &str, symbol: Option<&str>) -> (usize, usize) {
@@ -355,7 +283,11 @@ fn frame_diagnostic_with_symbol(
     let lines: Vec<&str> = source.lines().collect();
     let start = line.saturating_sub(1);
     let end = (start + 4).min(lines.len());
-    let line_numbers = if end > start { end.to_string().len() } else { 1 };
+    let line_numbers = if end > start {
+        end.to_string().len()
+    } else {
+        1
+    };
     let content_width = terminal_width.saturating_sub(line_numbers + 8).max(24);
     let border = "#".repeat(content_width + line_numbers + 7);
     let mut out = String::new();
@@ -423,7 +355,10 @@ fn render_diagnostic_reports(reports: &[FileDiagnosticReport]) {
 /// three work units: parse, semantic analysis, and Rust artifact generation.
 /// Syntax/semantic errors are accumulated across the entire tree and written
 /// to `data/admin/compiler-error.txt` before boot is allowed to continue.
-fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Arc<RouteFile>)>> {
+fn boot_compile(
+    _api_dir: &Path,
+    files: &[PathBuf],
+) -> anyhow::Result<Vec<(PathBuf, Arc<RouteFile>)>> {
     let error_path = compiler_error_path();
     if let Some(parent) = error_path.parent() {
         fs::create_dir_all(parent)?;
@@ -458,7 +393,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 report.details.push(detail.clone());
                 report.error_details.push(detail);
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
                 reports.push(report);
                 continue;
             }
@@ -472,7 +413,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 report.details.push(detail.clone());
                 report.error_details.push(detail);
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
                 reports.push(report);
                 continue;
             }
@@ -494,7 +441,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 report.details.push(detail.clone());
                 report.error_details.push(detail);
                 done += 3;
-                terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+                terminal.render(
+                    files.len(),
+                    Some(&display_path),
+                    "Parsing",
+                    done,
+                    total_units,
+                );
                 reports.push(report);
                 continue;
             }
@@ -502,7 +455,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
 
         let (file_opt, parse_errors) = Parser::new(tokens).parse_file_collecting();
         done += 1;
-        terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Parsing",
+            done,
+            total_units,
+        );
 
         for error in &parse_errors {
             let detail = frame_diagnostic_with_symbol(
@@ -521,28 +480,54 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
 
         let Some(file) = file_opt else {
             done += 2;
-            terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+            terminal.render(
+                files.len(),
+                Some(&display_path),
+                "Parsing",
+                done,
+                total_units,
+            );
             reports.push(report);
             continue;
         };
 
         if report.errors > 0 {
             done += 2;
-            terminal.render(files.len(), Some(&display_path), "Parsing", done, total_units);
+            terminal.render(
+                files.len(),
+                Some(&display_path),
+                "Parsing",
+                done,
+                total_units,
+            );
             reports.push(report);
             continue;
         }
 
         let file = Arc::new(file);
-        terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Semantic",
+            done,
+            total_units,
+        );
 
         let diagnostics = analyze(&file);
-        report.errors += diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-        report.warnings = diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+        report.errors += diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        report.warnings = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
 
         for diagnostic in &diagnostics {
             let message = if matches!(diagnostic.code, "E3010" | "E3011") {
-                diagnostic.message.replace("from the route file", &format!("from {}", path.display()))
+                diagnostic
+                    .message
+                    .replace("from the route file", &format!("from {}", path.display()))
             } else {
                 diagnostic.message.clone()
             };
@@ -562,16 +547,34 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
         }
 
         done += 1;
-        terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Semantic",
+            done,
+            total_units,
+        );
 
         if report.errors > 0 {
             done += 1;
-            terminal.render(files.len(), Some(&display_path), "Semantic", done, total_units);
+            terminal.render(
+                files.len(),
+                Some(&display_path),
+                "Semantic",
+                done,
+                total_units,
+            );
             reports.push(report);
             continue;
         }
 
-        terminal.render(files.len(), Some(&display_path), "Generating", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Generating",
+            done,
+            total_units,
+        );
         let module_names: Vec<String> = file.imports.iter().map(binding_name).collect();
         match transpile_file(&file, &path.to_string_lossy(), &module_names) {
             Ok(_) => {
@@ -594,7 +597,13 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
                 done += 1;
             }
         }
-        terminal.render(files.len(), Some(&display_path), "Generating", done, total_units);
+        terminal.render(
+            files.len(),
+            Some(&display_path),
+            "Generating",
+            done,
+            total_units,
+        );
 
         if report.errors > 0 || report.warnings > 0 {
             reports.push(report);
@@ -629,25 +638,28 @@ fn boot_compile(_api_dir: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<(PathB
 /// Scans `api_dir`, validates every `.route` file before routing starts,
 /// and only then constructs the Axum router. A broken route fails the boot,
 /// but errors from every file are collected into compiler-error.txt first.
-pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
+pub fn build_routes(
+    api_dir: &Path,
+    service_interfaces: &ServiceInterfaces,
+) -> anyhow::Result<Router<AppState>> {
+    let module_program = Arc::new(ModuleProgram::load_default_with_services(
+        service_interfaces,
+    )?);
+    tracing::info!(
+        modules = module_program.len(),
+        module_dir = %module_program.module_dir().display(),
+        "validated .module files"
+    );
+
     let mut files = Vec::new();
     collect_route_files(api_dir, &mut files)?;
     files.sort();
 
     let compiled = boot_compile(api_dir, &files)?;
-    reject_route_collisions(api_dir, &compiled)?;
     let mut router: Router<AppState> = Router::new();
 
     for (path, route_file) in compiled {
         let url_path = url_path_for(api_dir, &path);
-        let module_names: Arc<Vec<String>> = Arc::new(
-            route_file
-                .imports
-                .iter()
-                .map(binding_name)
-                .collect(),
-        );
-        let modules = Arc::new(ModuleRegistry::from_imports(&route_file.imports));
 
         tracing::info!(
             path = %path.display(),
@@ -658,76 +670,9 @@ pub fn build_routes(api_dir: &Path) -> anyhow::Result<Router<AppState>> {
 
         router = router.route(
             &url_path,
-            build_method_router(&route_file, modules, module_names, url_path.clone()),
+            build_method_router(&route_file, module_program.clone(), url_path.clone()),
         );
     }
 
     Ok(router)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn route_file(methods: &[&str]) -> Arc<RouteFile> {
-        Arc::new(RouteFile {
-            imports: Vec::new(),
-            functions: Vec::new(),
-            class_name: "Route".into(),
-            methods: methods
-                .iter()
-                .map(|verb| MethodDef {
-                    verb: (*verb).into(),
-                    param_name: None,
-                    body: Vec::new(),
-                })
-                .collect(),
-        })
-    }
-
-    #[test]
-    fn catches_index_and_sibling_route_method_collision() {
-        let api_dir = Path::new("api");
-        let compiled = vec![
-            (PathBuf::from("api/foo.route"), route_file(&["get"])),
-            (PathBuf::from("api/foo/index.route"), route_file(&["get"])),
-        ];
-
-        let collisions = find_route_collisions(api_dir, &compiled);
-        assert_eq!(collisions.len(), 1);
-        assert!(collisions[0].message.contains("GET `/api/foo`"));
-        assert!(collisions[0].message.contains("api/foo.route"));
-    }
-
-    #[test]
-    fn allows_different_methods_on_the_same_normalized_url() {
-        let api_dir = Path::new("api");
-        let compiled = vec![
-            (PathBuf::from("api/foo.route"), route_file(&["get"])),
-            (PathBuf::from("api/foo/index.route"), route_file(&["post"])),
-        ];
-
-        assert!(find_route_collisions(api_dir, &compiled).is_empty());
-    }
-
-    #[test]
-    fn rejects_route_files_inside_native_api_namespaces() {
-        let api_dir = Path::new("api");
-        let compiled = vec![(
-            PathBuf::from("api/admin/users.route"),
-            route_file(&["get"]),
-        )];
-
-        let collisions = find_route_collisions(api_dir, &compiled);
-        assert_eq!(collisions.len(), 1);
-        assert!(collisions[0]
-            .message
-            .contains("native API namespace `/api/admin`"));
-    }
-
-    #[test]
-    fn native_prefix_matching_is_segment_aware() {
-        assert!(is_in_native_namespace("/api/admin/users", "/api/admin"));
-        assert!(!is_in_native_namespace("/api/administrator", "/api/admin"));
-    }
 }

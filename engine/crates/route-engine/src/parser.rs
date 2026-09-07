@@ -1,10 +1,33 @@
 //! Recursive-descent / precedence parser for the RBE `.route` language.
 //! The parser is intentionally strict and reports line/column information.
 
-use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement};
+use std::collections::HashMap;
+
+use crate::ast::{
+    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceClassDef,
+    ServiceProgram, Statement, Value,
+};
 use crate::lexer::{Token, TokenKind};
 
 const KNOWN_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
+
+fn import_contains_service(import: &ImportTarget) -> bool {
+    match import {
+        ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. } => true,
+        ImportTarget::Aliased { target, .. } => import_contains_service(target),
+        _ => false,
+    }
+}
+
+fn import_is_builtin(import: &ImportTarget, expected: &str) -> bool {
+    match import {
+        ImportTarget::Builtin(name) | ImportTarget::BuiltinFunction { module: name, .. } => {
+            name == expected
+        }
+        ImportTarget::Aliased { target, .. } => import_is_builtin(target, expected),
+        _ => false,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ParseError {
@@ -19,7 +42,9 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self { Self { tokens, pos: 0 } }
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens, pos: 0 }
+    }
 
     pub fn parse_file(self) -> Result<RouteFile, ParseError> {
         let (file, errors) = self.parse_file_collecting();
@@ -31,6 +56,318 @@ impl Parser {
             line: 0,
             column: 0,
         })
+    }
+
+    pub fn parse_module_file(mut self) -> Result<ModuleFile, ParseError> {
+        let mut imports = Vec::new();
+        while self.check(&TokenKind::Colon) {
+            imports.extend(self.parse_imports()?);
+        }
+
+        let mut functions = Vec::new();
+        let mut exports = Vec::new();
+        while !self.check(&TokenKind::Eof) {
+            let exported = self.is_export_keyword();
+            if exported {
+                self.advance();
+            }
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
+            if !self.check(&TokenKind::Function) {
+                return Err(
+                    self.error_here("expected `function` or `export function` in .module file")
+                );
+            }
+            let function = self.parse_function()?;
+            if exported {
+                exports.push(function.name.clone());
+            }
+            functions.push(function);
+        }
+
+        Ok(ModuleFile {
+            imports,
+            functions,
+            exports,
+        })
+    }
+
+    pub fn parse_service_file(mut self) -> Result<ServiceProgram, ParseError> {
+        let mut imports = Vec::new();
+        while self.is_import_directive() {
+            imports.extend(self.parse_imports()?);
+        }
+
+        if imports.iter().any(import_contains_service) {
+            return Err(
+                self.error_here("service-to-service imports are not supported in .service files")
+            );
+        }
+
+        self.parse_service_directive()?;
+
+        let mut functions = Vec::new();
+        let mut exports = Vec::new();
+        let mut classes = Vec::new();
+        let mut class_name = None;
+        let mut lifecycle = Vec::new();
+
+        while !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::Class) {
+                let Some(TokenKind::Ident(next_name)) =
+                    self.tokens.get(self.pos + 1).map(|token| token.kind.clone())
+                else {
+                    return Err(self.error_here("expected class name after `class`"));
+                };
+
+                if next_name == "Service" {
+                    if class_name.is_some() {
+                        return Err(self.error_here("duplicate `class Service` in .service file"));
+                    }
+                    let (name, methods) = self.parse_service_class()?;
+                    class_name = Some(name);
+                    lifecycle = methods;
+                } else {
+                    let class = self.parse_service_namespace_class()?;
+                    if classes
+                        .iter()
+                        .any(|existing: &ServiceClassDef| existing.name == class.name)
+                    {
+                        return Err(self.error_here(&format!(
+                            "duplicate service-local class {:?}",
+                            class.name
+                        )));
+                    }
+                    classes.push(class);
+                }
+                continue;
+            }
+
+            let exported = self.is_export_keyword();
+            if exported {
+                self.advance();
+            }
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
+            if !self.check(&TokenKind::Function) {
+                return Err(self.error_here(
+                    "expected `function`, `export function`, or `class` in .service file",
+                ));
+            }
+            let function = self.parse_function()?;
+            if functions
+                .iter()
+                .any(|existing: &FunctionDef| existing.name == function.name)
+            {
+                return Err(self.error_here(&format!(
+                    "duplicate service function {:?}",
+                    function.name
+                )));
+            }
+            if exported {
+                if exports.iter().any(|name| name == &function.name) {
+                    return Err(
+                        self.error_here(&format!("duplicate service export {:?}", function.name))
+                    );
+                }
+                exports.push(function.name.clone());
+            }
+            functions.push(function);
+        }
+
+        let quick_db_imported = imports
+            .iter()
+            .any(|import| import_is_builtin(import, "quickDB"));
+        if !quick_db_imported
+            && classes
+                .iter()
+                .any(|class| class.bindings.contains_key("set"))
+        {
+            return Err(self.error_here(
+                "service-local classes using `const <= set => ...` require `:import[quickDB]`",
+            ));
+        }
+
+        Ok(ServiceProgram {
+            imports,
+            functions,
+            exports,
+            class_name,
+            lifecycle,
+            classes,
+        })
+    }
+
+    fn is_import_directive(&self) -> bool {
+        self.check(&TokenKind::Colon)
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|token| &token.kind),
+                Some(TokenKind::Import)
+            )
+    }
+
+    fn parse_service_directive(&mut self) -> Result<(), ParseError> {
+        self.expect(TokenKind::Colon)?;
+        match self.advance().kind {
+            TokenKind::Ident(name) if name == "service" => {}
+            other => {
+                return Err(self.error_here(&format!(
+                    "expected :service[...] declaration, got {other:?}"
+                )));
+            }
+        }
+        self.expect(TokenKind::LBracket)?;
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.advance().kind {
+                TokenKind::LBracket => depth = depth.saturating_add(1),
+                TokenKind::RBracket => depth -= 1,
+                TokenKind::Eof => {
+                    return Err(self.error_here("unterminated :service[...] declaration"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_service_class(&mut self) -> Result<(String, Vec<MethodDef>), ParseError> {
+        const LIFECYCLE: &[&str] = &["start", "event", "health", "stop"];
+
+        self.expect(TokenKind::Class)?;
+        let name = self.expect_ident()?;
+        if name != "Service" {
+            return Err(self.error_here(".service lifecycle class must be named `Service`"));
+        }
+        self.expect(TokenKind::LBrace)?;
+
+        let mut methods = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
+            let method_name = self.expect_ident()?;
+            let lifecycle_name = method_name.to_ascii_lowercase();
+            if !LIFECYCLE.contains(&lifecycle_name.as_str()) {
+                return Err(self.error_here(&format!(
+                "unsupported Service lifecycle method {method_name:?}; expected one of {LIFECYCLE:?}"
+            )));
+            }
+            if methods
+                .iter()
+                .any(|method: &MethodDef| method.verb == lifecycle_name)
+            {
+                return Err(self.error_here(&format!(
+                    "duplicate Service lifecycle method {lifecycle_name:?}"
+                )));
+            }
+            let params = self.parse_params()?;
+            if params.len() > 1 {
+                return Err(self.error_here(
+                    "Service lifecycle methods currently accept zero or one parameter",
+                ));
+            }
+            let body = self.parse_block()?;
+            methods.push(MethodDef {
+                verb: lifecycle_name,
+                param_name: params.into_iter().next(),
+                body,
+            });
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok((name, methods))
+    }
+
+    fn parse_service_namespace_class(&mut self) -> Result<ServiceClassDef, ParseError> {
+        self.expect(TokenKind::Class)?;
+        let name = self.expect_ident()?;
+        if name == "Service" {
+            return Err(self.error_here("`Service` is reserved for the .service lifecycle class"));
+        }
+        self.expect(TokenKind::LBrace)?;
+
+        let mut bindings = HashMap::new();
+        let mut methods = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::Const) {
+                self.advance();
+                self.expect(TokenKind::LtEq)?;
+                let binding = self.expect_ident()?;
+                // `=>` intentionally reuses the existing Eq + Gt tokens so
+                // this class-only declarative syntax does not alter ordinary
+                // expression parsing.
+                self.expect(TokenKind::Eq)?;
+                self.expect(TokenKind::Gt)?;
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::Semicolon)?;
+                let value = self.bound_constant_value(&expr)?;
+                if bindings.insert(binding.clone(), value).is_some() {
+                    return Err(self.error_here(&format!(
+                        "duplicate bound constant {binding:?} in class {name:?}"
+                    )));
+                }
+                continue;
+            }
+
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
+            let function = if self.check(&TokenKind::Function) {
+                self.parse_function()?
+            } else {
+                let method_name = self.expect_ident()?;
+                let params = self.parse_params()?;
+                let body = self.parse_block()?;
+                FunctionDef {
+                    name: method_name,
+                    params,
+                    body,
+                }
+            };
+            if methods
+                .iter()
+                .any(|existing: &FunctionDef| existing.name == function.name)
+            {
+                return Err(self.error_here(&format!(
+                    "duplicate class method {:?} in class {name:?}",
+                    function.name
+                )));
+            }
+            methods.push(function);
+        }
+        self.expect(TokenKind::RBrace)?;
+
+        Ok(ServiceClassDef {
+            name,
+            bindings,
+            methods,
+        })
+    }
+
+    fn bound_constant_value(&self, expr: &Expr) -> Result<Value, ParseError> {
+        match expr {
+            Expr::String(value) => Ok(Value::String(value.clone())),
+            Expr::Number(value) => Ok(Value::Number(*value)),
+            Expr::Bool(value) => Ok(Value::Bool(*value)),
+            Expr::Null => Ok(Value::Null),
+            Expr::Array(items) => items
+                .iter()
+                .map(|item| self.bound_constant_value(item))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array),
+            Expr::Object(fields) => {
+                let mut out = HashMap::new();
+                for (key, value) in fields {
+                    out.insert(key.clone(), self.bound_constant_value(value)?);
+                }
+                Ok(Value::Object(out))
+            }
+            _ => Err(self.error_here(
+                "class bound constants must be literal values, arrays, or objects",
+            )),
+        }
     }
 
     /// Parse a route while retaining recoverable statement errors. A valid
@@ -68,7 +405,15 @@ impl Parser {
             errors.push(self.error_here("unexpected content after Route class"));
         }
 
-        (Some(RouteFile { imports, functions, class_name, methods }), errors)
+        (
+            Some(RouteFile {
+                imports,
+                functions,
+                class_name,
+                methods,
+            }),
+            errors,
+        )
     }
 
     fn parse_imports(&mut self) -> Result<Vec<ImportTarget>, ParseError> {
@@ -80,7 +425,9 @@ impl Parser {
         loop {
             if self.check(&TokenKind::RBracket) {
                 if entries.is_empty() {
-                    return Err(self.error_here("expected at least one import entry inside :import[...]"));
+                    return Err(
+                        self.error_here("expected at least one import entry inside :import[...]")
+                    );
                 }
                 self.advance();
                 break;
@@ -90,7 +437,10 @@ impl Parser {
             let target = if self.is_as_keyword() {
                 self.advance();
                 let alias = self.expect_ident()?;
-                ImportTarget::Aliased { target: Box::new(target), alias }
+                ImportTarget::Aliased {
+                    target: Box::new(target),
+                    alias,
+                }
             } else {
                 target
             };
@@ -114,10 +464,23 @@ impl Parser {
     fn parse_import_target(&mut self) -> Result<ImportTarget, ParseError> {
         match self.advance().kind {
             TokenKind::Ident(name) => {
-                if self.check(&TokenKind::Dot) {
+                if name == "service" && self.check(&TokenKind::Colon) {
+                    self.advance();
+                    let service = self.expect_ident()?;
+                    if self.check(&TokenKind::Dot) {
+                        self.advance();
+                        let function = self.expect_ident()?;
+                        Ok(ImportTarget::ServiceFunction { service, function })
+                    } else {
+                        Ok(ImportTarget::Service(service))
+                    }
+                } else if self.check(&TokenKind::Dot) {
                     self.advance();
                     let function = self.expect_ident()?;
-                    Ok(ImportTarget::BuiltinFunction { module: name, function })
+                    Ok(ImportTarget::BuiltinFunction {
+                        module: name,
+                        function,
+                    })
                 } else if let Some((prefix, module_name)) = name.split_once('&') {
                     if prefix != "module" {
                         return Err(self.error_here("only module&name shorthand is supported"));
@@ -128,7 +491,24 @@ impl Parser {
                 }
             }
             TokenKind::String(path) => {
-                if self.check(&TokenKind::RBracket) || self.check(&TokenKind::Comma) || self.is_as_keyword() {
+                if let Some(service) = path.strip_prefix("service:") {
+                    if service.is_empty() {
+                        return Err(self.error_here("service import name cannot be empty"));
+                    }
+                    if self.check(&TokenKind::Dot) {
+                        self.advance();
+                        let function = self.expect_ident()?;
+                        Ok(ImportTarget::ServiceFunction {
+                            service: service.to_string(),
+                            function,
+                        })
+                    } else {
+                        Ok(ImportTarget::Service(service.to_string()))
+                    }
+                } else if self.check(&TokenKind::RBracket)
+                    || self.check(&TokenKind::Comma)
+                    || self.is_as_keyword()
+                {
                     Ok(ImportTarget::Custom(path))
                 } else {
                     self.expect(TokenKind::Dot)?;
@@ -137,9 +517,16 @@ impl Parser {
                 }
             }
             other => Err(self.error_here(&format!(
-                "expected builtin identifier or string path inside :import[...], got {other:?}"
-            ))),
+            "expected builtin, module path, or service import inside :import[...], got {other:?}"
+        ))),
         }
+    }
+
+    fn is_export_keyword(&self) -> bool {
+        matches!(
+            self.tokens.get(self.pos).map(|token| &token.kind),
+            Some(TokenKind::Ident(name)) if name == "export"
+        )
     }
 
     fn is_as_keyword(&self) -> bool {
@@ -185,7 +572,9 @@ impl Parser {
 
         let mut methods = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            if self.check(&TokenKind::Async) { self.advance(); }
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
             let method_name = self.expect_ident()?;
             let verb = method_name.to_lowercase();
             if !KNOWN_VERBS.contains(&verb.as_str()) {
@@ -196,16 +585,25 @@ impl Parser {
 
             let params = self.parse_params()?;
             if params.len() > 1 {
-                return Err(self.error_here("route methods currently accept zero or one request parameter"));
+                return Err(
+                    self.error_here("route methods currently accept zero or one request parameter")
+                );
             }
             let body = self.parse_block()?;
-            methods.push(MethodDef { verb, param_name: params.into_iter().next(), body });
+            methods.push(MethodDef {
+                verb,
+                param_name: params.into_iter().next(),
+                body,
+            });
         }
         self.expect(TokenKind::RBrace)?;
         Ok((name, methods))
     }
 
-    fn parse_class_collecting(&mut self, errors: &mut Vec<ParseError>) -> Option<(String, Vec<MethodDef>)> {
+    fn parse_class_collecting(
+        &mut self,
+        errors: &mut Vec<ParseError>,
+    ) -> Option<(String, Vec<MethodDef>)> {
         if let Err(error) = self.expect(TokenKind::Class) {
             errors.push(error);
             return None;
@@ -224,7 +622,9 @@ impl Parser {
 
         let mut methods = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            if self.check(&TokenKind::Async) { self.advance(); }
+            if self.check(&TokenKind::Async) {
+                self.advance();
+            }
             let method_name = match self.expect_ident() {
                 Ok(name) => name,
                 Err(error) => {
@@ -251,7 +651,9 @@ impl Parser {
                 }
             };
             if params.len() > 1 {
-                errors.push(self.error_here("route methods currently accept zero or one request parameter"));
+                errors.push(
+                    self.error_here("route methods currently accept zero or one request parameter"),
+                );
                 self.recover_class_member();
                 continue;
             }
@@ -259,7 +661,11 @@ impl Parser {
                 self.recover_class_member();
                 continue;
             };
-            methods.push(MethodDef { verb, param_name: params.into_iter().next(), body });
+            methods.push(MethodDef {
+                verb,
+                param_name: params.into_iter().next(),
+                body,
+            });
         }
 
         if let Err(error) = self.expect(TokenKind::RBrace) {
@@ -275,7 +681,9 @@ impl Parser {
         if !self.check(&TokenKind::RParen) {
             loop {
                 params.push(self.parse_identifier_spelling()?);
-                if !self.check(&TokenKind::Comma) { break; }
+                if !self.check(&TokenKind::Comma) {
+                    break;
+                }
                 self.advance();
             }
         }
@@ -374,16 +782,26 @@ impl Parser {
         } else {
             Vec::new()
         };
-        Ok(Statement::If { condition, then_body, else_body })
+        Ok(Statement::If {
+            condition,
+            then_body,
+            else_body,
+        })
     }
 
-    fn parse_expression(&mut self) -> Result<Expr, ParseError> { self.parse_or() }
+    fn parse_expression(&mut self) -> Result<Expr, ParseError> {
+        self.parse_or()
+    }
 
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_and()?;
         while self.check(&TokenKind::OrOr) {
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op: BinaryOp::Or, right: Box::new(self.parse_and()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op: BinaryOp::Or,
+                right: Box::new(self.parse_and()?),
+            };
         }
         Ok(expr)
     }
@@ -392,7 +810,11 @@ impl Parser {
         let mut expr = self.parse_equality()?;
         while self.check(&TokenKind::AndAnd) {
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op: BinaryOp::And, right: Box::new(self.parse_equality()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op: BinaryOp::And,
+                right: Box::new(self.parse_equality()?),
+            };
         }
         Ok(expr)
     }
@@ -409,7 +831,11 @@ impl Parser {
             };
             let Some(op) = op else { break };
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_comparison()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_comparison()?),
+            };
         }
         Ok(expr)
     }
@@ -426,7 +852,11 @@ impl Parser {
             };
             let Some(op) = op else { break };
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_term()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_term()?),
+            };
         }
         Ok(expr)
     }
@@ -441,7 +871,11 @@ impl Parser {
             };
             let Some(op) = op else { break };
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_factor()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_factor()?),
+            };
         }
         Ok(expr)
     }
@@ -457,7 +891,11 @@ impl Parser {
             };
             let Some(op) = op else { break };
             self.advance();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(self.parse_unary()?) };
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(self.parse_unary()?),
+            };
         }
         Ok(expr)
     }
@@ -485,7 +923,9 @@ impl Parser {
                     if !self.check(&TokenKind::RParen) {
                         loop {
                             args.push(self.parse_expression()?);
-                            if !self.check(&TokenKind::Comma) { break; }
+                            if !self.check(&TokenKind::Comma) {
+                                break;
+                            }
                             self.advance();
                         }
                     }
@@ -526,9 +966,13 @@ impl Parser {
                 self.expect(TokenKind::Colon)?;
                 let value = self.parse_expression()?;
                 fields.push((key, value));
-                if !self.check(&TokenKind::Comma) { break; }
+                if !self.check(&TokenKind::Comma) {
+                    break;
+                }
                 self.advance();
-                if self.check(&TokenKind::RBrace) { break; }
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
             }
         }
         self.expect(TokenKind::RBrace)?;
@@ -540,9 +984,13 @@ impl Parser {
         if !self.check(&TokenKind::RBracket) {
             loop {
                 items.push(self.parse_expression()?);
-                if !self.check(&TokenKind::Comma) { break; }
+                if !self.check(&TokenKind::Comma) {
+                    break;
+                }
                 self.advance();
-                if self.check(&TokenKind::RBracket) { break; }
+                if self.check(&TokenKind::RBracket) {
+                    break;
+                }
             }
         }
         self.expect(TokenKind::RBracket)?;
@@ -556,17 +1004,51 @@ impl Parser {
 
         while !self.check(&TokenKind::Eof) {
             match self.peek_kind() {
-                TokenKind::LParen => { paren_depth += 1; self.advance(); }
-                TokenKind::RParen if paren_depth > 0 => { paren_depth -= 1; self.advance(); }
-                TokenKind::LBracket => { bracket_depth += 1; self.advance(); }
-                TokenKind::RBracket if bracket_depth > 0 => { bracket_depth -= 1; self.advance(); }
-                TokenKind::LBrace => { brace_depth += 1; self.advance(); }
-                TokenKind::RBrace if brace_depth > 0 => { brace_depth -= 1; self.advance(); }
-                TokenKind::Semicolon if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => { self.advance(); break; }
-                TokenKind::RBrace if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
-                TokenKind::Const | TokenKind::Let | TokenKind::Return | TokenKind::If | TokenKind::Else
-                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
-                _ => { self.advance(); }
+                TokenKind::LParen => {
+                    paren_depth += 1;
+                    self.advance();
+                }
+                TokenKind::RParen if paren_depth > 0 => {
+                    paren_depth -= 1;
+                    self.advance();
+                }
+                TokenKind::LBracket => {
+                    bracket_depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBracket if bracket_depth > 0 => {
+                    bracket_depth -= 1;
+                    self.advance();
+                }
+                TokenKind::LBrace => {
+                    brace_depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBrace if brace_depth > 0 => {
+                    brace_depth -= 1;
+                    self.advance();
+                }
+                TokenKind::Semicolon
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    self.advance();
+                    break;
+                }
+                TokenKind::RBrace if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                    break
+                }
+                TokenKind::Const
+                | TokenKind::Let
+                | TokenKind::Return
+                | TokenKind::If
+                | TokenKind::Else
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    break
+                }
+                _ => {
+                    self.advance();
+                }
             }
         }
     }
@@ -591,16 +1073,27 @@ impl Parser {
     }
 
     fn is_identifier_followed_by_lparen(&self) -> bool {
-        matches!(self.tokens.get(self.pos).map(|token| &token.kind), Some(TokenKind::Ident(_)))
-            && matches!(self.tokens.get(self.pos + 1).map(|token| &token.kind), Some(TokenKind::LParen))
+        matches!(
+            self.tokens.get(self.pos).map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
+        ) && matches!(
+            self.tokens.get(self.pos + 1).map(|token| &token.kind),
+            Some(TokenKind::LParen)
+        )
     }
 
     fn peek_kind(&self) -> TokenKind {
-        self.tokens.get(self.pos).map(|t| t.kind.clone()).unwrap_or(TokenKind::Eof)
+        self.tokens
+            .get(self.pos)
+            .map(|t| t.kind.clone())
+            .unwrap_or(TokenKind::Eof)
     }
 
     fn check(&self, expected: &TokenKind) -> bool {
-        self.tokens.get(self.pos).map(|t| &t.kind == expected).unwrap_or(false)
+        self.tokens
+            .get(self.pos)
+            .map(|t| &t.kind == expected)
+            .unwrap_or(false)
     }
 
     fn advance(&mut self) -> Token {
@@ -613,7 +1106,9 @@ impl Parser {
             start: 0,
             end: 0,
         });
-        if self.pos < self.tokens.len() { self.pos += 1; }
+        if self.pos < self.tokens.len() {
+            self.pos += 1;
+        }
         tok
     }
 
@@ -622,7 +1117,10 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
-            Err(self.error_here(&format!("expected {expected:?}, got {:?}", self.peek_kind())))
+            Err(self.error_here(&format!(
+                "expected {expected:?}, got {:?}",
+                self.peek_kind()
+            )))
         }
     }
 

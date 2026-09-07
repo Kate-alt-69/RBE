@@ -1,15 +1,8 @@
 //! In-process async supervisor.
 //!
-//! Implements migration-plan §7: instead of the Node Bootstrap Manager's
-//! "spawn a child OS process per service" model, services here are
-//! `tokio` tasks registered with this supervisor. A panicking or
-//! error-returning task doesn't take the process down — it's restarted
-//! with exponential backoff, same fault-isolation guarantee as the
-//! subprocess model, none of the IPC overhead.
-//!
-//! Reminder (§3, non-negotiable): this is for *internal* services
-//! (email, future bootstrap services). The container runtime is a real
-//! separate process, on purpose, and never goes through this supervisor.
+//! Internal trusted tasks remain Tokio tasks. User-authored `.service` files are
+//! separate OS processes owned by `service-runtime`; both systems share the same
+//! top-level backend lifecycle.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -19,10 +12,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-/// Top-level backend lifecycle state, per migration-plan §3.2 / the
-/// handbook's "Backend Lifecycle" state machine. `main.rs`'s `boot()`
-/// drives this forward; the health endpoint reads it back out via
-/// [`Supervisor::subscribe_state`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendState {
@@ -38,12 +27,35 @@ pub enum BackendState {
     Stopped,
 }
 
+/// Cloneable lifecycle control plane. `Supervisor::run()` consumes the mutable
+/// supervisor task state, while boot/shutdown code retains this handle and can
+/// continue publishing truthful lifecycle transitions.
+#[derive(Clone)]
+pub struct Lifecycle {
+    state_tx: watch::Sender<BackendState>,
+}
+
+impl Lifecycle {
+    pub fn subscribe(&self) -> watch::Receiver<BackendState> {
+        self.state_tx.subscribe()
+    }
+
+    pub fn set(&self, state: BackendState) {
+        if *self.state_tx.borrow() == state {
+            return;
+        }
+        tracing::info!(?state, "backend state transition");
+        let _ = self.state_tx.send(state);
+    }
+
+    pub fn current(&self) -> BackendState {
+        *self.state_tx.borrow()
+    }
+}
+
 pub type TaskFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 pub type TaskFactory = Box<dyn Fn() -> TaskFuture + Send + Sync>;
 
-/// Restart policy for a supervised task. Deliberately simple/hand-rolled
-/// per §2.1 — reach for the `backoff` crate only if this needs to grow
-/// jitter, per-error-type policies, etc.
 #[derive(Debug, Clone, Copy)]
 pub struct RestartPolicy {
     pub initial_backoff: Duration,
@@ -71,19 +83,12 @@ struct RestartState {
     next_backoff: Duration,
 }
 
-/// The supervisor itself. Not `Clone` — hold one instance in `AppState`
-/// and give out [`watch::Receiver<BackendState>`] handles to whoever
-/// needs to observe state (e.g. the health-check route).
 pub struct Supervisor {
     factories: HashMap<String, TaskFactory>,
     restart_states: HashMap<String, RestartState>,
     policy: RestartPolicy,
     join_set: JoinSet<TaskOutcome>,
-    state_tx: watch::Sender<BackendState>,
-    // A panicking task never gets to construct `TaskOutcome` (the panic
-    // happens mid-future), so on the `JoinError` path all we get back
-    // from `join_next_with_id` is a task `Id` — this map is how we turn
-    // that back into a name we can look up in `factories`.
+    lifecycle: Lifecycle,
     id_to_name: HashMap<tokio::task::Id, String>,
 }
 
@@ -95,24 +100,23 @@ impl Supervisor {
             restart_states: HashMap::new(),
             policy,
             join_set: JoinSet::new(),
-            state_tx,
+            lifecycle: Lifecycle { state_tx },
             id_to_name: HashMap::new(),
         }
     }
 
+    pub fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle.clone()
+    }
+
     pub fn subscribe_state(&self) -> watch::Receiver<BackendState> {
-        self.state_tx.subscribe()
+        self.lifecycle.subscribe()
     }
 
     pub fn set_state(&self, state: BackendState) {
-        tracing::info!(?state, "backend state transition");
-        // A closed channel (no receivers yet) is fine — ignore the error.
-        let _ = self.state_tx.send(state);
+        self.lifecycle.set(state);
     }
 
-    /// Register a task and spawn it immediately. `factory` must be able
-    /// to produce a *fresh* future on every call, since a future can
-    /// only be polled to completion once — that's how restarts work.
     pub fn register(&mut self, name: impl Into<String>, factory: TaskFactory) {
         let name = name.into();
         self.spawn_task(name.clone(), &factory);
@@ -129,10 +133,6 @@ impl Supervisor {
     fn spawn_task(&mut self, name: String, factory: &TaskFactory) {
         let fut = factory();
         let name_for_task = name.clone();
-        // No manual panic-catching here: `JoinSet` already reports a
-        // panicking task as `Err(JoinError)` from `join_next_with_id()`
-        // (see `run()` below) — that's the mechanism, not anything at
-        // the future level.
         let abort_handle = self.join_set.spawn(async move {
             let result = fut.await;
             TaskOutcome {
@@ -143,10 +143,6 @@ impl Supervisor {
         self.id_to_name.insert(abort_handle.id(), name);
     }
 
-    /// Drives supervision forever (or until every task has permanently
-    /// failed). Call this from `main.rs` after registering the initial
-    /// set of services; later phases can extend this to also accept
-    /// late registrations via a channel.
     pub async fn run(&mut self) {
         while let Some(join_result) = self.join_set.join_next_with_id().await {
             let (name, failure_reason): (String, Option<String>) = match join_result {
@@ -177,7 +173,6 @@ impl Supervisor {
             };
 
             let Some(reason) = failure_reason else {
-                // Clean exit — don't restart. Remove bookkeeping.
                 self.factories.remove(&name);
                 self.restart_states.remove(&name);
                 continue;
@@ -204,7 +199,6 @@ impl Supervisor {
                     attempts = restart_state.attempts,
                     "task exceeded max restart attempts, giving up permanently"
                 );
-                self.factories.remove(&name);
                 self.restart_states.remove(&name);
                 continue;
             }
@@ -218,7 +212,7 @@ impl Supervisor {
             tokio::time::sleep(backoff).await;
 
             self.spawn_task(name.clone(), &factory);
-            self.factories.insert(name.clone(), factory);
+            self.factories.insert(name, factory);
         }
     }
 }
@@ -228,6 +222,15 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn lifecycle_handle_survives_supervisor_move() {
+        let supervisor = Supervisor::new(RestartPolicy::default());
+        let lifecycle = supervisor.lifecycle();
+        let receiver = lifecycle.subscribe();
+        lifecycle.set(BackendState::Running);
+        assert_eq!(*receiver.borrow(), BackendState::Running);
+    }
 
     #[tokio::test]
     async fn restarts_a_panicking_task_and_eventually_gives_up() {
@@ -251,10 +254,7 @@ mod tests {
             }),
         );
 
-        // Bound the test run so it can't hang if restart logic breaks.
         let _ = tokio::time::timeout(Duration::from_secs(2), supervisor.run()).await;
-
-        // Initial spawn + up to max_restarts retries.
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
     }
 
@@ -276,7 +276,6 @@ mod tests {
         );
 
         let _ = tokio::time::timeout(Duration::from_millis(200), supervisor.run()).await;
-
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

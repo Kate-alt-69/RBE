@@ -1,0 +1,61 @@
+name: Runtime CI
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  engine-runtime:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: format runtime slice
+        shell: bash
+        run: |
+          rustfmt --edition 2021 --check \
+            crates/service-runtime/src/lib.rs \
+            crates/service-runtime/src/manager.rs \
+            crates/service-runtime/src/mother.rs \
+            crates/backend/src/service_boot.rs \
+            crates/backend/src/service_mother.rs \
+            crates/config/src/lib.rs \
+            crates/video-manager/src/lib.rs \
+            crates/video-manager/src/download.rs \
+            crates/video-manager/src/download_worker.rs \
+            crates/video-manager/src/container_probe.rs \
+            crates/video-manager/src/ffprobe.rs \
+            crates/video-manager/src/ffmpeg.rs \
+            crates/video-manager/src/ffmpeg_capabilities.rs \
+            crates/video-manager/src/live.rs \
+            crates/video-manager/src/live_runtime.rs \
+            crates/video-manager/src/normalization.rs \
+            crates/video-manager/src/pipeline.rs \
+            crates/video-manager/src/worker.rs \
+            crates/core/src/video_language.rs \
+            crates/api/src/health.rs \
+            crates/route-engine/src/ast.rs \
+            crates/route-engine/src/parser.rs \
+            crates/route-engine/src/modules.rs \
+            crates/route-engine/src/analyzer.rs \
+            crates/route-engine/src/transpiler.rs \
+            crates/route-engine/src/module_runtime.rs \
+            crates/route-engine/src/module_eval.rs \
+            crates/route-engine/src/service_eval.rs \
+            crates/route-engine/src/video_host.rs \
+            crates/route-engine/src/discovery.rs
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --locked

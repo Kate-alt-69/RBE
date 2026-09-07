@@ -1,0 +1,14 @@
+[package]
+name = "rbe-group-memory"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone shared-memory crate. It is deliberately not owned by the Engine,
+# Service Mother, or any individual runtime. Any RBE process may depend on it
+# through a relative path and use the same mapping format/protocol.
+
+[dependencies]
+memmap2 = "0.9"
+fs2 = "0.4"
+thiserror = "1"

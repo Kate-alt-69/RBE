@@ -10,10 +10,24 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub enum ImportTarget {
     Builtin(String),
-    BuiltinFunction { module: String, function: String },
+    BuiltinFunction {
+        module: String,
+        function: String,
+    },
     Custom(String),
-    CustomFunction { path: String, function: String },
-    Aliased { target: Box<ImportTarget>, alias: String },
+    CustomFunction {
+        path: String,
+        function: String,
+    },
+    Service(String),
+    ServiceFunction {
+        service: String,
+        function: String,
+    },
+    Aliased {
+        target: Box<ImportTarget>,
+        alias: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +36,34 @@ pub struct RouteFile {
     pub functions: Vec<FunctionDef>,
     pub class_name: String,
     pub methods: Vec<MethodDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleFile {
+    pub imports: Vec<ImportTarget>,
+    pub functions: Vec<FunctionDef>,
+    pub exports: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceProgram {
+    pub imports: Vec<ImportTarget>,
+    pub functions: Vec<FunctionDef>,
+    pub exports: Vec<String>,
+    pub class_name: Option<String>,
+    pub lifecycle: Vec<MethodDef>,
+    pub(crate) classes: Vec<ServiceClassDef>,
+}
+
+/// Service-local namespace class. These are static/object-like namespaces, not
+/// heap-allocated instances. `bindings` come from RBE's class-bound constant
+/// syntax (`const <= key => value;`) and methods are reusable from any service
+/// function, lifecycle method, or other service-local class.
+#[derive(Debug, Clone)]
+pub(crate) struct ServiceClassDef {
+    pub name: String,
+    pub bindings: HashMap<String, Value>,
+    pub methods: Vec<FunctionDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,10 +82,17 @@ pub struct MethodDef {
 
 #[derive(Debug, Clone)]
 pub enum Statement {
-    Const { name: String, value: Expr },
+    Const {
+        name: String,
+        value: Expr,
+    },
     Return(Expr),
     Expr(Expr),
-    If { condition: Expr, then_body: Vec<Statement>, else_body: Vec<Statement> },
+    If {
+        condition: Expr,
+        then_body: Vec<Statement>,
+        else_body: Vec<Statement>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -58,20 +107,40 @@ pub enum Expr {
     Object(Vec<(String, Expr)>),
     Array(Vec<Expr>),
     UnaryNot(Box<Expr>),
-    Binary { left: Box<Expr>, op: BinaryOp, right: Box<Expr> },
+    Binary {
+        left: Box<Expr>,
+        op: BinaryOp,
+        right: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
-    Equal, StrictEqual, NotEqual, StrictNotEqual,
-    Less, LessEqual, Greater, GreaterEqual,
-    And, Or, Add, Subtract, Multiply, Divide, Modulo,
+    Equal,
+    StrictEqual,
+    NotEqual,
+    StrictNotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    And,
+    Or,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
 }
 
 #[derive(Debug, Clone)]
 pub enum Value {
-    String(String), Number(f64), Bool(bool), Null,
-    Object(HashMap<String, Value>), Array(Vec<Value>),
+    String(String),
+    Number(f64),
+    Bool(bool),
+    Null,
+    Object(HashMap<String, Value>),
+    Array(Vec<Value>),
 }
 
 impl Value {

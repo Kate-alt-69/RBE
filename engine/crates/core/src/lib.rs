@@ -1,21 +1,26 @@
 //! Home for backend infrastructure/business logic.
 //!
-//! Transport-independent runtime state lives here so the HTTP dashboard can
-//! observe backend/container state without pulling container internals into the
-//! backend process. The container remains a separate authenticated OS process.
+//! Transport-independent runtime state lives here so HTTP routes can observe
+//! backend/container/service/video state without owning those runtimes.
 
 mod container_client;
 mod metrics;
+mod video_language;
 
 use std::sync::Arc;
 
 use config::Config;
 use security::{HasIpStrikes, HasRateLimiters, IpStrikeTracker, RateLimiters};
+use service_runtime::ServiceManager;
 use supervisor::BackendState;
 use tokio::sync::watch;
+use video_manager::VideoManager;
 
 pub use container_client::{ContainerClient, ContainerEndpointSnapshot};
-pub use metrics::{BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot};
+pub use metrics::{
+    BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
+};
+pub use video_language::{VideoLanguage, VideoLanguageError};
 
 /// Shared application state, cloned cheaply into every Axum handler.
 #[derive(Clone)]
@@ -26,16 +31,21 @@ pub struct AppState {
     pub ip_strikes: Arc<IpStrikeTracker>,
     pub vault: Arc<vault_process::VaultClient>,
     pub container: ContainerClient,
+    pub services: ServiceManager,
+    pub video_manager: Option<Arc<VideoManager>>,
     pub backend_metrics: Arc<BackendMetrics>,
     pub maintenance: Arc<MaintenanceMetrics>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Arc<Config>,
         state_rx: watch::Receiver<BackendState>,
         vault: Arc<vault_process::VaultClient>,
         container: ContainerClient,
+        services: ServiceManager,
+        video_manager: Option<Arc<VideoManager>>,
         maintenance: Arc<MaintenanceMetrics>,
     ) -> Self {
         let rate_limiters = Arc::new(RateLimiters::new(&config.security));
@@ -47,6 +57,8 @@ impl AppState {
             ip_strikes,
             vault,
             container,
+            services,
+            video_manager,
             backend_metrics: Arc::new(BackendMetrics::default()),
             maintenance,
         }
