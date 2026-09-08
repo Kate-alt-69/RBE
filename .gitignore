@@ -2,6 +2,7 @@
 **/target/**
 **.log
 **/error-reporter-status.json
+**/*.key
 /dist/**
 /tmp
 **.lock
