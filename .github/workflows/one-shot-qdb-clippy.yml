@@ -26,74 +26,46 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          apply_fixes() {
-            python3 - <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
 
           service = Path("engine/crates/route-engine/src/service_eval.rs")
           text = service.read_text()
           old = 'assert!(error.to_string().contains("quickDB.seal"));'
           new = 'assert!(error.message.contains("quickDB.seal"));'
-          if text.count(old) == 2:
-              text = text.replace(old, new)
-          elif text.count(new) != 2:
-              raise SystemExit("unexpected ServiceExecutionError assertion shape")
-          service.write_text(text)
+          if text.count(old) != 2:
+              raise SystemExit(f"expected 2 ServiceExecutionError assertions, found {text.count(old)}")
+          service.write_text(text.replace(old, new))
 
           quickdb = Path("engine/crates/route-engine/src/quickdb.rs")
           text = quickdb.read_text()
           old = 'if index % 2 == 0 {'
           new = 'if index.is_multiple_of(2) {'
-          if text.count(old) == 2:
-              text = text.replace(old, new)
-          elif text.count(new) != 2:
-              raise SystemExit("unexpected counting-filter parity check shape")
+          if text.count(old) != 2:
+              raise SystemExit(f"expected 2 counting-filter parity checks, found {text.count(old)}")
+          text = text.replace(old, new)
 
-          old = '''        db.create("users", config(FilterKind::Bloom, 100)).unwrap();
-        let error = db.remove("users", "kate").unwrap_err();'''
-          new = '''        db.create("users", config(FilterKind::Bloom, 100)).unwrap();
-        db.seal("users").unwrap();
-        let error = db.remove("users", "kate").unwrap_err();'''
-          if text.count(old) == 1:
-              text = text.replace(old, new)
-          elif text.count(new) != 1:
-              raise SystemExit("unexpected normal bloom deletion regression test shape")
-          quickdb.write_text(text)
+          old = '        db.create("users", config(FilterKind::Bloom, 100)).unwrap();\n        let error = db.remove("users", "kate").unwrap_err();'
+          new = '        db.create("users", config(FilterKind::Bloom, 100)).unwrap();\n        db.seal("users").unwrap();\n        let error = db.remove("users", "kate").unwrap_err();'
+          if text.count(old) != 1:
+              raise SystemExit("expected normal bloom deletion regression block")
+          quickdb.write_text(text.replace(old, new))
           PY
-          }
 
-          validate() {
-            cd engine
-            cargo fmt --all
-            cargo clippy -p route-engine --all-targets -- -D warnings
-            cargo test -p route-engine
-            cd ..
-          }
-
-          git fetch origin main
-          git reset --hard origin/main
-          apply_fixes
-          validate
+          cd engine
+          cargo fmt --all
+          cargo clippy -p route-engine --all-targets -- -D warnings
+          cargo test -p route-engine
+          cd ..
 
           validated_base="$(git rev-parse HEAD)"
           git fetch origin main
-          latest_base="$(git rev-parse origin/main)"
-          if [ "$validated_base" != "$latest_base" ]; then
-            git reset --hard origin/main
-            apply_fixes
-            validate
-            validated_base="$(git rev-parse HEAD)"
-            git fetch origin main
-            latest_base="$(git rev-parse origin/main)"
-          fi
-
-          if [ "$validated_base" != "$latest_base" ]; then
-            echo "main moved twice during validation; refusing stale push"
+          if [ "$(git rev-parse origin/main)" != "$validated_base" ]; then
+            echo "main moved during validation; refusing stale push"
             exit 75
           fi
 
-          rm -f .github/workflows/one-shot-qdb-clippy.yml
+          rm .github/workflows/one-shot-qdb-clippy.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
