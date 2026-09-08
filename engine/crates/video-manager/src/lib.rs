@@ -237,6 +237,20 @@ pub trait VideoDatabase: Send + Sync {
         database: &str,
         request: &CreateAssetRequest,
     ) -> anyhow::Result<VideoAsset>;
+    /// Atomically persist a newly-generated quarantined download asset and its
+    /// initial queued job. Implementations must persist both records or neither;
+    /// adapters that cannot provide that guarantee must reject download queues.
+    fn create_queued_download_atomic(
+        &self,
+        _database: &str,
+        _asset_id: &str,
+        _request: &CreateAssetRequest,
+        _job: &VideoJob,
+    ) -> anyhow::Result<VideoAsset> {
+        anyhow::bail!(
+            "Video Manager database adapter does not support atomic download queue creation"
+        )
+    }
     fn insert_job(&self, job: &VideoJob) -> anyhow::Result<()>;
     fn claim_job(
         &self,
@@ -436,6 +450,108 @@ impl VideoDatabase for SqliteVideoDatabase {
 
         Ok(VideoAsset {
             id: asset_id,
+            uri,
+            database: database.to_string(),
+            namespace,
+            group: request.group.clone(),
+            title: request.title.clone(),
+            state: request.initial_state,
+            source_type: request.source_type,
+            source_uri: request.source_uri.clone(),
+            metadata: request.metadata.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    fn create_queued_download_atomic(
+        &self,
+        database: &str,
+        asset_id: &str,
+        request: &CreateAssetRequest,
+        job: &VideoJob,
+    ) -> anyhow::Result<VideoAsset> {
+        validate_generated_uuid("queued asset id", asset_id)?;
+        validate_segment("namespace kind", &request.namespace_kind)?;
+        validate_segment("namespace owner", &request.namespace_owner)?;
+        validate_segment("group", &request.group)?;
+        if request.source_type != VideoSourceType::Download
+            || request.initial_state != VideoAssetState::Quarantined
+        {
+            anyhow::bail!(
+                "Video Manager atomic download creation requires a quarantined download asset"
+            );
+        }
+        let validated_job = validate_stored_job(job.clone())?;
+        if validated_job.asset_id != asset_id
+            || validated_job.job_type != "download"
+            || validated_job.state != "queued"
+            || validated_job.progress != PROGRESS_QUEUED
+            || validated_job.attempts != 0
+            || validated_job.error.is_some()
+        {
+            anyhow::bail!("Video Manager atomic download creation requires a fresh queued job");
+        }
+
+        let namespace = format!("{}:{}", request.namespace_kind, request.namespace_owner);
+        let now = validated_job.created_at_ms;
+        let uri = format!("vm://{namespace}/{}/{}", request.group, asset_id);
+        let metadata_json = serde_json::to_string(&request.metadata)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        transaction.execute(
+            "INSERT OR IGNORE INTO video_namespaces (id, kind, owner, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![namespace, request.namespace_kind, request.namespace_owner, now],
+        )?;
+        let group_id: String = transaction
+            .query_row(
+                "SELECT id FROM video_groups WHERE namespace_id = ?1 AND name = ?2",
+                params![namespace, request.group],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        transaction.execute(
+            "INSERT OR IGNORE INTO video_groups (id, namespace_id, name, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![group_id, namespace, request.group, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO video_assets (id, group_id, title, state, source_type, source_uri, metadata_json, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                asset_id,
+                group_id,
+                request.title,
+                request.initial_state.as_str(),
+                request.source_type.as_str(),
+                request.source_uri,
+                metadata_json,
+                now,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO video_jobs (id, asset_id, job_type, state, progress, attempts, error, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                validated_job.id,
+                validated_job.asset_id,
+                validated_job.job_type,
+                validated_job.state,
+                validated_job.progress,
+                validated_job.attempts,
+                validated_job.error,
+                validated_job.created_at_ms,
+                validated_job.updated_at_ms,
+            ],
+        )?;
+        transaction.commit()?;
+
+        Ok(VideoAsset {
+            id: asset_id.to_string(),
             uri,
             database: database.to_string(),
             namespace,
@@ -1437,21 +1553,12 @@ impl VideoManager {
     pub fn queue_download(&self, request: QueueDownloadRequest) -> anyhow::Result<QueuedDownload> {
         let target = parse_download_target(&request.url)?;
         let database_selection = request.database.clone();
-        let asset = self.create_asset(CreateAssetRequest {
-            database: database_selection.clone(),
-            namespace_kind: request.namespace_kind,
-            namespace_owner: request.namespace_owner,
-            group: request.group,
-            title: request.title,
-            source_type: VideoSourceType::Download,
-            source_uri: Some(target.normalized_url().to_string()),
-            metadata: request.metadata,
-            initial_state: VideoAssetState::Quarantined,
-        })?;
+        let (database_name, database) = self.resolve_database(database_selection.as_deref())?;
+        let asset_id = Uuid::new_v4().to_string();
         let now = now_ms();
         let job = VideoJob {
             id: Uuid::new_v4().to_string(),
-            asset_id: asset.id.clone(),
+            asset_id: asset_id.clone(),
             job_type: "download".into(),
             state: "queued".into(),
             progress: PROGRESS_QUEUED,
@@ -1460,12 +1567,48 @@ impl VideoManager {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        let (_, database) = self.resolve_database(database_selection.as_deref())?;
-        let quarantine_path = self.reserve_download_quarantine(&asset.id, &job.id)?;
-        if let Err(error) = database.insert_job(&job) {
-            let _ = std::fs::remove_file(&quarantine_path);
-            return Err(error);
-        }
+        let asset_request = CreateAssetRequest {
+            database: database_selection,
+            namespace_kind: request.namespace_kind,
+            namespace_owner: request.namespace_owner,
+            group: request.group,
+            title: request.title,
+            source_type: VideoSourceType::Download,
+            source_uri: Some(target.normalized_url().to_string()),
+            metadata: request.metadata,
+            initial_state: VideoAssetState::Quarantined,
+        };
+
+        let quarantine_path = self.reserve_download_quarantine(&asset_id, &job.id)?;
+        let asset = match database.create_queued_download_atomic(
+            &database_name,
+            &asset_id,
+            &asset_request,
+            &job,
+        ) {
+            Ok(asset) => asset,
+            Err(error) => {
+                let cleanup_error = match std::fs::remove_file(&quarantine_path) {
+                    Ok(()) => None,
+                    Err(cleanup_error)
+                        if cleanup_error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        None
+                    }
+                    Err(cleanup_error) => Some(cleanup_error),
+                };
+                if let Some(parent) = quarantine_path.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+                if let Some(cleanup_error) = cleanup_error {
+                    return Err(anyhow::anyhow!(
+                        "Video Manager database queue creation failed: {error}; additionally failed to remove quarantine reservation {}: {cleanup_error}",
+                        quarantine_path.display()
+                    ));
+                }
+                return Err(error);
+            }
+        };
         self.work_notify.notify_one();
         Ok(QueuedDownload { asset, job })
     }
@@ -2207,6 +2350,8 @@ mod tests {
             })
             .unwrap();
 
+        // Start on the broken adapter so the healthy default database is only
+        // reachable if discovery isolates the adapter error and keeps scanning.
         manager.worker_database_cursor.store(1, Ordering::Relaxed);
         let queued = manager.next_queued_download(None).unwrap().unwrap();
         assert_eq!(queued.asset.database, DEFAULT_DATABASE_NAME);
@@ -2317,6 +2462,46 @@ mod tests {
                 .unwrap();
         assert!(quarantine_path.starts_with(expected_root));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_atomic_queue_creation_leaves_no_asset_job_or_quarantine() {
+        let path = temp_db("download-atomic-failure");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_video_jobs BEFORE INSERT ON video_jobs
+                 BEGIN
+                     SELECT RAISE(FAIL, 'reject video job');
+                 END;",
+            )
+            .unwrap();
+
+        let error = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "atomic".into(),
+                group: "downloads".into(),
+                title: "Rollback".into(),
+                url: "https://example.invalid/rollback.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .expect_err("job insertion failure must rollback the whole queue creation");
+        assert!(error.to_string().contains("reject video job"));
+
+        for table in ["video_namespaces", "video_groups", "video_assets", "video_jobs"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table} must remain empty after rollback");
+        }
+        assert!(std::fs::read_dir(&manager.quarantine_root)
+            .unwrap()
+            .next()
+            .is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
