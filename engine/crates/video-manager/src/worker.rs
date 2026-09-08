@@ -290,9 +290,7 @@ async fn run_download_worker_loop(
 
         if recovery_required || newly_registered {
             let periodic_recovery = recovery_required;
-            if database_names.len() == 1
-                && (periodic_recovery || recovered_databases.is_empty())
-            {
+            if database_names.len() == 1 && (periodic_recovery || recovered_databases.is_empty()) {
                 let name = &database_names[0];
                 match manager.recover_incomplete_downloads() {
                     Ok(count) => {
@@ -501,7 +499,9 @@ mod tests {
             .spawn_download_worker(policy(&root))
             .err()
             .expect("poisoned encoder telemetry must reject worker startup");
-        assert!(error.to_string().contains("worker encoder mutex is poisoned"));
+        assert!(error
+            .to_string()
+            .contains("worker encoder mutex is poisoned"));
         assert_eq!(
             *manager.worker_state.lock().unwrap(),
             VideoWorkerState::Disabled

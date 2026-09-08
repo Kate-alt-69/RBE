@@ -800,7 +800,11 @@ fn should_restart(policy: RestartPolicy, success: bool) -> bool {
 }
 
 fn next_restart_attempt(current: u32, stable: bool, retry_in_progress: bool) -> u32 {
-    let base = if stable && !retry_in_progress { 0 } else { current };
+    let base = if stable && !retry_in_progress {
+        0
+    } else {
+        current
+    };
     base.saturating_add(1)
 }
 

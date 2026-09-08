@@ -236,7 +236,10 @@ impl<'a> ModuleExecutor<'a> {
             ));
         }
         let class = self.classes.get(class_name).ok_or_else(|| {
-            ModuleEvalError::new("MOD3500", format!("service class {class_name:?} is not loaded"))
+            ModuleEvalError::new(
+                "MOD3500",
+                format!("service class {class_name:?} is not loaded"),
+            )
         })?;
         if let Some(function) = class
             .methods
@@ -251,12 +254,7 @@ impl<'a> ModuleExecutor<'a> {
 
         if class.bindings.contains_key("set") {
             if let Some(value) = self
-                .call_host_capability(
-                    Some(class_name.to_string()),
-                    "quickDB",
-                    function_name,
-                    args,
-                )
+                .call_host_capability(Some(class_name.to_string()), "quickDB", function_name, args)
                 .await?
             {
                 return Ok(value);

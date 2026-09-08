@@ -288,10 +288,9 @@ impl VideoManager {
                     VideoLiveSessionState::Starting,
                     VideoLiveSessionState::Stopping,
                 )),
-                VideoLiveSessionState::Live => Some((
-                    VideoLiveSessionState::Live,
-                    VideoLiveSessionState::Stopping,
-                )),
+                VideoLiveSessionState::Live => {
+                    Some((VideoLiveSessionState::Live, VideoLiveSessionState::Stopping))
+                }
                 VideoLiveSessionState::Stopping
                 | VideoLiveSessionState::Ended
                 | VideoLiveSessionState::Failed => return Ok(Some(current)),
@@ -596,10 +595,7 @@ mod tests {
 
     #[test]
     fn end_request_retries_when_runtime_advances_session_state() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbe-video-live-end-race-{}",
-            Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("rbe-video-live-end-race-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let manager = VideoManager::open_default(dir.join("video.db"), 7200).unwrap();
         let session_id = Uuid::new_v4().to_string();
@@ -609,19 +605,14 @@ mod tests {
             state: Mutex::new(VideoLiveSessionState::Starting),
             transition_attempts: AtomicUsize::new(0),
         });
-        manager
-            .register_database("race", database.clone())
-            .unwrap();
+        manager.register_database("race", database.clone()).unwrap();
 
         let stopped = manager
             .request_end_live_session(Some("race"), &session_id)
             .unwrap()
             .unwrap();
         assert_eq!(stopped.state, VideoLiveSessionState::Stopping);
-        assert_eq!(
-            database.transition_attempts.load(Ordering::SeqCst),
-            2
-        );
+        assert_eq!(database.transition_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             *database.state.lock().unwrap(),
             VideoLiveSessionState::Stopping

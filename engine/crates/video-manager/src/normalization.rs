@@ -180,9 +180,8 @@ async fn promote_normalized_output(staging: &Path, final_path: &Path) -> anyhow:
             return Ok(());
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(error).context(
-                "Video Manager normalized output already exists; refusing to replace it",
-            );
+            return Err(error)
+                .context("Video Manager normalized output already exists; refusing to replace it");
         }
         Err(_) => {
             // Some otherwise valid media roots (for example FAT/exFAT or
@@ -328,7 +327,10 @@ mod tests {
         assert!(error.to_string().contains("already exists"));
         let job = database.get_job(&queued.job.id).unwrap().unwrap();
         assert_eq!(job.state, "probed");
-        assert_eq!(std::fs::read(asset_dir.join("primary.mp4")).unwrap(), b"winner");
+        assert_eq!(
+            std::fs::read(asset_dir.join("primary.mp4")).unwrap(),
+            b"winner"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

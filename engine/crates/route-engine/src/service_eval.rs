@@ -13,9 +13,7 @@ use service_runtime::{
     ServiceLifecycleFuture, ServiceMemory,
 };
 
-use crate::ast::{
-    FunctionDef, MethodDef, ModuleFile, ServiceClassDef, ServiceProgram, Value,
-};
+use crate::ast::{FunctionDef, MethodDef, ModuleFile, ServiceClassDef, ServiceProgram, Value};
 use crate::module_eval::{
     HostCapabilityCaller, HostCapabilityFuture, ModuleEvalError, ModuleExecutor,
 };
@@ -49,8 +47,8 @@ impl ServiceHostCapabilities {
                 continue;
             }
             quick_db_classes.insert(class_name.clone());
-            if let Err(error) = quick_db_class_config(class)
-                .and_then(|config| quick_db.create(&class_name, config))
+            if let Err(error) =
+                quick_db_class_config(class).and_then(|config| quick_db.create(&class_name, config))
             {
                 quick_db_init_errors.push((class_name, error.to_string()));
             }
@@ -183,18 +181,13 @@ impl ServiceHostCapabilities {
                 let capacity = options
                     .get("capacity")
                     .ok_or_else(|| {
-                        eval_error(
-                            "SVC4212",
-                            "quickDB.create() options.capacity is required",
-                        )
+                        eval_error("SVC4212", "quickDB.create() options.capacity is required")
                     })
                     .and_then(|value| expect_usize(MODULE, function, value, "capacity"))?;
                 let false_positive_rate = options
                     .get("falsePositiveRate")
                     .or_else(|| options.get("false_positive_rate"))
-                    .map(|value| {
-                        expect_probability(MODULE, function, value, "falsePositiveRate")
-                    })
+                    .map(|value| expect_probability(MODULE, function, value, "falsePositiveRate"))
                     .transpose()?
                     .unwrap_or(0.01);
 
@@ -474,7 +467,10 @@ fn quick_db_class_config(class: &ServiceClassDef) -> Result<FilterConfig, QuickD
             if value.is_finite()
                 && *value > 0.0
                 && value.fract() == 0.0
-                && *value <= usize::MAX as f64 => *value as usize,
+                && *value <= usize::MAX as f64 =>
+        {
+            *value as usize
+        }
         Some(_) => {
             return Err(QuickDbError::new(
                 "bound constant `capacity` must be a positive integer",
@@ -580,11 +576,7 @@ fn expect_usize(
             format!("{module}.{function}() options.{field} must be a number"),
         ));
     };
-    if !value.is_finite()
-        || *value <= 0.0
-        || value.fract() != 0.0
-        || *value > usize::MAX as f64
-    {
+    if !value.is_finite() || *value <= 0.0 || value.fract() != 0.0 || *value > usize::MAX as f64 {
         return Err(eval_error(
             "SVC4212",
             format!(
@@ -747,10 +739,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "rbe-{name}-test-{}-{nonce}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rbe-{name}-test-{}-{nonce}", std::process::id()));
         ModuleProgram::load(&root.join("module")).expect("module load failed")
     }
 
@@ -800,8 +790,7 @@ mod tests {
         "#;
         let program = crate::parse_service_source(source).expect("service parse failed");
         let modules = modules_for_test("quick-db");
-        let executor =
-            ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
+        let executor = ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
 
         let contains = block_on_ready(ServiceExecutor::call(&executor, "setup", vec![]))
             .expect("quickDB setup failed");
@@ -847,8 +836,7 @@ mod tests {
         "#;
         let program = crate::parse_service_source(source).expect("service parse failed");
         let modules = modules_for_test("quick-db-class");
-        let executor =
-            ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
+        let executor = ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
 
         let loaded = block_on_ready(ServiceExecutor::call(
             &executor,
@@ -902,8 +890,7 @@ mod tests {
         "#;
         let program = crate::parse_service_source(source).expect("service parse failed");
         let modules = modules_for_test("quick-db-class-unready");
-        let executor =
-            ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
+        let executor = ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
         let error = block_on_ready(ServiceExecutor::call(
             &executor,
             "check",
@@ -926,8 +913,7 @@ mod tests {
         "#;
         let program = crate::parse_service_source(source).expect("service parse failed");
         let modules = modules_for_test("quick-db-unsealed");
-        let executor =
-            ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
+        let executor = ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
 
         let error = block_on_ready(ServiceExecutor::call(&executor, "unsafeCheck", vec![]))
             .expect_err("unsealed quickDB membership must fail");

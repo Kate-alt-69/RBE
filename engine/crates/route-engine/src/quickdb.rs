@@ -45,7 +45,9 @@ pub struct FilterConfig {
 impl FilterConfig {
     pub fn validate(&self) -> Result<(), QuickDbError> {
         if self.capacity == 0 {
-            return Err(QuickDbError::new("quickDB capacity must be greater than zero"));
+            return Err(QuickDbError::new(
+                "quickDB capacity must be greater than zero",
+            ));
         }
         if !self.false_positive_rate.is_finite()
             || self.false_positive_rate <= 0.0
@@ -143,9 +145,7 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
-        let managed = filters
-            .get_mut(name)
-            .ok_or_else(|| missing_filter(name))?;
+        let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         if let Err(error) = managed.filter.add(value.as_bytes()) {
             managed.ready = false;
             managed.poisoned = true;
@@ -163,9 +163,7 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
-        let managed = filters
-            .get_mut(name)
-            .ok_or_else(|| missing_filter(name))?;
+        let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         let mut added = 0usize;
         for value in values {
             if let Err(error) = managed.filter.add(value.as_bytes()) {
@@ -187,9 +185,7 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
-        let managed = filters
-            .get_mut(name)
-            .ok_or_else(|| missing_filter(name))?;
+        let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         if managed.ready {
             return Err(QuickDbError::new(
                 "quickDB.load() requires an unready filter; use rebuild() to replace a ready filter",
@@ -223,9 +219,7 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
-        let managed = filters
-            .get_mut(name)
-            .ok_or_else(|| missing_filter(name))?;
+        let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         managed.filter.clear();
         managed.ready = false;
         managed.poisoned = false;
@@ -262,9 +256,7 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
-        let managed = filters
-            .get_mut(name)
-            .ok_or_else(|| missing_filter(name))?;
+        let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         ensure_ready(name, managed)?;
         managed.filter.remove(value.as_bytes())
     }
@@ -274,9 +266,7 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
-        let managed = filters
-            .get_mut(name)
-            .ok_or_else(|| missing_filter(name))?;
+        let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         managed.filter.clear();
         managed.ready = false;
         managed.poisoned = false;
@@ -305,9 +295,7 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
-        let managed = filters
-            .get_mut(name)
-            .ok_or_else(|| missing_filter(name))?;
+        let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         if managed.poisoned {
             return Err(QuickDbError::new(format!(
                 "quickDB filter {name:?} cannot be sealed after a failed mutation; clear or rebuild it from the authoritative database first"
@@ -644,9 +632,7 @@ impl ScalableBloomFilter {
     }
 
     fn might_contain(&self, value: &[u8]) -> bool {
-        self.layers
-            .iter()
-            .any(|layer| layer.might_contain(value))
+        self.layers.iter().any(|layer| layer.might_contain(value))
     }
 
     fn clear(&mut self) {
@@ -670,12 +656,7 @@ impl ScalableBloomFilter {
             .iter()
             .fold(0usize, |total, layer| total.saturating_add(layer.bit_len));
         let allocated_bytes = self.layers.iter().fold(0usize, |total, layer| {
-            total.saturating_add(
-                layer
-                    .words
-                    .len()
-                    .saturating_mul(std::mem::size_of::<u64>()),
-            )
+            total.saturating_add(layer.words.len().saturating_mul(std::mem::size_of::<u64>()))
         });
         let hash_functions = self
             .layers
@@ -699,11 +680,11 @@ impl ScalableBloomFilter {
 
 fn bloom_shape(capacity: usize, false_positive_rate: f64) -> Result<(usize, u32), QuickDbError> {
     if capacity == 0 {
-        return Err(QuickDbError::new("quickDB capacity must be greater than zero"));
+        return Err(QuickDbError::new(
+            "quickDB capacity must be greater than zero",
+        ));
     }
-    if !false_positive_rate.is_finite()
-        || false_positive_rate <= 0.0
-        || false_positive_rate >= 1.0
+    if !false_positive_rate.is_finite() || false_positive_rate <= 0.0 || false_positive_rate >= 1.0
     {
         return Err(QuickDbError::new(
             "quickDB falsePositiveRate must be between 0 and 1",
@@ -717,8 +698,8 @@ fn bloom_shape(capacity: usize, false_positive_rate: f64) -> Result<(usize, u32)
         ));
     }
     let bit_len = bits as usize;
-    let hashes = (((bit_len as f64 / capacity as f64) * LN_2).round() as u32)
-        .clamp(1, MAX_HASH_FUNCTIONS);
+    let hashes =
+        (((bit_len as f64 / capacity as f64) * LN_2).round() as u32).clamp(1, MAX_HASH_FUNCTIONS);
     Ok((bit_len.max(64), hashes))
 }
 
@@ -729,9 +710,7 @@ fn hash_indexes(
     modulo: usize,
 ) -> impl Iterator<Item = usize> {
     (0..hash_functions).map(move |index| {
-        (first
-            .wrapping_add((index as u64).wrapping_mul(second))
-            % modulo as u64) as usize
+        (first.wrapping_add((index as u64).wrapping_mul(second)) % modulo as u64) as usize
     })
 }
 
@@ -776,10 +755,22 @@ mod tests {
 
     #[test]
     fn filter_kind_parser_accepts_public_aliases() {
-        assert_eq!(FilterKind::parse("counting").unwrap(), FilterKind::CountingBloom);
-        assert_eq!(FilterKind::parse("countingBloom").unwrap(), FilterKind::CountingBloom);
-        assert_eq!(FilterKind::parse("scalable").unwrap(), FilterKind::ScalableBloom);
-        assert_eq!(FilterKind::parse("scalableBloom").unwrap(), FilterKind::ScalableBloom);
+        assert_eq!(
+            FilterKind::parse("counting").unwrap(),
+            FilterKind::CountingBloom
+        );
+        assert_eq!(
+            FilterKind::parse("countingBloom").unwrap(),
+            FilterKind::CountingBloom
+        );
+        assert_eq!(
+            FilterKind::parse("scalable").unwrap(),
+            FilterKind::ScalableBloom
+        );
+        assert_eq!(
+            FilterKind::parse("scalableBloom").unwrap(),
+            FilterKind::ScalableBloom
+        );
     }
 
     #[test]
@@ -792,11 +783,11 @@ mod tests {
         }
         db.seal("users").unwrap();
         for index in 0..5_000 {
-            assert!(db
-                .might_contain("users", &format!("user-{index}"))
-                .unwrap());
+            assert!(db.might_contain("users", &format!("user-{index}")).unwrap());
         }
-        assert!(db.definitely_missing("users", "definitely-not-added").is_ok());
+        assert!(db
+            .definitely_missing("users", "definitely-not-added")
+            .is_ok());
     }
 
     #[test]
@@ -808,7 +799,9 @@ mod tests {
         db.seal("emails").unwrap();
         assert!(db.might_contain("emails", "kate@example.test").unwrap());
         assert!(db.remove("emails", "kate@example.test").unwrap());
-        assert!(db.definitely_missing("emails", "kate@example.test").unwrap());
+        assert!(db
+            .definitely_missing("emails", "kate@example.test")
+            .unwrap());
     }
 
     #[test]
@@ -842,7 +835,8 @@ mod tests {
     #[test]
     fn snapshot_helpers_finish_ready_under_one_registry_write() {
         let db = QuickDb::default();
-        db.create("users", config(FilterKind::Bloom, 1_000)).unwrap();
+        db.create("users", config(FilterKind::Bloom, 1_000))
+            .unwrap();
         assert_eq!(
             db.load_snapshot("users", ["old-a", "old-b"].into_iter())
                 .unwrap(),
@@ -893,7 +887,8 @@ mod tests {
     #[test]
     fn stats_report_packed_allocations() {
         let db = QuickDb::default();
-        db.create("bloom", config(FilterKind::Bloom, 10_000)).unwrap();
+        db.create("bloom", config(FilterKind::Bloom, 10_000))
+            .unwrap();
         db.create("counting", config(FilterKind::CountingBloom, 10_000))
             .unwrap();
 

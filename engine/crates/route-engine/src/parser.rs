@@ -115,8 +115,10 @@ impl Parser {
 
         while !self.check(&TokenKind::Eof) {
             if self.check(&TokenKind::Class) {
-                let Some(TokenKind::Ident(next_name)) =
-                    self.tokens.get(self.pos + 1).map(|token| token.kind.clone())
+                let Some(TokenKind::Ident(next_name)) = self
+                    .tokens
+                    .get(self.pos + 1)
+                    .map(|token| token.kind.clone())
                 else {
                     return Err(self.error_here("expected class name after `class`"));
                 };
@@ -161,10 +163,9 @@ impl Parser {
                 .iter()
                 .any(|existing: &FunctionDef| existing.name == function.name)
             {
-                return Err(self.error_here(&format!(
-                    "duplicate service function {:?}",
-                    function.name
-                )));
+                return Err(
+                    self.error_here(&format!("duplicate service function {:?}", function.name))
+                );
             }
             if exported {
                 if exports.iter().any(|name| name == &function.name) {
@@ -364,9 +365,10 @@ impl Parser {
                 }
                 Ok(Value::Object(out))
             }
-            _ => Err(self.error_here(
-                "class bound constants must be literal values, arrays, or objects",
-            )),
+            _ => {
+                Err(self
+                    .error_here("class bound constants must be literal values, arrays, or objects"))
+            }
         }
     }
 
