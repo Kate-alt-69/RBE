@@ -133,8 +133,20 @@ impl ServiceHostCapabilities {
     ) -> Result<(String, usize), ModuleEvalError> {
         const MODULE: &str = "quickDB";
         if let Some(scope) = scope.filter(|scope| self.quick_db_classes.contains(*scope)) {
-            expect_arity(MODULE, function, args, scoped_arity)?;
-            return Ok((scope.to_string(), 0));
+            if args.len() == scoped_arity {
+                return Ok((scope.to_string(), 0));
+            }
+            if args.len() == explicit_arity {
+                let name = expect_string(MODULE, function, &args[0], 0)?.to_string();
+                return Ok((name, 1));
+            }
+            return Err(eval_error(
+                "SVC4202",
+                format!(
+                    "{MODULE}.{function}() expects {scoped_arity} scoped argument(s) or {explicit_arity} explicit argument(s), got {}",
+                    args.len()
+                ),
+            ));
         }
 
         expect_arity(MODULE, function, args, explicit_arity)?;
@@ -875,6 +887,40 @@ mod tests {
         assert_eq!(tag, serde_json::json!("auth-usernames"));
     }
 
+    #[test]
+    fn bound_quick_db_class_can_explicitly_target_another_filter() {
+        let source = r#"
+            :import[quickDB]
+            :service[name = user-index]
+
+            class Usernames {
+                const <= set => "bloom";
+                const <= capacity => 1000;
+
+                function rememberElsewhere(value) {
+                    quickDB.add("aliases", value);
+                    quickDB.seal("aliases");
+                    return quickDB.mightHave("aliases", value);
+                }
+            }
+
+            export function setup(value) {
+                quickDB.create("aliases", { capacity: 1000 });
+                return Usernames.rememberElsewhere(value);
+            }
+        "#;
+        let program = crate::parse_service_source(source).expect("service parse failed");
+        let modules = modules_for_test("quick-db-class-explicit-target");
+        let executor = ServiceProgramExecutor::new(program, modules, ServiceMemory::default());
+
+        let remembered = block_on_ready(ServiceExecutor::call(
+            &executor,
+            "setup",
+            vec![serde_json::json!("kate")],
+        ))
+        .expect("bound quickDB explicit target failed");
+        assert_eq!(remembered, serde_json::json!(true));
+    }
     #[test]
     fn bound_quick_db_class_fails_closed_before_load() {
         let source = r#"

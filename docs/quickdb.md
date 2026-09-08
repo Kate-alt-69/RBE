@@ -152,7 +152,16 @@ class Emails {
 }
 ```
 
-Outside a bound class, the explicit lower-level registry API remains available:
+The explicit lower-level registry form also remains available, including from inside a bound class method when that method intentionally targets a different filter:
+
+```text
+function rememberAlias(alias) {
+    quickDB.add("aliases", alias);
+    return quickDB.mightHave("aliases", alias);
+}
+```
+
+Outside a bound class, registry calls continue to require the explicit filter name:
 
 ```text
 quickDB.create("emails", {
@@ -164,7 +173,7 @@ quickDB.addMany("emails", emailsFromDatabase);
 quickDB.seal("emails");
 ```
 
-This lower-level form is useful for dynamic filters and explicit registry management.
+The scoped shorthand is preferred for a class's own filter; the explicit form is useful for dynamic filters and deliberate cross-filter registry management.
 
 ## Correct membership semantics
 
