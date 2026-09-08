@@ -45,6 +45,15 @@ jobs:
           if count != 2:
               raise SystemExit(f"expected 2 counting-filter parity checks, found {count}")
           text = text.replace(old, 'if index.is_multiple_of(2) {')
+
+          old = '''        db.create("users", config(FilterKind::Bloom, 100)).unwrap();
+        let error = db.remove("users", "kate").unwrap_err();'''
+          new = '''        db.create("users", config(FilterKind::Bloom, 100)).unwrap();
+        db.seal("users").unwrap();
+        let error = db.remove("users", "kate").unwrap_err();'''
+          if text.count(old) != 1:
+              raise SystemExit("expected normal bloom deletion regression test block")
+          text = text.replace(old, new)
           quickdb.write_text(text)
           PY
 
