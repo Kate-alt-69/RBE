@@ -432,16 +432,12 @@ mod tests {
 
     #[tokio::test]
     async fn failed_log_collection_removes_candidate_output() {
-        let root = std::env::temp_dir().join(format!(
-            "rbe-ffmpeg-log-cleanup-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rbe-ffmpeg-log-cleanup-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let output = root.join("candidate.mp4");
         std::fs::write(&output, b"partial-output").unwrap();
-        let task = tokio::spawn(async {
-            anyhow::bail!("simulated FFmpeg log overflow")
-        });
+        let task = tokio::spawn(async { anyhow::bail!("simulated FFmpeg log overflow") });
 
         let error = collect_ffmpeg_stderr(task, &output)
             .await

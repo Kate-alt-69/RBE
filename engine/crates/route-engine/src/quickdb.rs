@@ -555,7 +555,7 @@ impl CountingBloomFilter {
 
     fn counter(&self, index: usize) -> u8 {
         let byte = self.counters[index / 2];
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             byte & 0x0f
         } else {
             (byte >> 4) & 0x0f
@@ -565,7 +565,7 @@ impl CountingBloomFilter {
     fn set_counter(&mut self, index: usize, value: u8) {
         let byte = &mut self.counters[index / 2];
         let value = value & 0x0f;
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             *byte = (*byte & 0xf0) | value;
         } else {
             *byte = (*byte & 0x0f) | (value << 4);
@@ -864,6 +864,7 @@ mod tests {
     fn normal_bloom_rejects_deletion() {
         let db = QuickDb::default();
         db.create("users", config(FilterKind::Bloom, 100)).unwrap();
+        db.seal("users").unwrap();
         let error = db.remove("users", "kate").unwrap_err();
         assert!(error.to_string().contains("counting-bloom"));
     }

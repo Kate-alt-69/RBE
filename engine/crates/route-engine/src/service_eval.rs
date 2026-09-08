@@ -897,7 +897,7 @@ mod tests {
             vec![serde_json::json!("kate")],
         ))
         .expect_err("unloaded bound quickDB class must fail closed");
-        assert!(error.to_string().contains("quickDB.seal"));
+        assert!(error.message.contains("quickDB.seal"));
     }
 
     #[test]
@@ -917,7 +917,7 @@ mod tests {
 
         let error = block_on_ready(ServiceExecutor::call(&executor, "unsafeCheck", vec![]))
             .expect_err("unsealed quickDB membership must fail");
-        assert!(error.to_string().contains("quickDB.seal"));
+        assert!(error.message.contains("quickDB.seal"));
     }
 
     #[test]
