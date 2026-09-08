@@ -16,6 +16,8 @@ const MOTHER_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 const MOTHER_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MOTHER_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const MOTHER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const MOTHER_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
+const MOTHER_ACCEPT_FAILURE_LIMIT: u32 = 8;
 const MAX_MOTHER_CONNECTIONS: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +268,7 @@ pub async fn run_service_mother(manager: ServiceManager, token: String) -> anyho
     let token: Arc<str> = Arc::<str>::from(token);
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_MOTHER_CONNECTIONS));
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut accept_failures = 0u32;
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -274,7 +277,28 @@ pub async fn run_service_mother(manager: ServiceManager, token: String) -> anyho
                 }
             }
             accepted = listener.accept() => {
-                let (stream, peer) = accepted?;
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => {
+                        accept_failures = 0;
+                        accepted
+                    }
+                    Err(error) => {
+                        accept_failures = accept_failures.saturating_add(1);
+                        if accept_failures >= MOTHER_ACCEPT_FAILURE_LIMIT {
+                            return Err(anyhow::anyhow!(
+                                "Service Mother listener failed {accept_failures} consecutive accepts: {error}"
+                            ));
+                        }
+                        tracing::warn!(
+                            error = %error,
+                            accept_failures,
+                            retry_ms = MOTHER_ACCEPT_RETRY_DELAY.as_millis() as u64,
+                            "Service Mother listener accept failed; retrying without tearing down services"
+                        );
+                        tokio::time::sleep(MOTHER_ACCEPT_RETRY_DELAY).await;
+                        continue;
+                    }
+                };
                 if !peer.ip().is_loopback() {
                     tracing::warn!(%peer, "Service Mother rejected non-loopback peer");
                     continue;
