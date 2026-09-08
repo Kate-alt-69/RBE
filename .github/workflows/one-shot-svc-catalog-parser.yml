@@ -1,0 +1,247 @@
+name: One-shot service catalog parser repairs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/one-shot-svc-catalog-parser.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Repair service catalog source discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("engine/crates/service-runtime/src/lib.rs")
+          source = path.read_text()
+
+          old_imports = '''    let mut imports = Vec::new();\n    let mut cursor = 0;\n    while let Some(relative) = source[cursor..].find(":import[") {\n        let start = cursor + relative;\n        if let Some((value, _)) = directive(&source[start..], ":import[") {\n            imports.extend(entries(&value).into_iter().map(|entry| unquote(&entry)));\n        }\n        cursor = (start + 8).min(source.len());\n    }'''
+          new_imports = '''    let mut imports = Vec::new();\n    let mut cursor = 0;\n    const IMPORT_PREFIX: &str = ":import[";\n    while cursor < source.len() {\n        let Some((value, relative)) = directive(&source[cursor..], IMPORT_PREFIX) else {\n            break;\n        };\n        imports.extend(entries(&value).into_iter().map(|entry| unquote(&entry)));\n        cursor = cursor\n            .saturating_add(relative)\n            .saturating_add(IMPORT_PREFIX.len())\n            .saturating_add(value.len())\n            .saturating_add(1)\n            .min(source.len());\n    }'''
+          if old_imports not in source:
+              raise SystemExit("service import discovery anchor changed")
+          source = source.replace(old_imports, new_imports, 1)
+
+          old_directive = '''fn directive(source: &str, prefix: &str) -> Option<(String, usize)> {\n    let start = source.find(prefix)?;\n    let begin = start + prefix.len();'''
+          new_directive = '''fn directive(source: &str, prefix: &str) -> Option<(String, usize)> {\n    let start = directive_start(source, prefix)?;\n    let begin = start + prefix.len();'''
+          if old_directive not in source:
+              raise SystemExit("service directive anchor changed")
+          source = source.replace(old_directive, new_directive, 1)
+
+          insert_anchor = '''fn entries(body: &str) -> Vec<String> {'''
+          helper = r'''fn directive_start(source: &str, prefix: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+
+    for (index, character) in source.char_indices() {
+        if line_comment {
+            if character == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        if character == '/' && source[index..].starts_with("//") {
+            line_comment = true;
+            continue;
+        }
+        if source[index..].starts_with(prefix) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+'''
+          if insert_anchor not in source:
+              raise SystemExit("service directive helper anchor changed")
+          source = source.replace(insert_anchor, helper + insert_anchor, 1)
+
+          test_anchor = '''    #[test]\n    fn parses_hybrid_and_on_demand_modes() {'''
+          test = r'''    #[test]
+    fn commented_directives_do_not_override_catalog_metadata() {
+        let path = test_service_path("commented-directives");
+        std::fs::write(
+            &path,
+            "// :import[ignored]\n// :service[name = wrong]\n:import[time]\n:service[name = right]\nexport function run() {}\n",
+        )
+        .unwrap();
+        let service = parse_service(&path, ServiceDefaults::default()).unwrap();
+        assert_eq!(service.name, "right");
+        assert_eq!(service.imports, vec!["time"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+'''
+          if test_anchor not in source:
+              raise SystemExit("service runtime test insertion anchor changed")
+          source = source.replace(test_anchor, test + test_anchor, 1)
+          path.write_text(source)
+          PY
+
+          cd engine
+          cargo fmt --all
+          cargo test -p service-runtime
+          cd ..
+          git add engine/crates/service-runtime/src/lib.rs
+          git commit -m "FIX | BUG-SVC-032 ignore commented service directives"
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("engine/crates/service-runtime/src/lib.rs")
+          source = path.read_text()
+
+          old_exports = '''    let exports = source\n        .lines()\n        .filter_map(|line| {\n            let line = line.trim_start();\n            let rest = line\n                .strip_prefix("export function ")\n                .or_else(|| line.strip_prefix("export async function "))?;\n            let name: String = rest\n                .chars()\n                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')\n                .collect();\n            (!name.is_empty()).then_some(name)\n        })\n        .collect();'''
+          new_exports = '''    let exports = service_export_names(&source);'''
+          if old_exports not in source:
+              raise SystemExit("service export discovery anchor changed")
+          source = source.replace(old_exports, new_exports, 1)
+
+          insert_anchor = '''fn directive(source: &str, prefix: &str) -> Option<(String, usize)> {'''
+          helper = r'''fn service_export_names(source: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut chars = source.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        if line_comment {
+            if character == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            quote = Some(character);
+            continue;
+        }
+        if character == '/' && chars.peek() == Some(&'/') {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            chars.next();
+            line_comment = true;
+            continue;
+        }
+        if character.is_ascii_alphanumeric() || character == '_' {
+            current.push(character);
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    let mut exports = Vec::new();
+    let mut index = 0usize;
+    while index < words.len() {
+        if words[index] != "export" {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 1;
+        if words.get(cursor).is_some_and(|word| word == "async") {
+            cursor += 1;
+        }
+        if words.get(cursor).is_some_and(|word| word == "function") {
+            if let Some(name) = words.get(cursor + 1) {
+                exports.push(name.clone());
+            }
+        }
+        index = cursor.saturating_add(1);
+    }
+    exports
+}
+
+'''
+          if insert_anchor not in source:
+              raise SystemExit("service export helper insertion anchor changed")
+          source = source.replace(insert_anchor, helper + insert_anchor, 1)
+
+          test_anchor = '''    #[test]\n    fn commented_directives_do_not_override_catalog_metadata() {'''
+          test = r'''    #[test]
+    fn export_discovery_matches_whitespace_insensitive_service_syntax() {
+        let path = test_service_path("multiline-export");
+        std::fs::write(
+            &path,
+            ":service[name = multiline]\n// export function ghost() {}\nexport\nasync\nfunction\nvisible() {}\n",
+        )
+        .unwrap();
+        let service = parse_service(&path, ServiceDefaults::default()).unwrap();
+        assert_eq!(service.exports, vec!["visible"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+'''
+          if test_anchor not in source:
+              raise SystemExit("service export test insertion anchor changed")
+          source = source.replace(test_anchor, test + test_anchor, 1)
+          path.write_text(source)
+          PY
+
+          cd engine
+          cargo fmt --all
+          cargo test -p service-runtime
+          cd ..
+          git rm .github/workflows/one-shot-svc-catalog-parser.yml
+          git add engine/crates/service-runtime/src/lib.rs
+          git commit -m "FIX | BUG-SVC-033 parse service exports across whitespace"
+
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" != "$(git rev-parse HEAD~2)" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
