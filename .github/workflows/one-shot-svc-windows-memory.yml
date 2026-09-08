@@ -1,6 +1,6 @@
 name: One-shot Windows service memory limit repair
 
-on:
+"on":
   push:
     branches: [main]
     paths:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   repair:
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,133 +19,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Enforce service memory limits on Windows
-        shell: bash
+      - name: Apply and validate Windows service memory repair
+        shell: pwsh
         run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git fetch origin main
           git reset --hard origin/main
 
-          python - <<'PY'
-          from pathlib import Path
+          python .github/patches/svc-windows-memory.py
 
-          cargo = Path("engine/crates/service-runtime/Cargo.toml")
-          text = cargo.read_text()
-          anchor = "[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n"
-          replacement = anchor + "\n[target.'cfg(windows)'.dependencies]\nwindows-sys = { version = \"0.59\", features = [\"Win32_Foundation\", \"Win32_Security\", \"Win32_System_JobObjects\", \"Win32_System_Threading\"] }\n"
-          if "[target.'cfg(windows)'.dependencies]" not in text:
-              if anchor not in text:
-                  raise SystemExit("service-runtime Cargo.toml dependency anchor changed")
-              text = text.replace(anchor, replacement, 1)
-              cargo.write_text(text)
-
-          lib = Path("engine/crates/service-runtime/src/lib.rs")
-          source = lib.read_text()
-          old = '''#[cfg(not(unix))]
-fn apply_memory_limit(_memory_limit_mb: u64) -> anyhow::Result<()> {
-    Ok(())
-}'''
-          new = '''#[cfg(windows)]
-fn apply_memory_limit(memory_limit_mb: u64) -> anyhow::Result<()> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    if memory_limit_mb == 0 {
-        return Ok(());
-    }
-
-    let limit_bytes = memory_limit_mb
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| anyhow::anyhow!("service memoryLimitMb is too large"))?;
-    let limit_bytes = usize::try_from(limit_bytes)
-        .map_err(|_| anyhow::anyhow!("service memoryLimitMb exceeds Windows addressable memory"))?;
-
-    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-    if job.is_null() {
-        return Err(anyhow::anyhow!(
-            "create Windows service memory Job Object: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-    limits.ProcessMemoryLimit = limit_bytes;
-
-    let configured = unsafe {
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    };
-    if configured == 0 {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            CloseHandle(job);
-        }
-        return Err(anyhow::anyhow!(
-            "configure Windows service memory Job Object: {error}"
-        ));
-    }
-
-    let assigned = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
-    if assigned == 0 {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            CloseHandle(job);
-        }
-        return Err(anyhow::anyhow!(
-            "assign service process to Windows memory Job Object: {error}"
-        ));
-    }
-
-    // A job object remains alive while it still has associated processes, even
-    // after its last userspace handle is closed. We intentionally do not set
-    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so closing this handle preserves the
-    // process memory limit for the lifetime of this service host.
-    unsafe {
-        CloseHandle(job);
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn apply_memory_limit(memory_limit_mb: u64) -> anyhow::Result<()> {
-    if memory_limit_mb == 0 {
-        Ok(())
-    } else {
-        anyhow::bail!("service memoryLimitMb is not supported on this platform")
-    }
-}'''
-          if old not in source:
-              raise SystemExit("service memory limit anchor changed")
-          source = source.replace(old, new, 1)
-          lib.write_text(source)
-          PY
-
-          cd engine
+          Push-Location engine
           cargo fmt --all
           cargo test -p service-runtime
           cargo check -p service-runtime
-          cd ..
+          Pop-Location
 
           git rm .github/workflows/one-shot-svc-windows-memory.yml
+          git rm .github/patches/svc-windows-memory.py
           git add engine/crates/service-runtime/Cargo.toml engine/crates/service-runtime/src/lib.rs engine/Cargo.lock
-          git commit -m "FIX | BUG-SVC-034 enforce service memory limits on Windows"
+          git commit -m 'FIX | BUG-SVC-034 enforce service memory limits on Windows'
 
           git fetch origin main
-          base="$(git rev-parse HEAD~1)"
-          current="$(git rev-parse origin/main)"
-          if [ "$current" != "$base" ]; then
+          $base = git rev-parse HEAD~1
+          $current = git rev-parse origin/main
+          if ($current -ne $base) {
             git rebase origin/main
-          fi
+          }
           git push origin HEAD:main
