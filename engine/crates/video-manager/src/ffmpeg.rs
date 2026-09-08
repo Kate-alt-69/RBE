@@ -177,9 +177,7 @@ async fn run_ffmpeg_once(
         }
     };
 
-    let stderr = stderr_task
-        .await
-        .context("join Video Manager FFmpeg stderr reader")??;
+    let stderr = collect_ffmpeg_stderr(stderr_task, output_path).await?;
     if !status.success() {
         let _ = tokio::fs::remove_file(output_path).await;
         let detail = bounded_error_text(&stderr);
@@ -210,6 +208,22 @@ async fn run_ffmpeg_once(
         audio_codec: "aac",
         size_bytes: metadata.len(),
     })
+}
+
+async fn collect_ffmpeg_stderr(
+    stderr_task: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
+    output_path: &Path,
+) -> anyhow::Result<Vec<u8>> {
+    let result = match stderr_task.await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!(
+            "join Video Manager FFmpeg stderr reader: {error}"
+        )),
+    };
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(output_path).await;
+    }
+    result
 }
 
 async fn validate_paths(input_path: &Path, output_path: &Path) -> anyhow::Result<()> {
@@ -413,6 +427,27 @@ mod tests {
             .await
             .expect_err("existing output must fail");
         assert!(error.to_string().contains("already exists"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_log_collection_removes_candidate_output() {
+        let root = std::env::temp_dir().join(format!(
+            "rbe-ffmpeg-log-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = root.join("candidate.mp4");
+        std::fs::write(&output, b"partial-output").unwrap();
+        let task = tokio::spawn(async {
+            anyhow::bail!("simulated FFmpeg log overflow")
+        });
+
+        let error = collect_ffmpeg_stderr(task, &output)
+            .await
+            .expect_err("failed log collection must reject FFmpeg output");
+        assert!(error.to_string().contains("simulated FFmpeg log overflow"));
+        assert!(!output.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }
