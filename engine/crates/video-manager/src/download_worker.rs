@@ -7,7 +7,8 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    parse_download_target, resolve_download_target, DownloadTarget, QueuedDownload, VideoManager,
+    parse_download_target, resolve_download_target, DownloadTarget, QueuedDownload, VideoAssetState,
+    VideoManager, VideoSourceType,
 };
 
 const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
@@ -75,7 +76,34 @@ impl VideoManager {
             if queued.asset.id != queued.job.asset_id {
                 anyhow::bail!("Video Manager queued download asset/job identity mismatch");
             }
-            let source_url = queued.asset.source_uri.as_deref().ok_or_else(|| {
+
+            // The job is claimed before this transport runs. Re-read its asset
+            // after that claim so a valid-looking but incompatible/stale row
+            // cannot drive HTTP work using an asset that is no longer the
+            // quarantined download this job was created for.
+            let current_asset = self
+                .get_asset(Some(&queued.asset.database), &queued.asset.id)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Video Manager queued download asset {:?} disappeared after job claim",
+                        queued.asset.id
+                    )
+                })?;
+            if current_asset.id != queued.job.asset_id
+                || current_asset.source_type != VideoSourceType::Download
+                || current_asset.state != VideoAssetState::Quarantined
+            {
+                anyhow::bail!(
+                    "Video Manager queued job no longer references a quarantined download asset"
+                );
+            }
+            if current_asset.source_uri != queued.asset.source_uri {
+                anyhow::bail!(
+                    "Video Manager queued download source changed after job discovery; refusing stale network work"
+                );
+            }
+
+            let source_url = current_asset.source_uri.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("Video Manager queued download has no source URL")
             })?;
             let target = parse_download_target(source_url)?;
@@ -498,6 +526,46 @@ mod tests {
             windows_file_identity(&first_a).unwrap(),
             windows_file_identity(&second).unwrap()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn claimed_download_rejects_authoritative_asset_drift_before_network() {
+        let root = quarantine_test_root("asset-drift");
+        let database_path = root.join("video-manager.db");
+        let manager = VideoManager::open_default(&database_path, 7200).unwrap();
+        let queued = manager
+            .queue_download(crate::QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "drift".into(),
+                group: "downloads".into(),
+                title: "Drift".into(),
+                url: "https://example.invalid/drift.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let quarantine = manager
+            .quarantine_path(&queued.asset.id, &queued.job.id)
+            .unwrap();
+
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE video_assets SET state = 'ready' WHERE id = ?1",
+                rusqlite::params![queued.asset.id],
+            )
+            .unwrap();
+
+        let error = manager
+            .run_queued_download(&queued, DownloadPolicy::default())
+            .await
+            .expect_err("asset drift must fail before network access");
+        assert!(error.to_string().contains("quarantined download asset"));
+        let job = manager.get_job(None, &queued.job.id).unwrap().unwrap();
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.attempts, 1);
+        assert!(!quarantine.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
