@@ -1,0 +1,180 @@
+name: One-shot bound QuickDB target repair
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-qdb-scope.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Repair bound QuickDB explicit targeting and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          service = Path("engine/crates/route-engine/src/service_eval.rs")
+          text = service.read_text()
+          old = "\n".join([
+              "        if let Some(scope) = scope.filter(|scope| self.quick_db_classes.contains(*scope)) {",
+              "            expect_arity(MODULE, function, args, scoped_arity)?;",
+              "            return Ok((scope.to_string(), 0));",
+              "        }",
+              "",
+              "        expect_arity(MODULE, function, args, explicit_arity)?;",
+              "        let name = expect_string(MODULE, function, &args[0], 0)?.to_string();",
+              "        Ok((name, 1))",
+          ])
+          new = "\n".join([
+              "        if let Some(scope) = scope.filter(|scope| self.quick_db_classes.contains(*scope)) {",
+              "            if args.len() == scoped_arity {",
+              "                return Ok((scope.to_string(), 0));",
+              "            }",
+              "            if args.len() == explicit_arity {",
+              "                let name = expect_string(MODULE, function, &args[0], 0)?.to_string();",
+              "                return Ok((name, 1));",
+              "            }",
+              "            return Err(eval_error(",
+              "                \"SVC4202\",",
+              "                format!(",
+              "                    \"{MODULE}.{function}() expects {scoped_arity} scoped argument(s) or {explicit_arity} explicit argument(s), got {}\",",
+              "                    args.len()",
+              "                ),",
+              "            ));",
+              "        }",
+              "",
+              "        expect_arity(MODULE, function, args, explicit_arity)?;",
+              "        let name = expect_string(MODULE, function, &args[0], 0)?.to_string();",
+              "        Ok((name, 1))",
+          ])
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one quick_db_target block, found {text.count(old)}")
+          text = text.replace(old, new)
+
+          marker = "\n".join([
+              "    #[test]",
+              "    fn bound_quick_db_class_fails_closed_before_load() {",
+          ])
+          test = "\n".join([
+              "    #[test]",
+              "    fn bound_quick_db_class_can_explicitly_target_another_filter() {",
+              "        let source = r#\"",
+              "            :import[quickDB]",
+              "            :service[name = user-index]",
+              "",
+              "            class Usernames {",
+              "                const <= set => \"bloom\";",
+              "                const <= capacity => 1000;",
+              "",
+              "                function rememberElsewhere(value) {",
+              "                    quickDB.add(\"aliases\", value);",
+              "                    quickDB.seal(\"aliases\");",
+              "                    return quickDB.mightHave(\"aliases\", value);",
+              "                }",
+              "            }",
+              "",
+              "            export function setup(value) {",
+              "                quickDB.create(\"aliases\", { capacity: 1000 });",
+              "                return Usernames.rememberElsewhere(value);",
+              "            }",
+              "        \"#;",
+              "        let program = crate::parse_service_source(source).expect(\"service parse failed\");",
+              "        let modules = modules_for_test(\"quick-db-class-explicit-target\");",
+              "        let executor = ServiceProgramExecutor::new(program, modules, ServiceMemory::default());",
+              "",
+              "        let remembered = block_on_ready(ServiceExecutor::call(",
+              "            &executor,",
+              "            \"setup\",",
+              "            vec![serde_json::json!(\"kate\")],",
+              "        ))",
+              "        .expect(\"bound quickDB explicit target failed\");",
+              "        assert_eq!(remembered, serde_json::json!(true));",
+              "    }",
+              "",
+          ])
+          if text.count(marker) != 1:
+              raise SystemExit(f"expected one bound unready test marker, found {text.count(marker)}")
+          text = text.replace(marker, test + marker)
+          service.write_text(text)
+
+          docs = Path("docs/quickdb.md")
+          text = docs.read_text()
+          old = "\n".join([
+              "Outside a bound class, the explicit lower-level registry API remains available:",
+              "",
+              "```text",
+              "quickDB.create(\"emails\", {",
+              "    kind: \"countingBloom\",",
+              "    capacity: 100000000,",
+              "    falsePositiveRate: 0.001",
+              "});",
+              "quickDB.addMany(\"emails\", emailsFromDatabase);",
+              "quickDB.seal(\"emails\");",
+              "```",
+              "",
+              "This lower-level form is useful for dynamic filters and explicit registry management.",
+          ])
+          new = "\n".join([
+              "The explicit lower-level registry form also remains available, including from inside a bound class method when that method intentionally targets a different filter:",
+              "",
+              "```text",
+              "function rememberAlias(alias) {",
+              "    quickDB.add(\"aliases\", alias);",
+              "    return quickDB.mightHave(\"aliases\", alias);",
+              "}",
+              "```",
+              "",
+              "Outside a bound class, registry calls continue to require the explicit filter name:",
+              "",
+              "```text",
+              "quickDB.create(\"emails\", {",
+              "    kind: \"countingBloom\",",
+              "    capacity: 100000000,",
+              "    falsePositiveRate: 0.001",
+              "});",
+              "quickDB.addMany(\"emails\", emailsFromDatabase);",
+              "quickDB.seal(\"emails\");",
+              "```",
+              "",
+              "The scoped shorthand is preferred for a class's own filter; the explicit form is useful for dynamic filters and deliberate cross-filter registry management.",
+          ])
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one scoped QuickDB docs block, found {text.count(old)}")
+          docs.write_text(text.replace(old, new))
+          PY
+
+          cd engine
+          cargo fmt --all
+          cargo clippy -p route-engine --all-targets -- -D warnings
+          cargo test -p route-engine
+          cd ..
+
+          validated_base="$(git rev-parse HEAD)"
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" != "$validated_base" ]; then
+            echo "main moved during validation; refusing stale push"
+            exit 75
+          fi
+
+          rm .github/workflows/one-shot-qdb-scope.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "FIX | BUG-QDB-005 allow explicit QuickDB targets within bound classes"
+          git push origin HEAD:main
