@@ -46,15 +46,17 @@ impl VideoWorkerHandle {
     /// recovery will safely re-queue any interrupted job on the next boot.
     pub async fn shutdown(mut self, timeout: Duration) {
         let _ = self.shutdown.send(true);
-        match tokio::time::timeout(timeout, &mut self.task).await {
+        let needs_cleanup = match tokio::time::timeout(timeout, &mut self.task).await {
             Ok(Ok(())) => {
                 tracing::info!("Video Manager download worker stopped gracefully");
+                false
             }
             Ok(Err(error)) => {
                 tracing::warn!(
                     error = %error,
                     "Video Manager download worker task ended unexpectedly during shutdown"
                 );
+                true
             }
             Err(_) => {
                 tracing::warn!(
@@ -63,18 +65,39 @@ impl VideoWorkerHandle {
                 );
                 self.task.abort();
                 let _ = self.task.await;
+                true
             }
-        }
-        if let Err(error) = self.manager.set_worker_state(VideoWorkerState::Disabled) {
-            tracing::error!(error = %error, "Video Manager worker shutdown telemetry failed");
-        }
-        if let Err(error) = self.manager.set_worker_encoder(None) {
-            tracing::error!(error = %error, "Video Manager worker encoder cleanup failed");
+        };
+        if needs_cleanup {
+            if let Err(error) = self.manager.release_worker_registration() {
+                tracing::error!(error = %error, "Video Manager worker shutdown cleanup failed");
+            }
         }
     }
 }
 
 impl VideoManager {
+    fn release_worker_registration(&self) -> anyhow::Result<()> {
+        let mut state = self
+            .worker_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager worker state mutex is poisoned"))?;
+        let encoder_result = match self.worker_encoder.lock() {
+            Ok(mut encoder) => {
+                *encoder = None;
+                Ok(())
+            }
+            Err(_) => Err(anyhow::anyhow!(
+                "Video Manager worker encoder mutex is poisoned"
+            )),
+        };
+        // `Disabled` is the public ownership hand-off. Publish it only after
+        // encoder cleanup while still holding the same state lock used by
+        // `spawn_download_worker`, so an old supervisor cannot clobber a new one.
+        *state = VideoWorkerState::Disabled;
+        encoder_result
+    }
+
     fn recover_worker_database(&self, name: &str) -> anyhow::Result<usize> {
         let (_, database) = self.resolve_database(Some(name))?;
         let mut count = 0usize;
@@ -226,11 +249,8 @@ impl VideoManager {
                 }
             }
 
-            if let Err(error) = task_manager.set_worker_state(VideoWorkerState::Disabled) {
-                tracing::error!(error = %error, "Video Manager worker supervisor exit telemetry failed");
-            }
-            if let Err(error) = task_manager.set_worker_encoder(None) {
-                tracing::error!(error = %error, "Video Manager worker supervisor encoder cleanup failed");
+            if let Err(error) = task_manager.release_worker_registration() {
+                tracing::error!(error = %error, "Video Manager worker supervisor cleanup failed");
             }
         });
 
@@ -506,6 +526,44 @@ mod tests {
             *manager.worker_state.lock().unwrap(),
             VideoWorkerState::Disabled
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_release_holds_slot_until_encoder_cleanup_finishes() {
+        let root = temp_root("registration-release");
+        let manager =
+            Arc::new(VideoManager::open_default(root.join("video-manager.db"), 7200).unwrap());
+        let encoder = policy(&root).ffmpeg.video_encoder;
+        manager
+            .set_worker_state(VideoWorkerState::Sleeping)
+            .unwrap();
+        manager.set_worker_encoder(Some(encoder)).unwrap();
+
+        let encoder_guard = manager.worker_encoder.lock().unwrap();
+        let release_manager = manager.clone();
+        let release = std::thread::spawn(move || release_manager.release_worker_registration());
+
+        let mut state_lock_held = false;
+        for _ in 0..100 {
+            if manager.worker_state.try_lock().is_err() {
+                state_lock_held = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            state_lock_held,
+            "worker registration cleanup must retain slot ownership while encoder cleanup is blocked"
+        );
+
+        drop(encoder_guard);
+        release.join().unwrap().unwrap();
+        assert_eq!(
+            *manager.worker_state.lock().unwrap(),
+            VideoWorkerState::Disabled
+        );
+        assert!(manager.worker_encoder.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
