@@ -3,7 +3,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 
 use service_runtime::{
@@ -13,6 +13,8 @@ use service_runtime::{
 const MOTHER_RESTART_BASE_DELAY: Duration = Duration::from_millis(250);
 const MOTHER_RESTART_MAX_DELAY: Duration = Duration::from_secs(30);
 const MOTHER_STABLE_WINDOW: Duration = Duration::from_secs(60);
+const MOTHER_READY_MAX_BYTES: usize = 4 * 1024;
+const MOTHER_STDOUT_LINE_MAX_BYTES: usize = 64 * 1024;
 
 pub struct ServiceMotherProcess {
     manager: ServiceManager,
@@ -251,23 +253,30 @@ async fn spawn_process(
         }
     };
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    let bytes =
-        match tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line)).await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(error)) => {
-                cleanup_failed_spawn(&alias, &mut child).await;
-                return Err(error.into());
-            }
-            Err(_) => {
-                cleanup_failed_spawn(&alias, &mut child).await;
-                anyhow::bail!("Service Mother readiness timed out");
-            }
-        };
-    if bytes == 0 {
-        cleanup_failed_spawn(&alias, &mut child).await;
-        anyhow::bail!("Service Mother exited before readiness");
-    }
+    let line = match tokio::time::timeout(
+        Duration::from_secs(30),
+        read_bounded_buffered_line(
+            &mut reader,
+            MOTHER_READY_MAX_BYTES,
+            "Service Mother readiness",
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            anyhow::bail!("Service Mother exited before readiness");
+        }
+        Ok(Err(error)) => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            return Err(error);
+        }
+        Err(_) => {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            anyhow::bail!("Service Mother readiness timed out");
+        }
+    };
     let ready: ServiceMotherReady = match serde_json::from_str(line.trim()) {
         Ok(ready) => ready,
         Err(error) => {
@@ -285,16 +294,21 @@ async fn spawn_process(
     }
 
     tokio::spawn(async move {
-        let mut line = String::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => return,
-                Ok(_) => {
+            match read_service_mother_stdout_line(&mut reader, MOTHER_STDOUT_LINE_MAX_BYTES).await {
+                Ok(None) => return,
+                Ok(Some(ServiceMotherStdoutLine::Line(line))) => {
                     let output = line.trim_end();
                     if !output.is_empty() {
                         tracing::info!(%output, "Service Mother stdout");
                     }
+                }
+                Ok(Some(ServiceMotherStdoutLine::Oversized)) => tracing::warn!(
+                    max_bytes = MOTHER_STDOUT_LINE_MAX_BYTES,
+                    "discarded oversized Service Mother stdout line"
+                ),
+                Ok(Some(ServiceMotherStdoutLine::InvalidUtf8)) => {
+                    tracing::warn!("discarded non-UTF-8 Service Mother stdout line")
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "failed to drain Service Mother stdout");
@@ -453,6 +467,94 @@ fn mother_restart_delay(attempt: u32) -> Duration {
     )
 }
 
+async fn read_bounded_buffered_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+    label: &str,
+) -> anyhow::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_bytes.min(1024));
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            anyhow::bail!("{label} is not newline terminated");
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        if bytes.len().saturating_add(consumed) > max_bytes {
+            reader.consume(consumed);
+            anyhow::bail!("{label} exceeded {max_bytes} bytes");
+        }
+        bytes.extend_from_slice(&buffer[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|error| anyhow::anyhow!("{label} is not valid UTF-8: {error}"));
+        }
+    }
+}
+
+enum ServiceMotherStdoutLine {
+    Line(String),
+    Oversized,
+    InvalidUtf8,
+}
+
+async fn read_service_mother_stdout_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<ServiceMotherStdoutLine>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_bytes.min(1024));
+    let mut oversized = false;
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            if bytes.is_empty() && !oversized {
+                return Ok(None);
+            }
+            if oversized {
+                return Ok(Some(ServiceMotherStdoutLine::Oversized));
+            }
+            return Ok(Some(match String::from_utf8(bytes) {
+                Ok(line) => ServiceMotherStdoutLine::Line(line),
+                Err(_) => ServiceMotherStdoutLine::InvalidUtf8,
+            }));
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        if !oversized {
+            if bytes.len().saturating_add(consumed) > max_bytes {
+                oversized = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(&buffer[..consumed]);
+            }
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            if oversized {
+                return Ok(Some(ServiceMotherStdoutLine::Oversized));
+            }
+            return Ok(Some(match String::from_utf8(bytes) {
+                Ok(line) => ServiceMotherStdoutLine::Line(line),
+                Err(_) => ServiceMotherStdoutLine::InvalidUtf8,
+            }));
+        }
+    }
+}
+
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
@@ -468,6 +570,47 @@ async fn cleanup_failed_spawn(alias: &Path, child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mother_readiness_reader_is_bounded_and_preserves_following_output() {
+        let payload = b"{\"pid\":1}\nfirst-log-line\n";
+        let mut reader = BufReader::new(&payload[..]);
+        let readiness = read_bounded_buffered_line(&mut reader, 64, "readiness")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(readiness, "{\"pid\":1}\n");
+
+        let mut next = String::new();
+        reader.read_line(&mut next).await.unwrap();
+        assert_eq!(next, "first-log-line\n");
+
+        let oversized = format!("{}\n", "x".repeat(65));
+        let mut oversized_reader = BufReader::new(oversized.as_bytes());
+        let error = read_bounded_buffered_line(&mut oversized_reader, 64, "readiness")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded 64 bytes"));
+    }
+
+    #[tokio::test]
+    async fn mother_stdout_reader_discards_oversized_lines_and_keeps_draining() {
+        let payload = format!("{}\nnext-line\n", "x".repeat(65));
+        let mut reader = BufReader::new(payload.as_bytes());
+        assert!(matches!(
+            read_service_mother_stdout_line(&mut reader, 64)
+                .await
+                .unwrap(),
+            Some(ServiceMotherStdoutLine::Oversized)
+        ));
+        match read_service_mother_stdout_line(&mut reader, 64)
+            .await
+            .unwrap()
+        {
+            Some(ServiceMotherStdoutLine::Line(line)) => assert_eq!(line, "next-line\n"),
+            _ => panic!("stdout reader should continue with the next bounded line"),
+        }
+    }
 
     #[test]
     fn catalog_fingerprint_argument_is_fixed_size_hex() {
