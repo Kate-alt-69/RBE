@@ -119,6 +119,7 @@ async fn run_live_runtime_coordinator(
                 continue;
             }
         };
+        restore_active_state_after_demand_recovery(&manager, active);
 
         if demand && !active {
             let _ = manager.set_live_runtime_state(VideoLiveRuntimeState::Starting);
@@ -228,6 +229,25 @@ async fn run_live_runtime_coordinator(
             } else {
                 true
             };
+        }
+    }
+}
+
+fn restore_active_state_after_demand_recovery(manager: &VideoManager, active: bool) {
+    if !active {
+        return;
+    }
+    if matches!(
+        manager.live_runtime_state(),
+        Ok(VideoLiveRuntimeState::Degraded)
+    ) {
+        if let Err(error) = manager.set_live_runtime_state(VideoLiveRuntimeState::Active) {
+            tracing::error!(
+                error = %error,
+                "Video Manager failed to restore active live runtime telemetry after demand recovery"
+            );
+        } else {
+            tracing::info!("Video Manager live runtime demand checks recovered");
         }
     }
 }
@@ -554,6 +574,31 @@ mod tests {
                 asset_id: asset.id,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn successful_demand_probe_restores_active_runtime_telemetry() {
+        let path = temp_db("demand-recovery-state");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        manager
+            .set_live_runtime_state(VideoLiveRuntimeState::Degraded)
+            .unwrap();
+
+        restore_active_state_after_demand_recovery(&manager, true);
+        assert_eq!(
+            manager.live_runtime_state().unwrap(),
+            VideoLiveRuntimeState::Active
+        );
+
+        manager
+            .set_live_runtime_state(VideoLiveRuntimeState::Degraded)
+            .unwrap();
+        restore_active_state_after_demand_recovery(&manager, false);
+        assert_eq!(
+            manager.live_runtime_state().unwrap(),
+            VideoLiveRuntimeState::Degraded
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]
