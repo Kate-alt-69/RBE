@@ -26,44 +26,74 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+
+          apply_fixes() {
+            python3 - <<'PY'
           from pathlib import Path
 
           service = Path("engine/crates/route-engine/src/service_eval.rs")
           text = service.read_text()
           old = 'assert!(error.to_string().contains("quickDB.seal"));'
-          count = text.count(old)
-          if count != 2:
-              raise SystemExit(f"expected 2 ServiceExecutionError string assertions, found {count}")
-          text = text.replace(old, 'assert!(error.message.contains("quickDB.seal"));')
+          new = 'assert!(error.message.contains("quickDB.seal"));'
+          if text.count(old) == 2:
+              text = text.replace(old, new)
+          elif text.count(new) != 2:
+              raise SystemExit("unexpected ServiceExecutionError assertion shape")
           service.write_text(text)
 
           quickdb = Path("engine/crates/route-engine/src/quickdb.rs")
           text = quickdb.read_text()
           old = 'if index % 2 == 0 {'
-          count = text.count(old)
-          if count != 2:
-              raise SystemExit(f"expected 2 counting-filter parity checks, found {count}")
-          text = text.replace(old, 'if index.is_multiple_of(2) {')
+          new = 'if index.is_multiple_of(2) {'
+          if text.count(old) == 2:
+              text = text.replace(old, new)
+          elif text.count(new) != 2:
+              raise SystemExit("unexpected counting-filter parity check shape")
 
           old = '''        db.create("users", config(FilterKind::Bloom, 100)).unwrap();
         let error = db.remove("users", "kate").unwrap_err();'''
           new = '''        db.create("users", config(FilterKind::Bloom, 100)).unwrap();
         db.seal("users").unwrap();
         let error = db.remove("users", "kate").unwrap_err();'''
-          if text.count(old) != 1:
-              raise SystemExit("expected normal bloom deletion regression test block")
-          text = text.replace(old, new)
+          if text.count(old) == 1:
+              text = text.replace(old, new)
+          elif text.count(new) != 1:
+              raise SystemExit("unexpected normal bloom deletion regression test shape")
           quickdb.write_text(text)
           PY
+          }
 
-          cd engine
-          cargo fmt --all
-          cargo clippy -p route-engine --all-targets -- -D warnings
-          cargo test -p route-engine
-          cd ..
+          validate() {
+            cd engine
+            cargo fmt --all
+            cargo clippy -p route-engine --all-targets -- -D warnings
+            cargo test -p route-engine
+            cd ..
+          }
 
-          rm .github/workflows/one-shot-qdb-clippy.yml
+          git fetch origin main
+          git reset --hard origin/main
+          apply_fixes
+          validate
+
+          validated_base="$(git rev-parse HEAD)"
+          git fetch origin main
+          latest_base="$(git rev-parse origin/main)"
+          if [ "$validated_base" != "$latest_base" ]; then
+            git reset --hard origin/main
+            apply_fixes
+            validate
+            validated_base="$(git rev-parse HEAD)"
+            git fetch origin main
+            latest_base="$(git rev-parse origin/main)"
+          fi
+
+          if [ "$validated_base" != "$latest_base" ]; then
+            echo "main moved twice during validation; refusing stale push"
+            exit 75
+          fi
+
+          rm -f .github/workflows/one-shot-qdb-clippy.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
