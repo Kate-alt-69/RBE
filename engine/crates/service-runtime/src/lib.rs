@@ -370,12 +370,18 @@ fn parse_service(
 
     let mut imports = Vec::new();
     let mut cursor = 0;
-    while let Some(relative) = source[cursor..].find(":import[") {
-        let start = cursor + relative;
-        if let Some((value, _)) = directive(&source[start..], ":import[") {
-            imports.extend(entries(&value).into_iter().map(|entry| unquote(&entry)));
-        }
-        cursor = (start + 8).min(source.len());
+    const IMPORT_PREFIX: &str = ":import[";
+    while cursor < source.len() {
+        let Some((value, relative)) = directive(&source[cursor..], IMPORT_PREFIX) else {
+            break;
+        };
+        imports.extend(entries(&value).into_iter().map(|entry| unquote(&entry)));
+        cursor = cursor
+            .saturating_add(relative)
+            .saturating_add(IMPORT_PREFIX.len())
+            .saturating_add(value.len())
+            .saturating_add(1)
+            .min(source.len());
     }
 
     let exports = source
@@ -419,7 +425,7 @@ fn parse_service(
 }
 
 fn directive(source: &str, prefix: &str) -> Option<(String, usize)> {
-    let start = source.find(prefix)?;
+    let start = directive_start(source, prefix)?;
     let begin = start + prefix.len();
     let mut quote = None;
     let mut escaped = false;
@@ -442,6 +448,45 @@ fn directive(source: &str, prefix: &str) -> Option<(String, usize)> {
         }
         if character == ']' && quote.is_none() {
             return Some((source[begin..begin + index].to_string(), start));
+        }
+    }
+    None
+}
+
+fn directive_start(source: &str, prefix: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+
+    for (index, character) in source.char_indices() {
+        if line_comment {
+            if character == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        if character == '/' && source[index..].starts_with("//") {
+            line_comment = true;
+            continue;
+        }
+        if source[index..].starts_with(prefix) {
+            return Some(index);
         }
     }
     None
@@ -1153,6 +1198,20 @@ mod tests {
         let memory = ServiceMemory::default();
         memory.set("x".into(), serde_json::json!(7));
         assert_eq!(memory.get("x"), Some(serde_json::json!(7)));
+    }
+
+    #[test]
+    fn commented_directives_do_not_override_catalog_metadata() {
+        let path = test_service_path("commented-directives");
+        std::fs::write(
+            &path,
+            "// :import[ignored]\n// :service[name = wrong]\n:import[time]\n:service[name = right]\nexport function run() {}\n",
+        )
+        .unwrap();
+        let service = parse_service(&path, ServiceDefaults::default()).unwrap();
+        assert_eq!(service.name, "right");
+        assert_eq!(service.imports, vec!["time"]);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
