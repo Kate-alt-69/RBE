@@ -625,40 +625,92 @@ impl VideoDatabase for SqliteVideoDatabase {
     }
 
     fn recover_incomplete_downloads(&self, database: &str) -> anyhow::Result<Vec<QueuedDownload>> {
-        let pairs = {
-            let now = now_ms();
-            let connection = self
-                .connection
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
-            let transaction = connection.unchecked_transaction()?;
-            let mut statement = transaction.prepare(
-                "SELECT id, asset_id FROM video_jobs WHERE job_type = 'download' AND state IN ('downloading', 'downloaded', 'inspecting', 'container_checked', 'probing', 'probed', 'normalizing') ORDER BY created_at_ms ASC, id ASC",
-            )?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(statement);
-            transaction.execute(
-                "UPDATE video_jobs SET state = 'queued', progress = 0.0, error = NULL, updated_at_ms = ?1 WHERE job_type = 'download' AND state IN ('downloading', 'downloaded', 'inspecting', 'container_checked', 'probing', 'probed', 'normalizing')",
-                params![now],
-            )?;
-            transaction.commit()?;
-            rows
-        };
+        let now = now_ms();
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Video Manager database mutex is poisoned"))?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut statement = transaction.prepare(
+            "SELECT id, asset_id, job_type, state, progress, attempts, error, created_at_ms, updated_at_ms FROM video_jobs WHERE job_type = 'download' AND state IN ('downloading', 'downloaded', 'inspecting', 'container_checked', 'probing', 'probed', 'normalizing') ORDER BY created_at_ms ASC, id ASC",
+        )?;
+        let jobs = statement
+            .query_map([], read_video_job)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
 
-        let mut recovered = Vec::with_capacity(pairs.len());
-        for (job_id, asset_id) in pairs {
-            let job = self.get_job(&job_id)?.ok_or_else(|| {
-                anyhow::anyhow!("Video Manager recovered job {job_id:?} disappeared")
+        let mut recovered = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let mut job = validate_stored_job(job)?;
+            let asset_row = transaction
+                .query_row(
+                    "SELECT a.id, a.title, a.state, a.source_type, a.source_uri, a.metadata_json, a.created_at_ms, a.updated_at_ms, n.id, g.name
+                     FROM video_assets a
+                     JOIN video_groups g ON g.id = a.group_id
+                     JOIN video_namespaces n ON n.id = g.namespace_id
+                     WHERE a.id = ?1",
+                    params![job.asset_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, String>(9)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some(row) = asset_row else {
+                anyhow::bail!(
+                    "Video Manager recovered asset {:?} disappeared before recovery commit",
+                    job.asset_id
+                );
+            };
+            let source_type = parse_source_type(&row.3)?;
+            let metadata = serde_json::from_str(&row.5).with_context(|| {
+                format!("parse Video Manager asset {} metadata JSON", row.0)
             })?;
-            let asset = self.get_asset(database, &asset_id)?.ok_or_else(|| {
-                anyhow::anyhow!("Video Manager recovered asset {asset_id:?} disappeared")
-            })?;
+            let asset = VideoAsset {
+                uri: format!("vm://{}/{}/{}", row.8, row.9, row.0),
+                id: row.0,
+                database: database.to_string(),
+                namespace: row.8,
+                group: row.9,
+                title: row.1,
+                state: VideoAssetState::parse(&row.2)?,
+                source_type,
+                source_uri: row.4,
+                metadata,
+                created_at_ms: row.6,
+                updated_at_ms: row.7,
+            };
+
+            job.state = "queued".into();
+            job.progress = PROGRESS_QUEUED;
+            job.error = None;
+            job.updated_at_ms = now.max(job.created_at_ms);
+            let job = validate_stored_job(job)?;
             recovered.push(QueuedDownload { asset, job });
         }
+
+        let changed = transaction.execute(
+            "UPDATE video_jobs SET state = 'queued', progress = 0.0, error = NULL, updated_at_ms = MAX(created_at_ms, ?1) WHERE job_type = 'download' AND state IN ('downloading', 'downloaded', 'inspecting', 'container_checked', 'probing', 'probed', 'normalizing')",
+            params![now],
+        )?;
+        if changed != recovered.len() {
+            anyhow::bail!(
+                "Video Manager recovery batch changed {changed} jobs after validating {}",
+                recovered.len()
+            );
+        }
+        transaction.commit()?;
         Ok(recovered)
     }
 
@@ -2155,8 +2207,6 @@ mod tests {
             })
             .unwrap();
 
-        // Start on the broken adapter so the healthy default database is only
-        // reachable if discovery isolates the adapter error and keeps scanning.
         manager.worker_database_cursor.store(1, Ordering::Relaxed);
         let queued = manager.next_queued_download(None).unwrap().unwrap();
         assert_eq!(queued.asset.database, DEFAULT_DATABASE_NAME);
@@ -2717,6 +2767,77 @@ mod tests {
             manager.next_queued_download(None).unwrap().unwrap().job.id,
             queued.job.id
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn recovery_validation_failure_does_not_requeue_batch() {
+        let path = temp_db("worker-recovery-corrupt");
+        let manager = VideoManager::open_default(&path, 7200).unwrap();
+        let first = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "recovery".into(),
+                title: "First interrupted".into(),
+                url: "https://example.invalid/first.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let second = manager
+            .queue_download(QueueDownloadRequest {
+                database: None,
+                namespace_kind: "module".into(),
+                namespace_owner: "worker".into(),
+                group: "recovery".into(),
+                title: "Second interrupted".into(),
+                url: "https://example.invalid/second.mp4".into(),
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        let (_, database) = manager.resolve_database(None).unwrap();
+        for queued in [&first, &second] {
+            database
+                .claim_job(&queued.job.id, "queued", "downloading")
+                .unwrap()
+                .unwrap();
+        }
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE video_assets SET metadata_json = '{broken' WHERE id = ?1",
+                params![second.asset.id],
+            )
+            .unwrap();
+
+        let error = database
+            .recover_incomplete_downloads(DEFAULT_DATABASE_NAME)
+            .expect_err("corrupt recovery asset must reject the whole recovery batch");
+        assert!(error.to_string().contains("metadata JSON"));
+        assert_eq!(
+            database.get_job(&first.job.id).unwrap().unwrap().state,
+            "downloading"
+        );
+        assert_eq!(
+            database.get_job(&second.job.id).unwrap().unwrap().state,
+            "downloading"
+        );
+
+        connection
+            .execute(
+                "UPDATE video_assets SET metadata_json = 'null' WHERE id = ?1",
+                params![second.asset.id],
+            )
+            .unwrap();
+        let recovered = database
+            .recover_incomplete_downloads(DEFAULT_DATABASE_NAME)
+            .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered.iter().all(|queued| queued.job.state == "queued"));
+        assert_eq!(database.get_job(&first.job.id).unwrap().unwrap().state, "queued");
+        assert_eq!(database.get_job(&second.job.id).unwrap().unwrap().state, "queued");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
