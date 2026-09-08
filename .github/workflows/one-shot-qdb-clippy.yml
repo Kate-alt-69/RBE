@@ -1,0 +1,62 @@
+name: One-shot QuickDB clippy repair
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-qdb-clippy.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Repair QuickDB lint breakages and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          service = Path("engine/crates/route-engine/src/service_eval.rs")
+          text = service.read_text()
+          old = 'assert!(error.to_string().contains("quickDB.seal"));'
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f"expected 2 ServiceExecutionError string assertions, found {count}")
+          text = text.replace(old, 'assert!(error.message.contains("quickDB.seal"));')
+          service.write_text(text)
+
+          quickdb = Path("engine/crates/route-engine/src/quickdb.rs")
+          text = quickdb.read_text()
+          old = 'if index % 2 == 0 {'
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f"expected 2 counting-filter parity checks, found {count}")
+          text = text.replace(old, 'if index.is_multiple_of(2) {')
+          quickdb.write_text(text)
+          PY
+
+          cd engine
+          cargo fmt --all
+          cargo clippy -p route-engine --all-targets -- -D warnings
+          cargo test -p route-engine
+          cd ..
+
+          rm .github/workflows/one-shot-qdb-clippy.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "FIX | BUG-QDB-004 restore route-engine Clippy compatibility"
+          git push origin HEAD:main
