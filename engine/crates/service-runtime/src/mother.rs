@@ -373,10 +373,11 @@ async fn handle_connection(
             services: manager.snapshot().await,
         },
         ServiceMotherRequest::Shutdown { .. } => {
-            // Acknowledge the authenticated control request before draining
-            // child services. The listener loop owns the actual shutdown so
-            // service teardown runs exactly once and cannot consume the
-            // client's bounded response window.
+            // Close admission immediately, then acknowledge the authenticated
+            // control request before draining child services. The listener loop
+            // owns the actual shutdown so teardown runs exactly once and cannot
+            // consume the client's bounded response window.
+            manager.begin_shutdown();
             let _ = shutdown_tx.send(true);
             write_response(&mut write, &ServiceMotherResponse::Ok).await?;
             return Ok(());
@@ -509,10 +510,12 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let server_token = Arc::<str>::from(token.clone());
+        let manager = ServiceManager::default();
+        let server_manager = manager.clone();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, ServiceManager::default(), server_token, shutdown_tx)
+            handle_connection(stream, server_manager, server_token, shutdown_tx)
                 .await
                 .unwrap();
         });
@@ -523,6 +526,11 @@ mod tests {
         assert!(matches!(response, ServiceMotherResponse::Ok));
         shutdown_rx.changed().await.unwrap();
         assert!(*shutdown_rx.borrow());
+        let error = manager
+            .call("missing", "run", Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServiceCallError::Unavailable { .. }));
         server.await.unwrap();
     }
 

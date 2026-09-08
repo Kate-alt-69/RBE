@@ -181,6 +181,10 @@ pub enum ServiceCallError {
 }
 
 impl ServiceManager {
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
     pub fn remote(address: SocketAddr, auth: String) -> anyhow::Result<Self> {
         if !address.ip().is_loopback() {
             anyhow::bail!("Service Mother endpoint must be loopback");
@@ -624,7 +628,7 @@ impl ServiceManager {
     }
 
     pub async fn shutdown_all(&self) {
-        self.shutting_down.store(true, Ordering::Release);
+        self.begin_shutdown();
         if let Some(mother) = &self.mother {
             if let Err(error) = mother.shutdown().await {
                 tracing::warn!(error = %error, "Service Mother shutdown RPC failed");
@@ -1126,6 +1130,17 @@ async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<Ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn begin_shutdown_closes_service_call_admission() {
+        let manager = ServiceManager::default();
+        manager.begin_shutdown();
+        let error = manager
+            .call("missing", "run", Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServiceCallError::Unavailable { .. }));
+    }
 
     #[tokio::test]
     async fn service_shutdown_drain_waits_for_active_call() {
