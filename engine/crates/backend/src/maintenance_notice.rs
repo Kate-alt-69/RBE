@@ -18,6 +18,8 @@ use tokio::process::{Child, ChildStdin, Command};
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(500);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
+const ACCEPT_FAILURE_LIMIT: u32 = 8;
 const MAX_HELPER_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAINTENANCE_MARKER: &str = "X-RBE-Maintenance: 1";
 const BODY: &str =
@@ -147,11 +149,33 @@ pub async fn run(host: String, port: u16) -> anyhow::Result<()> {
 
     let lifetime = tokio::time::sleep(MAX_HELPER_LIFETIME);
     tokio::pin!(lifetime);
+    let mut accept_failures = 0u32;
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => {
+                        accept_failures = 0;
+                        accepted
+                    }
+                    Err(error) => {
+                        accept_failures = accept_failures.saturating_add(1);
+                        if accept_failures >= ACCEPT_FAILURE_LIMIT {
+                            return Err(anyhow::anyhow!(
+                                "maintenance responder listener failed {accept_failures} consecutive accepts: {error}"
+                            ));
+                        }
+                        tracing::warn!(
+                            error = %error,
+                            accept_failures,
+                            retry_ms = ACCEPT_RETRY_DELAY.as_millis() as u64,
+                            "maintenance responder accept failed; retrying"
+                        );
+                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                        continue;
+                    }
+                };
                 tokio::spawn(async move {
                     if let Err(err) = serve_maintenance_response(stream).await {
                         tracing::debug!(error = %err, "maintenance response connection ended with error");
