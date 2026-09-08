@@ -1,0 +1,50 @@
+name: One-shot API body limit repair
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-api-body-limits.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply and validate API body limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+
+          python3 .github/patches/api-body-limits.py
+
+          cd engine
+          cargo fmt --all
+          cargo test -p config rejects_inconsistent_api_body_limits
+          cargo check -p api
+          cd ..
+
+          git rm .github/workflows/one-shot-api-body-limits.yml
+          git rm .github/patches/api-body-limits.py
+          git add engine/Cargo.toml engine/crates/api/src/lib.rs engine/crates/config/src/lib.rs engine/Cargo.lock
+          git commit -m "FIX | BUG-API-003 enforce generic and JSON body limits"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
