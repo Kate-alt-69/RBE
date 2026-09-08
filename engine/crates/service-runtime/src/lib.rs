@@ -384,20 +384,7 @@ fn parse_service(
             .min(source.len());
     }
 
-    let exports = source
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            let rest = line
-                .strip_prefix("export function ")
-                .or_else(|| line.strip_prefix("export async function "))?;
-            let name: String = rest
-                .chars()
-                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
-                .collect();
-            (!name.is_empty()).then_some(name)
-        })
-        .collect();
+    let exports = service_export_names(&source);
 
     let instances = number("instances", 1)?;
     if instances != 1 {
@@ -422,6 +409,79 @@ fn parse_service(
         exports,
         source_digest: Sha256::digest(source.as_bytes()).into(),
     })
+}
+
+fn service_export_names(source: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut chars = source.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        if line_comment {
+            if character == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            quote = Some(character);
+            continue;
+        }
+        if character == '/' && chars.peek() == Some(&'/') {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            chars.next();
+            line_comment = true;
+            continue;
+        }
+        if character.is_ascii_alphanumeric() || character == '_' {
+            current.push(character);
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    let mut exports = Vec::new();
+    let mut index = 0usize;
+    while index < words.len() {
+        if words[index] != "export" {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 1;
+        if words.get(cursor).is_some_and(|word| word == "async") {
+            cursor += 1;
+        }
+        if words.get(cursor).is_some_and(|word| word == "function") {
+            if let Some(name) = words.get(cursor + 1) {
+                exports.push(name.clone());
+            }
+        }
+        index = cursor.saturating_add(1);
+    }
+    exports
 }
 
 fn directive(source: &str, prefix: &str) -> Option<(String, usize)> {
@@ -1198,6 +1258,19 @@ mod tests {
         let memory = ServiceMemory::default();
         memory.set("x".into(), serde_json::json!(7));
         assert_eq!(memory.get("x"), Some(serde_json::json!(7)));
+    }
+
+    #[test]
+    fn export_discovery_matches_whitespace_insensitive_service_syntax() {
+        let path = test_service_path("multiline-export");
+        std::fs::write(
+            &path,
+            ":service[name = multiline]\n// export function ghost() {}\nexport\nasync\nfunction\nvisible() {}\n",
+        )
+        .unwrap();
+        let service = parse_service(&path, ServiceDefaults::default()).unwrap();
+        assert_eq!(service.exports, vec!["visible"]);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
