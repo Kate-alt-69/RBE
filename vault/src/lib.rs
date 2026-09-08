@@ -7,6 +7,7 @@ mod acl;
 mod file_store;
 
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 use logging::Logger;
