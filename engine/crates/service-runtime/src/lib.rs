@@ -21,6 +21,8 @@ mod mother;
 pub(crate) const SERVICE_IPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SERVICE_IPC_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const SERVICE_IPC_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SERVICE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
+const SERVICE_ACCEPT_FAILURE_LIMIT: u32 = 8;
 pub use manager::{ServiceCallError, ServiceManager, ServiceRuntimeState, ServiceSnapshot};
 pub use mother::{new_service_mother_token, run_service_mother, ServiceMotherReady};
 
@@ -722,6 +724,7 @@ pub async fn run_service_host_with_executor_and_memory(
     println!("{}", serde_json::to_string(&ready)?);
     std::io::stdout().flush()?;
     let mut parent_liveness = parent_liveness_signal_if_configured()?;
+    let mut accept_failures = 0u32;
     loop {
         let accepted = match parent_liveness.as_mut() {
             Some(parent_liveness) => {
@@ -750,7 +753,30 @@ pub async fn run_service_host_with_executor_and_memory(
             }
             return Ok(());
         };
-        let (stream, peer) = accepted?;
+        let (stream, peer) = match accepted {
+            Ok(accepted) => {
+                accept_failures = 0;
+                accepted
+            }
+            Err(error) => {
+                accept_failures = accept_failures.saturating_add(1);
+                if accept_failures >= SERVICE_ACCEPT_FAILURE_LIMIT {
+                    return Err(anyhow::anyhow!(
+                        "service {:?} listener failed {accept_failures} consecutive accepts: {error}",
+                        file.name
+                    ));
+                }
+                tracing::warn!(
+                    service = %file.name,
+                    error = %error,
+                    accept_failures,
+                    retry_ms = SERVICE_ACCEPT_RETRY_DELAY.as_millis() as u64,
+                    "service IPC listener accept failed; retrying"
+                );
+                tokio::time::sleep(SERVICE_ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+        };
         if !peer.ip().is_loopback() {
             tracing::warn!(%peer, service = %file.name, "service IPC rejected non-loopback peer");
             continue;
