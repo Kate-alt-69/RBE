@@ -111,10 +111,8 @@ impl<'a> Lexer<'a> {
             // names after a dot (`video.delete`, `module.import`, etc.). Keep
             // that distinction in the lexer so the parser receives an Ident
             // for member names without weakening top-level keyword handling.
-            let recognize_keywords = !matches!(
-                tokens.last().map(|token| &token.kind),
-                Some(TokenKind::Dot)
-            );
+            let recognize_keywords =
+                !matches!(tokens.last().map(|token| &token.kind), Some(TokenKind::Dot));
 
             let kind = match c {
                 ':' => {

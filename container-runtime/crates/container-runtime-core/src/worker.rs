@@ -6,7 +6,11 @@ use std::time::Instant;
 use crate::execution::{ExecutionId, ExecutionTask};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerState { Idle, Running, Stopped }
+pub enum WorkerState {
+    Idle,
+    Running,
+    Stopped,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerSnapshot {
@@ -18,10 +22,13 @@ pub struct WorkerSnapshot {
     pub current: Option<ExecutionId>,
 }
 
-struct WorkerCommand { task: ExecutionTask }
+struct WorkerCommand {
+    task: ExecutionTask,
+}
 
 pub type Runner = Arc<dyn Fn(&ExecutionTask) -> Result<(), String> + Send + Sync + 'static>;
-pub(crate) type Completion = Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>;
+pub(crate) type Completion =
+    Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>;
 type Availability = Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub struct Worker {
@@ -35,7 +42,12 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(id: usize, runner: Runner, on_complete: Completion, on_available: Availability) -> Self {
+    pub fn new(
+        id: usize,
+        runner: Runner,
+        on_complete: Completion,
+        on_available: Availability,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<WorkerCommand>();
         let state = Arc::new(Mutex::new(WorkerState::Idle));
         let current = Arc::new(Mutex::new(None));
@@ -54,12 +66,16 @@ impl Worker {
             .spawn(move || {
                 while let Ok(command) = rx.recv() {
                     *thread_state.lock().expect("worker state poisoned") = WorkerState::Running;
-                    *thread_current.lock().expect("worker current poisoned") = Some(command.task.id);
+                    *thread_current.lock().expect("worker current poisoned") =
+                        Some(command.task.id);
                     let started = Instant::now();
                     let result = runner(&command.task);
                     let elapsed_ms = started.elapsed().as_millis() as u64;
-                    if result.is_ok() { thread_completed.fetch_add(1, Ordering::Relaxed); }
-                    else { thread_failed.fetch_add(1, Ordering::Relaxed); }
+                    if result.is_ok() {
+                        thread_completed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        thread_failed.fetch_add(1, Ordering::Relaxed);
+                    }
                     thread_total_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
                     on_complete(&command.task, elapsed_ms, result);
                     {
@@ -77,7 +93,15 @@ impl Worker {
             })
             .expect("failed to start worker thread");
 
-        Self { id, tx, state, current, completed, failed, total_ms }
+        Self {
+            id,
+            tx,
+            state,
+            current,
+            completed,
+            failed,
+            total_ms,
+        }
     }
 
     pub fn is_idle(&self) -> bool {
@@ -88,7 +112,9 @@ impl Worker {
         let execution_id = task.id;
         {
             let mut state = self.state.lock().expect("worker state poisoned");
-            if *state != WorkerState::Idle { return Some(task); }
+            if *state != WorkerState::Idle {
+                return Some(task);
+            }
             *state = WorkerState::Running;
             *self.current.lock().expect("worker current poisoned") = Some(execution_id);
         }

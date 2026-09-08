@@ -23,7 +23,10 @@ const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 const JOURNAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 fn journal_path() -> PathBuf {
-    runtime_paths::binary_dir().join("data").join("container-runtime").join("execution.journal")
+    runtime_paths::binary_dir()
+        .join("data")
+        .join("container-runtime")
+        .join("execution.journal")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,24 +59,41 @@ struct Journal {
 impl Journal {
     fn open() -> Arc<Self> {
         let path = journal_path();
-        if let Some(parent) = path.parent() { let _ = create_dir_all(parent); }
-        Arc::new(Self { path, lock: Mutex::new(()), io: atomic_io::AtomicIo::new() })
+        if let Some(parent) = path.parent() {
+            let _ = create_dir_all(parent);
+        }
+        Arc::new(Self {
+            path,
+            lock: Mutex::new(()),
+            io: atomic_io::AtomicIo::new(),
+        })
     }
 
     fn append(&self, event: JournalEvent) {
         let _guard = self.lock.lock().expect("journal lock poisoned");
-        let Ok(line) = serde_json::to_string(&event) else { return; };
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.path) {
+        let Ok(line) = serde_json::to_string(&event) else {
+            return;
+        };
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
             let _ = writeln!(file, "{line}");
         }
-        if std::fs::metadata(&self.path).map(|metadata| metadata.len() >= JOURNAL_MAX_BYTES).unwrap_or(false) {
+        if std::fs::metadata(&self.path)
+            .map(|metadata| metadata.len() >= JOURNAL_MAX_BYTES)
+            .unwrap_or(false)
+        {
             self.compact_locked();
         }
     }
 
     fn recover(&self) -> (Vec<ExecutionTask>, u64) {
         let _guard = self.lock.lock().expect("journal lock poisoned");
-        let Ok(contents) = read_to_string(&self.path) else { return (Vec::new(), 0); };
+        let Ok(contents) = read_to_string(&self.path) else {
+            return (Vec::new(), 0);
+        };
         let (pending, max_sequence) = pending_events(&contents);
         if contents.len() as u64 >= JOURNAL_MAX_BYTES {
             self.write_compacted(max_sequence, &pending);
@@ -83,7 +103,9 @@ impl Journal {
     }
 
     fn compact_locked(&self) {
-        let Ok(contents) = read_to_string(&self.path) else { return; };
+        let Ok(contents) = read_to_string(&self.path) else {
+            return;
+        };
         let (pending, max_sequence) = pending_events(&contents);
         self.write_compacted(max_sequence, &pending);
     }
@@ -105,13 +127,26 @@ impl Journal {
     }
 
     fn append_cancel_string(&self, execution_id: &str) {
-        let Ok((epoch_ns, sequence)) = parse_execution_id(execution_id) else { return; };
+        let Ok((epoch_ns, sequence)) = parse_execution_id(execution_id) else {
+            return;
+        };
         self.append(JournalEvent {
-            kind: "cancel".into(), epoch_ns, sequence,
-            environment: "unknown".into(), artifact_hash: "unknown".into(),
-            cpu: 0, memory: 0, io: 0, network: 0, work_ms: 0,
-            limit_cpu_millis: 0, limit_memory_bytes: 0, limit_disk_bytes: 0,
-            limit_network_bytes: 0, limit_max_processes: 0, limit_max_file_descriptors: 0,
+            kind: "cancel".into(),
+            epoch_ns,
+            sequence,
+            environment: "unknown".into(),
+            artifact_hash: "unknown".into(),
+            cpu: 0,
+            memory: 0,
+            io: 0,
+            network: 0,
+            work_ms: 0,
+            limit_cpu_millis: 0,
+            limit_memory_bytes: 0,
+            limit_disk_bytes: 0,
+            limit_network_bytes: 0,
+            limit_max_processes: 0,
+            limit_max_file_descriptors: 0,
             limit_wall_time_ms: 0,
         });
     }
@@ -121,29 +156,51 @@ fn pending_events(contents: &str) -> (Vec<JournalEvent>, u64) {
     let mut latest: HashMap<String, (JournalEvent, bool)> = HashMap::new();
     let mut max_sequence = 0u64;
     for line in contents.lines() {
-        let Ok(event) = serde_json::from_str::<JournalEvent>(line) else { continue; };
+        let Ok(event) = serde_json::from_str::<JournalEvent>(line) else {
+            continue;
+        };
         max_sequence = max_sequence.max(event.sequence);
-        if event.kind == "checkpoint" { continue; }
+        if event.kind == "checkpoint" {
+            continue;
+        }
         let id = format!("exec-{:016x}-{:016x}", event.epoch_ns, event.sequence);
         match event.kind.as_str() {
-            "queued" => { latest.insert(id, (event, true)); }
+            "queued" => {
+                latest.insert(id, (event, true));
+            }
             "done" | "cancel" => {
-                if let Some(entry) = latest.get_mut(&id) { entry.1 = false; }
+                if let Some(entry) = latest.get_mut(&id) {
+                    entry.1 = false;
+                }
             }
             _ => {}
         }
     }
-    let pending = latest.into_values().filter_map(|(event, is_pending)| is_pending.then_some(event)).collect();
+    let pending = latest
+        .into_values()
+        .filter_map(|(event, is_pending)| is_pending.then_some(event))
+        .collect();
     (pending, max_sequence)
 }
 
 fn checkpoint_event(sequence: u64) -> JournalEvent {
     JournalEvent {
-        kind: "checkpoint".into(), epoch_ns: 0, sequence,
-        environment: "checkpoint".into(), artifact_hash: "checkpoint".into(),
-        cpu: 0, memory: 0, io: 0, network: 0, work_ms: 0,
-        limit_cpu_millis: 0, limit_memory_bytes: 0, limit_disk_bytes: 0,
-        limit_network_bytes: 0, limit_max_processes: 0, limit_max_file_descriptors: 0,
+        kind: "checkpoint".into(),
+        epoch_ns: 0,
+        sequence,
+        environment: "checkpoint".into(),
+        artifact_hash: "checkpoint".into(),
+        cpu: 0,
+        memory: 0,
+        io: 0,
+        network: 0,
+        work_ms: 0,
+        limit_cpu_millis: 0,
+        limit_memory_bytes: 0,
+        limit_disk_bytes: 0,
+        limit_network_bytes: 0,
+        limit_max_processes: 0,
+        limit_max_file_descriptors: 0,
         limit_wall_time_ms: 0,
     }
 }
@@ -154,7 +211,12 @@ fn event_to_task(event: JournalEvent) -> Option<ExecutionTask> {
         id: ExecutionId::from_parts(event.epoch_ns, event.sequence),
         environment: environment.to_string(),
         artifact_hash: event.artifact_hash,
-        declared_cost: WorkCost { cpu: event.cpu, memory: event.memory, io: event.io, network: event.network },
+        declared_cost: WorkCost {
+            cpu: event.cpu,
+            memory: event.memory,
+            io: event.io,
+            network: event.network,
+        },
         limits: ResourceLimits {
             cpu_millis: event.limit_cpu_millis,
             memory_bytes: event.limit_memory_bytes,
@@ -180,7 +242,12 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        Self { general_environments: 5, swamps_per_environment: physical_core_count(), workers_per_swamp: 1, rebalance_interval_ms: 25 }
+        Self {
+            general_environments: 5,
+            swamps_per_environment: physical_core_count(),
+            workers_per_swamp: 1,
+            rebalance_interval_ms: 25,
+        }
     }
 }
 
@@ -200,7 +267,9 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Arc<Self> {
         let config = RuntimeConfig {
-            general_environments: config.general_environments.clamp(1, EnvironmentId::GENERAL.len()),
+            general_environments: config
+                .general_environments
+                .clamp(1, EnvironmentId::GENERAL.len()),
             swamps_per_environment: config.swamps_per_environment.max(1),
             workers_per_swamp: config.workers_per_swamp.max(1),
             rebalance_interval_ms: config.rebalance_interval_ms.max(1),
@@ -216,13 +285,17 @@ impl Runtime {
             let cache = Arc::clone(&cache);
             let cancelled = Arc::clone(&cancelled);
             Arc::new(move |task| {
-                if is_cancelled(&cancelled, task) { return Err("execution cancelled before start".into()); }
+                if is_cancelled(&cancelled, task) {
+                    return Err("execution cancelled before start".into());
+                }
                 if cache.contains_artifact(&task.artifact_hash) {
                     run_isolated_worker(task, &cancelled)?;
                 } else if task.work_ms > 0 {
                     run_simulated_work(task, &cancelled)?;
                 }
-                if is_cancelled(&cancelled, task) { return Err("execution cancelled".into()); }
+                if is_cancelled(&cancelled, task) {
+                    return Err("execution cancelled".into());
+                }
                 Ok(())
             })
         };
@@ -233,32 +306,61 @@ impl Runtime {
             let journal = Arc::clone(&journal);
             Arc::new(move |task, elapsed_ms, result| {
                 let succeeded = result.is_ok();
-                let was_cancelled = cancelled.lock().expect("cancel table poisoned").remove(&task.id.to_string());
+                let was_cancelled = cancelled
+                    .lock()
+                    .expect("cancel table poisoned")
+                    .remove(&task.id.to_string());
                 if succeeded && !was_cancelled {
                     cache.record(&task.artifact_hash, elapsed_ms, task.declared_cost);
                 }
                 journal.append(JournalEvent {
-                    kind: if was_cancelled { "cancel".into() } else { "done".into() },
-                    epoch_ns: task.id.epoch_ns(), sequence: task.id.sequence(), environment: task.environment.clone(), artifact_hash: task.artifact_hash.clone(),
-                    cpu: task.declared_cost.cpu, memory: task.declared_cost.memory, io: task.declared_cost.io, network: task.declared_cost.network, work_ms: elapsed_ms,
-                    limit_cpu_millis: task.limits.cpu_millis, limit_memory_bytes: task.limits.memory_bytes, limit_disk_bytes: task.limits.disk_bytes,
-                    limit_network_bytes: task.limits.network_bytes, limit_max_processes: task.limits.max_processes, limit_max_file_descriptors: task.limits.max_file_descriptors,
+                    kind: if was_cancelled {
+                        "cancel".into()
+                    } else {
+                        "done".into()
+                    },
+                    epoch_ns: task.id.epoch_ns(),
+                    sequence: task.id.sequence(),
+                    environment: task.environment.clone(),
+                    artifact_hash: task.artifact_hash.clone(),
+                    cpu: task.declared_cost.cpu,
+                    memory: task.declared_cost.memory,
+                    io: task.declared_cost.io,
+                    network: task.declared_cost.network,
+                    work_ms: elapsed_ms,
+                    limit_cpu_millis: task.limits.cpu_millis,
+                    limit_memory_bytes: task.limits.memory_bytes,
+                    limit_disk_bytes: task.limits.disk_bytes,
+                    limit_network_bytes: task.limits.network_bytes,
+                    limit_max_processes: task.limits.max_processes,
+                    limit_max_file_descriptors: task.limits.max_file_descriptors,
                     limit_wall_time_ms: task.limits.wall_time_ms,
                 });
                 if let Err(error) = result {
-                    if !was_cancelled { tracing::warn!(execution = %task.id, environment = %task.environment, "execution failed: {error}"); }
+                    if !was_cancelled {
+                        tracing::warn!(execution = %task.id, environment = %task.environment, "execution failed: {error}");
+                    }
                 }
             })
         };
 
-        let environments = active_ids.iter().copied().map(|id| EnvironmentRuntime::new(
-            id,
-            config.swamps_per_environment,
-            config.workers_per_swamp,
-            EnvironmentStorage { limit_bytes: DEFAULT_ENVIRONMENT_STORAGE_BYTES, ephemeral: true },
-            Arc::clone(&runner),
-            Arc::clone(&completion),
-        )).collect();
+        let environments = active_ids
+            .iter()
+            .copied()
+            .map(|id| {
+                EnvironmentRuntime::new(
+                    id,
+                    config.swamps_per_environment,
+                    config.workers_per_swamp,
+                    EnvironmentStorage {
+                        limit_bytes: DEFAULT_ENVIRONMENT_STORAGE_BYTES,
+                        ephemeral: true,
+                    },
+                    Arc::clone(&runner),
+                    Arc::clone(&completion),
+                )
+            })
+            .collect();
         let generations = active_ids.iter().copied().map(|id| (id, 0u64)).collect();
         let runtime = Arc::new(Self {
             config,
@@ -276,7 +378,11 @@ impl Runtime {
         for task in recovered {
             if let Some(environment) = parse_environment(&task.environment) {
                 if runtime.has_environment(environment) {
-                    runtime.global_queue.lock().expect("global queue poisoned").push_back((environment, task));
+                    runtime
+                        .global_queue
+                        .lock()
+                        .expect("global queue poisoned")
+                        .push_back((environment, task));
                 } else {
                     tracing::warn!(%environment, execution = %task.id, "recovered task belongs to a disabled environment; leaving it out of the live queue");
                 }
@@ -285,29 +391,63 @@ impl Runtime {
 
         let weak = Arc::downgrade(&runtime);
         let interval = runtime.config.rebalance_interval_ms;
-        thread::Builder::new().name("rbe-runtime-scheduler".to_string()).spawn(move || {
-            while let Some(runtime) = weak.upgrade() {
-                runtime.rebalance_once();
-                let has_queued_work = runtime.snapshots().iter().any(|environment| environment.queued != 0);
-                if has_queued_work {
-                    thread::sleep(Duration::from_millis(interval));
-                    continue;
+        thread::Builder::new()
+            .name("rbe-runtime-scheduler".to_string())
+            .spawn(move || {
+                while let Some(runtime) = weak.upgrade() {
+                    runtime.rebalance_once();
+                    let has_queued_work = runtime
+                        .snapshots()
+                        .iter()
+                        .any(|environment| environment.queued != 0);
+                    if has_queued_work {
+                        thread::sleep(Duration::from_millis(interval));
+                        continue;
+                    }
+                    let queue = runtime.global_queue.lock().expect("global queue poisoned");
+                    if queue.is_empty() {
+                        drop(
+                            runtime
+                                .global_queue_changed
+                                .wait_timeout(queue, Duration::from_secs(1))
+                                .expect("global queue poisoned"),
+                        );
+                    }
                 }
-                let queue = runtime.global_queue.lock().expect("global queue poisoned");
-                if queue.is_empty() {
-                    drop(runtime.global_queue_changed.wait_timeout(queue, Duration::from_secs(1)).expect("global queue poisoned"));
-                }
-            }
-        }).expect("failed to start runtime scheduler");
+            })
+            .expect("failed to start runtime scheduler");
         runtime
     }
 
-    pub fn submit(&self, environment: EnvironmentId, artifact_hash: impl Into<String>, cost: WorkCost, work_ms: u64) -> ExecutionId {
-        self.submit_with_policy(environment, artifact_hash, cost, ResourceLimits::default(), SandboxPolicy::default(), work_ms, Vec::new())
+    pub fn submit(
+        &self,
+        environment: EnvironmentId,
+        artifact_hash: impl Into<String>,
+        cost: WorkCost,
+        work_ms: u64,
+    ) -> ExecutionId {
+        self.submit_with_policy(
+            environment,
+            artifact_hash,
+            cost,
+            ResourceLimits::default(),
+            SandboxPolicy::default(),
+            work_ms,
+            Vec::new(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn submit_with_policy(&self, environment: EnvironmentId, artifact_hash: impl Into<String>, cost: WorkCost, limits: ResourceLimits, sandbox: SandboxPolicy, work_ms: u64, payload: Vec<u8>) -> ExecutionId {
+    pub fn submit_with_policy(
+        &self,
+        environment: EnvironmentId,
+        artifact_hash: impl Into<String>,
+        cost: WorkCost,
+        limits: ResourceLimits,
+        sandbox: SandboxPolicy,
+        work_ms: u64,
+        payload: Vec<u8>,
+    ) -> ExecutionId {
         let claimed_artifact_hash = artifact_hash.into();
         let artifact_hash = if payload.is_empty() {
             claimed_artifact_hash
@@ -321,13 +461,40 @@ impl Runtime {
         };
         let id = ExecutionId::new(self.next_execution.fetch_add(1, Ordering::Relaxed));
         self.journal.append(JournalEvent {
-            kind: "queued".into(), epoch_ns: id.epoch_ns(), sequence: id.sequence(), environment: environment.to_string(), artifact_hash: artifact_hash.clone(),
-            cpu: cost.cpu, memory: cost.memory, io: cost.io, network: cost.network, work_ms,
-            limit_cpu_millis: limits.cpu_millis, limit_memory_bytes: limits.memory_bytes, limit_disk_bytes: limits.disk_bytes,
-            limit_network_bytes: limits.network_bytes, limit_max_processes: limits.max_processes, limit_max_file_descriptors: limits.max_file_descriptors,
+            kind: "queued".into(),
+            epoch_ns: id.epoch_ns(),
+            sequence: id.sequence(),
+            environment: environment.to_string(),
+            artifact_hash: artifact_hash.clone(),
+            cpu: cost.cpu,
+            memory: cost.memory,
+            io: cost.io,
+            network: cost.network,
+            work_ms,
+            limit_cpu_millis: limits.cpu_millis,
+            limit_memory_bytes: limits.memory_bytes,
+            limit_disk_bytes: limits.disk_bytes,
+            limit_network_bytes: limits.network_bytes,
+            limit_max_processes: limits.max_processes,
+            limit_max_file_descriptors: limits.max_file_descriptors,
             limit_wall_time_ms: limits.wall_time_ms,
         });
-        self.global_queue.lock().expect("global queue poisoned").push_back((environment, ExecutionTask { id, environment: environment.to_string(), artifact_hash, declared_cost: cost, limits, sandbox, work_ms, payload: Vec::new() }));
+        self.global_queue
+            .lock()
+            .expect("global queue poisoned")
+            .push_back((
+                environment,
+                ExecutionTask {
+                    id,
+                    environment: environment.to_string(),
+                    artifact_hash,
+                    declared_cost: cost,
+                    limits,
+                    sandbox,
+                    work_ms,
+                    payload: Vec::new(),
+                },
+            ));
         self.global_queue_changed.notify_one();
         id
     }
@@ -354,13 +521,21 @@ impl Runtime {
         }
 
         let running = self.snapshots().iter().any(|environment| {
-            environment.swamps.iter().any(|swamp| swamp.workers.iter().any(|worker| {
-                worker.current.map(|id| id.to_string() == execution_id).unwrap_or(false)
-            }))
+            environment.swamps.iter().any(|swamp| {
+                swamp.workers.iter().any(|worker| {
+                    worker
+                        .current
+                        .map(|id| id.to_string() == execution_id)
+                        .unwrap_or(false)
+                })
+            })
         });
 
         if running {
-            self.cancelled.lock().expect("cancel table poisoned").insert(execution_id.to_string());
+            self.cancelled
+                .lock()
+                .expect("cancel table poisoned")
+                .insert(execution_id.to_string());
         }
         if removed_queued || running {
             self.journal.append_cancel_string(execution_id);
@@ -371,61 +546,108 @@ impl Runtime {
     }
 
     pub fn restart_environment(&self, id: EnvironmentId) -> usize {
-        let Some(environment) = self.environment(id) else { return 0; };
+        let Some(environment) = self.environment(id) else {
+            return 0;
+        };
         let pending = environment.restart();
         let count = pending.len();
         if count != 0 {
             let mut queue = self.global_queue.lock().expect("global queue poisoned");
-            for task in pending { queue.push_back((id, task)); }
+            for task in pending {
+                queue.push_back((id, task));
+            }
             drop(queue);
             self.global_queue_changed.notify_one();
         }
-        *self.generations.lock().expect("generation table poisoned").entry(id).or_default() += 1;
+        *self
+            .generations
+            .lock()
+            .expect("generation table poisoned")
+            .entry(id)
+            .or_default() += 1;
         count
     }
 
     pub fn environment_generation(&self, id: EnvironmentId) -> u64 {
-        self.generations.lock().expect("generation table poisoned").get(&id).copied().unwrap_or(0)
+        self.generations
+            .lock()
+            .expect("generation table poisoned")
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn rebalance_once(&self) {
-        let pending = { let mut queue = self.global_queue.lock().expect("global queue poisoned"); queue.drain(..).collect::<Vec<_>>() };
+        let pending = {
+            let mut queue = self.global_queue.lock().expect("global queue poisoned");
+            queue.drain(..).collect::<Vec<_>>()
+        };
         for (environment, task) in pending {
-            if let Some(runtime) = self.environment(environment) { runtime.enqueue(task); }
-            else { tracing::warn!(%environment, execution = %task.id, "dropping live dispatch for disabled environment"); }
+            if let Some(runtime) = self.environment(environment) {
+                runtime.enqueue(task);
+            } else {
+                tracing::warn!(%environment, execution = %task.id, "dropping live dispatch for disabled environment");
+            }
         }
-        for environment in &self.environments { environment.rebalance(); }
+        for environment in &self.environments {
+            environment.rebalance();
+        }
     }
 
     pub fn is_idle(&self) -> bool {
-        if self.global_queue_len() != 0 { return false; }
+        if self.global_queue_len() != 0 {
+            return false;
+        }
         self.snapshots().iter().all(|environment| {
-            environment.queued == 0 && environment.swamps.iter().all(|swamp| {
-                swamp.queued == 0 && swamp.workers.iter().all(|worker| matches!(worker.state, WorkerState::Idle | WorkerState::Stopped))
-            })
+            environment.queued == 0
+                && environment.swamps.iter().all(|swamp| {
+                    swamp.queued == 0
+                        && swamp.workers.iter().all(|worker| {
+                            matches!(worker.state, WorkerState::Idle | WorkerState::Stopped)
+                        })
+                })
         })
     }
 
     fn environment(&self, id: EnvironmentId) -> Option<&EnvironmentRuntime> {
-        self.environments.iter().find(|environment| environment.id == id)
+        self.environments
+            .iter()
+            .find(|environment| environment.id == id)
     }
 
-    pub fn has_environment(&self, id: EnvironmentId) -> bool { self.environment(id).is_some() }
-    pub fn global_queue_len(&self) -> usize { self.global_queue.lock().expect("global queue poisoned").len() }
-    pub fn cache(&self) -> Arc<ArtifactCache> { Arc::clone(&self.cache) }
-    pub fn snapshots(&self) -> Vec<EnvironmentSnapshot> {
-        self.environments.iter().map(|environment| {
-            let mut snapshot = environment.snapshot();
-            snapshot.generation = self.environment_generation(snapshot.id);
-            snapshot
-        }).collect()
+    pub fn has_environment(&self, id: EnvironmentId) -> bool {
+        self.environment(id).is_some()
     }
-    pub fn config(&self) -> &RuntimeConfig { &self.config }
-    pub fn wasm_executor(&self) -> Arc<WasmExecutor> { Arc::clone(&self.executor) }
+    pub fn global_queue_len(&self) -> usize {
+        self.global_queue
+            .lock()
+            .expect("global queue poisoned")
+            .len()
+    }
+    pub fn cache(&self) -> Arc<ArtifactCache> {
+        Arc::clone(&self.cache)
+    }
+    pub fn snapshots(&self) -> Vec<EnvironmentSnapshot> {
+        self.environments
+            .iter()
+            .map(|environment| {
+                let mut snapshot = environment.snapshot();
+                snapshot.generation = self.environment_generation(snapshot.id);
+                snapshot
+            })
+            .collect()
+    }
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
+    }
+    pub fn wasm_executor(&self) -> Arc<WasmExecutor> {
+        Arc::clone(&self.executor)
+    }
 }
 
 fn active_environment_ids(general_count: usize) -> Vec<EnvironmentId> {
-    let mut ids = EnvironmentId::GENERAL[..general_count.clamp(1, EnvironmentId::GENERAL.len())].to_vec();
+    let mut ids =
+        EnvironmentId::GENERAL[..general_count.clamp(1, EnvironmentId::GENERAL.len())].to_vec();
     ids.push(EnvironmentId::Payment);
     ids
 }
@@ -439,22 +661,35 @@ fn physical_core_count() -> usize {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) { continue; }
+                if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
                 let topology = entry.path().join("topology");
                 let package = std::fs::read_to_string(topology.join("physical_package_id")).ok();
                 let core = std::fs::read_to_string(topology.join("core_id")).ok();
-                if let (Some(package), Some(core)) = (package, core) { cores.insert((package.trim().to_string(), core.trim().to_string())); }
+                if let (Some(package), Some(core)) = (package, core) {
+                    cores.insert((package.trim().to_string(), core.trim().to_string()));
+                }
             }
         }
-        if !cores.is_empty() { return cores.len(); }
+        if !cores.is_empty() {
+            return cores.len();
+        }
     }
-    std::thread::available_parallelism().map(|value| value.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
 }
 
 fn parse_environment(value: &str) -> Option<EnvironmentId> {
     match value {
-        "general-1" => Some(EnvironmentId::General1), "general-2" => Some(EnvironmentId::General2), "general-3" => Some(EnvironmentId::General3),
-        "general-4" => Some(EnvironmentId::General4), "general-5" => Some(EnvironmentId::General5), "payment" => Some(EnvironmentId::Payment), _ => None,
+        "general-1" => Some(EnvironmentId::General1),
+        "general-2" => Some(EnvironmentId::General2),
+        "general-3" => Some(EnvironmentId::General3),
+        "general-4" => Some(EnvironmentId::General4),
+        "general-5" => Some(EnvironmentId::General5),
+        "payment" => Some(EnvironmentId::Payment),
+        _ => None,
     }
 }
 
@@ -466,29 +701,55 @@ fn parse_execution_id(value: &str) -> Result<(u64, u64), ()> {
 }
 
 fn is_cancelled(cancelled: &Arc<Mutex<HashSet<String>>>, task: &ExecutionTask) -> bool {
-    cancelled.lock().expect("cancel table poisoned").contains(&task.id.to_string())
+    cancelled
+        .lock()
+        .expect("cancel table poisoned")
+        .contains(&task.id.to_string())
 }
 
-fn run_simulated_work(task: &ExecutionTask, cancelled: &Arc<Mutex<HashSet<String>>>) -> Result<(), String> {
+fn run_simulated_work(
+    task: &ExecutionTask,
+    cancelled: &Arc<Mutex<HashSet<String>>>,
+) -> Result<(), String> {
     let started = Instant::now();
     let work = Duration::from_millis(task.work_ms);
     let timeout = Duration::from_millis(task.limits.wall_time_ms.max(1));
     loop {
-        if is_cancelled(cancelled, task) { return Err("execution cancelled".into()); }
+        if is_cancelled(cancelled, task) {
+            return Err("execution cancelled".into());
+        }
         let elapsed = started.elapsed();
-        if elapsed >= work { return Ok(()); }
-        if elapsed >= timeout { return Err(format!("execution timed out after {} ms", task.limits.wall_time_ms)); }
+        if elapsed >= work {
+            return Ok(());
+        }
+        if elapsed >= timeout {
+            return Err(format!(
+                "execution timed out after {} ms",
+                task.limits.wall_time_ms
+            ));
+        }
         thread::sleep(Duration::from_millis(10).min(work.saturating_sub(elapsed)));
     }
 }
 
-fn run_isolated_worker(task: &ExecutionTask, cancelled: &Arc<Mutex<HashSet<String>>>) -> Result<(), String> {
+fn run_isolated_worker(
+    task: &ExecutionTask,
+    cancelled: &Arc<Mutex<HashSet<String>>>,
+) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let artifact = &task.artifact_hash;
     let fuel = task.limits.cpu_millis.saturating_mul(10_000).max(1_000_000);
     let memory = task.limits.memory_bytes.max(64 * 1024);
     let mut command = std::process::Command::new(exe);
-    command.args(["--worker", "--artifact", artifact, "--fuel", &fuel.to_string(), "--memory", &memory.to_string()]);
+    command.args([
+        "--worker",
+        "--artifact",
+        artifact,
+        "--fuel",
+        &fuel.to_string(),
+        "--memory",
+        &memory.to_string(),
+    ]);
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let started = Instant::now();
     let timeout = Duration::from_millis(task.limits.wall_time_ms.max(1));
@@ -502,7 +763,10 @@ fn run_isolated_worker(task: &ExecutionTask, cancelled: &Arc<Mutex<HashSet<Strin
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("execution timed out after {} ms", task.limits.wall_time_ms));
+            return Err(format!(
+                "execution timed out after {} ms",
+                task.limits.wall_time_ms
+            ));
         }
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(status) if status.success() => return Ok(()),

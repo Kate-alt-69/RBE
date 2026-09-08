@@ -15,7 +15,10 @@ pub struct ExecutionLimits {
 
 impl Default for ExecutionLimits {
     fn default() -> Self {
-        Self { fuel: 10_000_000, max_memory_bytes: 64 * 1024 * 1024 }
+        Self {
+            fuel: 10_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+        }
     }
 }
 
@@ -43,11 +46,10 @@ impl WasmExecutor {
         let module = Module::new(&self.engine, wasm)
             .map_err(|error| anyhow::anyhow!("compile WASM artifact: {error}"))?;
 
-        let memory_limit = usize::try_from(limits.max_memory_bytes)
-            .map_err(|_| anyhow::anyhow!("WASM memory limit does not fit this platform's address space"))?;
-        let store_limits: StoreLimits = StoreLimitsBuilder::new()
-            .memory_size(memory_limit)
-            .build();
+        let memory_limit = usize::try_from(limits.max_memory_bytes).map_err(|_| {
+            anyhow::anyhow!("WASM memory limit does not fit this platform's address space")
+        })?;
+        let store_limits: StoreLimits = StoreLimitsBuilder::new().memory_size(memory_limit).build();
         let mut store = Store::new(&self.engine, store_limits);
         store.limiter(|state| state);
         store
@@ -78,6 +80,8 @@ mod tests {
     #[test]
     fn rejects_invalid_wasm() {
         let executor = WasmExecutor::new().unwrap();
-        assert!(executor.execute(b"not wasm", ExecutionLimits::default()).is_err());
+        assert!(executor
+            .execute(b"not wasm", ExecutionLimits::default())
+            .is_err());
     }
 }

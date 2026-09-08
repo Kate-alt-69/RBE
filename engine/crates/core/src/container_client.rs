@@ -4,8 +4,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ipc_protocol::{
-    decode_response, read_frame, write_frame, HealthRequest, InspectRequest,
-    PrepareRefreshRequest, Request, Response, ResumeRequest,
+    decode_response, read_frame, write_frame, HealthRequest, InspectRequest, PrepareRefreshRequest,
+    Request, Response, ResumeRequest,
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -32,11 +32,21 @@ pub struct ContainerClient {
 
 impl ContainerClient {
     pub fn new(address: SocketAddr, token: String, pid: Option<u32>) -> Self {
-        Self { endpoint: Arc::new(RwLock::new(Endpoint { address, token, pid, generation: 1 })) }
+        Self {
+            endpoint: Arc::new(RwLock::new(Endpoint {
+                address,
+                token,
+                pid,
+                generation: 1,
+            })),
+        }
     }
 
     pub fn update_endpoint(&self, address: SocketAddr, token: String, pid: Option<u32>) {
-        let mut endpoint = self.endpoint.write().expect("container endpoint lock poisoned");
+        let mut endpoint = self
+            .endpoint
+            .write()
+            .expect("container endpoint lock poisoned");
         endpoint.address = address;
         endpoint.token = token;
         endpoint.pid = pid;
@@ -44,32 +54,62 @@ impl ContainerClient {
     }
 
     pub fn endpoint_snapshot(&self) -> ContainerEndpointSnapshot {
-        let endpoint = self.endpoint.read().expect("container endpoint lock poisoned");
-        ContainerEndpointSnapshot { address: endpoint.address, pid: endpoint.pid, generation: endpoint.generation }
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned");
+        ContainerEndpointSnapshot {
+            address: endpoint.address,
+            pid: endpoint.pid,
+            generation: endpoint.generation,
+        }
     }
 
     pub async fn health(&self) -> anyhow::Result<serde_json::Value> {
-        let endpoint = self.endpoint.read().expect("container endpoint lock poisoned").clone();
-        let request = Request::Health(HealthRequest { request_id: next_request_id(), auth_token: endpoint.token.clone() });
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request = Request::Health(HealthRequest {
+            request_id: next_request_id(),
+            auth_token: endpoint.token.clone(),
+        });
         match call(endpoint, request, Duration::from_secs(3)).await? {
             Response::Health { body, .. } => Ok(body),
-            Response::Error { code, message, .. } => anyhow::bail!("container health failed [{code}]: {message}"),
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("container health failed [{code}]: {message}")
+            }
             other => anyhow::bail!("unexpected container health response: {other:?}"),
         }
     }
 
     pub async fn inspect(&self) -> anyhow::Result<serde_json::Value> {
-        let endpoint = self.endpoint.read().expect("container endpoint lock poisoned").clone();
-        let request = Request::Inspect(InspectRequest { request_id: next_request_id(), auth_token: endpoint.token.clone(), execution_id: None });
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request = Request::Inspect(InspectRequest {
+            request_id: next_request_id(),
+            auth_token: endpoint.token.clone(),
+            execution_id: None,
+        });
         match call(endpoint, request, Duration::from_secs(3)).await? {
             Response::Inspection { body, .. } => Ok(body),
-            Response::Error { code, message, .. } => anyhow::bail!("container inspection failed [{code}]: {message}"),
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("container inspection failed [{code}]: {message}")
+            }
             other => anyhow::bail!("unexpected container inspection response: {other:?}"),
         }
     }
 
     pub async fn prepare_refresh(&self, drain_timeout: Duration) -> anyhow::Result<()> {
-        let endpoint = self.endpoint.read().expect("container endpoint lock poisoned").clone();
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
         let request = Request::PrepareRefresh(PrepareRefreshRequest {
             request_id: next_request_id(),
             auth_token: endpoint.token.clone(),
@@ -78,24 +118,36 @@ impl ContainerClient {
         let call_timeout = drain_timeout.saturating_add(Duration::from_secs(5));
         match call(endpoint, request, call_timeout).await? {
             Response::ReadyForRefresh { .. } => Ok(()),
-            Response::Error { code, message, .. } => anyhow::bail!("container refresh preparation failed [{code}]: {message}"),
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("container refresh preparation failed [{code}]: {message}")
+            }
             other => anyhow::bail!("unexpected container refresh response: {other:?}"),
         }
     }
 
     pub async fn resume(&self) -> anyhow::Result<()> {
-        let endpoint = self.endpoint.read().expect("container endpoint lock poisoned").clone();
-        let request = Request::Resume(ResumeRequest { request_id: next_request_id(), auth_token: endpoint.token.clone() });
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request = Request::Resume(ResumeRequest {
+            request_id: next_request_id(),
+            auth_token: endpoint.token.clone(),
+        });
         match call(endpoint, request, Duration::from_secs(3)).await? {
             Response::Resumed { .. } => Ok(()),
-            Response::Error { code, message, .. } => anyhow::bail!("container resume failed [{code}]: {message}"),
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("container resume failed [{code}]: {message}")
+            }
             other => anyhow::bail!("unexpected container resume response: {other:?}"),
         }
     }
 }
 
 async fn call(endpoint: Endpoint, request: Request, timeout: Duration) -> anyhow::Result<Response> {
-    tokio::task::spawn_blocking(move || transact(&endpoint, &request, timeout)).await
+    tokio::task::spawn_blocking(move || transact(&endpoint, &request, timeout))
+        .await
         .map_err(|err| anyhow::anyhow!("container IPC task failed: {err}"))?
 }
 

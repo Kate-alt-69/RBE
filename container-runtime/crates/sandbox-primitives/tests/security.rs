@@ -10,7 +10,9 @@
 
 use std::process::Stdio;
 
-use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, SandboxLauncher, SandboxPolicy};
+use sandbox_primitives::{
+    install_restricted_seccomp, set_no_new_privileges, SandboxLauncher, SandboxPolicy,
+};
 
 #[test]
 #[ignore = "requires a Linux host that permits unshare namespaces"]
@@ -18,7 +20,11 @@ fn worker_gets_a_private_pid_namespace() {
     let policy = SandboxPolicy::default();
     let args = vec!["-c".into(), "test \"$$\" = \"1\"".into()];
     let mut command = SandboxLauncher::command(&policy, "/bin/sh", &args).expect("sandbox command");
-    let status = command.stdout(Stdio::null()).stderr(Stdio::null()).status().expect("run sandbox probe");
+    let status = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run sandbox probe");
     assert!(status.success(), "PID namespace probe failed: {status}");
 }
 
@@ -26,9 +32,16 @@ fn worker_gets_a_private_pid_namespace() {
 #[ignore = "requires a Linux host that permits unshare network namespaces"]
 fn worker_network_namespace_is_denied_by_default() {
     let policy = SandboxPolicy::default();
-    let args = vec!["-c".into(), "test \"$(awk 'NR>1 && $2 != \"00000000\" {print; exit}' /proc/net/route)\" = \"\"".into()];
+    let args = vec![
+        "-c".into(),
+        "test \"$(awk 'NR>1 && $2 != \"00000000\" {print; exit}' /proc/net/route)\" = \"\"".into(),
+    ];
     let mut command = SandboxLauncher::command(&policy, "/bin/sh", &args).expect("sandbox command");
-    let status = command.stdout(Stdio::null()).stderr(Stdio::null()).status().expect("run network probe");
+    let status = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run network probe");
     assert!(status.success(), "network namespace probe failed: {status}");
 }
 

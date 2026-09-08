@@ -9,7 +9,9 @@ use crate::modules::ModuleRegistry;
 pub fn member_get(base: &Value, field: &str) -> Result<Value, EvalError> {
     match base {
         Value::Object(map) => Ok(map.get(field).cloned().unwrap_or(Value::Null)),
-        other => Err(EvalError::new(format!("cannot access .{field} on {other:?}"))),
+        other => Err(EvalError::new(format!(
+            "cannot access .{field} on {other:?}"
+        ))),
     }
 }
 
@@ -19,7 +21,8 @@ pub fn call_module(
     function_name: &str,
     args: Vec<Value>,
 ) -> Result<Value, EvalError> {
-    modules.call(module_name, function_name, &args)
+    modules
+        .call(module_name, function_name, &args)
         .map_err(|e| EvalError::new(e.to_string()))
 }
 
@@ -28,19 +31,26 @@ pub fn call_direct(
     binding: &str,
     args: Vec<Value>,
 ) -> Result<Value, EvalError> {
-    modules.call_direct(binding, &args)
+    modules
+        .call_direct(binding, &args)
         .map_err(|e| EvalError::new(e.to_string()))
 }
 
 pub fn object_value(fields: impl IntoIterator<Item = (String, Value)>) -> Value {
     let mut map = HashMap::new();
-    for (key, value) in fields { map.insert(key, value); }
+    for (key, value) in fields {
+        map.insert(key, value);
+    }
     Value::Object(map)
 }
 
-pub fn truthy(value: &Value) -> bool { value.truthy() }
+pub fn truthy(value: &Value) -> bool {
+    value.truthy()
+}
 
-pub fn unary_not(value: Value) -> Value { Value::Bool(!value.truthy()) }
+pub fn unary_not(value: Value) -> Value {
+    Value::Bool(!value.truthy())
+}
 
 pub fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, EvalError> {
     match op {
@@ -85,7 +95,9 @@ pub fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, EvalErro
                         _ => unreachable!(),
                     }))
                 }
-                _ => Err(EvalError::new("comparison requires matching numbers or strings")),
+                _ => Err(EvalError::new(
+                    "comparison requires matching numbers or strings",
+                )),
             }
         }
     }
@@ -97,8 +109,14 @@ fn eq(a: &Value, b: &Value) -> bool {
         (Value::Number(a), Value::Number(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Null, Value::Null) => true,
-        (Value::Object(a), Value::Object(b)) => a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).map(|x| eq(v, x)).unwrap_or(false)),
-        (Value::Array(a), Value::Array(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| eq(x, y)),
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.get(k).map(|x| eq(v, x)).unwrap_or(false))
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| eq(x, y))
+        }
         _ => false,
     }
 }

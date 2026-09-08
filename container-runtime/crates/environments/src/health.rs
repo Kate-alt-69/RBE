@@ -79,8 +79,7 @@ impl HealthMonitor {
             || since_heartbeat >= self.thresholds.unresponsive_after
         {
             HealthStatus::Unresponsive
-        } else if since_heartbeat >= self.thresholds.degraded_after
-            || self.consecutive_failures > 0
+        } else if since_heartbeat >= self.thresholds.degraded_after || self.consecutive_failures > 0
         {
             HealthStatus::Degraded
         } else {

@@ -39,9 +39,9 @@ impl Default for AbuseThresholds {
         Self {
             window: Duration::from_secs(60),
             max_requests_per_window: 120,
-            max_cpu_ms_per_window: 30_000,   // 30s of CPU time per minute
+            max_cpu_ms_per_window: 30_000, // 30s of CPU time per minute
             max_network_bytes_per_window: 50 * 1024 * 1024, // 50MB/min
-            max_disk_bytes_per_window: 20 * 1024 * 1024,    // 20MB/min
+            max_disk_bytes_per_window: 20 * 1024 * 1024, // 20MB/min
         }
     }
 }
@@ -122,10 +122,12 @@ impl AbuseDetector {
         let now = Instant::now();
         let mut callers = self.per_caller.lock().unwrap();
 
-        let entry = callers.entry(caller.to_string()).or_insert_with(|| WindowEntry {
-            window_start: now,
-            usage: Usage::default(),
-        });
+        let entry = callers
+            .entry(caller.to_string())
+            .or_insert_with(|| WindowEntry {
+                window_start: now,
+                usage: Usage::default(),
+            });
 
         if now.duration_since(entry.window_start) >= self.thresholds.window {
             entry.window_start = now;

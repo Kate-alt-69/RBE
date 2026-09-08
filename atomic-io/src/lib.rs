@@ -137,7 +137,10 @@ impl AtomicIo {
             .counters
             .bytes_written
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        self.inner.counters.write_ops.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .counters
+            .write_ops
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -153,14 +156,20 @@ impl AtomicIo {
             fs::create_dir_all(parent)?;
         }
 
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         file.write_all(bytes)?;
 
         self.inner
             .counters
             .bytes_written
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        self.inner.counters.write_ops.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .counters
+            .write_ops
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -239,7 +248,11 @@ mod tests {
         let path = dir.join("file.txt");
         io.write_atomic(&path, b"data").unwrap();
         let entries: Vec<_> = fs::read_dir(&dir).unwrap().collect();
-        assert_eq!(entries.len(), 1, "only the final file should remain, no .tmp");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the final file should remain, no .tmp"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -53,7 +53,11 @@ impl PaymentEnvironment {
         let secret = self
             .vault
             .credential(VAULT_KEY_NAME, VAULT_CALLER_IDENTITY)
-            .map_err(|e| anyhow::anyhow!("payment environment could not read its encryption key from vault: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "payment environment could not read its encryption key from vault: {e}"
+                )
+            })?;
 
         let hex_key = secret.expose_secret();
         let bytes = Zeroizing::new(
@@ -90,7 +94,11 @@ impl PaymentEnvironment {
         Ok(encrypted_result)
     }
 
-    pub fn send_details(&self, payload: &EncryptedPayload, destination_label: &str) -> anyhow::Result<()> {
+    pub fn send_details(
+        &self,
+        payload: &EncryptedPayload,
+        destination_label: &str,
+    ) -> anyhow::Result<()> {
         tracing::warn!(
             destination = destination_label,
             "PLACEHOLDER: send_details performs no real network call — no payment gateway integration exists yet. This call only proves the audit-logging wiring."
@@ -108,7 +116,8 @@ impl PaymentEnvironment {
         };
         let mut line = serde_json::to_string(&record)?;
         line.push('\n');
-        self.io.append_locked(&self.audit_log_path, line.as_bytes())?;
+        self.io
+            .append_locked(&self.audit_log_path, line.as_bytes())?;
         Ok(())
     }
 }
@@ -136,9 +145,9 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> anyhow::Result<EncryptedPayload>
 fn decrypt(key: &[u8; 32], payload: &EncryptedPayload) -> anyhow::Result<Vec<u8>> {
     let nonce_bytes = hex::decode(&payload.nonce)?;
     let nonce_len = nonce_bytes.len();
-    let nonce_bytes: [u8; 12] = nonce_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("payment environment: nonce is {nonce_len} bytes, expected exactly 12"))?;
+    let nonce_bytes: [u8; 12] = nonce_bytes.try_into().map_err(|_| {
+        anyhow::anyhow!("payment environment: nonce is {nonce_len} bytes, expected exactly 12")
+    })?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = hex::decode(&payload.ciphertext)?;
 

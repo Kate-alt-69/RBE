@@ -75,10 +75,12 @@ impl IpStrikeTracker {
 
         let count = {
             let mut strikes = self.strikes.lock().unwrap();
-            let entry = strikes.entry((key.clone(), category)).or_insert(StrikeEntry {
-                window_start: now,
-                count: 0,
-            });
+            let entry = strikes
+                .entry((key.clone(), category))
+                .or_insert(StrikeEntry {
+                    window_start: now,
+                    count: 0,
+                });
             if now.duration_since(entry.window_start) >= window {
                 entry.window_start = now;
                 entry.count = 0;
@@ -88,7 +90,10 @@ impl IpStrikeTracker {
         };
 
         if count >= self.config.strike_threshold {
-            self.bans.lock().unwrap().insert(key, BanEntry { banned_at: now });
+            self.bans
+                .lock()
+                .unwrap()
+                .insert(key, BanEntry { banned_at: now });
             tracing::warn!(ip = %ip, ?category, strikes = count, "IP banned");
             true
         } else {
@@ -116,14 +121,17 @@ impl IpStrikeTracker {
         let duration = Duration::from_secs(self.config.ban_duration_secs);
         let mut bans = self.bans.lock().unwrap();
         bans.retain(|_, entry| now.duration_since(entry.banned_at) < duration);
-        let mut output = bans.iter().map(|(ip, entry)| {
-            let age = now.duration_since(entry.banned_at);
-            BanSnapshot {
-                ip: ip.clone(),
-                age_secs: age.as_secs(),
-                remaining_secs: duration.saturating_sub(age).as_secs(),
-            }
-        }).collect::<Vec<_>>();
+        let mut output = bans
+            .iter()
+            .map(|(ip, entry)| {
+                let age = now.duration_since(entry.banned_at);
+                BanSnapshot {
+                    ip: ip.clone(),
+                    age_secs: age.as_secs(),
+                    remaining_secs: duration.saturating_sub(age).as_secs(),
+                }
+            })
+            .collect::<Vec<_>>();
         output.sort_by(|a, b| a.ip.cmp(&b.ip));
         output
     }
@@ -133,16 +141,19 @@ impl IpStrikeTracker {
         let window = Duration::from_secs(self.config.strike_window_secs);
         let mut strikes = self.strikes.lock().unwrap();
         strikes.retain(|_, entry| now.duration_since(entry.window_start) < window);
-        let mut output = strikes.iter().map(|((ip, category), entry)| {
-            let age = now.duration_since(entry.window_start);
-            StrikeSnapshot {
-                ip: ip.clone(),
-                category: category.label(),
-                count: entry.count,
-                age_secs: age.as_secs(),
-                remaining_window_secs: window.saturating_sub(age).as_secs(),
-            }
-        }).collect::<Vec<_>>();
+        let mut output = strikes
+            .iter()
+            .map(|((ip, category), entry)| {
+                let age = now.duration_since(entry.window_start);
+                StrikeSnapshot {
+                    ip: ip.clone(),
+                    category: category.label(),
+                    count: entry.count,
+                    age_secs: age.as_secs(),
+                    remaining_window_secs: window.saturating_sub(age).as_secs(),
+                }
+            })
+            .collect::<Vec<_>>();
         output.sort_by(|a, b| a.ip.cmp(&b.ip).then_with(|| a.category.cmp(b.category)));
         output
     }
@@ -151,8 +162,14 @@ impl IpStrikeTracker {
         let now = Instant::now();
         let strike_window = Duration::from_secs(self.config.strike_window_secs);
         let ban_duration = Duration::from_secs(self.config.ban_duration_secs);
-        self.strikes.lock().unwrap().retain(|_, e| now.duration_since(e.window_start) < strike_window);
-        self.bans.lock().unwrap().retain(|_, e| now.duration_since(e.banned_at) < ban_duration);
+        self.strikes
+            .lock()
+            .unwrap()
+            .retain(|_, e| now.duration_since(e.window_start) < strike_window);
+        self.bans
+            .lock()
+            .unwrap()
+            .retain(|_, e| now.duration_since(e.banned_at) < ban_duration);
     }
 }
 
@@ -171,7 +188,8 @@ where
 {
     use axum::response::IntoResponse;
 
-    let peer = req.extensions()
+    let peer = req
+        .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0)
         .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));

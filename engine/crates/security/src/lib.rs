@@ -14,7 +14,9 @@ use axum::response::Response;
 use uuid::Uuid;
 
 pub use headers::security_headers;
-pub use ip_strikes::{ban_check, BanSnapshot, HasIpStrikes, IpStrikeTracker, StrikeCategory, StrikeSnapshot};
+pub use ip_strikes::{
+    ban_check, BanSnapshot, HasIpStrikes, IpStrikeTracker, StrikeCategory, StrikeSnapshot,
+};
 pub use rate_limit::{api_rate_limit, global_rate_limit, HasRateLimiters, RateLimiters};
 pub use real_ip::{extract_real_ip, normalize_key};
 pub use timing::request_timing;
@@ -30,7 +32,9 @@ pub async fn correlation_id(mut request: Request, next: Next) -> Response {
 
     let correlation_id = incoming.unwrap_or_else(|| Uuid::new_v4().to_string());
     tracing::Span::current().record("correlation_id", tracing::field::display(&correlation_id));
-    request.extensions_mut().insert(CorrelationId(correlation_id.clone()));
+    request
+        .extensions_mut()
+        .insert(CorrelationId(correlation_id.clone()));
 
     let mut response = next.run(request).await;
     if let Ok(value) = correlation_id.parse::<axum::http::HeaderValue>() {

@@ -20,7 +20,8 @@ const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_HELPER_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAINTENANCE_MARKER: &str = "X-RBE-Maintenance: 1";
-const BODY: &str = r#"{"ok":false,"status":"maintenance","message":"NOT AVAILABLE TRY AGAIN LATER"}"#;
+const BODY: &str =
+    r#"{"ok":false,"status":"maintenance","message":"NOT AVAILABLE TRY AGAIN LATER"}"#;
 
 pub struct MaintenanceNoticeProcess {
     child: Child,
@@ -31,8 +32,9 @@ pub struct MaintenanceNoticeProcess {
 
 impl MaintenanceNoticeProcess {
     pub async fn spawn(host: &str, port: u16) -> anyhow::Result<Self> {
-        let exe = std::env::current_exe()
-            .map_err(|err| anyhow::anyhow!("could not resolve backend executable for maintenance responder: {err}"))?;
+        let exe = std::env::current_exe().map_err(|err| {
+            anyhow::anyhow!("could not resolve backend executable for maintenance responder: {err}")
+        })?;
         let port_arg = port.to_string();
         let mut child = Command::new(exe)
             .arg("--maintenance-notice")
@@ -43,11 +45,12 @@ impl MaintenanceNoticeProcess {
             .stdin(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|err| anyhow::anyhow!("failed to spawn temporary maintenance responder: {err}"))?;
-        let lease = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("maintenance responder stdin lifetime pipe was not created"))?;
+            .map_err(|err| {
+                anyhow::anyhow!("failed to spawn temporary maintenance responder: {err}")
+            })?;
+        let lease = child.stdin.take().ok_or_else(|| {
+            anyhow::anyhow!("maintenance responder stdin lifetime pipe was not created")
+        })?;
 
         let mut process = Self {
             child,
@@ -78,7 +81,9 @@ impl MaintenanceNoticeProcess {
                 tracing::warn!(error = %err, "failed while waiting for maintenance responder to exit");
             }
             Err(_) => {
-                tracing::warn!("maintenance responder did not release the port in time; force-killing it");
+                tracing::warn!(
+                    "maintenance responder did not release the port in time; force-killing it"
+                );
                 let _ = self.child.kill().await;
                 let _ = self.child.wait().await;
             }
@@ -110,9 +115,11 @@ impl MaintenanceNoticeProcess {
 
 /// Entry point for `backend(.exe) --maintenance-notice`.
 pub async fn run(host: String, port: u16) -> anyhow::Result<()> {
-    let listener = TcpListener::bind((host.as_str(), port)).await.map_err(|err| {
-        anyhow::anyhow!("maintenance responder failed to bind {host}:{port}: {err}")
-    })?;
+    let listener = TcpListener::bind((host.as_str(), port))
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("maintenance responder failed to bind {host}:{port}: {err}")
+        })?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     std::thread::Builder::new()

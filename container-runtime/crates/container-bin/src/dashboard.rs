@@ -8,7 +8,10 @@ use container_runtime_core::Runtime;
 
 pub fn spawn(address: String, token: String, runtime: Arc<Runtime>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&address)?;
-    println!("container: dashboard listening on http://{}/", listener.local_addr()?);
+    println!(
+        "container: dashboard listening on http://{}/",
+        listener.local_addr()?
+    );
     thread::Builder::new()
         .name("container-dashboard".into())
         .spawn(move || {
@@ -89,13 +92,7 @@ fn handle(mut stream: TcpStream, token: &str, runtime: &Runtime) -> anyhow::Resu
             "application/json; charset=utf-8",
             &events_json(),
         ),
-        "/healthz" => respond(
-            &mut stream,
-            200,
-            "OK",
-            "text/plain; charset=utf-8",
-            "ok\n",
-        ),
+        "/healthz" => respond(&mut stream, 200, "OK", "text/plain; charset=utf-8", "ok\n"),
         _ => respond(
             &mut stream,
             404,
@@ -202,12 +199,16 @@ fn state_json(runtime: &Runtime) -> String {
             "linux": "namespaces + no_new_privs + seccomp + cgroup-v2 + timeout"
         },
         "environments": environments
-    }).to_string()
+    })
+    .to_string()
 }
 
 fn events_json() -> String {
     let content = fs::read_to_string(crate::event_log_path()).unwrap_or_default();
-    let events = content.lines().rev().take(250)
+    let events = content
+        .lines()
+        .rev()
+        .take(250)
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .collect::<Vec<_>>();
     serde_json::json!({ "events": events.into_iter().rev().collect::<Vec<_>>() }).to_string()

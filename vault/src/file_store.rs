@@ -32,7 +32,11 @@ impl FileStore {
         let store_path = dir.join("vault-store.json");
         let key_path = dir.join("vault-master.key");
         let key = read_or_create_key(&io, &key_path, &store_path)?;
-        Ok(Self { io, store_path, key })
+        Ok(Self {
+            io,
+            store_path,
+            key,
+        })
     }
 
     pub fn get(&self, name: &str) -> anyhow::Result<String> {
@@ -97,9 +101,9 @@ impl FileStore {
     fn decrypt(&self, entry: &StoredEntry) -> anyhow::Result<String> {
         let nonce_bytes = hex::decode(&entry.nonce)?;
         let nonce_len = nonce_bytes.len();
-        let nonce_bytes: [u8; 12] = nonce_bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("vault: stored nonce is {nonce_len} bytes, expected exactly 12"))?;
+        let nonce_bytes: [u8; 12] = nonce_bytes.try_into().map_err(|_| {
+            anyhow::anyhow!("vault: stored nonce is {nonce_len} bytes, expected exactly 12")
+        })?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = hex::decode(&entry.ciphertext)?;
 
@@ -116,12 +120,20 @@ impl FileStore {
     }
 }
 
-fn read_or_create_key(io: &AtomicIo, key_path: &Path, store_path: &Path) -> anyhow::Result<[u8; 32]> {
+fn read_or_create_key(
+    io: &AtomicIo,
+    key_path: &Path,
+    store_path: &Path,
+) -> anyhow::Result<[u8; 32]> {
     match fs::read_to_string(key_path) {
         Ok(existing) => {
             let trimmed = existing.trim();
-            let bytes = hex::decode(trimmed)
-                .map_err(|error| anyhow::anyhow!("vault master key {} is malformed: {error}", key_path.display()))?;
+            let bytes = hex::decode(trimmed).map_err(|error| {
+                anyhow::anyhow!(
+                    "vault master key {} is malformed: {error}",
+                    key_path.display()
+                )
+            })?;
             if bytes.len() != 32 {
                 anyhow::bail!(
                     "vault master key {} is {} bytes, expected exactly 32; refusing to replace a key that may protect existing credentials",
@@ -135,7 +147,10 @@ fn read_or_create_key(io: &AtomicIo, key_path: &Path, store_path: &Path) -> anyh
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(anyhow::anyhow!("failed to read vault master key {}: {error}", key_path.display()));
+            return Err(anyhow::anyhow!(
+                "failed to read vault master key {}: {error}",
+                key_path.display()
+            ));
         }
     }
 
@@ -177,7 +192,9 @@ mod tests {
     fn round_trips_a_value() {
         let dir = temp_dir("roundtrip");
         let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
-        store.set("db.password", "correct horse battery staple").unwrap();
+        store
+            .set("db.password", "correct horse battery staple")
+            .unwrap();
         let value = store.get("db.password").unwrap();
         assert_eq!(value, "correct horse battery staple");
         let _ = fs::remove_dir_all(&dir);

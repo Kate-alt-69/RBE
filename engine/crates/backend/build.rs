@@ -21,9 +21,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_BIN_PATH");
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_SIGNING_PRIVATE_KEY");
 
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts");
+    let out_dir =
+        std::env::var("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts");
     let integrity_dest = Path::new(&out_dir).join("container_integrity.rs");
-    let source = std::env::var("RBE_CONTAINER_BIN_PATH").ok().map(PathBuf::from);
+    let source = std::env::var("RBE_CONTAINER_BIN_PATH")
+        .ok()
+        .map(PathBuf::from);
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
     let build_id = build_id();
 
@@ -32,7 +35,10 @@ fn main() {
             println!("cargo:rerun-if-changed={}", path.display());
 
             let hash = sha256_file(&path).unwrap_or_else(|err| {
-                panic!("backend/build.rs: failed to SHA-256 container binary {}: {err}", path.display())
+                panic!(
+                    "backend/build.rs: failed to SHA-256 container binary {}: {err}",
+                    path.display()
+                )
             });
 
             let private_key_hex = std::env::var("RBE_CONTAINER_SIGNING_PRIVATE_KEY").unwrap_or_else(|_| {
@@ -97,9 +103,7 @@ fn build_id() -> String {
 }
 
 fn signing_statement(hash: &str, build_id: &str, target: &str) -> String {
-    format!(
-        "RBE-CONTAINER-INTEGRITY-V1\nsha256={hash}\nbuild_id={build_id}\ntarget={target}\n"
-    )
+    format!("RBE-CONTAINER-INTEGRITY-V1\nsha256={hash}\nbuild_id={build_id}\ntarget={target}\n")
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {

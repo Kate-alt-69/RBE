@@ -149,7 +149,11 @@ pub fn report_issue(input: IssueInput) {
 
     let source: String = {
         let trimmed = input.source.trim();
-        let source = if trimmed.is_empty() { "unknown_source" } else { trimmed };
+        let source = if trimmed.is_empty() {
+            "unknown_source"
+        } else {
+            trimmed
+        };
         source.chars().take(96).collect()
     };
 
@@ -160,9 +164,8 @@ pub fn report_issue(input: IssueInput) {
 
     let now = Instant::now();
     let message_prefix: String = message.chars().take(256).collect();
-    let fingerprint = format!(
-        "{source}|{level:?}|{category:?}|{message_prefix}|{stack_for_fingerprint}"
-    );
+    let fingerprint =
+        format!("{source}|{level:?}|{category:?}|{message_prefix}|{stack_for_fingerprint}");
 
     if state.dedupe_window > Duration::ZERO {
         let mut fingerprints = state.recent_fingerprints.lock().unwrap();
@@ -294,7 +297,11 @@ fn iso_now() -> String {
 
     let days_since_epoch = secs / 86_400;
     let time_of_day = secs % 86_400;
-    let (hour, minute, second) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
+    let (hour, minute, second) = (
+        time_of_day / 3600,
+        (time_of_day % 3600) / 60,
+        time_of_day % 60,
+    );
 
     let (year, month, day) = civil_from_days(days_since_epoch as i64);
 
@@ -391,7 +398,11 @@ mod tests {
         // against any other test in this binary is this assertion
         // meaningful — but per this test's own doc comment, it's the
         // only one in the file that calls `init`, so it always wins.
-        assert_eq!(lines.len(), 2, "expected exactly 2 lines: one deduped away, one empty-message dropped");
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly 2 lines: one deduped away, one empty-message dropped"
+        );
         assert!(lines[0].contains("first distinct issue"));
         assert!(lines[1].contains("second distinct issue"));
 
@@ -401,7 +412,11 @@ mod tests {
     #[test]
     fn iso_now_produces_a_parseable_looking_timestamp() {
         let iso = iso_now();
-        assert_eq!(iso.len(), 24, "expected YYYY-MM-DDTHH:MM:SS.mmmZ, got {iso:?}");
+        assert_eq!(
+            iso.len(),
+            24,
+            "expected YYYY-MM-DDTHH:MM:SS.mmmZ, got {iso:?}"
+        );
         assert!(iso.ends_with('Z'));
         assert_eq!(&iso[4..5], "-");
         assert_eq!(&iso[7..8], "-");

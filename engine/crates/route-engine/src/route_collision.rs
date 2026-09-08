@@ -192,7 +192,9 @@ mod tests {
 
         let collisions = find_collisions(&root).unwrap();
         assert_eq!(collisions.len(), 1);
-        assert!(collisions[0].message.contains("native API namespace `/api/auth`"));
+        assert!(collisions[0]
+            .message
+            .contains("native API namespace `/api/auth`"));
         let _ = fs::remove_dir_all(root);
     }
 }

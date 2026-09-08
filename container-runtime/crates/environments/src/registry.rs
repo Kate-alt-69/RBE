@@ -79,7 +79,8 @@ impl EnvironmentRegistry {
             }
         }
 
-        env.abuse.record_execution(caller, cpu_ms, network_bytes, disk_bytes)
+        env.abuse
+            .record_execution(caller, cpu_ms, network_bytes, disk_bytes)
     }
 
     /// Same shape as `record_general_execution`, for the payment

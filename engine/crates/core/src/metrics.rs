@@ -50,12 +50,21 @@ impl BackendMetrics {
     pub fn request_finished(&self, status: u16, elapsed_micros: u64) {
         self.active_requests.fetch_sub(1, Ordering::Relaxed);
         self.completed_requests.fetch_add(1, Ordering::Relaxed);
-        self.total_latency_micros.fetch_add(elapsed_micros, Ordering::Relaxed);
+        self.total_latency_micros
+            .fetch_add(elapsed_micros, Ordering::Relaxed);
         match status / 100 {
-            2 => { self.responses_2xx.fetch_add(1, Ordering::Relaxed); }
-            3 => { self.responses_3xx.fetch_add(1, Ordering::Relaxed); }
-            4 => { self.responses_4xx.fetch_add(1, Ordering::Relaxed); }
-            5 => { self.responses_5xx.fetch_add(1, Ordering::Relaxed); }
+            2 => {
+                self.responses_2xx.fetch_add(1, Ordering::Relaxed);
+            }
+            3 => {
+                self.responses_3xx.fetch_add(1, Ordering::Relaxed);
+            }
+            4 => {
+                self.responses_4xx.fetch_add(1, Ordering::Relaxed);
+            }
+            5 => {
+                self.responses_5xx.fetch_add(1, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -71,7 +80,11 @@ impl BackendMetrics {
             responses_3xx: self.responses_3xx.load(Ordering::Relaxed),
             responses_4xx: self.responses_4xx.load(Ordering::Relaxed),
             responses_5xx: self.responses_5xx.load(Ordering::Relaxed),
-            average_latency_ms: if completed == 0 { 0.0 } else { latency as f64 / completed as f64 / 1000.0 },
+            average_latency_ms: if completed == 0 {
+                0.0
+            } else {
+                latency as f64 / completed as f64 / 1000.0
+            },
         }
     }
 }
@@ -112,17 +125,21 @@ impl MaintenanceMetrics {
 
     pub fn record_container_refresh(&self) {
         self.container_refreshes.fetch_add(1, Ordering::Relaxed);
-        self.last_container_refresh_ms.store(now_ms(), Ordering::Relaxed);
+        self.last_container_refresh_ms
+            .store(now_ms(), Ordering::Relaxed);
     }
 
     pub fn record_vault_refresh(&self) {
         self.vault_refreshes.fetch_add(1, Ordering::Relaxed);
-        self.last_vault_refresh_ms.store(now_ms(), Ordering::Relaxed);
+        self.last_vault_refresh_ms
+            .store(now_ms(), Ordering::Relaxed);
     }
 
     pub fn record_error_reporter_refresh(&self) {
-        self.error_reporter_refreshes.fetch_add(1, Ordering::Relaxed);
-        self.last_error_reporter_refresh_ms.store(now_ms(), Ordering::Relaxed);
+        self.error_reporter_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+        self.last_error_reporter_refresh_ms
+            .store(now_ms(), Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> MaintenanceSnapshot {
@@ -133,11 +150,17 @@ impl MaintenanceMetrics {
             error_reporter_refreshes: self.error_reporter_refreshes.load(Ordering::Relaxed),
             last_container_refresh_ms: self.last_container_refresh_ms.load(Ordering::Relaxed),
             last_vault_refresh_ms: self.last_vault_refresh_ms.load(Ordering::Relaxed),
-            last_error_reporter_refresh_ms: self.last_error_reporter_refresh_ms.load(Ordering::Relaxed),
+            last_error_reporter_refresh_ms: self
+                .last_error_reporter_refresh_ms
+                .load(Ordering::Relaxed),
         }
     }
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().min(u64::MAX as u128) as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }

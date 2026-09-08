@@ -62,7 +62,15 @@ pub(crate) fn infer(message: &str, stack: &str) -> IssueCategory {
         return IssueCategory::RustRuntimeError;
     }
     if any(&[
-        "econn", "enet", "dns", "socket", "network", "fetch", "axios", "timed out", "timeout",
+        "econn",
+        "enet",
+        "dns",
+        "socket",
+        "network",
+        "fetch",
+        "axios",
+        "timed out",
+        "timeout",
     ]) {
         return IssueCategory::NetworkError;
     }
@@ -100,8 +108,14 @@ mod tests {
 
     #[test]
     fn infers_network_from_common_keywords() {
-        assert_eq!(infer("ECONNREFUSED talking to upstream", ""), IssueCategory::NetworkError);
-        assert_eq!(infer("request timed out after 30s", ""), IssueCategory::NetworkError);
+        assert_eq!(
+            infer("ECONNREFUSED talking to upstream", ""),
+            IssueCategory::NetworkError
+        );
+        assert_eq!(
+            infer("request timed out after 30s", ""),
+            IssueCategory::NetworkError
+        );
     }
 
     #[test]
@@ -114,20 +128,29 @@ mod tests {
 
     #[test]
     fn infers_security_from_keywords_when_no_earlier_category_matches() {
-        assert_eq!(infer("request blocked: forbidden origin", ""), IssueCategory::SecurityError);
+        assert_eq!(
+            infer("request blocked: forbidden origin", ""),
+            IssueCategory::SecurityError
+        );
     }
 
     #[test]
     fn infers_rust_panic_before_operation_failure() {
         assert_eq!(
-            infer("thread 'main' panicked at src/main.rs:10: index out of bounds", ""),
+            infer(
+                "thread 'main' panicked at src/main.rs:10: index out of bounds",
+                ""
+            ),
             IssueCategory::RustRuntimeError
         );
     }
 
     #[test]
     fn falls_back_to_operation_failure_then_unknown() {
-        assert_eq!(infer("the operation failed", ""), IssueCategory::OperationFailure);
+        assert_eq!(
+            infer("the operation failed", ""),
+            IssueCategory::OperationFailure
+        );
         assert_eq!(infer("something happened", ""), IssueCategory::UnknownError);
     }
 

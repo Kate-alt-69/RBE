@@ -26,14 +26,29 @@ pub enum SyncAction {
 
 fn artifact_path_for(cache_dir: &Path, api_dir: &Path, route_path: &Path) -> PathBuf {
     let relative = route_path.strip_prefix(api_dir).unwrap_or(route_path);
-    cache_dir.join("artifact").join(relative).with_extension("rs")
+    cache_dir
+        .join("artifact")
+        .join(relative)
+        .with_extension("rs")
 }
 
-fn existing_hash_matches(io: &atomic_io::AtomicIo, artifact_path: &Path, current_hash: u64) -> bool {
-    let Ok(existing) = io.read(artifact_path) else { return false };
-    let Ok(existing_text) = String::from_utf8(existing) else { return false };
-    let Some(first_line) = existing_text.lines().next() else { return false };
-    let Some(recorded) = first_line.strip_prefix(SOURCE_HASH_PREFIX) else { return false };
+fn existing_hash_matches(
+    io: &atomic_io::AtomicIo,
+    artifact_path: &Path,
+    current_hash: u64,
+) -> bool {
+    let Ok(existing) = io.read(artifact_path) else {
+        return false;
+    };
+    let Ok(existing_text) = String::from_utf8(existing) else {
+        return false;
+    };
+    let Some(first_line) = existing_text.lines().next() else {
+        return false;
+    };
+    let Some(recorded) = first_line.strip_prefix(SOURCE_HASH_PREFIX) else {
+        return false;
+    };
     recorded.trim() == current_hash.to_string()
 }
 
@@ -62,12 +77,24 @@ fn sync_one(
 
     let source = String::from_utf8(bytes)
         .map_err(|e| format!("{}: not valid UTF-8: {e}", route_path.display()))?;
-    let tokens = Lexer::new(&source)
-        .tokenize()
-        .map_err(|e| format!("{}:{}:{}: {}", route_path.display(), e.line, e.column, e.message))?;
-    let file: RouteFile = Parser::new(tokens)
-        .parse_file()
-        .map_err(|e| format!("{}:{}:{}: {}", route_path.display(), e.line, e.column, e.message))?;
+    let tokens = Lexer::new(&source).tokenize().map_err(|e| {
+        format!(
+            "{}:{}:{}: {}",
+            route_path.display(),
+            e.line,
+            e.column,
+            e.message
+        )
+    })?;
+    let file: RouteFile = Parser::new(tokens).parse_file().map_err(|e| {
+        format!(
+            "{}:{}:{}: {}",
+            route_path.display(),
+            e.line,
+            e.column,
+            e.message
+        )
+    })?;
 
     let diagnostics = analyze(&file);
     let errors: Vec<String> = diagnostics
@@ -91,7 +118,11 @@ fn sync_one(
     Ok(SyncAction::Regenerated)
 }
 
-pub fn sync(io: &atomic_io::AtomicIo, api_dir: &Path, cache_dir: &Path) -> anyhow::Result<Vec<SyncOutcome>> {
+pub fn sync(
+    io: &atomic_io::AtomicIo,
+    api_dir: &Path,
+    cache_dir: &Path,
+) -> anyhow::Result<Vec<SyncOutcome>> {
     let mut route_paths = Vec::new();
     collect_route_files(api_dir, &mut route_paths)?;
 
@@ -99,7 +130,11 @@ pub fn sync(io: &atomic_io::AtomicIo, api_dir: &Path, cache_dir: &Path) -> anyho
     for route_path in route_paths {
         let artifact_path = artifact_path_for(cache_dir, api_dir, &route_path);
         let result = sync_one(io, api_dir, cache_dir, &route_path);
-        outcomes.push(SyncOutcome { route_path, artifact_path, result });
+        outcomes.push(SyncOutcome {
+            route_path,
+            artifact_path,
+            result,
+        });
     }
     Ok(outcomes)
 }
@@ -163,7 +198,11 @@ mod tests {
         let root = temp_dir("unchanged");
         let api_dir = root.join("api");
         std::fs::create_dir_all(&api_dir).unwrap();
-        std::fs::write(api_dir.join("ping.route"), "class Route { get(req) { return true; } }").unwrap();
+        std::fs::write(
+            api_dir.join("ping.route"),
+            "class Route { get(req) { return true; } }",
+        )
+        .unwrap();
 
         let cache_dir = root.join(".cache/backend");
         let io = atomic_io::AtomicIo::new();

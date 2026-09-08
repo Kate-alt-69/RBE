@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use container_runtime_core::{EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost};
+use container_runtime_core::{
+    EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost,
+};
 use execution_engine::{ExecutionLimits, WasmExecutor};
 use ipc_protocol::{decode_request, read_frame, write_frame, Request, Response, PROTOCOL_VERSION};
 use resource_limits::ResourceLimits;
@@ -35,23 +37,34 @@ const MONITOR_LOG_KEEP_BYTES: u64 = 4 * 1024 * 1024;
 static EVENT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) fn event_log_path() -> PathBuf {
-    runtime_paths::binary_dir().join("data").join("container-runtime").join("container-events.jsonl")
+    runtime_paths::binary_dir()
+        .join("data")
+        .join("container-runtime")
+        .join("container-events.jsonl")
 }
 pub(crate) fn monitor_log_path() -> PathBuf {
-    runtime_paths::binary_dir().join("data").join("container-runtime").join("container-monitor.log")
+    runtime_paths::binary_dir()
+        .join("data")
+        .join("container-runtime")
+        .join("container-monitor.log")
 }
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = env::args().skip(1).collect::<Vec<_>>();
 
-    if args.iter().any(|arg| arg == "--monitor") { return run_monitor(&args); }
-    if args.iter().any(|arg| arg == "--worker") { return run_worker(&args); }
+    if args.iter().any(|arg| arg == "--monitor") {
+        return run_monitor(&args);
+    }
+    if args.iter().any(|arg| arg == "--worker") {
+        return run_worker(&args);
+    }
 
     let debug = args.iter().any(|arg| arg == "--debug");
     let listen = value_after(&args, "--listen");
     let dashboard_disabled = args.iter().any(|arg| arg == "--no-dashboard");
-    let dashboard_address = value_after(&args, "--dashboard-listen").unwrap_or_else(|| DEFAULT_DASHBOARD_ADDRESS.to_string());
+    let dashboard_address = value_after(&args, "--dashboard-listen")
+        .unwrap_or_else(|| DEFAULT_DASHBOARD_ADDRESS.to_string());
     emit_event("container_start", &format!("pid={}", std::process::id()));
 
     if let Err(err) = spawn_monitor_supervisor() {
@@ -64,7 +77,9 @@ fn main() -> anyhow::Result<()> {
     error_client::init(io.clone(), &admin_dir);
     error_client::install_panic_hook();
 
-    let vault_data_dir = runtime_paths::binary_dir().join("data").join("container-admin");
+    let vault_data_dir = runtime_paths::binary_dir()
+        .join("data")
+        .join("container-admin");
     let vault = match vault::Vault::new(io.clone(), "backend-rs-container", &vault_data_dir) {
         Ok(v) => Arc::new(v),
         Err(e) => {
@@ -99,18 +114,23 @@ fn main() -> anyhow::Result<()> {
     });
     let accepting = Arc::new(AtomicBool::new(true));
 
-    emit_event("runtime_config", &format!(
-        "general_environments={} swamps_per_environment={} workers_per_swamp={}",
-        runtime.config().general_environments,
-        runtime.config().swamps_per_environment,
-        runtime.config().workers_per_swamp
-    ));
+    emit_event(
+        "runtime_config",
+        &format!(
+            "general_environments={} swamps_per_environment={} workers_per_swamp={}",
+            runtime.config().general_environments,
+            runtime.config().swamps_per_environment,
+            runtime.config().workers_per_swamp
+        ),
+    );
 
     let token = env::var("RBE_CONTAINER_TOKEN").ok();
     if !dashboard_disabled {
         match token.as_ref() {
             Some(token) => {
-                if let Err(error) = dashboard::spawn(dashboard_address.clone(), token.clone(), runtime.clone()) {
+                if let Err(error) =
+                    dashboard::spawn(dashboard_address.clone(), token.clone(), runtime.clone())
+                {
                     emit_event("dashboard_start_failed", &error.to_string());
                     tracing::warn!(error = %error, address = %dashboard_address, "container standalone dashboard could not be started");
                 } else {
@@ -118,15 +138,22 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             None => {
-                emit_event("dashboard_disabled_no_token", "RBE_CONTAINER_TOKEN is not set");
+                emit_event(
+                    "dashboard_disabled_no_token",
+                    "RBE_CONTAINER_TOKEN is not set",
+                );
                 tracing::warn!("container standalone dashboard disabled because RBE_CONTAINER_TOKEN is not set");
             }
         }
     }
 
-    if debug { run_debug(&args, &runtime)?; }
+    if debug {
+        run_debug(&args, &runtime)?;
+    }
     if let Some(address) = listen {
-        let token = token.ok_or_else(|| anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used"))?;
+        let token = token.ok_or_else(|| {
+            anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used")
+        })?;
         run_control_server(&address, token, runtime.clone(), accepting)?;
     } else if !debug {
         println!("container: no control socket requested; exiting after initialization");
@@ -139,12 +166,20 @@ fn spawn_monitor_supervisor() -> anyhow::Result<()> {
     let watched_pid = std::process::id();
     let events = event_log_path();
     let log = monitor_log_path();
-    thread::Builder::new().name("container-monitor-supervisor".into()).spawn(move || {
-        loop {
+    thread::Builder::new()
+        .name("container-monitor-supervisor".into())
+        .spawn(move || loop {
             let mut child = match std::process::Command::new(&exe)
-                .arg("--monitor").arg("--pid").arg(watched_pid.to_string())
-                .arg("--events").arg(&events).arg("--log").arg(&log)
-                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .arg("--monitor")
+                .arg("--pid")
+                .arg(watched_pid.to_string())
+                .arg("--events")
+                .arg(&events)
+                .arg("--log")
+                .arg(&log)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
             {
                 Ok(child) => child,
@@ -180,21 +215,30 @@ fn spawn_monitor_supervisor() -> anyhow::Result<()> {
                 }
                 thread::sleep(Duration::from_secs(1));
             }
-        }
-    })?;
+        })?;
     Ok(())
 }
 
 fn run_monitor(args: &[String]) -> anyhow::Result<()> {
-    let watched_pid = value_after(args, "--pid").and_then(|value| value.parse::<u32>().ok()).ok_or_else(|| anyhow::anyhow!("monitor: --pid is required"))?;
-    let event_path = value_after(args, "--events").map(PathBuf::from).unwrap_or_else(event_log_path);
-    let monitor_path = value_after(args, "--log").map(PathBuf::from).unwrap_or_else(monitor_log_path);
-    if let Some(parent) = monitor_path.parent() { fs::create_dir_all(parent)?; }
+    let watched_pid = value_after(args, "--pid")
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| anyhow::anyhow!("monitor: --pid is required"))?;
+    let event_path = value_after(args, "--events")
+        .map(PathBuf::from)
+        .unwrap_or_else(event_log_path);
+    let monitor_path = value_after(args, "--log")
+        .map(PathBuf::from)
+        .unwrap_or_else(monitor_log_path);
+    if let Some(parent) = monitor_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
     let mut last_event_len = 0_u64;
     loop {
         if let Ok(metadata) = fs::metadata(&event_path) {
-            if metadata.len() < last_event_len { last_event_len = 0; }
+            if metadata.len() < last_event_len {
+                last_event_len = 0;
+            }
             if metadata.len() > last_event_len {
                 if let Ok(mut file) = OpenOptions::new().read(true).open(&event_path) {
                     file.seek(SeekFrom::Start(last_event_len))?;
@@ -202,13 +246,19 @@ fn run_monitor(args: &[String]) -> anyhow::Result<()> {
                     file.read_to_string(&mut appended)?;
                     last_event_len = metadata.len();
                     if !appended.trim().is_empty() {
-                        append_monitor_log(&monitor_path, &format!("{} container-event {}", now_ms(), appended.trim_end()))?;
+                        append_monitor_log(
+                            &monitor_path,
+                            &format!("{} container-event {}", now_ms(), appended.trim_end()),
+                        )?;
                     }
                 }
             }
         }
         if !process_exists(watched_pid) {
-            append_monitor_log(&monitor_path, &format!("{} container_process_exit pid={watched_pid}", now_ms()))?;
+            append_monitor_log(
+                &monitor_path,
+                &format!("{} container_process_exit pid={watched_pid}", now_ms()),
+            )?;
             return Ok(());
         }
         thread::sleep(MONITOR_POLL);
@@ -218,23 +268,34 @@ fn run_monitor(args: &[String]) -> anyhow::Result<()> {
 fn process_exists(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+        unsafe {
+            libc::kill(pid as i32, 0) == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
     }
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle.is_null() { return false; }
+        if handle.is_null() {
+            return false;
+        }
         let mut exit_code = 0u32;
         let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
-        unsafe { CloseHandle(handle); }
+        unsafe {
+            CloseHandle(handle);
+        }
         ok && exit_code == 259
     }
 }
 
 fn append_monitor_log(path: &Path, line: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     rotate_log(path, MONITOR_LOG_MAX_BYTES, MONITOR_LOG_KEEP_BYTES)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{line}")?;
@@ -242,9 +303,14 @@ fn append_monitor_log(path: &Path, line: &str) -> anyhow::Result<()> {
 }
 
 fn emit_event(kind: &str, detail: &str) {
-    let _guard = EVENT_LOG_LOCK.get_or_init(|| Mutex::new(())).lock().expect("event log lock poisoned");
+    let _guard = EVENT_LOG_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("event log lock poisoned");
     let path = event_log_path();
-    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     let _ = rotate_log(&path, EVENT_LOG_MAX_BYTES, EVENT_LOG_KEEP_BYTES);
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let event = serde_json::json!({ "ts": now_ms(), "pid": std::process::id(), "kind": kind, "detail": detail });
@@ -253,15 +319,21 @@ fn emit_event(kind: &str, detail: &str) {
 }
 
 fn rotate_log(path: &Path, max_bytes: u64, keep_bytes: u64) -> anyhow::Result<()> {
-    let Ok(metadata) = fs::metadata(path) else { return Ok(()); };
-    if metadata.len() <= max_bytes { return Ok(()); }
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len() <= max_bytes {
+        return Ok(());
+    }
     let start = metadata.len().saturating_sub(keep_bytes);
     let mut input = OpenOptions::new().read(true).open(path)?;
     input.seek(SeekFrom::Start(start))?;
     let mut tail = Vec::new();
     input.read_to_end(&mut tail)?;
     if start > 0 {
-        if let Some(index) = tail.iter().position(|byte| *byte == b'\n') { tail.drain(..=index); }
+        if let Some(index) = tail.iter().position(|byte| *byte == b'\n') {
+            tail.drain(..=index);
+        }
     }
     let mut output = OpenOptions::new().write(true).truncate(true).open(path)?;
     output.write_all(&tail)?;
@@ -269,26 +341,66 @@ fn rotate_log(path: &Path, max_bytes: u64, keep_bytes: u64) -> anyhow::Result<()
     Ok(())
 }
 
-fn now_ms() -> u128 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() }
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 
 fn run_worker(args: &[String]) -> anyhow::Result<()> {
-    set_no_new_privileges().map_err(|e| anyhow::anyhow!("worker: failed to set no_new_privs: {e}"))?;
-    install_restricted_seccomp().map_err(|e| anyhow::anyhow!("worker: failed to install seccomp: {e}"))?;
-    let artifact = value_after(args, "--artifact").ok_or_else(|| anyhow::anyhow!("worker: --artifact is required"))?;
-    if artifact.is_empty() || artifact.len() > 128 || !artifact.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') { anyhow::bail!("worker: invalid artifact hash"); }
-    let path = runtime_paths::binary_dir().join("data").join("container-runtime").join("artifacts").join(format!("{artifact}.wasm"));
-    let wasm = fs::read(path).map_err(|e| anyhow::anyhow!("worker: failed to read artifact: {e}"))?;
-    let fuel = value_after(args, "--fuel").and_then(|value| value.parse::<u64>().ok()).unwrap_or(10_000_000);
-    let max_memory_bytes = value_after(args, "--memory").and_then(|value| value.parse::<u64>().ok()).unwrap_or(64 * 1024 * 1024);
+    set_no_new_privileges()
+        .map_err(|e| anyhow::anyhow!("worker: failed to set no_new_privs: {e}"))?;
+    install_restricted_seccomp()
+        .map_err(|e| anyhow::anyhow!("worker: failed to install seccomp: {e}"))?;
+    let artifact = value_after(args, "--artifact")
+        .ok_or_else(|| anyhow::anyhow!("worker: --artifact is required"))?;
+    if artifact.is_empty()
+        || artifact.len() > 128
+        || !artifact
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        anyhow::bail!("worker: invalid artifact hash");
+    }
+    let path = runtime_paths::binary_dir()
+        .join("data")
+        .join("container-runtime")
+        .join("artifacts")
+        .join(format!("{artifact}.wasm"));
+    let wasm =
+        fs::read(path).map_err(|e| anyhow::anyhow!("worker: failed to read artifact: {e}"))?;
+    let fuel = value_after(args, "--fuel")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(10_000_000);
+    let max_memory_bytes = value_after(args, "--memory")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(64 * 1024 * 1024);
     let executor = WasmExecutor::new()?;
-    let result = executor.execute(&wasm, ExecutionLimits { fuel, max_memory_bytes })?;
-    if result.exit_code != 0 { anyhow::bail!("worker: WASM exited with status {}", result.exit_code); }
+    let result = executor.execute(
+        &wasm,
+        ExecutionLimits {
+            fuel,
+            max_memory_bytes,
+        },
+    )?;
+    if result.exit_code != 0 {
+        anyhow::bail!("worker: WASM exited with status {}", result.exit_code);
+    }
     Ok(())
 }
 
-fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>, accepting: Arc<AtomicBool>) -> anyhow::Result<()> {
+fn run_control_server(
+    address: &str,
+    token: String,
+    runtime: Arc<Runtime>,
+    accepting: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
-    println!("container: control socket listening on {}", listener.local_addr()?);
+    println!(
+        "container: control socket listening on {}",
+        listener.local_addr()?
+    );
     emit_event("control_listening", address);
     for stream in listener.incoming() {
         match stream {
@@ -308,92 +420,196 @@ fn run_control_server(address: &str, token: String, runtime: Arc<Runtime>, accep
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, accepting: &AtomicBool) -> anyhow::Result<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    token: &str,
+    runtime: &Runtime,
+    accepting: &AtomicBool,
+) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let request = decode_request(&read_frame(&mut reader)?)?;
     let response = match request {
         Request::Hello(hello) => {
             if hello.version != PROTOCOL_VERSION || hello.auth_token != token {
-                Response::Error { request_id: None, code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
-            } else { Response::HelloAccepted { version: PROTOCOL_VERSION } }
+                Response::Error {
+                    request_id: None,
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else {
+                Response::HelloAccepted {
+                    version: PROTOCOL_VERSION,
+                }
+            }
         }
         Request::Execute(request) => {
             if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
             } else if !accepting.load(Ordering::Acquire) {
-                Response::Error { request_id: Some(request.request_id), code: "REFRESHING".into(), message: "container is draining for a supervised process refresh".into() }
-            } else if let Some(environment) = parse_environment(&request.environment).filter(|id| runtime.has_environment(*id)) {
-                let cost = WorkCost { cpu: request.declared_cost.cpu, memory: request.declared_cost.memory, io: request.declared_cost.io, network: request.declared_cost.network };
-                let execution_id = runtime.submit_with_policy(environment, request.artifact_hash, cost, ResourceLimits::default(), SandboxPolicy::default(), 0, request.payload);
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "REFRESHING".into(),
+                    message: "container is draining for a supervised process refresh".into(),
+                }
+            } else if let Some(environment) =
+                parse_environment(&request.environment).filter(|id| runtime.has_environment(*id))
+            {
+                let cost = WorkCost {
+                    cpu: request.declared_cost.cpu,
+                    memory: request.declared_cost.memory,
+                    io: request.declared_cost.io,
+                    network: request.declared_cost.network,
+                };
+                let execution_id = runtime.submit_with_policy(
+                    environment,
+                    request.artifact_hash,
+                    cost,
+                    ResourceLimits::default(),
+                    SandboxPolicy::default(),
+                    0,
+                    request.payload,
+                );
                 emit_event("execution_accepted", &execution_id.to_string());
-                Response::Accepted { request_id: request.request_id, execution_id: execution_id.to_string() }
+                Response::Accepted {
+                    request_id: request.request_id,
+                    execution_id: execution_id.to_string(),
+                }
             } else {
-                Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("container environment is unavailable: {}", request.environment) }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "INVALID_ENVIRONMENT".into(),
+                    message: format!(
+                        "container environment is unavailable: {}",
+                        request.environment
+                    ),
+                }
             }
         }
         Request::Health(request) => {
             if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
             } else {
                 let snapshots = runtime.snapshots();
                 let (swamps, workers, busy, completed, failed) = topology_totals(&snapshots);
-                Response::Health { request_id: request.request_id, body: serde_json::json!({
-                    "protocol": PROTOCOL_VERSION,
-                    "process": "container",
-                    "pid": std::process::id(),
-                    "accepting_executions": accepting.load(Ordering::Acquire),
-                    "environments": snapshots.len(),
-                    "general_environments": runtime.config().general_environments,
-                    "payment_environments": 1,
-                    "swamps": swamps,
-                    "workers": workers,
-                    "workers_busy": busy,
-                    "queue": runtime.global_queue_len(),
-                    "completed": completed,
-                    "failed": failed,
-                    "sandbox_policy": "deny-by-default",
-                    "wasm_engine": "wasmtime",
-                    "artifact_cache": runtime.cache().artifact_count(),
-                    "profile_cache": runtime.cache().len()
-                }) }
+                Response::Health {
+                    request_id: request.request_id,
+                    body: serde_json::json!({
+                        "protocol": PROTOCOL_VERSION,
+                        "process": "container",
+                        "pid": std::process::id(),
+                        "accepting_executions": accepting.load(Ordering::Acquire),
+                        "environments": snapshots.len(),
+                        "general_environments": runtime.config().general_environments,
+                        "payment_environments": 1,
+                        "swamps": swamps,
+                        "workers": workers,
+                        "workers_busy": busy,
+                        "queue": runtime.global_queue_len(),
+                        "completed": completed,
+                        "failed": failed,
+                        "sandbox_policy": "deny-by-default",
+                        "wasm_engine": "wasmtime",
+                        "artifact_cache": runtime.cache().artifact_count(),
+                        "profile_cache": runtime.cache().len()
+                    }),
+                }
             }
         }
         Request::Cancel(request) => {
             if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
             } else if runtime.cancel(&request.execution_id) {
                 emit_event("execution_cancel", &request.execution_id);
-                Response::Cancelled { request_id: request.request_id }
+                Response::Cancelled {
+                    request_id: request.request_id,
+                }
             } else {
-                Response::Error { request_id: Some(request.request_id), code: "NOT_FOUND".into(), message: "execution ID was not found".into() }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "NOT_FOUND".into(),
+                    message: "execution ID was not found".into(),
+                }
             }
         }
         Request::Inspect(request) => {
             if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
             } else {
-                Response::Inspection { request_id: request.request_id, body: inspection_body(runtime, request.execution_id, accepting.load(Ordering::Acquire)) }
+                Response::Inspection {
+                    request_id: request.request_id,
+                    body: inspection_body(
+                        runtime,
+                        request.execution_id,
+                        accepting.load(Ordering::Acquire),
+                    ),
+                }
             }
         }
         Request::RestartEnvironment(request) => {
             if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
             } else if !accepting.load(Ordering::Acquire) {
-                Response::Error { request_id: Some(request.request_id), code: "REFRESHING".into(), message: "container is draining for a supervised process refresh".into() }
-            } else if let Some(environment) = parse_environment(&request.environment).filter(|id| runtime.has_environment(*id)) {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "REFRESHING".into(),
+                    message: "container is draining for a supervised process refresh".into(),
+                }
+            } else if let Some(environment) =
+                parse_environment(&request.environment).filter(|id| runtime.has_environment(*id))
+            {
                 let requeued = runtime.restart_environment(environment);
-                emit_event("environment_restart", &format!("environment={environment} requeued={requeued}"));
-                Response::Restarted { request_id: request.request_id, environment: format!("{} ({} executions requeued)", environment, requeued) }
+                emit_event(
+                    "environment_restart",
+                    &format!("environment={environment} requeued={requeued}"),
+                );
+                Response::Restarted {
+                    request_id: request.request_id,
+                    environment: format!("{} ({} executions requeued)", environment, requeued),
+                }
             } else {
-                Response::Error { request_id: Some(request.request_id), code: "INVALID_ENVIRONMENT".into(), message: format!("container environment is unavailable: {}", request.environment) }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "INVALID_ENVIRONMENT".into(),
+                    message: format!(
+                        "container environment is unavailable: {}",
+                        request.environment
+                    ),
+                }
             }
         }
         Request::PrepareRefresh(request) => {
             if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
             } else {
                 accepting.store(false, Ordering::Release);
-                emit_event("refresh_drain_started", &format!("timeout_ms={}", request.drain_timeout_ms));
+                emit_event(
+                    "refresh_drain_started",
+                    &format!("timeout_ms={}", request.drain_timeout_ms),
+                );
                 let requested = Duration::from_millis(request.drain_timeout_ms.max(1_000));
                 let timeout = requested.min(MAX_REFRESH_DRAIN);
                 let started = Instant::now();
@@ -401,22 +617,36 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, acce
                     thread::sleep(Duration::from_millis(10));
                 }
                 if runtime.is_idle() {
-                    emit_event("refresh_drain_ready", &format!("elapsed_ms={}", started.elapsed().as_millis()));
-                    Response::ReadyForRefresh { request_id: request.request_id }
+                    emit_event(
+                        "refresh_drain_ready",
+                        &format!("elapsed_ms={}", started.elapsed().as_millis()),
+                    );
+                    Response::ReadyForRefresh {
+                        request_id: request.request_id,
+                    }
                 } else {
                     accepting.store(true, Ordering::Release);
-                    emit_event("refresh_drain_timeout", &format!("elapsed_ms={}", started.elapsed().as_millis()));
+                    emit_event(
+                        "refresh_drain_timeout",
+                        &format!("elapsed_ms={}", started.elapsed().as_millis()),
+                    );
                     Response::Error { request_id: Some(request.request_id), code: "DRAIN_TIMEOUT".into(), message: "container could not drain all executions before the refresh deadline; normal execution resumed".into() }
                 }
             }
         }
         Request::Resume(request) => {
             if request.auth_token != token {
-                Response::Error { request_id: Some(request.request_id), code: "AUTH_FAILED".into(), message: "container control authentication failed".into() }
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
             } else {
                 accepting.store(true, Ordering::Release);
                 emit_event("refresh_resume", "backend retained current container");
-                Response::Resumed { request_id: request.request_id }
+                Response::Resumed {
+                    request_id: request.request_id,
+                }
             }
         }
     };
@@ -424,9 +654,14 @@ fn handle_connection(mut stream: TcpStream, token: &str, runtime: &Runtime, acce
     Ok(())
 }
 
-fn inspection_body(runtime: &Runtime, execution_id: Option<String>, accepting: bool) -> serde_json::Value {
+fn inspection_body(
+    runtime: &Runtime,
+    execution_id: Option<String>,
+    accepting: bool,
+) -> serde_json::Value {
     let snapshots = runtime.snapshots();
-    let (swamps_total, workers_total, workers_busy, completed, failed) = topology_totals(&snapshots);
+    let (swamps_total, workers_total, workers_busy, completed, failed) =
+        topology_totals(&snapshots);
     let environments = snapshots.into_iter().map(|environment| {
         let swamps = environment.swamps.into_iter().map(|swamp| {
             let workers = swamp.workers.into_iter().map(|worker| serde_json::json!({
@@ -461,20 +696,27 @@ fn inspection_body(runtime: &Runtime, execution_id: Option<String>, accepting: b
         })
     }).collect::<Vec<_>>();
 
-    let cache_profiles = runtime.cache().profiles().into_iter().map(|(hash, profile)| serde_json::json!({
-        "artifact_hash": hash,
-        "samples": profile.samples,
-        "total_ms": profile.total_ms,
-        "last_ms": profile.last_ms,
-        "max_ms": profile.max_ms,
-        "average_ms": profile.average_ms(),
-        "declared_cost": {
-            "cpu": profile.declared_cost.cpu,
-            "memory": profile.declared_cost.memory,
-            "io": profile.declared_cost.io,
-            "network": profile.declared_cost.network
-        }
-    })).collect::<Vec<_>>();
+    let cache_profiles = runtime
+        .cache()
+        .profiles()
+        .into_iter()
+        .map(|(hash, profile)| {
+            serde_json::json!({
+                "artifact_hash": hash,
+                "samples": profile.samples,
+                "total_ms": profile.total_ms,
+                "last_ms": profile.last_ms,
+                "max_ms": profile.max_ms,
+                "average_ms": profile.average_ms(),
+                "declared_cost": {
+                    "cpu": profile.declared_cost.cpu,
+                    "memory": profile.declared_cost.memory,
+                    "io": profile.declared_cost.io,
+                    "network": profile.declared_cost.network
+                }
+            })
+        })
+        .collect::<Vec<_>>();
 
     serde_json::json!({
         "execution_id": execution_id,
@@ -514,7 +756,9 @@ fn inspection_body(runtime: &Runtime, execution_id: Option<String>, accepting: b
     })
 }
 
-fn topology_totals(snapshots: &[container_runtime_core::EnvironmentSnapshot]) -> (usize, usize, usize, u64, u64) {
+fn topology_totals(
+    snapshots: &[container_runtime_core::EnvironmentSnapshot],
+) -> (usize, usize, usize, u64, u64) {
     let mut swamps = 0usize;
     let mut workers = 0usize;
     let mut busy = 0usize;
@@ -524,7 +768,11 @@ fn topology_totals(snapshots: &[container_runtime_core::EnvironmentSnapshot]) ->
         swamps += environment.swamps.len();
         for swamp in &environment.swamps {
             workers += swamp.workers.len();
-            busy += swamp.workers.iter().filter(|worker| worker.current.is_some()).count();
+            busy += swamp
+                .workers
+                .iter()
+                .filter(|worker| worker.current.is_some())
+                .count();
             completed = completed.saturating_add(swamp.completed);
             failed = failed.saturating_add(swamp.failed);
         }
@@ -534,24 +782,61 @@ fn topology_totals(snapshots: &[container_runtime_core::EnvironmentSnapshot]) ->
 
 fn parse_environment(value: &str) -> Option<EnvironmentId> {
     match value {
-        "general-1" => Some(EnvironmentId::General1), "general-2" => Some(EnvironmentId::General2), "general-3" => Some(EnvironmentId::General3),
-        "general-4" => Some(EnvironmentId::General4), "general-5" => Some(EnvironmentId::General5), "payment" => Some(EnvironmentId::Payment), _ => None,
+        "general-1" => Some(EnvironmentId::General1),
+        "general-2" => Some(EnvironmentId::General2),
+        "general-3" => Some(EnvironmentId::General3),
+        "general-4" => Some(EnvironmentId::General4),
+        "general-5" => Some(EnvironmentId::General5),
+        "payment" => Some(EnvironmentId::Payment),
+        _ => None,
     }
 }
 
 fn run_debug(args: &[String], runtime: &Runtime) -> anyhow::Result<()> {
-    let demo_count = value_after(args, "--demo").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+    let demo_count = value_after(args, "--demo")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
     for index in 0..demo_count {
-        let cost = if index % 5 == 0 { WorkCost { cpu: 100, memory: 20, io: 5, network: 0 } } else { WorkCost { cpu: 10, memory: 2, io: 1, network: 0 } };
+        let cost = if index % 5 == 0 {
+            WorkCost {
+                cpu: 100,
+                memory: 20,
+                io: 5,
+                network: 0,
+            }
+        } else {
+            WorkCost {
+                cpu: 10,
+                memory: 2,
+                io: 1,
+                network: 0,
+            }
+        };
         let work_ms = if index % 5 == 0 { 40 } else { 5 };
-        let environment = if index % 11 == 0 { EnvironmentId::Payment } else { EnvironmentId::General1 };
-        let id = runtime.submit(environment, format!("demo-artifact-{}", index % 3), cost, work_ms);
+        let environment = if index % 11 == 0 {
+            EnvironmentId::Payment
+        } else {
+            EnvironmentId::General1
+        };
+        let id = runtime.submit(
+            environment,
+            format!("demo-artifact-{}", index % 3),
+            cost,
+            work_ms,
+        );
         println!("queued {id} -> {environment}");
     }
     runtime.rebalance_once();
     println!("\nRBE CONTAINER RUNTIME — DEBUG");
     println!("environments={} swamps_per_environment={} workers_per_swamp={} global_queue={} cache_profiles={} artifacts={}", runtime.snapshots().len(), runtime.config().swamps_per_environment, runtime.config().workers_per_swamp, runtime.global_queue_len(), runtime.cache().len(), runtime.cache().artifact_count());
-    for _ in 0..10 { print_snapshot(runtime); if demo_count == 0 { break; } thread::sleep(Duration::from_millis(250)); runtime.rebalance_once(); }
+    for _ in 0..10 {
+        print_snapshot(runtime);
+        if demo_count == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+        runtime.rebalance_once();
+    }
     Ok(())
 }
 
@@ -561,15 +846,36 @@ fn print_snapshot(runtime: &Runtime) {
         for swamp in environment.swamps {
             println!("  SWAMP {:03} queue={:<5} cost={:<6} throughput={:>8.1}/s completed={:<5} failed={:<5}", swamp.id, swamp.queued, swamp.queued_cost, swamp.throughput_per_sec, swamp.completed, swamp.failed);
             for worker in swamp.workers {
-                let execution = worker.current.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
-                let avg_ms = if worker.completed == 0 { 0.0 } else { worker.total_ms as f64 / worker.completed as f64 };
-                println!("    worker-{:<3} {:<7} current={:<40} completed={} failed={} avg_ms={:.1}", worker.id, format!("{:?}", worker.state), execution, worker.completed, worker.failed, avg_ms);
+                let execution = worker
+                    .current
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let avg_ms = if worker.completed == 0 {
+                    0.0
+                } else {
+                    worker.total_ms as f64 / worker.completed as f64
+                };
+                println!(
+                    "    worker-{:<3} {:<7} current={:<40} completed={} failed={} avg_ms={:.1}",
+                    worker.id,
+                    format!("{:?}", worker.state),
+                    execution,
+                    worker.completed,
+                    worker.failed,
+                    avg_ms
+                );
             }
         }
     }
-    println!("CACHE profiles={} artifacts={}", runtime.cache().len(), runtime.cache().artifact_count());
+    println!(
+        "CACHE profiles={} artifacts={}",
+        runtime.cache().len(),
+        runtime.cache().artifact_count()
+    );
 }
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone())
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
 }

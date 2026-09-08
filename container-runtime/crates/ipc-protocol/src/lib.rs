@@ -85,21 +85,49 @@ pub struct WorkCost {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
-    HelloAccepted { version: u16 },
-    Accepted { request_id: String, execution_id: String },
-    Cancelled { request_id: String },
-    Inspection { request_id: String, body: serde_json::Value },
-    Restarted { request_id: String, environment: String },
-    Health { request_id: String, body: serde_json::Value },
-    ReadyForRefresh { request_id: String },
-    Resumed { request_id: String },
-    Error { request_id: Option<String>, code: String, message: String },
+    HelloAccepted {
+        version: u16,
+    },
+    Accepted {
+        request_id: String,
+        execution_id: String,
+    },
+    Cancelled {
+        request_id: String,
+    },
+    Inspection {
+        request_id: String,
+        body: serde_json::Value,
+    },
+    Restarted {
+        request_id: String,
+        environment: String,
+    },
+    Health {
+        request_id: String,
+        body: serde_json::Value,
+    },
+    ReadyForRefresh {
+        request_id: String,
+    },
+    Resumed {
+        request_id: String,
+    },
+    Error {
+        request_id: Option<String>,
+        code: String,
+        message: String,
+    },
 }
 
 pub fn write_frame<W: Write>(writer: &mut W, value: &impl Serialize) -> io::Result<()> {
-    let body = serde_json::to_vec(value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let body =
+        serde_json::to_vec(value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     if body.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPC frame exceeds maximum size"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPC frame exceeds maximum size",
+        ));
     }
     let length = body.len() as u32;
     writer.write_all(&length.to_be_bytes())?;
@@ -112,7 +140,10 @@ pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     reader.read_exact(&mut len)?;
     let length = u32::from_be_bytes(len) as usize;
     if length == 0 || length > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid IPC frame length"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid IPC frame length",
+        ));
     }
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body)?;
@@ -133,7 +164,10 @@ mod tests {
 
     #[test]
     fn frame_round_trip() {
-        let request = Request::Health(HealthRequest { request_id: "req-1".into(), auth_token: "secret".into() });
+        let request = Request::Health(HealthRequest {
+            request_id: "req-1".into(),
+            auth_token: "secret".into(),
+        });
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &request).unwrap();
         let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();

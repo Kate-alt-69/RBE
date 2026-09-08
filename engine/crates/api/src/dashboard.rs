@@ -37,27 +37,49 @@ async fn dashboard_redirect(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    if let Some(response) = local_only(peer) { return response; }
-    let prefix = state.config.dashboards.admin_path_prefix.trim_end_matches('/');
-    Redirect::temporary(&format!("http://127.0.0.1:{DASHBOARD_PORT}{prefix}/dashboard")).into_response()
+    if let Some(response) = local_only(peer) {
+        return response;
+    }
+    let prefix = state
+        .config
+        .dashboards
+        .admin_path_prefix
+        .trim_end_matches('/');
+    Redirect::temporary(&format!(
+        "http://127.0.0.1:{DASHBOARD_PORT}{prefix}/dashboard"
+    ))
+    .into_response()
 }
 
 async fn dashboard_html(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Some(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) {
+        return response;
+    }
     Html(DASHBOARD_HTML).into_response()
 }
 
 async fn dashboard_css(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Some(response) = local_only(peer) { return response; }
+    if let Some(response) = local_only(peer) {
+        return response;
+    }
     ([(CONTENT_TYPE, "text/css; charset=utf-8")], DASHBOARD_CSS).into_response()
 }
 
-async fn overview(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Some(response) = local_only(peer) { return response; }
+async fn overview(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Some(response) = local_only(peer) {
+        return response;
+    }
     let metrics = state.backend_metrics.snapshot();
     let maintenance = state.maintenance.snapshot();
     let endpoint = state.container.endpoint_snapshot();
-    let container_health = state.container.health().await.unwrap_or_else(|error| json!({ "ok": false, "error": error.to_string() }));
+    let container_health = state
+        .container
+        .health()
+        .await
+        .unwrap_or_else(|error| json!({ "ok": false, "error": error.to_string() }));
     Json(json!({
         "backend": {
             "pid": std::process::id(),
@@ -90,8 +112,13 @@ async fn overview(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<
     })).into_response()
 }
 
-async fn backend(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Some(response) = local_only(peer) { return response; }
+async fn backend(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Some(response) = local_only(peer) {
+        return response;
+    }
     let metrics = state.backend_metrics.snapshot();
     Json(json!({
         "pid": std::process::id(),
@@ -117,11 +144,17 @@ async fn backend(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<S
             "worker_threads": state.config.runtime.worker_threads,
             "process_refresh_hours": state.config.runtime.process_refresh_hours
         }
-    })).into_response()
+    }))
+    .into_response()
 }
 
-async fn container(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Some(response) = local_only(peer) { return response; }
+async fn container(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Some(response) = local_only(peer) {
+        return response;
+    }
     let endpoint = state.container.endpoint_snapshot();
     match state.container.inspect().await {
         Ok(body) => Json(json!({
@@ -130,30 +163,54 @@ async fn container(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo
             "generation": endpoint.generation,
             "control_address": endpoint.address.to_string(),
             "state": body
-        })).into_response(),
-        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "online": false,
-            "pid": endpoint.pid,
-            "generation": endpoint.generation,
-            "error": error.to_string()
-        }))).into_response(),
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "online": false,
+                "pid": endpoint.pid,
+                "generation": endpoint.generation,
+                "error": error.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
-async fn security(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Some(response) = local_only(peer) { return response; }
-    let bans = state.ip_strikes.ban_snapshots().into_iter().map(|entry| json!({
-        "ip": entry.ip,
-        "age_secs": entry.age_secs,
-        "remaining_secs": entry.remaining_secs
-    })).collect::<Vec<_>>();
-    let strikes = state.ip_strikes.strike_snapshots().into_iter().map(|entry| json!({
-        "ip": entry.ip,
-        "category": entry.category,
-        "count": entry.count,
-        "age_secs": entry.age_secs,
-        "remaining_window_secs": entry.remaining_window_secs
-    })).collect::<Vec<_>>();
+async fn security(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Some(response) = local_only(peer) {
+        return response;
+    }
+    let bans = state
+        .ip_strikes
+        .ban_snapshots()
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "ip": entry.ip,
+                "age_secs": entry.age_secs,
+                "remaining_secs": entry.remaining_secs
+            })
+        })
+        .collect::<Vec<_>>();
+    let strikes = state
+        .ip_strikes
+        .strike_snapshots()
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "ip": entry.ip,
+                "category": entry.category,
+                "count": entry.count,
+                "age_secs": entry.age_secs,
+                "remaining_window_secs": entry.remaining_window_secs
+            })
+        })
+        .collect::<Vec<_>>();
     Json(json!({
         "banned_ips": bans,
         "strikes": strikes,
@@ -168,10 +225,21 @@ async fn security(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<
     })).into_response()
 }
 
-async fn settings(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
-    if let Some(response) = local_only(peer) { return response; }
+async fn settings(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Some(response) = local_only(peer) {
+        return response;
+    }
     let endpoint = state.container.endpoint_snapshot();
-    let resolved = state.container.inspect().await.ok().and_then(|value| value.get("config").cloned()).unwrap_or(Value::Null);
+    let resolved = state
+        .container
+        .inspect()
+        .await
+        .ok()
+        .and_then(|value| value.get("config").cloned())
+        .unwrap_or(Value::Null);
     Json(json!({
         "containers": {
             "general_environments": state.config.containers.environments,
@@ -193,11 +261,14 @@ async fn settings(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<
             "port": DASHBOARD_PORT
         },
         "maintenance": { "process_refresh_hours": state.config.runtime.process_refresh_hours }
-    })).into_response()
+    }))
+    .into_response()
 }
 
 #[allow(dead_code)]
-fn _is_loopback(ip: IpAddr) -> bool { ip.is_loopback() }
+fn _is_loopback(ip: IpAddr) -> bool {
+    ip.is_loopback()
+}
 
 const DASHBOARD_HTML: &str = r##"<!doctype html>
 <html lang="en">

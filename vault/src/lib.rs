@@ -170,10 +170,7 @@ fn start_gnome_keyring_secrets() -> Result<(), String> {
             continue;
         };
         match name.trim() {
-            "GNOME_KEYRING_CONTROL"
-            | "GNOME_KEYRING_PID"
-            | "SSH_AUTH_SOCK"
-            | "GPG_AGENT_INFO" => {
+            "GNOME_KEYRING_CONTROL" | "GNOME_KEYRING_PID" | "SSH_AUTH_SOCK" | "GPG_AGENT_INFO" => {
                 std::env::set_var(name.trim(), value.trim());
             }
             _ => {}

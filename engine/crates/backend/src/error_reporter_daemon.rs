@@ -96,16 +96,25 @@ struct RecentIds {
 
 impl RecentIds {
     fn new() -> Self {
-        Self { set: HashSet::new(), order: VecDeque::new() }
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
     }
 
-    fn contains(&self, id: &str) -> bool { self.set.contains(id) }
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
 
     fn insert(&mut self, id: String) {
-        if !self.set.insert(id.clone()) { return; }
+        if !self.set.insert(id.clone()) {
+            return;
+        }
         self.order.push_back(id);
         while self.order.len() > RECENT_ID_CAPACITY {
-            if let Some(oldest) = self.order.pop_front() { self.set.remove(&oldest); }
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
         }
     }
 }
@@ -130,7 +139,10 @@ pub async fn run(
 
     let pid = std::process::id();
     let started_at_ms = now_unix_ms();
-    let mut tail = TailState { offset: saved_queue_offset(&status_path, &queue_path), partial: String::new() };
+    let mut tail = TailState {
+        offset: saved_queue_offset(&status_path, &queue_path),
+        partial: String::new(),
+    };
     let mut recent_ids = load_recent_ids(&reports_path);
     let mut processed_count = 0u64;
     let mut duplicate_count = 0u64;
@@ -202,19 +214,23 @@ pub async fn run(
         }
     }
 
-    write_status(&io, &status_path, &StatusReport {
-        ok: true,
-        service: "error-reporter-daemon",
-        pid,
-        launched_as_separate_process,
-        started_at_ms,
-        updated_at_ms: now_unix_ms(),
-        queue_offset: tail.offset,
-        processed_count,
-        duplicate_count,
-        dropped_count,
-        last_error_message,
-    });
+    write_status(
+        &io,
+        &status_path,
+        &StatusReport {
+            ok: true,
+            service: "error-reporter-daemon",
+            pid,
+            launched_as_separate_process,
+            started_at_ms,
+            updated_at_ms: now_unix_ms(),
+            queue_offset: tail.offset,
+            processed_count,
+            duplicate_count,
+            dropped_count,
+            last_error_message,
+        },
+    );
     Ok(())
 }
 
@@ -222,16 +238,35 @@ fn saved_queue_offset(status_path: &Path, queue_path: &Path) -> u64 {
     let saved = std::fs::read_to_string(status_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|value| value.get("queue_offset").and_then(serde_json::Value::as_u64))
+        .and_then(|value| {
+            value
+                .get("queue_offset")
+                .and_then(serde_json::Value::as_u64)
+        })
         .unwrap_or(0);
-    let queue_len = std::fs::metadata(queue_path).map(|metadata| metadata.len()).unwrap_or(0);
-    if saved <= queue_len { saved } else { 0 }
+    let queue_len = std::fs::metadata(queue_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if saved <= queue_len {
+        saved
+    } else {
+        0
+    }
 }
 
 fn load_recent_ids(reports_path: &Path) -> RecentIds {
     let mut ids = RecentIds::new();
-    let Ok(raw) = std::fs::read_to_string(reports_path) else { return ids; };
-    for line in raw.lines().rev().take(RECENT_ID_CAPACITY).collect::<Vec<_>>().into_iter().rev() {
+    let Ok(raw) = std::fs::read_to_string(reports_path) else {
+        return ids;
+    };
+    for line in raw
+        .lines()
+        .rev()
+        .take(RECENT_ID_CAPACITY)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
                 ids.insert(id.to_string());
@@ -242,7 +277,11 @@ fn load_recent_ids(reports_path: &Path) -> RecentIds {
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = async { tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler"); };
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
     #[cfg(unix)]
     let terminate = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -256,20 +295,34 @@ async fn shutdown_signal() {
 }
 
 fn read_new_lines(queue_path: &Path, state: &mut TailState) -> Vec<String> {
-    let Ok(mut file) = std::fs::File::open(queue_path) else { return Vec::new(); };
-    let Ok(metadata) = file.metadata() else { return Vec::new(); };
+    let Ok(mut file) = std::fs::File::open(queue_path) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = file.metadata() else {
+        return Vec::new();
+    };
     let file_len = metadata.len();
 
     if file_len < state.offset {
-        tracing::warn!(old_offset = state.offset, file_len, "error-reporter queue shrank; resetting cursor");
+        tracing::warn!(
+            old_offset = state.offset,
+            file_len,
+            "error-reporter queue shrank; resetting cursor"
+        );
         state.offset = 0;
         state.partial.clear();
     }
-    if file_len == state.offset { return Vec::new(); }
-    if file.seek(SeekFrom::Start(state.offset)).is_err() { return Vec::new(); }
+    if file_len == state.offset {
+        return Vec::new();
+    }
+    if file.seek(SeekFrom::Start(state.offset)).is_err() {
+        return Vec::new();
+    }
 
     let mut buf = Vec::new();
-    if file.read_to_end(&mut buf).is_err() { return Vec::new(); }
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
     let Ok(text) = std::str::from_utf8(&buf) else {
         tracing::warn!("error-reporter queue chunk was not valid UTF-8; retrying next poll");
         return Vec::new();
@@ -308,7 +361,10 @@ fn sign_and_append(
         category: entry.category,
         message: entry.message,
         stack: entry.stack,
-        submitted_by: SubmittedBy { pid: entry.pid, ppid: entry.ppid },
+        submitted_by: SubmittedBy {
+            pid: entry.pid,
+            ppid: entry.ppid,
+        },
         reported_by: ReportedBy {
             service: "error-reporter-daemon",
             pid: daemon_pid,
@@ -317,7 +373,10 @@ fn sign_and_append(
         },
     };
     let canonical = canonical_json(&payload)?;
-    let signature = Signature { algo: "hmac-sha256", value: sign(&canonical, signing_key) };
+    let signature = Signature {
+        algo: "hmac-sha256",
+        value: sign(&canonical, signing_key),
+    };
     let signed = SignedIssueRecord { payload, signature };
     let mut line = serde_json::to_string(&signed)?;
     line.push('\n');
@@ -334,12 +393,17 @@ fn canonical_json<T: Serialize>(value: &T) -> anyhow::Result<String> {
 fn sort_keys(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            for value in map.values_mut() { sort_keys(value); }
-            let sorted: BTreeMap<String, serde_json::Value> = std::mem::take(map).into_iter().collect();
+            for value in map.values_mut() {
+                sort_keys(value);
+            }
+            let sorted: BTreeMap<String, serde_json::Value> =
+                std::mem::take(map).into_iter().collect();
             *map = sorted.into_iter().collect();
         }
         serde_json::Value::Array(items) => {
-            for value in items { sort_keys(value); }
+            for value in items {
+                sort_keys(value);
+            }
         }
         _ => {}
     }
@@ -351,14 +415,21 @@ fn sign(canonical_json: &str, key: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-fn read_or_create_signing_key(io: &atomic_io::AtomicIo, admin_dir: &Path) -> anyhow::Result<String> {
+fn read_or_create_signing_key(
+    io: &atomic_io::AtomicIo,
+    admin_dir: &Path,
+) -> anyhow::Result<String> {
     if let Ok(from_env) = std::env::var("ERROR_REPORT_SIGNING_KEY") {
-        if from_env.len() >= 16 { return Ok(from_env); }
+        if from_env.len() >= 16 {
+            return Ok(from_env);
+        }
     }
     let key_path = admin_dir.join("error-reporter.key");
     if let Ok(existing) = std::fs::read_to_string(&key_path) {
         let trimmed = existing.trim();
-        if trimmed.len() >= 16 { return Ok(trimmed.to_string()); }
+        if trimmed.len() >= 16 {
+            return Ok(trimmed.to_string());
+        }
     }
 
     use rand::RngCore;
@@ -377,21 +448,37 @@ fn read_or_create_signing_key(io: &atomic_io::AtomicIo, admin_dir: &Path) -> any
 }
 
 fn compact_reports_file(io: &atomic_io::AtomicIo, path: &Path) {
-    let Ok(metadata) = std::fs::metadata(path) else { return; };
-    if metadata.len() < MAX_REPORT_BYTES { return; }
-    let Ok(raw) = std::fs::read_to_string(path) else { return; };
-    let lines = raw.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>();
-    if lines.len() <= MAX_REPORT_LINES { return; }
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() < MAX_REPORT_BYTES {
+        return;
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let lines = raw
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() <= MAX_REPORT_LINES {
+        return;
+    }
     let compacted = lines[lines.len() - MAX_REPORT_LINES..].join("\n") + "\n";
     let _ = io.write_atomic(path, compacted.as_bytes());
 }
 
 fn write_status(io: &atomic_io::AtomicIo, path: &Path, status: &StatusReport) {
-    if let Ok(json) = serde_json::to_string_pretty(status) { let _ = io.write_atomic(path, json.as_bytes()); }
+    if let Ok(json) = serde_json::to_string_pretty(status) {
+        let _ = io.write_atomic(path, json.as_bytes());
+    }
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn iso_from_ms(ms: u64) -> String {
@@ -399,7 +486,11 @@ fn iso_from_ms(ms: u64) -> String {
     let millis = ms % 1000;
     let days_since_epoch = secs / 86_400;
     let time_of_day = secs % 86_400;
-    let (hour, minute, second) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
+    let (hour, minute, second) = (
+        time_of_day / 3600,
+        (time_of_day % 3600) / 60,
+        time_of_day % 60,
+    );
     let (year, month, day) = civil_from_days(days_since_epoch as i64);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
@@ -448,7 +539,9 @@ mod tests {
         ids.insert("same".into());
         ids.insert("same".into());
         assert_eq!(ids.order.len(), 1);
-        for index in 0..(RECENT_ID_CAPACITY + 10) { ids.insert(format!("id-{index}")); }
+        for index in 0..(RECENT_ID_CAPACITY + 10) {
+            ids.insert(format!("id-{index}"));
+        }
         assert!(ids.order.len() <= RECENT_ID_CAPACITY);
     }
 
@@ -461,13 +554,17 @@ mod tests {
         assert_eq!(read_new_lines(&path, &mut state), vec!["one".to_string()]);
         assert_eq!(state.partial, "tw");
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
-        assert_eq!(read_new_lines(&path, &mut state), vec!["two".to_string(), "three".to_string()]);
+        assert_eq!(
+            read_new_lines(&path, &mut state),
+            vec!["two".to_string(), "three".to_string()]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn canonical_json_sorts_keys() {
-        let value: serde_json::Value = serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":3}"#).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":3}"#).unwrap();
         let canonical = canonical_json(&value).unwrap();
         assert!(canonical.find("\"a\":3").unwrap() < canonical.find("\"z\"").unwrap());
         assert!(canonical.find("\"a\":2").unwrap() < canonical.find("\"b\":1").unwrap());

@@ -54,13 +54,27 @@ pub enum LimitViolation {
 
 impl ResourceLimits {
     pub fn check(&self, usage: ResourceUsage) -> Option<LimitViolation> {
-        if usage.cpu_millis > self.cpu_millis { return Some(LimitViolation::Cpu); }
-        if usage.memory_peak_bytes > self.memory_bytes { return Some(LimitViolation::Memory); }
-        if usage.disk_bytes > self.disk_bytes { return Some(LimitViolation::Disk); }
-        if usage.network_bytes > self.network_bytes { return Some(LimitViolation::Network); }
-        if usage.processes > self.max_processes { return Some(LimitViolation::Processes); }
-        if usage.file_descriptors > self.max_file_descriptors { return Some(LimitViolation::FileDescriptors); }
-        if usage.wall_time_ms > self.wall_time_ms { return Some(LimitViolation::WallTime); }
+        if usage.cpu_millis > self.cpu_millis {
+            return Some(LimitViolation::Cpu);
+        }
+        if usage.memory_peak_bytes > self.memory_bytes {
+            return Some(LimitViolation::Memory);
+        }
+        if usage.disk_bytes > self.disk_bytes {
+            return Some(LimitViolation::Disk);
+        }
+        if usage.network_bytes > self.network_bytes {
+            return Some(LimitViolation::Network);
+        }
+        if usage.processes > self.max_processes {
+            return Some(LimitViolation::Processes);
+        }
+        if usage.file_descriptors > self.max_file_descriptors {
+            return Some(LimitViolation::FileDescriptors);
+        }
+        if usage.wall_time_ms > self.wall_time_ms {
+            return Some(LimitViolation::WallTime);
+        }
         None
     }
 }
@@ -86,7 +100,10 @@ impl CgroupHandle {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (root, execution_id, limits);
-            Err(io::Error::new(io::ErrorKind::Unsupported, "cgroup-v2 enforcement is Linux-only"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cgroup-v2 enforcement is Linux-only",
+            ))
         }
     }
 
@@ -98,11 +115,16 @@ impl CgroupHandle {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = pid;
-            Err(io::Error::new(io::ErrorKind::Unsupported, "cgroup-v2 enforcement is Linux-only"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cgroup-v2 enforcement is Linux-only",
+            ))
         }
     }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Drop for CgroupHandle {
@@ -126,7 +148,10 @@ mod tests {
     #[test]
     fn limit_check_detects_wall_time() {
         let limits = ResourceLimits::default();
-        let usage = ResourceUsage { wall_time_ms: limits.wall_time_ms + 1, ..Default::default() };
+        let usage = ResourceUsage {
+            wall_time_ms: limits.wall_time_ms + 1,
+            ..Default::default()
+        };
         assert_eq!(limits.check(usage), Some(LimitViolation::WallTime));
     }
 }

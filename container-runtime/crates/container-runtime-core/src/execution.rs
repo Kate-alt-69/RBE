@@ -12,17 +12,29 @@ pub struct ExecutionId {
 
 impl ExecutionId {
     pub(crate) fn new(sequence: u64) -> Self {
-        let epoch_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().min(u64::MAX as u128) as u64;
+        let epoch_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
         Self { epoch_ns, sequence }
     }
 
-    pub fn from_parts(epoch_ns: u64, sequence: u64) -> Self { Self { epoch_ns, sequence } }
-    pub fn epoch_ns(self) -> u64 { self.epoch_ns }
-    pub fn sequence(self) -> u64 { self.sequence }
+    pub fn from_parts(epoch_ns: u64, sequence: u64) -> Self {
+        Self { epoch_ns, sequence }
+    }
+    pub fn epoch_ns(self) -> u64 {
+        self.epoch_ns
+    }
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
 }
 
 impl std::fmt::Display for ExecutionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "exec-{:016x}-{:016x}", self.epoch_ns, self.sequence) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exec-{:016x}-{:016x}", self.epoch_ns, self.sequence)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,12 +46,34 @@ pub struct WorkCost {
 }
 
 impl WorkCost {
-    pub fn scalar(self) -> u64 { self.cpu.saturating_add(self.memory).saturating_add(self.io).saturating_add(self.network).max(1) }
-    pub fn saturating_add(self, other: Self) -> Self { Self { cpu: self.cpu.saturating_add(other.cpu), memory: self.memory.saturating_add(other.memory), io: self.io.saturating_add(other.io), network: self.network.saturating_add(other.network) } }
+    pub fn scalar(self) -> u64 {
+        self.cpu
+            .saturating_add(self.memory)
+            .saturating_add(self.io)
+            .saturating_add(self.network)
+            .max(1)
+    }
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            cpu: self.cpu.saturating_add(other.cpu),
+            memory: self.memory.saturating_add(other.memory),
+            io: self.io.saturating_add(other.io),
+            network: self.network.saturating_add(other.network),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionState { Queued, Assigned, Running, Completed, Failed, Cancelled, TimedOut, SecurityTerminated }
+pub enum ExecutionState {
+    Queued,
+    Assigned,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+    SecurityTerminated,
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecutionTask {
