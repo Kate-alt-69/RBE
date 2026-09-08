@@ -1111,9 +1111,83 @@ fn apply_memory_limit(memory_limit_mb: u64) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(not(unix))]
-fn apply_memory_limit(_memory_limit_mb: u64) -> anyhow::Result<()> {
+#[cfg(windows)]
+fn apply_memory_limit(memory_limit_mb: u64) -> anyhow::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    if memory_limit_mb == 0 {
+        return Ok(());
+    }
+
+    let limit_bytes = memory_limit_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("service memoryLimitMb is too large"))?;
+    let limit_bytes = usize::try_from(limit_bytes)
+        .map_err(|_| anyhow::anyhow!("service memoryLimitMb exceeds Windows addressable memory"))?;
+
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(anyhow::anyhow!(
+            "create Windows service memory Job Object: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+    limits.ProcessMemoryLimit = limit_bytes;
+
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(anyhow::anyhow!(
+            "configure Windows service memory Job Object: {error}"
+        ));
+    }
+
+    let assigned = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
+    if assigned == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(anyhow::anyhow!(
+            "assign service process to Windows memory Job Object: {error}"
+        ));
+    }
+
+    // Windows keeps a job alive while it still has associated processes, even
+    // after the last userspace handle closes. KILL_ON_JOB_CLOSE is deliberately
+    // not enabled, so closing our setup handle preserves this process limit.
+    unsafe {
+        CloseHandle(job);
+    }
     Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn apply_memory_limit(memory_limit_mb: u64) -> anyhow::Result<()> {
+    if memory_limit_mb == 0 {
+        Ok(())
+    } else {
+        anyhow::bail!("service memoryLimitMb is not supported on this platform")
+    }
 }
 
 fn validate_parent_bootstrap_secret(secret: &str) -> anyhow::Result<()> {
