@@ -373,9 +373,13 @@ async fn handle_connection(
             services: manager.snapshot().await,
         },
         ServiceMotherRequest::Shutdown { .. } => {
-            manager.shutdown_all().await;
+            // Acknowledge the authenticated control request before draining
+            // child services. The listener loop owns the actual shutdown so
+            // service teardown runs exactly once and cannot consume the
+            // client's bounded response window.
             let _ = shutdown_tx.send(true);
-            ServiceMotherResponse::Ok
+            write_response(&mut write, &ServiceMotherResponse::Ok).await?;
+            return Ok(());
         }
     };
     write_response(&mut write, &response).await?;
@@ -496,6 +500,30 @@ mod tests {
         let endpoint = clone.current().await.unwrap();
         assert_eq!(endpoint.address, second);
         assert_eq!(endpoint.token.as_ref(), "b".repeat(64));
+    }
+
+    #[tokio::test]
+    async fn shutdown_request_is_acknowledged_and_signals_listener() {
+        let token = "a".repeat(64);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_token = Arc::<str>::from(token.clone());
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, ServiceManager::default(), server_token, shutdown_tx)
+                .await
+                .unwrap();
+        });
+
+        let response = mother_rpc(address, ServiceMotherRequest::Shutdown { token })
+            .await
+            .unwrap();
+        assert!(matches!(response, ServiceMotherResponse::Ok));
+        shutdown_rx.changed().await.unwrap();
+        assert!(*shutdown_rx.borrow());
+        server.await.unwrap();
     }
 
     #[test]
