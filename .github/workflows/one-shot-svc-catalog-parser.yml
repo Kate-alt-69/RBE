@@ -27,211 +27,16 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           git reset --hard origin/main
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          path = Path("engine/crates/service-runtime/src/lib.rs")
-          source = path.read_text()
-
-          old_imports = '''    let mut imports = Vec::new();\n    let mut cursor = 0;\n    while let Some(relative) = source[cursor..].find(":import[") {\n        let start = cursor + relative;\n        if let Some((value, _)) = directive(&source[start..], ":import[") {\n            imports.extend(entries(&value).into_iter().map(|entry| unquote(&entry)));\n        }\n        cursor = (start + 8).min(source.len());\n    }'''
-          new_imports = '''    let mut imports = Vec::new();\n    let mut cursor = 0;\n    const IMPORT_PREFIX: &str = ":import[";\n    while cursor < source.len() {\n        let Some((value, relative)) = directive(&source[cursor..], IMPORT_PREFIX) else {\n            break;\n        };\n        imports.extend(entries(&value).into_iter().map(|entry| unquote(&entry)));\n        cursor = cursor\n            .saturating_add(relative)\n            .saturating_add(IMPORT_PREFIX.len())\n            .saturating_add(value.len())\n            .saturating_add(1)\n            .min(source.len());\n    }'''
-          if old_imports not in source:
-              raise SystemExit("service import discovery anchor changed")
-          source = source.replace(old_imports, new_imports, 1)
-
-          old_directive = '''fn directive(source: &str, prefix: &str) -> Option<(String, usize)> {\n    let start = source.find(prefix)?;\n    let begin = start + prefix.len();'''
-          new_directive = '''fn directive(source: &str, prefix: &str) -> Option<(String, usize)> {\n    let start = directive_start(source, prefix)?;\n    let begin = start + prefix.len();'''
-          if old_directive not in source:
-              raise SystemExit("service directive anchor changed")
-          source = source.replace(old_directive, new_directive, 1)
-
-          insert_anchor = '''fn entries(body: &str) -> Vec<String> {'''
-          helper = r'''fn directive_start(source: &str, prefix: &str) -> Option<usize> {
-    let mut quote = None;
-    let mut escaped = false;
-    let mut line_comment = false;
-
-    for (index, character) in source.char_indices() {
-        if line_comment {
-            if character == '\n' {
-                line_comment = false;
-            }
-            continue;
-        }
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if let Some(active_quote) = quote {
-            if character == '\\' {
-                escaped = true;
-            } else if character == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            quote = Some(character);
-            continue;
-        }
-        if character == '/' && source[index..].starts_with("//") {
-            line_comment = true;
-            continue;
-        }
-        if source[index..].starts_with(prefix) {
-            return Some(index);
-        }
-    }
-    None
-}
-
-'''
-          if insert_anchor not in source:
-              raise SystemExit("service directive helper anchor changed")
-          source = source.replace(insert_anchor, helper + insert_anchor, 1)
-
-          test_anchor = '''    #[test]\n    fn parses_hybrid_and_on_demand_modes() {'''
-          test = r'''    #[test]
-    fn commented_directives_do_not_override_catalog_metadata() {
-        let path = test_service_path("commented-directives");
-        std::fs::write(
-            &path,
-            "// :import[ignored]\n// :service[name = wrong]\n:import[time]\n:service[name = right]\nexport function run() {}\n",
-        )
-        .unwrap();
-        let service = parse_service(&path, ServiceDefaults::default()).unwrap();
-        assert_eq!(service.name, "right");
-        assert_eq!(service.imports, vec!["time"]);
-        let _ = std::fs::remove_file(path);
-    }
-
-'''
-          if test_anchor not in source:
-              raise SystemExit("service runtime test insertion anchor changed")
-          source = source.replace(test_anchor, test + test_anchor, 1)
-          path.write_text(source)
-          PY
-
+          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpwYXRoID0gUGF0aCgiZW5naW5lL2NyYXRlcy9zZXJ2aWNlLXJ1bnRpbWUvc3JjL2xpYi5ycyIpCnNvdXJjZSA9IHBhdGgucmVhZF90ZXh0KCkKCm9sZF9pbXBvcnRzID0gIiIiICAgIGxldCBtdXQgaW1wb3J0cyA9IFZlYzo6bmV3KCk7CiAgICBsZXQgbXV0IGN1cnNvciA9IDA7CiAgICB3aGlsZSBsZXQgU29tZShyZWxhdGl2ZSkgPSBzb3VyY2VbY3Vyc29yLi5dLmZpbmQoIjppbXBvcnRbIikgewogICAgICAgIGxldCBzdGFydCA9IGN1cnNvciArIHJlbGF0aXZlOwogICAgICAgIGlmIGxldCBTb21lKCh2YWx1ZSwgXykpID0gZGlyZWN0aXZlKCZzb3VyY2Vbc3RhcnQuLl0sICI6aW1wb3J0WyIpIHsKICAgICAgICAgICAgaW1wb3J0cy5leHRlbmQoZW50cmllcygmdmFsdWUpLmludG9faXRlcigpLm1hcCh8ZW50cnl8IHVucXVvdGUoJmVudHJ5KSkpOwogICAgICAgIH0KICAgICAgICBjdXJzb3IgPSAoc3RhcnQgKyA4KS5taW4oc291cmNlLmxlbigpKTsKICAgIH0iIiIKbmV3X2ltcG9ydHMgPSAiIiIgICAgbGV0IG11dCBpbXBvcnRzID0gVmVjOjpuZXcoKTsKICAgIGxldCBtdXQgY3Vyc29yID0gMDsKICAgIGNvbnN0IElNUE9SVF9QUkVGSVg6ICZzdHIgPSAiOmltcG9ydFsiOwogICAgd2hpbGUgY3Vyc29yIDwgc291cmNlLmxlbigpIHsKICAgICAgICBsZXQgU29tZSgodmFsdWUsIHJlbGF0aXZlKSkgPSBkaXJlY3RpdmUoJnNvdXJjZVtjdXJzb3IuLl0sIElNUE9SVF9QUkVGSVgpIGVsc2UgewogICAgICAgICAgICBicmVhazsKICAgICAgICB9OwogICAgICAgIGltcG9ydHMuZXh0ZW5kKGVudHJpZXMoJnZhbHVlKS5pbnRvX2l0ZXIoKS5tYXAofGVudHJ5fCB1bnF1b3RlKCZlbnRyeSkpKTsKICAgICAgICBjdXJzb3IgPSBjdXJzb3IKICAgICAgICAgICAgLnNhdHVyYXRpbmdfYWRkKHJlbGF0aXZlKQogICAgICAgICAgICAuc2F0dXJhdGluZ19hZGQoSU1QT1JUX1BSRUZJWC5sZW4oKSkKICAgICAgICAgICAgLnNhdHVyYXRpbmdfYWRkKHZhbHVlLmxlbigpKQogICAgICAgICAgICAuc2F0dXJhdGluZ19hZGQoMSkKICAgICAgICAgICAgLm1pbihzb3VyY2UubGVuKCkpOwogICAgfSIiIgppZiBvbGRfaW1wb3J0cyBub3QgaW4gc291cmNlOgogICAgcmFpc2UgU3lzdGVtRXhpdCgic2VydmljZSBpbXBvcnQgZGlzY292ZXJ5IGFuY2hvciBjaGFuZ2VkIikKc291cmNlID0gc291cmNlLnJlcGxhY2Uob2xkX2ltcG9ydHMsIG5ld19pbXBvcnRzLCAxKQoKb2xkX2RpcmVjdGl2ZSA9ICIiImZuIGRpcmVjdGl2ZShzb3VyY2U6ICZzdHIsIHByZWZpeDogJnN0cikgLT4gT3B0aW9uPChTdHJpbmcsIHVzaXplKT4gewogICAgbGV0IHN0YXJ0ID0gc291cmNlLmZpbmQocHJlZml4KT87CiAgICBsZXQgYmVnaW4gPSBzdGFydCArIHByZWZpeC5sZW4oKTsiIiIKbmV3X2RpcmVjdGl2ZSA9ICIiImZuIGRpcmVjdGl2ZShzb3VyY2U6ICZzdHIsIHByZWZpeDogJnN0cikgLT4gT3B0aW9uPChTdHJpbmcsIHVzaXplKT4gewogICAgbGV0IHN0YXJ0ID0gZGlyZWN0aXZlX3N0YXJ0KHNvdXJjZSwgcHJlZml4KT87CiAgICBsZXQgYmVnaW4gPSBzdGFydCArIHByZWZpeC5sZW4oKTsiIiIKaWYgb2xkX2RpcmVjdGl2ZSBub3QgaW4gc291cmNlOgogICAgcmFpc2UgU3lzdGVtRXhpdCgic2VydmljZSBkaXJlY3RpdmUgYW5jaG9yIGNoYW5nZWQiKQpzb3VyY2UgPSBzb3VyY2UucmVwbGFjZShvbGRfZGlyZWN0aXZlLCBuZXdfZGlyZWN0aXZlLCAxKQoKaW5zZXJ0X2FuY2hvciA9ICJmbiBlbnRyaWVzKGJvZHk6ICZzdHIpIC0+IFZlYzxTdHJpbmc+IHsiCmhlbHBlciA9IHIiIiJmbiBkaXJlY3RpdmVfc3RhcnQoc291cmNlOiAmc3RyLCBwcmVmaXg6ICZzdHIpIC0+IE9wdGlvbjx1c2l6ZT4gewogICAgbGV0IG11dCBxdW90ZSA9IE5vbmU7CiAgICBsZXQgbXV0IGVzY2FwZWQgPSBmYWxzZTsKICAgIGxldCBtdXQgbGluZV9jb21tZW50ID0gZmFsc2U7CgogICAgZm9yIChpbmRleCwgY2hhcmFjdGVyKSBpbiBzb3VyY2UuY2hhcl9pbmRpY2VzKCkgewogICAgICAgIGlmIGxpbmVfY29tbWVudCB7CiAgICAgICAgICAgIGlmIGNoYXJhY3RlciA9PSAnXG4nIHsKICAgICAgICAgICAgICAgIGxpbmVfY29tbWVudCA9IGZhbHNlOwogICAgICAgICAgICB9CiAgICAgICAgICAgIGNvbnRpbnVlOwogICAgICAgIH0KICAgICAgICBpZiBlc2NhcGVkIHsKICAgICAgICAgICAgZXNjYXBlZCA9IGZhbHNlOwogICAgICAgICAgICBjb250aW51ZTsKICAgICAgICB9CiAgICAgICAgaWYgbGV0IFNvbWUoYWN0aXZlX3F1b3RlKSA9IHF1b3RlIHsKICAgICAgICAgICAgaWYgY2hhcmFjdGVyID09ICdcXCcgewogICAgICAgICAgICAgICAgZXNjYXBlZCA9IHRydWU7CiAgICAgICAgICAgIH0gZWxzZSBpZiBjaGFyYWN0ZXIgPT0gYWN0aXZlX3F1b3RlIHsKICAgICAgICAgICAgICAgIHF1b3RlID0gTm9uZTsKICAgICAgICAgICAgfQogICAgICAgICAgICBjb250aW51ZTsKICAgICAgICB9CiAgICAgICAgaWYgbWF0Y2hlcyEoY2hhcmFjdGVyLCAnXCcnIHwgJyInKSB7CiAgICAgICAgICAgIHF1b3RlID0gU29tZShjaGFyYWN0ZXIpOwogICAgICAgICAgICBjb250aW51ZTsKICAgICAgICB9CiAgICAgICAgaWYgY2hhcmFjdGVyID09ICcvJyAmJiBzb3VyY2VbaW5kZXguLl0uc3RhcnRzX3dpdGgoIi8vIikgewogICAgICAgICAgICBsaW5lX2NvbW1lbnQgPSB0cnVlOwogICAgICAgICAgICBjb250aW51ZTsKICAgICAgICB9CiAgICAgICAgaWYgc291cmNlW2luZGV4Li5dLnN0YXJ0c193aXRoKHByZWZpeCkgewogICAgICAgICAgICByZXR1cm4gU29tZShpbmRleCk7CiAgICAgICAgfQogICAgfQogICAgTm9uZQp9CgoiIiIKaWYgaW5zZXJ0X2FuY2hvciBub3QgaW4gc291cmNlOgogICAgcmFpc2UgU3lzdGVtRXhpdCgic2VydmljZSBkaXJlY3RpdmUgaGVscGVyIGFuY2hvciBjaGFuZ2VkIikKc291cmNlID0gc291cmNlLnJlcGxhY2UoaW5zZXJ0X2FuY2hvciwgaGVscGVyICsgaW5zZXJ0X2FuY2hvciwgMSkKCnRlc3RfYW5jaG9yID0gIiIiICAgICNbdGVzdF0KICAgIGZuIHBhcnNlc19oeWJyaWRfYW5kX29uX2RlbWFuZF9tb2RlcygpIHsiIiIKdGVzdCA9IHIiIiIgICAgI1t0ZXN0XQogICAgZm4gY29tbWVudGVkX2RpcmVjdGl2ZXNfZG9fbm90X292ZXJyaWRlX2NhdGFsb2dfbWV0YWRhdGEoKSB7CiAgICAgICAgbGV0IHBhdGggPSB0ZXN0X3NlcnZpY2VfcGF0aCgiY29tbWVudGVkLWRpcmVjdGl2ZXMiKTsKICAgICAgICBzdGQ6OmZzOjp3cml0ZSgKICAgICAgICAgICAgJnBhdGgsCiAgICAgICAgICAgICIvLyA6aW1wb3J0W2lnbm9yZWRdXG4vLyA6c2VydmljZVtuYW1lID0gd3JvbmddXG46aW1wb3J0W3RpbWVdXG46c2VydmljZVtuYW1lID0gcmlnaHRdXG5leHBvcnQgZnVuY3Rpb24gcnVuKCkge31cbiIsCiAgICAgICAgKQogICAgICAgIC51bndyYXAoKTsKICAgICAgICBsZXQgc2VydmljZSA9IHBhcnNlX3NlcnZpY2UoJnBhdGgsIFNlcnZpY2VEZWZhdWx0czo6ZGVmYXVsdCgpKS51bndyYXAoKTsKICAgICAgICBhc3NlcnRfZXEhKHNlcnZpY2UubmFtZSwgInJpZ2h0Iik7CiAgICAgICAgYXNzZXJ0X2VxIShzZXJ2aWNlLmltcG9ydHMsIHZlYyFbInRpbWUiXSk7CiAgICAgICAgbGV0IF8gPSBzdGQ6OmZzOjpyZW1vdmVfZmlsZShwYXRoKTsKICAgIH0KCiIiIgppZiB0ZXN0X2FuY2hvciBub3QgaW4gc291cmNlOgogICAgcmFpc2UgU3lzdGVtRXhpdCgic2VydmljZSBydW50aW1lIHRlc3QgaW5zZXJ0aW9uIGFuY2hvciBjaGFuZ2VkIikKc291cmNlID0gc291cmNlLnJlcGxhY2UodGVzdF9hbmNob3IsIHRlc3QgKyB0ZXN0X2FuY2hvciwgMSkKcGF0aC53cml0ZV90ZXh0KHNvdXJjZSkK' | base64 -d > /tmp/patch-svc-032.py
+          python3 /tmp/patch-svc-032.py
           cd engine
           cargo fmt --all
           cargo test -p service-runtime
           cd ..
           git add engine/crates/service-runtime/src/lib.rs
           git commit -m "FIX | BUG-SVC-032 ignore commented service directives"
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          path = Path("engine/crates/service-runtime/src/lib.rs")
-          source = path.read_text()
-
-          old_exports = '''    let exports = source\n        .lines()\n        .filter_map(|line| {\n            let line = line.trim_start();\n            let rest = line\n                .strip_prefix("export function ")\n                .or_else(|| line.strip_prefix("export async function "))?;\n            let name: String = rest\n                .chars()\n                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')\n                .collect();\n            (!name.is_empty()).then_some(name)\n        })\n        .collect();'''
-          new_exports = '''    let exports = service_export_names(&source);'''
-          if old_exports not in source:
-              raise SystemExit("service export discovery anchor changed")
-          source = source.replace(old_exports, new_exports, 1)
-
-          insert_anchor = '''fn directive(source: &str, prefix: &str) -> Option<(String, usize)> {'''
-          helper = r'''fn service_export_names(source: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut escaped = false;
-    let mut line_comment = false;
-    let mut chars = source.chars().peekable();
-
-    while let Some(character) = chars.next() {
-        if line_comment {
-            if character == '\n' {
-                line_comment = false;
-            }
-            continue;
-        }
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if let Some(active_quote) = quote {
-            if character == '\\' {
-                escaped = true;
-            } else if character == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            quote = Some(character);
-            continue;
-        }
-        if character == '/' && chars.peek() == Some(&'/') {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            chars.next();
-            line_comment = true;
-            continue;
-        }
-        if character.is_ascii_alphanumeric() || character == '_' {
-            current.push(character);
-        } else if !current.is_empty() {
-            words.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-
-    let mut exports = Vec::new();
-    let mut index = 0usize;
-    while index < words.len() {
-        if words[index] != "export" {
-            index += 1;
-            continue;
-        }
-        let mut cursor = index + 1;
-        if words.get(cursor).is_some_and(|word| word == "async") {
-            cursor += 1;
-        }
-        if words.get(cursor).is_some_and(|word| word == "function") {
-            if let Some(name) = words.get(cursor + 1) {
-                exports.push(name.clone());
-            }
-        }
-        index = cursor.saturating_add(1);
-    }
-    exports
-}
-
-'''
-          if insert_anchor not in source:
-              raise SystemExit("service export helper insertion anchor changed")
-          source = source.replace(insert_anchor, helper + insert_anchor, 1)
-
-          test_anchor = '''    #[test]\n    fn commented_directives_do_not_override_catalog_metadata() {'''
-          test = r'''    #[test]
-    fn export_discovery_matches_whitespace_insensitive_service_syntax() {
-        let path = test_service_path("multiline-export");
-        std::fs::write(
-            &path,
-            ":service[name = multiline]\n// export function ghost() {}\nexport\nasync\nfunction\nvisible() {}\n",
-        )
-        .unwrap();
-        let service = parse_service(&path, ServiceDefaults::default()).unwrap();
-        assert_eq!(service.exports, vec!["visible"]);
-        let _ = std::fs::remove_file(path);
-    }
-
-'''
-          if test_anchor not in source:
-              raise SystemExit("service export test insertion anchor changed")
-          source = source.replace(test_anchor, test + test_anchor, 1)
-          path.write_text(source)
-          PY
-
+          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpwYXRoID0gUGF0aCgiZW5naW5lL2NyYXRlcy9zZXJ2aWNlLXJ1bnRpbWUvc3JjL2xpYi5ycyIpCnNvdXJjZSA9IHBhdGgucmVhZF90ZXh0KCkKCm9sZF9leHBvcnRzID0gIiIiICAgIGxldCBleHBvcnRzID0gc291cmNlCiAgICAgICAgLmxpbmVzKCkKICAgICAgICAuZmlsdGVyX21hcCh8bGluZXwgewogICAgICAgICAgICBsZXQgbGluZSA9IGxpbmUudHJpbV9zdGFydCgpOwogICAgICAgICAgICBsZXQgcmVzdCA9IGxpbmUKICAgICAgICAgICAgICAgIC5zdHJpcF9wcmVmaXgoImV4cG9ydCBmdW5jdGlvbiAiKQogICAgICAgICAgICAgICAgLm9yX2Vsc2UofHwgbGluZS5zdHJpcF9wcmVmaXgoImV4cG9ydCBhc3luYyBmdW5jdGlvbiAiKSk/OwogICAgICAgICAgICBsZXQgbmFtZTogU3RyaW5nID0gcmVzdAogICAgICAgICAgICAgICAgLmNoYXJzKCkKICAgICAgICAgICAgICAgIC50YWtlX3doaWxlKHxjaGFyYWN0ZXJ8IGNoYXJhY3Rlci5pc19hc2NpaV9hbHBoYW51bWVyaWMoKSB8fCAqY2hhcmFjdGVyID09ICdfJykKICAgICAgICAgICAgICAgIC5jb2xsZWN0KCk7CiAgICAgICAgICAgICghbmFtZS5pc19lbXB0eSgpKS50aGVuX3NvbWUobmFtZSkKICAgICAgICB9KQogICAgICAgIC5jb2xsZWN0KCk7IiIiCm5ld19leHBvcnRzID0gIiAgICBsZXQgZXhwb3J0cyA9IHNlcnZpY2VfZXhwb3J0X25hbWVzKCZzb3VyY2UpOyIKaWYgb2xkX2V4cG9ydHMgbm90IGluIHNvdXJjZToKICAgIHJhaXNlIFN5c3RlbUV4aXQoInNlcnZpY2UgZXhwb3J0IGRpc2NvdmVyeSBhbmNob3IgY2hhbmdlZCIpCnNvdXJjZSA9IHNvdXJjZS5yZXBsYWNlKG9sZF9leHBvcnRzLCBuZXdfZXhwb3J0cywgMSkKCmluc2VydF9hbmNob3IgPSAiZm4gZGlyZWN0aXZlKHNvdXJjZTogJnN0ciwgcHJlZml4OiAmc3RyKSAtPiBPcHRpb248KFN0cmluZywgdXNpemUpPiB7IgpoZWxwZXIgPSByIiIiZm4gc2VydmljZV9leHBvcnRfbmFtZXMoc291cmNlOiAmc3RyKSAtPiBWZWM8U3RyaW5nPiB7CiAgICBsZXQgbXV0IHdvcmRzID0gVmVjOjpuZXcoKTsKICAgIGxldCBtdXQgY3VycmVudCA9IFN0cmluZzo6bmV3KCk7CiAgICBsZXQgbXV0IHF1b3RlID0gTm9uZTsKICAgIGxldCBtdXQgZXNjYXBlZCA9IGZhbHNlOwogICAgbGV0IG11dCBsaW5lX2NvbW1lbnQgPSBmYWxzZTsKICAgIGxldCBtdXQgY2hhcnMgPSBzb3VyY2UuY2hhcnMoKS5wZWVrYWJsZSgpOwoKICAgIHdoaWxlIGxldCBTb21lKGNoYXJhY3RlcikgPSBjaGFycy5uZXh0KCkgewogICAgICAgIGlmIGxpbmVfY29tbWVudCB7CiAgICAgICAgICAgIGlmIGNoYXJhY3RlciA9PSAnXG4nIHsKICAgICAgICAgICAgICAgIGxpbmVfY29tbWVudCA9IGZhbHNlOwogICAgICAgICAgICB9CiAgICAgICAgICAgIGNvbnRpbnVlOwogICAgICAgIH0KICAgICAgICBpZiBlc2NhcGVkIHsKICAgICAgICAgICAgZXNjYXBlZCA9IGZhbHNlOwogICAgICAgICAgICBjb250aW51ZTsKICAgICAgICB9CiAgICAgICAgaWYgbGV0IFNvbWUoYWN0aXZlX3F1b3RlKSA9IHF1b3RlIHsKICAgICAgICAgICAgaWYgY2hhcmFjdGVyID09ICdcXCcgewogICAgICAgICAgICAgICAgZXNjYXBlZCA9IHRydWU7CiAgICAgICAgICAgIH0gZWxzZSBpZiBjaGFyYWN0ZXIgPT0gYWN0aXZlX3F1b3RlIHsKICAgICAgICAgICAgICAgIHF1b3RlID0gTm9uZTsKICAgICAgICAgICAgfQogICAgICAgICAgICBjb250aW51ZTsKICAgICAgICB9CiAgICAgICAgaWYgbWF0Y2hlcyEoY2hhcmFjdGVyLCAnXCcnIHwgJyInKSB7CiAgICAgICAgICAgIGlmICFjdXJyZW50LmlzX2VtcHR5KCkgewogICAgICAgICAgICAgICAgd29yZHMucHVzaChzdGQ6Om1lbTo6dGFrZSgmbXV0IGN1cnJlbnQpKTsKICAgICAgICAgICAgfQogICAgICAgICAgICBxdW90ZSA9IFNvbWUoY2hhcmFjdGVyKTsKICAgICAgICAgICAgY29udGludWU7CiAgICAgICAgfQogICAgICAgIGlmIGNoYXJhY3RlciA9PSAnLycgJiYgY2hhcnMucGVlaygpID09IFNvbWUoJicvJykgewogICAgICAgICAgICBpZiAhY3VycmVudC5pc19lbXB0eSgpIHsKICAgICAgICAgICAgICAgIHdvcmRzLnB1c2goc3RkOjptZW06OnRha2UoJm11dCBjdXJyZW50KSk7CiAgICAgICAgICAgIH0KICAgICAgICAgICAgY2hhcnMubmV4dCgpOwogICAgICAgICAgICBsaW5lX2NvbW1lbnQgPSB0cnVlOwogICAgICAgICAgICBjb250aW51ZTsKICAgICAgICB9CiAgICAgICAgaWYgY2hhcmFjdGVyLmlzX2FzY2lpX2FscGhhbnVtZXJpYygpIHx8IGNoYXJhY3RlciA9PSAnXycgewogICAgICAgICAgICBjdXJyZW50LnB1c2goY2hhcmFjdGVyKTsKICAgICAgICB9IGVsc2UgaWYgIWN1cnJlbnQuaXNfZW1wdHkoKSB7CiAgICAgICAgICAgIHdvcmRzLnB1c2goc3RkOjptZW06OnRha2UoJm11dCBjdXJyZW50KSk7CiAgICAgICAgfQogICAgfQogICAgaWYgIWN1cnJlbnQuaXNfZW1wdHkoKSB7CiAgICAgICAgd29yZHMucHVzaChjdXJyZW50KTsKICAgIH0KCiAgICBsZXQgbXV0IGV4cG9ydHMgPSBWZWM6Om5ldygpOwogICAgbGV0IG11dCBpbmRleCA9IDB1c2l6ZTsKICAgIHdoaWxlIGluZGV4IDwgd29yZHMubGVuKCkgewogICAgICAgIGlmIHdvcmRzW2luZGV4XSAhPSAiZXhwb3J0IiB7CiAgICAgICAgICAgIGluZGV4ICs9IDE7CiAgICAgICAgICAgIGNvbnRpbnVlOwogICAgICAgIH0KICAgICAgICBsZXQgbXV0IGN1cnNvciA9IGluZGV4ICsgMTsKICAgICAgICBpZiB3b3Jkcy5nZXQoY3Vyc29yKS5pc19zb21lX2FuZCh8d29yZHwgd29yZCA9PSAiYXN5bmMiKSB7CiAgICAgICAgICAgIGN1cnNvciArPSAxOwogICAgICAgIH0KICAgICAgICBpZiB3b3Jkcy5nZXQoY3Vyc29yKS5pc19zb21lX2FuZCh8d29yZHwgd29yZCA9PSAiZnVuY3Rpb24iKSB7CiAgICAgICAgICAgIGlmIGxldCBTb21lKG5hbWUpID0gd29yZHMuZ2V0KGN1cnNvciArIDEpIHsKICAgICAgICAgICAgICAgIGV4cG9ydHMucHVzaChuYW1lLmNsb25lKCkpOwogICAgICAgICAgICB9CiAgICAgICAgfQogICAgICAgIGluZGV4ID0gY3Vyc29yLnNhdHVyYXRpbmdfYWRkKDEpOwogICAgfQogICAgZXhwb3J0cwp9CgoiIiIKaWYgaW5zZXJ0X2FuY2hvciBub3QgaW4gc291cmNlOgogICAgcmFpc2UgU3lzdGVtRXhpdCgic2VydmljZSBleHBvcnQgaGVscGVyIGluc2VydGlvbiBhbmNob3IgY2hhbmdlZCIpCnNvdXJjZSA9IHNvdXJjZS5yZXBsYWNlKGluc2VydF9hbmNob3IsIGhlbHBlciArIGluc2VydF9hbmNob3IsIDEpCgp0ZXN0X2FuY2hvciA9ICIiIiAgICAjW3Rlc3RdCiAgICBmbiBjb21tZW50ZWRfZGlyZWN0aXZlc19kb19ub3Rfb3ZlcnJpZGVfY2F0YWxvZ19tZXRhZGF0YSgpIHsiIiIKdGVzdCA9IHIiIiIgICAgI1t0ZXN0XQogICAgZm4gZXhwb3J0X2Rpc2NvdmVyeV9tYXRjaGVzX3doaXRlc3BhY2VfaW5zZW5zaXRpdmVfc2VydmljZV9zeW50YXgoKSB7CiAgICAgICAgbGV0IHBhdGggPSB0ZXN0X3NlcnZpY2VfcGF0aCgibXVsdGlsaW5lLWV4cG9ydCIpOwogICAgICAgIHN0ZDo6ZnM6OndyaXRlKAogICAgICAgICAgICAmcGF0aCwKICAgICAgICAgICAgIjpzZXJ2aWNlW25hbWUgPSBtdWx0aWxpbmVdXG4vLyBleHBvcnQgZnVuY3Rpb24gZ2hvc3QoKSB7fVxuZXhwb3J0XG5hc3luY1xuZnVuY3Rpb25cbnZpc2libGUoKSB7fVxuIiwKICAgICAgICApCiAgICAgICAgLnVud3JhcCgpOwogICAgICAgIGxldCBzZXJ2aWNlID0gcGFyc2Vfc2VydmljZSgmcGF0aCwgU2VydmljZURlZmF1bHRzOjpkZWZhdWx0KCkpLnVud3JhcCgpOwogICAgICAgIGFzc2VydF9lcSEoc2VydmljZS5leHBvcnRzLCB2ZWMhWyJ2aXNpYmxlIl0pOwogICAgICAgIGxldCBfID0gc3RkOjpmczo6cmVtb3ZlX2ZpbGUocGF0aCk7CiAgICB9CgoiIiIKaWYgdGVzdF9hbmNob3Igbm90IGluIHNvdXJjZToKICAgIHJhaXNlIFN5c3RlbUV4aXQoInNlcnZpY2UgZXhwb3J0IHRlc3QgaW5zZXJ0aW9uIGFuY2hvciBjaGFuZ2VkIikKc291cmNlID0gc291cmNlLnJlcGxhY2UodGVzdF9hbmNob3IsIHRlc3QgKyB0ZXN0X2FuY2hvciwgMSkKcGF0aC53cml0ZV90ZXh0KHNvdXJjZSkK' | base64 -d > /tmp/patch-svc-033.py
+          python3 /tmp/patch-svc-033.py
           cd engine
           cargo fmt --all
           cargo test -p service-runtime
@@ -239,7 +44,6 @@ jobs:
           git rm .github/workflows/one-shot-svc-catalog-parser.yml
           git add engine/crates/service-runtime/src/lib.rs
           git commit -m "FIX | BUG-SVC-033 parse service exports across whitespace"
-
           git fetch origin main
           if [ "$(git rev-parse origin/main)" != "$(git rev-parse HEAD~2)" ]; then
             git rebase origin/main
