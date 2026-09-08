@@ -157,14 +157,26 @@ async fn run_ffmpeg_once(
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn configured FFmpeg {}", policy.executable.display()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Video Manager FFmpeg stderr pipe is unavailable"))?;
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = tokio::fs::remove_file(output_path).await;
+            anyhow::bail!("Video Manager FFmpeg stderr pipe is unavailable");
+        }
+    };
     let stderr_task = tokio::spawn(read_bounded_output(stderr, policy.max_log_bytes));
 
     let status = match tokio::time::timeout(policy.timeout, child.wait()).await {
-        Ok(result) => result.context("wait for Video Manager FFmpeg")?,
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            stderr_task.abort();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = tokio::fs::remove_file(output_path).await;
+            return Err(error).context("wait for Video Manager FFmpeg");
+        }
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -187,14 +199,18 @@ async fn run_ffmpeg_once(
         );
     }
 
-    let metadata = tokio::fs::symlink_metadata(output_path)
-        .await
-        .with_context(|| {
-            format!(
-                "inspect Video Manager normalized output {}",
-                output_path.display()
-            )
-        })?;
+    let metadata = match tokio::fs::symlink_metadata(output_path).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(output_path).await;
+            return Err(error).with_context(|| {
+                format!(
+                    "inspect Video Manager normalized output {}",
+                    output_path.display()
+                )
+            });
+        }
+    };
     if !metadata.file_type().is_file() || metadata.len() == 0 {
         let _ = tokio::fs::remove_file(output_path).await;
         anyhow::bail!("Video Manager FFmpeg did not produce a non-empty regular output file");
