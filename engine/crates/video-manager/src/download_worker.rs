@@ -208,44 +208,66 @@ async fn open_reserved_quarantine(
     quarantine_path: &Path,
     quarantine_root: &Path,
 ) -> anyhow::Result<tokio::fs::File> {
-    let before = tokio::fs::symlink_metadata(quarantine_path)
+    let path = quarantine_path.to_path_buf();
+    let root = quarantine_root.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || open_reserved_quarantine_sync(&path, &root))
         .await
-        .with_context(|| {
-            format!(
-                "inspect reserved Video Manager quarantine file {}",
-                quarantine_path.display()
-            )
-        })?;
+        .context("Video Manager quarantine open task failed")??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+fn open_reserved_quarantine_sync(
+    quarantine_path: &Path,
+    quarantine_root: &Path,
+) -> anyhow::Result<std::fs::File> {
+    // On Windows, keep a handle to the path before opening the writable handle.
+    // Stable Rust does not yet expose MetadataExt file-index APIs, so identity
+    // is read directly from each handle with GetFileInformationByHandle.
+    #[cfg(windows)]
+    let before_identity = {
+        let before_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(quarantine_path)
+            .with_context(|| {
+                format!(
+                    "open reserved Video Manager quarantine file for identity verification {}",
+                    quarantine_path.display()
+                )
+            })?;
+        windows_file_identity(&before_file)
+            .context("read reserved Video Manager quarantine identity before opening")?
+    };
+
+    let before = std::fs::symlink_metadata(quarantine_path).with_context(|| {
+        format!(
+            "inspect reserved Video Manager quarantine file {}",
+            quarantine_path.display()
+        )
+    })?;
     if !before.file_type().is_file() {
         anyhow::bail!("Video Manager quarantine entry is not a reserved regular file");
     }
 
-    let canonical = tokio::fs::canonicalize(quarantine_path)
-        .await
-        .with_context(|| {
-            format!(
-                "canonicalize reserved Video Manager quarantine file {}",
-                quarantine_path.display()
-            )
-        })?;
+    let canonical = std::fs::canonicalize(quarantine_path).with_context(|| {
+        format!(
+            "canonicalize reserved Video Manager quarantine file {}",
+            quarantine_path.display()
+        )
+    })?;
     if !canonical.starts_with(quarantine_root) {
         anyhow::bail!("Video Manager quarantine file escaped its storage root");
     }
 
-    let path = quarantine_path.to_path_buf();
-    let file = tokio::task::spawn_blocking(move || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "open reserved Video Manager quarantine file {}",
-                    path.display()
-                )
-            })
-    })
-    .await
-    .context("Video Manager quarantine open task failed")??;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(quarantine_path)
+        .with_context(|| {
+            format!(
+                "open reserved Video Manager quarantine file {}",
+                quarantine_path.display()
+            )
+        })?;
 
     let opened = file
         .metadata()
@@ -256,17 +278,39 @@ async fn open_reserved_quarantine(
             quarantine_path.display()
         )
     })?;
-    if !opened.file_type().is_file()
-        || !after.file_type().is_file()
-        || !same_file_identity(&before, &opened)
-        || !same_file_identity(&opened, &after)
-    {
+
+    #[cfg(unix)]
+    let same_identity =
+        same_file_identity(&before, &opened) && same_file_identity(&opened, &after);
+
+    #[cfg(windows)]
+    let same_identity = {
+        let opened_identity = windows_file_identity(&file)
+            .context("read opened Video Manager quarantine handle identity")?;
+        let after_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(quarantine_path)
+            .with_context(|| {
+                format!(
+                    "reopen reserved Video Manager quarantine file for identity verification {}",
+                    quarantine_path.display()
+                )
+            })?;
+        let after_identity = windows_file_identity(&after_file)
+            .context("read reserved Video Manager quarantine identity after opening")?;
+        before_identity == opened_identity && opened_identity == after_identity
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let same_identity = false;
+
+    if !opened.file_type().is_file() || !after.file_type().is_file() || !same_identity {
         anyhow::bail!("Video Manager quarantine file identity changed while opening");
     }
 
     file.set_len(0)
         .context("truncate verified Video Manager quarantine file")?;
-    Ok(tokio::fs::File::from_std(file))
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -276,15 +320,64 @@ fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bo
 }
 
 #[cfg(windows)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsFileIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
 }
 
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
-    false
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct WindowsFileTime {
+    low_date_time: u32,
+    high_date_time: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct WindowsByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: WindowsFileTime,
+    last_access_time: WindowsFileTime,
+    last_write_time: WindowsFileTime,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+extern "system" {
+    #[link_name = "GetFileInformationByHandle"]
+    fn get_file_information_by_handle(
+        file: *mut std::ffi::c_void,
+        information: *mut WindowsByHandleFileInformation,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> std::io::Result<WindowsFileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut information = WindowsByHandleFileInformation::default();
+    // SAFETY: `file` owns a valid open Windows handle for this call and the
+    // output pointer targets a correctly laid-out writable Win32 structure.
+    let succeeded = unsafe {
+        get_file_information_by_handle(file.as_raw_handle(), &mut information as *mut _)
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(WindowsFileIdentity {
+        volume_serial_number: information.volume_serial_number,
+        file_index: (u64::from(information.file_index_high) << 32)
+            | u64::from(information.file_index_low),
+    })
 }
 
 fn redirect_target(current: &DownloadTarget, location: &str) -> anyhow::Result<DownloadTarget> {
@@ -384,6 +477,28 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"do not truncate");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_uses_stable_handle_information() {
+        let root = quarantine_test_root("windows-identity");
+        let first_path = root.join("first.part");
+        let second_path = root.join("second.part");
+        std::fs::write(&first_path, b"first").unwrap();
+        std::fs::write(&second_path, b"second").unwrap();
+        let first_a = std::fs::File::open(&first_path).unwrap();
+        let first_b = std::fs::File::open(&first_path).unwrap();
+        let second = std::fs::File::open(&second_path).unwrap();
+        assert_eq!(
+            windows_file_identity(&first_a).unwrap(),
+            windows_file_identity(&first_b).unwrap()
+        );
+        assert_ne!(
+            windows_file_identity(&first_a).unwrap(),
+            windows_file_identity(&second).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
