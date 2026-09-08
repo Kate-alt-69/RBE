@@ -6,11 +6,12 @@ mod routes;
 
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
+use axum::http::StatusCode;
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::Router;
 use core_lib::AppState;
 use tower::ServiceBuilder;
@@ -57,7 +58,11 @@ pub fn build_router(
             state.config.clone(),
             security::security_headers,
         ))
-        .layer(cors);
+        .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            Duration::from_millis(state.config.api.request_timeout_ms),
+            request_timeout,
+        ));
 
     let mut router = Router::new()
         .merge(health::routes())
@@ -115,6 +120,17 @@ fn start_dashboard_server(state: AppState) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+async fn request_timeout(
+    State(timeout): State<Duration>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
 }
 
 async fn request_metrics(State(state): State<AppState>, request: Request, next: Next) -> Response {

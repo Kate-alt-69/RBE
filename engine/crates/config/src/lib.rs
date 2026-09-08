@@ -512,6 +512,11 @@ impl Config {
                 "api.port must be a nonzero port".into(),
             ));
         }
+        if self.api.request_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "api.requestTimeoutMs must be greater than zero".into(),
+            ));
+        }
         if self.runtime.process_refresh_hours == 0 {
             return Err(ConfigError::Invalid(
                 "runtime.processRefreshHours must be greater than zero".into(),
@@ -613,6 +618,22 @@ mod tests {
         assert_eq!(config.video_manager.live_idle_secs, 7200);
         assert!(!config.video_manager.download_worker_enabled);
         assert_eq!(config.video_manager.worker_recovery_scan_secs, 30);
+    }
+
+    #[test]
+    fn rejects_zero_api_request_timeout() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "api": {
+                    "host": "0.0.0.0",
+                    "port": 8080,
+                    "requestTimeoutMs": 0
+                }
+            }"#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("api.requestTimeoutMs"));
     }
 
     #[test]
