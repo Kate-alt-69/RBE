@@ -57,7 +57,7 @@ The child binds a loopback-only TCP IPC endpoint and prints one readiness record
 
 IPC uses a random 256-bit per-process token. Supported internal operations currently include health, exported function calls, lifecycle events, service memory operations, and shutdown.
 
-On Unix, the configured memory limit is enforced with `RLIMIT_AS`. Equivalent Windows Job Object enforcement is still pending.
+On Unix, the configured memory limit is enforced with `RLIMIT_AS`. On Windows, each service host creates a private Job Object, applies `JOB_OBJECT_LIMIT_PROCESS_MEMORY`, and assigns itself before advertising readiness. A non-zero `memoryLimitMb` therefore fails service startup if the platform cannot install the requested hard limit instead of silently running unbounded.
 
 ## Service execution
 
@@ -147,7 +147,7 @@ Executable-body validation also runs before service processes are launched. Back
 
 The following should not be inferred from the current runtime:
 
-- Windows Job Object memory/process limits
+- additional Windows Job Object limits beyond per-process memory, such as CPU or process-count limits
 - `instances > 1` or service load balancing
 - arbitrary child-process/shell execution from `.service`
 - durable persistence for process-local `memory`
