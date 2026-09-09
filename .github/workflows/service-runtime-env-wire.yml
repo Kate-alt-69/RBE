@@ -8,6 +8,7 @@ on:
       - '.github/patches/runtime-policy-wire.py'
       - '.github/patches/runtime-launch-hardening-wire.py'
       - '.github/patches/runtime-security-docs-wire.py'
+      - '.github/patches/middleware-runtime-wire.py'
       - '.github/workflows/service-runtime-env-wire.yml'
 
 permissions:
@@ -54,6 +55,9 @@ jobs:
 
       - name: Apply launch environment hardening
         run: python .github/patches/runtime-launch-hardening-wire.py
+
+      - name: Apply native MiddlewarePlan runtime wiring
+        run: python .github/patches/middleware-runtime-wire.py
 
       - name: Apply source security documentation
         run: python .github/patches/runtime-security-docs-wire.py
@@ -105,6 +109,9 @@ jobs:
           if ! grep -q 'fn resolve_settings_path()' engine/crates/backend/src/main.rs; then
             python .github/patches/runtime-launch-hardening-wire.py
           fi
+          if ! grep -q 'apply_middleware_plan' engine/crates/backend/src/runtime_image_boot.rs; then
+            python .github/patches/middleware-runtime-wire.py
+          fi
           if [ ! -f doc/source-security.md ]; then
             python .github/patches/runtime-security-docs-wire.py
           fi
@@ -129,6 +136,7 @@ jobs:
             .github/patches/service-runtime-env-wire.py \
             .github/patches/runtime-policy-wire.py \
             .github/patches/runtime-launch-hardening-wire.py \
+            .github/patches/middleware-runtime-wire.py \
             .github/patches/runtime-security-docs-wire.py \
             .github/workflows/service-runtime-env-wire.yml
           git config user.name 'github-actions[bot]'
