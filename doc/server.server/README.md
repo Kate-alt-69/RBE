@@ -41,13 +41,13 @@ normal server.server defaults
 RBE built-in defaults
 ```
 
-`force` is intended to lock a server policy value against a conflicting `settings.json` value. It cannot disable a hard engine safety invariant.
+`force` locks a server policy value against a conflicting deployment value. It cannot disable a hard engine safety invariant.
+
+The Server REL compiler already separates normal defaults from forced values in the compiled `ServerPolicy`. Applying those maps to the typed runtime `Config` is the next boot-integration stage; until that stage is active, `settings.json` remains the source used by the running backend.
 
 ## Public runtime ENV
 
 `settings.json` may provide shared public runtime values. Server REL may provide a value when settings did not set it.
-
-Example target shape:
 
 ```text
 server Main {
@@ -56,20 +56,24 @@ server Main {
         REGION "local";
         SESSION_TTL 86400;
     }
+
+    force {
+        env {
+            DEPLOYMENT_TIER "production";
+        }
+    }
 }
 ```
 
-Settings values win over normal Server REL ENV defaults. Forced values may be introduced where policy requires them.
+Server REL ENV literals are compiled as typed JSON-compatible values rather than flattened strings. Normal values are stored separately from forced ENV values so the runtime can preserve the same precedence model as ordinary server policy.
 
 Public ENV means readable by authorized backend REL code; it is not automatically exposed to HTTP clients.
 
-See [`../rel.md`](../rel.md) for `ENV` access and [`../compatibility.md`](../compatibility.md) for which source types may read it.
+The `ENV` runtime capability itself is not wired yet. See [`../rel.md`](../rel.md) for the target access surface and [`../compatibility.md`](../compatibility.md) for source-role capability rules.
 
 ## Native middleware
 
-Server REL is the intended place to compile native Rust middleware into a deterministic `MiddlewarePlan`.
-
-Target built-ins include:
+Server REL compiles native middleware declarations into an ordered policy list. The currently recognized built-ins are:
 
 ```text
 correlationId
@@ -97,7 +101,7 @@ auth
 errorHandler
 ```
 
-Example target syntax:
+The compiler rejects unknown or duplicate middleware names.
 
 ```text
 server Main {
@@ -127,11 +131,11 @@ server Main {
 }
 ```
 
-The exact syntax remains subject to parser implementation, but middleware should be native REL policy instead of requiring ordinary package imports for standard server behavior.
+Middleware options are currently preserved as typed/atom values in `MiddlewarePolicy`. The runtime `MiddlewarePlan` lowering and Axum installation stage are still being implemented; declaring middleware does not yet change live request handling.
 
 ## Server status
 
-Target states include:
+The compiler recognizes:
 
 ```text
 online
@@ -141,11 +145,38 @@ readonly
 offline
 ```
 
-Status policy may define route exceptions and responses, for example allowing health/admin endpoints during maintenance while rejecting normal traffic.
+Unknown states fail with an `SRV1xxx` compiler diagnostic. Runtime request gates and route exceptions for these states are a later Server REL runtime stage.
+
+## General policy blocks
+
+Normal and forced policy declarations may use nested blocks. They are compiled into deterministic dotted keys so the config merger can apply them without depending on declaration order.
+
+```text
+server Main {
+    api {
+        host "0.0.0.0";
+        port 8080;
+    }
+
+    security {
+        trustedProxyHeaders false;
+    }
+
+    force {
+        api {
+            requestTimeoutMs 30000;
+        }
+    }
+}
+```
+
+This produces keys such as `api.port`, `security.trustedProxyHeaders`, and forced `api.requestTimeoutMs`.
 
 ## Server functions
 
-Server REL may contain normal REL helper functions. Higher-level grammar is not exclusive to Server REL; the difference is that these helpers can participate in Server REL policy/configuration evaluation.
+Server REL may contain normal REL helper functions and classes. The policy compilation pass validates/skips their balanced bodies instead of interpreting their contents as configuration.
+
+Both synchronous and `async function` declarations are accepted by this policy pass. Executable Server REL helper lowering belongs to the shared RELC linker/runtime stage and is not runtime-enabled yet.
 
 A helper is not automatically global to every file. Reusable application code should live in a `.module` or an embedded Module REL file.
 
@@ -163,7 +194,7 @@ export function appName() {
 [file-end:module]
 ```
 
-Planned forms:
+Supported extraction forms are:
 
 ```text
 [file-start:module.NAME]
@@ -176,25 +207,57 @@ Planned forms:
 [file-end:service]
 ```
 
-RELC extracts each block before normal source compilation. The contents are compiled by their own file-type compiler and follow exactly the same capability rules as physical files.
+The first Server REL compiler stage now extracts these blocks before policy parsing, keeps source line positions stable for diagnostics, assigns stable virtual identities such as `server.server#module:Auth`, retains header attributes such as route `path`, and rejects nested/malformed or duplicate embedded identities.
 
-Embedded sources may import each other. Dependencies are resolved by SourceId/symbol identity, not by deciding that one literal block must be fully compiled first.
+The next RELC discovery stage must feed the extracted contents into their own Route/Module/Service compiler paths. Embedded source contents do not inherit Server REL privileges.
 
 See [`../relc.md`](../relc.md).
 
 ## Duplicate identity
 
-If a physical source and embedded source claim the same logical identity, RELC should fail deterministically rather than silently choose one.
+Duplicate embedded virtual identities inside one `server.server` already fail deterministically.
 
-Example:
+The full RELC discovery pass will additionally reject collisions between a physical source and an embedded source that claim the same logical identity. For example:
 
 ```text
 module/Auth.module
 server.server#module:Auth
 ```
 
-should produce a duplicate-source diagnostic unless a future explicit override mechanism is deliberately designed.
+must not silently pick one implementation.
+
+## Diagnostics
+
+The Server REL compiler foundation uses the `SRV1xxx` family for syntax/policy diagnostics, including invalid status, middleware, embedded source markers, duplicate policy keys, and unsupported/reserved declarations.
+
+`profile` blocks are reserved by the grammar contract but intentionally rejected until profile selection/merging semantics are implemented.
 
 ## Current implementation status
 
-`server.server`, force policy, embedded files, compiled ServerPolicy, and Runtime ENV merging are planned architecture at the time this page was introduced. Existing `settings.json` remains the implemented configuration source until the Server REL work lands.
+Implemented in the current Server REL compiler foundation:
+
+- root `server NAME { ... }` policy compilation
+- typed `ServerPolicy`
+- status parsing and validation
+- nested normal policy defaults
+- nested `force` policy values
+- typed normal and forced ENV declarations
+- ordered native middleware parsing and validation
+- literal route/module/service extraction with stable virtual SourceIds
+- embedded-header attributes such as route `path`
+- duplicate embedded SourceId rejection
+- synchronous and async helper/class body isolation during policy compilation
+- `SRV1xxx` diagnostics for the implemented surface
+
+Still being wired into the runtime/RELC pipeline:
+
+- automatic root `server.server` boot discovery
+- `ServerPolicy` + `settings.json` precedence application to the typed runtime config
+- Runtime ENV capability and access checks
+- physical-versus-embedded duplicate resolution across the complete source graph
+- compiling embedded sources through the normal Route/Module/Service passes
+- native `MiddlewarePlan` lowering and Axum request-stack installation
+- live server-status request gates and route exceptions
+- profile blocks
+- executable Server REL helper linking
+- full multi-pass `RuntimeImage`/transactional reload support
