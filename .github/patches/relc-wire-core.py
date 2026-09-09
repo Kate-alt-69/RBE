@@ -46,12 +46,46 @@ replace_once(
     "if !matches!(&token.kind, TokenKind::Eof) {",
 )
 
+# Fold the reserved-setting duplicate check into one condition.
+replace_once(
+    "engine/crates/route-engine/src/server_rel.rs",
+    '''        if matches!(
+            normalized.as_str(),
+            "status" | "listener" | "env" | "middleware"
+        ) {
+            if reserved
+                .insert(normalized.clone(), (setting.line, setting.column))
+                .is_some()
+            {
+                return Err(ServerCompileError::semantic(
+                    setting,
+                    format!("duplicate `{}` Server REL section/setting", setting.name),
+                ));
+            }
+        }
+''',
+    '''        if matches!(
+            normalized.as_str(),
+            "status" | "listener" | "env" | "middleware"
+        ) && reserved
+            .insert(normalized.clone(), (setting.line, setting.column))
+            .is_some()
+        {
+            return Err(ServerCompileError::semantic(
+                setting,
+                format!("duplicate `{}` Server REL section/setting", setting.name),
+            ));
+        }
+''',
+)
+
 # The extraction fixture is a raw Rust string. Backslash-escaped quotes would
 # be literal REL marker bytes and correctly fail the marker parser.
 embedded_path = ROOT / "engine/crates/route-engine/src/embedded_rel.rs"
 embedded_text = embedded_path.read_text(encoding="utf-8")
 embedded_text = embedded_text.replace('export function name() { return \\\"Auth\\\"; }', 'export function name() { return "Auth"; }')
 embedded_text = embedded_text.replace('[file-start:route.Health path=\\\"/health\\\"]', '[file-start:route.Health path="/health"]')
+embedded_text = embedded_text.replace("fn split_header<'a>(\n    input: &'a str,\n    line: usize,\n) -> Result<impl Iterator<Item = &'a str>, EmbeddedRelError> {", "fn split_header(\n    input: &str,\n    line: usize,\n) -> Result<impl Iterator<Item = &str>, EmbeddedRelError> {")
 embedded_path.write_text(embedded_text, encoding="utf-8")
 
 # Runtime ENV is a typed top-level deployment field in settings.json.
@@ -88,5 +122,35 @@ text = text.replace(
 text = text.replace(
     "policy.get(\"requestTimeoutMs\").unwrap().value,\n            ServerValue::Number(12000.0)",
     "&policy.get(\"requestTimeoutMs\").unwrap().value,\n            ServerValue::Number(value) if *value == 12000.0",
+)
+p.write_text(text, encoding="utf-8")
+
+# Clippy prefers a guarded import match over an inner `if`.
+p = ROOT / "engine/crates/route-engine/src/relc.rs"
+text = p.read_text(encoding="utf-8")
+text = text.replace(
+    '''                ImportTarget::Service(service)
+                | ImportTarget::ServiceFunction { service, .. } => {
+                    if registry
+                        .get_logical(RelSourceKind::Service, service)
+                        .is_none()
+                    {
+                        return Err(RelcError::Link(format!(
+                            "{source_id} imports missing service `{service}`"
+                        )));
+                    }
+                }
+''',
+    '''                ImportTarget::Service(service)
+                | ImportTarget::ServiceFunction { service, .. }
+                    if registry
+                        .get_logical(RelSourceKind::Service, service)
+                        .is_none() =>
+                {
+                    return Err(RelcError::Link(format!(
+                        "{source_id} imports missing service `{service}`"
+                    )));
+                }
+''',
 )
 p.write_text(text, encoding="utf-8")
