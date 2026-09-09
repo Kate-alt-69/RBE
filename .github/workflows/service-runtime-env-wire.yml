@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/patches/service-runtime-env-wire.py'
+      - '.github/patches/runtime-source-security-fix.py'
       - '.github/workflows/service-runtime-env-wire.yml'
 
 permissions:
@@ -33,6 +34,9 @@ jobs:
           fi
           if ! grep -q 'pub enum RuntimeExecutable' engine/crates/route-engine/src/runtime_image.rs; then
             python .github/patches/runtime-source-security-wire.py
+          fi
+          if ! grep -q 'pub route_path: Option<String>' engine/crates/route-engine/src/runtime_image.rs; then
+            python .github/patches/runtime-source-security-fix.py
           fi
 
       - name: Apply Service Runtime ENV propagation
@@ -73,6 +77,9 @@ jobs:
           if ! grep -q 'pub enum RuntimeExecutable' engine/crates/route-engine/src/runtime_image.rs; then
             python .github/patches/runtime-source-security-wire.py
           fi
+          if ! grep -q 'pub route_path: Option<String>' engine/crates/route-engine/src/runtime_image.rs; then
+            python .github/patches/runtime-source-security-fix.py
+          fi
           python .github/patches/service-runtime-env-wire.py
           (cd engine && cargo fmt --all)
           (cd engine && cargo check --workspace --locked)
@@ -90,6 +97,7 @@ jobs:
             .github/patches/runtime-core-wire.py \
             .github/workflows/runtime-core-wire.yml \
             .github/patches/runtime-source-security-wire.py \
+            .github/patches/runtime-source-security-fix.py \
             .github/workflows/runtime-source-security-wire.yml \
             .github/patches/service-runtime-env-wire.py \
             .github/workflows/service-runtime-env-wire.yml
