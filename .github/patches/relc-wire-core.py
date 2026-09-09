@@ -46,6 +46,14 @@ replace_once(
     "if !matches!(&token.kind, TokenKind::Eof) {",
 )
 
+# The extraction fixture is a raw Rust string. Backslash-escaped quotes would
+# be literal REL marker bytes and correctly fail the marker parser.
+embedded_path = ROOT / "engine/crates/route-engine/src/embedded_rel.rs"
+embedded_text = embedded_path.read_text(encoding="utf-8")
+embedded_text = embedded_text.replace('export function name() { return \\\"Auth\\\"; }', 'export function name() { return "Auth"; }')
+embedded_text = embedded_text.replace('[file-start:route.Health path=\\\"/health\\\"]', '[file-start:route.Health path="/health"]')
+embedded_path.write_text(embedded_text, encoding="utf-8")
+
 # Runtime ENV is a typed top-level deployment field in settings.json.
 replace_once(
     "engine/crates/config/src/lib.rs",
