@@ -120,7 +120,7 @@ pub struct EmbeddedSource {
 pub struct ServerPolicy {
     pub name: String,
     pub status: ServerStatus,
-    /// Public typed runtime ENV defaults supplied by Server REL.
+    /// Typed public runtime ENV defaults supplied by Server REL.
     pub environment: BTreeMap<String, Value>,
     /// ENV values locked by Server REL `force` policy.
     pub forced_environment: BTreeMap<String, Value>,
@@ -177,13 +177,12 @@ impl std::error::Error for ServerRelError {}
 /// Compile one root Server REL source into a deterministic policy object.
 pub fn compile_server_source(source: &str) -> Result<ServerPolicy, ServerRelError> {
     let (policy_source, embedded_sources) = extract_embedded_sources(source)?;
-    let tokens = tokenize(&policy_source)?;
-    Parser::new(tokens, embedded_sources).parse()
+    Parser::new(tokenize(&policy_source)?, embedded_sources).parse()
 }
 
-/// Extract literal REL sources while retaining line count in the remaining
-/// Server REL text. The returned virtual source ids are stable and are suitable
-/// for RELC duplicate-identity diagnostics.
+/// Extract literal REL sources while retaining the original line count in the
+/// remaining Server REL source. Virtual source ids are stable and suitable for
+/// RELC diagnostics and duplicate-identity checks.
 pub fn extract_embedded_sources(
     source: &str,
 ) -> Result<(String, Vec<EmbeddedSource>), ServerRelError> {
@@ -215,7 +214,7 @@ pub fn extract_embedded_sources(
         let mut body = String::new();
         let mut found_end = false;
         while index < lines.len() {
-            let current_number = index + 1;
+            let current_line = index + 1;
             let current = lines[index];
             let current_trimmed = current.trim();
             if current_trimmed == end_marker {
@@ -227,7 +226,7 @@ pub fn extract_embedded_sources(
             if current_trimmed.starts_with("[file-start:") {
                 return Err(ServerRelError::new(
                     "SRV1011",
-                    current_number,
+                    current_line,
                     1,
                     "embedded REL blocks cannot be nested",
                 ));
@@ -274,10 +273,10 @@ fn parse_embedded_header(
     header: &str,
     line: usize,
 ) -> Result<(EmbeddedSourceKind, String, BTreeMap<String, String>), ServerRelError> {
-    let mut pieces = split_header_fields(header, line)?;
-    let identity = pieces
-        .next()
-        .ok_or_else(|| ServerRelError::new("SRV1014", line, 1, "empty embedded source header"))?;
+    let fields = split_header_fields(header, line)?;
+    let identity = fields.first().copied().ok_or_else(|| {
+        ServerRelError::new("SRV1014", line, 1, "empty embedded source header")
+    })?;
     let (kind, name) = identity.split_once('.').ok_or_else(|| {
         ServerRelError::new(
             "SRV1014",
@@ -297,7 +296,7 @@ fn parse_embedded_header(
     }
 
     let mut attributes = BTreeMap::new();
-    for field in pieces {
+    for field in fields.into_iter().skip(1) {
         let (key, value) = field.split_once('=').ok_or_else(|| {
             ServerRelError::new(
                 "SRV1015",
@@ -326,7 +325,7 @@ fn parse_embedded_header(
 fn split_header_fields<'a>(
     header: &'a str,
     line: usize,
-) -> Result<impl Iterator<Item = &'a str>, ServerRelError> {
+) -> Result<Vec<&'a str>, ServerRelError> {
     if header.matches('"').count() % 2 != 0 {
         return Err(ServerRelError::new(
             "SRV1015",
@@ -354,7 +353,7 @@ fn split_header_fields<'a>(
     if start < header.len() {
         fields.push(&header[start..]);
     }
-    Ok(fields.into_iter())
+    Ok(fields)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -484,7 +483,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ServerRelError> {
                             "unterminated string escape",
                         )
                     })?;
-                    let resolved = match escaped {
+                    value.push(match escaped {
                         'n' => '\n',
                         'r' => '\r',
                         't' => '\t',
@@ -492,8 +491,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ServerRelError> {
                         '"' => '"',
                         '\'' => '\'',
                         other => other,
-                    };
-                    value.push(resolved);
+                    });
                     index += 2;
                     column += 2;
                     continue;
@@ -559,8 +557,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ServerRelError> {
 }
 
 fn is_atom_character(character: char) -> bool {
-    character.is_alphanumeric()
-        || matches!(character, '_' | '-' | '.' | '/' | '$' | '@')
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | '/' | '$' | '@')
 }
 
 struct Parser {
@@ -602,7 +599,8 @@ impl Parser {
                     "server block is missing closing `}`",
                 ));
             }
-            let key_token = self.current().clone();
+
+            let declaration = self.current().clone();
             let key = self.take_atom("expected Server REL declaration")?;
             match key.as_str() {
                 "status" => {
@@ -611,41 +609,42 @@ impl Parser {
                     policy.status = ServerStatus::parse(&status, &status_token)?;
                     self.expect(TokenKind::Semicolon, "expected `;` after server status")?;
                 }
-                "env" => {
-                    self.parse_value_block("", &mut policy.environment)?;
-                }
-                "force" => {
-                    self.parse_force_block(&mut policy)?;
-                }
-                "middleware" => {
-                    policy.middleware = self.parse_middleware_block()?;
-                }
-                "function" | "class" => self.skip_declaration_body(&key_token)?,
-                "async" if self.peek_atom("function") => {
+                "env" => self.parse_value_block("", &mut policy.environment)?,
+                "force" => self.parse_force_block(&mut policy)?,
+                "middleware" => policy.middleware = self.parse_middleware_block()?,
+                "function" | "class" => self.skip_declaration_body(&declaration)?,
+                "async" => {
+                    if !self.current_is_atom("function") {
+                        return Err(ServerRelError::at(
+                            "SRV1007",
+                            &declaration,
+                            "`async` Server REL declaration must be an async function",
+                        ));
+                    }
                     self.advance();
-                    self.skip_declaration_body(&key_token)?;
+                    self.skip_declaration_body(&declaration)?;
                 }
                 "profile" => {
                     return Err(ServerRelError::at(
                         "SRV1009",
-                        &key_token,
+                        &declaration,
                         "profile blocks are reserved but are not runtime-enabled yet",
                     ));
                 }
+                _ if self.check(&TokenKind::LBrace) => {
+                    self.parse_value_block(&key, &mut policy.defaults)?;
+                }
                 _ => {
-                    if self.check(&TokenKind::LBrace) {
-                        self.parse_value_block(&key, &mut policy.defaults)?;
-                    } else {
-                        let value = self.parse_value()?;
-                        self.expect(
-                            TokenKind::Semicolon,
-                            "expected `;` after Server REL policy value",
-                        )?;
-                        insert_unique(&mut policy.defaults, key, value, &key_token)?;
-                    }
+                    let value = self.parse_value()?;
+                    self.expect(
+                        TokenKind::Semicolon,
+                        "expected `;` after Server REL policy value",
+                    )?;
+                    insert_unique(&mut policy.defaults, key, value, &declaration)?;
                 }
             }
         }
+
         self.advance();
         if !self.check(&TokenKind::Eof) {
             return Err(ServerRelError::at(
@@ -660,19 +659,24 @@ impl Parser {
     fn parse_force_block(&mut self, policy: &mut ServerPolicy) -> Result<(), ServerRelError> {
         self.expect(TokenKind::LBrace, "expected `{` after `force`")?;
         while !self.check(&TokenKind::RBrace) {
-            let key_token = self.current().clone();
+            if self.check(&TokenKind::Eof) {
+                return Err(ServerRelError::at(
+                    "SRV1002",
+                    self.current(),
+                    "force block is missing closing `}`",
+                ));
+            }
+            let token = self.current().clone();
             let key = self.take_atom("expected forced policy key")?;
             if key == "env" && self.check(&TokenKind::LBrace) {
                 self.parse_value_block("", &mut policy.forced_environment)?;
-                continue;
-            }
-            if self.check(&TokenKind::LBrace) {
+            } else if self.check(&TokenKind::LBrace) {
                 self.parse_value_block(&key, &mut policy.forced)?;
-                continue;
+            } else {
+                let value = self.parse_value()?;
+                self.expect(TokenKind::Semicolon, "expected `;` after forced value")?;
+                insert_unique(&mut policy.forced, key, value, &token)?;
             }
-            let value = self.parse_value()?;
-            self.expect(TokenKind::Semicolon, "expected `;` after forced value")?;
-            insert_unique(&mut policy.forced, key, value, &key_token)?;
         }
         self.advance();
         Ok(())
@@ -692,7 +696,7 @@ impl Parser {
                     "policy block is missing closing `}`",
                 ));
             }
-            let key_token = self.current().clone();
+            let token = self.current().clone();
             let key = self.take_atom("expected policy key")?;
             let full_key = if prefix.is_empty() {
                 key
@@ -708,7 +712,7 @@ impl Parser {
             }
             let value = self.parse_value()?;
             self.expect(TokenKind::Semicolon, "expected `;` after policy value")?;
-            insert_unique(output, full_key, value, &key_token)?;
+            insert_unique(output, full_key, value, &token)?;
         }
         self.advance();
         Ok(())
@@ -718,23 +722,32 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{` after `middleware`")?;
         let mut middleware = Vec::new();
         let mut names = HashSet::new();
+
         while !self.check(&TokenKind::RBrace) {
-            let name_token = self.current().clone();
+            if self.check(&TokenKind::Eof) {
+                return Err(ServerRelError::at(
+                    "SRV1002",
+                    self.current(),
+                    "middleware block is missing closing `}`",
+                ));
+            }
+            let token = self.current().clone();
             let name = self.take_atom("expected native middleware name")?;
             if !NATIVE_MIDDLEWARE.contains(&name.as_str()) {
                 return Err(ServerRelError::at(
                     "SRV1005",
-                    &name_token,
+                    &token,
                     format!("unknown native middleware {name:?}"),
                 ));
             }
             if !names.insert(name.clone()) {
                 return Err(ServerRelError::at(
                     "SRV1006",
-                    &name_token,
+                    &token,
                     format!("duplicate native middleware {name:?}"),
                 ));
             }
+
             let options = if self.check(&TokenKind::Semicolon) {
                 self.advance();
                 BTreeMap::new()
@@ -745,6 +758,7 @@ impl Parser {
             };
             middleware.push(MiddlewarePolicy { name, options });
         }
+
         self.advance();
         Ok(middleware)
     }
@@ -778,6 +792,13 @@ impl Parser {
         self.advance();
         let mut values = Vec::new();
         while !self.check(&TokenKind::RBracket) {
+            if self.check(&TokenKind::Eof) {
+                return Err(ServerRelError::at(
+                    "SRV1003",
+                    self.current(),
+                    "array is missing closing `]`",
+                ));
+            }
             values.push(self.parse_value()?);
             if self.check(&TokenKind::Comma) {
                 self.advance();
@@ -800,9 +821,8 @@ impl Parser {
         Ok(Value::Array(values))
     }
 
-    /// Policy compilation currently ignores helper/class bodies after validating
-    /// their braces. They remain Server REL source and can be handed to the
-    /// shared executable REL path as that linker stage lands.
+    /// The policy phase validates and skips executable helper/class bodies.
+    /// A later RELC linking pass owns executable Server REL helper lowering.
     fn skip_declaration_body(&mut self, start: &Token) -> Result<(), ServerRelError> {
         while !self.check(&TokenKind::LBrace) {
             if self.check(&TokenKind::Eof) || self.check(&TokenKind::RBrace) {
@@ -814,6 +834,7 @@ impl Parser {
             }
             self.advance();
         }
+
         let mut depth = 0usize;
         loop {
             match self.current().kind {
@@ -873,11 +894,8 @@ impl Parser {
         }
     }
 
-    fn peek_atom(&self, expected: &str) -> bool {
-        matches!(
-            self.tokens.get(self.index + 1).map(|token| &token.kind),
-            Some(TokenKind::Atom(value)) if value == expected
-        )
+    fn current_is_atom(&self, expected: &str) -> bool {
+        matches!(&self.current().kind, TokenKind::Atom(value) if value == expected)
     }
 
     fn check(&self, expected: &TokenKind) -> bool {
@@ -1006,10 +1024,7 @@ mod tests {
             policy.embedded_sources[0].source_id,
             "server.server#module:Auth"
         );
-        assert_eq!(
-            policy.embedded_sources[1].attributes["path"],
-            "/health"
-        );
+        assert_eq!(policy.embedded_sources[1].attributes["path"], "/health");
         assert!(policy.embedded_sources[0].source.contains(":import[ENV]"));
     }
 
@@ -1055,8 +1070,11 @@ mod tests {
                     if (value) { return value; }
                     return "default";
                 }
+                async function prepare(value) {
+                    return normalize(value);
+                }
                 class Helpers {
-                    run(value) { return normalize(value); }
+                    run(value) { return prepare(value); }
                 }
                 status online;
             }
@@ -1064,5 +1082,12 @@ mod tests {
         )
         .expect("helper declarations should not break policy compilation");
         assert_eq!(policy.status, ServerStatus::Online);
+    }
+
+    #[test]
+    fn rejects_bare_async_declarations() {
+        let error = compile_server_source("server Main { async nope() {} }")
+            .expect_err("bare async declaration should fail");
+        assert_eq!(error.code, "SRV1007");
     }
 }
