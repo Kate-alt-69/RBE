@@ -82,6 +82,15 @@ jobs:
         working-directory: engine
         run: cargo check --workspace --locked
 
+      - name: Cross-check Service runtime platform layer
+        working-directory: engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin
+          cargo check -p service-runtime --target x86_64-pc-windows-gnu --locked
+          cargo check -p service-runtime --target x86_64-apple-darwin --locked
+
       - name: Test runtime slices
         working-directory: engine
         run: cargo test -p route-engine -p service-runtime -p backend -p api --locked
