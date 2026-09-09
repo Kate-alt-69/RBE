@@ -77,7 +77,10 @@ pub fn extract_embedded_rel(source: &str) -> Result<ExtractedServerRel, Embedded
         if trimmed.starts_with("[file-end:") {
             let end_kind = parse_end_marker(trimmed, line_number)?;
             let Some(block) = active.take() else {
-                return Err(error(line_number, "[file-end:*] without a matching file-start"));
+                return Err(error(
+                    line_number,
+                    "[file-end:*] without a matching file-start",
+                ));
             };
             if block.kind != end_kind {
                 return Err(error(
@@ -159,7 +162,10 @@ fn parse_start_marker(
     };
     let kind = parse_kind(kind, line)?;
     if kind == RelSourceKind::Server {
-        return Err(error(line, "server.server cannot embed another Server REL source"));
+        return Err(error(
+            line,
+            "server.server cannot embed another Server REL source",
+        ));
     }
     let logical_name = logical_name.trim();
     if logical_name.is_empty() {
@@ -229,10 +235,7 @@ fn parse_kind(kind: &str, line: usize) -> Result<RelSourceKind, EmbeddedRelError
 
 /// Header splitter supporting quoted attribute values without turning this
 /// source-container syntax into a second REL lexer.
-fn split_header<'a>(
-    input: &'a str,
-    line: usize,
-) -> Result<impl Iterator<Item = &'a str>, EmbeddedRelError> {
+fn split_header(input: &str, line: usize) -> Result<impl Iterator<Item = &str>, EmbeddedRelError> {
     let mut spans = Vec::new();
     let bytes = input.as_bytes();
     let mut start = None;
@@ -272,7 +275,10 @@ fn unquote(value: &str, line: usize) -> Result<String, EmbeddedRelError> {
             return Ok(value[1..value.len() - 1].to_string());
         }
         if first == b'\"' || first == b'\'' || last == b'\"' || last == b'\'' {
-            return Err(error(line, "mismatched quotes in embedded source attribute"));
+            return Err(error(
+                line,
+                "mismatched quotes in embedded source attribute",
+            ));
         }
     }
     Ok(value.to_string())
@@ -305,9 +311,9 @@ mod tests {
     status online;
 }
 [file-start:module.Auth]
-export function name() { return \"Auth\"; }
+export function name() { return "Auth"; }
 [file-end:module]
-[file-start:route.Health path=\"/health\"]
+[file-start:route.Health path="/health"]
 class Route { get() { return true; } }
 [file-end:route]
 "#;

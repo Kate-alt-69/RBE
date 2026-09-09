@@ -1,5 +1,6 @@
 //! Typed, validated loader for `settings.json`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -11,6 +12,8 @@ use serde::{Deserialize, Deserializer};
 pub struct Config {
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub runtime_env: BTreeMap<String, serde_json::Value>,
     pub api: ApiConfig,
     #[serde(default)]
     pub security: SecurityConfig,

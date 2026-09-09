@@ -130,16 +130,14 @@ fn validate_server_program(program: &ServerProgram) -> Result<(), ServerCompileE
         if matches!(
             normalized.as_str(),
             "status" | "listener" | "env" | "middleware"
-        ) {
-            if reserved
-                .insert(normalized.clone(), (setting.line, setting.column))
-                .is_some()
-            {
-                return Err(ServerCompileError::semantic(
-                    setting,
-                    format!("duplicate `{}` Server REL section/setting", setting.name),
-                ));
-            }
+        ) && reserved
+            .insert(normalized.clone(), (setting.line, setting.column))
+            .is_some()
+        {
+            return Err(ServerCompileError::semantic(
+                setting,
+                format!("duplicate `{}` Server REL section/setting", setting.name),
+            ));
         }
 
         match normalized.as_str() {
@@ -268,9 +266,8 @@ impl<'a> ServerParser<'a> {
 
         self.expect(TokenKind::RBrace)?;
         if !self.check(&TokenKind::Eof) {
-            return Err(self.error_here(
-                "unexpected tokens after the root `server NAME { ... }` declaration",
-            ));
+            return Err(self
+                .error_here("unexpected tokens after the root `server NAME { ... }` declaration"));
         }
 
         Ok(ServerProgram {
@@ -299,18 +296,21 @@ impl<'a> ServerParser<'a> {
             {
                 return Err(self.error_here("expected `[` after `:import` in Server REL"));
             }
-            let close = self.find_matching(self.pos + 2, TokenKind::LBracket, TokenKind::RBracket)?;
+            let close =
+                self.find_matching(self.pos + 2, TokenKind::LBracket, TokenKind::RBracket)?;
             end = self.tokens[close].end;
             self.pos = close + 1;
         }
 
         let mut fragment = self.source[start..end].to_string();
         fragment.push_str("\nfunction __rbe_server_import_probe() { return null; }");
-        let tokens = Lexer::new(&fragment).tokenize().map_err(|error| ParseError {
-            message: error.message,
-            line: error.line,
-            column: error.column,
-        })?;
+        let tokens = Lexer::new(&fragment)
+            .tokenize()
+            .map_err(|error| ParseError {
+                message: error.message,
+                line: error.line,
+                column: error.column,
+            })?;
         let module = Parser::new(tokens).parse_module_file()?;
         Ok(module.imports)
     }
@@ -536,7 +536,9 @@ impl<'a> ServerParser<'a> {
             .map(|token| same_token_variant(&token.kind, &open))
             .unwrap_or(false)
         {
-            return Err(self.error_here("internal Server REL delimiter scan started at wrong token"));
+            return Err(
+                self.error_here("internal Server REL delimiter scan started at wrong token")
+            );
         }
 
         let mut depth = 0usize;
@@ -553,7 +555,10 @@ impl<'a> ServerParser<'a> {
                 break;
             }
         }
-        Err(self.error_at(&self.tokens[start], "unterminated Server REL delimiter block"))
+        Err(self.error_at(
+            &self.tokens[start],
+            "unterminated Server REL delimiter block",
+        ))
     }
 
     fn expect_ident_value(&mut self, expected: &str) -> Result<(), ParseError> {
@@ -594,7 +599,7 @@ impl<'a> ServerParser<'a> {
 
     fn advance(&mut self) -> Token {
         let token = self.current().clone();
-        if !matches!(token.kind, TokenKind::Eof) {
+        if !matches!(&token.kind, TokenKind::Eof) {
             self.pos += 1;
         }
         token
@@ -762,7 +767,9 @@ mod tests {
     #[test]
     fn compiler_rejects_non_block_env() {
         let error = compile_server_source("server Main { env true; }").unwrap_err();
-        assert!(error.to_string().contains("`env` must use a configuration block"));
+        assert!(error
+            .to_string()
+            .contains("`env` must use a configuration block"));
     }
 
     #[test]
@@ -773,10 +780,9 @@ mod tests {
 
     #[test]
     fn rejects_nested_server_root_after_main_server() {
-        let error = parse_server_source(
-            "server Main { status online; } server Other { status offline; }",
-        )
-        .unwrap_err();
+        let error =
+            parse_server_source("server Main { status online; } server Other { status offline; }")
+                .unwrap_err();
         assert!(error.message.contains("unexpected tokens after"));
     }
 }

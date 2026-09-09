@@ -154,7 +154,11 @@ impl InvocationTracker {
         Ok(invocation.operation_count)
     }
 
-    pub fn producing(&self, id: InvocationId, key: impl Into<String>) -> Result<(), InvocationError> {
+    pub fn producing(
+        &self,
+        id: InvocationId,
+        key: impl Into<String>,
+    ) -> Result<(), InvocationError> {
         let key = key.into();
         let mut state = self.state.lock().expect("REL invocation tracker poisoned");
         if !state.invocations.contains_key(&id) {
@@ -187,7 +191,11 @@ impl InvocationTracker {
         Ok(())
     }
 
-    pub fn wait_for(&self, id: InvocationId, key: impl Into<String>) -> Result<(), InvocationError> {
+    pub fn wait_for(
+        &self,
+        id: InvocationId,
+        key: impl Into<String>,
+    ) -> Result<(), InvocationError> {
         let key = key.into();
         let mut state = self.state.lock().expect("REL invocation tracker poisoned");
         if !state.invocations.contains_key(&id) {
@@ -321,9 +329,7 @@ mod tests {
             operation_budget: 100,
         });
         let root = tracker.begin(None, symbol("walk"), 5).unwrap();
-        let child = tracker
-            .begin(Some(root.id()), symbol("walk"), 4)
-            .unwrap();
+        let child = tracker.begin(Some(root.id()), symbol("walk"), 4).unwrap();
         assert_eq!(tracker.snapshot(child.id()).unwrap().depth, 2);
     }
 

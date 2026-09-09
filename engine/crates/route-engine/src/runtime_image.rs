@@ -74,12 +74,20 @@ impl RuntimeImageSlot {
     }
 }
 
-pub(crate) fn stable_source_hash<'a>(sources: impl Iterator<Item = (&'a SourceId, &'a str)>) -> u64 {
+pub(crate) fn stable_source_hash<'a>(
+    sources: impl Iterator<Item = (&'a SourceId, &'a str)>,
+) -> u64 {
     // Explicit FNV-1a avoids relying on std's non-contractual DefaultHasher
     // algorithm for Runtime Image identity.
     let mut hash = 0xcbf29ce484222325u64;
     for (id, source) in sources {
-        for byte in id.as_str().bytes().chain([0]).chain(source.bytes()).chain([0xff]) {
+        for byte in id
+            .as_str()
+            .bytes()
+            .chain([0])
+            .chain(source.bytes())
+            .chain([0xff])
+        {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }

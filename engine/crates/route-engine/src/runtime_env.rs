@@ -161,7 +161,9 @@ impl RuntimeEnv {
 
     pub fn string(&self, name: &str) -> Result<&str, RuntimeEnvError> {
         let value = self.require(name)?;
-        value.as_str().ok_or_else(|| wrong_type(name, "string", value))
+        value
+            .as_str()
+            .ok_or_else(|| wrong_type(name, "string", value))
     }
 
     pub fn number(&self, name: &str) -> Result<f64, RuntimeEnvError> {

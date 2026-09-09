@@ -17,7 +17,10 @@
 
 mod analyzer;
 mod ast;
+pub mod dependency_graph;
 mod discovery;
+pub mod embedded_rel;
+pub mod execution_tracker;
 mod interpreter;
 mod lexer;
 mod module_eval;
@@ -30,6 +33,11 @@ mod service_eval;
 mod terminal;
 
 pub mod cache;
+pub mod middleware_plan;
+pub mod relc;
+pub mod runtime_env;
+pub mod runtime_image;
+pub mod server_policy;
 pub mod server_rel;
 pub mod source_registry;
 pub mod transpiled_support;
@@ -41,8 +49,16 @@ pub use ast::{
     BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram,
     Statement, Value,
 };
+pub use dependency_graph::{SymbolDependencyGraph, SymbolId};
 pub use discovery::RouteCache;
+pub use embedded_rel::{
+    extract_embedded_rel, EmbeddedRelError, EmbeddedRelSource, ExtractedServerRel,
+};
+pub use execution_tracker::{
+    InvocationError, InvocationGuard, InvocationId, InvocationSnapshot, InvocationTracker,
+};
 pub use interpreter::{EvalError, Interpreter, RequestContext};
+pub use middleware_plan::{MiddlewarePlan, MiddlewarePlanError, MiddlewareStep};
 pub use module_eval::{ModuleEvalError, ModuleExecutor};
 pub use module_runtime::{
     ModuleCompileError, ModuleCompileErrors, ModuleProgram, ServiceInterfaces,
@@ -50,6 +66,13 @@ pub use module_runtime::{
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
+pub use relc::{compile_runtime_image, PhysicalRelSource, RelcError};
+pub use runtime_env::{RuntimeEnv, RuntimeEnvError, RuntimeEnvOrigin};
+pub use runtime_image::{RuntimeImage, RuntimeImageSlot, RuntimeSourceManifest};
+pub use server_policy::{
+    PolicyOrigin, RecursionPolicy, ResolvedPolicyValue, ServerPolicy, ServerPolicyError,
+    ServerStatus,
+};
 pub use server_rel::{
     compile_server_source, parse_server_source, ServerCompileError, ServerProgram, ServerSetting,
     ServerSettingBody, ServerValue,

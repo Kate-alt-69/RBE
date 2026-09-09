@@ -74,7 +74,10 @@ pub struct ServerPolicy {
 }
 
 impl ServerPolicy {
-    pub fn resolve(program: &ServerProgram, settings: &JsonValue) -> Result<Self, ServerPolicyError> {
+    pub fn resolve(
+        program: &ServerProgram,
+        settings: &JsonValue,
+    ) -> Result<Self, ServerPolicyError> {
         let mut values = BTreeMap::new();
         for (key, value) in builtin_policy() {
             values.insert(
@@ -136,7 +139,10 @@ impl std::error::Error for ServerPolicyError {}
 fn builtin_policy() -> BTreeMap<String, ServerValue> {
     BTreeMap::from([
         ("status".into(), ServerValue::Ident("online".into())),
-        ("listener.host".into(), ServerValue::String("127.0.0.1".into())),
+        (
+            "listener.host".into(),
+            ServerValue::String("127.0.0.1".into()),
+        ),
         ("listener.port".into(), ServerValue::Number(8080.0)),
         ("requestTimeoutMs".into(), ServerValue::Number(30_000.0)),
         (
@@ -183,7 +189,11 @@ fn flatten_server_setting(
         }
         ServerSettingBody::Value(value) => {
             let target = if force { forced } else { normal };
-            insert_unique(target, canonical_key(&raw_key), normalize_value(&raw_key, value)?)?;
+            insert_unique(
+                target,
+                canonical_key(&raw_key),
+                normalize_value(&raw_key, value)?,
+            )?;
         }
     }
     Ok(())
@@ -254,12 +264,7 @@ fn settings_overlay(settings: &JsonValue) -> BTreeMap<String, ServerValue> {
         "maxJsonPayloadBytes",
         &mut out,
     );
-    copy_json_path(
-        settings,
-        &["security", "cspPolicy"],
-        "cspPolicy",
-        &mut out,
-    );
+    copy_json_path(settings, &["security", "cspPolicy"], "cspPolicy", &mut out);
     out
 }
 
@@ -302,7 +307,9 @@ fn normalize_value(key: &str, value: &ServerValue) -> Result<ServerValue, Server
         ServerValue::Quantity { value, unit }
             if canonical == "requestTimeoutMs" || canonical.ends_with("TimeoutMs") =>
         {
-            Ok(ServerValue::Number(quantity_duration_ms(*value, unit)? as f64))
+            Ok(ServerValue::Number(
+                quantity_duration_ms(*value, unit)? as f64
+            ))
         }
         ServerValue::Quantity { value, unit }
             if canonical == "maxBodySizeBytes" || canonical.ends_with("Bytes") =>
@@ -364,7 +371,9 @@ fn finite_positive_integer(value: f64, label: &str) -> Result<u64, ServerPolicyE
     Ok(value as u64)
 }
 
-fn validate_policy(values: &BTreeMap<String, ResolvedPolicyValue>) -> Result<(), ServerPolicyError> {
+fn validate_policy(
+    values: &BTreeMap<String, ResolvedPolicyValue>,
+) -> Result<(), ServerPolicyError> {
     let port = numeric(values, "listener.port")?;
     if port == 0 || port > u16::MAX as u64 {
         return Err(ServerPolicyError(
@@ -379,7 +388,9 @@ fn validate_policy(values: &BTreeMap<String, ResolvedPolicyValue>) -> Result<(),
     }
     let timeout = numeric(values, "requestTimeoutMs")?;
     if timeout == 0 {
-        return Err(ServerPolicyError("requestTimeoutMs must be positive".into()));
+        return Err(ServerPolicyError(
+            "requestTimeoutMs must be positive".into(),
+        ));
     }
     Ok(())
 }
@@ -392,7 +403,11 @@ fn status_from_values(
     };
     let raw = match &value.value {
         ServerValue::Ident(value) | ServerValue::String(value) => value.as_str(),
-        _ => return Err(ServerPolicyError("status must be an identifier/string".into())),
+        _ => {
+            return Err(ServerPolicyError(
+                "status must be an identifier/string".into(),
+            ))
+        }
     };
     match raw.to_ascii_lowercase().as_str() {
         "online" => Ok(ServerStatus::Online),
@@ -400,7 +415,9 @@ fn status_from_values(
         "draining" => Ok(ServerStatus::Draining),
         "readonly" => Ok(ServerStatus::Readonly),
         "offline" => Ok(ServerStatus::Offline),
-        _ => Err(ServerPolicyError(format!("unsupported server status `{raw}`"))),
+        _ => Err(ServerPolicyError(format!(
+            "unsupported server status `{raw}`"
+        ))),
     }
 }
 
@@ -441,7 +458,9 @@ fn numeric(
         .ok_or_else(|| ServerPolicyError(format!("missing resolved ServerPolicy `{key}`")))?;
     match value.value {
         ServerValue::Number(value) => finite_positive_integer(value, key),
-        _ => Err(ServerPolicyError(format!("ServerPolicy `{key}` must be numeric"))),
+        _ => Err(ServerPolicyError(format!(
+            "ServerPolicy `{key}` must be numeric"
+        ))),
     }
 }
 
@@ -467,14 +486,17 @@ mod tests {
             &policy.get("listener.host").unwrap().value,
             ServerValue::String(value) if value == "operator"
         ));
-        assert_eq!(policy.get("listener.port").unwrap().origin, PolicyOrigin::ForcedServer);
+        assert_eq!(
+            policy.get("listener.port").unwrap().origin,
+            PolicyOrigin::ForcedServer
+        );
         assert!(matches!(
-            policy.get("listener.port").unwrap().value,
-            ServerValue::Number(7044.0)
+            &policy.get("listener.port").unwrap().value,
+            ServerValue::Number(value) if *value == 7044.0
         ));
         assert!(matches!(
-            policy.get("requestTimeoutMs").unwrap().value,
-            ServerValue::Number(12000.0)
+            &policy.get("requestTimeoutMs").unwrap().value,
+            ServerValue::Number(value) if *value == 12000.0
         ));
     }
 

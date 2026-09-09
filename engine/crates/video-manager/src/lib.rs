@@ -790,9 +790,8 @@ impl VideoDatabase for SqliteVideoDatabase {
                 );
             };
             let source_type = parse_source_type(&row.3)?;
-            let metadata = serde_json::from_str(&row.5).with_context(|| {
-                format!("parse Video Manager asset {} metadata JSON", row.0)
-            })?;
+            let metadata = serde_json::from_str(&row.5)
+                .with_context(|| format!("parse Video Manager asset {} metadata JSON", row.0))?;
             let asset = VideoAsset {
                 uri: format!("vm://{}/{}/{}", row.8, row.9, row.0),
                 id: row.0,
@@ -1590,9 +1589,7 @@ impl VideoManager {
             Err(error) => {
                 let cleanup_error = match std::fs::remove_file(&quarantine_path) {
                     Ok(()) => None,
-                    Err(cleanup_error)
-                        if cleanup_error.kind() == std::io::ErrorKind::NotFound =>
-                    {
+                    Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
                         None
                     }
                     Err(cleanup_error) => Some(cleanup_error),
@@ -2491,9 +2488,16 @@ mod tests {
             .expect_err("job insertion failure must rollback the whole queue creation");
         assert!(error.to_string().contains("reject video job"));
 
-        for table in ["video_namespaces", "video_groups", "video_assets", "video_jobs"] {
+        for table in [
+            "video_namespaces",
+            "video_groups",
+            "video_assets",
+            "video_jobs",
+        ] {
             let count: i64 = connection
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(count, 0, "{table} must remain empty after rollback");
         }
@@ -3021,8 +3025,14 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.len(), 2);
         assert!(recovered.iter().all(|queued| queued.job.state == "queued"));
-        assert_eq!(database.get_job(&first.job.id).unwrap().unwrap().state, "queued");
-        assert_eq!(database.get_job(&second.job.id).unwrap().unwrap().state, "queued");
+        assert_eq!(
+            database.get_job(&first.job.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            database.get_job(&second.job.id).unwrap().unwrap().state,
+            "queued"
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

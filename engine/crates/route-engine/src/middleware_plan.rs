@@ -246,7 +246,10 @@ mod tests {
         .unwrap();
         let plan = MiddlewarePlan::lower(&program).unwrap();
         assert_eq!(
-            plan.steps.iter().map(|step| step.name.as_str()).collect::<Vec<_>>(),
+            plan.steps
+                .iter()
+                .map(|step| step.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["correlationId", "json", "compression", "errorHandler"]
         );
         assert!(plan.steps[1].options.contains_key("limit"));
@@ -254,16 +257,13 @@ mod tests {
 
     #[test]
     fn rejects_unknown_or_misordered_error_handler() {
-        let unknown = compile_server_source(
-            "server Main { middleware { totallyNotMiddleware; } }",
-        )
-        .unwrap();
+        let unknown =
+            compile_server_source("server Main { middleware { totallyNotMiddleware; } }").unwrap();
         assert!(MiddlewarePlan::lower(&unknown).is_err());
 
-        let order = compile_server_source(
-            "server Main { middleware { errorHandler; correlationId; } }",
-        )
-        .unwrap();
+        let order =
+            compile_server_source("server Main { middleware { errorHandler; correlationId; } }")
+                .unwrap();
         assert!(MiddlewarePlan::lower(&order).is_err());
     }
 }

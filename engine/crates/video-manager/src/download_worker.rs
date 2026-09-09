@@ -7,8 +7,8 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    parse_download_target, resolve_download_target, DownloadTarget, QueuedDownload, VideoAssetState,
-    VideoManager, VideoSourceType,
+    parse_download_target, resolve_download_target, DownloadTarget, QueuedDownload,
+    VideoAssetState, VideoManager, VideoSourceType,
 };
 
 const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
@@ -308,8 +308,7 @@ fn open_reserved_quarantine_sync(
     })?;
 
     #[cfg(unix)]
-    let same_identity =
-        same_file_identity(&before, &opened) && same_file_identity(&opened, &after);
+    let same_identity = same_file_identity(&before, &opened) && same_file_identity(&opened, &after);
 
     #[cfg(windows)]
     let same_identity = {
@@ -395,9 +394,8 @@ fn windows_file_identity(file: &std::fs::File) -> std::io::Result<WindowsFileIde
     let mut information = WindowsByHandleFileInformation::default();
     // SAFETY: `file` owns a valid open Windows handle for this call and the
     // output pointer targets a correctly laid-out writable Win32 structure.
-    let succeeded = unsafe {
-        get_file_information_by_handle(file.as_raw_handle(), &mut information as *mut _)
-    };
+    let succeeded =
+        unsafe { get_file_information_by_handle(file.as_raw_handle(), &mut information as *mut _) };
     if succeeded == 0 {
         return Err(std::io::Error::last_os_error());
     }

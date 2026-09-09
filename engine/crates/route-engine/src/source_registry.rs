@@ -388,7 +388,9 @@ impl RelSourceRegistry {
     }
 
     pub fn iter_kind(&self, kind: RelSourceKind) -> impl Iterator<Item = &RelSource> {
-        self.sources.values().filter(move |source| source.kind == kind)
+        self.sources
+            .values()
+            .filter(move |source| source.kind == kind)
     }
 }
 
@@ -506,14 +508,7 @@ mod tests {
         let mut registry = RelSourceRegistry::new();
         let missing_server = SourceId::physical(RelSourceKind::Server, "Main").unwrap();
         let error = registry
-            .register_embedded(
-                &missing_server,
-                RelSourceKind::Module,
-                "Auth",
-                0,
-                1,
-                "",
-            )
+            .register_embedded(&missing_server, RelSourceKind::Module, "Auth", 0, 1, "")
             .unwrap_err();
         assert!(matches!(
             error,
@@ -521,7 +516,12 @@ mod tests {
         ));
 
         let module = registry
-            .register_physical(RelSourceKind::Module, "Container", "module/Container.module", "")
+            .register_physical(
+                RelSourceKind::Module,
+                "Container",
+                "module/Container.module",
+                "",
+            )
             .unwrap();
         let error = registry
             .register_embedded(&module, RelSourceKind::Route, "/embedded", 0, 1, "")

@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use serde_json::Value as JsonValue;
 
-use crate::ast::{Expr, FunctionDef, ImportTarget, ModuleFile, RouteFile, ServiceProgram, Statement};
+use crate::ast::{
+    Expr, FunctionDef, ImportTarget, ModuleFile, RouteFile, ServiceProgram, Statement,
+};
 use crate::dependency_graph::{SymbolDependencyGraph, SymbolId};
 use crate::embedded_rel::{extract_embedded_rel, EmbeddedRelError};
 use crate::lexer::Lexer;
@@ -17,9 +19,7 @@ use crate::runtime_env::{RuntimeEnv, RuntimeEnvError};
 use crate::runtime_image::{stable_source_hash, RuntimeImage, RuntimeSourceManifest};
 use crate::server_policy::{ServerPolicy, ServerPolicyError};
 use crate::server_rel::{compile_server_source, ServerCompileError, ServerProgram};
-use crate::source_registry::{
-    RelSourceKind, RelSourceRegistry, SourceId, SourceRegistryError,
-};
+use crate::source_registry::{RelSourceKind, RelSourceRegistry, SourceId, SourceRegistryError};
 
 #[derive(Debug, Clone)]
 pub struct PhysicalRelSource {
@@ -50,17 +50,11 @@ pub enum RelcError {
     Registry(SourceRegistryError),
     Embedded(EmbeddedRelError),
     Server(ServerCompileError),
-    Parse {
-        source: SourceId,
-        error: ParseError,
-    },
+    Parse { source: SourceId, error: ParseError },
     RuntimeEnv(RuntimeEnvError),
     Policy(ServerPolicyError),
     Middleware(MiddlewarePlanError),
-    Capability {
-        source: SourceId,
-        message: String,
-    },
+    Capability { source: SourceId, message: String },
     Link(String),
 }
 
@@ -151,12 +145,7 @@ pub fn compile_runtime_image(
                 "server.server is the single physical Server REL root".into(),
             ));
         }
-        registry.register_physical(
-            source.kind,
-            source.logical_name,
-            source.path,
-            source.source,
-        )?;
+        registry.register_physical(source.kind, source.logical_name, source.path, source.source)?;
     }
     for embedded in extracted.embedded {
         registry.register_embedded(
@@ -209,7 +198,10 @@ pub fn compile_runtime_image(
 
     for source in registry.iter() {
         let unit = compiled.get(source.id()).ok_or_else(|| {
-            RelcError::Link(format!("registered source {} was not compiled", source.id()))
+            RelcError::Link(format!(
+                "registered source {} was not compiled",
+                source.id()
+            ))
         })?;
         let manifest = RuntimeSourceManifest {
             id: source.id().clone(),
@@ -235,11 +227,8 @@ pub fn compile_runtime_image(
     }
 
     // PASS 10: immutable Runtime Image link.
-    let source_hash = stable_source_hash(
-        registry
-            .iter()
-            .map(|source| (source.id(), source.source())),
-    );
+    let source_hash =
+        stable_source_hash(registry.iter().map(|source| (source.id(), source.source())));
     Ok(RuntimeImage {
         image_id: format!("rbe-{source_hash:016x}"),
         source_hash,
@@ -264,9 +253,9 @@ fn runtime_env_from_settings(
     let Some(value) = settings.get("runtimeEnv") else {
         return Ok(BTreeMap::new());
     };
-    let object = value.as_object().ok_or_else(|| {
-        RelcError::Link("settings.json runtimeEnv must be a JSON object".into())
-    })?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| RelcError::Link("settings.json runtimeEnv must be a JSON object".into()))?;
     Ok(object
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
@@ -278,14 +267,16 @@ fn parse_registered_source(
     kind: RelSourceKind,
     source: &str,
 ) -> Result<CompiledUnit, RelcError> {
-    let tokens = Lexer::new(source).tokenize().map_err(|error| RelcError::Parse {
-        source: id.clone(),
-        error: ParseError {
-            message: error.message,
-            line: error.line,
-            column: error.column,
-        },
-    })?;
+    let tokens = Lexer::new(source)
+        .tokenize()
+        .map_err(|error| RelcError::Parse {
+            source: id.clone(),
+            error: ParseError {
+                message: error.message,
+                line: error.line,
+                column: error.column,
+            },
+        })?;
     let result = match kind {
         RelSourceKind::Route => Parser::new(tokens).parse_file().map(CompiledUnit::Route),
         RelSourceKind::Module => Parser::new(tokens)
@@ -309,7 +300,8 @@ fn validate_capabilities(
 ) -> Result<(), RelcError> {
     for import in imports {
         let base = import_base(import);
-        if let ImportTarget::Builtin(name) | ImportTarget::BuiltinFunction { module: name, .. } = base
+        if let ImportTarget::Builtin(name) | ImportTarget::BuiltinFunction { module: name, .. } =
+            base
         {
             if name == "ENV" && !RuntimeEnv::can_read(kind) {
                 return Err(RelcError::Capability {
@@ -324,12 +316,15 @@ fn validate_capabilities(
                 });
             }
         }
-        if matches!(base, ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. })
-            && kind == RelSourceKind::Route
+        if matches!(
+            base,
+            ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. }
+        ) && kind == RelSourceKind::Route
         {
             return Err(RelcError::Capability {
                 source: source.clone(),
-                message: "Route REL cannot directly import Service REL; use a module boundary".into(),
+                message: "Route REL cannot directly import Service REL; use a module boundary"
+                    .into(),
             });
         }
     }
@@ -354,16 +349,14 @@ fn validate_import_targets(
                         )));
                     }
                 }
-                ImportTarget::Service(service)
-                | ImportTarget::ServiceFunction { service, .. } => {
+                ImportTarget::Service(service) | ImportTarget::ServiceFunction { service, .. }
                     if registry
                         .get_logical(RelSourceKind::Service, service)
-                        .is_none()
-                    {
-                        return Err(RelcError::Link(format!(
-                            "{source_id} imports missing service `{service}`"
-                        )));
-                    }
+                        .is_none() =>
+                {
+                    return Err(RelcError::Link(format!(
+                        "{source_id} imports missing service `{service}`"
+                    )));
                 }
                 _ => {}
             }
@@ -383,13 +376,7 @@ fn build_symbol_graph(
             graph.add_symbol(from.clone());
             let imports = import_bindings(registry, unit.imports());
             let locals = unit.symbol_names();
-            collect_statement_edges(
-                &from,
-                &body,
-                &locals,
-                &imports,
-                &mut graph,
-            );
+            collect_statement_edges(&from, &body, &locals, &imports, &mut graph);
         }
     }
     graph
@@ -410,23 +397,51 @@ fn import_bindings(
         let binding = binding_name(import);
         match import_base(import) {
             ImportTarget::Custom(path) => {
-                if let Some(target) = registry.get_logical(RelSourceKind::Module, &logical_module_name(path)) {
-                    out.insert(binding, ImportBinding { source: target.id().clone(), function: None });
+                if let Some(target) =
+                    registry.get_logical(RelSourceKind::Module, &logical_module_name(path))
+                {
+                    out.insert(
+                        binding,
+                        ImportBinding {
+                            source: target.id().clone(),
+                            function: None,
+                        },
+                    );
                 }
             }
             ImportTarget::CustomFunction { path, function } => {
-                if let Some(target) = registry.get_logical(RelSourceKind::Module, &logical_module_name(path)) {
-                    out.insert(binding, ImportBinding { source: target.id().clone(), function: Some(function.clone()) });
+                if let Some(target) =
+                    registry.get_logical(RelSourceKind::Module, &logical_module_name(path))
+                {
+                    out.insert(
+                        binding,
+                        ImportBinding {
+                            source: target.id().clone(),
+                            function: Some(function.clone()),
+                        },
+                    );
                 }
             }
             ImportTarget::Service(service) => {
                 if let Some(target) = registry.get_logical(RelSourceKind::Service, service) {
-                    out.insert(binding, ImportBinding { source: target.id().clone(), function: None });
+                    out.insert(
+                        binding,
+                        ImportBinding {
+                            source: target.id().clone(),
+                            function: None,
+                        },
+                    );
                 }
             }
             ImportTarget::ServiceFunction { service, function } => {
                 if let Some(target) = registry.get_logical(RelSourceKind::Service, service) {
-                    out.insert(binding, ImportBinding { source: target.id().clone(), function: Some(function.clone()) });
+                    out.insert(
+                        binding,
+                        ImportBinding {
+                            source: target.id().clone(),
+                            function: Some(function.clone()),
+                        },
+                    );
                 }
             }
             _ => {}
@@ -447,7 +462,11 @@ fn collect_statement_edges(
             Statement::Const { value, .. } | Statement::Return(value) | Statement::Expr(value) => {
                 collect_expr_edges(from, value, locals, imports, graph)
             }
-            Statement::If { condition, then_body, else_body } => {
+            Statement::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
                 collect_expr_edges(from, condition, locals, imports, graph);
                 collect_statement_edges(from, then_body, locals, imports, graph);
                 collect_statement_edges(from, else_body, locals, imports, graph);
@@ -467,7 +486,10 @@ fn collect_expr_edges(
         Expr::Call(callee, args) => {
             match callee.as_ref() {
                 Expr::Ident(name) if locals.contains(name) => {
-                    graph.add_edge(from.clone(), SymbolId::new(from.source.clone(), name.clone()));
+                    graph.add_edge(
+                        from.clone(),
+                        SymbolId::new(from.source.clone(), name.clone()),
+                    );
                 }
                 Expr::Ident(name) => {
                     if let Some(binding) = imports.get(name) {
@@ -588,7 +610,10 @@ impl CompiledUnit {
     }
 
     fn symbol_names(&self) -> BTreeSet<String> {
-        self.symbol_bodies().into_iter().map(|(name, _)| name).collect()
+        self.symbol_bodies()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
     }
 
     fn symbol_bodies(&self) -> Vec<(String, Vec<Statement>)> {
@@ -608,7 +633,10 @@ impl CompiledUnit {
                 }
                 for class in &file.classes {
                     for method in &class.methods {
-                        out.push((format!("{}.{}", class.name, method.name), method.body.clone()));
+                        out.push((
+                            format!("{}.{}", class.name, method.name),
+                            method.body.clone(),
+                        ));
                     }
                 }
             }
