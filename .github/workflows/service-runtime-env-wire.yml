@@ -5,10 +5,15 @@ on:
     paths:
       - '.github/patches/service-runtime-env-wire.py'
       - '.github/patches/runtime-source-security-fix.py'
+      - '.github/patches/runtime-policy-wire.py'
       - '.github/workflows/service-runtime-env-wire.yml'
 
 permissions:
   contents: write
+
+concurrency:
+  group: rel-runtime-final-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   wire:
@@ -42,6 +47,9 @@ jobs:
       - name: Apply Service Runtime ENV propagation
         run: python .github/patches/service-runtime-env-wire.py
 
+      - name: Apply Runtime Image server policy admission
+        run: python .github/patches/runtime-policy-wire.py
+
       - name: Format workspace
         working-directory: engine
         run: cargo fmt --all
@@ -50,11 +58,11 @@ jobs:
         working-directory: engine
         run: cargo check --workspace --locked
 
-      - name: Test Runtime ENV and Service Fabric slices
+      - name: Test runtime slices
         working-directory: engine
         run: cargo test -p route-engine -p service-runtime -p backend -p api --locked
 
-      - name: Clippy Runtime ENV and Service Fabric slices
+      - name: Clippy runtime slices
         working-directory: engine
         run: cargo clippy -p route-engine -p service-runtime -p backend -p api --all-targets --locked -- -D warnings
 
@@ -67,7 +75,7 @@ jobs:
             exit 0
           fi
 
-          echo 'main moved while validating; regenerating Service Runtime ENV from latest main.'
+          echo 'main moved while validating; regenerating REL runtime from latest main.'
           git reset --hard origin/main
           if ! grep -q 'pub struct RuntimeHostCapabilities' engine/crates/route-engine/src/video_host.rs; then
             python .github/patches/http-rel-wire.py
@@ -80,13 +88,18 @@ jobs:
           if ! grep -q 'pub route_path: Option<String>' engine/crates/route-engine/src/runtime_image.rs; then
             python .github/patches/runtime-source-security-fix.py
           fi
-          python .github/patches/service-runtime-env-wire.py
+          if ! grep -q 'ImageSnapshot' engine/crates/route-engine/src/runtime_env.rs; then
+            python .github/patches/service-runtime-env-wire.py
+          fi
+          if ! grep -q 'async fn server_status_gate' engine/crates/api/src/lib.rs; then
+            python .github/patches/runtime-policy-wire.py
+          fi
           (cd engine && cargo fmt --all)
           (cd engine && cargo check --workspace --locked)
           (cd engine && cargo test -p route-engine -p service-runtime -p backend -p api --locked)
           (cd engine && cargo clippy -p route-engine -p service-runtime -p backend -p api --all-targets --locked -- -D warnings)
 
-      - name: Commit verified Service Runtime ENV snapshot propagation
+      - name: Commit verified REL runtime activation
         shell: bash
         run: |
           set -euo pipefail
@@ -100,6 +113,7 @@ jobs:
             .github/patches/runtime-source-security-fix.py \
             .github/workflows/runtime-source-security-wire.yml \
             .github/patches/service-runtime-env-wire.py \
+            .github/patches/runtime-policy-wire.py \
             .github/workflows/service-runtime-env-wire.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -107,5 +121,5 @@ jobs:
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m 'FIX | BUG-REL-ENV-001 pin Service Runtime ENV to active image'
+          git commit -m 'FIX | BUG-REL-ENV-001 pin Runtime Image execution and Service ENV'
           git push origin HEAD:main
