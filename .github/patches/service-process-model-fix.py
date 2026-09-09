@@ -173,3 +173,21 @@ if old_name not in text:
     raise SystemExit("missing backend service_process_label name anchor")
 text = text.replace(old_name, new_name, 1)
 write(path, text)
+
+# Canonical service.exe removed all temporary alias filesystem paths from the
+# manager, so Path/PathBuf are no longer used here.
+path = "engine/crates/service-runtime/src/manager.rs"
+text = read(path)
+text = text.replace("use std::path::{Path, PathBuf};\n", "", 1)
+write(path, text)
+
+# Runtime Image route registration borrows url_path for Router::route while the
+# handler also needs an owned path. Clone the cheap String for the handler.
+path = "engine/crates/route-engine/src/discovery.rs"
+text = read(path)
+old = "build_method_router(route_file.as_ref(), module_program.clone(), url_path),"
+new = "build_method_router(route_file.as_ref(), module_program.clone(), url_path.clone()),"
+if old not in text and new not in text:
+    raise SystemExit("missing Runtime Image route path ownership anchor")
+text = text.replace(old, new, 1)
+write(path, text)
