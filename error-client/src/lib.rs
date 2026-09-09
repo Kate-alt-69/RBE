@@ -47,6 +47,44 @@ const MAX_QUEUE_LINES: usize = 2_500;
 const DEDUPE_CACHE_MAX: usize = 800;
 const DEFAULT_DEDUPE_WINDOW_MS: u64 = 2_000;
 const MAX_DEDUPE_WINDOW_MS: u64 = 30_000;
+const REDACTED: &str = "[REDACTED]";
+const REDACTED_PRIVATE_KEY: &str = "[REDACTED PRIVATE KEY]";
+const SENSITIVE_VALUE_NAMES: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "api_key",
+    "api-key",
+    "apikey",
+    "x-api-key",
+    "secret",
+    "client_secret",
+    "client-secret",
+    "access_token",
+    "access-token",
+    "refresh_token",
+    "refresh-token",
+    "auth_token",
+    "auth-token",
+    "session_token",
+    "session-token",
+    "cookie",
+    "set-cookie",
+    "database_url",
+    "database-url",
+    "db_url",
+    "db-url",
+    "connection_string",
+    "connection-string",
+    "dsn",
+];
+const SENSITIVE_LINE_HEADERS: &[&str] = &[
+    "authorization:",
+    "proxy-authorization:",
+    "cookie:",
+    "set-cookie:",
+    "x-api-key:",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -124,14 +162,10 @@ pub fn init(io: atomic_io::AtomicIo, admin_dir: &Path) {
     });
 }
 
-/// Reports one issue — normalizes the input, drops it silently if
-/// it's a near-duplicate of something reported very recently from
-/// this same process (see the module doc comment on why dedup happens
-/// HERE, at the source, rather than in the daemon), and appends one
-/// JSON line to the queue file for the daemon to pick up. Safe to
-/// call from a panic hook (synchronous, no `.await` anywhere in this
-/// path) or before [`init`] has run (silently does nothing — see
-/// that function's doc comment).
+/// Reports one issue — normalizes and redacts the input, drops it silently if
+/// it's a near-duplicate of something reported very recently from this same
+/// process, and appends one JSON line to the queue file for the daemon to pick
+/// up. Redaction happens before anything reaches persistent diagnostic storage.
 pub fn report_issue(input: IssueInput) {
     let Some(state) = STATE.get() else {
         return; // not initialized yet (or ever) — best-effort, no-op
@@ -141,10 +175,17 @@ pub fn report_issue(input: IssueInput) {
     if message.is_empty() {
         return;
     }
+    let message = redact_sensitive_text(message);
     let message: String = message.chars().take(4_000).collect();
 
     let stack = input.stack.map(|s| s.trim()).filter(|s| !s.is_empty());
-    let stack_for_fingerprint: String = stack.unwrap_or("").chars().take(256).collect();
+    let stack = stack.map(redact_sensitive_text);
+    let stack_for_fingerprint: String = stack
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .take(256)
+        .collect();
     let stack: Option<String> = stack.map(|s| s.chars().take(4_000).collect());
 
     let source: String = {
@@ -205,6 +246,232 @@ pub fn report_issue(input: IssueInput) {
     // logged nowhere further; there's nowhere further for it to go.
     let _ = state.io.append_locked(&state.queue_path, line.as_bytes());
     compact_queue_if_needed(&state.io, &state.queue_path);
+}
+
+fn redact_sensitive_text(input: &str) -> String {
+    let mut text = input.to_string();
+    redact_private_key_blocks(&mut text);
+    redact_url_userinfo(&mut text);
+    redact_auth_schemes(&mut text);
+    for name in SENSITIVE_VALUE_NAMES {
+        redact_named_values(&mut text, name);
+    }
+    redact_sensitive_headers(&mut text);
+    text
+}
+
+fn redact_private_key_blocks(text: &mut String) {
+    let mut search_from = 0usize;
+    loop {
+        let lower = text.to_ascii_lowercase();
+        let Some(relative_begin) = lower[search_from..].find("-----begin ") else {
+            break;
+        };
+        let begin = search_from + relative_begin;
+        let header_end = text[begin..]
+            .find('\n')
+            .map(|offset| begin + offset)
+            .unwrap_or(text.len());
+        if !lower[begin..header_end].contains("private key-----") {
+            search_from = header_end.min(text.len());
+            if search_from == text.len() {
+                break;
+            }
+            continue;
+        }
+
+        let end = lower[header_end..]
+            .find("-----end ")
+            .map(|offset| header_end + offset)
+            .and_then(|end_begin| {
+                text[end_begin..]
+                    .find("-----")
+                    .map(|first| end_begin + first + 5)
+                    .and_then(|after_first| {
+                        text[after_first..]
+                            .find("-----")
+                            .map(|second| after_first + second + 5)
+                    })
+            })
+            .unwrap_or(text.len());
+        text.replace_range(begin..end, REDACTED_PRIVATE_KEY);
+        search_from = begin + REDACTED_PRIVATE_KEY.len();
+    }
+}
+
+fn redact_url_userinfo(text: &mut String) {
+    let mut search_from = 0usize;
+    loop {
+        let Some(relative_scheme) = text[search_from..].find("://") else {
+            break;
+        };
+        let authority_start = search_from + relative_scheme + 3;
+        let authority_end = text[authority_start..]
+            .find(|ch: char| ch == '/' || ch == '?' || ch == '#' || ch.is_whitespace())
+            .map(|offset| authority_start + offset)
+            .unwrap_or(text.len());
+        let Some(relative_at) = text[authority_start..authority_end].rfind('@') else {
+            search_from = authority_end;
+            continue;
+        };
+        let userinfo_end = authority_start + relative_at;
+        if userinfo_end > authority_start {
+            text.replace_range(authority_start..userinfo_end, REDACTED);
+            search_from = authority_start + REDACTED.len() + 1;
+        } else {
+            search_from = authority_end;
+        }
+    }
+}
+
+fn redact_auth_schemes(text: &mut String) {
+    for scheme in ["bearer", "basic"] {
+        let mut search_from = 0usize;
+        loop {
+            let lower = text.to_ascii_lowercase();
+            let Some(relative) = lower[search_from..].find(scheme) else {
+                break;
+            };
+            let start = search_from + relative;
+            if start > 0 && text.as_bytes()[start - 1].is_ascii_alphanumeric() {
+                search_from = start + scheme.len();
+                continue;
+            }
+            let mut cursor = start + scheme.len();
+            let bytes = text.as_bytes();
+            if cursor >= bytes.len() || !bytes[cursor].is_ascii_whitespace() {
+                search_from = cursor;
+                continue;
+            }
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let value_start = cursor;
+            while cursor < text.len() {
+                let byte = text.as_bytes()[cursor];
+                if byte.is_ascii_whitespace()
+                    || matches!(byte, b',' | b';' | b'"' | b'\'' | b')' | b']' | b'}')
+                {
+                    break;
+                }
+                cursor += 1;
+            }
+            if cursor > value_start {
+                text.replace_range(value_start..cursor, REDACTED);
+                search_from = value_start + REDACTED.len();
+            } else {
+                search_from = cursor;
+            }
+        }
+    }
+}
+
+fn redact_named_values(text: &mut String, name: &str) {
+    let mut search_from = 0usize;
+    loop {
+        let lower = text.to_ascii_lowercase();
+        let Some(relative) = lower[search_from..].find(name) else {
+            break;
+        };
+        let start = search_from + relative;
+        let name_end = start + name.len();
+        let bytes = text.as_bytes();
+        if (start > 0 && is_identifier_byte(bytes[start - 1]))
+            || (name_end < bytes.len() && is_identifier_byte(bytes[name_end]))
+        {
+            search_from = name_end;
+            continue;
+        }
+
+        let mut cursor = name_end;
+        if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
+            cursor += 1;
+        }
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || !matches!(bytes[cursor], b'=' | b':') {
+            search_from = name_end;
+            continue;
+        }
+        cursor += 1;
+        while cursor < text.len() && text.as_bytes()[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= text.len() {
+            break;
+        }
+
+        let quote = match text.as_bytes()[cursor] {
+            b'"' => Some(b'"'),
+            b'\'' => Some(b'\''),
+            _ => None,
+        };
+        if let Some(quote) = quote {
+            let value_start = cursor + 1;
+            let value_end = text.as_bytes()[value_start..]
+                .iter()
+                .position(|byte| *byte == quote)
+                .map(|offset| value_start + offset)
+                .unwrap_or(text.len());
+            if value_end > value_start {
+                text.replace_range(value_start..value_end, REDACTED);
+                search_from = value_start + REDACTED.len();
+            } else {
+                search_from = value_end;
+            }
+        } else {
+            let value_start = cursor;
+            while cursor < text.len() && !is_secret_terminator(text.as_bytes()[cursor]) {
+                cursor += 1;
+            }
+            if cursor > value_start {
+                text.replace_range(value_start..cursor, REDACTED);
+                search_from = value_start + REDACTED.len();
+            } else {
+                search_from = cursor.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn redact_sensitive_headers(text: &mut String) {
+    for header in SENSITIVE_LINE_HEADERS {
+        let mut search_from = 0usize;
+        loop {
+            let lower = text.to_ascii_lowercase();
+            let Some(relative) = lower[search_from..].find(header) else {
+                break;
+            };
+            let header_start = search_from + relative;
+            if header_start > 0 {
+                let previous = text.as_bytes()[header_start - 1];
+                if is_identifier_byte(previous) {
+                    search_from = header_start + header.len();
+                    continue;
+                }
+            }
+            let value_start = header_start + header.len();
+            let line_end = text[value_start..]
+                .find(['\r', '\n'])
+                .map(|offset| value_start + offset)
+                .unwrap_or(text.len());
+            text.replace_range(value_start..line_end, REDACTED);
+            search_from = value_start + REDACTED.len();
+        }
+    }
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn is_secret_terminator(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'&' | b',' | b';' | b'"' | b'\'' | b')' | b']' | b'}' | b'<' | b'>'
+        )
 }
 
 fn compact_queue_if_needed(io: &atomic_io::AtomicIo, queue_path: &Path) {
@@ -362,8 +629,6 @@ mod tests {
             message: "first distinct issue",
             stack: None,
         });
-        // Same fingerprint as the one above (same source/level/message)
-        // — should be suppressed by the dedupe window.
         report_issue(IssueInput {
             source: "integration_test_source",
             level: Some(IssueLevel::Error),
@@ -371,8 +636,6 @@ mod tests {
             message: "first distinct issue",
             stack: None,
         });
-        // Different message — distinct fingerprint, should NOT be
-        // suppressed.
         report_issue(IssueInput {
             source: "integration_test_source",
             level: Some(IssueLevel::Warn),
@@ -380,8 +643,6 @@ mod tests {
             message: "second distinct issue",
             stack: None,
         });
-        // Empty message — should be silently dropped, contributing no
-        // line at all (not even an attempt).
         report_issue(IssueInput {
             source: "integration_test_source",
             level: None,
@@ -393,11 +654,6 @@ mod tests {
         let queue_path = dir.join(QUEUE_FILE_NAME);
         let contents = std::fs::read_to_string(&queue_path).unwrap();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
-
-        // Only IF this test's `init()` call actually won the race
-        // against any other test in this binary is this assertion
-        // meaningful — but per this test's own doc comment, it's the
-        // only one in the file that calls `init`, so it always wins.
         assert_eq!(
             lines.len(),
             2,
@@ -407,6 +663,33 @@ mod tests {
         assert!(lines[1].contains("second distinct issue"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostic_redaction_covers_common_secret_shapes() {
+        let input = "Authorization: Bearer top-secret-token\npassword=hunter2&next=1\nurl=https://alice:correct-horse@example.com/private\naccess_token=abc.def.ghi\nCookie: session=very-secret\n-----BEGIN PRIVATE KEY-----\nsecret-pem-body\n-----END PRIVATE KEY-----";
+        let redacted = redact_sensitive_text(input);
+        for secret in [
+            "top-secret-token",
+            "hunter2",
+            "alice",
+            "correct-horse",
+            "abc.def.ghi",
+            "very-secret",
+            "secret-pem-body",
+        ] {
+            assert!(!redacted.contains(secret), "secret {secret:?} leaked: {redacted}");
+        }
+        assert!(redacted.contains(REDACTED));
+        assert!(redacted.contains(REDACTED_PRIVATE_KEY));
+        assert!(redacted.contains("next=1"));
+        assert!(redacted.contains("example.com/private"));
+    }
+
+    #[test]
+    fn diagnostic_redaction_preserves_normal_error_context() {
+        let input = "database request failed after 250ms: connection refused";
+        assert_eq!(redact_sensitive_text(input), input);
     }
 
     #[test]
@@ -425,9 +708,7 @@ mod tests {
 
     #[test]
     fn civil_from_days_matches_known_epoch_date() {
-        // 1970-01-01 is day 0.
         assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 2000-01-01 is a well-known reference point (10957 days after epoch).
         assert_eq!(civil_from_days(10_957), (2000, 1, 1));
     }
 }
