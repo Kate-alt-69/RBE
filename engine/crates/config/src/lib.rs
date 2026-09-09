@@ -1,8 +1,8 @@
-//! Typed, validated loader for `settings.json`.
+//! Typed, validated loader for `settings.json` plus root Server REL policy.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -34,6 +34,16 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub dashboards: DashboardsConfig,
+}
+
+/// Result of the deterministic configuration bootstrap pass. Callers that only
+/// need the typed settings can continue to use [`Config::load`]. RELC/runtime
+/// boot can retain `server_policy` for ENV, middleware and embedded-source work.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub server_policy: Option<server_rel::ServerPolicy>,
+    pub server_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -449,12 +459,56 @@ pub enum ConfigError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to compile Server REL {path}: {source}")]
+    ServerRel {
+        path: String,
+        #[source]
+        source: server_rel::ServerRelError,
+    },
     #[error("invalid config: {0}")]
     Invalid(String),
 }
 
 impl Config {
+    /// Load the effective configuration. If a root `server.server` exists next
+    /// to `settings.json` (or `SERVER_REL_PATH` points at one), its defaults and
+    /// forced settings are applied automatically.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Ok(Self::load_bundle(path)?.config)
+    }
+
+    /// Load effective typed configuration and retain the compiled Server REL
+    /// policy for later RELC/runtime stages.
+    pub fn load_bundle(path: impl AsRef<Path>) -> Result<LoadedConfig, ConfigError> {
+        let path_ref = path.as_ref();
+        let server_path = discover_server_rel_path(path_ref)?;
+        let Some(server_path) = server_path else {
+            return Ok(LoadedConfig {
+                config: Self::load_settings_only(path_ref)?,
+                server_policy: None,
+                server_path: None,
+            });
+        };
+
+        let source = std::fs::read_to_string(&server_path).map_err(|source| ConfigError::Read {
+            path: server_path.display().to_string(),
+            source,
+        })?;
+        let policy = server_rel::compile_server_source(&source).map_err(|source| {
+            ConfigError::ServerRel {
+                path: server_path.display().to_string(),
+                source,
+            }
+        })?;
+        let config = Self::load_with_overlays(path_ref, &policy.defaults, &policy.forced)?;
+        Ok(LoadedConfig {
+            config,
+            server_policy: Some(policy),
+            server_path: Some(server_path),
+        })
+    }
+
+    fn load_settings_only(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path_ref = path.as_ref();
         let path_str = path_ref.display().to_string();
         let raw = std::fs::read_to_string(path_ref).map_err(|source| ConfigError::Read {
@@ -639,6 +693,43 @@ impl Config {
     }
 }
 
+fn discover_server_rel_path(settings_path: &Path) -> Result<Option<PathBuf>, ConfigError> {
+    if let Ok(explicit) = std::env::var("SERVER_REL_PATH") {
+        if explicit.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "SERVER_REL_PATH is set but empty".into(),
+            ));
+        }
+        let path = PathBuf::from(explicit);
+        let metadata = std::fs::metadata(&path).map_err(|source| ConfigError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(ConfigError::Invalid(format!(
+                "SERVER_REL_PATH must point to a file, got {}",
+                path.display()
+            )));
+        }
+        return Ok(Some(path));
+    }
+
+    let parent = settings_path.parent().unwrap_or_else(|| Path::new("."));
+    let candidate = parent.join("server.server");
+    match std::fs::metadata(&candidate) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(candidate)),
+        Ok(_) => Err(ConfigError::Invalid(format!(
+            "root Server REL path exists but is not a file: {}",
+            candidate.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ConfigError::Read {
+            path: candidate.display().to_string(),
+            source,
+        }),
+    }
+}
+
 fn apply_env_overrides_to_json(value: &mut JsonValue) -> Result<(), ConfigError> {
     if let Ok(port) = std::env::var("API_PORT") {
         match port.parse::<u16>() {
@@ -700,6 +791,16 @@ fn apply_json_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rbe-config-{name}-{nonce}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn minimal_valid_config_loads() {
@@ -779,5 +880,59 @@ mod tests {
         let error = apply_json_path(&mut value, "api.port", JsonValue::from(8080), true)
             .expect_err("scalar parent must fail");
         assert!(error.to_string().contains("crosses non-object"));
+    }
+
+    #[test]
+    fn load_bundle_discovers_server_rel_and_applies_precedence() {
+        if std::env::var_os("SERVER_REL_PATH").is_some() {
+            return;
+        }
+        let directory = temp_dir("server-rel");
+        let settings = directory.join("settings.json");
+        let server = directory.join("server.server");
+        std::fs::write(
+            &settings,
+            r#"{ "api": { "host": "127.0.0.1", "port": 8080 } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &server,
+            r#"
+            server Main {
+                api { port 7000; }
+                services { monitorIntervalMs 2500; }
+                force { api { port 9090; } }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_bundle(&settings).expect("Server REL config should load");
+        assert_eq!(loaded.config.api.host, "127.0.0.1");
+        assert_eq!(loaded.config.api.port, 9090);
+        assert_eq!(loaded.config.services.monitor_interval_ms, 2500);
+        assert_eq!(loaded.server_path.as_deref(), Some(server.as_path()));
+        assert_eq!(loaded.server_policy.as_ref().unwrap().name, "Main");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn forced_server_policy_still_passes_hard_config_validation() {
+        let directory = temp_dir("invalid-force");
+        let settings = directory.join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{ "api": { "host": "127.0.0.1", "port": 8080 } }"#,
+        )
+        .unwrap();
+
+        let mut forced = BTreeMap::new();
+        forced.insert("api.port".to_string(), JsonValue::from(0));
+        let error = Config::load_with_overlays(&settings, &BTreeMap::new(), &forced)
+            .expect_err("hard validation must reject a forced zero port");
+        assert!(error.to_string().contains("nonzero port"));
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
