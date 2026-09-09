@@ -7,6 +7,7 @@ on:
       - '.github/patches/runtime-source-security-fix.py'
       - '.github/patches/runtime-policy-wire.py'
       - '.github/patches/runtime-launch-hardening-wire.py'
+      - '.github/patches/runtime-security-docs-wire.py'
       - '.github/workflows/service-runtime-env-wire.yml'
 
 permissions:
@@ -53,6 +54,9 @@ jobs:
 
       - name: Apply launch environment hardening
         run: python .github/patches/runtime-launch-hardening-wire.py
+
+      - name: Apply source security documentation
+        run: python .github/patches/runtime-security-docs-wire.py
 
       - name: Format workspace
         working-directory: engine
@@ -101,6 +105,9 @@ jobs:
           if ! grep -q 'fn resolve_settings_path()' engine/crates/backend/src/main.rs; then
             python .github/patches/runtime-launch-hardening-wire.py
           fi
+          if [ ! -f doc/source-security.md ]; then
+            python .github/patches/runtime-security-docs-wire.py
+          fi
           (cd engine && cargo fmt --all)
           (cd engine && cargo check --workspace --locked)
           (cd engine && cargo test -p route-engine -p service-runtime -p backend -p api --locked)
@@ -122,6 +129,7 @@ jobs:
             .github/patches/service-runtime-env-wire.py \
             .github/patches/runtime-policy-wire.py \
             .github/patches/runtime-launch-hardening-wire.py \
+            .github/patches/runtime-security-docs-wire.py \
             .github/workflows/service-runtime-env-wire.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
