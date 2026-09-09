@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 core-lib = { path = "../core" }
+server-rel = { path = "../server-rel" }
 service-runtime = { path = "../service-runtime" }
 atomic-io = { path = "../../../atomic-io" }
 axum = { workspace = true }
