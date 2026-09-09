@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/patches/service-fabric-wire.py'
+      - '.github/patches/service-fabric-fix.py'
       - '.github/workflows/service-fabric-wire.yml'
 
 permissions:
@@ -20,45 +21,14 @@ jobs:
       - name: Apply Service Fabric wiring
         run: python .github/patches/service-fabric-wire.py
       - name: Apply compile fixups
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          import re
-
-          manager = Path('engine/crates/service-runtime/src/manager.rs')
-          text = manager.read_text(encoding='utf-8')
-          text, count = re.subn(
-              r'\n    fn running\(file: ServiceFile, process: ServiceProcess\) -> Self \{.*?\n    \}\n(?=\n    fn wakeable)',
-              '',
-              text,
-              count=1,
-              flags=re.S,
-          )
-          if count != 1:
-              raise SystemExit('failed to remove obsolete Managed::running constructor')
-          manager.write_text(text, encoding='utf-8')
-
-          mother = Path('engine/crates/backend/src/service_mother.rs')
-          text = mother.read_text(encoding='utf-8')
-          old = '''            Ok(())
-        }
-        None => server_task.await??,
-'''
-          new = '''        }
-        None => server_task.await??,
-'''
-          if old not in text:
-              raise SystemExit('failed to find Service Mother match result fixup')
-          mother.write_text(text.replace(old, new, 1), encoding='utf-8')
-          PY
+        run: python .github/patches/service-fabric-fix.py
       - name: Format workspace
         working-directory: engine
         run: cargo fmt --all
       - name: Check workspace
         working-directory: engine
         run: cargo check --workspace
-      - name: Test service runtime and route engine
+      - name: Test affected crates
         working-directory: engine
         run: cargo test -p service-runtime -p route-engine -p backend
       - name: Clippy affected crates
@@ -67,7 +37,7 @@ jobs:
       - name: Commit successful wiring and remove one-shot files
         shell: bash
         run: |
-          rm -f .github/patches/service-fabric-wire.py .github/workflows/service-fabric-wire.yml
+          rm -f .github/patches/service-fabric-wire.py .github/patches/service-fabric-fix.py .github/workflows/service-fabric-wire.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
