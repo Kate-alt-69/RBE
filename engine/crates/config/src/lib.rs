@@ -1,10 +1,12 @@
 //! Typed, validated loader for `settings.json`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
+use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -469,6 +471,46 @@ impl Config {
         Ok(config)
     }
 
+    /// Load `settings.json` with deterministic Server REL policy overlays.
+    ///
+    /// Precedence within this method is:
+    /// built-in serde defaults < Server REL defaults < settings.json < operator
+    /// environment overrides < Server REL forced values. Hard engine invariants
+    /// are still enforced by `validate` after the final merge.
+    pub fn load_with_overlays(
+        path: impl AsRef<Path>,
+        defaults: &BTreeMap<String, JsonValue>,
+        forced: &BTreeMap<String, JsonValue>,
+    ) -> Result<Self, ConfigError> {
+        let path_ref = path.as_ref();
+        let path_str = path_ref.display().to_string();
+        let raw = std::fs::read_to_string(path_ref).map_err(|source| ConfigError::Read {
+            path: path_str.clone(),
+            source,
+        })?;
+        let mut value: JsonValue =
+            serde_json::from_str(&raw).map_err(|source| ConfigError::Parse {
+                path: path_str.clone(),
+                source,
+            })?;
+
+        for (key, default) in defaults {
+            apply_json_path(&mut value, key, default.clone(), false)?;
+        }
+        apply_env_overrides_to_json(&mut value)?;
+        for (key, forced_value) in forced {
+            apply_json_path(&mut value, key, forced_value.clone(), true)?;
+        }
+
+        let config: Config =
+            serde_json::from_value(value).map_err(|source| ConfigError::Parse {
+                path: path_str,
+                source,
+            })?;
+        config.validate()?;
+        Ok(config)
+    }
+
     fn apply_env_overrides(&mut self) {
         if let Ok(port) = std::env::var("API_PORT") {
             match port.parse::<u16>() {
@@ -597,6 +639,64 @@ impl Config {
     }
 }
 
+fn apply_env_overrides_to_json(value: &mut JsonValue) -> Result<(), ConfigError> {
+    if let Ok(port) = std::env::var("API_PORT") {
+        match port.parse::<u16>() {
+            Ok(port) => apply_json_path(value, "api.port", JsonValue::from(port), true)?,
+            Err(_) => {
+                tracing::warn!(value = %port, "API_PORT env var is not a valid u16, ignoring")
+            }
+        }
+    }
+    if let Ok(host) = std::env::var("API_HOST") {
+        apply_json_path(value, "api.host", JsonValue::String(host), true)?;
+    }
+    if let Ok(environment) = std::env::var("RUNTIME_ENVIRONMENT") {
+        apply_json_path(
+            value,
+            "runtime.environment",
+            JsonValue::String(environment),
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_json_path(
+    root: &mut JsonValue,
+    path: &str,
+    value: JsonValue,
+    overwrite: bool,
+) -> Result<(), ConfigError> {
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(ConfigError::Invalid(format!(
+            "Server REL config path {path:?} is invalid"
+        )));
+    }
+
+    let mut current = root.as_object_mut().ok_or_else(|| {
+        ConfigError::Invalid("settings.json root must be a JSON object".into())
+    })?;
+    for segment in &segments[..segments.len() - 1] {
+        if !current.contains_key(*segment) {
+            current.insert((*segment).to_string(), JsonValue::Object(Default::default()));
+        }
+        let next = current.get_mut(*segment).expect("inserted or existing key");
+        current = next.as_object_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "Server REL config path {path:?} crosses non-object key {segment:?}"
+            ))
+        })?;
+    }
+
+    let leaf = segments[segments.len() - 1];
+    if overwrite || !current.contains_key(leaf) {
+        current.insert(leaf.to_string(), value);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,5 +751,33 @@ mod tests {
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("ffprobeExecutable"));
         assert!(error.contains("ffmpegExecutable"));
+    }
+
+    #[test]
+    fn server_defaults_only_fill_missing_settings_and_force_wins() {
+        let mut value = serde_json::json!({
+            "api": { "host": "0.0.0.0", "port": 8080 }
+        });
+        apply_json_path(&mut value, "api.port", JsonValue::from(9000), false).unwrap();
+        apply_json_path(
+            &mut value,
+            "services.monitorIntervalMs",
+            JsonValue::from(2500),
+            false,
+        )
+        .unwrap();
+        apply_json_path(&mut value, "api.port", JsonValue::from(9090), true).unwrap();
+
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(config.api.port, 9090);
+        assert_eq!(config.services.monitor_interval_ms, 2500);
+    }
+
+    #[test]
+    fn overlay_rejects_paths_through_scalar_values() {
+        let mut value = serde_json::json!({ "api": "broken" });
+        let error = apply_json_path(&mut value, "api.port", JsonValue::from(8080), true)
+            .expect_err("scalar parent must fail");
+        assert!(error.to_string().contains("crosses non-object"));
     }
 }
