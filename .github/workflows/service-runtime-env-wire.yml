@@ -1,0 +1,103 @@
+name: Service Runtime ENV Snapshot
+
+on:
+  push:
+    paths:
+      - '.github/patches/service-runtime-env-wire.py'
+      - '.github/workflows/service-runtime-env-wire.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Materialize prerequisite runtime state
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -q 'pub struct RuntimeHostCapabilities' engine/crates/route-engine/src/video_host.rs; then
+            python .github/patches/http-rel-wire.py
+            python .github/patches/http-rel-fix.py
+            python .github/patches/runtime-core-wire.py
+          fi
+          if ! grep -q 'pub enum RuntimeExecutable' engine/crates/route-engine/src/runtime_image.rs; then
+            python .github/patches/runtime-source-security-wire.py
+          fi
+
+      - name: Apply Service Runtime ENV propagation
+        run: python .github/patches/service-runtime-env-wire.py
+
+      - name: Format workspace
+        working-directory: engine
+        run: cargo fmt --all
+
+      - name: Check workspace
+        working-directory: engine
+        run: cargo check --workspace --locked
+
+      - name: Test Runtime ENV and Service Fabric slices
+        working-directory: engine
+        run: cargo test -p route-engine -p service-runtime -p backend -p api --locked
+
+      - name: Clippy Runtime ENV and Service Fabric slices
+        working-directory: engine
+        run: cargo clippy -p route-engine -p service-runtime -p backend -p api --all-targets --locked -- -D warnings
+
+      - name: Regenerate and revalidate if main moved
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+            exit 0
+          fi
+
+          echo 'main moved while validating; regenerating Service Runtime ENV from latest main.'
+          git reset --hard origin/main
+          if ! grep -q 'pub struct RuntimeHostCapabilities' engine/crates/route-engine/src/video_host.rs; then
+            python .github/patches/http-rel-wire.py
+            python .github/patches/http-rel-fix.py
+            python .github/patches/runtime-core-wire.py
+          fi
+          if ! grep -q 'pub enum RuntimeExecutable' engine/crates/route-engine/src/runtime_image.rs; then
+            python .github/patches/runtime-source-security-wire.py
+          fi
+          python .github/patches/service-runtime-env-wire.py
+          (cd engine && cargo fmt --all)
+          (cd engine && cargo check --workspace --locked)
+          (cd engine && cargo test -p route-engine -p service-runtime -p backend -p api --locked)
+          (cd engine && cargo clippy -p route-engine -p service-runtime -p backend -p api --all-targets --locked -- -D warnings)
+
+      - name: Commit verified Service Runtime ENV snapshot propagation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f \
+            .github/patches/http-rel-wire.py \
+            .github/patches/http-rel-fix.py \
+            .github/workflows/http-rel-wire.yml \
+            .github/patches/runtime-core-wire.py \
+            .github/workflows/runtime-core-wire.yml \
+            .github/patches/runtime-source-security-wire.py \
+            .github/workflows/runtime-source-security-wire.yml \
+            .github/patches/service-runtime-env-wire.py \
+            .github/workflows/service-runtime-env-wire.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'FIX | BUG-REL-ENV-001 pin Service Runtime ENV to active image'
+          git push origin HEAD:main
