@@ -25,6 +25,10 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 800;
 const MIN_POLL_INTERVAL_MS: u64 = 250;
 const MAX_POLL_INTERVAL_MS: u64 = 5_000;
 const STATUS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const SIGNING_KEY_SERVICE: &str = "rbe.error-reporter";
+const SIGNING_KEY_ACCOUNT: &str = "report-auth";
+const LEGACY_SIGNING_KEY_FILE: &str = "error-reporter.key";
+const MIN_SIGNING_KEY_LEN: usize = 16;
 
 #[derive(Serialize)]
 struct ReportedBy {
@@ -125,7 +129,7 @@ pub async fn run(
     launched_as_separate_process: bool,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&admin_dir)?;
-    let signing_key = read_or_create_signing_key(&io, &admin_dir)?;
+    let signing_key = read_or_create_signing_key(&admin_dir)?;
 
     let queue_path = admin_dir.join(error_client::QUEUE_FILE_NAME);
     let reports_path = admin_dir.join("error-reports.log");
@@ -415,20 +419,32 @@ fn sign(canonical_json: &str, key: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-fn read_or_create_signing_key(
-    io: &atomic_io::AtomicIo,
-    admin_dir: &Path,
-) -> anyhow::Result<String> {
+fn read_or_create_signing_key(admin_dir: &Path) -> anyhow::Result<String> {
+    let legacy_path = admin_dir.join(LEGACY_SIGNING_KEY_FILE);
+
     if let Ok(from_env) = std::env::var("ERROR_REPORT_SIGNING_KEY") {
-        if from_env.len() >= 16 {
+        if from_env.len() >= MIN_SIGNING_KEY_LEN {
+            remove_legacy_signing_key(&legacy_path)?;
             return Ok(from_env);
         }
+        anyhow::bail!(
+            "ERROR_REPORT_SIGNING_KEY is present but shorter than {MIN_SIGNING_KEY_LEN} bytes"
+        );
     }
-    let key_path = admin_dir.join("error-reporter.key");
-    if let Ok(existing) = std::fs::read_to_string(&key_path) {
-        let trimmed = existing.trim();
-        if trimmed.len() >= 16 {
-            return Ok(trimmed.to_string());
+
+    let entry = keyring::Entry::new(SIGNING_KEY_SERVICE, SIGNING_KEY_ACCOUNT)
+        .map_err(|error| anyhow::anyhow!("error reporter could not open OS credential entry: {error}"))?;
+
+    match entry.get_password() {
+        Ok(existing) if existing.len() >= MIN_SIGNING_KEY_LEN => {
+            remove_legacy_signing_key(&legacy_path)?;
+            return Ok(existing);
+        }
+        Ok(_) => {
+            tracing::warn!("error-reporter OS credential was invalid; rotating it");
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "error-reporter OS credential not readable; creating a fresh credential");
         }
     }
 
@@ -436,15 +452,33 @@ fn read_or_create_signing_key(
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     let generated = hex::encode(bytes);
-    io.write_atomic(&key_path, generated.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&key_path)?.permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(&key_path, permissions)?;
+    entry
+        .set_password(&generated)
+        .map_err(|error| anyhow::anyhow!("error reporter could not store key in OS credential store: {error}"))?;
+
+    let verified = entry
+        .get_password()
+        .map_err(|error| anyhow::anyhow!("error reporter could not verify OS credential write: {error}"))?;
+    if verified != generated {
+        anyhow::bail!("error reporter OS credential verification returned a different value");
     }
+
+    remove_legacy_signing_key(&legacy_path)?;
     Ok(generated)
+}
+
+fn remove_legacy_signing_key(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::warn!(path = %path.display(), "removed legacy plaintext error-reporter credential");
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "failed to remove legacy plaintext error-reporter credential {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn compact_reports_file(io: &atomic_io::AtomicIo, path: &Path) {
@@ -568,5 +602,16 @@ mod tests {
         let canonical = canonical_json(&value).unwrap();
         assert!(canonical.find("\"a\":3").unwrap() < canonical.find("\"z\"").unwrap());
         assert!(canonical.find("\"a\":2").unwrap() < canonical.find("\"b\":1").unwrap());
+    }
+
+    #[test]
+    fn legacy_plaintext_credential_is_removed() {
+        let dir = temp_dir("legacy-key-removal");
+        let path = dir.join(LEGACY_SIGNING_KEY_FILE);
+        std::fs::write(&path, "legacy-secret").unwrap();
+        remove_legacy_signing_key(&path).unwrap();
+        assert!(!path.exists());
+        remove_legacy_signing_key(&path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
