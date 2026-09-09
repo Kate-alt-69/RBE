@@ -1,9 +1,13 @@
-//! RBE's JavaScript-shaped `.route` language.
+//! Runtime Engine Language (REL) parsing and execution infrastructure.
 //!
-//! `.route` files are parsed into a controlled Rust AST. They are not
-//! arbitrary JavaScript and never invoke Node/Bun. The current runtime
-//! interpreter is retained as a fallback while the AOT Rust artifact
-//! pipeline is developed.
+//! `.route`, `.module`, and `.service` already share core lexer/parser/evaluator
+//! building blocks. RELC is being introduced around those pieces to discover,
+//! identify, validate and eventually link every REL source role into a Runtime
+//! Image. A source role controls capabilities and lifecycle; it does not receive
+//! a weaker copy of the common REL grammar.
+//!
+//! Server REL is represented by the RELC source model now; its dedicated
+//! `server.server` parser/compiler is the next compiler layer.
 
 // The route cache and direct parser helpers are retained as internal building
 // blocks for the AOT/diagnostic pipeline even when a particular build path does
@@ -25,6 +29,7 @@ mod service_eval;
 mod terminal;
 
 pub mod cache;
+pub mod source_registry;
 pub mod transpiled_support;
 pub mod transpiler;
 mod video_host;
@@ -44,6 +49,9 @@ pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleReg
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
 pub use service_eval::ServiceProgramExecutor;
+pub use source_registry::{
+    RelSource, RelSourceKind, RelSourceRegistry, SourceId, SourceOrigin, SourceRegistryError,
+};
 
 pub fn build_routes(
     api_dir: &std::path::Path,

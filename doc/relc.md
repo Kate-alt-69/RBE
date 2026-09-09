@@ -31,17 +31,70 @@ server.server
 embedded [file-start:*] blocks
 ```
 
-Each source receives a stable identity such as:
+Each source receives a stable diagnostic identity such as:
 
 ```text
 route:/account/login
 module:Auth
 service:Mail
 server:Main
-server.server#module:Auth
+server:Main#module:Auth
 ```
 
-Physical and embedded sources are equivalent after discovery.
+An embedded source keeps its own REL role. `server:Main#module:Auth` is Module REL after extraction; the `server:Main#` prefix records where it came from for diagnostics and reload metadata.
+
+Physical and embedded sources are equivalent compilation inputs after discovery. They are also in the same logical namespace: a physical `module:Auth` and embedded `server:Main#module:Auth` may not both claim the logical Module REL target `Auth`.
+
+### Source Registry — implemented foundation
+
+The first concrete RELC compiler primitive is now implemented in the route-engine crate as `RelSourceRegistry`.
+
+It currently provides:
+
+- `RelSourceKind` for Route, Module, Service and Server REL roles without using the role as a grammar gate.
+- stable `SourceId` values for physical and embedded sources.
+- `SourceOrigin::Physical` and `SourceOrigin::Embedded` metadata.
+- embedded block index and source start-line metadata for later diagnostic remapping into `server.server`.
+- deterministic source iteration through an ordered registry.
+- duplicate `SourceId` rejection.
+- duplicate physical-path rejection.
+- duplicate logical-target rejection across physical and embedded sources.
+- a logical lookup index for later import/symbol resolution.
+- enforcement that embedded sources belong to a registered Server REL container.
+- rejection of embedded Server REL; `server.server` is the single root composition source shape, not a nesting mechanism for more servers.
+
+The current registry is source identity and compiler-state infrastructure. It does **not** yet parse `server.server`, extract embedded blocks from it, replace the existing route/module/service boot loaders, or produce a Runtime Image. Those are subsequent RELC stages.
+
+Current conceptual representation:
+
+```text
+RelSource {
+    id
+    kind
+    logicalName
+    origin
+    source
+}
+
+SourceOrigin::Physical {
+    path
+}
+
+SourceOrigin::Embedded {
+    container
+    blockIndex
+    startLine
+}
+```
+
+The distinction is intentional:
+
+```text
+SourceId                  = exact source/diagnostic identity
+(kind, logicalName)       = logical compiler/import identity
+```
+
+That prevents two different source origins from silently defining the same import target.
 
 ## Multi-pass compilation
 
@@ -61,6 +114,8 @@ PASS 8  lower to executable representation / IR
 PASS 9  optimize
 PASS 10 link Runtime Image
 ```
+
+The Source Registry is the foundation of PASS 1. Physical discovery and `server.server` embedded extraction will feed that registry before later passes consume it.
 
 This lets files refer to symbols whose implementations appear in another source without inventing a fake "compile this file first" rule.
 
