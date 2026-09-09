@@ -191,3 +191,34 @@ if old not in text and new not in text:
     raise SystemExit("missing Runtime Image route path ownership anchor")
 text = text.replace(old, new, 1)
 write(path, text)
+
+# Service Runtime ENV propagation uses Arc in Mother supervision. Keep that
+# ownership local to backend rather than leaking it through globals.
+path = "engine/crates/backend/src/service_mother.rs"
+text = read(path)
+if "use std::sync::Arc;" not in text:
+    text = text.replace("use std::process::Stdio;\n", "use std::process::Stdio;\nuse std::sync::Arc;\n", 1)
+
+# Internal Service modes are parent-owned. Remove the historical argv token
+# fallback now that service(.exe) exposes only restart control publicly.
+token_start = text.find('    let token = match service_runtime::read_parent_bootstrap_secret_if_configured("Service Mother")?')
+if token_start < 0:
+    raise SystemExit("missing Service Mother token bootstrap anchor")
+token_end = text.find("    };\n", token_start)
+if token_end < 0:
+    raise SystemExit("missing Service Mother token bootstrap end")
+token_end += len("    };\n")
+text = text[:token_start] + '''    let token = service_runtime::read_parent_bootstrap_secret_if_configured("Service Mother")?\n        .ok_or_else(|| {\n            anyhow::anyhow!(\n                "Service Mother requires inherited parent authentication; command-line tokens are not accepted"\n            )\n        })?;\n''' + text[token_end:]
+write(path, text)
+
+path = "engine/crates/backend/src/service_boot.rs"
+text = read(path)
+token_start = text.find('    let token = match service_runtime::read_parent_bootstrap_secret_if_configured("service host")?')
+if token_start < 0:
+    raise SystemExit("missing Service worker token bootstrap anchor")
+token_end = text.find("    };\n", token_start)
+if token_end < 0:
+    raise SystemExit("missing Service worker token bootstrap end")
+token_end += len("    };\n")
+text = text[:token_start] + '''    let token = service_runtime::read_parent_bootstrap_secret_if_configured("service host")?\n        .ok_or_else(|| {\n            anyhow::anyhow!(\n                "Service worker requires inherited parent authentication; command-line tokens are not accepted"\n            )\n        })?;\n''' + text[token_end:]
+write(path, text)
