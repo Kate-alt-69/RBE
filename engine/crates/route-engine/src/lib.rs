@@ -6,8 +6,9 @@
 //! Image. A source role controls capabilities and lifecycle; it does not receive
 //! a weaker copy of the common REL grammar.
 //!
-//! Server REL is represented by the RELC source model now; its dedicated
-//! `server.server` parser/compiler is the next compiler layer.
+//! Server REL is represented by the RELC source model and its structural
+//! `server.server` front-end. Final ServerPolicy/Runtime Image lowering remains
+//! a later RELC pass.
 
 // The route cache and direct parser helpers are retained as internal building
 // blocks for the AOT/diagnostic pipeline even when a particular build path does
@@ -29,6 +30,7 @@ mod service_eval;
 mod terminal;
 
 pub mod cache;
+pub mod server_rel;
 pub mod source_registry;
 pub mod transpiled_support;
 pub mod transpiler;
@@ -48,6 +50,10 @@ pub use module_runtime::{
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
+pub use server_rel::{
+    compile_server_source, parse_server_source, ServerCompileError, ServerProgram, ServerSetting,
+    ServerSettingBody, ServerValue,
+};
 pub use service_eval::ServiceProgramExecutor;
 pub use source_registry::{
     RelSource, RelSourceKind, RelSourceRegistry, SourceId, SourceOrigin, SourceRegistryError,
