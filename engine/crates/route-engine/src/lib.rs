@@ -20,7 +20,6 @@ mod module_runtime;
 mod modules;
 mod parser;
 mod paths;
-mod server_rel;
 mod service_eval;
 mod terminal;
 
