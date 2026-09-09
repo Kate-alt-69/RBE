@@ -99,12 +99,6 @@ impl Parser {
             imports.extend(self.parse_imports()?);
         }
 
-        if imports.iter().any(import_contains_service) {
-            return Err(
-                self.error_here("service-to-service imports are not supported in .service files")
-            );
-        }
-
         self.parse_service_directive()?;
 
         let mut functions = Vec::new();

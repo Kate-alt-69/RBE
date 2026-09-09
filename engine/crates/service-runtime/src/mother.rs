@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
-use crate::{ServiceCallError, ServiceManager, ServiceSnapshot};
+use crate::{ServiceCallError, ServiceFabricEndpoint, ServiceManager, ServiceSnapshot};
 
 const MOTHER_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 const MOTHER_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -253,78 +253,110 @@ pub fn new_service_mother_token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub async fn run_service_mother(manager: ServiceManager, token: String) -> anyhow::Result<()> {
-    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!("Service Mother token must be a 256-bit hexadecimal value");
-    }
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
-    let ready = ServiceMotherReady {
-        pid: std::process::id(),
-        address: listener.local_addr()?,
-    };
-    println!("{}", serde_json::to_string(&ready)?);
-    std::io::stdout().flush()?;
+pub struct ServiceMotherServer {
+    listener: TcpListener,
+    ready: ServiceMotherReady,
+    token: Arc<str>,
+}
 
-    let token: Arc<str> = Arc::<str>::from(token);
-    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_MOTHER_CONNECTIONS));
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut accept_failures = 0u32;
-    loop {
-        tokio::select! {
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || *shutdown_rx.borrow() {
-                    break;
-                }
-            }
-            accepted = listener.accept() => {
-                let (stream, peer) = match accepted {
-                    Ok(accepted) => {
-                        accept_failures = 0;
-                        accepted
+impl ServiceMotherServer {
+    pub async fn bind(token: String) -> anyhow::Result<Self> {
+        validate_mother_endpoint(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1), &token)?;
+        let listener =
+            TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
+        let ready = ServiceMotherReady {
+            pid: std::process::id(),
+            address: listener.local_addr()?,
+        };
+        Ok(Self {
+            listener,
+            ready,
+            token: Arc::<str>::from(token),
+        })
+    }
+
+    pub fn ready(&self) -> &ServiceMotherReady {
+        &self.ready
+    }
+
+    pub fn fabric_endpoint(&self) -> ServiceFabricEndpoint {
+        ServiceFabricEndpoint::new(self.ready.address, self.token.to_string())
+            .expect("validated Service Mother endpoint must be a valid Fabric endpoint")
+    }
+
+    pub async fn serve(self, manager: ServiceManager) -> anyhow::Result<()> {
+        let Self {
+            listener,
+            ready: _,
+            token,
+        } = self;
+        let connections = Arc::new(tokio::sync::Semaphore::new(MAX_MOTHER_CONNECTIONS));
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut accept_failures = 0u32;
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
                     }
-                    Err(error) => {
-                        accept_failures = accept_failures.saturating_add(1);
-                        if accept_failures >= MOTHER_ACCEPT_FAILURE_LIMIT {
-                            return Err(anyhow::anyhow!(
-                                "Service Mother listener failed {accept_failures} consecutive accepts: {error}"
-                            ));
+                }
+                accepted = listener.accept() => {
+                    let (stream, peer) = match accepted {
+                        Ok(accepted) => {
+                            accept_failures = 0;
+                            accepted
                         }
-                        tracing::warn!(
-                            error = %error,
-                            accept_failures,
-                            retry_ms = MOTHER_ACCEPT_RETRY_DELAY.as_millis() as u64,
-                            "Service Mother listener accept failed; retrying without tearing down services"
-                        );
-                        tokio::time::sleep(MOTHER_ACCEPT_RETRY_DELAY).await;
+                        Err(error) => {
+                            accept_failures = accept_failures.saturating_add(1);
+                            if accept_failures >= MOTHER_ACCEPT_FAILURE_LIMIT {
+                                return Err(anyhow::anyhow!(
+                                    "Service Mother listener failed {accept_failures} consecutive accepts: {error}"
+                                ));
+                            }
+                            tracing::warn!(
+                                error = %error,
+                                accept_failures,
+                                retry_ms = MOTHER_ACCEPT_RETRY_DELAY.as_millis() as u64,
+                                "Service Mother listener accept failed; retrying without tearing down services"
+                            );
+                            tokio::time::sleep(MOTHER_ACCEPT_RETRY_DELAY).await;
+                            continue;
+                        }
+                    };
+                    if !peer.ip().is_loopback() {
+                        tracing::warn!(%peer, "Service Mother rejected non-loopback peer");
                         continue;
                     }
-                };
-                if !peer.ip().is_loopback() {
-                    tracing::warn!(%peer, "Service Mother rejected non-loopback peer");
-                    continue;
+                    let permit = match connections.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            tracing::warn!(%peer, limit = MAX_MOTHER_CONNECTIONS, "Service Mother connection limit reached");
+                            drop(stream);
+                            continue;
+                        }
+                    };
+                    let manager = manager.clone();
+                    let token = token.clone();
+                    let shutdown_tx = shutdown_tx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = handle_connection(stream, manager, token, shutdown_tx).await {
+                            tracing::warn!(error = %error, "Service Mother request failed");
+                        }
+                    });
                 }
-                let permit = match connections.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        tracing::warn!(%peer, limit = MAX_MOTHER_CONNECTIONS, "Service Mother connection limit reached");
-                        drop(stream);
-                        continue;
-                    }
-                };
-                let manager = manager.clone();
-                let token = token.clone();
-                let shutdown_tx = shutdown_tx.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(error) = handle_connection(stream, manager, token, shutdown_tx).await {
-                        tracing::warn!(error = %error, "Service Mother request failed");
-                    }
-                });
             }
         }
+        manager.shutdown_all().await;
+        Ok(())
     }
-    manager.shutdown_all().await;
-    Ok(())
+}
+
+pub async fn run_service_mother(manager: ServiceManager, token: String) -> anyhow::Result<()> {
+    let server = ServiceMotherServer::bind(token).await?;
+    println!("{}", serde_json::to_string(server.ready())?);
+    std::io::stdout().flush()?;
+    server.serve(manager).await
 }
 
 async fn handle_connection(

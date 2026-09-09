@@ -74,7 +74,7 @@ The currently implemented service-local `memory` capability supports:
 
 This memory is process-local RAM. A cold activation after a dormant service has exited creates a new service process and therefore a new in-process memory store. Durable service state must be implemented explicitly through a persistent capability/data system; process-local memory should not be treated as durable storage.
 
-Service-to-service imports are rejected in `.service` files. Service calls are intended to flow through the module/mother runtime rather than allowing a service mesh with ambient cross-process authority.
+Service-to-service imports are supported through the authenticated loopback Service Mother Fabric. Child services receive the Mother address as non-secret process metadata and receive the Mother authentication token only through the inherited stdin bootstrap pipe. Direct synchronous service dependency cycles are rejected because they would deadlock single-request service workers; normal in-process REL recursion remains a separate concept.
 
 ## Lifecycle class
 

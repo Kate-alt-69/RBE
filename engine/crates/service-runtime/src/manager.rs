@@ -16,9 +16,9 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 
 use super::{
-    read_bounded_line, RestartPolicy, ServiceCatalog, ServiceFile, ServiceMode, ServiceReady,
-    ServiceRequest, ServiceResponse, SERVICE_IPC_REQUEST_MAX_BYTES, SERVICE_IPC_RESPONSE_MAX_BYTES,
-    SERVICE_IPC_TIMEOUT,
+    read_bounded_line, RestartPolicy, ServiceCatalog, ServiceFabricEndpoint, ServiceFile,
+    ServiceMode, ServiceReady, ServiceRequest, ServiceResponse, SERVICE_IPC_REQUEST_MAX_BYTES,
+    SERVICE_IPC_RESPONSE_MAX_BYTES, SERVICE_IPC_TIMEOUT,
 };
 use crate::mother::ServiceMotherClient;
 
@@ -79,18 +79,6 @@ impl Managed {
         }
     }
 
-    fn running(file: ServiceFile, process: ServiceProcess) -> Self {
-        Self {
-            file,
-            process: Some(process),
-            restart_attempts: 0,
-            exit_observed: false,
-            restarting: false,
-            active_calls: Arc::new(AtomicU32::new(0)),
-            last_activity: Instant::now(),
-        }
-    }
-
     fn wakeable(&self) -> bool {
         self.file.mode != ServiceMode::Resident
     }
@@ -129,6 +117,7 @@ pub struct ServiceManager {
     services: Arc<AsyncRwLock<HashMap<String, Arc<Mutex<Managed>>>>>,
     shutting_down: Arc<AtomicBool>,
     mother: Option<ServiceMotherClient>,
+    fabric: Option<ServiceFabricEndpoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,31 +202,70 @@ impl ServiceManager {
     }
 
     pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
-        let manager = Self::default();
+        let manager = Self::prepare_all(catalog, None).await;
+        manager.start_prepared(catalog).await?;
+        Ok(manager)
+    }
+
+    pub async fn prepare_all_with_fabric(
+        catalog: &ServiceCatalog,
+        fabric: ServiceFabricEndpoint,
+    ) -> Self {
+        Self::prepare_all(catalog, Some(fabric)).await
+    }
+
+    async fn prepare_all(catalog: &ServiceCatalog, fabric: Option<ServiceFabricEndpoint>) -> Self {
+        let manager = Self {
+            fabric,
+            ..Self::default()
+        };
+        let mut services = manager.services.write().await;
         for file in catalog.services() {
-            let managed = match file.mode {
-                ServiceMode::OnDemand => Managed::dormant(file.clone()),
-                ServiceMode::Resident | ServiceMode::Hybrid => match spawn_process(file).await {
-                    Ok(process) => Managed::running(file.clone(), process),
-                    Err(error) => {
-                        manager.shutdown_all().await;
-                        return Err(error);
-                    }
-                },
+            services.insert(
+                file.name.clone(),
+                Arc::new(Mutex::new(Managed::dormant(file.clone()))),
+            );
+        }
+        drop(services);
+        manager
+    }
+
+    /// Start resident/hybrid children after every service identity is already
+    /// addressable by Mother. Direct service dependencies are started first so
+    /// lifecycle hooks can synchronously call an already-running dependency.
+    pub async fn start_prepared(&self, catalog: &ServiceCatalog) -> anyhow::Result<()> {
+        for file in service_startup_order(catalog)? {
+            if file.mode == ServiceMode::OnDemand {
+                continue;
+            }
+            let process = match spawn_process(&file, self.fabric.as_ref()).await {
+                Ok(process) => process,
+                Err(error) => {
+                    self.shutdown_all().await;
+                    return Err(error);
+                }
             };
-            manager
+            let handle = self
                 .services
-                .write()
+                .read()
                 .await
-                .insert(file.name.clone(), Arc::new(Mutex::new(managed)));
+                .get(&file.name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("prepared service {:?} disappeared", file.name))?;
+            let mut managed = handle.lock().await;
+            managed.process = Some(process);
+            managed.restart_attempts = 0;
+            managed.exit_observed = false;
+            managed.restarting = false;
+            managed.last_activity = Instant::now();
         }
         if !catalog.services().is_empty() {
-            manager.start_monitor(
+            self.start_monitor(
                 Duration::from_millis(catalog.monitor_interval_ms.max(50)),
                 Duration::from_millis(catalog.max_restart_backoff_ms.max(RESTART_BASE_DELAY_MS)),
             );
         }
-        Ok(manager)
+        Ok(())
     }
 
     fn start_monitor(&self, interval: Duration, max_restart_backoff: Duration) {
@@ -410,7 +438,7 @@ impl ServiceManager {
                 continue;
             }
 
-            match spawn_process(&file).await {
+            match spawn_process(&file, self.fabric.as_ref()).await {
                 Ok(replacement) => {
                     let new_pid = replacement.ready.pid;
                     service.process = Some(replacement);
@@ -555,7 +583,7 @@ impl ServiceManager {
 
         let file = service.file.clone();
         service.restarting = true;
-        match spawn_process(&file).await {
+        match spawn_process(&file, self.fabric.as_ref()).await {
             Ok(process) => {
                 let pid = process.ready.pid;
                 service.process = Some(process);
@@ -820,6 +848,85 @@ fn restart_delay(attempt: u32, maximum: Duration) -> Duration {
         .min(maximum)
 }
 
+fn direct_service_dependency(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let rest = raw.strip_prefix("service:")?;
+    let name = rest
+        .split(|character: char| character == '.' || character.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn service_startup_order(catalog: &ServiceCatalog) -> anyhow::Result<Vec<ServiceFile>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Visit {
+        Visiting,
+        Done,
+    }
+
+    fn visit(
+        name: &str,
+        files: &HashMap<String, ServiceFile>,
+        state: &mut HashMap<String, Visit>,
+        stack: &mut Vec<String>,
+        out: &mut Vec<ServiceFile>,
+    ) -> anyhow::Result<()> {
+        match state.get(name) {
+            Some(Visit::Done) => return Ok(()),
+            Some(Visit::Visiting) => {
+                let start = stack.iter().position(|item| item == name).unwrap_or(0);
+                let mut cycle = stack[start..].to_vec();
+                cycle.push(name.to_string());
+                anyhow::bail!(
+                    "synchronous Service Fabric dependency cycle would deadlock: {}",
+                    cycle.join(" -> ")
+                );
+            }
+            None => {}
+        }
+        let file = files
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown service dependency {name:?}"))?;
+        state.insert(name.to_string(), Visit::Visiting);
+        stack.push(name.to_string());
+        for dependency in file
+            .imports
+            .iter()
+            .filter_map(|raw| direct_service_dependency(raw))
+        {
+            if !files.contains_key(&dependency) {
+                anyhow::bail!(
+                    "service {:?} imports unknown service {dependency:?}",
+                    file.name
+                );
+            }
+            visit(&dependency, files, state, stack, out)?;
+        }
+        stack.pop();
+        state.insert(name.to_string(), Visit::Done);
+        out.push(file.clone());
+        Ok(())
+    }
+
+    let files = catalog
+        .services()
+        .iter()
+        .cloned()
+        .map(|file| (file.name.clone(), file))
+        .collect::<HashMap<_, _>>();
+    let mut names = files.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    let mut state = HashMap::new();
+    let mut stack = Vec::new();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        visit(&name, &files, &mut state, &mut stack, &mut out)?;
+    }
+    Ok(out)
+}
+
 async fn stop_process(service_name: &str, process: &mut ServiceProcess) {
     let _ = rpc(
         process.ready.address,
@@ -931,7 +1038,10 @@ where
     }
 }
 
-async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
+async fn spawn_process(
+    file: &ServiceFile,
+    fabric: Option<&ServiceFabricEndpoint>,
+) -> anyhow::Result<ServiceProcess> {
     let exe = std::env::current_exe().context("resolve backend executable")?;
     let parent = exe.parent().context("backend executable has no parent")?;
     let dir = parent.join(".runtime/process");
@@ -953,9 +1063,16 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
     }
 
     let token = random_token();
-    let mut child = match Command::new(&alias)
+    let mut command = Command::new(&alias);
+    command
         .args(["--service-host", "--service-file"])
-        .arg(&file.path)
+        .arg(&file.path);
+    if let Some(fabric) = fabric {
+        command
+            .arg("--service-mother-address")
+            .arg(fabric.address().to_string());
+    }
+    let mut child = match command
         .current_dir(parent)
         .env("RBE_PARENT_LIVENESS_PIPE", "1")
         .stdin(Stdio::piped())
@@ -984,6 +1101,16 @@ async fn spawn_process(file: &ServiceFile) -> anyhow::Result<ServiceProcess> {
             "send service {:?} parent bootstrap secret: {error}",
             file.name
         ));
+    }
+    if let Some(fabric) = fabric {
+        if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, fabric.auth()).await
+        {
+            cleanup_failed_spawn(&alias, &mut child).await;
+            return Err(anyhow::anyhow!(
+                "send service {:?} Service Fabric bootstrap secret: {error}",
+                file.name
+            ));
+        }
     }
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,

@@ -203,16 +203,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_service_to_service_imports() {
-        let error = parse_service_source(
+    fn parses_service_to_service_imports_for_fabric() {
+        let file = parse_service_source(
             r#"
             :import[service:other]
             :service[name = current]
             export function run() { return true; }
         "#,
         )
-        .expect_err("service-to-service import should fail");
-        assert!(error.message.contains("service-to-service"));
+        .expect("service-to-service import should be accepted for Service Fabric");
+        assert!(matches!(
+            file.imports.as_slice(),
+            [ImportTarget::Service(name)] if name == "other"
+        ));
     }
 
     #[test]

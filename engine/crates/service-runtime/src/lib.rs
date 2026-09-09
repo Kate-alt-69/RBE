@@ -24,7 +24,39 @@ pub(crate) const SERVICE_IPC_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SERVICE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SERVICE_ACCEPT_FAILURE_LIMIT: u32 = 8;
 pub use manager::{ServiceCallError, ServiceManager, ServiceRuntimeState, ServiceSnapshot};
-pub use mother::{new_service_mother_token, run_service_mother, ServiceMotherReady};
+pub use mother::{
+    new_service_mother_token, run_service_mother, ServiceMotherReady, ServiceMotherServer,
+};
+
+/// Authenticated loopback endpoint handed only to service children by their
+/// Service Mother. The authentication token is transferred over the inherited
+/// stdin bootstrap pipe, never command-line arguments or environment variables.
+#[derive(Clone)]
+pub struct ServiceFabricEndpoint {
+    address: SocketAddr,
+    auth: Arc<str>,
+}
+
+impl ServiceFabricEndpoint {
+    pub fn new(address: SocketAddr, auth: String) -> anyhow::Result<Self> {
+        if !address.ip().is_loopback() {
+            anyhow::bail!("Service Fabric endpoint must be loopback");
+        }
+        validate_parent_bootstrap_secret(&auth)?;
+        Ok(Self {
+            address,
+            auth: Arc::<str>::from(auth),
+        })
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub(crate) fn auth(&self) -> &str {
+        &self.auth
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]

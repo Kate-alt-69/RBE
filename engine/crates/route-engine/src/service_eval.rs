@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 use service_runtime::{
     ServiceExecutionError, ServiceExecutionFuture, ServiceExecutor, ServiceLifecycle,
-    ServiceLifecycleFuture, ServiceMemory,
+    ServiceLifecycleFuture, ServiceManager, ServiceMemory,
 };
 
 use crate::ast::{FunctionDef, MethodDef, ModuleFile, ServiceClassDef, ServiceProgram, Value};
@@ -352,10 +352,29 @@ pub struct ServiceProgramExecutor {
     lifecycle: Vec<MethodDef>,
     classes: Arc<HashMap<String, ServiceClassDef>>,
     host_capabilities: Arc<ServiceHostCapabilities>,
+    services: Option<ServiceManager>,
 }
 
 impl ServiceProgramExecutor {
     pub fn new(program: ServiceProgram, modules: ModuleProgram, memory: ServiceMemory) -> Self {
+        Self::build(program, modules, memory, None)
+    }
+
+    pub fn with_services(
+        program: ServiceProgram,
+        modules: ModuleProgram,
+        memory: ServiceMemory,
+        services: ServiceManager,
+    ) -> Self {
+        Self::build(program, modules, memory, Some(services))
+    }
+
+    fn build(
+        program: ServiceProgram,
+        modules: ModuleProgram,
+        memory: ServiceMemory,
+        services: Option<ServiceManager>,
+    ) -> Self {
         let ServiceProgram {
             imports,
             functions,
@@ -382,6 +401,7 @@ impl ServiceProgramExecutor {
             lifecycle,
             classes,
             host_capabilities,
+            services,
         }
     }
 
@@ -393,11 +413,19 @@ impl ServiceProgramExecutor {
     }
 
     fn module_executor(&self) -> ModuleExecutor<'_> {
-        ModuleExecutor::with_host_capabilities_and_classes(
-            &self.modules,
-            self.host_capabilities.clone(),
-            self.classes.clone(),
-        )
+        match &self.services {
+            Some(services) => ModuleExecutor::with_services_host_capabilities_and_classes(
+                &self.modules,
+                services.clone(),
+                self.host_capabilities.clone(),
+                self.classes.clone(),
+            ),
+            None => ModuleExecutor::with_host_capabilities_and_classes(
+                &self.modules,
+                self.host_capabilities.clone(),
+                self.classes.clone(),
+            ),
+        }
     }
 }
 

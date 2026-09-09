@@ -153,6 +153,20 @@ impl<'a> ModuleExecutor<'a> {
         }
     }
 
+    pub(crate) fn with_services_host_capabilities_and_classes(
+        program: &'a ModuleProgram,
+        services: ServiceManager,
+        host_capabilities: Arc<dyn HostCapabilityCaller>,
+        classes: Arc<HashMap<String, ServiceClassDef>>,
+    ) -> Self {
+        Self {
+            program,
+            services: Some(Arc::new(services)),
+            host_capabilities: Some(host_capabilities),
+            classes,
+        }
+    }
+
     async fn call_host_capability(
         &self,
         scope: Option<String>,

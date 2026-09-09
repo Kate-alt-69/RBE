@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 
 use service_runtime::{
-    new_service_mother_token, run_service_mother, ServiceManager, ServiceMotherReady,
+    new_service_mother_token, ServiceManager, ServiceMotherReady, ServiceMotherServer,
 };
 
 const MOTHER_RESTART_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -140,12 +141,30 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
             );
         }
     }
+    let server = ServiceMotherServer::bind(token).await?;
+    let ready = server.ready().clone();
     let manager = match catalog.as_ref() {
-        Some(catalog) => ServiceManager::spawn_all(catalog).await?,
+        Some(catalog) => {
+            ServiceManager::prepare_all_with_fabric(catalog, server.fabric_endpoint()).await
+        }
         None => ServiceManager::default(),
     };
+    // Serve Fabric RPC before running Service.start() so lifecycle hooks can
+    // call dependencies. Parent readiness remains withheld until starts pass.
+    let server_manager = manager.clone();
+    let mut server_task = tokio::spawn(async move { server.serve(server_manager).await });
+    if let Some(catalog) = catalog.as_ref() {
+        if let Err(error) = manager.start_prepared(catalog).await {
+            server_task.abort();
+            let _ = (&mut server_task).await;
+            return Err(error);
+        }
+    }
+    println!("{}", serde_json::to_string(&ready)?);
+    std::io::stdout().flush()?;
     tracing::info!(
         pid = std::process::id(),
+        address = %ready.address,
         services = catalog
             .as_ref()
             .map(|catalog| catalog.services().len())
@@ -156,18 +175,20 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
     match parent_liveness.as_mut() {
         Some(parent_liveness) => {
             tokio::select! {
-                result = run_service_mother(manager.clone(), token) => result,
+                result = &mut server_task => result??,
                 _ = parent_liveness => {
                     tracing::warn!(
                         "Service Mother parent liveness pipe closed; shutting down managed services"
                     );
                     manager.shutdown_all().await;
-                    Ok(())
+                    server_task.abort();
+                    let _ = (&mut server_task).await;
                 }
             }
         }
-        None => run_service_mother(manager, token).await,
+        None => server_task.await??,
     }
+    Ok(())
 }
 
 async fn spawn_process(

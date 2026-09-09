@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,6 +20,26 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
             .ok_or_else(|| {
                 anyhow::anyhow!("backend --service-host requires parent authentication")
             })?,
+    };
+    let service_manager = match value("--service-mother-address") {
+        Some(raw_address) => {
+            let address = raw_address.parse::<SocketAddr>().map_err(|error| {
+                anyhow::anyhow!("service host received invalid Service Mother address: {error}")
+            })?;
+            if !address.ip().is_loopback() {
+                anyhow::bail!("service host Service Mother address must be loopback");
+            }
+            let auth = service_runtime::read_parent_bootstrap_secret_if_configured(
+                "Service Fabric",
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "service host received a Service Mother address without inherited Fabric authentication"
+                )
+            })?;
+            service_runtime::ServiceManager::remote(address, auth)?
+        }
+        None => service_runtime::ServiceManager::default(),
     };
 
     // Service children load the same typed settings as the mother process so
@@ -57,7 +78,12 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         )
     })?;
     let memory = ServiceMemory::default();
-    let executor = route_engine::ServiceProgramExecutor::new(program, modules, memory.clone());
+    let executor = route_engine::ServiceProgramExecutor::with_services(
+        program,
+        modules,
+        memory.clone(),
+        service_manager,
+    );
     service_runtime::run_service_host_with_executor_and_memory(
         service_file,
         token,
