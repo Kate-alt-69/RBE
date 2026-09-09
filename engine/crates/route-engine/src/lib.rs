@@ -20,6 +20,7 @@ mod module_runtime;
 mod modules;
 mod parser;
 mod paths;
+mod server_rel;
 mod service_eval;
 mod terminal;
 
@@ -42,6 +43,10 @@ pub use module_runtime::{
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
+pub use server_rel::{
+    compile_server_source, extract_embedded_sources, EmbeddedSource, EmbeddedSourceKind,
+    MiddlewarePolicy, ServerPolicy, ServerRelError, ServerStatus, NATIVE_MIDDLEWARE,
+};
 pub use service_eval::ServiceProgramExecutor;
 
 pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
