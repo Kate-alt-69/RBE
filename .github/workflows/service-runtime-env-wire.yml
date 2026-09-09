@@ -78,7 +78,11 @@ jobs:
         working-directory: engine
         run: cargo fmt --all
 
-      - name: Check workspace
+      - name: Refresh staged dependency lock
+        working-directory: engine
+        run: cargo check --workspace
+
+      - name: Check workspace locked
         working-directory: engine
         run: cargo check --workspace --locked
 
@@ -144,6 +148,7 @@ jobs:
             python .github/patches/runtime-security-docs-wire.py
           fi
           (cd engine && cargo fmt --all)
+          (cd engine && cargo check --workspace)
           (cd engine && cargo check --workspace --locked)
           (cd engine && cargo test -p route-engine -p service-runtime -p backend -p api --locked)
           (cd engine && cargo clippy -p route-engine -p service-runtime -p backend -p api --all-targets --locked -- -D warnings)
