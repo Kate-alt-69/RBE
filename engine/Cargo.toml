@@ -9,6 +9,7 @@ members = [
     "crates/supervisor",
     "crates/logging",
     "crates/route-engine",
+    "crates/server-rel",
     "crates/service-runtime",
     "crates/video-manager",
 ]
