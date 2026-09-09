@@ -9,6 +9,7 @@ on:
       - '.github/patches/runtime-launch-hardening-wire.py'
       - '.github/patches/runtime-security-docs-wire.py'
       - '.github/patches/middleware-runtime-wire.py'
+      - '.github/patches/service-process-model-wire.py'
       - '.github/workflows/service-runtime-env-wire.yml'
 
 permissions:
@@ -58,6 +59,9 @@ jobs:
 
       - name: Apply native MiddlewarePlan runtime wiring
         run: python .github/patches/middleware-runtime-wire.py
+
+      - name: Apply canonical service process model
+        run: python .github/patches/service-process-model-wire.py
 
       - name: Apply source security documentation
         run: python .github/patches/runtime-security-docs-wire.py
@@ -112,6 +116,9 @@ jobs:
           if ! grep -q 'apply_middleware_plan' engine/crates/backend/src/runtime_image_boot.rs; then
             python .github/patches/middleware-runtime-wire.py
           fi
+          if ! grep -q 'fn running_as_service_executable()' engine/crates/backend/src/main.rs; then
+            python .github/patches/service-process-model-wire.py
+          fi
           if [ ! -f doc/source-security.md ]; then
             python .github/patches/runtime-security-docs-wire.py
           fi
@@ -137,6 +144,7 @@ jobs:
             .github/patches/runtime-policy-wire.py \
             .github/patches/runtime-launch-hardening-wire.py \
             .github/patches/middleware-runtime-wire.py \
+            .github/patches/service-process-model-wire.py \
             .github/patches/runtime-security-docs-wire.py \
             .github/workflows/service-runtime-env-wire.yml
           git config user.name 'github-actions[bot]'
@@ -145,5 +153,5 @@ jobs:
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m 'FIX | BUG-REL-ENV-001 pin Runtime Image execution and Service ENV'
+          git commit -m 'FIX | BUG-RUNTIME-001 pin Runtime Image and canonical service process model'
           git push origin HEAD:main
