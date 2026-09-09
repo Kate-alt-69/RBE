@@ -13,9 +13,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: engine-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   engine:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: engine
