@@ -12,9 +12,12 @@ use std::process::Command;
 
 use logging::Logger;
 use secrecy::SecretString;
+use zeroize::Zeroizing;
 
 use acl::Acl;
 use file_store::FileStore;
+
+const FALLBACK_MASTER_KEY_ENV: &str = "RBE_VAULT_FALLBACK_MASTER_KEY";
 
 enum Backend {
     Keyring { service_name: String },
@@ -42,11 +45,16 @@ impl Vault {
         } else if probe_keyring(&service_name) {
             Backend::Keyring { service_name }
         } else {
+            let master_key = Zeroizing::new(std::env::var(FALLBACK_MASTER_KEY_ENV).map_err(|_| {
+                anyhow::anyhow!(
+                    "OS credential service is unavailable and {FALLBACK_MASTER_KEY_ENV} is not set; refusing to create a plaintext vault master key beside the encrypted fallback store"
+                )
+            })?);
             log.warn(
-                "Secret Service unavailable; falling back to local encrypted file store for this run",
+                "Secret Service unavailable; using encrypted file store with an externally supplied master key",
             );
             Backend::File {
-                store: FileStore::open(io, data_dir)?,
+                store: FileStore::open(io, data_dir, &master_key)?,
             }
         };
 

@@ -1,8 +1,8 @@
 //! Fallback credential store for when the OS credential store isn't
 //! available (headless Linux with no Secret Service daemon is the
 //! realistic case — see `lib.rs`'s startup probe). AES-256-GCM,
-//! per-entry nonce, matching the encryption scheme named in the
-//! design discussion.
+//! per-entry nonce, with the master key supplied from outside the
+//! data directory rather than persisted beside the ciphertext.
 
 use std::collections::HashMap;
 use std::fs;
@@ -13,6 +13,9 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use atomic_io::AtomicIo;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+const LEGACY_MASTER_KEY_FILE: &str = "vault-master.key";
 
 #[derive(Serialize, Deserialize, Clone)]
 struct StoredEntry {
@@ -23,20 +26,24 @@ struct StoredEntry {
 pub struct FileStore {
     io: AtomicIo,
     store_path: PathBuf,
-    key: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
 }
 
 impl FileStore {
-    pub fn open(io: AtomicIo, dir: &Path) -> anyhow::Result<Self> {
+    pub fn open(io: AtomicIo, dir: &Path, master_key_hex: &str) -> anyhow::Result<Self> {
         fs::create_dir_all(dir)?;
         let store_path = dir.join("vault-store.json");
-        let key_path = dir.join("vault-master.key");
-        let key = read_or_create_key(&io, &key_path, &store_path)?;
-        Ok(Self {
+        let legacy_key_path = dir.join(LEGACY_MASTER_KEY_FILE);
+        let key = parse_master_key(master_key_hex, "externally supplied vault fallback key")?;
+        migrate_legacy_key(&legacy_key_path, &store_path, &key)?;
+
+        let store = Self {
             io,
             store_path,
             key,
-        })
+        };
+        store.validate_existing_entries()?;
+        Ok(store)
     }
 
     pub fn get(&self, name: &str) -> anyhow::Result<String> {
@@ -77,8 +84,19 @@ impl FileStore {
         Ok(())
     }
 
+    fn validate_existing_entries(&self) -> anyhow::Result<()> {
+        for (name, entry) in self.load_map()? {
+            self.decrypt(&entry).map_err(|error| {
+                anyhow::anyhow!(
+                    "vault fallback credential {name:?} could not be decrypted with the supplied master key: {error}"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.key))
+        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*self.key))
     }
 
     fn encrypt(&self, plaintext: &str) -> anyhow::Result<StoredEntry> {
@@ -120,62 +138,58 @@ impl FileStore {
     }
 }
 
-fn read_or_create_key(
-    io: &AtomicIo,
-    key_path: &Path,
-    store_path: &Path,
-) -> anyhow::Result<[u8; 32]> {
-    match fs::read_to_string(key_path) {
-        Ok(existing) => {
-            let trimmed = existing.trim();
-            let bytes = hex::decode(trimmed).map_err(|error| {
-                anyhow::anyhow!(
-                    "vault master key {} is malformed: {error}",
-                    key_path.display()
-                )
-            })?;
-            if bytes.len() != 32 {
-                anyhow::bail!(
-                    "vault master key {} is {} bytes, expected exactly 32; refusing to replace a key that may protect existing credentials",
-                    key_path.display(),
-                    bytes.len()
-                );
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            return Ok(key);
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "failed to read vault master key {}: {error}",
-                key_path.display()
-            ));
-        }
-    }
-
-    if store_path.exists() {
+fn parse_master_key(value: &str, label: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+    let trimmed = value.trim();
+    let bytes = Zeroizing::new(
+        hex::decode(trimmed)
+            .map_err(|error| anyhow::anyhow!("{label} is not valid hexadecimal: {error}"))?,
+    );
+    if bytes.len() != 32 {
         anyhow::bail!(
-            "vault credential store {} exists but master key {} is missing; refusing to generate a replacement key that would make existing credentials unrecoverable",
-            store_path.display(),
-            key_path.display()
+            "{label} is {} bytes, expected exactly 32 (64 hexadecimal characters)",
+            bytes.len()
         );
     }
 
-    use rand::RngCore;
     let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
-    io.write_atomic(key_path, hex::encode(key).as_bytes())?;
+    key.copy_from_slice(&bytes);
+    Ok(Zeroizing::new(key))
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(key_path)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(key_path, perms)?;
+fn migrate_legacy_key(
+    key_path: &Path,
+    store_path: &Path,
+    supplied_key: &[u8; 32],
+) -> anyhow::Result<()> {
+    let existing = match fs::read_to_string(key_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "failed to inspect legacy vault master key {}: {error}",
+                key_path.display()
+            ));
+        }
+    };
+
+    if store_path.exists() {
+        let legacy = parse_master_key(&existing, "legacy vault master key")?;
+        if &*legacy != supplied_key {
+            anyhow::bail!(
+                "legacy vault credential store {} is protected by a different master key; refusing to delete {} or open the store with the supplied key",
+                store_path.display(),
+                key_path.display()
+            );
+        }
     }
 
-    Ok(key)
+    fs::remove_file(key_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to remove legacy plaintext vault master key {}: {error}",
+            key_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -188,22 +202,27 @@ mod tests {
         dir
     }
 
+    fn test_key(byte: u8) -> String {
+        hex::encode([byte; 32])
+    }
+
     #[test]
-    fn round_trips_a_value() {
+    fn round_trips_a_value_without_writing_master_key() {
         let dir = temp_dir("roundtrip");
-        let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
+        let store = FileStore::open(AtomicIo::new(), &dir, &test_key(7)).unwrap();
         store
             .set("db.password", "correct horse battery staple")
             .unwrap();
         let value = store.get("db.password").unwrap();
         assert_eq!(value, "correct horse battery staple");
+        assert!(!dir.join(LEGACY_MASTER_KEY_FILE).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn missing_key_is_a_clear_error_not_a_panic() {
+    fn missing_credential_is_a_clear_error_not_a_panic() {
         let dir = temp_dir("missing");
-        let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
+        let store = FileStore::open(AtomicIo::new(), &dir, &test_key(7)).unwrap();
         assert!(store.get("does.not.exist").is_err());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -211,7 +230,7 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails_to_decrypt() {
         let dir = temp_dir("tamper");
-        let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
+        let store = FileStore::open(AtomicIo::new(), &dir, &test_key(7)).unwrap();
         store.set("secret", "sensitive-value").unwrap();
         let mut map = store.load_map().unwrap();
         let entry = map.get_mut("secret").unwrap();
@@ -226,7 +245,7 @@ mod tests {
     #[test]
     fn malformed_nonce_is_an_error_not_a_panic() {
         let dir = temp_dir("bad-nonce");
-        let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
+        let store = FileStore::open(AtomicIo::new(), &dir, &test_key(7)).unwrap();
         store.set("secret", "value").unwrap();
         let mut map = store.load_map().unwrap();
         map.get_mut("secret").unwrap().nonce = "00".repeat(8);
@@ -236,20 +255,47 @@ mod tests {
     }
 
     #[test]
-    fn existing_store_without_key_fails_closed() {
-        let dir = temp_dir("missing-master-key");
-        let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
+    fn wrong_external_key_fails_during_open() {
+        let dir = temp_dir("wrong-key");
+        let store = FileStore::open(AtomicIo::new(), &dir, &test_key(7)).unwrap();
         store.set("secret", "value").unwrap();
         drop(store);
-        fs::remove_file(dir.join("vault-master.key")).unwrap();
-        assert!(FileStore::open(AtomicIo::new(), &dir).is_err());
+        assert!(FileStore::open(AtomicIo::new(), &dir, &test_key(9)).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matching_legacy_key_is_removed_after_migration() {
+        let dir = temp_dir("legacy-match");
+        fs::create_dir_all(&dir).unwrap();
+        let key = test_key(7);
+        fs::write(dir.join(LEGACY_MASTER_KEY_FILE), &key).unwrap();
+        let store = FileStore::open(AtomicIo::new(), &dir, &key).unwrap();
+        assert!(!dir.join(LEGACY_MASTER_KEY_FILE).exists());
+        store.set("secret", "value").unwrap();
+        assert_eq!(store.get("secret").unwrap(), "value");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mismatched_legacy_key_preserves_existing_store_and_key() {
+        let dir = temp_dir("legacy-mismatch");
+        let old_key = test_key(7);
+        let store = FileStore::open(AtomicIo::new(), &dir, &old_key).unwrap();
+        store.set("secret", "value").unwrap();
+        drop(store);
+        fs::write(dir.join(LEGACY_MASTER_KEY_FILE), &old_key).unwrap();
+
+        assert!(FileStore::open(AtomicIo::new(), &dir, &test_key(9)).is_err());
+        assert!(dir.join(LEGACY_MASTER_KEY_FILE).exists());
+        assert!(dir.join("vault-store.json").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn two_entries_never_share_a_nonce() {
         let dir = temp_dir("nonce-uniqueness");
-        let store = FileStore::open(AtomicIo::new(), &dir).unwrap();
+        let store = FileStore::open(AtomicIo::new(), &dir, &test_key(7)).unwrap();
         store.set("a", "value-a").unwrap();
         store.set("b", "value-b").unwrap();
         let map = store.load_map().unwrap();
