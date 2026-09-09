@@ -8,39 +8,48 @@ set -e
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-ensure_container_signing_key() {
-    if [ -n "${RBE_CONTAINER_SIGNING_PRIVATE_KEY:-}" ]; then
+remove_legacy_container_signing_key() {
+    local key_dir="${RBE_CONFIG_HOME:-${HOME:-$REPO_ROOT}/.rbe}"
+    local key_path="$key_dir/container-signing.key"
+    if [ ! -e "$key_path" ]; then
         return 0
     fi
 
-    local key_dir="${RBE_CONFIG_HOME:-${HOME:-$REPO_ROOT}/.rbe}"
-    local key_path="$key_dir/container-signing.key"
+    rm -f -- "$key_path"
+    if [ -e "$key_path" ]; then
+        echo "ERROR: failed to remove legacy local signing credential: $key_path" >&2
+        exit 1
+    fi
+    echo "Removed legacy local signing credential: $key_path" >&2
+}
 
-    if [ -f "$key_path" ]; then
-        local existing
-        existing="$(tr -d '[:space:]' < "$key_path")"
-        if [[ "$existing" =~ ^[0-9a-fA-F]{64}$ ]]; then
-            export RBE_CONTAINER_SIGNING_PRIVATE_KEY="$existing"
-            echo "Using existing local RBE container signing key: $key_path" >&2
-            return 0
+ensure_container_signing_key() {
+    if [ -n "${RBE_CONTAINER_SIGNING_PRIVATE_KEY:-}" ]; then
+        if [[ ! "$RBE_CONTAINER_SIGNING_PRIVATE_KEY" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "ERROR: RBE_CONTAINER_SIGNING_PRIVATE_KEY must contain exactly 64 hexadecimal characters." >&2
+            exit 1
         fi
-        echo "WARNING: local RBE container signing key is invalid; regenerating it." >&2
-        rm -f "$key_path"
+        remove_legacy_container_signing_key
+        echo "Using externally supplied RBE container signing key." >&2
+        return 0
     fi
 
+    remove_legacy_container_signing_key
+
     if ! command -v openssl >/dev/null 2>&1; then
-        echo "ERROR: OpenSSL is required to generate the local RBE container signing key." >&2
+        echo "ERROR: OpenSSL is required to generate the ephemeral local RBE container signing key." >&2
         echo "Install OpenSSL or set RBE_CONTAINER_SIGNING_PRIVATE_KEY explicitly." >&2
         exit 1
     fi
 
-    mkdir -p "$key_dir"
     local key
     key="$(openssl rand -hex 32)"
-    printf '%s\n' "$key" > "$key_path"
-    chmod 600 "$key_path" 2>/dev/null || true
+    if [[ ! "$key" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "ERROR: OpenSSL failed to generate a valid 32-byte container signing key." >&2
+        exit 1
+    fi
     export RBE_CONTAINER_SIGNING_PRIVATE_KEY="$key"
-    echo "Generated and saved local RBE container signing key: $key_path" >&2
+    echo "Generated ephemeral local RBE container signing key (not written to disk)." >&2
 }
 
 ensure_container_signing_key
