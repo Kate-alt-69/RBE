@@ -1,0 +1,82 @@
+name: Native REL route WASM compiler
+
+on:
+  push:
+    paths:
+      - '.github/workflows/route-wasm-compiler.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: route-wasm-compiler-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply native REL route WASM compiler
+        run: python .github/patches/route-wasm-compiler.py
+
+      - name: Format
+        run: cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Refresh engine lockfile
+        run: cargo check --manifest-path engine/Cargo.toml -p route-engine
+
+      - name: Check route engine locked
+        run: cargo check --manifest-path engine/Cargo.toml -p route-engine --locked
+
+      - name: Test route engine native compiler and cache
+        run: cargo test --manifest-path engine/Cargo.toml -p route-engine --locked
+
+      - name: Clippy route engine
+        run: cargo clippy --manifest-path engine/Cargo.toml -p route-engine --all-targets --locked -- -D warnings
+
+      - name: Verify native WASM cache contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          grep -q 'pub const ROUTE_WASM_ABI_VERSION: u32 = 1' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q 'rbe", "output_write"' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q 'RouteWasmCompilation::Native' engine/crates/route-engine/src/cache.rs
+          grep -q '"interpreter_fallback"' engine/crates/route-engine/src/cache.rs
+          grep -q 'CACHE_MANIFEST_VERSION: u64 = 2' engine/crates/route-engine/src/cache.rs
+          grep -q 'io.write_atomic(&wasm_path, &native.bytes)' engine/crates/route-engine/src/cache.rs
+          grep -q 'wasm-encoder = "0.248"' engine/crates/route-engine/Cargo.toml
+          grep -q 'wasmparser = "0.248"' engine/crates/route-engine/Cargo.toml
+
+      - name: Commit verified native route WASM compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          latest="$(git rev-parse origin/main)"
+          if [[ "$latest" != "$GITHUB_SHA" ]]; then
+            echo "main moved during validation; refusing stale commit" >&2
+            exit 75
+          fi
+
+          rm -f .github/patches/route-wasm-compiler.py
+          rm -f .github/workflows/route-wasm-compiler.yml
+
+          git add -A
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'FIX | BUG-WASM-004 compile literal REL routes to native WASM'
+          git push origin HEAD:main
