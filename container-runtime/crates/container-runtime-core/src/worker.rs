@@ -26,9 +26,9 @@ struct WorkerCommand {
     task: ExecutionTask,
 }
 
-pub type Runner = Arc<dyn Fn(&ExecutionTask) -> Result<(), String> + Send + Sync + 'static>;
+pub type Runner = Arc<dyn Fn(&ExecutionTask) -> Result<Vec<u8>, String> + Send + Sync + 'static>;
 pub(crate) type Completion =
-    Arc<dyn Fn(&ExecutionTask, u64, Result<(), String>) + Send + Sync + 'static>;
+    Arc<dyn Fn(&ExecutionTask, u64, Result<Vec<u8>, String>) + Send + Sync + 'static>;
 type Availability = Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub struct Worker {

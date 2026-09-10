@@ -22,8 +22,9 @@ use container_runtime_core::{
 };
 use execution_engine::{ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
-    decode_request, read_frame, write_frame, Request, Response, MAX_ARTIFACT_BYTES,
-    MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES, PROTOCOL_VERSION,
+    decode_request, read_frame, read_worker_input, write_frame, write_worker_result, Request,
+    Response, WorkerResultFrame, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS,
+    MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES, PROTOCOL_VERSION,
 };
 use resource_limits::ResourceLimits;
 use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, SandboxPolicy};
@@ -352,17 +353,32 @@ fn now_ms() -> u128 {
 }
 
 fn run_worker(args: &[String]) -> anyhow::Result<()> {
+    let frame = match run_worker_inner(args) {
+        Ok(output) => WorkerResultFrame::Success(output),
+        Err(error) => WorkerResultFrame::Error(bounded_worker_error(&error.to_string())),
+    };
+    let mut stdout = std::io::stdout().lock();
+    write_worker_result(&mut stdout, &frame)
+        .map_err(|error| anyhow::anyhow!("worker: failed to write result frame: {error}"))?;
+    Ok(())
+}
+
+fn run_worker_inner(args: &[String]) -> anyhow::Result<Vec<u8>> {
     set_no_new_privileges()
         .map_err(|e| anyhow::anyhow!("worker: failed to set no_new_privs: {e}"))?;
     install_restricted_seccomp()
         .map_err(|e| anyhow::anyhow!("worker: failed to install seccomp: {e}"))?;
+
+    let mut stdin = std::io::stdin().lock();
+    let input = read_worker_input(&mut stdin)
+        .map_err(|e| anyhow::anyhow!("worker: invalid invocation frame: {e}"))?;
+
     let artifact = value_after(args, "--artifact")
         .ok_or_else(|| anyhow::anyhow!("worker: --artifact is required"))?;
-    if artifact.is_empty()
-        || artifact.len() > 128
+    if artifact.len() != 64
         || !artifact
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         anyhow::bail!("worker: invalid artifact hash");
     }
@@ -380,17 +396,31 @@ fn run_worker(args: &[String]) -> anyhow::Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(64 * 1024 * 1024);
     let executor = WasmExecutor::new()?;
-    let result = executor.execute(
+    let result = executor.execute_with_input(
         &wasm,
+        &input,
         ExecutionLimits {
             fuel,
             max_memory_bytes,
+            max_output_bytes: MAX_EXECUTION_OUTPUT_BYTES as u64,
         },
     )?;
     if result.exit_code != 0 {
         anyhow::bail!("worker: WASM exited with status {}", result.exit_code);
     }
-    Ok(())
+    Ok(result.output)
+}
+
+fn bounded_worker_error(message: &str) -> String {
+    const LIMIT: usize = 32 * 1024;
+    if message.len() <= LIMIT {
+        return message.to_string();
+    }
+    let mut end = LIMIT;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &message[..end])
 }
 
 fn run_control_server(

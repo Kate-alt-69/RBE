@@ -10,6 +10,10 @@ pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EXECUTION_INPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_EXECUTION_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_AWAIT_RESULT_MS: u64 = 30_000;
+pub const MAX_WORKER_ERROR_BYTES: usize = 64 * 1024;
+const WORKER_PIPE_MAGIC: [u8; 4] = *b"RBW1";
+const WORKER_STATUS_SUCCESS: u8 = 0;
+const WORKER_STATUS_ERROR: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
@@ -107,6 +111,12 @@ pub struct WorkCost {
     pub network: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerResultFrame {
+    Success(Vec<u8>),
+    Error(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     HelloAccepted {
@@ -194,6 +204,112 @@ pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body)?;
     Ok(body)
+}
+
+pub fn write_worker_input<W: Write>(writer: &mut W, input: &[u8]) -> io::Result<()> {
+    if input.len() > MAX_EXECUTION_INPUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker invocation input exceeds maximum size",
+        ));
+    }
+    writer.write_all(&WORKER_PIPE_MAGIC)?;
+    writer.write_all(&(input.len() as u32).to_be_bytes())?;
+    writer.write_all(input)?;
+    writer.flush()
+}
+
+pub fn read_worker_input<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    expect_worker_magic(reader)?;
+    let length = read_worker_length(reader, MAX_EXECUTION_INPUT_BYTES, "worker invocation input")?;
+    let mut input = vec![0u8; length];
+    reader.read_exact(&mut input)?;
+    Ok(input)
+}
+
+pub fn write_worker_result<W: Write>(writer: &mut W, result: &WorkerResultFrame) -> io::Result<()> {
+    writer.write_all(&WORKER_PIPE_MAGIC)?;
+    match result {
+        WorkerResultFrame::Success(output) => {
+            if output.len() > MAX_EXECUTION_OUTPUT_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worker execution output exceeds maximum size",
+                ));
+            }
+            writer.write_all(&[WORKER_STATUS_SUCCESS])?;
+            writer.write_all(&(output.len() as u32).to_be_bytes())?;
+            writer.write_all(output)?;
+        }
+        WorkerResultFrame::Error(message) => {
+            let bytes = message.as_bytes();
+            if bytes.len() > MAX_WORKER_ERROR_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worker error payload exceeds maximum size",
+                ));
+            }
+            writer.write_all(&[WORKER_STATUS_ERROR])?;
+            writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+            writer.write_all(bytes)?;
+        }
+    }
+    writer.flush()
+}
+
+pub fn read_worker_result<R: Read>(reader: &mut R) -> io::Result<WorkerResultFrame> {
+    expect_worker_magic(reader)?;
+    let mut status = [0u8; 1];
+    reader.read_exact(&mut status)?;
+    match status[0] {
+        WORKER_STATUS_SUCCESS => {
+            let length = read_worker_length(reader, MAX_EXECUTION_OUTPUT_BYTES, "worker output")?;
+            let mut output = vec![0u8; length];
+            reader.read_exact(&mut output)?;
+            Ok(WorkerResultFrame::Success(output))
+        }
+        WORKER_STATUS_ERROR => {
+            let length = read_worker_length(reader, MAX_WORKER_ERROR_BYTES, "worker error")?;
+            let mut bytes = vec![0u8; length];
+            reader.read_exact(&mut bytes)?;
+            let message = String::from_utf8(bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("worker error is not UTF-8: {error}"),
+                )
+            })?;
+            Ok(WorkerResultFrame::Error(message))
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown worker result status {other}"),
+        )),
+    }
+}
+
+fn expect_worker_magic<R: Read>(reader: &mut R) -> io::Result<()> {
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if magic != WORKER_PIPE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid worker pipe protocol magic",
+        ));
+    }
+    Ok(())
+}
+
+fn read_worker_length<R: Read>(reader: &mut R, max: usize, label: &str) -> io::Result<usize> {
+    let mut length = [0u8; 4];
+    reader.read_exact(&mut length)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} exceeds maximum size"),
+        ));
+    }
+    Ok(length)
 }
 
 pub fn decode_request(bytes: &[u8]) -> io::Result<Request> {
@@ -284,6 +400,27 @@ mod tests {
         };
         assert_eq!(decoded.timeout_ms, 250);
         assert!(decoded.execution_id.starts_with("exec-"));
+    }
+
+    #[test]
+    fn worker_pipe_round_trips_binary_input_and_output() {
+        let input = b"request\0bytes".to_vec();
+        let mut encoded = Vec::new();
+        write_worker_input(&mut encoded, &input).unwrap();
+        assert_eq!(read_worker_input(&mut encoded.as_slice()).unwrap(), input);
+
+        let frame = WorkerResultFrame::Success(b"response\0bytes".to_vec());
+        let mut encoded = Vec::new();
+        write_worker_result(&mut encoded, &frame).unwrap();
+        assert_eq!(read_worker_result(&mut encoded.as_slice()).unwrap(), frame);
+    }
+
+    #[test]
+    fn worker_pipe_rejects_oversized_lengths_before_allocating() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&WORKER_PIPE_MAGIC);
+        encoded.extend_from_slice(&((MAX_EXECUTION_INPUT_BYTES as u32) + 1).to_be_bytes());
+        assert!(read_worker_input(&mut encoded.as_slice()).is_err());
     }
 
     #[test]

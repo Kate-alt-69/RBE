@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{create_dir_all, read_to_string, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use environments::EnvironmentId;
 use execution_engine::WasmExecutor;
+use ipc_protocol::{read_worker_result, write_worker_input, WorkerResultFrame};
 use resource_limits::ResourceLimits;
 use sandbox_primitives::SandboxPolicy;
 use serde::{Deserialize, Serialize};
@@ -340,15 +341,17 @@ impl Runtime {
                 if is_cancelled(&cancelled, task) {
                     return Err("execution cancelled before start".into());
                 }
-                if cache.contains_artifact(&task.artifact_hash) {
-                    run_isolated_worker(task, &cancelled)?;
+                let output = if cache.contains_artifact(&task.artifact_hash) {
+                    run_isolated_worker(task, &cancelled)?
                 } else if task.work_ms > 0 {
-                    run_simulated_work(task, &cancelled)?;
-                }
+                    run_simulated_work(task, &cancelled)?
+                } else {
+                    Vec::new()
+                };
                 if is_cancelled(&cancelled, task) {
                     return Err("execution cancelled".into());
                 }
-                Ok(())
+                Ok(output)
             })
         };
 
@@ -375,7 +378,7 @@ impl Runtime {
                     }
                 } else {
                     ExecutionOutcome {
-                        output: Vec::new(),
+                        output: result.as_ref().ok().cloned().unwrap_or_default(),
                         error: result.as_ref().err().cloned(),
                         elapsed_ms,
                         cancelled: false,
@@ -820,7 +823,7 @@ fn is_cancelled(cancelled: &Arc<Mutex<HashSet<String>>>, task: &ExecutionTask) -
 fn run_simulated_work(
     task: &ExecutionTask,
     cancelled: &Arc<Mutex<HashSet<String>>>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let started = Instant::now();
     let work = Duration::from_millis(task.work_ms);
     let timeout = Duration::from_millis(task.limits.wall_time_ms.max(1));
@@ -830,7 +833,7 @@ fn run_simulated_work(
         }
         let elapsed = started.elapsed();
         if elapsed >= work {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if elapsed >= timeout {
             return Err(format!(
@@ -845,7 +848,7 @@ fn run_simulated_work(
 fn run_isolated_worker(
     task: &ExecutionTask,
     cancelled: &Arc<Mutex<HashSet<String>>>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let artifact = &task.artifact_hash;
     let fuel = task.limits.cpu_millis.saturating_mul(10_000).max(1_000_000);
@@ -860,7 +863,45 @@ fn run_isolated_worker(
         "--memory",
         &memory.to_string(),
     ]);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
     let mut child = command.spawn().map_err(|e| e.to_string())?;
+
+    let write_result = (|| -> Result<(), String> {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "isolated worker stdin pipe is unavailable".to_string())?;
+        write_worker_input(&mut stdin, &task.payload).map_err(|e| e.to_string())?;
+        drop(stdin);
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "failed to send invocation data to isolated worker: {error}"
+        ));
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "isolated worker stdout pipe is unavailable".to_string())?;
+    let result_reader = thread::Builder::new()
+        .name(format!("rbe-worker-result-{}", task.id))
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            read_worker_result(&mut reader)
+        })
+        .map_err(|e| {
+            let _ = child.kill();
+            let _ = child.wait();
+            format!("failed to start isolated worker result reader: {e}")
+        })?;
+
     let started = Instant::now();
     let timeout = Duration::from_millis(task.limits.wall_time_ms.max(1));
 
@@ -868,19 +909,34 @@ fn run_isolated_worker(
         if is_cancelled(cancelled, task) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = result_reader.join();
             return Err("execution cancelled".into());
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = result_reader.join();
             return Err(format!(
                 "execution timed out after {} ms",
                 task.limits.wall_time_ms
             ));
         }
         match child.try_wait().map_err(|e| e.to_string())? {
-            Some(status) if status.success() => return Ok(()),
-            Some(status) => return Err(format!("isolated worker exited with status {status}")),
+            Some(status) => {
+                let frame = result_reader
+                    .join()
+                    .map_err(|_| "isolated worker result reader panicked".to_string())?
+                    .map_err(|e| {
+                        format!("isolated worker returned an invalid result frame: {e}")
+                    })?;
+                if !status.success() {
+                    return Err(format!("isolated worker exited with status {status}"));
+                }
+                return match frame {
+                    WorkerResultFrame::Success(output) => Ok(output),
+                    WorkerResultFrame::Error(message) => Err(message),
+                };
+            }
             None => thread::sleep(Duration::from_millis(10)),
         }
     }

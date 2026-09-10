@@ -254,7 +254,7 @@ mod tests {
                         .wait_while(released, |released| !*released)
                         .expect("gate poisoned");
                 }
-                Ok(())
+                Ok(Vec::new())
             })
         };
         let completed = Arc::new((Mutex::new(0usize), Condvar::new()));
