@@ -47,8 +47,9 @@ jobs:
           python .github/patches/service-bin-split.py
           python - <<'PY'
           from pathlib import Path
-          path = Path('engine/crates/backend/src/service_mother.rs')
-          text = path.read_text(encoding='utf-8')
+
+          mother_path = Path('engine/crates/backend/src/service_mother.rs')
+          text = mother_path.read_text(encoding='utf-8')
           old_call = "            supervisor_fingerprint,\n            runtime_env,\n"
           new_call = "            supervisor_fingerprint,\n            expected_service_sha256,\n            runtime_env,\n"
           if old_call not in text:
@@ -58,7 +59,38 @@ jobs:
           new_sig = "    expected_catalog_fingerprint: String,\n    expected_service_sha256: String,\n    runtime_env: Arc<serde_json::Value>,\n"
           if old_sig not in text:
               raise SystemExit('Service Mother supervise signature anchor changed')
-          path.write_text(text.replace(old_sig, new_sig, 1), encoding='utf-8')
+          mother_path.write_text(text.replace(old_sig, new_sig, 1), encoding='utf-8')
+
+          # A few source modules are intentionally shared between the two binary roots while
+          # the physical executable split lands. Each root uses a different half of those
+          # modules, so scope dead-code allowances at the root rather than weakening the
+          # source modules or the workspace-wide lint policy.
+          backend_path = Path('engine/crates/backend/src/main.rs')
+          backend = backend_path.read_text(encoding='utf-8')
+          backend_replacements = {
+              'mod er_recovery;\n': '#[allow(dead_code)]\nmod er_recovery;\n',
+              'mod service_boot;\n': '#[allow(dead_code)]\nmod service_boot;\n',
+              'mod service_control;\n': '#[allow(dead_code)]\nmod service_control;\n',
+              'mod service_mother;\n': '#[allow(dead_code, clippy::too_many_arguments)]\nmod service_mother;\n',
+          }
+          for old, new in backend_replacements.items():
+              if old not in backend:
+                  raise SystemExit(f'backend shared-module anchor changed: {old.strip()}')
+              backend = backend.replace(old, new, 1)
+          backend_path.write_text(backend, encoding='utf-8')
+
+          service_path = Path('engine/crates/backend/src/service_main.rs')
+          service = service_path.read_text(encoding='utf-8')
+          service_replacements = {
+              'mod er_recovery;\n': '#[allow(dead_code)]\nmod er_recovery;\n',
+              'mod service_mother;\n': '#[allow(dead_code, clippy::too_many_arguments)]\nmod service_mother;\n',
+              'mod host_bootstrap {\n': '#[allow(dead_code)]\nmod host_bootstrap {\n',
+          }
+          for old, new in service_replacements.items():
+              if old not in service:
+                  raise SystemExit(f'Service shared-module anchor changed: {old.strip()}')
+              service = service.replace(old, new, 1)
+          service_path.write_text(service, encoding='utf-8')
           PY
 
       - name: Format
@@ -122,6 +154,10 @@ jobs:
           main = Path('engine/crates/backend/src/main.rs').read_text(encoding='utf-8')
           if 'running_as_service_executable' in main:
               raise SystemExit('backend still contains filename-based Service alias dispatch')
+          service_main = Path('engine/crates/backend/src/service_main.rs').read_text(encoding='utf-8')
+          for forbidden in ['mod container_process;', 'mod error_reporter_daemon;', 'mod vault_recovery;', 'mod runtime_image_boot;']:
+              if forbidden in service_main:
+                  raise SystemExit(f'Service root unexpectedly owns backend subsystem: {forbidden}')
           PY
 
       - name: Commit verified standalone Service runtime
