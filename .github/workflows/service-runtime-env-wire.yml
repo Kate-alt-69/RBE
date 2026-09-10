@@ -12,6 +12,7 @@ on:
       - '.github/patches/service-process-model-wire.py'
       - '.github/patches/service-process-model-fix.py'
       - '.github/patches/service-restart-control-wire.py'
+      - '.github/patches/host-bootstrap-er-wire.py'
       - '.github/workflows/service-runtime-env-wire.yml'
 
 permissions:
@@ -70,6 +71,16 @@ jobs:
 
       - name: Apply portable Service restart supervision
         run: python .github/patches/service-restart-control-wire.py
+
+      - name: Apply Linux HostBootstrap and ER authority modes
+        run: python .github/patches/host-bootstrap-er-wire.py
+
+      - name: Validate embedded Linux bootstrap scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh -n engine/crates/backend/scripts/bootstrap/linux/probe-secret-service.sh
+          sh -n engine/crates/backend/scripts/bootstrap/linux/install-secret-service.sh
 
       - name: Apply source security documentation
         run: python .github/patches/runtime-security-docs-wire.py
@@ -144,9 +155,14 @@ jobs:
           if [ ! -f engine/crates/backend/src/service_control.rs ]; then
             python .github/patches/service-restart-control-wire.py
           fi
+          if [ ! -f engine/crates/backend/src/host_bootstrap.rs ]; then
+            python .github/patches/host-bootstrap-er-wire.py
+          fi
           if [ ! -f doc/source-security.md ]; then
             python .github/patches/runtime-security-docs-wire.py
           fi
+          sh -n engine/crates/backend/scripts/bootstrap/linux/probe-secret-service.sh
+          sh -n engine/crates/backend/scripts/bootstrap/linux/install-secret-service.sh
           (cd engine && cargo fmt --all)
           (cd engine && cargo check --workspace)
           (cd engine && cargo check --workspace --locked)
@@ -173,6 +189,7 @@ jobs:
             .github/patches/service-process-model-wire.py \
             .github/patches/service-process-model-fix.py \
             .github/patches/service-restart-control-wire.py \
+            .github/patches/host-bootstrap-er-wire.py \
             .github/patches/runtime-security-docs-wire.py \
             .github/workflows/service-runtime-env-wire.yml
           git config user.name 'github-actions[bot]'
@@ -181,5 +198,5 @@ jobs:
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m 'FIX | BUG-RUNTIME-001 pin Runtime Image and canonical Service supervision'
+          git commit -m 'FIX | BUG-RUNTIME-001 pin Runtime Image, HostBootstrap, and Service supervision'
           git push origin HEAD:main
