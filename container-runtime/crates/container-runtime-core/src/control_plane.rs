@@ -222,9 +222,8 @@ impl CapabilityBroker {
             .write()
             .expect("capability manifest table poisoned");
         let before = manifests.len();
-        manifests.retain(|key, _| {
-            !(key.environment == environment && key.generation == generation)
-        });
+        manifests
+            .retain(|key, _| !(key.environment == environment && key.generation == generation));
         before.saturating_sub(manifests.len())
     }
 
@@ -291,7 +290,10 @@ fn validate_source_id(value: &str) -> Result<(), CapabilityError> {
         || value.contains('\0')
         || value.chars().any(char::is_control)
     {
-        return Err(invalid_identity("source_id", "is empty, too long, or invalid"));
+        return Err(invalid_identity(
+            "source_id",
+            "is empty, too long, or invalid",
+        ));
     }
     Ok(())
 }
@@ -301,7 +303,10 @@ fn validate_environment(value: &str) -> Result<(), CapabilityError> {
         value,
         "general-1" | "general-2" | "general-3" | "general-4" | "general-5" | "payment"
     ) {
-        return Err(invalid_identity("environment", "is not a configured RBE Environment"));
+        return Err(invalid_identity(
+            "environment",
+            "is not a configured RBE Environment",
+        ));
     }
     Ok(())
 }
@@ -395,7 +400,9 @@ mod tests {
     #[test]
     fn exact_grant_authorizes_and_enforces_request_bound() {
         let broker = CapabilityBroker::new(false);
-        broker.register_manifest(&request(vec![service_grant()])).unwrap();
+        broker
+            .register_manifest(&request(vec![service_grant()]))
+            .unwrap();
         let authorized = broker.authorize(call(4, "get_user", 1000)).unwrap();
         assert_eq!(authorized.max_response_bytes, 4096);
         let error = broker.authorize(call(4, "get_user", 1025)).unwrap_err();
@@ -405,9 +412,14 @@ mod tests {
     #[test]
     fn wrong_operation_and_generation_fail_closed() {
         let broker = CapabilityBroker::new(false);
-        broker.register_manifest(&request(vec![service_grant()])).unwrap();
+        broker
+            .register_manifest(&request(vec![service_grant()]))
+            .unwrap();
         assert_eq!(
-            broker.authorize(call(4, "delete_user", 1)).unwrap_err().code,
+            broker
+                .authorize(call(4, "delete_user", 1))
+                .unwrap_err()
+                .code,
             "CAPABILITY_DENIED"
         );
         assert_eq!(
@@ -424,7 +436,10 @@ mod tests {
             grant.kind = kind;
             grant.target = "shell".into();
             assert_eq!(
-                broker.register_manifest(&request(vec![grant])).unwrap_err().code,
+                broker
+                    .register_manifest(&request(vec![grant]))
+                    .unwrap_err()
+                    .code,
                 "DEBUG_DISABLED"
             );
         }
@@ -433,7 +448,9 @@ mod tests {
     #[test]
     fn revoke_is_bound_to_environment_generation() {
         let broker = CapabilityBroker::new(false);
-        broker.register_manifest(&request(vec![service_grant()])).unwrap();
+        broker
+            .register_manifest(&request(vec![service_grant()]))
+            .unwrap();
         assert_eq!(broker.revoke_environment_generation("general-1", 4), 1);
         assert_eq!(broker.manifest_count(), 0);
         assert_eq!(

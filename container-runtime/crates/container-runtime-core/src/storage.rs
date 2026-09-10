@@ -124,7 +124,10 @@ impl EnvironmentStorageManager {
     pub fn read(&self, namespace: &str, path: &str) -> Result<Option<Vec<u8>>> {
         validate_namespace(namespace)?;
         let path = normalize_relative_path(path)?;
-        let _guard = self.commit_lock.lock().expect("storage commit lock poisoned");
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("storage commit lock poisoned");
         let manifest = self.load_manifest(namespace)?;
         let Some(blob) = manifest.files.get(&path) else {
             return Ok(None);
@@ -146,13 +149,19 @@ impl EnvironmentStorageManager {
 
     pub fn list(&self, namespace: &str) -> Result<Vec<String>> {
         validate_namespace(namespace)?;
-        let _guard = self.commit_lock.lock().expect("storage commit lock poisoned");
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("storage commit lock poisoned");
         Ok(self.load_manifest(namespace)?.files.into_keys().collect())
     }
 
     pub fn snapshot(&self, namespace: &str) -> Result<StorageSnapshot> {
         validate_namespace(namespace)?;
-        let _guard = self.commit_lock.lock().expect("storage commit lock poisoned");
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("storage commit lock poisoned");
         let manifest = self.load_manifest(namespace)?;
         Ok(StorageSnapshot {
             namespace: namespace.to_string(),
@@ -169,7 +178,10 @@ impl EnvironmentStorageManager {
         mutations: &BTreeMap<String, StagedMutation>,
     ) -> Result<StorageCommit> {
         validate_namespace(namespace)?;
-        let _guard = self.commit_lock.lock().expect("storage commit lock poisoned");
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("storage commit lock poisoned");
         let current = self.load_manifest(namespace)?;
         let mut next_files = current.files.clone();
         let mut predicted_bytes = logical_bytes(&next_files)?;
@@ -349,7 +361,8 @@ pub struct StorageTransaction {
 impl StorageTransaction {
     pub fn put(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
         let path = normalize_relative_path(path)?;
-        let bytes_len = u64::try_from(bytes.len()).map_err(|_| anyhow!("storage write is too large"))?;
+        let bytes_len =
+            u64::try_from(bytes.len()).map_err(|_| anyhow!("storage write is too large"))?;
         if bytes_len > self.manager.limit_bytes {
             bail!("single storage write exceeds Environment quota");
         }
@@ -382,11 +395,7 @@ impl StorageTransaction {
 
     pub fn delete(&mut self, path: &str) -> Result<()> {
         let path = normalize_relative_path(path)?;
-        if let Some(StagedMutation::Put {
-            staged_path,
-            bytes,
-        }) = self.mutations.remove(&path)
-        {
+        if let Some(StagedMutation::Put { staged_path, bytes }) = self.mutations.remove(&path) {
             self.staged_bytes = self.staged_bytes.saturating_sub(bytes);
             let _ = fs::remove_file(staged_path);
         }
@@ -512,7 +521,10 @@ mod tests {
         first.put("sessions/index.json", b"sessions-v1").unwrap();
         let commit = first.commit().unwrap();
         assert_eq!(commit.generation, 1);
-        assert_eq!(storage.read("uac", "users/index.json").unwrap().unwrap(), b"users-v1");
+        assert_eq!(
+            storage.read("uac", "users/index.json").unwrap().unwrap(),
+            b"users-v1"
+        );
 
         let mut second = storage.begin("uac").unwrap();
         second.put("users/index.json", b"users-v2").unwrap();
@@ -520,9 +532,18 @@ mod tests {
         second.put("metadata.json", b"meta-v2").unwrap();
         let commit = second.commit().unwrap();
         assert_eq!(commit.generation, 2);
-        assert_eq!(storage.read("uac", "users/index.json").unwrap().unwrap(), b"users-v2");
-        assert!(storage.read("uac", "sessions/index.json").unwrap().is_none());
-        assert_eq!(storage.read("uac", "metadata.json").unwrap().unwrap(), b"meta-v2");
+        assert_eq!(
+            storage.read("uac", "users/index.json").unwrap().unwrap(),
+            b"users-v2"
+        );
+        assert!(storage
+            .read("uac", "sessions/index.json")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage.read("uac", "metadata.json").unwrap().unwrap(),
+            b"meta-v2"
+        );
 
         assert!(storage.generation_path("uac", 1).is_file());
         assert!(storage.generation_path("uac", 2).is_file());

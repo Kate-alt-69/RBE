@@ -59,12 +59,13 @@ impl EnvironmentRuntime {
             .join("container-runtime")
             .join("environments")
             .join(id.to_string());
-        let storage_manager = EnvironmentStorageManager::open(storage_path.clone(), storage.limit_bytes)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to initialize transactional storage for Environment {id}: {error}"
-                )
-            });
+        let storage_manager =
+            EnvironmentStorageManager::open(storage_path.clone(), storage.limit_bytes)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to initialize transactional storage for Environment {id}: {error}"
+                    )
+                });
         let swamps = Self::build_swamps(swamp_count, workers_per_swamp, &runner, &on_complete);
         Self {
             id,
