@@ -1,16 +1,18 @@
-use std::fs::{create_dir_all, remove_dir_all};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use environments::EnvironmentId;
 
 use crate::execution::ExecutionTask;
+use crate::storage::EnvironmentStorageManager;
 use crate::swamp::{Swamp, SwampSnapshot};
 use crate::worker::{Completion, Runner};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EnvironmentStorage {
     pub limit_bytes: u64,
+    /// When true, volatile and staging data are reset with the Environment.
+    /// Transactionally committed namespace state is deliberately persistent.
     pub ephemeral: bool,
 }
 
@@ -23,6 +25,7 @@ pub struct EnvironmentRuntime {
     swamps: Mutex<Vec<Arc<Swamp>>>,
     storage: EnvironmentStorage,
     storage_path: PathBuf,
+    storage_manager: Arc<EnvironmentStorageManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +59,12 @@ impl EnvironmentRuntime {
             .join("container-runtime")
             .join("environments")
             .join(id.to_string());
-        Self::prepare_ephemeral_storage(&storage_path);
+        let storage_manager = EnvironmentStorageManager::open(storage_path.clone(), storage.limit_bytes)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to initialize transactional storage for Environment {id}: {error}"
+                )
+            });
         let swamps = Self::build_swamps(swamp_count, workers_per_swamp, &runner, &on_complete);
         Self {
             id,
@@ -67,17 +75,20 @@ impl EnvironmentRuntime {
             swamps: Mutex::new(swamps),
             storage,
             storage_path,
+            storage_manager,
         }
-    }
-
-    fn prepare_ephemeral_storage(path: &PathBuf) {
-        let _ = create_dir_all(path);
     }
 
     fn reset_ephemeral_storage(&self) {
         if self.storage.ephemeral {
-            let _ = remove_dir_all(&self.storage_path);
-            Self::prepare_ephemeral_storage(&self.storage_path);
+            self.storage_manager
+                .reset_volatile()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to reset volatile storage for Environment {}: {error}",
+                        self.id
+                    )
+                });
         }
     }
 
@@ -152,6 +163,10 @@ impl EnvironmentRuntime {
         for task in swamps[source.id].drain(source.queued / 2) {
             swamps[target.id].enqueue(task);
         }
+    }
+
+    pub fn storage(&self) -> Arc<EnvironmentStorageManager> {
+        Arc::clone(&self.storage_manager)
     }
 
     pub fn snapshot(&self) -> EnvironmentSnapshot {
