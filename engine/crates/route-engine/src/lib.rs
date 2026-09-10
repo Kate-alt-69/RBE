@@ -43,6 +43,7 @@ pub mod source_registry;
 pub mod transpiled_support;
 pub mod transpiler;
 mod video_host;
+pub mod wasm_compiler;
 
 pub use analyzer::{analyze, Diagnostic, Severity};
 pub use ast::{
@@ -82,6 +83,10 @@ pub use server_rel::{
 pub use service_eval::ServiceProgramExecutor;
 pub use source_registry::{
     RelSource, RelSourceKind, RelSourceRegistry, SourceId, SourceOrigin, SourceRegistryError,
+};
+pub use wasm_compiler::{
+    compile_route as compile_route_wasm, RouteWasmArtifact, RouteWasmCompilation,
+    ROUTE_WASM_ABI_VERSION,
 };
 
 pub fn build_routes(

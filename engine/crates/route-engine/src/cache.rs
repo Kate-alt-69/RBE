@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::analyzer::{analyze, Severity};
 use crate::ast::RouteFile;
 use crate::discovery::{collect_route_files, hash_bytes};
@@ -15,8 +17,9 @@ use crate::lexer::Lexer;
 use crate::modules::binding_name;
 use crate::parser::Parser;
 use crate::transpiler::transpile_file;
+use crate::wasm_compiler::{compile_route, RouteWasmCompilation, ROUTE_WASM_ABI_VERSION};
 
-const CACHE_MANIFEST_VERSION: u64 = 1;
+const CACHE_MANIFEST_VERSION: u64 = 2;
 
 pub struct SyncOutcome {
     pub route_path: PathBuf,
@@ -56,6 +59,7 @@ fn existing_hash_matches(
     io: &atomic_io::AtomicIo,
     manifest_path: &Path,
     artifact_path: &Path,
+    wasm_path: &Path,
     current_hash: u64,
 ) -> bool {
     if !artifact_path.is_file() {
@@ -67,11 +71,35 @@ fn existing_hash_matches(
     let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&existing) else {
         return false;
     };
-    manifest.get("version").and_then(serde_json::Value::as_u64) == Some(CACHE_MANIFEST_VERSION)
-        && manifest
+    if manifest.get("version").and_then(serde_json::Value::as_u64) != Some(CACHE_MANIFEST_VERSION)
+        || manifest
             .get("source_hash")
             .and_then(serde_json::Value::as_str)
-            == Some(current_hash.to_string().as_str())
+            != Some(current_hash.to_string().as_str())
+    {
+        return false;
+    }
+    let Some(wasm) = manifest.get("wasm").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if wasm.get("abi_version").and_then(serde_json::Value::as_u64)
+        != Some(u64::from(ROUTE_WASM_ABI_VERSION))
+    {
+        return false;
+    }
+    match wasm.get("status").and_then(serde_json::Value::as_str) {
+        Some("native") => {
+            let Some(expected) = wasm.get("sha256").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Ok(bytes) = io.read(wasm_path) else {
+                return false;
+            };
+            hex::encode(Sha256::digest(bytes)) == expected
+        }
+        Some("interpreter_fallback") => !wasm_path.exists(),
+        _ => false,
+    }
 }
 
 fn diagnostic_text(route_path: &Path, severity: Severity, message: &str) -> String {
@@ -98,14 +126,29 @@ fn write_manifest(
     route_path: &Path,
     manifest_path: &Path,
     current_hash: u64,
+    wasm: &RouteWasmCompilation,
 ) -> Result<(), String> {
     let relative = route_path.strip_prefix(api_dir).unwrap_or(route_path);
+    let wasm = match wasm {
+        RouteWasmCompilation::Native(artifact) => serde_json::json!({
+            "status": "native",
+            "abi_version": ROUTE_WASM_ABI_VERSION,
+            "sha256": artifact.sha256,
+            "verb": artifact.verb,
+        }),
+        RouteWasmCompilation::InterpreterFallback { reason } => serde_json::json!({
+            "status": "interpreter_fallback",
+            "abi_version": ROUTE_WASM_ABI_VERSION,
+            "reason": reason,
+        }),
+    };
     let manifest = serde_json::json!({
         "version": CACHE_MANIFEST_VERSION,
         "route": relative.to_string_lossy(),
         "source_hash": current_hash.to_string(),
         "generated_rust": "generated.rs",
         "wasm_artifact": "module.wasm",
+        "wasm": wasm,
     });
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("failed to encode {}: {error}", manifest_path.display()))?;
@@ -131,7 +174,7 @@ fn sync_one(
     let wasm_path = wasm_path_for(cache_root, api_dir, route_path);
     let manifest_path = manifest_path_for(cache_root, api_dir, route_path);
 
-    if existing_hash_matches(io, &manifest_path, &artifact_path, current_hash) {
+    if existing_hash_matches(io, &manifest_path, &artifact_path, &wasm_path, current_hash) {
         return Ok(SyncAction::UpToDate);
     }
 
@@ -175,9 +218,15 @@ fn sync_one(
     let generated = transpile_file(&file, &source_display, &module_names)
         .map_err(|error| format!("{}: {}", route_path.display(), error.message))?;
 
+    let wasm = compile_route(&file);
+    if let RouteWasmCompilation::Native(native) = &wasm {
+        io.write_atomic(&wasm_path, &native.bytes)
+            .map_err(|error| format!("failed to write {}: {error}", wasm_path.display()))?;
+    }
     io.write_atomic(&artifact_path, generated.as_bytes())
         .map_err(|error| format!("failed to write {}: {error}", artifact_path.display()))?;
-    write_manifest(io, api_dir, route_path, &manifest_path, current_hash)?;
+    // Manifest is committed last and therefore acts as the cache validity marker.
+    write_manifest(io, api_dir, route_path, &manifest_path, current_hash, &wasm)?;
 
     Ok(SyncAction::Regenerated)
 }
@@ -259,6 +308,7 @@ mod tests {
                 Some("module.wasm")
             );
             assert!(outcome.artifact_path.is_file());
+            assert!(outcome.wasm_path.is_file());
             assert!(outcome.manifest_path.is_file());
             assert_eq!(outcome.result, Ok(SyncAction::Regenerated));
         }
@@ -311,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn source_change_invalidates_a_stale_wasm_image() {
+    fn source_change_replaces_a_stale_wasm_image() {
         let root = temp_dir("invalidate-wasm");
         let api_dir = root.join("api");
         std::fs::create_dir_all(&api_dir).unwrap();
@@ -322,15 +372,41 @@ mod tests {
         let io = atomic_io::AtomicIo::new();
         let first = sync(&io, &api_dir, &cache_root).unwrap();
         std::fs::write(&first[0].wasm_path, b"old-wasm").unwrap();
-        assert!(first[0].wasm_path.is_file());
 
         std::fs::write(&route_path, "class Route { get(req) { return false; } }").unwrap();
         let second = sync(&io, &api_dir, &cache_root).unwrap();
         assert_eq!(second[0].result, Ok(SyncAction::Regenerated));
-        assert!(!second[0].wasm_path.exists());
+        let wasm = std::fs::read(&second[0].wasm_path).unwrap();
+        assert_ne!(wasm, b"old-wasm");
+        wasmparser::validate(&wasm).unwrap();
 
         let manifest = std::fs::read_to_string(&second[0].manifest_path).unwrap();
+        assert!(manifest.contains("\"status\": \"native\""));
         assert!(manifest.contains("\"wasm_artifact\": \"module.wasm\""));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dynamic_route_records_explicit_interpreter_fallback_without_wasm() {
+        let root = temp_dir("wasm-fallback");
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        std::fs::write(
+            api_dir.join("echo.route"),
+            "class Route { post(req) { return req.body; } }",
+        )
+        .unwrap();
+
+        let cache_root = root.join(".cache");
+        let io = atomic_io::AtomicIo::new();
+        let first = sync(&io, &api_dir, &cache_root).unwrap();
+        assert_eq!(first[0].result, Ok(SyncAction::Regenerated));
+        assert!(!first[0].wasm_path.exists());
+        let manifest = std::fs::read_to_string(&first[0].manifest_path).unwrap();
+        assert!(manifest.contains("\"status\": \"interpreter_fallback\""));
+
+        let second = sync(&io, &api_dir, &cache_root).unwrap();
+        assert_eq!(second[0].result, Ok(SyncAction::UpToDate));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
