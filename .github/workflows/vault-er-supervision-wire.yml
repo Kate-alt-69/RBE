@@ -33,19 +33,17 @@ jobs:
         run: |
           cargo fmt --manifest-path engine/Cargo.toml --all
           cargo fmt --manifest-path vault-process/Cargo.toml
-      - name: Stage standalone Vault lock from verified engine graph
-        run: cp engine/Cargo.lock vault-process/Cargo.lock
-      - name: Check locked workspaces
+      - name: Check engine lock and standalone Vault package
         run: |
           cargo check --manifest-path engine/Cargo.toml --workspace --locked
-          cargo check --manifest-path vault-process/Cargo.toml --locked
+          cargo check --manifest-path vault-process/Cargo.toml
       - name: Test Vault supervision slices
         run: |
-          cargo test --manifest-path vault-process/Cargo.toml --locked
+          cargo test --manifest-path vault-process/Cargo.toml
           cargo test --manifest-path engine/Cargo.toml -p backend --locked
       - name: Clippy Vault supervision slices
         run: |
-          cargo clippy --manifest-path vault-process/Cargo.toml --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path vault-process/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path engine/Cargo.toml -p backend --all-targets --locked -- -D warnings
       - name: Regenerate if main moved
         shell: bash
@@ -60,12 +58,11 @@ jobs:
             python .github/patches/vault-er-supervision-wire.py
             cargo fmt --manifest-path engine/Cargo.toml --all
             cargo fmt --manifest-path vault-process/Cargo.toml
-            cp engine/Cargo.lock vault-process/Cargo.lock
             cargo check --manifest-path engine/Cargo.toml --workspace --locked
-            cargo check --manifest-path vault-process/Cargo.toml --locked
-            cargo test --manifest-path vault-process/Cargo.toml --locked
+            cargo check --manifest-path vault-process/Cargo.toml
+            cargo test --manifest-path vault-process/Cargo.toml
             cargo test --manifest-path engine/Cargo.toml -p backend --locked
-            cargo clippy --manifest-path vault-process/Cargo.toml --all-targets --locked -- -D warnings
+            cargo clippy --manifest-path vault-process/Cargo.toml --all-targets -- -D warnings
             cargo clippy --manifest-path engine/Cargo.toml -p backend --all-targets --locked -- -D warnings
           fi
           rm -f vault-process/Cargo.lock
