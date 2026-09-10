@@ -9,6 +9,10 @@ default-run = "backend"
 name = "backend"
 path = "src/main.rs"
 
+[[bin]]
+name = "service"
+path = "src/service_main.rs"
+
 [dependencies]
 api = { path = "../api" }
 core-lib = { path = "../core" }

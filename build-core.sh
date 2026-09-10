@@ -79,9 +79,9 @@ command -v cross >/dev/null 2>&1 && CROSS_CMD=cross
 [ -z "$CROSS_CMD" ] && command -v cargo-zigbuild >/dev/null 2>&1 && CROSS_CMD=cargo-zigbuild
 install_target_if_missing() { local t="$1"; rustup target list --installed 2>/dev/null | grep -q "^$t$" || rustup target add "$t"; }
 invoke_cargo_build() {
-    local package="$1" target="$2" release="$3"; install_target_if_missing "$target"
+    local package="$1" target="$2" release="$3" binary="${4:-}"; install_target_if_missing "$target"
     local target_os; target_os=$(get_target_os "$target")
-    local args=(build -p "$package" --target "$target"); [ "$release" = true ] && args+=(--release)
+    local args=(build -p "$package" --target "$target"); [ -n "$binary" ] && args+=(--bin "$binary"); [ "$release" = true ] && args+=(--release)
     local tool=cargo; local tool_args=("${args[@]}")
     if [ "$target_os" != "$HOST_OS" ] && [ "$CROSS_CMD" = cross ]; then tool=cross
     elif [ "$target_os" != "$HOST_OS" ] && [ "$CROSS_CMD" = cargo-zigbuild ]; then tool=cargo; tool_args=(zigbuild "${args[@]:1}"); fi
@@ -109,16 +109,24 @@ for target in "${targets[@]}"; do
     container_dest="$dep_dir/container"; [ "$(get_target_os "$target")" = windows ] && container_dest="$container_dest.exe"
     cp "$container_bin_path" "$container_dest"
 
+    export RBE_BUILD_ID="${RBE_BUILD_ID:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown-build)}"
+
+    echo "-- service ($target) --" >&2
+    unset RBE_CONTAINER_BIN_PATH RBE_SERVICE_BIN_PATH || true
+    (cd "$ENGINE_DIR" && invoke_cargo_build backend "$target" "$RELEASE" service)
+    service_path=$(get_built_binary_path "$ENGINE_DIR" service "$target" "$RELEASE")
+    [ -f "$service_path" ] || { echo "ERROR: service artifact missing: $service_path" >&2; exit 1; }
+
     echo "-- backend ($target) --" >&2
     export RBE_CONTAINER_BIN_PATH="$container_bin_path"
-    export RBE_BUILD_ID="${RBE_BUILD_ID:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown-build)}"
-    (cd "$ENGINE_DIR" && invoke_cargo_build backend "$target" "$RELEASE")
-    unset RBE_CONTAINER_BIN_PATH
+    export RBE_SERVICE_BIN_PATH="$service_path"
+    (cd "$ENGINE_DIR" && invoke_cargo_build backend "$target" "$RELEASE" backend)
+    unset RBE_CONTAINER_BIN_PATH RBE_SERVICE_BIN_PATH
     backend_path=$(get_built_binary_path "$ENGINE_DIR" backend "$target" "$RELEASE")
     [ -f "$backend_path" ] || { echo "ERROR: backend artifact missing: $backend_path" >&2; exit 1; }
     cp "$backend_path" "$out_dir/"
     service_dest="$out_dir/service"; [ "$(get_target_os "$target")" = windows ] && service_dest="$service_dest.exe"
-    cp "$backend_path" "$service_dest"
+    cp "$service_path" "$service_dest"
 
     [ -f "$ENGINE_DIR/settings.json" ] && cp "$ENGINE_DIR/settings.json" "$out_dir/" 2>/dev/null || true
     if [ "$DEV_CONTENT" = true ]; then [ -d "$REPO_ROOT/api" ] && cp -r "$REPO_ROOT/api" "$out_dir/"; [ -d "$REPO_ROOT/module" ] && cp -r "$REPO_ROOT/module" "$out_dir/"; else mkdir -p "$out_dir/api" "$out_dir/module"; fi

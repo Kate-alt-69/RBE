@@ -13,105 +13,29 @@ use core_lib::{AppState, ContainerClient, MaintenanceMetrics};
 use supervisor::{BackendState, RestartPolicy, Supervisor};
 
 mod container_process;
+#[allow(dead_code)]
 mod er_recovery;
 mod error_reporter_daemon;
 mod host_bootstrap;
 mod maintenance_notice;
 mod port_guard;
 mod runtime_image_boot;
+#[allow(dead_code)]
 mod service_boot;
+#[allow(dead_code)]
 mod service_control;
+#[allow(dead_code, clippy::too_many_arguments)]
 mod service_mother;
 mod vault_recovery;
 
-fn running_as_service_executable() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().to_string())
-        })
-        .is_some_and(|stem| stem.eq_ignore_ascii_case("service"))
-}
-
-fn service_flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|pair| pair[0] == flag)
-        .map(|pair| pair[1].clone())
-}
-
-fn service_process_label(args: &[String]) -> String {
-    if args.iter().any(|arg| arg == "--service-mother") {
-        return "service - mother".into();
-    }
-    let name = service_flag_value(args, "--service-file")
-        .and_then(|path| {
-            std::path::Path::new(&path)
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-        })
-        .or_else(|| service_flag_value(args, "--service-name"))
-        .unwrap_or_else(|| "unknown.service".into());
-    let clean = name
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(80)
-        .collect::<String>();
-    format!("service - {clean} | service.exe")
+mod service_integrity {
+    include!(concat!(env!("OUT_DIR"), "/service_integrity.rs"));
 }
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
-
-    if running_as_service_executable() {
-        match service_control::command_from_args(&args) {
-            Ok(Some(command)) => {
-                match service_control::submit(&command) {
-                    Ok(path) => {
-                        println!("Service restart request queued: {}", path.display());
-                    }
-                    Err(error) => {
-                        eprintln!("failed to queue Service restart request: {error:#}");
-                        std::process::exit(1);
-                    }
-                }
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!("invalid Service restart command: {error:#}");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    let service_mother_mode = has("--service-mother");
-    let service_host_mode = has("--service-host");
-    if service_mother_mode || service_host_mode {
-        if !running_as_service_executable() {
-            eprintln!(
-                "internal service runtime modes must be launched through the sibling service executable"
-            );
-            std::process::exit(2);
-        }
-        service_runtime::apply_service_process_label(&service_process_label(&args));
-        if service_mother_mode {
-            if let Err(error) = service_mother::run_child(&args).await {
-                eprintln!("fatal Service Mother error: {error:#}");
-                std::process::exit(1);
-            }
-        } else if let Err(error) = service_boot::run_host(&args).await {
-            eprintln!("fatal service worker error: {error:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-    if running_as_service_executable() {
-        eprintln!("service executable requires an internal Mother or worker mode");
-        std::process::exit(2);
-    }
 
     if has("--maintenance-notice") {
         let value = |flag: &str| {
@@ -758,6 +682,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
                 &catalog.fingerprint(),
                 service_runtime_env.clone(),
                 er_control_key.clone(),
+                service_integrity::EXPECTED_SERVICE_SHA256,
             )
             .await?,
         ),

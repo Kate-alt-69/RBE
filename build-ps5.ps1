@@ -338,7 +338,7 @@ function Get-TargetOs {
 }
 
 function Invoke-CargoBuild {
-    param([string]$Package, [string]$Target, [bool]$IsRelease)
+    param([string]$Package, [string]$Target, [bool]$IsRelease, [string]$Binary = $null)
 
     Install-TargetIfMissing $Target
 
@@ -372,6 +372,7 @@ function Invoke-CargoBuild {
 
     # Base cargo args (same for cross/cargo)
     $cargoArgs = @("build", "-p", $Package, "--target", $Target)
+    if ($Binary) { $cargoArgs += @("--bin", $Binary) }
     if ($IsRelease) { $cargoArgs += "--release" }
 
     if ($useCross) {
@@ -513,6 +514,18 @@ foreach ($target in $targets) {
         }
     }
 
+    Write-Host "-- service ($target) --" -ForegroundColor Cyan
+    Remove-Item Env:\RBE_CONTAINER_BIN_PATH -ErrorAction SilentlyContinue
+    Remove-Item Env:\RBE_SERVICE_BIN_PATH -ErrorAction SilentlyContinue
+    Push-Location $engineDir
+    try {
+        Invoke-CargoBuild -Package "backend" -Target $target -IsRelease $Release -Binary "service"
+        $servicePath = Get-BuiltBinaryPath -WorkspaceDir $engineDir -BinName "service" -Target $target -IsRelease $Release
+    } finally {
+        Pop-Location
+    }
+    if (-not (Test-Path $servicePath)) { throw "service runtime was not produced: $servicePath" }
+
     Write-Host "-- backend ($target) --" -ForegroundColor Cyan
     Push-Location $engineDir
     try {
@@ -521,17 +534,19 @@ foreach ($target in $targets) {
         } else {
             Remove-Item Env:\RBE_CONTAINER_BIN_PATH -ErrorAction SilentlyContinue
         }
-        Invoke-CargoBuild -Package "backend" -Target $target -IsRelease $Release
+        $env:RBE_SERVICE_BIN_PATH = $servicePath
+        Invoke-CargoBuild -Package "backend" -Target $target -IsRelease $Release -Binary "backend"
         $backendPath = Get-BuiltBinaryPath -WorkspaceDir $engineDir -BinName "backend" -Target $target -IsRelease $Release
     } finally {
         Remove-Item Env:\RBE_CONTAINER_BIN_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:\RBE_SERVICE_BIN_PATH -ErrorAction SilentlyContinue
         Pop-Location
     }
 
     Copy-Item $backendPath -Destination $outDir -Force
     Write-Host "  -> $outDir\$(Split-Path -Leaf $backendPath)" -ForegroundColor Green
     $serviceName = if ((Get-TargetOs $target) -eq "windows") { "service.exe" } else { "service" }
-    Copy-Item $backendPath -Destination (Join-Path $outDir $serviceName) -Force
+    Copy-Item $servicePath -Destination (Join-Path $outDir $serviceName) -Force
     Write-Host "  -> $outDir\$serviceName" -ForegroundColor Green
 
     if ($NoEmbed -and $containerBinPath -and (Test-Path $containerBinPath)) {

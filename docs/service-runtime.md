@@ -63,7 +63,7 @@ backend.exe
    └─ service.exe           service - Mail | service.exe
 ```
 
-The packaged `service.exe` is byte-for-byte identical to the packaged `backend.exe`; only the execution name and restricted internal mode differ. At development boot RBE materializes/repairs the canonical sibling from its own executable and verifies the SHA-256 before spawning Mother. `backend.exe` refuses `--service-host`/`--service-mother` unless it was launched through the canonical `service.exe` name.
+The packaged `service.exe` is now a separately linked executable target. It contains the Service Mother/worker entrypoints, `.service` compiler/executor path, Service Fabric IPC, Runtime ENV bootstrap, CONTROL-ER recovery client, and restart controls, but it does not expose the normal backend API/Vault/container/HostBootstrap/ER-daemon boot path. The release builder compiles `service` first, passes its exact artifact to the backend build, and backend embeds that Service SHA-256. At runtime backend requires the sibling `service.exe`/`service` to match that build-time digest and explicitly refuses a Service image whose bytes are identical to backend. Backend never repairs, copies, or hard-links itself into the Service path.
 
 The child binds a loopback-only TCP IPC endpoint and prints one readiness record to stdout. The parent consumes that record, verifies the service identity, then continuously drains the remaining stdout stream into structured logging.
 

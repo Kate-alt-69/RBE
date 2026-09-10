@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -293,43 +293,60 @@ fn service_executable_name() -> &'static str {
 }
 
 fn file_sha256_hex(path: &Path) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("read runtime executable {}", path.display()))?;
-    let digest = Sha256::digest(bytes);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open runtime executable {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read runtime executable {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
-fn ensure_canonical_service_executable(backend: &Path, parent: &Path) -> anyhow::Result<PathBuf> {
-    let service = parent.join(service_executable_name());
-    let expected = file_sha256_hex(backend)?;
-    let valid_existing = service.is_file()
-        && file_sha256_hex(&service)
-            .map(|actual| actual.eq_ignore_ascii_case(&expected))
-            .unwrap_or(false);
-    if !valid_existing {
-        if service.exists() {
-            std::fs::remove_file(&service).with_context(|| {
-                format!(
-                    "replace stale service runtime {}; stop stale service.exe processes first",
-                    service.display()
-                )
-            })?;
-        }
-        if std::fs::hard_link(backend, &service).is_err() {
-            std::fs::copy(backend, &service).with_context(|| {
-                format!(
-                    "materialize canonical service runtime {}",
-                    service.display()
-                )
-            })?;
-        }
+fn ensure_canonical_service_executable(
+    backend: &Path,
+    parent: &Path,
+    expected_service_sha256: &str,
+) -> anyhow::Result<PathBuf> {
+    if expected_service_sha256.len() != 64
+        || !expected_service_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("backend was built without a valid standalone Service integrity binding");
     }
-    let actual = file_sha256_hex(&service)?;
-    if !actual.eq_ignore_ascii_case(&expected) {
+
+    let service = parent.join(service_executable_name());
+    if !service.is_file() {
         anyhow::bail!(
-            "canonical service runtime {} does not match backend executable bytes",
+            "standalone Service runtime {} is missing; backend will not synthesize it from itself",
             service.display()
         );
+    }
+
+    let actual = file_sha256_hex(&service)?;
+    if !actual.eq_ignore_ascii_case(expected_service_sha256) {
+        anyhow::bail!(
+            "standalone Service runtime {} failed build-time SHA-256 verification",
+            service.display()
+        );
+    }
+
+    // Regression guard: service.exe must be an independently linked runtime,
+    // never backend.exe copied/hard-linked under another filename again.
+    let backend_hash = file_sha256_hex(backend)?;
+    if actual.eq_ignore_ascii_case(&backend_hash) {
+        anyhow::bail!("standalone Service runtime unexpectedly matches backend executable bytes");
     }
     Ok(service)
 }
@@ -337,6 +354,7 @@ fn ensure_canonical_service_executable(backend: &Path, parent: &Path) -> anyhow:
 async fn spawn_process(
     settings_path: impl AsRef<Path>,
     expected_catalog_fingerprint: &str,
+    expected_service_sha256: &str,
     runtime_env: &serde_json::Value,
     er_control_key: Option<&crate::host_bootstrap::ErControlKey>,
     existing_manager: Option<&ServiceManager>,
@@ -352,7 +370,7 @@ async fn spawn_process(
     let parent = exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("backend executable has no parent directory"))?;
-    let service_exe = ensure_canonical_service_executable(&exe, parent)?;
+    let service_exe = ensure_canonical_service_executable(&exe, parent, expected_service_sha256)?;
 
     let settings_path = std::fs::canonicalize(settings_path.as_ref()).with_context(|| {
         format!(
@@ -530,6 +548,7 @@ pub async fn spawn(
     expected_catalog_fingerprint: &str,
     runtime_env: Arc<serde_json::Value>,
     er_control_key: Option<crate::host_bootstrap::ErControlKey>,
+    expected_service_sha256: &str,
 ) -> anyhow::Result<ServiceMotherSupervisor> {
     let settings_path = std::fs::canonicalize(settings_path.as_ref()).with_context(|| {
         format!(
@@ -538,9 +557,11 @@ pub async fn spawn(
         )
     })?;
     let expected_catalog_fingerprint = expected_catalog_fingerprint.to_string();
+    let expected_service_sha256 = expected_service_sha256.to_string();
     let initial = spawn_process(
         &settings_path,
         &expected_catalog_fingerprint,
+        &expected_service_sha256,
         runtime_env.as_ref(),
         er_control_key.as_ref(),
         None,
@@ -556,6 +577,7 @@ pub async fn spawn(
             initial,
             supervisor_settings,
             supervisor_fingerprint,
+            expected_service_sha256,
             runtime_env,
             er_control_key,
             supervisor_manager,
@@ -574,6 +596,7 @@ async fn supervise(
     mut process: ServiceMotherProcess,
     settings_path: PathBuf,
     expected_catalog_fingerprint: String,
+    expected_service_sha256: String,
     runtime_env: Arc<serde_json::Value>,
     er_control_key: Option<crate::host_bootstrap::ErControlKey>,
     manager: ServiceManager,
@@ -644,6 +667,7 @@ async fn supervise(
             match spawn_process(
                 &settings_path,
                 &expected_catalog_fingerprint,
+                &expected_service_sha256,
                 runtime_env.as_ref(),
                 er_control_key.as_ref(),
                 Some(&manager),

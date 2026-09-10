@@ -19,13 +19,18 @@ use sha2::{Digest, Sha256};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_BIN_PATH");
+    println!("cargo:rerun-if-env-changed=RBE_SERVICE_BIN_PATH");
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_SIGNING_PRIVATE_KEY");
     println!("cargo:rerun-if-env-changed=RBE_BUILD_TRACE");
 
     let out_dir =
         std::env::var("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts");
     let integrity_dest = Path::new(&out_dir).join("container_integrity.rs");
+    let service_integrity_dest = Path::new(&out_dir).join("service_integrity.rs");
     let source = std::env::var("RBE_CONTAINER_BIN_PATH")
+        .ok()
+        .map(PathBuf::from);
+    let service_source = std::env::var("RBE_SERVICE_BIN_PATH")
         .ok()
         .map(PathBuf::from);
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
@@ -75,6 +80,36 @@ fn main() {
             (String::new(), String::new(), String::new())
         }
     };
+
+    let expected_service_hash = match service_source {
+        Some(path) if path.is_file() => {
+            println!("cargo:rerun-if-changed={}", path.display());
+            let hash = sha256_file(&path).unwrap_or_else(|err| {
+                panic!(
+                    "backend/build.rs: failed to SHA-256 service binary {}: {err}",
+                    path.display()
+                )
+            });
+            if std::env::var_os("RBE_BUILD_TRACE").is_some() {
+                println!(
+                    "cargo:warning=backend: binding standalone service SHA-256 {hash}, build_id {build_id}, target {target}"
+                );
+            }
+            hash
+        }
+        Some(path) => {
+            panic!(
+                "backend/build.rs: RBE_SERVICE_BIN_PATH was set to {} but the file does not exist",
+                path.display()
+            );
+        }
+        None => String::new(),
+    };
+    let service_literal =
+        format!("pub const EXPECTED_SERVICE_SHA256: &str = \"{expected_service_hash}\";\n");
+    fs::write(&service_integrity_dest, service_literal).unwrap_or_else(|err| {
+        panic!("backend/build.rs: failed to write generated service integrity source: {err}")
+    });
 
     let source_literal = format!(
         "pub const EXPECTED_CONTAINER_SHA256: &str = \"{expected_hash}\";\n\

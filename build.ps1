@@ -147,9 +147,9 @@ try {
         if ($env:CARGO_TARGET_DIR) { return Join-Path $env:CARGO_TARGET_DIR $Target $profile $name }
         return Join-Path $Workspace 'target' $Target $profile $name
     }
-    function Invoke-Build([string]$Package, [string]$Target, [bool]$IsRelease) {
+    function Invoke-Build([string]$Package, [string]$Target, [bool]$IsRelease, [string]$Binary = $null) {
         Install-Target $Target
-        $args2 = @('build','-p',$Package,'--target',$Target); if ($IsRelease) { $args2 += '--release' }
+        $args2 = @('build','-p',$Package,'--target',$Target); if ($Binary) { $args2 += @('--bin',$Binary) }; if ($IsRelease) { $args2 += '--release' }
         $targetOs = Get-TargetOs $Target
         if (($targetOs -ne $hostOs) -and $cross) { & cross @args2 }
         elseif (($targetOs -ne $hostOs) -and $cargoZigbuild) { & cargo zigbuild @($args2[1..($args2.Count-1)]) }
@@ -172,16 +172,30 @@ try {
         $containerName = if ((Get-TargetOs $target) -eq 'windows') { 'container.exe' } else { 'container' }
         Copy-Item $containerPath (Join-Path $depDir $containerName) -Force
 
+        if ([string]::IsNullOrWhiteSpace($env:RBE_BUILD_ID)) { $env:RBE_BUILD_ID = (& git -C $RepoRoot rev-parse HEAD 2>$null) }
+
+        Write-Host "-- service ($target) --" -ForegroundColor Cyan
+        Remove-Item Env:RBE_CONTAINER_BIN_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:RBE_SERVICE_BIN_PATH -ErrorAction SilentlyContinue
+        Push-Location $EngineDir
+        try { Invoke-Build 'backend' $target $Release 'service'; $servicePath = Get-BinaryPath $EngineDir 'service' $target $Release }
+        finally { Pop-Location }
+        if (-not (Test-Path $servicePath)) { throw "service runtime was not produced: $servicePath" }
+
         Write-Host "-- backend ($target) --" -ForegroundColor Cyan
         $env:RBE_CONTAINER_BIN_PATH = $containerPath
-        if ([string]::IsNullOrWhiteSpace($env:RBE_BUILD_ID)) { $env:RBE_BUILD_ID = (& git -C $RepoRoot rev-parse HEAD 2>$null) }
+        $env:RBE_SERVICE_BIN_PATH = $servicePath
         Push-Location $EngineDir
-        try { Invoke-Build 'backend' $target $Release; $backendPath = Get-BinaryPath $EngineDir 'backend' $target $Release }
-        finally { Pop-Location; Remove-Item Env:RBE_CONTAINER_BIN_PATH -ErrorAction SilentlyContinue }
+        try { Invoke-Build 'backend' $target $Release 'backend'; $backendPath = Get-BinaryPath $EngineDir 'backend' $target $Release }
+        finally {
+            Pop-Location
+            Remove-Item Env:RBE_CONTAINER_BIN_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:RBE_SERVICE_BIN_PATH -ErrorAction SilentlyContinue
+        }
         if (-not (Test-Path $backendPath)) { throw "backend was not produced: $backendPath" }
         Copy-Item $backendPath $outDir -Force
         $serviceName = if ((Get-TargetOs $target) -eq 'windows') { 'service.exe' } else { 'service' }
-        Copy-Item $backendPath (Join-Path $outDir $serviceName) -Force
+        Copy-Item $servicePath (Join-Path $outDir $serviceName) -Force
 
         $settings = Join-Path $EngineDir 'settings.json'; if (Test-Path $settings) { Copy-Item $settings $outDir -Force }
         if ($DevContent) { Copy-Item (Join-Path $RepoRoot 'api') $outDir -Recurse -Force -ErrorAction SilentlyContinue; Copy-Item (Join-Path $RepoRoot 'module') $outDir -Recurse -Force -ErrorAction SilentlyContinue }
