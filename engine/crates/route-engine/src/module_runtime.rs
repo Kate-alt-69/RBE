@@ -127,6 +127,8 @@ impl ModuleProgram {
             modules.insert(normalize(&path), file);
         }
 
+        validate_module_graph(&binary_root, &modules, &mut errors);
+
         if !errors.is_empty() {
             return Err(ModuleCompileErrors(errors));
         }
@@ -170,31 +172,7 @@ impl ModuleProgram {
             }
         }
 
-        let mut graph: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-        for (path, file) in &modules {
-            let mut dependencies = Vec::new();
-            for import in &file.imports {
-                if let Some(raw_path) = custom_import_path(import) {
-                    let resolved = normalize(&resolve_custom_import(&binary_root, raw_path));
-                    if modules.contains_key(&resolved) {
-                        dependencies.push(resolved);
-                    } else {
-                        errors.push(ModuleCompileError {
-                            code: "MOD2001",
-                            path: path.clone(),
-                            line: 1,
-                            column: 1,
-                            message: format!(
-                                "module import {raw_path:?} resolves to missing file {}",
-                                resolved.display()
-                            ),
-                        });
-                    }
-                }
-            }
-            graph.insert(path.clone(), dependencies);
-        }
-        detect_cycles(&graph, &mut errors);
+        validate_module_graph(&binary_root, &modules, &mut errors);
 
         if !errors.is_empty() {
             return Err(ModuleCompileErrors(errors));
@@ -228,6 +206,56 @@ impl ModuleProgram {
         let owner = module_owner(&self.module_dir, &path);
         self.modules.get(&path).cloned().map(|file| (owner, file))
     }
+}
+
+fn validate_module_graph(
+    binary_root: &Path,
+    modules: &HashMap<PathBuf, Arc<ModuleFile>>,
+    errors: &mut Vec<ModuleCompileError>,
+) {
+    let mut graph: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    for (owner_path, file) in modules {
+        let mut dependencies = Vec::new();
+        for import in &file.imports {
+            let (raw_path, requested_export) = match import_base(import) {
+                ImportTarget::Custom(path) => (path.as_str(), None),
+                ImportTarget::CustomFunction { path, function } => {
+                    (path.as_str(), Some(function.as_str()))
+                }
+                _ => continue,
+            };
+            let resolved = normalize(&resolve_custom_import(binary_root, raw_path));
+            let Some(target) = modules.get(&resolved) else {
+                errors.push(ModuleCompileError {
+                    code: "MOD2001",
+                    path: owner_path.clone(),
+                    line: 1,
+                    column: 1,
+                    message: format!(
+                        "module import {raw_path:?} resolves to missing file {}",
+                        resolved.display()
+                    ),
+                });
+                continue;
+            };
+            if let Some(export) = requested_export {
+                if !target.exports.iter().any(|candidate| candidate == export) {
+                    errors.push(ModuleCompileError {
+                        code: "MOD2011",
+                        path: owner_path.clone(),
+                        line: 1,
+                        column: 1,
+                        message: format!(
+                            "module import {raw_path:?} requests missing export {export:?}"
+                        ),
+                    });
+                }
+            }
+            dependencies.push(resolved);
+        }
+        graph.insert(owner_path.clone(), dependencies);
+    }
+    detect_cycles(&graph, errors);
 }
 
 fn load_one(path: &Path) -> Result<ModuleFile, ModuleCompileError> {
@@ -582,6 +610,25 @@ mod tests {
 
         let error = ModuleProgram::load(&root.join("module")).unwrap_err();
         assert!(error.0.iter().any(|item| item.code == "MOD2007"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_direct_import_of_missing_module_export() {
+        let root = root();
+        fs::write(
+            root.join("module/b.module"),
+            "export function present() { return true; }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("module/a.module"),
+            ":import[\"./module/b\".missing as missing]\nexport function run() { return true; }",
+        )
+        .unwrap();
+        let errors = ModuleProgram::load(&root.join("module"))
+            .expect_err("direct imports must reference a real export");
+        assert!(errors.0.iter().any(|error| error.code == "MOD2011"));
         let _ = fs::remove_dir_all(root);
     }
 

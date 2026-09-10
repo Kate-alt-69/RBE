@@ -1,30 +1,14 @@
 # `.module`
 
-> # 🚨 `.module` IS NOT IMPLEMENTED 🚨
+> Status: **IMPLEMENTED / EXECUTABLE**
 >
-> **Actual `.module` files are NOT implemented.**
->
-> RBE currently does **not**:
-> - parse `.module` files as executable source files;
-> - discover `.module` files during boot;
-> - compile `.module` files;
-> - interpret or execute `.module` files;
-> - generate `.module` artifacts;
-> - load `.module` files as executable modules;
-> - export functions from `.module` files;
-> - import/export executable `.module` dependencies;
-> - build or execute a `.module` dependency graph;
-> - perform recursive `.module` loading or cycle detection.
->
-> References to `.module` currently describe **planned/reserved language design, import/export syntax, capability boundaries, and future interoperability only**. An existing `.module` file must **not** be treated as a working executable module.
->
-> **Do not confuse a parsed/planned module import reference with an implemented `.module` file system.**
->
+> `.module` files are discovered or linked into the immutable Runtime Image, parsed as Module REL, validated as a dependency graph, and executed by the async `ModuleExecutor`. Exported functions support positional parameters, module-to-module calls, Service calls, and capability-scoped host calls. Cycles, missing module targets, and direct imports of missing exports fail during initialization.
+
 ---
 
 # RBE Module Language Specification
 
-**Status:** **PLANNED / RESERVED — NOT IMPLEMENTED**
+**Status:** **IMPLEMENTED / LIVING SPECIFICATION**
 
 This document defines the intended `.module` language and its relationship to `.route`. It deliberately separates the future language design from the current runtime.
 
@@ -44,7 +28,7 @@ The intended relationship is:
 built-in capabilities / other modules
 ```
 
-**This relationship is design-only today.** No executable `.module` call path currently exists end-to-end.
+This relationship is executable today through the immutable Runtime Image and `ModuleExecutor`.
 
 ## 2. What makes `.module` different from `.route`
 
@@ -57,7 +41,7 @@ built-in capabilities / other modules
 
 ### `.module`
 
-Planned behavior:
+Implemented behavior:
 
 - Function names are arbitrary identifiers.
 - Functions may accept zero or more named parameters.
@@ -186,7 +170,7 @@ The intended module capability surface is:
 
 ## 7. Function calls
 
-Once module execution is implemented, a caller is intended to use:
+Module callers use:
 
 ```text
 moduleName.functionName(arg1, arg2)
@@ -214,7 +198,7 @@ module B
 module C
 ```
 
-The future loader must maintain a dependency graph and detect cycles:
+The loader maintains a dependency graph and rejects cycles:
 
 ```text
 A → B → C → A

@@ -20,7 +20,7 @@ Only declared HTTP methods are registered.
 
 ### `.module`
 
-`.module` is the reusable logic layer. It is designed for arbitrary function names, multiple parameters, privileged capabilities, and heavier work. **Full `.module` execution is planned and remains separate from the currently implemented `.route` interpreter.**
+`.module` is the executable reusable logic layer. It supports arbitrary exported function names, multiple parameters, module-to-module calls, Service calls, and capability-scoped host calls through the immutable Runtime Image.
 
 ## 3. Variables, statements, and expressions
 
@@ -43,7 +43,7 @@ Imports use one directive:
 
 A comma separates entries. Aliases create a local binding without changing the underlying capability. Duplicate source capabilities are rejected.
 
-Import resolution distinguishes curated built-ins from quoted module paths. `.module` loading is a planned capability even though path resolution/desugaring exists.
+Import resolution distinguishes curated built-ins from quoted module paths. `.module` targets are loaded from the immutable Runtime Image and their dependency/export contracts are validated before requests are served.
 
 ### Import diagnostics
 
@@ -67,14 +67,14 @@ The intended boundary is:
 | `crypto` | Yes | Yes | Basic surface exists; cryptographic correctness remains a release concern |
 | `encoding` | No | Yes | Planned |
 | `time` | Yes | Yes | Basic support implemented |
-| `http` | Yes | No | Planned surface |
+| `http` | Yes | No | Implemented as bounded async outbound HTTP with SSRF protections |
 | `auth` | No | Yes | Planned/feature-gated |
 | `vault` | No | Yes | Planned privileged module surface |
-| `request` | Yes | Yes | Planned beyond the current minimal surface |
+| `request` | Yes | Yes | Implemented request snapshot helpers |
 | `storage` | No | Yes | Planned |
 | `cache` | No | Yes | Planned |
 | `log` | Yes | Yes | `info`/`warn` support implemented |
-| `security` | Yes | Yes | Policy-controlled surface; broader implementation planned |
+| `security` | Yes | Yes | Implemented request-security and constant-time comparison helpers |
 | `net:response` | Yes | Yes | Planned namespace |
 | `private` | Yes | N/A | Implemented as read-only backend health information |
 
@@ -178,7 +178,7 @@ diagnostics
 route registration
 ```
 
-The current RBE route engine is a tree-walking interpreter rather than a complete Rust source generator. Invalid routes must not become runnable route registrations.
+The active request path currently evaluates the immutable linked REL AST through `ModuleExecutor`; the cache also emits readable Rust source as the staging artifact for the route-to-WASM pipeline. Invalid routes never become runnable registrations.
 
 ## 9. Diagnostics
 
@@ -220,7 +220,7 @@ The UI must represent real work, adapt to terminal width, support ANSI-capable t
 
 `.module` files are not JavaScript packages. Their imports use the same capability-oriented syntax and are resolved against the backend's module root/path rules.
 
-The intended module model is documented separately in [`module-language.md`](module-language.md). Full module loading/execution, recursive module graphs, arbitrary module function parameters, and cycle guards remain planned until the module runtime is implemented end-to-end.
+The executable module model is documented separately in [`module-language.md`](module-language.md). Module loading/execution, recursive calls, arbitrary parameters, Service calls, dependency validation, and cycle guards are implemented; the remaining compiler work is moving route execution from the linked AST to the WASM artifact path.
 
 ## 12. Status discipline
 

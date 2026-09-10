@@ -2096,8 +2096,12 @@ dependencies = [
  "atomic-io",
  "axum",
  "core-lib",
+ "reqwest",
  "serde_json",
  "service-runtime",
+ "sha2",
+ "subtle",
+ "tokio",
  "tracing",
 ]
 

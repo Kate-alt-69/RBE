@@ -80,6 +80,28 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
         "time" => matches!(function, "now"),
         "log" => matches!(function, "info" | "warn"),
         "crypto" => matches!(function, "hash"),
+        "http" => matches!(function, "request" | "get" | "post"),
+        "request" => matches!(
+            function,
+            "header"
+                | "hasHeader"
+                | "has_header"
+                | "query"
+                | "param"
+                | "cookie"
+                | "method"
+                | "path"
+                | "body"
+        ),
+        "security" => matches!(
+            function,
+            "constantTimeEqual"
+                | "constant_time_equal"
+                | "isSecure"
+                | "is_secure"
+                | "clientIp"
+                | "client_ip"
+        ),
         "env" => matches!(function, "get"),
         "ENV" => matches!(
             function,
@@ -274,14 +296,12 @@ impl ModuleRegistry {
             ModuleKind::Builtin(BuiltinModule::Log) => call_log(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Crypto) => call_crypto(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Http) => Err(ModuleError {
-                message: format!("{module_name}.{function_name}() is not implemented yet"),
+                message: format!(
+                    "{module_name}.{function_name}() requires the async runtime HTTP host capability"
+                ),
             }),
-            ModuleKind::Builtin(BuiltinModule::Request) => Err(ModuleError {
-                message: format!("{module_name}.{function_name}() is not implemented yet"),
-            }),
-            ModuleKind::Builtin(BuiltinModule::Security) => Err(ModuleError {
-                message: format!("{module_name}.{function_name}() is not implemented yet"),
-            }),
+            ModuleKind::Builtin(BuiltinModule::Request) => call_request(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Security) => call_security(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Response) => call_response(function_name, args),
             ModuleKind::Builtin(BuiltinModule::VideoManager) => Err(ModuleError {
                 message: format!(
@@ -304,6 +324,118 @@ impl ModuleRegistry {
                 })
             }
         }
+    }
+}
+
+fn request_object(value: Option<&Value>) -> Result<&HashMap<String, Value>, ModuleError> {
+    match value {
+        Some(Value::Object(fields)) => Ok(fields),
+        _ => Err(ModuleError {
+            message: "request helper requires the request object as its first argument".into(),
+        }),
+    }
+}
+
+fn request_named_value(
+    request: &HashMap<String, Value>,
+    bucket: &str,
+    name: &str,
+    case_insensitive: bool,
+) -> Value {
+    let Some(Value::Object(values)) = request.get(bucket) else {
+        return Value::Null;
+    };
+    if !case_insensitive {
+        return values.get(name).cloned().unwrap_or(Value::Null);
+    }
+    values
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+        .unwrap_or(Value::Null)
+}
+
+fn request_name<'a>(value: Option<&'a Value>, label: &str) -> Result<&'a str, ModuleError> {
+    match value {
+        Some(Value::String(value)) if !value.is_empty() => Ok(value),
+        _ => Err(ModuleError {
+            message: format!("{label} must be a non-empty string"),
+        }),
+    }
+}
+
+fn call_request(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+    let request = request_object(args.first())?;
+    match function_name {
+        "header" => {
+            let name = request_name(args.get(1), "request header name")?;
+            Ok(request_named_value(request, "headers", name, true))
+        }
+        "hasHeader" | "has_header" => {
+            let name = request_name(args.get(1), "request header name")?;
+            Ok(Value::Bool(!matches!(
+                request_named_value(request, "headers", name, true),
+                Value::Null
+            )))
+        }
+        "query" => {
+            let name = request_name(args.get(1), "query name")?;
+            Ok(request_named_value(request, "query", name, false))
+        }
+        "param" => {
+            let name = request_name(args.get(1), "route parameter name")?;
+            Ok(request_named_value(request, "params", name, false))
+        }
+        "cookie" => {
+            let name = request_name(args.get(1), "cookie name")?;
+            Ok(request_named_value(request, "cookies", name, false))
+        }
+        "method" | "path" | "body" => {
+            Ok(request.get(function_name).cloned().unwrap_or(Value::Null))
+        }
+        other => Err(ModuleError {
+            message: format!("request.{other}() does not exist"),
+        }),
+    }
+}
+
+fn security_string<'a>(value: Option<&'a Value>, label: &str) -> Result<&'a str, ModuleError> {
+    match value {
+        Some(Value::String(value)) => Ok(value),
+        _ => Err(ModuleError {
+            message: format!("{label} must be a string"),
+        }),
+    }
+}
+
+fn call_security(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+    match function_name {
+        "constantTimeEqual" | "constant_time_equal" => {
+            use sha2::{Digest, Sha256};
+            use subtle::ConstantTimeEq;
+
+            let left = security_string(args.first(), "left value")?;
+            let right = security_string(args.get(1), "right value")?;
+            // Hash to equal-width inputs first, so comparison work does not vary
+            // with the original secret lengths.
+            let left = Sha256::digest(left.as_bytes());
+            let right = Sha256::digest(right.as_bytes());
+            Ok(Value::Bool(bool::from(left.ct_eq(&right))))
+        }
+        "isSecure" | "is_secure" => {
+            let request = request_object(args.first())?;
+            Ok(Value::Bool(matches!(
+                request.get("protocol"),
+                Some(Value::String(protocol)) if protocol.eq_ignore_ascii_case("https")
+            )))
+        }
+        "clientIp" | "client_ip" => {
+            let request = request_object(args.first())?;
+            Ok(request.get("ip").cloned().unwrap_or(Value::Null))
+        }
+        other => Err(ModuleError {
+            message: format!("security.{other}() does not exist"),
+        }),
     }
 }
 
@@ -872,6 +1004,93 @@ mod tests {
                 ],
             )
             .is_err());
+    }
+
+    #[test]
+    fn request_helpers_read_the_bounded_request_snapshot() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("request".into())]);
+        let request = Value::Object(HashMap::from([
+            ("method".into(), Value::String("POST".into())),
+            ("path".into(), Value::String("/api/users/7".into())),
+            ("protocol".into(), Value::String("https".into())),
+            ("ip".into(), Value::String("203.0.113.7".into())),
+            ("body".into(), Value::Bool(true)),
+            (
+                "headers".into(),
+                Value::Object(HashMap::from([(
+                    "x-test".into(),
+                    Value::String("yes".into()),
+                )])),
+            ),
+            (
+                "query".into(),
+                Value::Object(HashMap::from([("page".into(), Value::String("2".into()))])),
+            ),
+            (
+                "params".into(),
+                Value::Object(HashMap::from([("id".into(), Value::String("7".into()))])),
+            ),
+            (
+                "cookies".into(),
+                Value::Object(HashMap::from([(
+                    "session".into(),
+                    Value::String("abc".into()),
+                )])),
+            ),
+        ]));
+        assert!(
+            matches!(registry.call("request", "method", std::slice::from_ref(&request)).unwrap(), Value::String(value) if value == "POST")
+        );
+        assert!(
+            matches!(registry.call("request", "header", &[request.clone(), Value::String("X-Test".into())]).unwrap(), Value::String(value) if value == "yes")
+        );
+        assert!(
+            matches!(registry.call("request", "param", &[request.clone(), Value::String("id".into())]).unwrap(), Value::String(value) if value == "7")
+        );
+        assert!(
+            matches!(registry.call("request", "query", &[request.clone(), Value::String("page".into())]).unwrap(), Value::String(value) if value == "2")
+        );
+        assert!(
+            matches!(registry.call("request", "cookie", &[request, Value::String("session".into())]).unwrap(), Value::String(value) if value == "abc")
+        );
+    }
+
+    #[test]
+    fn security_helpers_are_explicit_and_constant_width() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("security".into())]);
+        assert!(matches!(
+            registry
+                .call(
+                    "security",
+                    "constantTimeEqual",
+                    &[Value::String("same".into()), Value::String("same".into())]
+                )
+                .unwrap(),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            registry
+                .call(
+                    "security",
+                    "constantTimeEqual",
+                    &[Value::String("same".into()), Value::String("other".into())]
+                )
+                .unwrap(),
+            Value::Bool(false)
+        ));
+        let request = Value::Object(HashMap::from([
+            ("protocol".into(), Value::String("https".into())),
+            ("ip".into(), Value::String("198.51.100.4".into())),
+        ]));
+        assert!(matches!(
+            registry
+                .call("security", "isSecure", std::slice::from_ref(&request))
+                .unwrap(),
+            Value::Bool(true)
+        ));
+        assert!(
+            matches!(registry.call("security", "clientIp", &[request]).unwrap(), Value::String(value) if value == "198.51.100.4")
+        );
     }
 
     #[test]
