@@ -266,3 +266,26 @@ local Mother supervisor. A `Stop` response for an unexpected critical Mother is
 treated as unsafe and ignored, so an ER bug cannot permanently remove the
 `.service` tree. Planned backend shutdown bypasses this crash-decision path.
 
+### CONTROL ER Vault child recovery
+
+The separate Vault child is also connected to the critical-process recovery
+boundary without making `vault-process` depend on backend/ER. `vault-process`
+defines a neutral bounded recovery-authority interface; backend adapts that
+interface to the same per-backend-generation CONTROL ER capability from a
+separate `vault-process-io` thread.
+
+When the Vault child exits unexpectedly, the report contains only its PID,
+portable exit code or Unix signal, uptime, prior recovery attempts, observation
+phase, and a fixed non-sensitive operation class such as `credential-get` or
+`credential-set`. Backend adds only fixed runtime context (`credential-runtime`,
+`stdio-json`, and `vault-process-io`). Credential names, callers, credential
+values, session tokens, Secret Service data, Vault ACL contents, Runtime ENV
+values, and protocol request/response bodies are never sent to ER.
+
+Vault keeps final recovery ownership. Local recovery uses exponential backoff
+from 200 ms to a 30-second cap. CONTROL ER may raise the minimum delay but cannot
+exceed that cap or permanently stop the critical Vault child; an unavailable,
+BASIC, failed, or timed-out ER decision falls back to the local Vault recovery
+path. A scheduled `refresh_process()` remains an intentional restart and resets
+unexpected-crash attempts rather than being classified as a crash.
+

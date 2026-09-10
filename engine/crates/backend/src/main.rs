@@ -22,6 +22,7 @@ mod runtime_image_boot;
 mod service_boot;
 mod service_control;
 mod service_mother;
+mod vault_recovery;
 
 fn running_as_service_executable() -> bool {
     std::env::current_exe()
@@ -463,7 +464,16 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         "vault starting as separate process data dir={}",
         admin_dir.display()
     ));
-    let vault_instance = match vault_process::VaultClient::spawn("backend-rs", &admin_dir) {
+    let vault_recovery_authority: Option<Arc<dyn vault_process::VaultRecoveryAuthority>> =
+        er_control_key.as_ref().map(|key| {
+            Arc::new(vault_recovery::VaultErRecoveryAuthority::new(key.clone()))
+                as Arc<dyn vault_process::VaultRecoveryAuthority>
+        });
+    let vault_instance = match vault_process::VaultClient::spawn_with_recovery(
+        "backend-rs",
+        &admin_dir,
+        vault_recovery_authority,
+    ) {
         Ok(vault) => Arc::new(vault),
         Err(error) => {
             let details = format!("{error:#}");
