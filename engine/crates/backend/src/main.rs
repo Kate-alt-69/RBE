@@ -235,8 +235,14 @@ fn spawn_error_reporter_daemon_process(
         anyhow::anyhow!("could not resolve current_exe to spawn the error-reporter daemon: {error}")
     })?;
     Ok(tokio::spawn(async move {
-        const RETRY_DELAY: Duration = Duration::from_secs(3);
+        const STABLE_WINDOW: Duration = Duration::from_secs(60);
+        let authority = if control_key.is_some() {
+            "control"
+        } else {
+            "basic"
+        };
         let mut consecutive_failures = 0u32;
+
         loop {
             let frame = control_key
                 .as_ref()
@@ -250,70 +256,198 @@ fn spawn_error_reporter_daemon_process(
             } else {
                 command.stdin(std::process::Stdio::null());
             }
-            let spawn_result = command.kill_on_drop(true).spawn();
-            let mut child = match spawn_result {
+
+            let mut child = match command.kill_on_drop(true).spawn() {
                 Ok(child) => child,
                 Err(error) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
+                    let delay = er_restart_delay(consecutive_failures);
+                    report_er_supervisor_failure(
+                        ErSupervisorFailure {
+                            phase: "spawn-failed",
+                            pid: None,
+                            exit_success: None,
+                            exit_code: None,
+                            exit_signal: None,
+                            uptime: Duration::ZERO,
+                            observation_error: Some(error.to_string()),
+                        },
+                        consecutive_failures,
+                        authority,
+                    );
                     tracing::error!(
                         consecutive_failures,
+                        backoff_ms = delay.as_millis() as u64,
                         error = %error,
                         "failed to spawn error-reporter daemon process"
                     );
-                    tokio::time::sleep(RETRY_DELAY.min(Duration::from_secs(30))).await;
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
             };
+            let pid = child.id();
+            let started_at = tokio::time::Instant::now();
+
             if let Some(frame) = frame {
                 use tokio::io::AsyncWriteExt;
                 let encoded = match serde_json::to_vec(&frame) {
                     Ok(encoded) => encoded,
                     Err(error) => {
-                        tracing::error!(error = %error, "failed to serialize ER bootstrap frame");
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        let delay = er_restart_delay(consecutive_failures);
+                        report_er_supervisor_failure(
+                            ErSupervisorFailure {
+                                phase: "bootstrap-serialize-failed",
+                                pid,
+                                exit_success: None,
+                                exit_code: None,
+                                exit_signal: None,
+                                uptime: started_at.elapsed(),
+                                observation_error: Some(error.to_string()),
+                            },
+                            consecutive_failures,
+                            authority,
+                        );
+                        tracing::error!(
+                            error = %error,
+                            consecutive_failures,
+                            backoff_ms = delay.as_millis() as u64,
+                            "failed to serialize ER bootstrap frame"
+                        );
                         let _ = child.kill().await;
                         let _ = child.wait().await;
-                        tokio::time::sleep(RETRY_DELAY).await;
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                 };
                 let Some(mut stdin) = child.stdin.take() else {
-                    tracing::error!("CONTROL ER child did not expose inherited bootstrap stdin");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let delay = er_restart_delay(consecutive_failures);
+                    report_er_supervisor_failure(
+                        ErSupervisorFailure {
+                            phase: "bootstrap-pipe-unavailable",
+                            pid,
+                            exit_success: None,
+                            exit_code: None,
+                            exit_signal: None,
+                            uptime: started_at.elapsed(),
+                            observation_error: Some(
+                                "CONTROL ER child did not expose inherited bootstrap stdin".into(),
+                            ),
+                        },
+                        consecutive_failures,
+                        authority,
+                    );
+                    tracing::error!(
+                        consecutive_failures,
+                        backoff_ms = delay.as_millis() as u64,
+                        "CONTROL ER child did not expose inherited bootstrap stdin"
+                    );
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    tokio::time::sleep(RETRY_DELAY).await;
+                    tokio::time::sleep(delay).await;
                     continue;
                 };
                 if let Err(error) = stdin.write_all(&encoded).await {
-                    tracing::error!(error = %error, "failed to deliver ER bootstrap frame");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let delay = er_restart_delay(consecutive_failures);
+                    report_er_supervisor_failure(
+                        ErSupervisorFailure {
+                            phase: "bootstrap-write-failed",
+                            pid,
+                            exit_success: None,
+                            exit_code: None,
+                            exit_signal: None,
+                            uptime: started_at.elapsed(),
+                            observation_error: Some(error.to_string()),
+                        },
+                        consecutive_failures,
+                        authority,
+                    );
+                    tracing::error!(
+                        error = %error,
+                        consecutive_failures,
+                        backoff_ms = delay.as_millis() as u64,
+                        "failed to deliver ER bootstrap frame"
+                    );
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    tokio::time::sleep(RETRY_DELAY).await;
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 drop(stdin);
             }
-            consecutive_failures = 0;
+
             tracing::info!(
-                pid = child.id(),
-                authority = if control_key.is_some() {
-                    "control"
-                } else {
-                    "basic"
-                },
+                pid,
+                authority,
+                consecutive_failures,
                 "error-reporter daemon process spawned"
             );
 
             tokio::select! {
                 status = child.wait() => {
-                    match status {
-                        Ok(status) if status.success() => tracing::warn!(%status, "error-reporter daemon exited; restarting supervisor child"),
-                        Ok(status) => tracing::warn!(%status, "error-reporter daemon exited unexpectedly; restarting"),
-                        Err(error) => tracing::warn!(error = %error, "error watching error-reporter daemon process; restarting"),
+                    let uptime = started_at.elapsed();
+                    if uptime >= STABLE_WINDOW {
+                        consecutive_failures = 0;
                     }
-                    tokio::time::sleep(RETRY_DELAY).await;
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let delay = er_restart_delay(consecutive_failures);
+                    match status {
+                        Ok(status) => {
+                            report_er_supervisor_failure(
+                                ErSupervisorFailure {
+                                    phase: "unexpected-exit",
+                                    pid,
+                                    exit_success: Some(status.success()),
+                                    exit_code: status.code(),
+                                    exit_signal: er_exit_signal(&status),
+                                    uptime,
+                                    observation_error: None,
+                                },
+                                consecutive_failures,
+                                authority,
+                            );
+                            tracing::warn!(
+                                %status,
+                                pid,
+                                authority,
+                                uptime_ms = uptime.as_millis() as u64,
+                                consecutive_failures,
+                                backoff_ms = delay.as_millis() as u64,
+                                "error-reporter daemon exited unexpectedly; replacement scheduled"
+                            );
+                        }
+                        Err(error) => {
+                            report_er_supervisor_failure(
+                                ErSupervisorFailure {
+                                    phase: "wait-failed",
+                                    pid,
+                                    exit_success: None,
+                                    exit_code: None,
+                                    exit_signal: None,
+                                    uptime,
+                                    observation_error: Some(error.to_string()),
+                                },
+                                consecutive_failures,
+                                authority,
+                            );
+                            tracing::warn!(
+                                error = %error,
+                                pid,
+                                authority,
+                                uptime_ms = uptime.as_millis() as u64,
+                                consecutive_failures,
+                                backoff_ms = delay.as_millis() as u64,
+                                "error watching error-reporter daemon process; replacement scheduled"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
                 }
                 _ = tokio::time::sleep(refresh_interval) => {
                     tracing::info!(
+                        pid,
                         hours = refresh_interval.as_secs() / 3600,
                         "scheduled error-reporter process refresh"
                     );
@@ -321,11 +455,101 @@ fn spawn_error_reporter_daemon_process(
                         tracing::warn!(error = %error, "failed to terminate error-reporter for scheduled refresh");
                     }
                     let _ = child.wait().await;
+                    consecutive_failures = 0;
                     maintenance.record_error_reporter_refresh();
                 }
             }
         }
     }))
+}
+
+fn er_restart_delay(attempt: u32) -> Duration {
+    const BASE: Duration = Duration::from_millis(500);
+    const MAX: Duration = Duration::from_secs(30);
+    let shift = attempt.saturating_sub(1).min(31);
+    let factor = 1u64 << shift;
+    let millis = BASE.as_millis().min(u128::from(u64::MAX)) as u64;
+    Duration::from_millis(millis.saturating_mul(factor)).min(MAX)
+}
+
+struct ErSupervisorFailure {
+    phase: &'static str,
+    pid: Option<u32>,
+    exit_success: Option<bool>,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    uptime: Duration,
+    observation_error: Option<String>,
+}
+
+fn report_er_supervisor_failure(
+    observation: ErSupervisorFailure,
+    consecutive_failures: u32,
+    authority: &str,
+) {
+    let ErSupervisorFailure {
+        phase,
+        pid,
+        exit_success,
+        exit_code,
+        exit_signal,
+        uptime,
+        observation_error,
+    } = observation;
+    let why = match observation_error.as_deref() {
+        Some(error) => format!("supervisor observation/bootstrap failure: {error}"),
+        None => match (exit_signal, exit_code, exit_success) {
+            (Some(signal), _, _) => format!("terminated by signal {signal}"),
+            (_, Some(code), _) => format!("exited with code {code}"),
+            (_, _, Some(true)) => "exited successfully but outside a planned refresh".into(),
+            _ => "process ended without a portable code or signal".into(),
+        },
+    };
+    let details = serde_json::json!({
+        "kind": "critical_process_postmortem",
+        "component": "error-reporter-daemon",
+        "processImage": if cfg!(windows) { "backend.exe" } else { "backend" },
+        "pid": pid,
+        "phase": phase,
+        "authority": authority,
+        "why": why,
+        "how": "backend-owned Error Reporter supervisor observed the child state transition",
+        "whatWasDoing": "tail-sign-dedupe-and-compact-error-queue",
+        "exitSuccess": exit_success,
+        "exitCode": exit_code,
+        "exitSignal": exit_signal,
+        "uptimeMs": uptime.as_millis().min(u128::from(u64::MAX)) as u64,
+        "consecutiveFailures": consecutive_failures,
+        "recovery": {
+            "owner": "backend-local-supervisor",
+            "nextBackoffMs": er_restart_delay(consecutive_failures).as_millis() as u64,
+            "controlErDecisionAvailable": false,
+            "reason": "ER cannot synchronously authorize recovery of its own dead process; the replacement ER signs this queued postmortem after startup"
+        }
+    });
+    let stack = serde_json::to_string(&details).unwrap_or_else(|_| {
+        format!(
+            "phase={phase} pid={pid:?} authority={authority} why={why} failures={consecutive_failures}"
+        )
+    });
+    error_client::report_issue(error_client::IssueInput {
+        source: "backend.er.supervisor",
+        level: Some(error_client::IssueLevel::Error),
+        category: Some(error_client::IssueCategory::OperationFailure),
+        message: "Error Reporter process failed; backend local supervisor scheduled a replacement",
+        stack: Some(&stack),
+    });
+}
+
+#[cfg(unix)]
+fn er_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn er_exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 fn resolve_settings_path() -> String {
@@ -1180,7 +1404,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
-mod container_supervision_tests {
+mod critical_process_supervision_tests {
     use super::*;
 
     #[test]
@@ -1201,5 +1425,13 @@ mod container_supervision_tests {
             container_recovery_backoff(1, Duration::from_secs(300)),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn er_self_recovery_backoff_is_exponential_and_capped() {
+        assert_eq!(er_restart_delay(1), Duration::from_millis(500));
+        assert_eq!(er_restart_delay(2), Duration::from_secs(1));
+        assert_eq!(er_restart_delay(3), Duration::from_secs(2));
+        assert_eq!(er_restart_delay(30), Duration::from_secs(30));
     }
 }

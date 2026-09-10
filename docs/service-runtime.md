@@ -289,3 +289,27 @@ BASIC, failed, or timed-out ER decision falls back to the local Vault recovery
 path. A scheduled `refresh_process()` remains an intentional restart and resets
 unexpected-crash attempts rather than being classified as a crash.
 
+### Error Reporter self-crash postmortems
+
+ER cannot safely ask itself whether its own dead process should restart. The
+backend therefore remains the final recovery owner for the Error Reporter daemon
+and uses a bounded local exponential replacement delay (500 ms through 30 s).
+A process that survives the 60-second stable window resets the crash streak.
+Scheduled ER refreshes remain planned maintenance and do not create crash
+postmortems or inflate the crash counter.
+
+For every unexpected ER exit, wait failure, spawn failure, or CONTROL bootstrap
+failure, backend writes one normal `error-client` issue into the existing bounded
+queue. The replacement ER later consumes and signs that record. The structured
+postmortem says `why`, `how`, `whatWasDoing`, child PID when available, authority
+mode, exit code or Unix signal, uptime, failure streak, and the local recovery
+backoff. It explicitly records that no synchronous CONTROL-ER decision was
+possible because the decision engine was the failed process itself.
+
+The self-postmortem contains no CONTROL key, report-signing key, queue contents,
+issue bodies, Runtime ENV values, credentials, request data, or arbitrary process
+memory. It goes through `error-client`'s normal redaction, de-duplication, and
+bounded queue path before the replacement ER signs it. This avoids an ER
+self-dependency while still preserving enough failure chronology for later
+diagnostics.
+

@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 fn main() {
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_BIN_PATH");
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_SIGNING_PRIVATE_KEY");
+    println!("cargo:rerun-if-env-changed=RBE_BUILD_TRACE");
 
     let out_dir =
         std::env::var("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts");
@@ -56,7 +57,9 @@ fn main() {
             let statement = signing_statement(&hash, &build_id, &target);
             let signature = signing_key.sign(statement.as_bytes());
 
-            println!("cargo:warning=backend: binding container SHA-256 {hash}, build_id {build_id}, target {target}");
+            if std::env::var_os("RBE_BUILD_TRACE").is_some() {
+                println!("cargo:warning=backend: binding container SHA-256 {hash}, build_id {build_id}, target {target}");
+            }
             (
                 hash,
                 hex::encode(public_key.to_bytes()),

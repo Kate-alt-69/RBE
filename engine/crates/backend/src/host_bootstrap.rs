@@ -1,7 +1,9 @@
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 use std::sync::Arc;
 
 use rand::RngCore;
+#[cfg(target_os = "linux")]
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]

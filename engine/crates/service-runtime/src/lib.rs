@@ -66,6 +66,7 @@ pub fn apply_service_process_label(label: &str) {
     apply_service_process_label_platform(label);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn short_service_process_label(label: &str, max_bytes: usize) -> String {
     let semantic = if label == "service - mother" {
         "service-mother"
