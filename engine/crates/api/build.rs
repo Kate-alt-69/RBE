@@ -33,7 +33,9 @@ fn main() {
                 panic!("RBE_ADMIN_AUTH_SALT_HEX must contain exactly 16 hexadecimal characters");
             }
             if !valid_hex(&verifier, 32) {
-                panic!("RBE_ADMIN_AUTH_VERIFIER_HEX must contain exactly 64 hexadecimal characters");
+                panic!(
+                    "RBE_ADMIN_AUTH_VERIFIER_HEX must contain exactly 64 hexadecimal characters"
+                );
             }
             format!(
                 "pub const ADMIN_PASSWORD_CONFIGURED: bool = true;\n\
@@ -54,9 +56,7 @@ fn main() {
              pub const ADMIN_PASSWORD_VERIFIER_HEX: &str = \"\";\n"
                 .to_string()
         }
-        _ => panic!(
-            "RBE admin verifier is incomplete; set rounds, salt, and verifier together"
-        ),
+        _ => panic!("RBE admin verifier is incomplete; set rounds, salt, and verifier together"),
     };
 
     fs::write(destination, generated).expect("write dashboard auth constants");

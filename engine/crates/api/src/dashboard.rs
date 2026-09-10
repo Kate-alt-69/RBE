@@ -112,9 +112,11 @@ fn prune_sessions(state: &mut AdminAuthState) {
 }
 
 fn session_token(headers: &HeaderMap) -> Option<&str> {
-    headers.get(SESSION_HEADER)?.to_str().ok().filter(|value| {
-        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
+    headers
+        .get(SESSION_HEADER)?
+        .to_str()
+        .ok()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn authorized_session(headers: &HeaderMap) -> Option<AdminSession> {
@@ -145,10 +147,7 @@ fn require_auth(peer: SocketAddr, headers: &HeaderMap) -> Result<AdminSession, R
     })
 }
 
-fn require_mutation_auth(
-    peer: SocketAddr,
-    headers: &HeaderMap,
-) -> Result<AdminSession, Response> {
+fn require_mutation_auth(peer: SocketAddr, headers: &HeaderMap) -> Result<AdminSession, Response> {
     let session = require_auth(peer, headers)?;
     let csrf = headers
         .get(CSRF_HEADER)
@@ -229,7 +228,10 @@ async fn login(
         };
         prune_sessions(&mut state);
         if let Some(deadline) = state.blocked_until {
-            let retry = deadline.saturating_duration_since(Instant::now()).as_secs().max(1);
+            let retry = deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .max(1);
             let mut response = json_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 json!({ "error": "too many failed login attempts", "retryAfterSecs": retry }),
@@ -246,7 +248,9 @@ async fn login(
         .await
         .unwrap_or(false);
     if !verified {
-        let mut state = auth_state().lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = auth_state()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state.failures = state.failures.saturating_add(1);
         if state.failures >= LOGIN_FAILURE_LIMIT {
             state.blocked_until = Some(Instant::now() + LOGIN_LOCKOUT);
@@ -268,7 +272,9 @@ async fn login(
         expires_at_ms,
     };
 
-    let mut state = auth_state().lock().unwrap_or_else(|error| error.into_inner());
+    let mut state = auth_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     prune_sessions(&mut state);
     state.failures = 0;
     state.blocked_until = None;
@@ -294,10 +300,7 @@ async fn login(
     )
 }
 
-async fn logout(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
+async fn logout(ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
     if let Err(response) = require_mutation_auth(peer, &headers) {
         return response;
     }

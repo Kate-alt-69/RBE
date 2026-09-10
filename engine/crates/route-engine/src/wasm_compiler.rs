@@ -14,6 +14,7 @@ use wasm_encoder::{
 use crate::ast::{Expr, RouteFile, Statement};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 1;
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 1;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 

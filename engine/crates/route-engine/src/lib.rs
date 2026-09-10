@@ -86,7 +86,7 @@ pub use source_registry::{
 };
 pub use wasm_compiler::{
     compile_route as compile_route_wasm, RouteWasmArtifact, RouteWasmCompilation,
-    ROUTE_WASM_ABI_VERSION,
+    ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
 };
 
 pub fn build_routes(

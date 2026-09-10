@@ -17,9 +17,11 @@ use crate::lexer::Lexer;
 use crate::modules::binding_name;
 use crate::parser::Parser;
 use crate::transpiler::transpile_file;
-use crate::wasm_compiler::{compile_route, RouteWasmCompilation, ROUTE_WASM_ABI_VERSION};
+use crate::wasm_compiler::{
+    compile_route, RouteWasmCompilation, ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
+};
 
-const CACHE_MANIFEST_VERSION: u64 = 2;
+const CACHE_MANIFEST_VERSION: u64 = 3;
 
 pub struct SyncOutcome {
     pub route_path: PathBuf,
@@ -84,6 +86,10 @@ fn existing_hash_matches(
     };
     if wasm.get("abi_version").and_then(serde_json::Value::as_u64)
         != Some(u64::from(ROUTE_WASM_ABI_VERSION))
+        || wasm
+            .get("compiler_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(ROUTE_WASM_COMPILER_VERSION))
     {
         return false;
     }
@@ -133,12 +139,14 @@ fn write_manifest(
         RouteWasmCompilation::Native(artifact) => serde_json::json!({
             "status": "native",
             "abi_version": ROUTE_WASM_ABI_VERSION,
+            "compiler_version": ROUTE_WASM_COMPILER_VERSION,
             "sha256": artifact.sha256,
             "verb": artifact.verb,
         }),
         RouteWasmCompilation::InterpreterFallback { reason } => serde_json::json!({
             "status": "interpreter_fallback",
             "abi_version": ROUTE_WASM_ABI_VERSION,
+            "compiler_version": ROUTE_WASM_COMPILER_VERSION,
             "reason": reason,
         }),
     };

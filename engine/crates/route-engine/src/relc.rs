@@ -26,6 +26,7 @@ use crate::runtime_image::{
 use crate::server_policy::{ServerPolicy, ServerPolicyError};
 use crate::server_rel::{compile_server_source, ServerCompileError, ServerProgram};
 use crate::source_registry::{RelSourceKind, RelSourceRegistry, SourceId, SourceRegistryError};
+use crate::wasm_compiler::{compile_route, RouteWasmCompilation};
 
 #[derive(Debug, Clone)]
 pub struct PhysicalRelSource {
@@ -311,6 +312,22 @@ pub fn compile_runtime_image(
         .map(|(id, unit)| (id.clone(), unit.runtime_executable()))
         .collect::<BTreeMap<_, _>>();
 
+    let mut route_wasm_artifacts = BTreeMap::new();
+    let mut route_wasm_fallbacks = BTreeMap::new();
+    for (id, unit) in &compiled {
+        let CompiledUnit::Route(file) = unit else {
+            continue;
+        };
+        match compile_route(file) {
+            RouteWasmCompilation::Native(artifact) => {
+                route_wasm_artifacts.insert(id.clone(), artifact);
+            }
+            RouteWasmCompilation::InterpreterFallback { reason } => {
+                route_wasm_fallbacks.insert(id.clone(), reason);
+            }
+        }
+    }
+
     for source in registry.iter() {
         let unit = compiled.get(source.id()).ok_or_else(|| {
             RelcError::Link(format!(
@@ -361,6 +378,8 @@ pub fn compile_runtime_image(
         middleware_plan,
         service_assignments,
         capabilities,
+        route_wasm_artifacts,
+        route_wasm_fallbacks,
         executables,
     })
 }
@@ -907,6 +926,55 @@ mod tests {
             "export function value() { return 2; }",
         )];
         assert!(compile_runtime_image(server, physical, &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn runtime_image_pins_native_route_artifacts_and_explicit_fallbacks() {
+        let routes = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "static",
+                "api/static.route",
+                "class Route { get(req) { return { ok: true }; } }",
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "dynamic",
+                "api/dynamic.route",
+                "class Route { post(req) { return req.body; } }",
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", routes, &serde_json::json!({})).unwrap();
+        let static_id = image
+            .routes
+            .iter()
+            .find(|id| {
+                image
+                    .source(id)
+                    .is_some_and(|source| source.logical_name == "static")
+            })
+            .unwrap();
+        let dynamic_id = image
+            .routes
+            .iter()
+            .find(|id| {
+                image
+                    .source(id)
+                    .is_some_and(|source| source.logical_name == "dynamic")
+            })
+            .unwrap();
+
+        let artifact = image.route_wasm_artifact(static_id).unwrap();
+        assert_eq!(artifact.verb, "get");
+        assert_eq!(artifact.sha256.len(), 64);
+        assert_eq!(&artifact.bytes[..4], b"\0asm");
+        assert!(image.route_wasm_fallback(static_id).is_none());
+        assert!(image.route_wasm_artifact(dynamic_id).is_none());
+        assert!(image
+            .route_wasm_fallback(dynamic_id)
+            .unwrap()
+            .contains("runtime REL evaluation"));
     }
 
     #[test]

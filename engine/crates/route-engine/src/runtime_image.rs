@@ -10,6 +10,9 @@ use crate::runtime_env::RuntimeEnv;
 use crate::server_policy::ServerPolicy;
 use crate::server_rel::ServerProgram;
 use crate::source_registry::{RelSourceKind, SourceId};
+use crate::wasm_compiler::{
+    RouteWasmArtifact, ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
+};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeSourceManifest {
@@ -45,6 +48,11 @@ pub struct RuntimeImage {
     pub middleware_plan: MiddlewarePlan,
     pub service_assignments: BTreeMap<String, String>,
     pub capabilities: BTreeMap<SourceId, BTreeSet<String>>,
+    /// Exact native route artifacts pinned at image-link time. These bytes
+    /// are the only route WASM payloads eligible for Container registration.
+    pub route_wasm_artifacts: BTreeMap<SourceId, RouteWasmArtifact>,
+    /// Routes outside the current native compiler subset remain explicit.
+    pub route_wasm_fallbacks: BTreeMap<SourceId, String>,
     pub executables: BTreeMap<SourceId, RuntimeExecutable>,
 }
 
@@ -59,6 +67,14 @@ impl RuntimeImage {
 
     pub fn executable(&self, id: &SourceId) -> Option<&RuntimeExecutable> {
         self.executables.get(id)
+    }
+
+    pub fn route_wasm_artifact(&self, id: &SourceId) -> Option<&RouteWasmArtifact> {
+        self.route_wasm_artifacts.get(id)
+    }
+
+    pub fn route_wasm_fallback(&self, id: &SourceId) -> Option<&str> {
+        self.route_wasm_fallbacks.get(id).map(String::as_str)
     }
 
     pub fn route_file(&self, id: &SourceId) -> Option<Arc<RouteFile>> {
@@ -141,8 +157,10 @@ pub(crate) fn stable_source_hash<'a>(
 
 pub(crate) fn stable_image_hash(source_hash: u64, settings: &serde_json::Value) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
-    feed_hash(&mut hash, b"RBE_RUNTIME_IMAGE_V1");
+    feed_hash(&mut hash, b"RBE_RUNTIME_IMAGE_V2");
     feed_hash(&mut hash, &source_hash.to_be_bytes());
+    feed_hash(&mut hash, &ROUTE_WASM_ABI_VERSION.to_be_bytes());
+    feed_hash(&mut hash, &ROUTE_WASM_COMPILER_VERSION.to_be_bytes());
     hash_json(&mut hash, settings);
     hash
 }
