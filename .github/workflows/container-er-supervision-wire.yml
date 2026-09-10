@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/patches/container-er-supervision-wire.py'
+      - '.github/patches/container-er-supervision-fix.py'
       - '.github/workflows/container-er-supervision-wire.yml'
 
 permissions:
@@ -28,7 +29,9 @@ jobs:
         with:
           workspaces: engine
       - name: Apply CONTROL ER container supervision
-        run: python .github/patches/container-er-supervision-wire.py
+        run: |
+          python .github/patches/container-er-supervision-wire.py
+          python .github/patches/container-er-supervision-fix.py
       - name: Format
         working-directory: engine
         run: cargo fmt --all
@@ -51,6 +54,7 @@ jobs:
             echo "main moved to $latest; regenerating against latest source"
             git reset --hard "$latest"
             python .github/patches/container-er-supervision-wire.py
+            python .github/patches/container-er-supervision-fix.py
             cd engine
             cargo fmt --all
             cargo check --workspace --locked
@@ -62,6 +66,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f .github/patches/container-er-supervision-wire.py
+          rm -f .github/patches/container-er-supervision-fix.py
           rm -f .github/workflows/container-er-supervision-wire.yml
           git add -A
           git config user.name 'github-actions[bot]'
