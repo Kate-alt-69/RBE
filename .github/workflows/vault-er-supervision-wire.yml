@@ -33,6 +33,8 @@ jobs:
         run: |
           cargo fmt --manifest-path engine/Cargo.toml --all
           cargo fmt --manifest-path vault-process/Cargo.toml
+      - name: Stage standalone Vault lock from verified engine graph
+        run: cp engine/Cargo.lock vault-process/Cargo.lock
       - name: Check locked workspaces
         run: |
           cargo check --manifest-path engine/Cargo.toml --workspace --locked
@@ -49,6 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          rm -f vault-process/Cargo.lock
           git fetch origin main
           latest="$(git rev-parse origin/main)"
           if [[ "$latest" != "$GITHUB_SHA" ]]; then
@@ -57,6 +60,7 @@ jobs:
             python .github/patches/vault-er-supervision-wire.py
             cargo fmt --manifest-path engine/Cargo.toml --all
             cargo fmt --manifest-path vault-process/Cargo.toml
+            cp engine/Cargo.lock vault-process/Cargo.lock
             cargo check --manifest-path engine/Cargo.toml --workspace --locked
             cargo check --manifest-path vault-process/Cargo.toml --locked
             cargo test --manifest-path vault-process/Cargo.toml --locked
@@ -64,10 +68,12 @@ jobs:
             cargo clippy --manifest-path vault-process/Cargo.toml --all-targets --locked -- -D warnings
             cargo clippy --manifest-path engine/Cargo.toml -p backend --all-targets --locked -- -D warnings
           fi
+          rm -f vault-process/Cargo.lock
       - name: Commit verified Vault supervision
         shell: bash
         run: |
           set -euo pipefail
+          rm -f vault-process/Cargo.lock
           rm -f .github/patches/vault-er-supervision-wire.py
           rm -f .github/workflows/vault-er-supervision-wire.yml
           git add -A
