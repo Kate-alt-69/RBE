@@ -4,7 +4,8 @@ use std::fs::File;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::ExitStatus;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
@@ -20,6 +21,8 @@ pub struct ContainerProcess {
     child: Child,
     pub address: SocketAddr,
     token: String,
+    pid: Option<u32>,
+    started_at: Instant,
 }
 
 impl ContainerProcess {
@@ -60,11 +63,14 @@ impl ContainerProcess {
                     binary.display()
                 )
             })?;
+            let pid = child.id();
 
             let mut process = Self {
                 child,
                 address,
                 token,
+                pid,
+                started_at: Instant::now(),
             };
             match process.wait_for_control_socket().await {
                 Ok(()) => {
@@ -120,7 +126,19 @@ impl ContainerProcess {
     }
 
     pub fn endpoint(&self) -> (SocketAddr, String, Option<u32>) {
-        (self.address, self.token.clone(), self.child.id())
+        (self.address, self.token.clone(), self.pid)
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    pub fn uptime(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
     }
 }
 

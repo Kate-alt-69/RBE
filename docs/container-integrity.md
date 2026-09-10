@@ -85,3 +85,30 @@ For a production release, the corresponding public key is compiled into `backend
 Changing or replacing `dep/container(.exe)` after the build causes backend startup to fail. Changing the expected hash/signature requires rebuilding `backend.exe` with the release signing key.
 
 A simple self-hash of `backend.exe` is intentionally **not** used: such a self-reference is circular. Authenticating the backend itself requires an external code-signing mechanism in addition to this container dependency signature.
+
+## Runtime crash supervision
+
+The verified container dependency is now supervised continuously, not only at
+scheduled refresh time. Backend polls the owned child at a bounded interval. An
+unexpected exit keeps the existing `ContainerClient` generation unavailable only
+until a cryptographically verified replacement becomes healthy; backend then
+atomically retargets the shared client to the replacement endpoint. Rapid
+failures use exponential backoff from 250 ms up to 30 seconds, and a process
+that survives the stable window resets accumulated crash attempts.
+
+Scheduled rolling refresh remains a separate path: backend asks the healthy
+container to drain, starts and verifies a replacement, switches IPC, and only
+then releases the old process. A planned refresh is therefore not reported as a
+crash and does not inflate crash-loop attempts.
+
+When HostBootstrap granted CONTROL ER, an unexpected container exit also emits
+a bounded authenticated `ProcessExitReport` before replacement. The report
+contains only the stable component/image identity, PID, exit code or Unix
+signal, uptime, previous recovery attempts, endpoint generation, configured
+environment count, runtime phase, supervision scope, and a fixed activity label.
+The container authentication token, request payloads, execution data, Vault
+credentials, Runtime ENV values, and worker memory are never included. CONTROL
+ER may increase the minimum recovery delay, but it cannot exceed the local
+30-second cap or permanently stop this critical process; BASIC/dead/timed-out
+ER falls back to the local supervisor.
+

@@ -2,7 +2,7 @@
 //! are separate supervised OS processes. Video Manager's lightweight control
 //! plane lives in-process; heavy media workers remain lazy/separate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -506,13 +506,14 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         "verified container process ready pid={pid:?} address={address}"
     ));
     let container_process = Arc::new(tokio::sync::Mutex::new(initial_container));
-    let container_refresh_task = spawn_container_refresh(
+    let container_supervisor_task = spawn_container_supervisor(
         container_path.clone(),
         config.containers.clone(),
         container_process.clone(),
         container_client.clone(),
         maintenance.clone(),
         refresh_interval,
+        er_control_key.clone(),
     );
 
     let service_runtime_env = Arc::new(runtime_image.snapshot().environment.to_json());
@@ -695,7 +696,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
             ))
             .await;
     }
-    container_refresh_task.abort();
+    container_supervisor_task.abort();
     vault_refresh_task.abort();
     error_reporter_task.abort();
     drop(container_process);
@@ -742,74 +743,286 @@ async fn bind_backend_listener(addr: &str) -> anyhow::Result<tokio::net::TcpList
     ))
 }
 
-fn spawn_container_refresh(
+fn spawn_container_supervisor(
     binary: PathBuf,
     settings: config::ContainersConfig,
     process: Arc<tokio::sync::Mutex<container_process::ContainerProcess>>,
     client: ContainerClient,
     maintenance: Arc<MaintenanceMetrics>,
     refresh_interval: Duration,
+    er_control_key: Option<host_bootstrap::ErControlKey>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const DRAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-        let mut interval = tokio::time::interval(refresh_interval);
-        interval.tick().await;
+        const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
+        const STABLE_WINDOW: Duration = Duration::from_secs(60);
+
+        let mut refresh = tokio::time::interval(refresh_interval);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        refresh.tick().await;
+        let mut monitor = tokio::time::interval(MONITOR_INTERVAL);
+        monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        monitor.tick().await;
+        let mut restart_attempts = 0u32;
+
         loop {
-            interval.tick().await;
-            tracing::info!(
-                hours = refresh_interval.as_secs() / 3600,
-                "starting scheduled rolling container refresh"
-            );
-
-            if let Err(error) = client.prepare_refresh(DRAIN_TIMEOUT).await {
-                tracing::warn!(
-                    error = %error,
-                    "container did not complete refresh drain; retaining current process"
-                );
-                if let Err(resume_error) = client.resume().await {
-                    tracing::error!(
-                        error = %resume_error,
-                        "failed to resume container after refresh drain failure"
-                    );
-                }
-                continue;
-            }
-
-            match container_process::ContainerProcess::spawn(&binary, &settings).await {
-                Ok(replacement) => {
-                    let (address, token, pid) = replacement.endpoint();
-                    let old = {
+            tokio::select! {
+                _ = monitor.tick() => {
+                    let observed = {
                         let mut guard = process.lock().await;
-                        std::mem::replace(&mut *guard, replacement)
+                        let pid = guard.pid().unwrap_or_default();
+                        let uptime = guard.uptime();
+                        match guard.try_wait() {
+                            Ok(Some(status)) => Some((pid, uptime, status)),
+                            Ok(None) => None,
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    pid,
+                                    "failed to inspect verified container process; retaining current process identity"
+                                );
+                                None
+                            }
+                        }
                     };
-                    client.update_endpoint(address, token, pid);
-                    maintenance.record_container_refresh();
-                    tracing::info!(
+                    let Some((pid, uptime, status)) = observed else {
+                        continue;
+                    };
+
+                    if uptime >= STABLE_WINDOW {
+                        restart_attempts = 0;
+                    }
+                    let generation = client.endpoint_snapshot().generation;
+                    let report = container_exit_report(
                         pid,
-                        %address,
-                        "replacement container healthy; IPC switched to new process"
+                        &status,
+                        uptime,
+                        restart_attempts,
+                        generation,
+                        &settings,
                     );
-                    // The old process has already stopped accepting work and is
-                    // confirmed idle. This short grace only lets in-flight
-                    // health/inspection IPC calls release their old socket.
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    drop(old);
-                }
-                Err(error) => {
-                    tracing::error!(
-                        error = %error,
-                        "scheduled container replacement failed; resuming existing healthy container"
-                    );
-                    if let Err(resume_error) = client.resume().await {
-                        tracing::error!(
-                            error = %resume_error,
-                            "failed to resume existing container after replacement failure"
+                    let (authority_minimum_backoff, authority_reason) =
+                        decide_container_recovery(er_control_key.as_ref(), report).await;
+
+                    loop {
+                        restart_attempts = restart_attempts.saturating_add(1);
+                        let delay = container_recovery_backoff(
+                            restart_attempts,
+                            authority_minimum_backoff,
                         );
+                        tracing::warn!(
+                            pid,
+                            %status,
+                            attempt = restart_attempts,
+                            backoff_ms = delay.as_millis() as u64,
+                            authority_reason = authority_reason
+                                .as_deref()
+                                .unwrap_or("local critical-process policy"),
+                            "verified container process exited unexpectedly; scheduling replacement"
+                        );
+                        tokio::time::sleep(delay).await;
+
+                        match container_process::ContainerProcess::spawn(&binary, &settings).await {
+                            Ok(replacement) => {
+                                let (address, token, new_pid) = replacement.endpoint();
+                                let old = {
+                                    let mut guard = process.lock().await;
+                                    std::mem::replace(&mut *guard, replacement)
+                                };
+                                client.update_endpoint(address, token, new_pid);
+                                drop(old);
+                                tracing::info!(
+                                    old_pid = pid,
+                                    pid = new_pid,
+                                    %address,
+                                    attempt = restart_attempts,
+                                    authority_reason = authority_reason
+                                        .as_deref()
+                                        .unwrap_or("local critical-process policy"),
+                                    "verified container replacement healthy; IPC switched to recovered process"
+                                );
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    old_pid = pid,
+                                    attempt = restart_attempts,
+                                    error = %error,
+                                    "verified container crash replacement failed; retrying with bounded backoff"
+                                );
+                            }
+                        }
+                    }
+                }
+                _ = refresh.tick() => {
+                    tracing::info!(
+                        hours = refresh_interval.as_secs() / 3600,
+                        "starting scheduled rolling container refresh"
+                    );
+
+                    if let Err(error) = client.prepare_refresh(DRAIN_TIMEOUT).await {
+                        tracing::warn!(
+                            error = %error,
+                            "container did not complete refresh drain; retaining current process"
+                        );
+                        if let Err(resume_error) = client.resume().await {
+                            tracing::error!(
+                                error = %resume_error,
+                                "failed to resume container after refresh drain failure"
+                            );
+                        }
+                        continue;
+                    }
+
+                    match container_process::ContainerProcess::spawn(&binary, &settings).await {
+                        Ok(replacement) => {
+                            let (address, token, pid) = replacement.endpoint();
+                            let old = {
+                                let mut guard = process.lock().await;
+                                std::mem::replace(&mut *guard, replacement)
+                            };
+                            client.update_endpoint(address, token, pid);
+                            maintenance.record_container_refresh();
+                            restart_attempts = 0;
+                            tracing::info!(
+                                pid,
+                                %address,
+                                "replacement container healthy; IPC switched to new process"
+                            );
+                            // The old process has already stopped accepting work and is
+                            // confirmed idle. This short grace only lets in-flight
+                            // health/inspection IPC calls release their old socket.
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            drop(old);
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "scheduled container replacement failed; resuming existing healthy container"
+                            );
+                            if let Err(resume_error) = client.resume().await {
+                                tracing::error!(
+                                    error = %resume_error,
+                                    "failed to resume existing container after replacement failure"
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
     })
+}
+
+fn container_exit_report(
+    pid: u32,
+    status: &std::process::ExitStatus,
+    uptime: Duration,
+    previous_restart_attempts: u32,
+    endpoint_generation: u64,
+    settings: &config::ContainersConfig,
+) -> er_recovery::ProcessExitReport {
+    let mut context = BTreeMap::new();
+    context.insert(
+        "endpoint_generation".into(),
+        endpoint_generation.to_string(),
+    );
+    context.insert(
+        "configured_environments".into(),
+        settings.environments.to_string(),
+    );
+    context.insert("supervision_scope".into(), "execution-runtime".into());
+
+    er_recovery::ProcessExitReport {
+        component: "container-runtime".into(),
+        process_image: if cfg!(windows) {
+            "container.exe".into()
+        } else {
+            "container".into()
+        },
+        pid,
+        exit_success: status.success(),
+        exit_code: status.code(),
+        exit_signal: container_exit_signal(status),
+        previous_restart_attempts,
+        uptime_ms: uptime.as_millis().min(u128::from(u64::MAX)) as u64,
+        expected: false,
+        phase: "runtime-supervision".into(),
+        last_operation: Some("serve-authenticated-container-control".into()),
+        observation_error: None,
+        context,
+    }
+}
+
+async fn decide_container_recovery(
+    key: Option<&host_bootstrap::ErControlKey>,
+    report: er_recovery::ProcessExitReport,
+) -> (Duration, Option<String>) {
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    let Some(key) = key else {
+        return (Duration::ZERO, None);
+    };
+    let client = er_recovery::ErRecoveryClient::new(key.clone());
+    match tokio::time::timeout(Duration::from_millis(700), client.decide_process(report)).await {
+        Ok(Ok(service_runtime::ServiceRestartDirective::Restart {
+            minimum_backoff_ms,
+            reason,
+        })) => (
+            Duration::from_millis(minimum_backoff_ms).min(MAX_BACKOFF),
+            Some(reason),
+        ),
+        Ok(Ok(service_runtime::ServiceRestartDirective::Default)) => (Duration::ZERO, None),
+        Ok(Ok(service_runtime::ServiceRestartDirective::Stop { reason })) => {
+            tracing::error!(
+                authority_reason = %reason,
+                "CONTROL ER requested Stop for unexpected critical container exit; ignoring unsafe stop directive"
+            );
+            (
+                Duration::ZERO,
+                Some(format!("unsafe CONTROL ER stop ignored: {reason}")),
+            )
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                "CONTROL ER container decision failed; using local critical-process policy"
+            );
+            (Duration::ZERO, None)
+        }
+        Err(_) => {
+            tracing::warn!(
+                "CONTROL ER container decision timed out; using local critical-process policy"
+            );
+            (Duration::ZERO, None)
+        }
+    }
+}
+
+fn container_restart_delay(attempt: u32) -> Duration {
+    const BASE: Duration = Duration::from_millis(250);
+    const MAX: Duration = Duration::from_secs(30);
+    let shift = attempt.saturating_sub(1).min(31);
+    let factor = 1u64 << shift;
+    let millis = BASE.as_millis().min(u128::from(u64::MAX)) as u64;
+    Duration::from_millis(millis.saturating_mul(factor)).min(MAX)
+}
+
+fn container_recovery_backoff(attempt: u32, authority_minimum: Duration) -> Duration {
+    const MAX: Duration = Duration::from_secs(30);
+    container_restart_delay(attempt)
+        .max(authority_minimum)
+        .min(MAX)
+}
+
+#[cfg(unix)]
+fn container_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn container_exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 fn spawn_vault_refresh(
@@ -954,4 +1167,29 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod container_supervision_tests {
+    use super::*;
+
+    #[test]
+    fn container_recovery_backoff_is_exponential_capped_and_never_shortened() {
+        assert_eq!(container_restart_delay(1), Duration::from_millis(250));
+        assert_eq!(container_restart_delay(2), Duration::from_millis(500));
+        assert_eq!(container_restart_delay(3), Duration::from_secs(1));
+        assert_eq!(container_restart_delay(30), Duration::from_secs(30));
+        assert_eq!(
+            container_recovery_backoff(1, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            container_recovery_backoff(6, Duration::from_millis(1)),
+            container_restart_delay(6)
+        );
+        assert_eq!(
+            container_recovery_backoff(1, Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+    }
 }
