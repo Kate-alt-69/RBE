@@ -4,10 +4,12 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EXECUTION_INPUT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_EXECUTION_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_AWAIT_RESULT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
@@ -33,6 +35,14 @@ pub struct ExecuteRequest {
     /// Invocation data for an already-registered artifact. This field must
     /// never be interpreted as executable bytes.
     pub input: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AwaitResultRequest {
+    pub request_id: String,
+    pub auth_token: String,
+    pub execution_id: String,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +90,7 @@ pub enum Request {
     Hello(Hello),
     RegisterArtifact(RegisterArtifactRequest),
     Execute(ExecuteRequest),
+    AwaitResult(AwaitResultRequest),
     Cancel(CancelRequest),
     Inspect(InspectRequest),
     RestartEnvironment(RestartEnvironmentRequest),
@@ -107,6 +118,23 @@ pub enum Response {
         already_present: bool,
     },
     Accepted {
+        request_id: String,
+        execution_id: String,
+    },
+    ExecutionFinished {
+        request_id: String,
+        execution_id: String,
+        output: Vec<u8>,
+        elapsed_ms: u64,
+    },
+    ExecutionFailed {
+        request_id: String,
+        execution_id: String,
+        code: String,
+        message: String,
+        elapsed_ms: u64,
+    },
+    ExecutionPending {
         request_id: String,
         execution_id: String,
     },
@@ -238,6 +266,24 @@ mod tests {
             panic!("expected execute request");
         };
         assert_eq!(decoded.input, b"request-body");
+    }
+
+    #[test]
+    fn await_result_round_trip_preserves_execution_identity_and_timeout() {
+        let request = Request::AwaitResult(AwaitResultRequest {
+            request_id: "wait-1".into(),
+            auth_token: "secret".into(),
+            execution_id: "exec-0000000000000001-0000000000000002".into(),
+            timeout_ms: 250,
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();
+        let Request::AwaitResult(decoded) = decoded else {
+            panic!("expected await-result request");
+        };
+        assert_eq!(decoded.timeout_ms, 250);
+        assert!(decoded.execution_id.starts_with("exec-"));
     }
 
     #[test]

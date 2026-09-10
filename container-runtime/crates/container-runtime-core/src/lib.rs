@@ -18,7 +18,9 @@ mod worker;
 
 pub use cache::{ArtifactCache, ExecutionProfile};
 pub use environment::EnvironmentSnapshot;
-pub use execution::{ExecutionId, ExecutionRecord, ExecutionState, ExecutionTask, WorkCost};
+pub use execution::{
+    ExecutionId, ExecutionOutcome, ExecutionRecord, ExecutionState, ExecutionTask, WorkCost,
+};
 pub use runtime::{Runtime, RuntimeConfig};
 pub use swamp::SwampSnapshot;
 pub use worker::{WorkerSnapshot, WorkerState};

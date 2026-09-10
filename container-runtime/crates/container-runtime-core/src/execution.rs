@@ -88,6 +88,14 @@ pub struct ExecutionTask {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExecutionOutcome {
+    pub output: Vec<u8>,
+    pub error: Option<String>,
+    pub elapsed_ms: u64,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ExecutionRecord {
     pub task: ExecutionTask,
     pub state: ExecutionState,

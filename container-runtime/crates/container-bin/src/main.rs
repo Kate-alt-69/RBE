@@ -23,7 +23,7 @@ use container_runtime_core::{
 use execution_engine::{ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
     decode_request, read_frame, write_frame, Request, Response, MAX_ARTIFACT_BYTES,
-    MAX_EXECUTION_INPUT_BYTES, PROTOCOL_VERSION,
+    MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES, PROTOCOL_VERSION,
 };
 use resource_limits::ResourceLimits;
 use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, SandboxPolicy};
@@ -531,6 +531,55 @@ fn handle_connection(
                         "container environment is unavailable: {}",
                         request.environment
                     ),
+                }
+            }
+        }
+        Request::AwaitResult(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else {
+                let timeout =
+                    Duration::from_millis(request.timeout_ms.clamp(1, MAX_AWAIT_RESULT_MS));
+                match runtime.wait_for_result(&request.execution_id, timeout) {
+                    Some(outcome) if outcome.cancelled => Response::ExecutionFailed {
+                        request_id: request.request_id,
+                        execution_id: request.execution_id,
+                        code: "EXECUTION_CANCELLED".into(),
+                        message: outcome
+                            .error
+                            .unwrap_or_else(|| "execution was cancelled".into()),
+                        elapsed_ms: outcome.elapsed_ms,
+                    },
+                    Some(outcome) if outcome.error.is_some() => Response::ExecutionFailed {
+                        request_id: request.request_id,
+                        execution_id: request.execution_id,
+                        code: "EXECUTION_FAILED".into(),
+                        message: outcome.error.unwrap_or_else(|| "execution failed".into()),
+                        elapsed_ms: outcome.elapsed_ms,
+                    },
+                    Some(outcome) if outcome.output.len() > MAX_EXECUTION_OUTPUT_BYTES => {
+                        Response::ExecutionFailed {
+                            request_id: request.request_id,
+                            execution_id: request.execution_id,
+                            code: "EXECUTION_OUTPUT_TOO_LARGE".into(),
+                            message: "execution output exceeds the Container IPC limit".into(),
+                            elapsed_ms: outcome.elapsed_ms,
+                        }
+                    }
+                    Some(outcome) => Response::ExecutionFinished {
+                        request_id: request.request_id,
+                        execution_id: request.execution_id,
+                        output: outcome.output,
+                        elapsed_ms: outcome.elapsed_ms,
+                    },
+                    None => Response::ExecutionPending {
+                        request_id: request.request_id,
+                        execution_id: request.execution_id,
+                    },
                 }
             }
         }

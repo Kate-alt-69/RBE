@@ -16,11 +16,61 @@ use sha2::{Digest, Sha256};
 
 use crate::cache::ArtifactCache;
 use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot, EnvironmentStorage};
-use crate::execution::{ExecutionId, ExecutionTask, WorkCost};
+use crate::execution::{ExecutionId, ExecutionOutcome, ExecutionTask, WorkCost};
 use crate::worker::{Completion, Runner, WorkerState};
 
 const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 const JOURNAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const RESULT_STORE_MAX_RECORDS: usize = 1024;
+const RESULT_STORE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct ResultStore {
+    outcomes: HashMap<String, ExecutionOutcome>,
+    order: VecDeque<String>,
+    retained_bytes: usize,
+}
+
+type SharedResults = Arc<(Mutex<ResultStore>, Condvar)>;
+
+fn outcome_retained_bytes(outcome: &ExecutionOutcome) -> usize {
+    outcome
+        .output
+        .len()
+        .saturating_add(outcome.error.as_ref().map_or(0, String::len))
+        .saturating_add(64)
+}
+
+fn record_execution_outcome(results: &SharedResults, id: &str, outcome: ExecutionOutcome) {
+    let (lock, changed) = &**results;
+    let mut store = lock.lock().expect("execution result store poisoned");
+    if let Some(previous) = store.outcomes.remove(id) {
+        store.retained_bytes = store
+            .retained_bytes
+            .saturating_sub(outcome_retained_bytes(&previous));
+        store.order.retain(|candidate| candidate != id);
+    }
+    store.retained_bytes = store
+        .retained_bytes
+        .saturating_add(outcome_retained_bytes(&outcome));
+    store.outcomes.insert(id.to_string(), outcome);
+    store.order.push_back(id.to_string());
+
+    while store.outcomes.len() > RESULT_STORE_MAX_RECORDS
+        || store.retained_bytes > RESULT_STORE_MAX_BYTES
+    {
+        let Some(oldest) = store.order.pop_front() else {
+            break;
+        };
+        if let Some(removed) = store.outcomes.remove(&oldest) {
+            store.retained_bytes = store
+                .retained_bytes
+                .saturating_sub(outcome_retained_bytes(&removed));
+        }
+    }
+    drop(store);
+    changed.notify_all();
+}
 
 fn journal_path() -> PathBuf {
     runtime_paths::binary_dir()
@@ -262,6 +312,7 @@ pub struct Runtime {
     cache: Arc<ArtifactCache>,
     executor: Arc<WasmExecutor>,
     journal: Arc<Journal>,
+    results: SharedResults,
 }
 
 impl Runtime {
@@ -280,6 +331,7 @@ impl Runtime {
         let journal = Journal::open();
         let (recovered, max_sequence) = journal.recover();
         let cancelled = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let results: SharedResults = Arc::new((Mutex::new(ResultStore::default()), Condvar::new()));
 
         let runner: Runner = {
             let cache = Arc::clone(&cache);
@@ -304,6 +356,7 @@ impl Runtime {
             let cache = Arc::clone(&cache);
             let cancelled = Arc::clone(&cancelled);
             let journal = Arc::clone(&journal);
+            let results = Arc::clone(&results);
             Arc::new(move |task, elapsed_ms, result| {
                 let succeeded = result.is_ok();
                 let was_cancelled = cancelled
@@ -313,6 +366,22 @@ impl Runtime {
                 if succeeded && !was_cancelled {
                     cache.record(&task.artifact_hash, elapsed_ms, task.declared_cost);
                 }
+                let outcome = if was_cancelled {
+                    ExecutionOutcome {
+                        output: Vec::new(),
+                        error: Some("execution cancelled".into()),
+                        elapsed_ms,
+                        cancelled: true,
+                    }
+                } else {
+                    ExecutionOutcome {
+                        output: Vec::new(),
+                        error: result.as_ref().err().cloned(),
+                        elapsed_ms,
+                        cancelled: false,
+                    }
+                };
+                record_execution_outcome(&results, &task.id.to_string(), outcome);
                 journal.append(JournalEvent {
                     kind: if was_cancelled {
                         "cancel".into()
@@ -373,6 +442,7 @@ impl Runtime {
             cache,
             executor,
             journal,
+            results,
         });
 
         for task in recovered {
@@ -543,9 +613,45 @@ impl Runtime {
         }
         if removed_queued || running {
             self.journal.append_cancel_string(execution_id);
+            if removed_queued && !running {
+                record_execution_outcome(
+                    &self.results,
+                    execution_id,
+                    ExecutionOutcome {
+                        output: Vec::new(),
+                        error: Some("execution cancelled before start".into()),
+                        elapsed_ms: 0,
+                        cancelled: true,
+                    },
+                );
+            }
             true
         } else {
             false
+        }
+    }
+
+    pub fn wait_for_result(
+        &self,
+        execution_id: &str,
+        timeout: Duration,
+    ) -> Option<ExecutionOutcome> {
+        let timeout = timeout.max(Duration::from_millis(1));
+        let started = Instant::now();
+        let (lock, changed) = &*self.results;
+        let mut store = lock.lock().expect("execution result store poisoned");
+        loop {
+            if let Some(outcome) = store.outcomes.get(execution_id) {
+                return Some(outcome.clone());
+            }
+            let remaining = timeout.checked_sub(started.elapsed())?;
+            let (next, wait) = changed
+                .wait_timeout(store, remaining)
+                .expect("execution result store poisoned");
+            store = next;
+            if wait.timed_out() {
+                return store.outcomes.get(execution_id).cloned();
+            }
         }
     }
 

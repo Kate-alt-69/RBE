@@ -4,9 +4,10 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ipc_protocol::{
-    decode_response, read_frame, write_frame, ExecuteRequest, HealthRequest, InspectRequest,
-    PrepareRefreshRequest, RegisterArtifactRequest, Request, Response, ResumeRequest,
-    WorkCost as IpcWorkCost, MAX_ARTIFACT_BYTES, MAX_EXECUTION_INPUT_BYTES,
+    decode_response, read_frame, write_frame, AwaitResultRequest, ExecuteRequest, HealthRequest,
+    InspectRequest, PrepareRefreshRequest, RegisterArtifactRequest, Request, Response,
+    ResumeRequest, WorkCost as IpcWorkCost, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS,
+    MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES,
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -125,6 +126,63 @@ impl ContainerClient {
                 anyhow::bail!("container execution submission failed [{code}]: {message}")
             }
             other => anyhow::bail!("unexpected container execute response: {other:?}"),
+        }
+    }
+
+    pub async fn await_result(
+        &self,
+        execution_id: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let timeout_ms = timeout
+            .as_millis()
+            .clamp(1, u128::from(MAX_AWAIT_RESULT_MS)) as u64;
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request = Request::AwaitResult(AwaitResultRequest {
+            request_id: next_request_id(),
+            auth_token: endpoint.token.clone(),
+            execution_id: execution_id.to_string(),
+            timeout_ms,
+        });
+        let call_timeout = Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(3));
+        match call(endpoint, request, call_timeout).await? {
+            Response::ExecutionFinished { output, .. } => {
+                if output.len() > MAX_EXECUTION_OUTPUT_BYTES {
+                    anyhow::bail!("Container returned an oversized execution result");
+                }
+                Ok(Some(output))
+            }
+            Response::ExecutionPending { .. } => Ok(None),
+            Response::ExecutionFailed { code, message, .. } => {
+                anyhow::bail!("container execution failed [{code}]: {message}")
+            }
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("container result wait failed [{code}]: {message}")
+            }
+            other => anyhow::bail!("unexpected container result response: {other:?}"),
+        }
+    }
+
+    pub async fn execute_and_wait(
+        &self,
+        environment: &str,
+        artifact_hash: &str,
+        input: Vec<u8>,
+        declared_cost: IpcWorkCost,
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<u8>> {
+        let execution_id = self
+            .execute(environment, artifact_hash, input, declared_cost)
+            .await?;
+        match self.await_result(&execution_id, timeout).await? {
+            Some(output) => Ok(output),
+            None => {
+                anyhow::bail!("container execution {execution_id} is still pending after timeout")
+            }
         }
     }
 
