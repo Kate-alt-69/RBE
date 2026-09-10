@@ -1,0 +1,130 @@
+name: Standalone Service Runtime Repair
+
+on:
+  push:
+    paths:
+      - '.github/workflows/service-bin-split-repair.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: standalone-service-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply standalone Service split
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/patches/service-bin-split-fix.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/patches/service-bin-split.py')
+          lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+          for index, line in enumerate(lines):
+              if 'pub const EXPECTED_SERVICE_SHA256: &str =' in line:
+                  lines[index] = '        "pub const EXPECTED_SERVICE_SHA256: &str = \\"{expected_service_hash}\\";\\n"\n'
+                  break
+          else:
+              raise SystemExit('service integrity generated-source line not found')
+          path.write_text(''.join(lines), encoding='utf-8')
+          PY
+          python .github/patches/service-bin-split.py
+
+      - name: Format
+        run: cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check locked workspace
+        run: cargo check --manifest-path engine/Cargo.toml --workspace --locked
+
+      - name: Test Service and backend slices
+        run: cargo test --manifest-path engine/Cargo.toml -p backend -p service-runtime --locked
+
+      - name: Clippy Service and backend slices
+        run: cargo clippy --manifest-path engine/Cargo.toml -p backend -p service-runtime --all-targets --locked -- -D warnings
+
+      - name: Build and prove distinct release images
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset RBE_CONTAINER_BIN_PATH RBE_SERVICE_BIN_PATH || true
+          cargo build --manifest-path engine/Cargo.toml -p backend --bin service --release --locked
+          service_path="engine/target/release/service"
+          test -f "$service_path"
+          service_hash="$(sha256sum "$service_path" | awk '{print $1}')"
+          service_size="$(stat -c '%s' "$service_path")"
+          RBE_SERVICE_BIN_PATH="$PWD/$service_path" cargo build --manifest-path engine/Cargo.toml -p backend --bin backend --release --locked
+          backend_path="engine/target/release/backend"
+          test -f "$backend_path"
+          backend_hash="$(sha256sum "$backend_path" | awk '{print $1}')"
+          backend_size="$(stat -c '%s' "$backend_path")"
+          echo "service: $service_size bytes $service_hash"
+          echo "backend: $backend_size bytes $backend_hash"
+          test "$service_hash" != "$backend_hash"
+          test "$service_size" -lt "$backend_size"
+          set +e
+          "$service_path" >/tmp/service-no-mode.out 2>/tmp/service-no-mode.err
+          code=$?
+          set -e
+          test "$code" -eq 2
+          grep -q 'requires exactly one internal Mother or worker mode' /tmp/service-no-mode.err
+
+      - name: Verify packaging never aliases backend as Service
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          checks = {
+              'build.ps1': ['Copy-Item $backendPath (Join-Path $outDir $serviceName)', 'Copy-Item $backendPath -Destination (Join-Path $outDir $serviceName)'],
+              'build-ps5.ps1': ['Copy-Item $backendPath (Join-Path $outDir $serviceName)', 'Copy-Item $backendPath -Destination (Join-Path $outDir $serviceName)'],
+              'build-core.sh': ['cp "$backend_path" "$service_dest"'],
+          }
+          for path, forbidden in checks.items():
+              text = Path(path).read_text(encoding='utf-8')
+              for needle in forbidden:
+                  if needle in text:
+                      raise SystemExit(f'{path} still aliases backend as Service: {needle}')
+          mother = Path('engine/crates/backend/src/service_mother.rs').read_text(encoding='utf-8')
+          for needle in ['std::fs::hard_link(backend, &service)', 'std::fs::copy(backend, &service)']:
+              if needle in mother:
+                  raise SystemExit(f'Service Mother still synthesizes service executable: {needle}')
+          main = Path('engine/crates/backend/src/main.rs').read_text(encoding='utf-8')
+          if 'running_as_service_executable' in main:
+              raise SystemExit('backend still contains filename-based Service alias dispatch')
+          PY
+
+      - name: Commit verified standalone Service runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          latest="$(git rev-parse origin/main)"
+          if [[ "$latest" != "$GITHUB_SHA" ]]; then
+            echo "main moved during validation; refusing stale commit" >&2
+            exit 75
+          fi
+          rm -f .github/patches/service-bin-split.py
+          rm -f .github/patches/service-bin-split-fix.py
+          rm -f .github/workflows/service-bin-split.yml
+          rm -f .github/workflows/service-bin-split-repair.yml
+          git add -A
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'FIX | BUG-SVC-006 split Service runtime from backend executable'
+          git push origin HEAD:main
