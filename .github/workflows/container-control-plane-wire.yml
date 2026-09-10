@@ -6,6 +6,7 @@ on:
       - work/container-control-plane
     paths:
       - '.github/patches/container-control-plane-wire.py'
+      - '.github/patches/container-control-plane-fix.py'
       - '.github/workflows/container-control-plane-wire.yml'
   workflow_dispatch:
 
@@ -34,7 +35,9 @@ jobs:
             container-runtime
             engine
       - name: Wire capability broker into Controller
-        run: python .github/patches/container-control-plane-wire.py
+        run: |
+          python .github/patches/container-control-plane-wire.py
+          python .github/patches/container-control-plane-fix.py
       - name: Format Container workspace
         run: cargo fmt --manifest-path container-runtime/Cargo.toml --all
       - name: Check Container workspace
@@ -54,6 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f .github/patches/container-control-plane-wire.py
+          rm -f .github/patches/container-control-plane-fix.py
           rm -f .github/workflows/container-control-plane-wire.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
