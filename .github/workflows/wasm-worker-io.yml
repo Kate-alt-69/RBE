@@ -32,7 +32,20 @@ jobs:
             engine
 
       - name: Apply WASM worker invocation IO
-        run: python .github/patches/wasm-worker-io.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/patches/wasm-worker-io.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('container-runtime/crates/execution-engine/src/lib.rs')
+          text = path.read_text(encoding='utf-8')
+          old = 'if capacity as usize < input.len() {'
+          new = 'if (capacity as usize) < input.len() {'
+          if old not in text:
+              raise SystemExit('missing capacity comparison repair anchor')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
 
       - name: Format Rust workspaces
         run: |
