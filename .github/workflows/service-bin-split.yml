@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/patches/service-bin-split.py'
+      - '.github/patches/service-bin-split-fix.py'
       - '.github/workflows/service-bin-split.yml'
 
 permissions:
@@ -29,7 +30,9 @@ jobs:
           workspaces: engine
 
       - name: Apply standalone Service split
-        run: python .github/patches/service-bin-split.py
+        run: |
+          python .github/patches/service-bin-split-fix.py
+          python .github/patches/service-bin-split.py
 
       - name: Format
         run: cargo fmt --manifest-path engine/Cargo.toml --all
@@ -111,6 +114,7 @@ jobs:
           if [[ "$latest" != "$GITHUB_SHA" ]]; then
             echo "main moved to $latest; regenerating against latest source"
             git reset --hard "$latest"
+            python .github/patches/service-bin-split-fix.py
             python .github/patches/service-bin-split.py
             cargo fmt --manifest-path engine/Cargo.toml --all
             cargo check --manifest-path engine/Cargo.toml --workspace --locked
@@ -129,6 +133,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f .github/patches/service-bin-split.py
+          rm -f .github/patches/service-bin-split-fix.py
           rm -f .github/workflows/service-bin-split.yml
           git add -A
           git config user.name 'github-actions[bot]'
