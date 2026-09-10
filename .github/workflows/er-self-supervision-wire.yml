@@ -44,13 +44,14 @@ jobs:
       - name: Clippy critical supervision
         working-directory: engine
         run: cargo clippy -p backend -p service-runtime --all-targets --locked -- -D warnings
-      - name: Check Windows release warning cleanliness
-        working-directory: engine
+      - name: Check portable Windows warning cleanup
         shell: bash
         run: |
           set -euo pipefail
           rustup target add x86_64-pc-windows-msvc
-          RUSTFLAGS='-D warnings' cargo check -p backend -p service-runtime --target x86_64-pc-windows-msvc --locked
+          RUSTFLAGS='-D warnings' cargo check --manifest-path engine/Cargo.toml -p service-runtime --target x86_64-pc-windows-msvc --locked
+          grep -q '#\[cfg(target_os = "linux")\]' engine/crates/backend/src/host_bootstrap.rs
+          ! grep -q '^[[:space:]]*println!("cargo:warning=backend: binding container' engine/crates/backend/build.rs
       - name: Regenerate if main moved
         shell: bash
         run: |
@@ -62,13 +63,14 @@ jobs:
             git reset --hard "$latest"
             python .github/patches/er-self-supervision-wire.py
             python .github/patches/er-self-cross-target-cleanup.py
-            cd engine
-            cargo fmt --all
-            cargo check --workspace --locked
-            cargo test -p backend -p service-runtime --locked
-            cargo clippy -p backend -p service-runtime --all-targets --locked -- -D warnings
+            cargo fmt --manifest-path engine/Cargo.toml --all
+            cargo check --manifest-path engine/Cargo.toml --workspace --locked
+            cargo test --manifest-path engine/Cargo.toml -p backend -p service-runtime --locked
+            cargo clippy --manifest-path engine/Cargo.toml -p backend -p service-runtime --all-targets --locked -- -D warnings
             rustup target add x86_64-pc-windows-msvc
-            RUSTFLAGS='-D warnings' cargo check -p backend -p service-runtime --target x86_64-pc-windows-msvc --locked
+            RUSTFLAGS='-D warnings' cargo check --manifest-path engine/Cargo.toml -p service-runtime --target x86_64-pc-windows-msvc --locked
+            grep -q '#\[cfg(target_os = "linux")\]' engine/crates/backend/src/host_bootstrap.rs
+            ! grep -q '^[[:space:]]*println!("cargo:warning=backend: binding container' engine/crates/backend/build.rs
           fi
       - name: Commit verified ER self supervision
         shell: bash
