@@ -448,17 +448,7 @@ impl Runtime {
         work_ms: u64,
         payload: Vec<u8>,
     ) -> ExecutionId {
-        let claimed_artifact_hash = artifact_hash.into();
-        let artifact_hash = if payload.is_empty() {
-            claimed_artifact_hash
-        } else {
-            let computed = hex::encode(Sha256::digest(&payload));
-            if !claimed_artifact_hash.is_empty() && claimed_artifact_hash != computed {
-                tracing::warn!(claimed = %claimed_artifact_hash, computed = %computed, "artifact hash did not match payload; using content hash");
-            }
-            self.cache.put_artifact(computed.clone(), payload);
-            computed
-        };
+        let artifact_hash = artifact_hash.into();
         let id = ExecutionId::new(self.next_execution.fetch_add(1, Ordering::Relaxed));
         self.journal.append(JournalEvent {
             kind: "queued".into(),
@@ -492,20 +482,34 @@ impl Runtime {
                     limits,
                     sandbox,
                     work_ms,
-                    payload: Vec::new(),
+                    payload,
                 },
             ));
         self.global_queue_changed.notify_one();
         id
     }
 
-    pub fn register_artifact(&self, artifact_hash: impl Into<String>, wasm: Vec<u8>) {
-        let claimed = artifact_hash.into();
-        let computed = hex::encode(Sha256::digest(&wasm));
-        if !claimed.is_empty() && claimed != computed {
-            tracing::warn!(claimed = %claimed, computed = %computed, "registered artifact hash did not match content; storing by content hash only");
+    /// Register immutable WASM under its canonical SHA-256 identity.
+    /// Returns whether the exact artifact was already present.
+    pub fn register_artifact(&self, artifact_hash: &str, wasm: Vec<u8>) -> Result<bool, String> {
+        if artifact_hash.len() != 64
+            || !artifact_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err("artifact hash must be lowercase SHA-256 hexadecimal".into());
         }
-        self.cache.put_artifact(computed, wasm);
+        let computed = hex::encode(Sha256::digest(&wasm));
+        if artifact_hash != computed {
+            return Err(format!(
+                "artifact SHA-256 mismatch: claimed {artifact_hash}, computed {computed}"
+            ));
+        }
+        let already_present = self.cache.contains_artifact(artifact_hash);
+        if !already_present {
+            self.cache.put_artifact(computed, wasm);
+        }
+        Ok(already_present)
     }
 
     pub fn cancel(&self, execution_id: &str) -> bool {

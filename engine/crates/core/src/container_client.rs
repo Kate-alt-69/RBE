@@ -4,8 +4,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ipc_protocol::{
-    decode_response, read_frame, write_frame, HealthRequest, InspectRequest, PrepareRefreshRequest,
-    Request, Response, ResumeRequest,
+    decode_response, read_frame, write_frame, ExecuteRequest, HealthRequest, InspectRequest,
+    PrepareRefreshRequest, RegisterArtifactRequest, Request, Response, ResumeRequest,
+    WorkCost as IpcWorkCost, MAX_ARTIFACT_BYTES, MAX_EXECUTION_INPUT_BYTES,
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -62,6 +63,68 @@ impl ContainerClient {
             address: endpoint.address,
             pid: endpoint.pid,
             generation: endpoint.generation,
+        }
+    }
+
+    pub async fn register_artifact(
+        &self,
+        artifact_hash: &str,
+        wasm: Vec<u8>,
+    ) -> anyhow::Result<bool> {
+        if wasm.is_empty() || wasm.len() > MAX_ARTIFACT_BYTES {
+            anyhow::bail!("WASM artifact size is outside the Container IPC limit");
+        }
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request = Request::RegisterArtifact(RegisterArtifactRequest {
+            request_id: next_request_id(),
+            auth_token: endpoint.token.clone(),
+            artifact_hash: artifact_hash.to_string(),
+            wasm,
+        });
+        match call(endpoint, request, Duration::from_secs(10)).await? {
+            Response::ArtifactRegistered {
+                already_present, ..
+            } => Ok(already_present),
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("container artifact registration failed [{code}]: {message}")
+            }
+            other => anyhow::bail!("unexpected artifact registration response: {other:?}"),
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        environment: &str,
+        artifact_hash: &str,
+        input: Vec<u8>,
+        declared_cost: IpcWorkCost,
+    ) -> anyhow::Result<String> {
+        if input.len() > MAX_EXECUTION_INPUT_BYTES {
+            anyhow::bail!("Container execution input exceeds the IPC limit");
+        }
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request = Request::Execute(ExecuteRequest {
+            request_id: next_request_id(),
+            auth_token: endpoint.token.clone(),
+            environment: environment.to_string(),
+            artifact_hash: artifact_hash.to_string(),
+            declared_cost,
+            input,
+        });
+        match call(endpoint, request, Duration::from_secs(5)).await? {
+            Response::Accepted { execution_id, .. } => Ok(execution_id),
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("container execution submission failed [{code}]: {message}")
+            }
+            other => anyhow::bail!("unexpected container execute response: {other:?}"),
         }
     }
 

@@ -4,13 +4,23 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_EXECUTION_INPUT_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u16,
     pub auth_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterArtifactRequest {
+    pub request_id: String,
+    pub auth_token: String,
+    pub artifact_hash: String,
+    pub wasm: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,7 +30,9 @@ pub struct ExecuteRequest {
     pub environment: String,
     pub artifact_hash: String,
     pub declared_cost: WorkCost,
-    pub payload: Vec<u8>,
+    /// Invocation data for an already-registered artifact. This field must
+    /// never be interpreted as executable bytes.
+    pub input: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +78,7 @@ pub struct ResumeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Hello(Hello),
+    RegisterArtifact(RegisterArtifactRequest),
     Execute(ExecuteRequest),
     Cancel(CancelRequest),
     Inspect(InspectRequest),
@@ -87,6 +100,11 @@ pub struct WorkCost {
 pub enum Response {
     HelloAccepted {
         version: u16,
+    },
+    ArtifactRegistered {
+        request_id: String,
+        artifact_hash: String,
+        already_present: bool,
     },
     Accepted {
         request_id: String,
@@ -185,6 +203,41 @@ mod tests {
         write_frame(&mut bytes, &request).unwrap();
         let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();
         assert!(matches!(decoded, Request::PrepareRefresh(_)));
+    }
+
+    #[test]
+    fn artifact_registration_round_trip_is_distinct_from_execution_input() {
+        let request = Request::RegisterArtifact(RegisterArtifactRequest {
+            request_id: "artifact-1".into(),
+            auth_token: "secret".into(),
+            artifact_hash: "ab".repeat(32),
+            wasm: vec![0, 97, 115, 109],
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();
+        assert!(matches!(decoded, Request::RegisterArtifact(_)));
+
+        let execute = Request::Execute(ExecuteRequest {
+            request_id: "exec-1".into(),
+            auth_token: "secret".into(),
+            environment: "general-1".into(),
+            artifact_hash: "ab".repeat(32),
+            declared_cost: WorkCost {
+                cpu: 1,
+                memory: 1,
+                io: 0,
+                network: 0,
+            },
+            input: b"request-body".to_vec(),
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &execute).unwrap();
+        let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();
+        let Request::Execute(decoded) = decoded else {
+            panic!("expected execute request");
+        };
+        assert_eq!(decoded.input, b"request-body");
     }
 
     #[test]

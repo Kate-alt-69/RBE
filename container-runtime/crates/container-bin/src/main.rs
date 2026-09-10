@@ -21,7 +21,10 @@ use container_runtime_core::{
     EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost,
 };
 use execution_engine::{ExecutionLimits, WasmExecutor};
-use ipc_protocol::{decode_request, read_frame, write_frame, Request, Response, PROTOCOL_VERSION};
+use ipc_protocol::{
+    decode_request, read_frame, write_frame, Request, Response, MAX_ARTIFACT_BYTES,
+    MAX_EXECUTION_INPUT_BYTES, PROTOCOL_VERSION,
+};
 use resource_limits::ResourceLimits;
 use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, SandboxPolicy};
 
@@ -442,12 +445,54 @@ fn handle_connection(
                 }
             }
         }
+        Request::RegisterArtifact(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else if request.wasm.is_empty() || request.wasm.len() > MAX_ARTIFACT_BYTES {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "ARTIFACT_SIZE_INVALID".into(),
+                    message: format!(
+                        "WASM artifact must be between 1 and {MAX_ARTIFACT_BYTES} bytes"
+                    ),
+                }
+            } else {
+                match runtime.register_artifact(&request.artifact_hash, request.wasm) {
+                    Ok(already_present) => Response::ArtifactRegistered {
+                        request_id: request.request_id,
+                        artifact_hash: request.artifact_hash,
+                        already_present,
+                    },
+                    Err(message) => Response::Error {
+                        request_id: Some(request.request_id),
+                        code: "ARTIFACT_HASH_MISMATCH".into(),
+                        message,
+                    },
+                }
+            }
+        }
         Request::Execute(request) => {
             if request.auth_token != token {
                 Response::Error {
                     request_id: Some(request.request_id),
                     code: "AUTH_FAILED".into(),
                     message: "container control authentication failed".into(),
+                }
+            } else if request.input.len() > MAX_EXECUTION_INPUT_BYTES {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "EXECUTION_INPUT_TOO_LARGE".into(),
+                    message: format!("execution input exceeds {MAX_EXECUTION_INPUT_BYTES} bytes"),
+                }
+            } else if !runtime.cache().contains_artifact(&request.artifact_hash) {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "ARTIFACT_NOT_FOUND".into(),
+                    message: "execution artifact is not registered".into(),
                 }
             } else if !accepting.load(Ordering::Acquire) {
                 Response::Error {
@@ -471,7 +516,7 @@ fn handle_connection(
                     ResourceLimits::default(),
                     SandboxPolicy::default(),
                     0,
-                    request.payload,
+                    request.input,
                 );
                 emit_event("execution_accepted", &execution_id.to_string());
                 Response::Accepted {
