@@ -33,3 +33,16 @@ if old not in text:
     raise SystemExit("missing ER activity explanation anchor")
 text = text.replace(old, new, 1)
 write(path, text)
+
+path = "engine/crates/backend/src/error_reporter_daemon.rs"
+text = read(path)
+old = '''    pub fn control_key(&self) -> Option<&str> {\n        self.control_key.as_deref()\n    }\n\n'''
+if old not in text:
+    raise SystemExit("missing obsolete ErBootstrap::control_key method")
+text = text.replace(old, "", 1)
+old = '''        assert!(!bootstrap.authority().can_control_restarts());\n        assert!(bootstrap.control_key().is_none());\n'''
+new = '''        assert!(!bootstrap.authority().can_control_restarts());\n        assert!(bootstrap.recovery_key().unwrap().is_none());\n'''
+if old not in text:
+    raise SystemExit("missing BASIC ER control-key test anchor")
+text = text.replace(old, new, 1)
+write(path, text)
