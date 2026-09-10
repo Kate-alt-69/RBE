@@ -21,6 +21,7 @@ mod mother;
 pub(crate) const SERVICE_IPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SERVICE_IPC_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const SERVICE_IPC_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const PARENT_BOOTSTRAP_JSON_MAX_BYTES: usize = 1024 * 1024;
 const SERVICE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SERVICE_ACCEPT_FAILURE_LIMIT: u32 = 8;
 pub use manager::{ServiceCallError, ServiceManager, ServiceRuntimeState, ServiceSnapshot};
@@ -58,6 +59,87 @@ impl ServiceFabricEndpoint {
     }
 }
 
+pub fn apply_service_process_label(label: &str) {
+    apply_service_process_label_platform(label);
+}
+
+fn short_service_process_label(label: &str, max_bytes: usize) -> String {
+    let semantic = if label == "service - mother" {
+        "service-mother"
+    } else {
+        label
+            .strip_prefix("service - ")
+            .and_then(|value| value.split(" | ").next())
+            .unwrap_or(label)
+    };
+    let mut out = String::new();
+    for character in semantic.chars() {
+        if character.is_control() || character == '\0' {
+            continue;
+        }
+        if out.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        out.push(character);
+    }
+    if out.is_empty() {
+        "service".into()
+    } else {
+        out
+    }
+}
+
+#[cfg(windows)]
+fn apply_service_process_label_platform(label: &str) {
+    use windows_sys::Win32::System::Console::{GetConsoleProcessList, SetConsoleTitleW};
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadDescription};
+
+    let clean = label
+        .chars()
+        .filter(|character| !character.is_control() && *character != '\0')
+        .take(120)
+        .collect::<String>();
+    let wide = clean
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        let _ = SetThreadDescription(GetCurrentThread(), wide.as_ptr());
+        let mut processes = [0u32; 2];
+        if GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) == 1 {
+            let _ = SetConsoleTitleW(wide.as_ptr());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_service_process_label_platform(label: &str) {
+    use std::ffi::CString;
+    let short = short_service_process_label(label, 15);
+    if let Ok(name) = CString::new(short) {
+        unsafe {
+            let _ = libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_service_process_label_platform(label: &str) {
+    use std::ffi::CString;
+    let short = short_service_process_label(label, 63);
+    if let Ok(name) = CString::new(short) {
+        unsafe {
+            let _ = libc::pthread_setname_np(name.as_ptr());
+        }
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn apply_service_process_label_platform(_label: &str) {}
+
+#[cfg(not(any(unix, windows)))]
+fn apply_service_process_label_platform(_label: &str) {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
@@ -89,6 +171,39 @@ pub struct ServiceFile {
     pub imports: Vec<String>,
     pub exports: Vec<String>,
     source_digest: [u8; 32],
+}
+
+impl ServiceFile {
+    pub fn source_digest_hex(&self) -> String {
+        digest_hex(&self.source_digest)
+    }
+
+    pub fn source_matches(&self, source: &str) -> bool {
+        let actual: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        constant_time_eq(&self.source_digest, &actual)
+    }
+}
+
+pub fn service_source_digest_hex(source: &str) -> String {
+    let digest: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+    digest_hex(&digest)
+}
+
+pub fn service_source_matches_digest(source: &str, expected_hex: &str) -> bool {
+    if expected_hex.len() != 64 || !expected_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let actual = service_source_digest_hex(source);
+    constant_time_eq(actual.as_bytes(), expected_hex.as_bytes())
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1261,6 +1376,55 @@ pub fn read_parent_bootstrap_secret_if_configured(label: &str) -> anyhow::Result
     read_parent_bootstrap_secret(&mut stdin, label).map(Some)
 }
 
+fn read_parent_bootstrap_json<R: BufRead>(reader: &mut R, label: &str) -> anyhow::Result<Value> {
+    let limit = u64::try_from(PARENT_BOOTSTRAP_JSON_MAX_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut limited = reader.take(limit);
+    let mut line = String::new();
+    let bytes = limited.read_line(&mut line)?;
+    if bytes == 0 {
+        anyhow::bail!("{label} parent bootstrap pipe closed before JSON frame");
+    }
+    if bytes > PARENT_BOOTSTRAP_JSON_MAX_BYTES {
+        anyhow::bail!(
+            "{label} parent bootstrap JSON exceeded {PARENT_BOOTSTRAP_JSON_MAX_BYTES} bytes"
+        );
+    }
+    if !line.ends_with('\n') {
+        anyhow::bail!("{label} parent bootstrap JSON is not newline terminated");
+    }
+    line.pop();
+    if line.ends_with('\r') {
+        line.pop();
+    }
+    serde_json::from_str(&line)
+        .map_err(|error| anyhow::anyhow!("{label} parent bootstrap JSON is invalid: {error}"))
+}
+
+pub fn read_parent_bootstrap_json_if_configured(label: &str) -> anyhow::Result<Option<Value>> {
+    if std::env::var_os("RBE_PARENT_LIVENESS_PIPE").is_none() {
+        return Ok(None);
+    }
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    read_parent_bootstrap_json(&mut stdin, label).map(Some)
+}
+
+pub async fn write_parent_bootstrap_json<W>(writer: &mut W, value: &Value) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let payload = serde_json::to_vec(value)?;
+    if payload.len().saturating_add(1) > PARENT_BOOTSTRAP_JSON_MAX_BYTES {
+        anyhow::bail!("parent bootstrap JSON exceeded {PARENT_BOOTSTRAP_JSON_MAX_BYTES} bytes");
+    }
+    writer.write_all(&payload).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 /// Send the one-time child authentication value without exposing it in the
 /// process command line or environment. The caller must retain `writer` after
 /// this returns so EOF continues to mean parent death to the child.
@@ -1313,6 +1477,26 @@ pub fn pause_for_interactive_exit() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_process_label_preserves_service_file_identity() {
+        assert_eq!(
+            short_service_process_label("service - mother", 15),
+            "service-mother"
+        );
+        assert_eq!(
+            short_service_process_label("service - auth.service | service.exe", 15),
+            "auth.service"
+        );
+        assert!(
+            short_service_process_label(
+                "service - this-is-a-very-long-name.service | service.exe",
+                15
+            )
+            .len()
+                <= 15
+        );
+    }
+
     use super::*;
 
     fn test_service_path(name: &str) -> PathBuf {
@@ -1336,6 +1520,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn parent_bootstrap_json_is_bounded_and_round_trips_types() {
+        let value = serde_json::json!({
+            "APP_NAME": "RBE",
+            "COUNT": 7,
+            "FLAGS": [true, false]
+        });
+        let mut output = Vec::new();
+        write_parent_bootstrap_json(&mut output, &value)
+            .await
+            .unwrap();
+        let mut cursor = std::io::Cursor::new(output);
+        let decoded = read_parent_bootstrap_json(&mut cursor, "test").unwrap();
+        assert_eq!(decoded, value);
+
+        let mut unterminated = std::io::Cursor::new(b"{\"A\":1}".to_vec());
+        assert!(read_parent_bootstrap_json(&mut unterminated, "test").is_err());
+    }
+
     #[test]
     fn parent_bootstrap_secret_reader_is_bounded_and_validates_token() {
         let token = "ab".repeat(32);
@@ -1357,6 +1560,16 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secreu"));
         assert!(!constant_time_eq(b"secret", b"short"));
+    }
+
+    #[test]
+    fn service_source_digest_contract_rejects_drift() {
+        let original = ":service[name = test]\nexport function run() { return true; }\n";
+        let changed = ":service[name = test]\nexport function run() { return false; }\n";
+        let expected = service_source_digest_hex(original);
+        assert_eq!(expected.len(), 64);
+        assert!(service_source_matches_digest(original, &expected));
+        assert!(!service_source_matches_digest(changed, &expected));
     }
 
     #[test]

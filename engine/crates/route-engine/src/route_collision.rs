@@ -2,10 +2,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::discovery::{collision_key_for, url_path_for, url_path_for_logical};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
+use crate::runtime_image::RuntimeImage;
 
 const RESERVED_NATIVE_API_PREFIXES: &[&str] = &[
+    "/health",
     "/api/account",
     "/api/admin",
     "/api/auth",
@@ -51,6 +54,84 @@ pub(crate) fn validate(api_dir: &Path) -> anyhow::Result<()> {
     ))
 }
 
+pub(crate) fn validate_image(image: &RuntimeImage) -> anyhow::Result<()> {
+    let mut owners: HashMap<(String, String), PathBuf> = HashMap::new();
+    let mut collisions = Vec::new();
+
+    for id in &image.routes {
+        let manifest = image
+            .source(id)
+            .ok_or_else(|| anyhow::anyhow!("Runtime Image route {id} has no manifest"))?;
+        let file = image.route_file(id).ok_or_else(|| {
+            anyhow::anyhow!("Runtime Image route {id} has no executable snapshot")
+        })?;
+        let url_path = manifest
+            .route_path
+            .clone()
+            .unwrap_or_else(|| url_path_for_logical(&manifest.logical_name));
+        let owner = PathBuf::from(id.as_str());
+
+        if let Some(prefix) = RESERVED_NATIVE_API_PREFIXES
+            .iter()
+            .find(|prefix| is_in_native_namespace(&url_path, prefix))
+        {
+            collisions.push(RouteCollision {
+                path: owner,
+                message: format!(
+                    "route URL `{url_path}` conflicts with native API namespace `{prefix}`"
+                ),
+            });
+            continue;
+        }
+
+        for method in &file.methods {
+            let verb = method.verb.to_ascii_lowercase();
+            let key = (collision_key_for(&url_path), verb.clone());
+            if let Some(existing) = owners.get(&key) {
+                collisions.push(RouteCollision {
+                    path: owner.clone(),
+                    message: format!(
+                        "route {} `{}` conflicts with {}",
+                        verb.to_ascii_uppercase(),
+                        url_path,
+                        existing.display()
+                    ),
+                });
+            } else {
+                owners.insert(key, owner.clone());
+            }
+        }
+    }
+
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    write_collision_report(&collisions)?;
+    Err(anyhow::anyhow!(
+        "Runtime Image contains {} route collision(s)",
+        collisions.len()
+    ))
+}
+
+fn write_collision_report(collisions: &[RouteCollision]) -> anyhow::Result<()> {
+    let error_path = PathBuf::from("data")
+        .join("admin")
+        .join("compiler-error.txt");
+    if let Some(parent) = error_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut report = String::new();
+    for collision in collisions {
+        report.push_str(&format!(
+            "E3013: {}: {}\n",
+            collision.path.display(),
+            collision.message
+        ));
+    }
+    fs::write(&error_path, report)?;
+    Ok(())
+}
+
 fn find_collisions(api_dir: &Path) -> anyhow::Result<Vec<RouteCollision>> {
     let mut files = Vec::new();
     collect_route_files(api_dir, &mut files)?;
@@ -91,7 +172,7 @@ fn find_collisions(api_dir: &Path) -> anyhow::Result<Vec<RouteCollision>> {
 
         for method in file.methods {
             let verb = method.verb.to_ascii_lowercase();
-            let key = (url_path.clone(), verb.clone());
+            let key = (collision_key_for(&url_path), verb.clone());
             if let Some(existing) = owners.get(&key) {
                 collisions.push(RouteCollision {
                     path: path.clone(),
@@ -124,19 +205,6 @@ fn collect_route_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()>
         }
     }
     Ok(())
-}
-
-fn url_path_for(api_dir: &Path, file_path: &Path) -> String {
-    let relative = file_path.strip_prefix(api_dir).unwrap_or(file_path);
-    let without_ext = relative.with_extension("");
-    let mut segments: Vec<String> = without_ext
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
-        .collect();
-    if segments.last().is_some_and(|segment| segment == "index") {
-        segments.pop();
-    }
-    format!("/api/{}", segments.join("/"))
 }
 
 fn is_in_native_namespace(url_path: &str, prefix: &str) -> bool {
@@ -177,6 +245,26 @@ mod tests {
         let collisions = find_collisions(&root).unwrap();
         assert_eq!(collisions.len(), 1);
         assert!(collisions[0].message.contains("GET `/api/foo`"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catches_same_dynamic_shape_with_different_parameter_names() {
+        let root = temp_api_dir();
+        fs::create_dir_all(root.join("users")).unwrap();
+        fs::write(
+            root.join("users/[id].route"),
+            "class Route { get(req) { return true; } }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("users/[slug].route"),
+            "class Route { get(req) { return true; } }",
+        )
+        .unwrap();
+
+        let collisions = find_collisions(&root).unwrap();
+        assert_eq!(collisions.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 

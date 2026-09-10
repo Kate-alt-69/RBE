@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use error_client::{IssueCategory, IssueLevel, QueueEntry};
 use hmac::{Hmac, Mac};
-use serde::Serialize;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -25,15 +26,125 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 800;
 const MIN_POLL_INTERVAL_MS: u64 = 250;
 const MAX_POLL_INTERVAL_MS: u64 = 5_000;
 const STATUS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
-const SIGNING_KEY_SERVICE: &str = "rbe.error-reporter";
-const SIGNING_KEY_ACCOUNT: &str = "report-auth";
-const LEGACY_SIGNING_KEY_FILE: &str = "error-reporter.key";
-const MIN_SIGNING_KEY_LEN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ErAuthority {
+    Basic,
+    Control,
+}
+
+impl ErAuthority {
+    pub fn can_control_restarts(self) -> bool {
+        matches!(self, Self::Control)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Control => "control",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ParentBootstrapFrame {
+    version: u8,
+    authority: ErAuthority,
+    signing_key_hex: String,
+    control_key_hex: Option<String>,
+}
+
+impl ParentBootstrapFrame {
+    pub fn control() -> Self {
+        Self {
+            version: 1,
+            authority: ErAuthority::Control,
+            signing_key_hex: random_key_hex(),
+            control_key_hex: Some(random_key_hex()),
+        }
+    }
+}
+
+pub struct ErBootstrap {
+    authority: ErAuthority,
+    signing_key: String,
+    control_key: Option<String>,
+}
+
+impl ErBootstrap {
+    pub fn basic() -> Self {
+        Self {
+            authority: ErAuthority::Basic,
+            signing_key: random_key_hex(),
+            control_key: None,
+        }
+    }
+
+    pub fn from_parent_stdin() -> anyhow::Result<Self> {
+        let mut raw = String::new();
+        std::io::stdin().read_to_string(&mut raw)?;
+        if raw.len() > 4096 {
+            anyhow::bail!("ER bootstrap frame exceeded 4 KiB");
+        }
+        let frame: ParentBootstrapFrame = serde_json::from_str(raw.trim())?;
+        if frame.version != 1 {
+            anyhow::bail!("unsupported ER bootstrap frame version {}", frame.version);
+        }
+        validate_key(&frame.signing_key_hex)?;
+        if frame.authority == ErAuthority::Control {
+            let key = frame
+                .control_key_hex
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("CONTROL ER bootstrap omitted COM key"))?;
+            validate_key(key)?;
+        }
+        Ok(Self {
+            authority: frame.authority,
+            signing_key: frame.signing_key_hex,
+            control_key: frame.control_key_hex,
+        })
+    }
+
+    pub fn authority(&self) -> ErAuthority {
+        self.authority
+    }
+
+    pub fn control_key(&self) -> Option<&str> {
+        self.control_key.as_deref()
+    }
+}
+
+impl Drop for ErBootstrap {
+    fn drop(&mut self) {
+        unsafe {
+            self.signing_key.as_mut_vec().fill(0);
+            if let Some(key) = self.control_key.as_mut() {
+                key.as_mut_vec().fill(0);
+            }
+        }
+    }
+}
+
+fn random_key_hex() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn validate_key(value: &str) -> anyhow::Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("ER bootstrap key must be a 32-byte hex value");
+    }
+    Ok(())
+}
 
 #[derive(Serialize)]
 struct ReportedBy {
     service: &'static str,
     pid: u32,
+    authority: ErAuthority,
+    restart_control: bool,
     processed_at_ms: u64,
     processed_iso: String,
 }
@@ -69,7 +180,21 @@ struct Signature {
 struct SignedIssueRecord {
     #[serde(flatten)]
     payload: IssuePayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic_context: Option<DiagnosticContext>,
     signature: Signature,
+}
+
+#[derive(Serialize)]
+struct DiagnosticContext {
+    why: String,
+    how: String,
+    activity_source: String,
+    submitted_pid: u32,
+    submitted_ppid: u32,
+    stack_present: bool,
+    message_bytes: usize,
+    stack_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -78,6 +203,9 @@ struct StatusReport {
     service: &'static str,
     pid: u32,
     launched_as_separate_process: bool,
+    authority: ErAuthority,
+    restart_control: bool,
+    com_key_in_memory: bool,
     started_at_ms: u64,
     updated_at_ms: u64,
     queue_offset: u64,
@@ -127,9 +255,13 @@ pub async fn run(
     io: atomic_io::AtomicIo,
     admin_dir: PathBuf,
     launched_as_separate_process: bool,
+    bootstrap: ErBootstrap,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&admin_dir)?;
-    let signing_key = read_or_create_signing_key(&admin_dir)?;
+    let authority = bootstrap.authority();
+    let restart_control = authority.can_control_restarts();
+    let com_key_in_memory = bootstrap.control_key().is_some();
+    let signing_key = bootstrap.signing_key.as_str();
 
     let queue_path = admin_dir.join(error_client::QUEUE_FILE_NAME);
     let reports_path = admin_dir.join("error-reports.log");
@@ -160,6 +292,8 @@ pub async fn run(
         resume_offset = tail.offset,
         recent_signed_ids = recent_ids.set.len(),
         poll_interval_ms,
+        authority = authority.as_str(),
+        restart_control,
         "error-reporter daemon started"
     );
 
@@ -177,7 +311,7 @@ pub async fn run(
                                 continue;
                             }
                             let id = entry.id.clone();
-                            match sign_and_append(&io, &reports_path, entry, pid, &signing_key) {
+                            match sign_and_append(&io, &reports_path, entry, pid, authority, signing_key) {
                                 Ok(()) => {
                                     processed_count = processed_count.saturating_add(1);
                                     recent_ids.insert(id);
@@ -202,6 +336,9 @@ pub async fn run(
                     service: "error-reporter-daemon",
                     pid,
                     launched_as_separate_process,
+                    authority,
+                    restart_control,
+                    com_key_in_memory,
                     started_at_ms,
                     updated_at_ms: now_unix_ms(),
                     queue_offset: tail.offset,
@@ -226,6 +363,9 @@ pub async fn run(
             service: "error-reporter-daemon",
             pid,
             launched_as_separate_process,
+            authority,
+            restart_control,
+            com_key_in_memory,
             started_at_ms,
             updated_at_ms: now_unix_ms(),
             queue_offset: tail.offset,
@@ -353,9 +493,24 @@ fn sign_and_append(
     reports_path: &Path,
     entry: QueueEntry,
     daemon_pid: u32,
+    authority: ErAuthority,
     signing_key: &str,
 ) -> anyhow::Result<()> {
     let processed_at_ms = now_unix_ms();
+    let diagnostic_context = (authority == ErAuthority::Control).then(|| DiagnosticContext {
+        why: format!("{:?}: {}", entry.category, entry.message),
+        how: entry
+            .stack
+            .as_deref()
+            .map(|stack| stack.chars().take(2048).collect())
+            .unwrap_or_else(|| "no stack supplied by reporting process".into()),
+        activity_source: entry.source.clone(),
+        submitted_pid: entry.pid,
+        submitted_ppid: entry.ppid,
+        stack_present: entry.stack.is_some(),
+        message_bytes: entry.message.len(),
+        stack_bytes: entry.stack.as_ref().map(String::len).unwrap_or(0),
+    });
     let payload = IssuePayload {
         id: entry.id,
         ts_ms: entry.ts,
@@ -372,6 +527,8 @@ fn sign_and_append(
         reported_by: ReportedBy {
             service: "error-reporter-daemon",
             pid: daemon_pid,
+            authority,
+            restart_control: authority.can_control_restarts(),
             processed_at_ms,
             processed_iso: iso_from_ms(processed_at_ms),
         },
@@ -381,7 +538,11 @@ fn sign_and_append(
         algo: "hmac-sha256",
         value: sign(&canonical, signing_key),
     };
-    let signed = SignedIssueRecord { payload, signature };
+    let signed = SignedIssueRecord {
+        payload,
+        diagnostic_context,
+        signature,
+    };
     let mut line = serde_json::to_string(&signed)?;
     line.push('\n');
     io.append_locked(reports_path, line.as_bytes())?;
@@ -417,68 +578,6 @@ fn sign(canonical_json: &str, key: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
     mac.update(canonical_json.as_bytes());
     hex::encode(mac.finalize().into_bytes())
-}
-
-fn read_or_create_signing_key(admin_dir: &Path) -> anyhow::Result<String> {
-    let legacy_path = admin_dir.join(LEGACY_SIGNING_KEY_FILE);
-
-    if let Ok(from_env) = std::env::var("ERROR_REPORT_SIGNING_KEY") {
-        if from_env.len() >= MIN_SIGNING_KEY_LEN {
-            remove_legacy_signing_key(&legacy_path)?;
-            return Ok(from_env);
-        }
-        anyhow::bail!(
-            "ERROR_REPORT_SIGNING_KEY is present but shorter than {MIN_SIGNING_KEY_LEN} bytes"
-        );
-    }
-
-    let entry = keyring::Entry::new(SIGNING_KEY_SERVICE, SIGNING_KEY_ACCOUNT)
-        .map_err(|error| anyhow::anyhow!("error reporter could not open OS credential entry: {error}"))?;
-
-    match entry.get_password() {
-        Ok(existing) if existing.len() >= MIN_SIGNING_KEY_LEN => {
-            remove_legacy_signing_key(&legacy_path)?;
-            return Ok(existing);
-        }
-        Ok(_) => {
-            tracing::warn!("error-reporter OS credential was invalid; rotating it");
-        }
-        Err(error) => {
-            tracing::debug!(error = %error, "error-reporter OS credential not readable; creating a fresh credential");
-        }
-    }
-
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let generated = hex::encode(bytes);
-    entry
-        .set_password(&generated)
-        .map_err(|error| anyhow::anyhow!("error reporter could not store key in OS credential store: {error}"))?;
-
-    let verified = entry
-        .get_password()
-        .map_err(|error| anyhow::anyhow!("error reporter could not verify OS credential write: {error}"))?;
-    if verified != generated {
-        anyhow::bail!("error reporter OS credential verification returned a different value");
-    }
-
-    remove_legacy_signing_key(&legacy_path)?;
-    Ok(generated)
-}
-
-fn remove_legacy_signing_key(path: &Path) -> anyhow::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {
-            tracing::warn!(path = %path.display(), "removed legacy plaintext error-reporter credential");
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(anyhow::anyhow!(
-            "failed to remove legacy plaintext error-reporter credential {}: {error}",
-            path.display()
-        )),
-    }
 }
 
 fn compact_reports_file(io: &atomic_io::AtomicIo, path: &Path) {
@@ -605,13 +704,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plaintext_credential_is_removed() {
-        let dir = temp_dir("legacy-key-removal");
-        let path = dir.join(LEGACY_SIGNING_KEY_FILE);
-        std::fs::write(&path, "legacy-secret").unwrap();
-        remove_legacy_signing_key(&path).unwrap();
-        assert!(!path.exists());
-        remove_legacy_signing_key(&path).unwrap();
-        let _ = std::fs::remove_dir_all(dir);
+    fn basic_er_never_has_restart_control() {
+        let bootstrap = ErBootstrap::basic();
+        assert_eq!(bootstrap.authority(), ErAuthority::Basic);
+        assert!(!bootstrap.authority().can_control_restarts());
+        assert!(bootstrap.control_key().is_none());
+    }
+
+    #[test]
+    fn control_frame_carries_only_memory_bootstrap_material() {
+        let frame = ParentBootstrapFrame::control();
+        assert_eq!(frame.authority, ErAuthority::Control);
+        assert!(frame
+            .control_key_hex
+            .as_deref()
+            .is_some_and(|key| key.len() == 64));
+        assert_eq!(frame.signing_key_hex.len(), 64);
     }
 }

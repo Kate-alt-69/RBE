@@ -84,6 +84,41 @@ ENV is typed; JSON numbers, booleans, arrays, and objects should not be flattene
 
 See [`server.server/`](server.server/) for precedence and configuration ownership.
 
+## Runtime source and environment security
+
+A linked application executes the immutable AST/program snapshots stored in its
+Runtime Image. Raw `.route`, `.module`, `.service`, and `server.server` files are
+boot/deployment inputs; changing them after RELC validation does not change the
+active Route/Module program. Service child activation independently verifies the
+ServiceCatalog SHA-256 contract until Service execution is fully transported as
+an image snapshot too.
+
+Uppercase `ENV` is public typed Runtime Image configuration. It is not the
+operating-system process environment and it must not carry credentials. Secrets
+belong in Vault. The legacy lowercase `env` process-environment capability is
+rejected by RELC-linked applications, and Service Mother/Service child processes
+start from a scrubbed environment instead of inheriting arbitrary loader, proxy,
+or application variables.
+
+RBE does not destructively delete source files as its primary security boundary.
+Deletion does not defend against a host administrator/process-memory compromise,
+can break restart/relink workflows, and does not make HTTP endpoints secret. The
+runtime contract is instead:
+
+```text
+source bytes -> RELC validate/link -> immutable Runtime Image -> execute snapshot
+```
+
+Supervised Service REL does not reconstruct Runtime ENV from child process state.
+Backend sends the active image's typed ENV snapshot over the authenticated
+parent-liveness bootstrap channel; Service Mother propagates that same snapshot
+to resident, on-demand, and restarted service children.
+
+A future sealed production bundle may omit raw REL sources entirely after RBE
+has a persistent signed executable Runtime Image format. That is a deployment
+hardening/obfuscation feature, not a replacement for authentication,
+authorization, Vault isolation, rate limiting, or network policy.
+
 ## Embedded REL files
 
 Server REL may contain literal embedded files:

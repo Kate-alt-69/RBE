@@ -66,9 +66,11 @@ pub use module_runtime::{
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
-pub use relc::{compile_runtime_image, PhysicalRelSource, RelcError};
+pub use relc::{
+    compile_runtime_image, discover_physical_rel_sources, PhysicalRelSource, RelcError,
+};
 pub use runtime_env::{RuntimeEnv, RuntimeEnvError, RuntimeEnvOrigin};
-pub use runtime_image::{RuntimeImage, RuntimeImageSlot, RuntimeSourceManifest};
+pub use runtime_image::{RuntimeExecutable, RuntimeImage, RuntimeImageSlot, RuntimeSourceManifest};
 pub use server_policy::{
     PolicyOrigin, RecursionPolicy, ResolvedPolicyValue, ServerPolicy, ServerPolicyError,
     ServerStatus,
@@ -88,6 +90,13 @@ pub fn build_routes(
 ) -> anyhow::Result<axum::Router<core_lib::AppState>> {
     route_collision::validate(api_dir)?;
     discovery::build_routes(api_dir, service_interfaces)
+}
+
+pub fn build_routes_from_image(
+    image: &RuntimeImage,
+    service_interfaces: &ServiceInterfaces,
+) -> anyhow::Result<axum::Router<core_lib::AppState>> {
+    discovery::build_routes_from_image(image, service_interfaces)
 }
 
 pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {

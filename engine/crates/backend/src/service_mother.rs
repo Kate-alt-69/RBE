@@ -1,9 +1,11 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 
@@ -21,7 +23,6 @@ pub struct ServiceMotherProcess {
     manager: ServiceManager,
     child: Child,
     _liveness: ChildStdin,
-    alias: PathBuf,
     started_at: Instant,
 }
 
@@ -29,7 +30,6 @@ pub struct ServiceMotherSupervisor {
     manager: ServiceManager,
     shutdown: Option<tokio::sync::oneshot::Sender<Duration>>,
     task: tokio::task::JoinHandle<()>,
-    alias: PathBuf,
 }
 
 impl ServiceMotherSupervisor {
@@ -55,7 +55,6 @@ impl ServiceMotherSupervisor {
                 let _ = (&mut self.task).await;
             }
         }
-        let _ = tokio::fs::remove_file(&self.alias).await;
     }
 }
 
@@ -76,7 +75,6 @@ impl ServiceMotherProcess {
             );
             let _ = self.child.kill().await;
             let _ = self.child.wait().await;
-            let _ = std::fs::remove_file(&self.alias);
             return;
         }
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -96,31 +94,49 @@ impl ServiceMotherProcess {
                 let _ = self.child.wait().await;
             }
         }
-        let _ = std::fs::remove_file(&self.alias);
     }
 }
 
 pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
-    let token = match service_runtime::read_parent_bootstrap_secret_if_configured("Service Mother")?
-    {
-        Some(token) => token,
-        None => flag_value(args, "--service-token")
-            .filter(|value| !value.is_empty())
+    let expected_runtime_digest = flag_value(args, "--service-runtime-digest")
+        .ok_or_else(|| anyhow::anyhow!("Service Mother requires parent runtime image digest"))?;
+    let current_exe = std::env::current_exe().context("resolve Service Mother executable")?;
+    let actual_runtime_digest = file_sha256_hex(&current_exe)?;
+    if !expected_runtime_digest.eq_ignore_ascii_case(&actual_runtime_digest) {
+        anyhow::bail!(
+            "Service Mother executable digest mismatch; refusing unverified service runtime"
+        );
+    }
+    let token = service_runtime::read_parent_bootstrap_secret_if_configured("Service Mother")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Service Mother requires inherited parent authentication; command-line tokens are not accepted"
+            )
+        })?;
+    let runtime_env_frame = if args.iter().any(|arg| arg == "--runtime-env-frame") {
+        service_runtime::read_parent_bootstrap_json_if_configured("Service Mother Runtime ENV")?
             .ok_or_else(|| {
-                anyhow::anyhow!("backend --service-mother requires parent authentication")
-            })?,
+                anyhow::anyhow!("Service Mother Runtime ENV frame requires inherited bootstrap")
+            })?
+            .into()
+    } else {
+        None
     };
     if !args
         .iter()
         .any(|arg| arg == "--launch-separate" || arg == "--launch-saperate")
     {
-        anyhow::bail!("backend --service-mother requires --launch-separate");
+        anyhow::bail!("service --service-mother requires --launch-separate");
     }
 
-    let settings_path = std::env::var("SETTINGS_PATH").unwrap_or_else(|_| "settings.json".into());
+    let settings_path = flag_value(args, "--settings").unwrap_or_else(|| "settings.json".into());
     let config = config::Config::load(&settings_path).map_err(|error| {
         anyhow::anyhow!("Service Mother failed to load {settings_path}: {error}")
     })?;
+    let runtime_env = Arc::new(match runtime_env_frame {
+        Some(value) => value,
+        None => serde_json::to_value(&config.runtime_env)?,
+    });
     let io = atomic_io::AtomicIo::new();
     let catalog = crate::service_boot::compile(&config.services, &io)?;
     let actual_fingerprint = catalog
@@ -145,7 +161,12 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
     let ready = server.ready().clone();
     let manager = match catalog.as_ref() {
         Some(catalog) => {
-            ServiceManager::prepare_all_with_fabric(catalog, server.fabric_endpoint()).await
+            ServiceManager::prepare_all_with_fabric_and_runtime_env(
+                catalog,
+                server.fabric_endpoint(),
+                runtime_env.clone(),
+            )
+            .await
         }
         None => ServiceManager::default(),
     };
@@ -171,29 +192,133 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
             .unwrap_or(0),
         "Service Mother runtime ready"
     );
+    let control_manager = manager.clone();
+    let mut control_task = tokio::spawn(async move {
+        crate::service_control::run_mother_control(control_manager).await;
+    });
     let mut parent_liveness = service_runtime::parent_liveness_signal_if_configured()?;
-    match parent_liveness.as_mut() {
+    let whole_restart_requested = match parent_liveness.as_mut() {
         Some(parent_liveness) => {
             tokio::select! {
-                result = &mut server_task => result??,
+                result = &mut server_task => {
+                    control_task.abort();
+                    result??;
+                    false
+                }
+                result = &mut control_task => {
+                    result.map_err(|error| anyhow::anyhow!("Service control task failed: {error}"))?;
+                    true
+                }
                 _ = parent_liveness => {
+                    control_task.abort();
                     tracing::warn!(
                         "Service Mother parent liveness pipe closed; shutting down managed services"
                     );
                     manager.shutdown_all().await;
                     server_task.abort();
                     let _ = (&mut server_task).await;
+                    false
                 }
             }
         }
-        None => server_task.await??,
+        None => {
+            tokio::select! {
+                result = &mut server_task => {
+                    control_task.abort();
+                    result??;
+                    false
+                }
+                result = &mut control_task => {
+                    result.map_err(|error| anyhow::anyhow!("Service control task failed: {error}"))?;
+                    true
+                }
+            }
+        }
+    };
+    if whole_restart_requested {
+        tracing::warn!("restarting complete Service runtime by explicit operator request");
+        manager.shutdown_all().await;
+        server_task.abort();
+        let _ = (&mut server_task).await;
     }
     Ok(())
+}
+
+fn harden_service_mother_environment(command: &mut Command, settings_path: &Path) {
+    command.env_clear();
+    for name in [
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "RUST_LOG",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .env("RBE_TRUSTED_SETTINGS_PATH", settings_path)
+        .env("RBE_PARENT_LIVENESS_PIPE", "1");
+}
+
+fn service_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "service.exe"
+    } else {
+        "service"
+    }
+}
+
+fn file_sha256_hex(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read runtime executable {}", path.display()))?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn ensure_canonical_service_executable(backend: &Path, parent: &Path) -> anyhow::Result<PathBuf> {
+    let service = parent.join(service_executable_name());
+    let expected = file_sha256_hex(backend)?;
+    let valid_existing = service.is_file()
+        && file_sha256_hex(&service)
+            .map(|actual| actual.eq_ignore_ascii_case(&expected))
+            .unwrap_or(false);
+    if !valid_existing {
+        if service.exists() {
+            std::fs::remove_file(&service).with_context(|| {
+                format!(
+                    "replace stale service runtime {}; stop stale service.exe processes first",
+                    service.display()
+                )
+            })?;
+        }
+        if std::fs::hard_link(backend, &service).is_err() {
+            std::fs::copy(backend, &service).with_context(|| {
+                format!(
+                    "materialize canonical service runtime {}",
+                    service.display()
+                )
+            })?;
+        }
+    }
+    let actual = file_sha256_hex(&service)?;
+    if !actual.eq_ignore_ascii_case(&expected) {
+        anyhow::bail!(
+            "canonical service runtime {} does not match backend executable bytes",
+            service.display()
+        );
+    }
+    Ok(service)
 }
 
 async fn spawn_process(
     settings_path: impl AsRef<Path>,
     expected_catalog_fingerprint: &str,
+    runtime_env: &serde_json::Value,
     existing_manager: Option<&ServiceManager>,
 ) -> anyhow::Result<ServiceMotherProcess> {
     if expected_catalog_fingerprint.len() != 64
@@ -207,23 +332,7 @@ async fn spawn_process(
     let parent = exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("backend executable has no parent directory"))?;
-    let process_dir = parent.join(".runtime").join("process");
-    std::fs::create_dir_all(&process_dir)?;
-    let extension = exe
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| format!(".{value}"))
-        .unwrap_or_default();
-    let alias = process_dir.join(format!(
-        "rbe-service-mother-parent-{}{}",
-        std::process::id(),
-        extension
-    ));
-    let _ = std::fs::remove_file(&alias);
-    if std::fs::hard_link(&exe, &alias).is_err() {
-        std::fs::copy(&exe, &alias)
-            .with_context(|| format!("create Service Mother process alias {}", alias.display()))?;
-    }
+    let service_exe = ensure_canonical_service_executable(&exe, parent)?;
 
     let settings_path = std::fs::canonicalize(settings_path.as_ref()).with_context(|| {
         format!(
@@ -232,13 +341,18 @@ async fn spawn_process(
         )
     })?;
     let token = new_service_mother_token();
-    let mut child = match Command::new(&alias)
+    let mut command = Command::new(&service_exe);
+    harden_service_mother_environment(&mut command, &settings_path);
+    let mut child = match command
         .args(["--service-mother", "--launch-separate"])
         .arg("--service-catalog-fingerprint")
         .arg(expected_catalog_fingerprint)
+        .arg("--service-runtime-digest")
+        .arg(file_sha256_hex(&service_exe)?)
+        .arg("--settings")
+        .arg(&settings_path)
+        .arg("--runtime-env-frame")
         .current_dir(parent)
-        .env("SETTINGS_PATH", &settings_path)
-        .env("RBE_PARENT_LIVENESS_PIPE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -247,7 +361,6 @@ async fn spawn_process(
     {
         Ok(child) => child,
         Err(error) => {
-            let _ = std::fs::remove_file(&alias);
             return Err(error.into());
         }
     };
@@ -255,21 +368,29 @@ async fn spawn_process(
     let mut liveness = match child.stdin.take() {
         Some(stdin) => stdin,
         None => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             anyhow::bail!("Service Mother parent liveness pipe unavailable");
         }
     };
     if let Err(error) = service_runtime::write_parent_bootstrap_secret(&mut liveness, &token).await
     {
-        cleanup_failed_spawn(&alias, &mut child).await;
+        cleanup_failed_spawn(&mut child).await;
         return Err(anyhow::anyhow!(
             "send Service Mother parent bootstrap secret: {error}"
+        ));
+    }
+    if let Err(error) =
+        service_runtime::write_parent_bootstrap_json(&mut liveness, runtime_env).await
+    {
+        cleanup_failed_spawn(&mut child).await;
+        return Err(anyhow::anyhow!(
+            "send Service Mother Runtime ENV snapshot: {error}"
         ));
     }
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             anyhow::bail!("Service Mother stdout unavailable");
         }
     };
@@ -286,31 +407,31 @@ async fn spawn_process(
     {
         Ok(Ok(Some(line))) => line,
         Ok(Ok(None)) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             anyhow::bail!("Service Mother exited before readiness");
         }
         Ok(Err(error)) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             return Err(error);
         }
         Err(_) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             anyhow::bail!("Service Mother readiness timed out");
         }
     };
     let ready: ServiceMotherReady = match serde_json::from_str(line.trim()) {
         Ok(ready) => ready,
         Err(error) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             return Err(error.into());
         }
     };
     if !ready.address.ip().is_loopback() {
-        cleanup_failed_spawn(&alias, &mut child).await;
+        cleanup_failed_spawn(&mut child).await;
         anyhow::bail!("Service Mother advertised a non-loopback endpoint");
     }
     if child.id() != Some(ready.pid) {
-        cleanup_failed_spawn(&alias, &mut child).await;
+        cleanup_failed_spawn(&mut child).await;
         anyhow::bail!("Service Mother readiness PID does not match child process");
     }
 
@@ -349,7 +470,7 @@ async fn spawn_process(
     let manager = match manager_result {
         Ok(manager) => manager,
         Err(error) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             return Err(error);
         }
     };
@@ -363,7 +484,6 @@ async fn spawn_process(
         manager,
         child,
         _liveness: liveness,
-        alias,
         started_at: Instant::now(),
     })
 }
@@ -371,6 +491,7 @@ async fn spawn_process(
 pub async fn spawn(
     settings_path: impl AsRef<Path>,
     expected_catalog_fingerprint: &str,
+    runtime_env: Arc<serde_json::Value>,
 ) -> anyhow::Result<ServiceMotherSupervisor> {
     let settings_path = std::fs::canonicalize(settings_path.as_ref()).with_context(|| {
         format!(
@@ -379,8 +500,13 @@ pub async fn spawn(
         )
     })?;
     let expected_catalog_fingerprint = expected_catalog_fingerprint.to_string();
-    let initial = spawn_process(&settings_path, &expected_catalog_fingerprint, None).await?;
-    let alias = initial.alias.clone();
+    let initial = spawn_process(
+        &settings_path,
+        &expected_catalog_fingerprint,
+        runtime_env.as_ref(),
+        None,
+    )
+    .await?;
     let manager = initial.manager();
     let supervisor_manager = manager.clone();
     let supervisor_settings = settings_path.clone();
@@ -391,6 +517,7 @@ pub async fn spawn(
             initial,
             supervisor_settings,
             supervisor_fingerprint,
+            runtime_env,
             supervisor_manager,
             &mut shutdown_rx,
         )
@@ -400,7 +527,6 @@ pub async fn spawn(
         manager,
         shutdown: Some(shutdown_tx),
         task,
-        alias,
     })
 }
 
@@ -408,6 +534,7 @@ async fn supervise(
     mut process: ServiceMotherProcess,
     settings_path: PathBuf,
     expected_catalog_fingerprint: String,
+    runtime_env: Arc<serde_json::Value>,
     manager: ServiceManager,
     shutdown_rx: &mut tokio::sync::oneshot::Receiver<Duration>,
 ) {
@@ -421,11 +548,9 @@ async fn supervise(
             }
             status = process.child.wait() => {
                 let uptime = process.started_at.elapsed();
-                let alias = process.alias.clone();
-                let _ = std::fs::remove_file(alias);
                 manager.invalidate_remote().await;
                 match status {
-                    Ok(status) => tracing::warn!(%status, uptime_ms = uptime.as_millis(), "Service Mother exited unexpectedly; supervising replacement"),
+                    Ok(status) => tracing::warn!(%status, uptime_ms = uptime.as_millis(), "Service Mother exited; supervising replacement"),
                     Err(error) => tracing::warn!(error = %error, uptime_ms = uptime.as_millis(), "failed watching Service Mother; supervising replacement"),
                 }
                 if uptime >= MOTHER_STABLE_WINDOW {
@@ -453,6 +578,7 @@ async fn supervise(
             match spawn_process(
                 &settings_path,
                 &expected_catalog_fingerprint,
+                runtime_env.as_ref(),
                 Some(&manager),
             )
             .await
@@ -582,10 +708,9 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
-async fn cleanup_failed_spawn(alias: &Path, child: &mut Child) {
+async fn cleanup_failed_spawn(child: &mut Child) {
     let _ = child.kill().await;
     let _ = child.wait().await;
-    let _ = std::fs::remove_file(alias);
 }
 
 #[cfg(test)]

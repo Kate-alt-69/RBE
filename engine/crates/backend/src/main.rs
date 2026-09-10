@@ -14,32 +14,101 @@ use supervisor::{BackendState, RestartPolicy, Supervisor};
 
 mod container_process;
 mod error_reporter_daemon;
+mod host_bootstrap;
 mod maintenance_notice;
 mod port_guard;
+mod runtime_image_boot;
 mod service_boot;
+mod service_control;
 mod service_mother;
+
+fn running_as_service_executable() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+        })
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("service"))
+}
+
+fn service_flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+}
+
+fn service_process_label(args: &[String]) -> String {
+    if args.iter().any(|arg| arg == "--service-mother") {
+        return "service - mother".into();
+    }
+    let name = service_flag_value(args, "--service-file")
+        .and_then(|path| {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .or_else(|| service_flag_value(args, "--service-name"))
+        .unwrap_or_else(|| "unknown.service".into());
+    let clean = name
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(80)
+        .collect::<String>();
+    format!("service - {clean} | service.exe")
+}
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
 
-    if has("--service-mother") {
-        if let Err(error) = service_mother::run_child(&args).await {
-            eprintln!("fatal service-mother error: {error:#}");
+    if running_as_service_executable() {
+        match service_control::command_from_args(&args) {
+            Ok(Some(command)) => {
+                match service_control::submit(&command) {
+                    Ok(path) => {
+                        println!("Service restart request queued: {}", path.display());
+                    }
+                    Err(error) => {
+                        eprintln!("failed to queue Service restart request: {error:#}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("invalid Service restart command: {error:#}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let service_mother_mode = has("--service-mother");
+    let service_host_mode = has("--service-host");
+    if service_mother_mode || service_host_mode {
+        if !running_as_service_executable() {
+            eprintln!(
+                "internal service runtime modes must be launched through the sibling service executable"
+            );
+            std::process::exit(2);
+        }
+        service_runtime::apply_service_process_label(&service_process_label(&args));
+        if service_mother_mode {
+            if let Err(error) = service_mother::run_child(&args).await {
+                eprintln!("fatal Service Mother error: {error:#}");
+                std::process::exit(1);
+            }
+        } else if let Err(error) = service_boot::run_host(&args).await {
+            eprintln!("fatal service worker error: {error:#}");
             std::process::exit(1);
         }
         return;
     }
-
-    // This must branch before normal backend boot. A user .service process is
-    // the same binary in a restricted host mode, not a second mother backend.
-    if has("--service-host") {
-        if let Err(error) = service_boot::run_host(&args).await {
-            eprintln!("fatal service-host error: {error:#}");
-            std::process::exit(1);
-        }
-        return;
+    if running_as_service_executable() {
+        eprintln!("service executable requires an internal Mother or worker mode");
+        std::process::exit(2);
     }
 
     if has("--maintenance-notice") {
@@ -65,7 +134,19 @@ async fn main() {
             std::process::exit(2);
         }
         let separate = has("--separate-process") || has("--saperate-process");
-        if let Err(error) = run_error_reporter_daemon(separate).await {
+        let bootstrap = if has("--er-bootstrap-stdin") {
+            error_reporter_daemon::ErBootstrap::from_parent_stdin()
+        } else {
+            Ok(error_reporter_daemon::ErBootstrap::basic())
+        };
+        let bootstrap = match bootstrap {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                eprintln!("fatal error-reporter bootstrap error: {error:#}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = run_error_reporter_daemon(separate, bootstrap).await {
             eprintln!("fatal error-reporter-daemon error: {error:#}");
             std::process::exit(1);
         }
@@ -73,6 +154,14 @@ async fn main() {
     }
 
     if has("--vault") {
+        if let Err(error) = host_bootstrap::evaluate(&args).await {
+            if host_bootstrap::verbose_debug(&args) {
+                eprintln!("[HostBootstrap] {error:#}");
+            } else {
+                eprintln!("RBE initialization failed.");
+            }
+            std::process::exit(1);
+        }
         if !has("--separate-process") && !has("--saperate-process") {
             eprintln!("backend.exe --vault requires --separate-process");
             std::process::exit(2);
@@ -96,13 +185,29 @@ async fn main() {
         return;
     }
 
-    if let Err(error) = boot_and_run().await {
+    println!("Evaluating..");
+    let host_ready = match host_bootstrap::evaluate(&args).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            if host_bootstrap::verbose_debug(&args) {
+                eprintln!("[HostBootstrap] {error:#}");
+            } else {
+                eprintln!("RBE initialization failed.");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = boot_and_run(host_ready).await {
         eprintln!("fatal boot error: {error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run_error_reporter_daemon(separate_process: bool) -> anyhow::Result<()> {
+async fn run_error_reporter_daemon(
+    separate_process: bool,
+    bootstrap: error_reporter_daemon::ErBootstrap,
+) -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -116,12 +221,13 @@ async fn run_error_reporter_daemon(separate_process: bool) -> anyhow::Result<()>
     );
     let io = atomic_io::AtomicIo::new();
     let admin_dir = runtime_paths::default_admin_dir();
-    error_reporter_daemon::run(io, admin_dir, separate_process).await
+    error_reporter_daemon::run(io, admin_dir, separate_process, bootstrap).await
 }
 
 fn spawn_error_reporter_daemon_process(
     maintenance: Arc<MaintenanceMetrics>,
     refresh_interval: Duration,
+    control_enabled: bool,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let exe = std::env::current_exe().map_err(|error| {
         anyhow::anyhow!("could not resolve current_exe to spawn the error-reporter daemon: {error}")
@@ -130,10 +236,17 @@ fn spawn_error_reporter_daemon_process(
         const RETRY_DELAY: Duration = Duration::from_secs(3);
         let mut consecutive_failures = 0u32;
         loop {
-            let spawn_result = tokio::process::Command::new(&exe)
-                .args(["--er", "--separate-process", "--launch"])
-                .kill_on_drop(true)
-                .spawn();
+            let frame = control_enabled.then(error_reporter_daemon::ParentBootstrapFrame::control);
+            let mut command = tokio::process::Command::new(&exe);
+            command.args(["--er", "--separate-process", "--launch"]);
+            if frame.is_some() {
+                command
+                    .arg("--er-bootstrap-stdin")
+                    .stdin(std::process::Stdio::piped());
+            } else {
+                command.stdin(std::process::Stdio::null());
+            }
+            let spawn_result = command.kill_on_drop(true).spawn();
             let mut child = match spawn_result {
                 Ok(child) => child,
                 Err(error) => {
@@ -147,8 +260,40 @@ fn spawn_error_reporter_daemon_process(
                     continue;
                 }
             };
+            if let Some(frame) = frame {
+                use tokio::io::AsyncWriteExt;
+                let encoded = match serde_json::to_vec(&frame) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed to serialize ER bootstrap frame");
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                let Some(mut stdin) = child.stdin.take() else {
+                    tracing::error!("CONTROL ER child did not expose inherited bootstrap stdin");
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                };
+                if let Err(error) = stdin.write_all(&encoded).await {
+                    tracing::error!(error = %error, "failed to deliver ER bootstrap frame");
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                drop(stdin);
+            }
             consecutive_failures = 0;
-            tracing::info!(pid = child.id(), "error-reporter daemon process spawned");
+            tracing::info!(
+                pid = child.id(),
+                authority = if control_enabled { "control" } else { "basic" },
+                "error-reporter daemon process spawned"
+            );
 
             tokio::select! {
                 status = child.wait() => {
@@ -175,7 +320,33 @@ fn spawn_error_reporter_daemon_process(
     }))
 }
 
-async fn boot_and_run() -> anyhow::Result<()> {
+fn resolve_settings_path() -> String {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(value) = args
+        .windows(2)
+        .find(|pair| pair[0] == "--settings")
+        .map(|pair| pair[1].clone())
+    {
+        return value;
+    }
+
+    if args.iter().any(|arg| arg == "--allow-settings-env") {
+        if let Ok(value) = std::env::var("SETTINGS_PATH") {
+            eprintln!(
+                "warning: --allow-settings-env enabled deprecated ambient SETTINGS_PATH support"
+            );
+            return value;
+        }
+    } else if std::env::var_os("SETTINGS_PATH").is_some() {
+        eprintln!(
+            "warning: ignoring ambient SETTINGS_PATH; use --settings <file> (or --allow-settings-env for legacy development compatibility)"
+        );
+    }
+
+    "settings.json".to_string()
+}
+
+async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow::Result<()> {
     boot_trace("start");
     boot_trace(format!(
         "exe={}",
@@ -190,22 +361,16 @@ async fn boot_and_run() -> anyhow::Result<()> {
             .unwrap_or_else(|error| format!("<unavailable: {error}>"))
     ));
 
-    let settings_path =
-        std::env::var("SETTINGS_PATH").unwrap_or_else(|_| "settings.json".to_string());
+    let settings_path = resolve_settings_path();
     boot_trace(format!("settings path={settings_path}"));
-    let config = config::Config::load(&settings_path)
+    let mut config = config::Config::load(&settings_path)
         .map_err(|error| anyhow::anyhow!("failed to load {settings_path}: {error}"))?;
-    let config = Arc::new(config);
     let refresh_interval =
         Duration::from_secs(config.runtime.process_refresh_hours.saturating_mul(3600));
     let maintenance = Arc::new(MaintenanceMetrics::new(
         config.runtime.process_refresh_hours,
     ));
     boot_trace("settings loaded");
-    boot_trace(format!(
-        "effective api bind={}:{}",
-        config.api.host, config.api.port
-    ));
 
     logging::terminal::init(&config.logging)?;
     boot_trace("logging initialized");
@@ -218,6 +383,48 @@ async fn boot_and_run() -> anyhow::Result<()> {
         supervisor.run().await;
     });
     boot_trace("supervisor spawned");
+
+    let io = atomic_io::AtomicIo::new();
+    let admin_dir = runtime_paths::default_admin_dir();
+    error_client::init(io.clone(), &admin_dir);
+    error_client::install_panic_hook();
+    boot_trace("error-client initialized, panic hook installed");
+    lifecycle.set(BackendState::ConfigurationLoaded);
+
+    // Compile every executable service and the complete REL Runtime Image
+    // before binding even the maintenance responder. A malformed source or
+    // invalid ServerPolicy cannot leave the backend half-started.
+    let service_catalog = service_boot::compile(&config.services, &io)?;
+    let service_interfaces: route_engine::ServiceInterfaces = service_catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .services()
+                .iter()
+                .map(|service| {
+                    (
+                        service.name.clone(),
+                        service.exports.iter().cloned().collect::<HashSet<_>>(),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let runtime_image = runtime_image_boot::compile(&config, service_catalog.as_ref())?;
+    runtime_image_boot::apply_server_policy(&mut config, &runtime_image.server_policy)?;
+    runtime_image_boot::apply_middleware_plan(&mut config, &runtime_image.middleware_plan)?;
+    let runtime_image = Arc::new(route_engine::RuntimeImageSlot::new(runtime_image));
+    let config = Arc::new(config);
+    boot_trace(format!(
+        "effective api bind={}:{}",
+        config.api.host, config.api.port
+    ));
+    tracing::info!(
+        path = %settings_path,
+        refresh_hours = config.runtime.process_refresh_hours,
+        image = %runtime_image.snapshot().image_id,
+        "configuration and Runtime Image loaded"
+    );
 
     // Reclaim stale/crashed prior backend listeners BEFORE the temporary
     // responder starts. The responder is this same executable, so running the
@@ -236,42 +443,13 @@ async fn boot_and_run() -> anyhow::Result<()> {
         "temporary API maintenance responder ready"
     );
     boot_trace("temporary API maintenance responder ready");
-
-    let io = atomic_io::AtomicIo::new();
-    let admin_dir = runtime_paths::default_admin_dir();
-    error_client::init(io.clone(), &admin_dir);
-    error_client::install_panic_hook();
-    boot_trace("error-client initialized, panic hook installed");
-    tracing::info!(
-        path = %settings_path,
-        refresh_hours = config.runtime.process_refresh_hours,
-        "configuration loaded"
-    );
-    lifecycle.set(BackendState::ConfigurationLoaded);
-
-    // Parse the complete user service catalog before expensive infrastructure
-    // startup. One malformed service fails the whole boot with SVC diagnostics
-    // rather than leaving a partially-started backend.
-    let service_catalog = service_boot::compile(&config.services, &io)?;
-    let service_interfaces: route_engine::ServiceInterfaces = service_catalog
-        .as_ref()
-        .map(|catalog| {
-            catalog
-                .services()
-                .iter()
-                .map(|service| {
-                    (
-                        service.name.clone(),
-                        service.exports.iter().cloned().collect::<HashSet<_>>(),
-                    )
-                })
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
     lifecycle.set(BackendState::ServicesStarting);
 
-    let error_reporter_task =
-        spawn_error_reporter_daemon_process(maintenance.clone(), refresh_interval)?;
+    let error_reporter_task = spawn_error_reporter_daemon_process(
+        maintenance.clone(),
+        refresh_interval,
+        host_ready.er_control_enabled(),
+    )?;
 
     boot_trace(format!(
         "vault starting as separate process data dir={}",
@@ -329,8 +507,16 @@ async fn boot_and_run() -> anyhow::Result<()> {
         refresh_interval,
     );
 
+    let service_runtime_env = Arc::new(runtime_image.snapshot().environment.to_json());
     let service_mother = match service_catalog.as_ref() {
-        Some(catalog) => Some(service_mother::spawn(&settings_path, &catalog.fingerprint()).await?),
+        Some(catalog) => Some(
+            service_mother::spawn(
+                &settings_path,
+                &catalog.fingerprint(),
+                service_runtime_env.clone(),
+            )
+            .await?,
+        ),
         None => None,
     };
     let service_manager = service_mother
@@ -464,7 +650,7 @@ async fn boot_and_run() -> anyhow::Result<()> {
         ),
     }
 
-    let router = api::build_router(app_state, &api_dir, &service_interfaces)?;
+    let router = api::build_router(app_state, &api_dir, &service_interfaces, runtime_image)?;
     boot_trace("router built; handing API port to real backend");
     let addr = format!("{}:{}", config.api.host, config.api.port);
 

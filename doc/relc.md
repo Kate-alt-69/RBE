@@ -266,3 +266,8 @@ REL8xxx  recursion/dataflow
 ```
 
 The exact numeric catalog should be kept in one error-book source once the RELC refactor lands.
+
+
+## Runtime source integrity
+
+RELC's successful output is an immutable Runtime Image, and the runtime must execute the exact parsed/lowered objects associated with that image rather than reopening mutable source files. Service processes additionally verify their parent-validated source digest before activation. See [`source-security.md`](source-security.md) for the complete boundary and the planned source-less sealed deployment artifact.

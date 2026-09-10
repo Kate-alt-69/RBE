@@ -3,10 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
+use crate::ast::{ModuleFile, RouteFile, ServiceProgram};
 use crate::dependency_graph::{SymbolDependencyGraph, SymbolId};
 use crate::middleware_plan::MiddlewarePlan;
 use crate::runtime_env::RuntimeEnv;
 use crate::server_policy::ServerPolicy;
+use crate::server_rel::ServerProgram;
 use crate::source_registry::{RelSourceKind, SourceId};
 
 #[derive(Debug, Clone)]
@@ -16,6 +18,15 @@ pub struct RuntimeSourceManifest {
     pub logical_name: String,
     pub exports: Vec<String>,
     pub imports: Vec<String>,
+    pub route_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeExecutable {
+    Route(Arc<RouteFile>),
+    Module(Arc<ModuleFile>),
+    Service(Arc<ServiceProgram>),
+    Server(Arc<ServerProgram>),
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +45,7 @@ pub struct RuntimeImage {
     pub middleware_plan: MiddlewarePlan,
     pub service_assignments: BTreeMap<String, String>,
     pub capabilities: BTreeMap<SourceId, BTreeSet<String>>,
+    pub executables: BTreeMap<SourceId, RuntimeExecutable>,
 }
 
 impl RuntimeImage {
@@ -43,6 +55,38 @@ impl RuntimeImage {
 
     pub fn contains_source(&self, id: &SourceId) -> bool {
         self.source(id).is_some()
+    }
+
+    pub fn executable(&self, id: &SourceId) -> Option<&RuntimeExecutable> {
+        self.executables.get(id)
+    }
+
+    pub fn route_file(&self, id: &SourceId) -> Option<Arc<RouteFile>> {
+        match self.executable(id) {
+            Some(RuntimeExecutable::Route(file)) => Some(file.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn module_file(&self, id: &SourceId) -> Option<Arc<ModuleFile>> {
+        match self.executable(id) {
+            Some(RuntimeExecutable::Module(file)) => Some(file.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn service_program(&self, id: &SourceId) -> Option<Arc<ServiceProgram>> {
+        match self.executable(id) {
+            Some(RuntimeExecutable::Service(program)) => Some(program.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn server_program(&self, id: &SourceId) -> Option<Arc<ServerProgram>> {
+        match self.executable(id) {
+            Some(RuntimeExecutable::Server(program)) => Some(program.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -95,10 +139,76 @@ pub(crate) fn stable_source_hash<'a>(
     hash
 }
 
+pub(crate) fn stable_image_hash(source_hash: u64, settings: &serde_json::Value) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    feed_hash(&mut hash, b"RBE_RUNTIME_IMAGE_V1");
+    feed_hash(&mut hash, &source_hash.to_be_bytes());
+    hash_json(&mut hash, settings);
+    hash
+}
+
+fn feed_hash(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+fn hash_json(hash: &mut u64, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => feed_hash(hash, b"N"),
+        serde_json::Value::Bool(value) => feed_hash(hash, if *value { b"T" } else { b"F" }),
+        serde_json::Value::Number(value) => {
+            feed_hash(hash, b"D");
+            feed_hash(hash, value.to_string().as_bytes());
+            feed_hash(hash, &[0]);
+        }
+        serde_json::Value::String(value) => {
+            feed_hash(hash, b"S");
+            feed_hash(hash, &(value.len() as u64).to_be_bytes());
+            feed_hash(hash, value.as_bytes());
+        }
+        serde_json::Value::Array(values) => {
+            feed_hash(hash, b"A");
+            feed_hash(hash, &(values.len() as u64).to_be_bytes());
+            for value in values {
+                hash_json(hash, value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            feed_hash(hash, b"O");
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            feed_hash(hash, &(keys.len() as u64).to_be_bytes());
+            for key in keys {
+                feed_hash(hash, &(key.len() as u64).to_be_bytes());
+                feed_hash(hash, key.as_bytes());
+                hash_json(hash, &values[key]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::source_registry::RelSourceKind;
+
+    #[test]
+    fn image_hash_is_sensitive_to_settings_and_key_order_is_stable() {
+        let source_hash = 42;
+        let first = serde_json::json!({"runtimeEnv": {"A": 1, "B": true}});
+        let reordered = serde_json::json!({"runtimeEnv": {"B": true, "A": 1}});
+        let changed = serde_json::json!({"runtimeEnv": {"A": 2, "B": true}});
+        assert_eq!(
+            stable_image_hash(source_hash, &first),
+            stable_image_hash(source_hash, &reordered)
+        );
+        assert_ne!(
+            stable_image_hash(source_hash, &first),
+            stable_image_hash(source_hash, &changed)
+        );
+    }
 
     #[test]
     fn source_hash_is_deterministic_and_sensitive_to_content() {

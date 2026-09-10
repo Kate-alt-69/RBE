@@ -135,3 +135,31 @@ A Service REL program may eventually expose middleware phases. Unlike Module REL
 An embedded service inside `server.server` remains Service REL and receives exactly the same lifecycle/capability rules as a physical `.service` file.
 
 See [`../server.server/`](../server.server/).
+
+
+## Process identity
+
+Service REL does not run inside `backend.exe`. RBE uses one canonical sibling runtime image named `service` (`service.exe` on Windows): one Mother process plus one separate process for each active service. The same executable file is reused; RBE does not manufacture per-service `rbe-service-*-parent-*` executable aliases.
+
+```text
+backend.exe
+└─ service.exe              service - mother
+   ├─ service.exe           service - Auth | service.exe
+   └─ service.exe           service - Cache | service.exe
+```
+
+The canonical service image is byte-identical to the backend build artifact and is SHA-256 checked before Mother receives runtime authority. Per-service authentication, liveness, resource limits, and IPC remain independent even though the processes execute the same image file.
+
+
+### Operator restart behavior
+
+Service processes are intentionally supervisor-friendly. Ending one default (`on-failure`) worker causes Mother to replace only that worker. Ending Mother causes the backend supervisor to replace Mother and rebuild the entire Service process set after the old children lose their liveness pipe.
+
+The same behavior can be requested portably:
+
+```text
+service.exe -restart-whole
+service.exe -restart-auth.service
+```
+
+(`service` without `.exe` on Unix.) Explicit service restart requests retry with bounded exponential backoff and surface sustained failures as `crash_loop_backoff` instead of busy-looping.

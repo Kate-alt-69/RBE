@@ -12,15 +12,13 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     };
     let service_file = value("--service-file")
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("backend --service-host requires --service-file <path>"))?;
-    let token = match service_runtime::read_parent_bootstrap_secret_if_configured("service host")? {
-        Some(token) => token,
-        None => value("--service-token")
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("backend --service-host requires parent authentication")
-            })?,
-    };
+        .ok_or_else(|| anyhow::anyhow!("service --service-host requires --service-file <path>"))?;
+    let token = service_runtime::read_parent_bootstrap_secret_if_configured("service host")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Service worker requires inherited parent authentication; command-line tokens are not accepted"
+            )
+        })?;
     let service_manager = match value("--service-mother-address") {
         Some(raw_address) => {
             let address = raw_address.parse::<SocketAddr>().map_err(|error| {
@@ -42,12 +40,29 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         None => service_runtime::ServiceManager::default(),
     };
 
+    let runtime_env_frame = if args.iter().any(|arg| arg == "--runtime-env-frame") {
+        Some(
+            service_runtime::read_parent_bootstrap_json_if_configured("service Runtime ENV")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("service Runtime ENV frame requires inherited bootstrap")
+                })?,
+        )
+    } else {
+        None
+    };
+
     // Service children load the same typed settings as the mother process so
     // configurable defaults stay consistent even when the .service file omits
     // memoryLimitMb/startupTimeoutMs.
-    let settings_path = std::env::var("SETTINGS_PATH").unwrap_or_else(|_| "settings.json".into());
+    let settings_path = value("--settings").unwrap_or_else(|| "settings.json".into());
     let config = config::Config::load(&settings_path)
         .map_err(|error| anyhow::anyhow!("service host failed to load {settings_path}: {error}"))?;
+    let runtime_env = Arc::new(route_engine::RuntimeEnv::from_snapshot(
+        match runtime_env_frame {
+            Some(value) => value,
+            None => serde_json::to_value(&config.runtime_env)?,
+        },
+    )?);
     let defaults = ServiceDefaults {
         memory_limit_mb: config.services.default_memory_limit_mb,
         startup_timeout_ms: config.services.startup_timeout_ms,
@@ -61,6 +76,18 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
             service_file.display()
         )
     })?;
+    let expected_source_digest = value("--service-source-digest");
+    if std::env::var_os("RBE_PARENT_LIVENESS_PIPE").is_some() && expected_source_digest.is_none() {
+        anyhow::bail!("service host requires the parent-validated source digest");
+    }
+    if let Some(expected_source_digest) = expected_source_digest {
+        if !service_runtime::service_source_matches_digest(&source, &expected_source_digest) {
+            anyhow::bail!(
+                "service host source changed after parent validation; refusing to execute {}",
+                service_file.display()
+            );
+        }
+    }
     let program = route_engine::parse_service_source(&source).map_err(|error| {
         anyhow::anyhow!(
             "service host failed to parse {}:{}:{}: {}",
@@ -78,11 +105,12 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         )
     })?;
     let memory = ServiceMemory::default();
-    let executor = route_engine::ServiceProgramExecutor::with_services(
+    let executor = route_engine::ServiceProgramExecutor::with_services_and_runtime_env(
         program,
         modules,
         memory.clone(),
         service_manager,
+        runtime_env,
     );
     service_runtime::run_service_host_with_executor_and_memory(
         service_file,

@@ -81,6 +81,25 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
         "log" => matches!(function, "info" | "warn"),
         "crypto" => matches!(function, "hash"),
         "env" => matches!(function, "get"),
+        "ENV" => matches!(
+            function,
+            "get" | "has" | "require" | "string" | "number" | "bool" | "object" | "array"
+        ),
+        "response" => matches!(
+            function,
+            "json"
+                | "text"
+                | "html"
+                | "status"
+                | "noContent"
+                | "no_content"
+                | "redirect"
+                | "withHeader"
+                | "with_header"
+                | "cookie"
+                | "clearCookie"
+                | "clear_cookie"
+        ),
         "vm" | "video-manager" => matches!(
             function,
             "status"
@@ -263,9 +282,7 @@ impl ModuleRegistry {
             ModuleKind::Builtin(BuiltinModule::Security) => Err(ModuleError {
                 message: format!("{module_name}.{function_name}() is not implemented yet"),
             }),
-            ModuleKind::Builtin(BuiltinModule::Response) => Err(ModuleError {
-                message: format!("{module_name}.{function_name}() is not implemented yet"),
-            }),
+            ModuleKind::Builtin(BuiltinModule::Response) => call_response(function_name, args),
             ModuleKind::Builtin(BuiltinModule::VideoManager) => Err(ModuleError {
                 message: format!(
             "{module_name}.{function_name}() requires the privileged module Video Manager host capability"
@@ -287,6 +304,259 @@ impl ModuleRegistry {
                 })
             }
         }
+    }
+}
+
+const HTTP_RESPONSE_MARKER: &str = "__rbeHttpResponse";
+
+fn response_error(message: impl Into<String>) -> ModuleError {
+    ModuleError {
+        message: message.into(),
+    }
+}
+
+fn parse_http_status(value: Option<&Value>, default: u16) -> Result<u16, ModuleError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let Value::Number(number) = value else {
+        return Err(response_error("response status must be a number"));
+    };
+    if !number.is_finite() || number.fract() != 0.0 || !(100.0..=599.0).contains(number) {
+        return Err(response_error(
+            "response status must be an integer from 100 through 599",
+        ));
+    }
+    Ok(*number as u16)
+}
+
+fn response_descriptor(kind: &str, status: u16, body: Value) -> Value {
+    Value::Object(HashMap::from([
+        (HTTP_RESPONSE_MARKER.into(), Value::Bool(true)),
+        ("kind".into(), Value::String(kind.into())),
+        ("status".into(), Value::Number(status as f64)),
+        ("body".into(), body),
+        ("headers".into(), Value::Object(HashMap::new())),
+        ("cookies".into(), Value::Array(Vec::new())),
+    ]))
+}
+
+fn response_fields(value: &Value) -> Result<HashMap<String, Value>, ModuleError> {
+    let Value::Object(fields) = value else {
+        return Err(response_error(
+            "response helper requires a response value as its first argument",
+        ));
+    };
+    if !matches!(fields.get(HTTP_RESPONSE_MARKER), Some(Value::Bool(true))) {
+        return Err(response_error(
+            "response helper received a normal object instead of a response value",
+        ));
+    }
+    Ok(fields.clone())
+}
+
+fn response_string<'a>(value: Option<&'a Value>, label: &str) -> Result<&'a str, ModuleError> {
+    match value {
+        Some(Value::String(value)) => Ok(value),
+        _ => Err(response_error(format!("{label} must be a string"))),
+    }
+}
+
+fn valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'!' | b'#'..=b'+' | b'-'..=b':' | b'<'..=b'[' | b']'..=b'~'
+            ) && !matches!(
+                byte,
+                b'(' | b')'
+                    | b','
+                    | b'/'
+                    | b':'
+                    | b';'
+                    | b'<'
+                    | b'='
+                    | b'>'
+                    | b'?'
+                    | b'@'
+                    | b'['
+                    | b'\\'
+                    | b']'
+                    | b'{'
+                    | b'}'
+            )
+        })
+}
+
+fn safe_cookie_component(value: &str) -> bool {
+    !value.contains(['\r', '\n', ';'])
+}
+
+fn build_cookie(
+    name: &str,
+    value: &str,
+    options: Option<&Value>,
+    clear: bool,
+) -> Result<String, ModuleError> {
+    if !valid_cookie_name(name) {
+        return Err(response_error("cookie name contains invalid characters"));
+    }
+    if !safe_cookie_component(value) {
+        return Err(response_error("cookie value contains invalid characters"));
+    }
+    let mut cookie = format!("{name}={value}");
+    if clear {
+        cookie.push_str("; Max-Age=0");
+    }
+    let Some(options) = options else {
+        return Ok(cookie);
+    };
+    let Value::Object(options) = options else {
+        return Err(response_error("cookie options must be an object"));
+    };
+    if let Some(Value::String(path)) = options.get("path") {
+        if !safe_cookie_component(path) {
+            return Err(response_error("cookie path contains invalid characters"));
+        }
+        cookie.push_str("; Path=");
+        cookie.push_str(path);
+    }
+    if let Some(Value::String(domain)) = options.get("domain") {
+        if !safe_cookie_component(domain) {
+            return Err(response_error("cookie domain contains invalid characters"));
+        }
+        cookie.push_str("; Domain=");
+        cookie.push_str(domain);
+    }
+    if !clear {
+        if let Some(Value::Number(max_age)) = options.get("maxAge") {
+            if !max_age.is_finite() || max_age.fract() != 0.0 || *max_age < 0.0 {
+                return Err(response_error(
+                    "cookie maxAge must be a non-negative integer",
+                ));
+            }
+            cookie.push_str(&format!("; Max-Age={}", *max_age as u64));
+        }
+    }
+    if matches!(options.get("httpOnly"), Some(Value::Bool(true))) {
+        cookie.push_str("; HttpOnly");
+    }
+    if matches!(options.get("secure"), Some(Value::Bool(true))) {
+        cookie.push_str("; Secure");
+    }
+    if let Some(Value::String(same_site)) = options.get("sameSite") {
+        let normalized = match same_site.to_ascii_lowercase().as_str() {
+            "strict" => "Strict",
+            "lax" => "Lax",
+            "none" => "None",
+            _ => {
+                return Err(response_error(
+                    "cookie sameSite must be Strict, Lax, or None",
+                ))
+            }
+        };
+        cookie.push_str("; SameSite=");
+        cookie.push_str(normalized);
+    }
+    Ok(cookie)
+}
+
+fn call_response(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+    match function_name {
+        "json" => {
+            let body = args.first().cloned().unwrap_or(Value::Null);
+            let status = parse_http_status(args.get(1), 200)?;
+            Ok(response_descriptor("json", status, body))
+        }
+        "text" | "html" => {
+            let body = response_string(args.first(), "response body")?.to_string();
+            let status = parse_http_status(args.get(1), 200)?;
+            Ok(response_descriptor(
+                function_name,
+                status,
+                Value::String(body),
+            ))
+        }
+        "status" => {
+            let status = parse_http_status(args.first(), 200)?;
+            let body = args.get(1).cloned().unwrap_or(Value::Null);
+            let kind = if matches!(body, Value::Null) {
+                "empty"
+            } else {
+                "json"
+            };
+            Ok(response_descriptor(kind, status, body))
+        }
+        "noContent" | "no_content" => Ok(response_descriptor("empty", 204, Value::Null)),
+        "redirect" => {
+            let location = response_string(args.first(), "redirect location")?;
+            if location.contains(['\r', '\n']) {
+                return Err(response_error(
+                    "redirect location contains invalid characters",
+                ));
+            }
+            let status = parse_http_status(args.get(1), 302)?;
+            if !(300..=399).contains(&status) {
+                return Err(response_error("redirect status must be in the 300 range"));
+            }
+            let Value::Object(mut fields) = response_descriptor("empty", status, Value::Null)
+            else {
+                unreachable!();
+            };
+            fields.insert(
+                "headers".into(),
+                Value::Object(HashMap::from([(
+                    "location".into(),
+                    Value::String(location.to_string()),
+                )])),
+            );
+            Ok(Value::Object(fields))
+        }
+        "withHeader" | "with_header" => {
+            let mut fields = response_fields(
+                args.first()
+                    .ok_or_else(|| response_error("missing response value"))?,
+            )?;
+            let name = response_string(args.get(1), "header name")?.to_ascii_lowercase();
+            let value = response_string(args.get(2), "header value")?.to_string();
+            if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+                return Err(response_error(
+                    "HTTP header contains invalid newline characters",
+                ));
+            }
+            let headers = fields
+                .entry("headers".into())
+                .or_insert_with(|| Value::Object(HashMap::new()));
+            let Value::Object(headers) = headers else {
+                return Err(response_error("response header storage is invalid"));
+            };
+            headers.insert(name, Value::String(value));
+            Ok(Value::Object(fields))
+        }
+        "cookie" | "clearCookie" | "clear_cookie" => {
+            let mut fields = response_fields(
+                args.first()
+                    .ok_or_else(|| response_error("missing response value"))?,
+            )?;
+            let name = response_string(args.get(1), "cookie name")?;
+            let clear = matches!(function_name, "clearCookie" | "clear_cookie");
+            let (value, options) = if clear {
+                ("", args.get(2))
+            } else {
+                (response_string(args.get(2), "cookie value")?, args.get(3))
+            };
+            let cookie = build_cookie(name, value, options, clear)?;
+            let cookies = fields
+                .entry("cookies".into())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let Value::Array(cookies) = cookies else {
+                return Err(response_error("response cookie storage is invalid"));
+            };
+            cookies.push(Value::String(cookie));
+            Ok(Value::Object(fields))
+        }
+        other => Err(response_error(format!("response.{other}() does not exist"))),
     }
 }
 
@@ -553,6 +823,55 @@ mod tests {
             panic!("expected number")
         };
         assert!(now > 0.0);
+    }
+
+    #[test]
+    fn response_builders_create_typed_descriptors() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("response".into())]);
+        let response = registry
+            .call(
+                "response",
+                "json",
+                &[Value::Bool(true), Value::Number(201.0)],
+            )
+            .expect("response.json");
+        let Value::Object(fields) = response else {
+            panic!("expected response object")
+        };
+        assert!(matches!(
+            fields.get(HTTP_RESPONSE_MARKER),
+            Some(Value::Bool(true))
+        ));
+        assert!(matches!(fields.get("status"), Some(Value::Number(201.0))));
+        assert!(matches!(fields.get("kind"), Some(Value::String(kind)) if kind == "json"));
+    }
+
+    #[test]
+    fn response_headers_and_cookies_reject_injection() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("response".into())]);
+        let base = registry.call("response", "noContent", &[]).unwrap();
+        assert!(registry
+            .call(
+                "response",
+                "withHeader",
+                &[
+                    base.clone(),
+                    Value::String("x-ok".into()),
+                    Value::String("bad\r\nheader".into()),
+                ],
+            )
+            .is_err());
+        assert!(registry
+            .call(
+                "response",
+                "cookie",
+                &[
+                    base,
+                    Value::String("session".into()),
+                    Value::String("oops; injected=1".into()),
+                ],
+            )
+            .is_err());
     }
 
     #[test]

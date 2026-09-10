@@ -2,10 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
+use service_runtime::ServiceCatalog;
 
+use crate::analyzer::{analyze, Severity};
 use crate::ast::{
     Expr, FunctionDef, ImportTarget, ModuleFile, RouteFile, ServiceProgram, Statement,
 };
@@ -16,7 +20,9 @@ use crate::middleware_plan::{MiddlewarePlan, MiddlewarePlanError};
 use crate::modules::binding_name;
 use crate::parser::{ParseError, Parser};
 use crate::runtime_env::{RuntimeEnv, RuntimeEnvError};
-use crate::runtime_image::{stable_source_hash, RuntimeImage, RuntimeSourceManifest};
+use crate::runtime_image::{
+    stable_image_hash, stable_source_hash, RuntimeExecutable, RuntimeImage, RuntimeSourceManifest,
+};
 use crate::server_policy::{ServerPolicy, ServerPolicyError};
 use crate::server_rel::{compile_server_source, ServerCompileError, ServerProgram};
 use crate::source_registry::{RelSourceKind, RelSourceRegistry, SourceId, SourceRegistryError};
@@ -43,6 +49,86 @@ impl PhysicalRelSource {
             source: source.into(),
         }
     }
+}
+
+pub fn discover_physical_rel_sources(
+    api_dir: &Path,
+    module_dir: &Path,
+    service_catalog: Option<&ServiceCatalog>,
+) -> anyhow::Result<Vec<PhysicalRelSource>> {
+    let mut out = Vec::new();
+    collect_physical_dir(api_dir, RelSourceKind::Route, "route", &mut out)?;
+    collect_physical_dir(module_dir, RelSourceKind::Module, "module", &mut out)?;
+    if let Some(catalog) = service_catalog {
+        for service in catalog.services() {
+            let source = fs::read_to_string(&service.path).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to read Runtime Image service source {}: {error}",
+                    service.path.display()
+                )
+            })?;
+            if !service.source_matches(&source) {
+                anyhow::bail!(
+                    "Runtime Image service source {} changed after ServiceCatalog validation",
+                    service.path.display()
+                );
+            }
+            out.push(PhysicalRelSource::new(
+                RelSourceKind::Service,
+                service.name.clone(),
+                service.path.clone(),
+                source,
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn collect_physical_dir(
+    root: &Path,
+    kind: RelSourceKind,
+    extension: &str,
+    out: &mut Vec<PhysicalRelSource>,
+) -> anyhow::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut paths = Vec::new();
+    collect_physical_paths(root, extension, &mut paths)?;
+    paths.sort();
+    for path in paths {
+        let relative = path.strip_prefix(root).unwrap_or(&path).with_extension("");
+        let logical_name = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        out.push(PhysicalRelSource::new(
+            kind,
+            logical_name,
+            path.clone(),
+            fs::read_to_string(&path).map_err(|error| {
+                anyhow::anyhow!("failed to read REL source {}: {error}", path.display())
+            })?,
+        ));
+    }
+    Ok(())
+}
+
+fn collect_physical_paths(
+    dir: &Path,
+    extension: &str,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_physical_paths(&path, extension, out)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -132,6 +218,8 @@ pub fn compile_runtime_image(
         raw_server_source,
     )?;
 
+    let mut embedded_route_paths = BTreeMap::<SourceId, String>::new();
+
     physical_sources.sort_by(|left, right| {
         (left.kind, left.logical_name.as_str(), left.path.as_path()).cmp(&(
             right.kind,
@@ -148,7 +236,12 @@ pub fn compile_runtime_image(
         registry.register_physical(source.kind, source.logical_name, source.path, source.source)?;
     }
     for embedded in extracted.embedded {
-        registry.register_embedded(
+        let route_path = if embedded.kind == RelSourceKind::Route {
+            embedded.attributes.get("path").cloned()
+        } else {
+            None
+        };
+        let embedded_id = registry.register_embedded(
             &server_id,
             embedded.kind,
             embedded.logical_name,
@@ -156,6 +249,9 @@ pub fn compile_runtime_image(
             embedded.start_line,
             embedded.source,
         )?;
+        if let Some(route_path) = route_path {
+            embedded_route_paths.insert(embedded_id, route_path);
+        }
     }
 
     // PASS 2: role-specific parsing using the shared REL lexer/grammar pieces.
@@ -167,12 +263,27 @@ pub fn compile_runtime_image(
         }
         let unit = parse_registered_source(source.id(), source.kind(), source.source())?;
         validate_capabilities(source.id(), source.kind(), unit.imports())?;
+        if let CompiledUnit::Route(file) = &unit {
+            let errors = analyze(file)
+                .into_iter()
+                .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>();
+            if !errors.is_empty() {
+                return Err(RelcError::Link(format!(
+                    "{} failed Route REL semantic analysis: {}",
+                    source.id(),
+                    errors.join("; ")
+                )));
+            }
+        }
         compiled.insert(source.id().clone(), unit);
     }
     validate_capabilities(&server_id, RelSourceKind::Server, &server.imports)?;
 
     // PASS 3/4: declaration + import target collection.
     validate_import_targets(&registry, &compiled)?;
+    validate_service_dependency_cycles(&registry, &compiled)?;
 
     // PASS 5: symbol graph. Import cycles are not rejected; only actual symbol
     // call edges form recursive SCC metadata.
@@ -195,6 +306,10 @@ pub fn compile_runtime_image(
     let mut services = Vec::new();
     let mut capabilities = BTreeMap::new();
     let mut service_assignments = BTreeMap::new();
+    let executables = compiled
+        .iter()
+        .map(|(id, unit)| (id.clone(), unit.runtime_executable()))
+        .collect::<BTreeMap<_, _>>();
 
     for source in registry.iter() {
         let unit = compiled.get(source.id()).ok_or_else(|| {
@@ -209,6 +324,7 @@ pub fn compile_runtime_image(
             logical_name: source.logical_name().to_string(),
             exports: unit.exports(),
             imports: unit.imports().iter().map(import_label).collect(),
+            route_path: embedded_route_paths.get(source.id()).cloned(),
         };
         match source.kind() {
             RelSourceKind::Route => routes.push(source.id().clone()),
@@ -229,8 +345,9 @@ pub fn compile_runtime_image(
     // PASS 10: immutable Runtime Image link.
     let source_hash =
         stable_source_hash(registry.iter().map(|source| (source.id(), source.source())));
+    let image_hash = stable_image_hash(source_hash, settings_json);
     Ok(RuntimeImage {
-        image_id: format!("rbe-{source_hash:016x}"),
+        image_id: format!("rbe-{image_hash:016x}"),
         source_hash,
         server_policy,
         environment,
@@ -244,6 +361,7 @@ pub fn compile_runtime_image(
         middleware_plan,
         service_assignments,
         capabilities,
+        executables,
     })
 }
 
@@ -303,6 +421,12 @@ fn validate_capabilities(
         if let ImportTarget::Builtin(name) | ImportTarget::BuiltinFunction { module: name, .. } =
             base
         {
+            if name == "env" {
+                return Err(RelcError::Capability {
+                    source: source.clone(),
+                    message: "legacy process environment capability `env` is disabled in RELC-linked applications; use typed `ENV` for public runtime configuration or Vault for secrets".into(),
+                });
+            }
             if name == "ENV" && !RuntimeEnv::can_read(kind) {
                 return Err(RelcError::Capability {
                     source: source.clone(),
@@ -539,11 +663,85 @@ fn collect_expr_edges(
     }
 }
 
+fn service_dependency(import: &ImportTarget) -> Option<&str> {
+    match import_base(import) {
+        ImportTarget::Service(service) | ImportTarget::ServiceFunction { service, .. } => {
+            Some(service.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn validate_service_dependency_cycles(
+    registry: &RelSourceRegistry,
+    compiled: &BTreeMap<SourceId, CompiledUnit>,
+) -> Result<(), RelcError> {
+    let mut graph = BTreeMap::<String, BTreeSet<String>>::new();
+    for (id, unit) in compiled {
+        let CompiledUnit::Service(service) = unit else {
+            continue;
+        };
+        let source = registry
+            .get(id)
+            .ok_or_else(|| RelcError::Link(format!("compiled service {id} is not registered")))?;
+        let dependencies = service
+            .imports
+            .iter()
+            .filter_map(service_dependency)
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+        graph.insert(source.logical_name().to_string(), dependencies);
+    }
+
+    fn visit(
+        node: &str,
+        graph: &BTreeMap<String, BTreeSet<String>>,
+        visiting: &mut BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), RelcError> {
+        if visited.contains(node) {
+            return Ok(());
+        }
+        if !visiting.insert(node.to_string()) {
+            let start = stack.iter().position(|value| value == node).unwrap_or(0);
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(node.to_string());
+            return Err(RelcError::Link(format!(
+                "synchronous Service Fabric dependency cycle would deadlock: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        stack.push(node.to_string());
+        if let Some(dependencies) = graph.get(node) {
+            for dependency in dependencies {
+                visit(dependency, graph, visiting, visited, stack)?;
+            }
+        }
+        stack.pop();
+        visiting.remove(node);
+        visited.insert(node.to_string());
+        Ok(())
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut stack = Vec::new();
+    for node in graph.keys() {
+        visit(node, &graph, &mut visiting, &mut visited, &mut stack)?;
+    }
+    Ok(())
+}
+
 fn logical_module_name(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     let after_amp = normalized.rsplit('&').next().unwrap_or(&normalized);
-    let leaf = after_amp.rsplit('/').next().unwrap_or(after_amp);
-    leaf.strip_suffix(".module").unwrap_or(leaf).to_string()
+    let relative = after_amp.strip_prefix("./").unwrap_or(after_amp);
+    let relative = relative.strip_prefix("module/").unwrap_or(relative);
+    relative
+        .strip_suffix(".module")
+        .unwrap_or(relative)
+        .to_string()
 }
 
 fn capability_set(imports: &[ImportTarget]) -> BTreeSet<String> {
@@ -587,6 +785,15 @@ enum CompiledUnit {
 }
 
 impl CompiledUnit {
+    fn runtime_executable(&self) -> RuntimeExecutable {
+        match self {
+            Self::Route(file) => RuntimeExecutable::Route(Arc::new(file.clone())),
+            Self::Module(file) => RuntimeExecutable::Module(Arc::new(file.clone())),
+            Self::Service(file) => RuntimeExecutable::Service(Arc::new(file.clone())),
+            Self::Server(file) => RuntimeExecutable::Server(Arc::new(file.clone())),
+        }
+    }
+
     fn imports(&self) -> &[ImportTarget] {
         match self {
             Self::Route(file) => &file.imports,
@@ -678,6 +885,8 @@ mod tests {
         });
         let image = compile_runtime_image(server, Vec::new(), &settings).unwrap();
         assert_eq!(image.routes.len(), 1);
+        let route = image.source(&image.routes[0]).unwrap();
+        assert_eq!(route.route_path.as_deref(), Some("/health"));
         assert_eq!(image.modules.len(), 1);
         assert_eq!(image.environment.string("APP_NAME").unwrap(), "settings");
         assert!(image.environment.bool("LOCKED").unwrap());
@@ -698,6 +907,59 @@ mod tests {
             "export function value() { return 2; }",
         )];
         assert!(compile_runtime_image(server, physical, &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn runtime_image_id_changes_when_settings_change() {
+        let server = "server Main {}";
+        let first = compile_runtime_image(
+            server,
+            Vec::new(),
+            &serde_json::json!({"runtimeEnv": {"MODE": "one"}}),
+        )
+        .unwrap();
+        let second = compile_runtime_image(
+            server,
+            Vec::new(),
+            &serde_json::json!({"runtimeEnv": {"MODE": "two"}}),
+        )
+        .unwrap();
+        assert_eq!(first.source_hash, second.source_hash);
+        assert_ne!(first.image_id, second.image_id);
+    }
+
+    #[test]
+    fn rejects_synchronous_service_fabric_cycles_during_link() {
+        let services = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Service,
+                "a",
+                "service/a.service",
+                r#":import[service:b]
+                   :service[name = a]
+                   export function run() { return b.run(); }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Service,
+                "b",
+                "service/b.service",
+                r#":import[service:a]
+                   :service[name = b]
+                   export function run() { return a.run(); }"#,
+            ),
+        ];
+        let error = compile_runtime_image("server Main {}", services, &serde_json::json!({}))
+            .expect_err("service dependency cycle must fail");
+        assert!(error.to_string().contains("would deadlock"));
+    }
+
+    #[test]
+    fn nested_module_logical_names_preserve_the_relative_path() {
+        assert_eq!(
+            logical_module_name("./module/users/profile.module"),
+            "users/profile"
+        );
+        assert_eq!(logical_module_name("module&users/profile"), "users/profile");
     }
 
     #[test]

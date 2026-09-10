@@ -1,23 +1,28 @@
-//! Async language bridge from `.module` execution into core Video Manager.
+//! Async language bridge from `.module` execution into runtime-owned capabilities.
+
+use std::sync::Arc;
 
 use core_lib::{AppState, VideoLanguage};
 
 use crate::ast::Value;
 use crate::module_eval::{HostCapabilityCaller, HostCapabilityFuture, ModuleEvalError};
+use crate::runtime_image::RuntimeImage;
 
-pub struct VideoHostCapabilities {
+pub struct RuntimeHostCapabilities {
     video: VideoLanguage,
+    image: Arc<RuntimeImage>,
 }
 
-impl VideoHostCapabilities {
-    pub fn from_state(state: &AppState) -> Self {
+impl RuntimeHostCapabilities {
+    pub fn from_state_and_image(state: &AppState, image: Arc<RuntimeImage>) -> Self {
         Self {
             video: VideoLanguage::new(state.video_manager.clone()),
+            image,
         }
     }
 }
 
-impl HostCapabilityCaller for VideoHostCapabilities {
+impl HostCapabilityCaller for RuntimeHostCapabilities {
     fn call<'a>(
         &'a self,
         scope: Option<String>,
@@ -26,6 +31,17 @@ impl HostCapabilityCaller for VideoHostCapabilities {
         args: Vec<Value>,
     ) -> HostCapabilityFuture<'a> {
         Box::pin(async move {
+            if module == "ENV" {
+                let value = self
+                    .image
+                    .environment
+                    .call_rel(function, &args)
+                    .map_err(|error| ModuleEvalError {
+                        code: "ENV3000",
+                        message: error.to_string(),
+                    })?;
+                return Ok(Some(value));
+            }
             if !matches!(module, "vm" | "video-manager") {
                 return Ok(None);
             }

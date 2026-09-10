@@ -180,12 +180,7 @@ pub fn report_issue(input: IssueInput) {
 
     let stack = input.stack.map(|s| s.trim()).filter(|s| !s.is_empty());
     let stack = stack.map(redact_sensitive_text);
-    let stack_for_fingerprint: String = stack
-        .as_deref()
-        .unwrap_or("")
-        .chars()
-        .take(256)
-        .collect();
+    let stack_for_fingerprint: String = stack.as_deref().unwrap_or("").chars().take(256).collect();
     let stack: Option<String> = stack.map(|s| s.chars().take(4_000).collect());
 
     let source: String = {
@@ -678,7 +673,10 @@ mod tests {
             "very-secret",
             "secret-pem-body",
         ] {
-            assert!(!redacted.contains(secret), "secret {secret:?} leaked: {redacted}");
+            assert!(
+                !redacted.contains(secret),
+                "secret {secret:?} leaked: {redacted}"
+            );
         }
         assert!(redacted.contains(REDACTED));
         assert!(redacted.contains(REDACTED_PRIVATE_KEY));

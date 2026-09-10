@@ -3,6 +3,7 @@ name = "backend"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+default-run = "backend"
 
 [[bin]]
 name = "backend"

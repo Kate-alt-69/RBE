@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -28,11 +29,12 @@ const SERVICE_SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(10);
 const SERVICE_STABLE_WINDOW: Duration = Duration::from_secs(60);
 const SERVICE_READY_MAX_BYTES: usize = 4 * 1024;
 const SERVICE_STDOUT_LINE_MAX_BYTES: usize = 64 * 1024;
+const MANUAL_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CRASH_LOOP_BACKOFF_THRESHOLD: u32 = 6;
 
 struct ServiceProcess {
     child: Child,
     _liveness: ChildStdin,
-    alias: PathBuf,
     ready: ServiceReady,
     token: String,
     started_at: Instant,
@@ -118,6 +120,7 @@ pub struct ServiceManager {
     shutting_down: Arc<AtomicBool>,
     mother: Option<ServiceMotherClient>,
     fabric: Option<ServiceFabricEndpoint>,
+    runtime_env: Option<Arc<Value>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +129,7 @@ pub enum ServiceRuntimeState {
     Dormant,
     Running,
     Restarting,
+    CrashLoopBackoff,
     Stopped,
     Unknown,
 }
@@ -202,7 +206,7 @@ impl ServiceManager {
     }
 
     pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
-        let manager = Self::prepare_all(catalog, None).await;
+        let manager = Self::prepare_all(catalog, None, None).await;
         manager.start_prepared(catalog).await?;
         Ok(manager)
     }
@@ -211,12 +215,25 @@ impl ServiceManager {
         catalog: &ServiceCatalog,
         fabric: ServiceFabricEndpoint,
     ) -> Self {
-        Self::prepare_all(catalog, Some(fabric)).await
+        Self::prepare_all(catalog, Some(fabric), None).await
     }
 
-    async fn prepare_all(catalog: &ServiceCatalog, fabric: Option<ServiceFabricEndpoint>) -> Self {
+    pub async fn prepare_all_with_fabric_and_runtime_env(
+        catalog: &ServiceCatalog,
+        fabric: ServiceFabricEndpoint,
+        runtime_env: Arc<Value>,
+    ) -> Self {
+        Self::prepare_all(catalog, Some(fabric), Some(runtime_env)).await
+    }
+
+    async fn prepare_all(
+        catalog: &ServiceCatalog,
+        fabric: Option<ServiceFabricEndpoint>,
+        runtime_env: Option<Arc<Value>>,
+    ) -> Self {
         let manager = Self {
             fabric,
+            runtime_env,
             ..Self::default()
         };
         let mut services = manager.services.write().await;
@@ -238,13 +255,15 @@ impl ServiceManager {
             if file.mode == ServiceMode::OnDemand {
                 continue;
             }
-            let process = match spawn_process(&file, self.fabric.as_ref()).await {
-                Ok(process) => process,
-                Err(error) => {
-                    self.shutdown_all().await;
-                    return Err(error);
-                }
-            };
+            let process =
+                match spawn_process(&file, self.fabric.as_ref(), self.runtime_env.as_deref()).await
+                {
+                    Ok(process) => process,
+                    Err(error) => {
+                        self.shutdown_all().await;
+                        return Err(error);
+                    }
+                };
             let handle = self
                 .services
                 .read()
@@ -358,9 +377,6 @@ impl ServiceManager {
             if !should_restart(service.file.restart, status.success()) {
                 service.exit_observed = true;
                 service.restarting = false;
-                if let Some(process) = service.process.as_ref() {
-                    let _ = std::fs::remove_file(&process.alias);
-                }
                 tracing::warn!(
                     service = %service.file.name,
                     pid = old_pid,
@@ -438,7 +454,7 @@ impl ServiceManager {
                 continue;
             }
 
-            match spawn_process(&file, self.fabric.as_ref()).await {
+            match spawn_process(&file, self.fabric.as_ref(), self.runtime_env.as_deref()).await {
                 Ok(replacement) => {
                     let new_pid = replacement.ready.pid;
                     service.process = Some(replacement);
@@ -463,6 +479,147 @@ impl ServiceManager {
                     error = %error,
                     "service restart attempt failed"
                               );
+                }
+            }
+        }
+    }
+
+    pub async fn restart_service(&self, target: &str) -> Result<String, ServiceCallError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ServiceCallError::Unavailable {
+                service: target.to_string(),
+            });
+        }
+        if self.mother.is_some() {
+            return Err(ServiceCallError::Unavailable {
+                service: target.to_string(),
+            });
+        }
+        let (service_name, handle) = self.find_restart_target(target).await?;
+        let (file, old_process) = {
+            let mut service = handle.lock().await;
+            if service.restarting {
+                tracing::info!(
+                    service = %service.file.name,
+                    "explicit restart request joined an already-running restart"
+                );
+                return Ok(service.file.name.clone());
+            }
+            service.restarting = true;
+            service.exit_observed = false;
+            service.restart_attempts = 0;
+            (service.file.clone(), service.process.take())
+        };
+
+        let manager = self.clone();
+        tokio::spawn(async move {
+            if let Some(mut process) = old_process {
+                stop_process(&file.name, &mut process).await;
+            }
+            manager.restart_requested_until_ready(handle, file).await;
+        });
+        Ok(service_name)
+    }
+
+    async fn find_restart_target(
+        &self,
+        target: &str,
+    ) -> Result<(String, Arc<Mutex<Managed>>), ServiceCallError> {
+        let target = target.trim();
+        let without_extension = target.strip_suffix(".service").unwrap_or(target);
+        let handles = {
+            let services = self.services.read().await;
+            if let Some(handle) = services.get(target) {
+                return Ok((target.to_string(), handle.clone()));
+            }
+            if let Some(handle) = services.get(without_extension) {
+                return Ok((without_extension.to_string(), handle.clone()));
+            }
+            services.values().cloned().collect::<Vec<_>>()
+        };
+
+        for handle in handles {
+            let service = handle.lock().await;
+            let filename = service
+                .file
+                .path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let stem = service
+                .file
+                .path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if target == filename || target == stem || without_extension == stem {
+                return Ok((service.file.name.clone(), handle.clone()));
+            }
+        }
+
+        Err(ServiceCallError::Unknown {
+            service: target.to_string(),
+        })
+    }
+
+    async fn restart_requested_until_ready(&self, handle: Arc<Mutex<Managed>>, file: ServiceFile) {
+        let mut attempt = 0u32;
+        loop {
+            if self.shutting_down.load(Ordering::Acquire) {
+                let mut service = handle.lock().await;
+                service.restarting = false;
+                return;
+            }
+            attempt = attempt.saturating_add(1);
+            match spawn_process(&file, self.fabric.as_ref(), self.runtime_env.as_deref()).await {
+                Ok(mut replacement) => {
+                    let pid = replacement.ready.pid;
+                    let mut service = handle.lock().await;
+                    if self.shutting_down.load(Ordering::Acquire) || !service.restarting {
+                        drop(service);
+                        stop_process(&file.name, &mut replacement).await;
+                        return;
+                    }
+                    service.process = Some(replacement);
+                    service.restart_attempts = 0;
+                    service.exit_observed = false;
+                    service.restarting = false;
+                    service.last_activity = Instant::now();
+                    tracing::info!(
+                        service = %file.name,
+                        pid,
+                        attempts = attempt,
+                        "explicit Service restart completed"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let delay = restart_delay(attempt, MANUAL_RESTART_MAX_BACKOFF);
+                    {
+                        let mut service = handle.lock().await;
+                        if !service.restarting {
+                            return;
+                        }
+                        service.restart_attempts = attempt;
+                    }
+                    if attempt >= CRASH_LOOP_BACKOFF_THRESHOLD {
+                        tracing::error!(
+                            service = %file.name,
+                            attempt,
+                            retry_in_ms = delay.as_millis() as u64,
+                            error = %error,
+                            "Service remains in crash-loop backoff; retrying explicit restart"
+                        );
+                    } else {
+                        tracing::warn!(
+                            service = %file.name,
+                            attempt,
+                            retry_in_ms = delay.as_millis() as u64,
+                            error = %error,
+                            "explicit Service restart failed; retry scheduled"
+                        );
+                    }
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -583,7 +740,7 @@ impl ServiceManager {
 
         let file = service.file.clone();
         service.restarting = true;
-        match spawn_process(&file, self.fabric.as_ref()).await {
+        match spawn_process(&file, self.fabric.as_ref(), self.runtime_env.as_deref()).await {
             Ok(process) => {
                 let pid = process.ready.pid;
                 service.process = Some(process);
@@ -722,7 +879,11 @@ async fn snapshot_managed_service(
         let wakeable = service.wakeable();
         let exit_observed = service.exit_observed;
         let restart = service.file.restart;
+        let restart_attempts = service.restart_attempts;
         let (pid, state, health_target) = match service.process.as_mut() {
+            None if restarting && restart_attempts >= CRASH_LOOP_BACKOFF_THRESHOLD => {
+                (None, ServiceRuntimeState::CrashLoopBackoff, None)
+            }
             None if restarting => (None, ServiceRuntimeState::Restarting, None),
             None if wakeable && !exit_observed => (None, ServiceRuntimeState::Dormant, None),
             None => (None, ServiceRuntimeState::Stopped, None),
@@ -732,6 +893,9 @@ async fn snapshot_managed_service(
                     ServiceRuntimeState::Running,
                     Some((process.ready.address, process.token.clone())),
                 ),
+                Ok(Some(_)) if restarting && restart_attempts >= CRASH_LOOP_BACKOFF_THRESHOLD => {
+                    (None, ServiceRuntimeState::CrashLoopBackoff, None)
+                }
                 Ok(Some(_)) if restarting => (None, ServiceRuntimeState::Restarting, None),
                 Ok(Some(status)) if exit_observed || !should_restart(restart, status.success()) => {
                     (None, ServiceRuntimeState::Stopped, None)
@@ -947,7 +1111,6 @@ async fn stop_process(service_name: &str, process: &mut ServiceProcess) {
             let _ = process.child.wait().await;
         }
     }
-    let _ = std::fs::remove_file(&process.alias);
 }
 
 async fn read_bounded_buffered_line<R>(
@@ -1038,43 +1201,82 @@ where
     }
 }
 
+fn harden_service_child_environment(command: &mut Command) {
+    command.env_clear();
+    for name in [
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "RUST_LOG",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.env("RBE_PARENT_LIVENESS_PIPE", "1");
+}
+
 async fn spawn_process(
     file: &ServiceFile,
     fabric: Option<&ServiceFabricEndpoint>,
+    runtime_env: Option<&Value>,
 ) -> anyhow::Result<ServiceProcess> {
-    let exe = std::env::current_exe().context("resolve backend executable")?;
-    let parent = exe.parent().context("backend executable has no parent")?;
-    let dir = parent.join(".runtime/process");
-    std::fs::create_dir_all(&dir)?;
-    let extension = exe
-        .extension()
+    let source = std::fs::read_to_string(&file.path).with_context(|| {
+        format!(
+            "read service source {} before child activation",
+            file.path.display()
+        )
+    })?;
+    if !file.source_matches(&source) {
+        anyhow::bail!(
+            "service {:?} source changed after catalog validation; refusing to execute drifted REL",
+            file.name
+        );
+    }
+
+    let service_exe = std::env::current_exe().context("resolve service runtime executable")?;
+    let parent = service_exe
+        .parent()
+        .context("service runtime executable has no parent")?;
+    let stem = service_exe
+        .file_stem()
         .and_then(|value| value.to_str())
-        .map(|value| format!(".{value}"))
         .unwrap_or_default();
-    let alias = dir.join(format!(
-        "rbe-service-{}-parent-{}{}",
-        process_name(&file.name),
-        std::process::id(),
-        extension
-    ));
-    let _ = std::fs::remove_file(&alias);
-    if std::fs::hard_link(&exe, &alias).is_err() {
-        std::fs::copy(&exe, &alias)?;
+    if !stem.eq_ignore_ascii_case("service") {
+        anyhow::bail!(
+            "ServiceManager process spawning is restricted to the canonical service executable"
+        );
     }
 
     let token = random_token();
-    let mut command = Command::new(&alias);
+    let mut command = Command::new(&service_exe);
+    harden_service_child_environment(&mut command);
     command
         .args(["--service-host", "--service-file"])
-        .arg(&file.path);
+        .arg(&file.path)
+        .arg("--service-name")
+        .arg(&file.name)
+        .arg("--settings")
+        .arg(
+            std::env::var_os("RBE_TRUSTED_SETTINGS_PATH")
+                .unwrap_or_else(|| std::ffi::OsString::from("settings.json")),
+        )
+        .arg("--service-source-digest")
+        .arg(file.source_digest_hex());
     if let Some(fabric) = fabric {
         command
             .arg("--service-mother-address")
             .arg(fabric.address().to_string());
     }
+    if runtime_env.is_some() {
+        command.arg("--runtime-env-frame");
+    }
     let mut child = match command
         .current_dir(parent)
-        .env("RBE_PARENT_LIVENESS_PIPE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -1083,7 +1285,6 @@ async fn spawn_process(
     {
         Ok(child) => child,
         Err(error) => {
-            let _ = std::fs::remove_file(&alias);
             return Err(error.into());
         }
     };
@@ -1091,12 +1292,12 @@ async fn spawn_process(
     let mut liveness = match child.stdin.take() {
         Some(stdin) => stdin,
         None => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             anyhow::bail!("service {:?} parent liveness pipe unavailable", file.name);
         }
     };
     if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, &token).await {
-        cleanup_failed_spawn(&alias, &mut child).await;
+        cleanup_failed_spawn(&mut child).await;
         return Err(anyhow::anyhow!(
             "send service {:?} parent bootstrap secret: {error}",
             file.name
@@ -1105,9 +1306,18 @@ async fn spawn_process(
     if let Some(fabric) = fabric {
         if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, fabric.auth()).await
         {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             return Err(anyhow::anyhow!(
                 "send service {:?} Service Fabric bootstrap secret: {error}",
+                file.name
+            ));
+        }
+    }
+    if let Some(runtime_env) = runtime_env {
+        if let Err(error) = super::write_parent_bootstrap_json(&mut liveness, runtime_env).await {
+            cleanup_failed_spawn(&mut child).await;
+            return Err(anyhow::anyhow!(
+                "send service {:?} Runtime ENV snapshot: {error}",
                 file.name
             ));
         }
@@ -1115,7 +1325,7 @@ async fn spawn_process(
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             anyhow::bail!("service {:?} stdout unavailable", file.name);
         }
     };
@@ -1128,35 +1338,35 @@ async fn spawn_process(
     {
         Ok(Ok(Some(line))) => line,
         Ok(Ok(None)) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             anyhow::bail!("service {:?} exited before readiness", file.name);
         }
         Ok(Err(error)) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             return Err(error);
         }
         Err(_) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             anyhow::bail!("service {:?} startup timeout", file.name);
         }
     };
     let ready: ServiceReady = match serde_json::from_str(line.trim()) {
         Ok(ready) => ready,
         Err(error) => {
-            cleanup_failed_spawn(&alias, &mut child).await;
+            cleanup_failed_spawn(&mut child).await;
             return Err(error.into());
         }
     };
     if ready.service != file.name {
-        cleanup_failed_spawn(&alias, &mut child).await;
+        cleanup_failed_spawn(&mut child).await;
         anyhow::bail!("service readiness identity mismatch");
     }
     if !ready.address.ip().is_loopback() {
-        cleanup_failed_spawn(&alias, &mut child).await;
+        cleanup_failed_spawn(&mut child).await;
         anyhow::bail!("service readiness advertised a non-loopback endpoint");
     }
     if child.id() != Some(ready.pid) {
-        cleanup_failed_spawn(&alias, &mut child).await;
+        cleanup_failed_spawn(&mut child).await;
         anyhow::bail!("service readiness PID does not match child process");
     }
 
@@ -1191,29 +1401,15 @@ async fn spawn_process(
     Ok(ServiceProcess {
         child,
         _liveness: liveness,
-        alias,
         ready,
         token,
         started_at: Instant::now(),
     })
 }
 
-async fn cleanup_failed_spawn(alias: &Path, child: &mut Child) {
+async fn cleanup_failed_spawn(child: &mut Child) {
     let _ = child.kill().await;
     let _ = child.wait().await;
-    let _ = std::fs::remove_file(alias);
-}
-
-fn process_name(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 fn random_token() -> String {
@@ -1294,13 +1490,6 @@ mod tests {
             assert_eq!(counter.load(Ordering::Acquire), 1);
         }
         assert_eq!(counter.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn service_process_alias_preserves_distinct_legal_names() {
-        assert_eq!(process_name("cache.v1"), "cache.v1");
-        assert_eq!(process_name("cache-v1"), "cache-v1");
-        assert_ne!(process_name("cache.v1"), process_name("cache-v1"));
     }
 
     #[test]

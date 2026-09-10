@@ -18,6 +18,7 @@ use crate::module_eval::{
     HostCapabilityCaller, HostCapabilityFuture, ModuleEvalError, ModuleExecutor,
 };
 use crate::module_runtime::ModuleProgram;
+use crate::runtime_env::RuntimeEnv;
 
 #[path = "quickdb.rs"]
 mod quickdb;
@@ -29,10 +30,15 @@ struct ServiceHostCapabilities {
     quick_db: QuickDb,
     quick_db_classes: HashSet<String>,
     quick_db_init_errors: Vec<(String, String)>,
+    runtime_env: Option<Arc<RuntimeEnv>>,
 }
 
 impl ServiceHostCapabilities {
-    fn new(memory: ServiceMemory, classes: &HashMap<String, ServiceClassDef>) -> Self {
+    fn new(
+        memory: ServiceMemory,
+        classes: &HashMap<String, ServiceClassDef>,
+        runtime_env: Option<Arc<RuntimeEnv>>,
+    ) -> Self {
         let quick_db = QuickDb::default();
         let mut quick_db_classes = HashSet::new();
         let mut quick_db_init_errors = Vec::new();
@@ -59,6 +65,7 @@ impl ServiceHostCapabilities {
             quick_db,
             quick_db_classes,
             quick_db_init_errors,
+            runtime_env,
         }
     }
 
@@ -336,6 +343,16 @@ impl HostCapabilityCaller for ServiceHostCapabilities {
             let value = match module {
                 "memory" => self.call_memory(function, &args)?,
                 "quickDB" => self.call_quick_db(scope.as_deref(), function, &args)?,
+                "ENV" => {
+                    let env = self.runtime_env.as_ref().ok_or_else(|| {
+                        eval_error(
+                            "ENV3001",
+                            "Runtime ENV snapshot is unavailable in this Service REL executor",
+                        )
+                    })?;
+                    env.call_rel(function, &args)
+                        .map_err(|error| eval_error("ENV3000", error.to_string()))?
+                }
                 _ => return Ok(None),
             };
             Ok(Some(value))
@@ -357,7 +374,7 @@ pub struct ServiceProgramExecutor {
 
 impl ServiceProgramExecutor {
     pub fn new(program: ServiceProgram, modules: ModuleProgram, memory: ServiceMemory) -> Self {
-        Self::build(program, modules, memory, None)
+        Self::build(program, modules, memory, None, None)
     }
 
     pub fn with_services(
@@ -366,7 +383,17 @@ impl ServiceProgramExecutor {
         memory: ServiceMemory,
         services: ServiceManager,
     ) -> Self {
-        Self::build(program, modules, memory, Some(services))
+        Self::build(program, modules, memory, Some(services), None)
+    }
+
+    pub fn with_services_and_runtime_env(
+        program: ServiceProgram,
+        modules: ModuleProgram,
+        memory: ServiceMemory,
+        services: ServiceManager,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> Self {
+        Self::build(program, modules, memory, Some(services), Some(runtime_env))
     }
 
     fn build(
@@ -374,6 +401,7 @@ impl ServiceProgramExecutor {
         modules: ModuleProgram,
         memory: ServiceMemory,
         services: Option<ServiceManager>,
+        runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Self {
         let ServiceProgram {
             imports,
@@ -394,7 +422,8 @@ impl ServiceProgramExecutor {
                 .map(|class| (class.name.clone(), class))
                 .collect::<HashMap<_, _>>(),
         );
-        let host_capabilities = Arc::new(ServiceHostCapabilities::new(memory, &classes));
+        let host_capabilities =
+            Arc::new(ServiceHostCapabilities::new(memory, &classes, runtime_env));
         Self {
             modules,
             file,

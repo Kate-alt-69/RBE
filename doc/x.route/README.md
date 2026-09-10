@@ -65,30 +65,73 @@ See [`../x.module/`](../x.module/) and [`../x.service/`](../x.service/).
 
 ## Request object
 
-Current implementation is minimal: method/path exist while params/query are currently created as empty objects by the route runtime.
-
-Target request context includes:
+Route handlers now receive the real request snapshot when they declare a request parameter:
 
 ```text
-method
-path
-originalUrl
-params
-query
-headers
-cookies
-body
-rawBody
-ip
-forwardedFor
-protocol
-host
-userAgent
-contentType
-contentLength
+request.method
+request.path
+request.originalUrl
+request.params
+request.query
+request.headers
+request.cookies
+request.body
+request.rawBody
+request.ip
+request.forwardedFor
+request.protocol
+request.host
+request.userAgent
+request.contentType
+request.contentLength
 ```
 
-Dynamic route segments and real request extraction are required before Route REL can replace typical production backend routing end-to-end.
+JSON bodies are decoded into native REL values. Other body types are exposed as strings in the current v1 transport. Body reads are bounded by the configured security payload limit. Invalid JSON returns HTTP 400 and oversized bodies return HTTP 413 before REL execution.
+
+Proxy-derived client IP/protocol information is used only when `security.trustedProxyHeaders` is enabled. Otherwise forwarded headers are treated as untrusted input and `request.ip` comes from the socket peer.
+
+File-system route parameters are active:
+
+```text
+api/users/[uid].route       -> /api/users/:uid
+api/files/[...path].route   -> /api/files/*path
+```
+
+Parameter names do not make two otherwise-identical route shapes distinct; `[id]` and `[slug]` for the same method/path collide at boot.
+
+Current v1 limitations: duplicate query keys collapse to one value, duplicate request headers are joined for the REL object, and binary body APIs are not yet a first-class byte type.
+
+## Response object
+
+Plain REL return values remain JSON with status 200 for compatibility. Import `response` when explicit HTTP behavior is needed:
+
+```text
+:import[response]
+
+class Route {
+    post(request) {
+        return response.json({ ok: true }, 201);
+    }
+}
+```
+
+Implemented response helpers:
+
+```text
+response.json(body, status?)
+response.text(text, status?)
+response.html(html, status?)
+response.status(status, body?)
+response.noContent()
+response.redirect(location, status?)
+response.withHeader(responseValue, name, value)
+response.cookie(responseValue, name, value, options?)
+response.clearCookie(responseValue, name, options?)
+```
+
+Header names/values and cookies are validated again at the Rust HTTP boundary; newline/header injection is rejected. Cookie options currently support `path`, `domain`, `maxAge`, `httpOnly`, `secure`, and `sameSite`.
+
+Streaming bodies, first-class binary responses, file sends and SSE remain later transport extensions rather than being pretended complete.
 
 ## Dynamic routing target
 

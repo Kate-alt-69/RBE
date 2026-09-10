@@ -7,6 +7,7 @@ This directory is the authoritative user-facing documentation for the current RB
 - [`rbe.md`](rbe.md) — what RBE is, what it is trying to become, and when it is useful.
 - [`rel.md`](rel.md) — REL (Runtime Engine Language), the language shared by `.route`, `.module`, `.service`, and `.server` sources.
 - [`relc.md`](relc.md) — RELC (Runtime Engine Language Compiler), compilation, linking, dependency analysis, recursion, and Runtime Images.
+- [`source-security.md`](source-security.md) — Runtime Image source integrity, ENV hardening, and the sealed deployment model.
 - [`compatibility.md`](compatibility.md) — cross-file capability and runtime compatibility matrix.
 
 ## File-type documentation

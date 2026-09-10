@@ -13,6 +13,7 @@ use crate::lexer::Lexer;
 use crate::modules::binding_name;
 use crate::parser::Parser;
 use crate::paths::{binary_dir, default_module_dir, resolve_custom_import};
+use crate::runtime_image::RuntimeImage;
 
 #[derive(Debug, Clone)]
 pub struct ModuleCompileError {
@@ -85,6 +86,56 @@ impl ModuleProgram {
         services: &ServiceInterfaces,
     ) -> Result<Self, ModuleCompileErrors> {
         Self::load_internal(module_dir, Some(services))
+    }
+
+    pub fn from_runtime_image_with_services(
+        image: &RuntimeImage,
+        services: &ServiceInterfaces,
+    ) -> Result<Self, ModuleCompileErrors> {
+        let module_dir = default_module_dir();
+        let binary_root = module_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(binary_dir);
+        let mut modules = HashMap::new();
+        let mut errors = Vec::new();
+
+        for id in &image.modules {
+            let Some(manifest) = image.source(id) else {
+                errors.push(ModuleCompileError {
+                    code: "MOD1010",
+                    path: module_dir.clone(),
+                    line: 0,
+                    column: 0,
+                    message: format!("Runtime Image is missing module manifest {id}"),
+                });
+                continue;
+            };
+            let Some(file) = image.module_file(id) else {
+                errors.push(ModuleCompileError {
+                    code: "MOD1011",
+                    path: module_dir.clone(),
+                    line: 0,
+                    column: 0,
+                    message: format!("Runtime Image is missing executable module {id}"),
+                });
+                continue;
+            };
+            let mut path = module_dir.join(&manifest.logical_name);
+            path.set_extension("module");
+            validate_local(&path, file.as_ref(), Some(services), &mut errors);
+            modules.insert(normalize(&path), file);
+        }
+
+        if !errors.is_empty() {
+            return Err(ModuleCompileErrors(errors));
+        }
+
+        Ok(Self {
+            binary_root,
+            module_dir,
+            modules,
+        })
     }
 
     fn load_internal(

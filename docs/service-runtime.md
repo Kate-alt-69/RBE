@@ -51,7 +51,19 @@ The mother process and service child both load the same typed settings so omitte
 
 ## Process model
 
-Each active service is a separate OS process. RBE launches the same backend executable through a service-specific alias under `.runtime/process/` and starts it with internal `--service-host`, `--service-file`, and authenticated token arguments.
+Each active service is a separate OS process. RBE now uses one canonical sibling executable named `service` (`service.exe` on Windows). The Service Mother and every active Service REL worker are separate processes of that same canonical image; per-service executable aliases under `.runtime/process/` are no longer created.
+
+Typical Windows process layout:
+
+```text
+backend.exe
+└─ service.exe              service - mother
+   ├─ service.exe           service - Auth | service.exe
+   ├─ service.exe           service - Cache | service.exe
+   └─ service.exe           service - Mail | service.exe
+```
+
+The packaged `service.exe` is byte-for-byte identical to the packaged `backend.exe`; only the execution name and restricted internal mode differ. At development boot RBE materializes/repairs the canonical sibling from its own executable and verifies the SHA-256 before spawning Mother. `backend.exe` refuses `--service-host`/`--service-mother` unless it was launched through the canonical `service.exe` name.
 
 The child binds a loopback-only TCP IPC endpoint and prints one readiness record to stdout. The parent consumes that record, verifies the service identity, then continuously drains the remaining stdout stream into structured logging.
 
@@ -156,3 +168,46 @@ The following should not be inferred from the current runtime:
 - automatic distributed service placement
 
 The Video Manager is a separate global runtime subsystem; see `docs/video-manager.md`.
+
+
+## Process restart controls
+
+The Service runtime intentionally uses OS-process supervision. With the default `restart = on-failure`, terminating one worker through Task Manager, `kill`, `htop`, or another process manager is treated as a failed worker and Mother restarts only that service. Terminating Mother closes every child parent-liveness pipe; the backend supervisor recreates Mother and therefore recreates the complete Service process tree.
+
+Operators can request the same lifecycle explicitly without exposing Mother authentication:
+
+```text
+./service.exe -restart-whole
+./service.exe -restart-auth.service
+./service.exe --restart-service auth.service
+```
+
+On Unix the executable is `./service` instead of `./service.exe`. Restart commands write a short-lived atomic request under the binary-relative RBE admin directory. Mother consumes the request and remains the only component allowed to create/replace Service workers.
+
+An explicit per-service restart overrides that service's `restart = never` crash policy for the requested restart. If replacement startup keeps failing, RBE retries with bounded exponential backoff rather than a hot loop; after repeated failures the snapshot state becomes `crash_loop_backoff`, while `restartAttempts` shows continued recovery attempts.
+
+
+## HostBootstrap and Error Reporter authority
+
+On Linux, normal RBE startup has a Phase 0 `HostBootstrap` boundary before any
+runtime credential is created, read, migrated, rotated, modified, or persisted.
+The bootstrap scripts are normal `.sh` source files for debugging, embedded in
+the backend at compile time, and piped to `/bin/sh` through stdin; RBE does not
+extract temporary script files. The bootstrap first reuses a working
+`org.freedesktop.secrets` provider, otherwise starts/provisions D-Bus plus a
+Secret Service provider through a supported package manager, then verifies a
+disposable write/read/delete credential. Failure aborts normal boot before
+Vault, container signing material, Communication keys, or user Services start.
+Production output is intentionally generic; a debug build launched with
+`-debug` outside `RBE_ENV=production` exposes bounded script diagnostics.
+
+The Error Reporter has two authority levels. `BASIC` keeps diagnostics and
+report signing but cannot authorize managed restarts. `CONTROL` is issued only
+by a parent that already owns `HostBootstrapReady`; each ER generation receives
+fresh signing/control material over an inherited one-shot stdin pipe. ER COM
+keys are never stored in a file, argv, or environment variable. CONTROL reports
+also carry structured diagnostic context (`why`, `how`, activity source,
+process identity, and bounded stack/message metadata) for later recovery-policy
+decisions. Actual process execution remains owned by the relevant supervisor;
+CONTROL is authority to decide/authorize recovery, not permission to spawn an
+arbitrary executable.

@@ -7,11 +7,14 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
-use axum::response::{IntoResponse, Json};
+use axum::body::{to_bytes, Body};
+use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::MethodRouter;
 use axum::Router;
 use core_lib::AppState;
@@ -23,9 +26,10 @@ use crate::module_eval::ModuleExecutor;
 use crate::module_runtime::{ModuleProgram, ServiceInterfaces};
 use crate::modules::binding_name;
 use crate::parser::Parser;
+use crate::runtime_image::RuntimeImage;
 use crate::terminal::Terminal;
 use crate::transpiler::transpile_file;
-use crate::video_host::VideoHostCapabilities;
+use crate::video_host::RuntimeHostCapabilities;
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -101,17 +105,63 @@ pub(crate) fn collect_route_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow:
     collect_files(dir, "route", out)
 }
 
+fn route_segment(segment: String) -> String {
+    if let Some(inner) = segment
+        .strip_prefix("[...")
+        .and_then(|value| value.strip_suffix(']'))
+        .filter(|value| !value.is_empty())
+    {
+        return format!("*{inner}");
+    }
+    if let Some(inner) = segment
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .filter(|value| !value.is_empty())
+    {
+        return format!(":{inner}");
+    }
+    segment
+}
+
 pub(crate) fn url_path_for(api_dir: &Path, file_path: &Path) -> String {
     let relative = file_path.strip_prefix(api_dir).unwrap_or(file_path);
     let without_ext = relative.with_extension("");
     let mut segments: Vec<String> = without_ext
         .components()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .map(|component| route_segment(component.as_os_str().to_string_lossy().to_string()))
         .collect();
-    if segments.last().map(|s| s == "index").unwrap_or(false) {
+    if segments.last().is_some_and(|segment| segment == "index") {
         segments.pop();
     }
     format!("/api/{}", segments.join("/"))
+}
+
+pub(crate) fn url_path_for_logical(logical_name: &str) -> String {
+    let mut segments = logical_name
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| route_segment(segment.to_string()))
+        .collect::<Vec<_>>();
+    if segments.last().is_some_and(|segment| segment == "index") {
+        segments.pop();
+    }
+    format!("/api/{}", segments.join("/"))
+}
+
+pub(crate) fn collision_key_for(url_path: &str) -> String {
+    url_path
+        .split('/')
+        .map(|segment| {
+            if segment.starts_with(':') {
+                ":"
+            } else if segment.starts_with('*') {
+                "*"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn value_to_json(value: &Value) -> serde_json::Value {
@@ -149,13 +199,292 @@ fn append_runtime_error(path: &str, error: &str) {
 
 const INLINE_ROUTE_HANDLER: &str = "\0rbe-route-handler";
 
-fn request_value(method: &str, path: &str) -> Value {
-    let mut fields = HashMap::new();
-    fields.insert("method".into(), Value::String(method.to_string()));
-    fields.insert("path".into(), Value::String(path.to_string()));
-    fields.insert("params".into(), Value::Object(HashMap::new()));
-    fields.insert("query".into(), Value::Object(HashMap::new()));
-    Value::Object(fields)
+const HTTP_RESPONSE_MARKER: &str = "__rbeHttpResponse";
+
+fn json_to_value(value: serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(value) => Value::Bool(value),
+        serde_json::Value::Number(value) => Value::Number(value.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(value) => Value::String(value),
+        serde_json::Value::Array(values) => {
+            Value::Array(values.into_iter().map(json_to_value).collect())
+        }
+        serde_json::Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, json_to_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+fn headers_value(headers: &HeaderMap) -> Value {
+    let mut out = HashMap::new();
+    for name in headers.keys() {
+        let values = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.insert(name.as_str().to_string(), Value::String(values));
+    }
+    Value::Object(out)
+}
+
+fn cookies_value(headers: &HeaderMap) -> Value {
+    let mut cookies = HashMap::new();
+    if let Some(raw) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    {
+        for part in raw.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if !name.is_empty() {
+                cookies.insert(name.to_string(), Value::String(value.to_string()));
+            }
+        }
+    }
+    Value::Object(cookies)
+}
+
+fn request_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
+}
+
+async fn request_value(
+    state: &AppState,
+    params: HashMap<String, String>,
+    query: HashMap<String, String>,
+    request: Request,
+) -> Result<Value, Box<Response>> {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|connect| connect.0);
+    let (parts, body) = request.into_parts();
+    let raw = to_bytes(body, state.config.security.max_json_payload_bytes)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "REL route request body rejected");
+            Box::new(request_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds the configured payload limit",
+            ))
+        })?;
+
+    let content_type = header_string(&parts.headers, header::CONTENT_TYPE);
+    let body_value = if raw.is_empty() {
+        Value::Null
+    } else if content_type
+        .as_deref()
+        .is_some_and(|value| value.contains("application/json") || value.contains("+json"))
+    {
+        let parsed = serde_json::from_slice::<serde_json::Value>(&raw).map_err(|error| {
+            Box::new(request_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid JSON request body: {error}"),
+            ))
+        })?;
+        json_to_value(parsed)
+    } else {
+        Value::String(String::from_utf8_lossy(&raw).into_owned())
+    };
+
+    let trust_proxy = state.config.security.trusted_proxy_headers;
+    let forwarded_for = if trust_proxy {
+        parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Value::String(value.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let peer_ip = peer.map(|peer| peer.ip().to_string());
+    let client_ip = forwarded_for
+        .first()
+        .and_then(|value| match value {
+            Value::String(value) => Some(value.clone()),
+            _ => None,
+        })
+        .or(peer_ip)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let protocol = if trust_proxy {
+        parts
+            .headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| matches!(*value, "http" | "https"))
+            .unwrap_or("http")
+    } else {
+        "http"
+    };
+    let host = header_string(&parts.headers, header::HOST)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let user_agent = header_string(&parts.headers, header::USER_AGENT)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let content_length = header_string(&parts.headers, header::CONTENT_LENGTH)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| Value::Number(value as f64))
+        .unwrap_or(Value::Null);
+
+    let fields = HashMap::from([
+        (
+            "method".into(),
+            Value::String(parts.method.as_str().to_string()),
+        ),
+        ("path".into(), Value::String(parts.uri.path().to_string())),
+        ("originalUrl".into(), Value::String(parts.uri.to_string())),
+        (
+            "params".into(),
+            Value::Object(
+                params
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect(),
+            ),
+        ),
+        (
+            "query".into(),
+            Value::Object(
+                query
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect(),
+            ),
+        ),
+        ("headers".into(), headers_value(&parts.headers)),
+        ("cookies".into(), cookies_value(&parts.headers)),
+        ("body".into(), body_value),
+        (
+            "rawBody".into(),
+            Value::String(String::from_utf8_lossy(&raw).into_owned()),
+        ),
+        ("ip".into(), client_ip),
+        ("forwardedFor".into(), Value::Array(forwarded_for)),
+        ("protocol".into(), Value::String(protocol.to_string())),
+        ("host".into(), host),
+        ("userAgent".into(), user_agent),
+        (
+            "contentType".into(),
+            content_type.map(Value::String).unwrap_or(Value::Null),
+        ),
+        ("contentLength".into(), content_length),
+    ]);
+    Ok(Value::Object(fields))
+}
+
+fn descriptor_status(fields: &HashMap<String, Value>) -> Result<StatusCode, String> {
+    let Some(Value::Number(status)) = fields.get("status") else {
+        return Err("REL response descriptor is missing numeric status".into());
+    };
+    if !status.is_finite() || status.fract() != 0.0 || !(100.0..=599.0).contains(status) {
+        return Err("REL response descriptor has invalid HTTP status".into());
+    }
+    StatusCode::from_u16(*status as u16).map_err(|error| error.to_string())
+}
+
+fn rel_http_response(value: &Value) -> Result<Option<Response>, String> {
+    let Value::Object(fields) = value else {
+        return Ok(None);
+    };
+    if !matches!(fields.get(HTTP_RESPONSE_MARKER), Some(Value::Bool(true))) {
+        return Ok(None);
+    }
+    let status = descriptor_status(fields)?;
+    let kind = match fields.get("kind") {
+        Some(Value::String(kind)) => kind.as_str(),
+        _ => return Err("REL response descriptor is missing response kind".into()),
+    };
+    let body_value = fields.get("body").unwrap_or(&Value::Null);
+    let mut builder = Response::builder().status(status);
+    if let Some(Value::Object(headers)) = fields.get("headers") {
+        for (name, value) in headers {
+            let Value::String(value) = value else {
+                return Err(format!("REL response header {name:?} must be a string"));
+            };
+            let name =
+                HeaderName::from_bytes(name.as_bytes()).map_err(|error| error.to_string())?;
+            let value = HeaderValue::from_str(value).map_err(|error| error.to_string())?;
+            builder = builder.header(name, value);
+        }
+    }
+    if let Some(Value::Array(cookies)) = fields.get("cookies") {
+        for cookie in cookies {
+            let Value::String(cookie) = cookie else {
+                return Err("REL response cookie must be a string".into());
+            };
+            let value = HeaderValue::from_str(cookie).map_err(|error| error.to_string())?;
+            builder = builder.header(header::SET_COOKIE, value);
+        }
+    }
+
+    let body = match kind {
+        "json" => {
+            if !fields
+                .get("headers")
+                .and_then(|value| match value {
+                    Value::Object(value) => Some(value),
+                    _ => None,
+                })
+                .is_some_and(|headers| {
+                    headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("content-type"))
+                })
+            {
+                builder = builder.header(header::CONTENT_TYPE, "application/json; charset=utf-8");
+            }
+            Body::from(
+                serde_json::to_vec(&value_to_json(body_value))
+                    .map_err(|error| error.to_string())?,
+            )
+        }
+        "text" => {
+            let Value::String(body) = body_value else {
+                return Err("REL text response body must be a string".into());
+            };
+            builder = builder.header(header::CONTENT_TYPE, "text/plain; charset=utf-8");
+            Body::from(body.clone())
+        }
+        "html" => {
+            let Value::String(body) = body_value else {
+                return Err("REL HTML response body must be a string".into());
+            };
+            builder = builder.header(header::CONTENT_TYPE, "text/html; charset=utf-8");
+            Body::from(body.clone())
+        }
+        "empty" => Body::empty(),
+        other => return Err(format!("unknown REL response kind {other:?}")),
+    };
+    builder
+        .body(body)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 async fn execute(
@@ -163,29 +492,60 @@ async fn execute(
     module_program: Arc<ModuleProgram>,
     takes_request: bool,
     state: AppState,
-    http_method: String,
-    path: String,
-) -> axum::response::Response {
+    params: HashMap<String, String>,
+    query: HashMap<String, String>,
+    request: Request,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let image = match request
+        .extensions()
+        .get::<Arc<crate::runtime_image::RuntimeImageSlot>>()
+    {
+        Some(slot) => slot.snapshot(),
+        None => {
+            let error = "Runtime Image extension is unavailable";
+            tracing::error!(path = %path, error, "REL request has no active Runtime Image");
+            return request_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+    };
     let args = if takes_request {
-        vec![request_value(&http_method, &path)]
+        match request_value(&state, params, query, request).await {
+            Ok(request) => vec![request],
+            Err(response) => return *response,
+        }
     } else {
+        // Even handlers without a request parameter must consume the request
+        // body so connection reuse/backpressure behavior remains predictable.
+        let _ = to_bytes(
+            request.into_body(),
+            state.config.security.max_json_payload_bytes,
+        )
+        .await;
         Vec::new()
     };
     let executor = ModuleExecutor::with_services_and_host_capabilities(
         module_program.as_ref(),
         state.services.clone(),
-        Arc::new(VideoHostCapabilities::from_state(&state)),
+        Arc::new(RuntimeHostCapabilities::from_state_and_image(&state, image)),
     );
     match executor
         .call_inline(inline_file, INLINE_ROUTE_HANDLER, args)
         .await
     {
-        Ok(value) => Json(value_to_json(&value)).into_response(),
+        Ok(value) => match rel_http_response(&value) {
+            Ok(Some(response)) => response,
+            Ok(None) => Json(value_to_json(&value)).into_response(),
+            Err(error) => {
+                tracing::error!(error = %error, path = %path, "REL response descriptor rejected");
+                append_runtime_error(&path, &error);
+                request_error(StatusCode::INTERNAL_SERVER_ERROR, error)
+            }
+        },
         Err(err) => {
             tracing::error!(error = %err, path = %path, "route evaluation failed");
             append_runtime_error(&path, &err.to_string());
             (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": err.to_string() })),
             )
                 .into_response()
@@ -196,7 +556,7 @@ async fn execute(
 fn build_method_router(
     file: &RouteFile,
     module_program: Arc<ModuleProgram>,
-    url_path: String,
+    _url_path: String,
 ) -> MethodRouter<AppState> {
     let mut router = MethodRouter::<AppState>::new();
     for method_def in &file.methods {
@@ -213,22 +573,22 @@ fn build_method_router(
         });
         let takes_request = method_def.param_name.is_some();
         let module_program = module_program.clone();
-        let url_path = url_path.clone();
         let verb = method_def.verb.clone();
-        let handler_verb = verb.clone();
-        let handler = move |State(state): State<AppState>| {
+        let handler = move |State(state): State<AppState>,
+                            AxumPath(params): AxumPath<HashMap<String, String>>,
+                            Query(query): Query<HashMap<String, String>>,
+                            request: Request| {
             let inline_file = inline_file.clone();
             let module_program = module_program.clone();
-            let path = url_path.clone();
-            let method = handler_verb.to_uppercase();
             async move {
                 execute(
                     inline_file,
                     module_program,
                     takes_request,
                     state,
-                    method,
-                    path,
+                    params,
+                    query,
+                    request,
                 )
                 .await
             }
@@ -675,4 +1035,89 @@ pub fn build_routes(
     }
 
     Ok(router)
+}
+
+/// Build the executable REL router from the exact immutable ASTs linked by
+/// RELC. Disk files are deployment inputs, not runtime authorities.
+pub fn build_routes_from_image(
+    image: &RuntimeImage,
+    service_interfaces: &ServiceInterfaces,
+) -> anyhow::Result<Router<AppState>> {
+    crate::route_collision::validate_image(image)?;
+    let module_program = Arc::new(ModuleProgram::from_runtime_image_with_services(
+        image,
+        service_interfaces,
+    )?);
+    tracing::info!(
+        modules = module_program.len(),
+        image = %image.image_id,
+        "using Runtime Image module snapshots"
+    );
+
+    let mut router: Router<AppState> = Router::new();
+    for id in &image.routes {
+        let manifest = image
+            .source(id)
+            .ok_or_else(|| anyhow::anyhow!("Runtime Image route {id} has no manifest"))?;
+        let route_file = image.route_file(id).ok_or_else(|| {
+            anyhow::anyhow!("Runtime Image route {id} has no executable snapshot")
+        })?;
+        let url_path = manifest
+            .route_path
+            .clone()
+            .unwrap_or_else(|| url_path_for_logical(&manifest.logical_name));
+        tracing::info!(
+            source = %id,
+            url = %url_path,
+            methods = ?route_file.methods.iter().map(|method| &method.verb).collect::<Vec<_>>(),
+            "registered Runtime Image Route REL"
+        );
+        router = router.route(
+            &url_path,
+            build_method_router(
+                route_file.as_ref(),
+                module_program.clone(),
+                url_path.clone(),
+            ),
+        );
+    }
+    Ok(router)
+}
+
+#[cfg(test)]
+mod http_edge_tests {
+    use super::*;
+
+    #[test]
+    fn file_route_parameters_lower_to_axum_patterns() {
+        let root = PathBuf::from("/tmp/api");
+        assert_eq!(
+            url_path_for(&root, &root.join("users/[uid].route")),
+            "/api/users/:uid"
+        );
+        assert_eq!(
+            url_path_for(&root, &root.join("files/[...path].route")),
+            "/api/files/*path"
+        );
+        assert_eq!(collision_key_for("/api/users/:uid"), "/api/users/:");
+        assert_eq!(collision_key_for("/api/users/:name"), "/api/users/:");
+    }
+
+    #[test]
+    fn response_descriptor_becomes_real_http_response() {
+        let value = Value::Object(HashMap::from([
+            (HTTP_RESPONSE_MARKER.into(), Value::Bool(true)),
+            ("kind".into(), Value::String("text".into())),
+            ("status".into(), Value::Number(202.0)),
+            ("body".into(), Value::String("accepted".into())),
+            ("headers".into(), Value::Object(HashMap::new())),
+            ("cookies".into(), Value::Array(Vec::new())),
+        ]));
+        let response = rel_http_response(&value).unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
 }

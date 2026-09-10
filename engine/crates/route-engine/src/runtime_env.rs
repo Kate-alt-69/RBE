@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::ast::Value;
 use crate::server_rel::{ServerProgram, ServerSettingBody, ServerValue};
 use crate::source_registry::RelSourceKind;
 
@@ -19,6 +20,7 @@ pub enum RuntimeEnvOrigin {
     ServerDefault,
     Settings,
     ForcedServer,
+    ImageSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +44,7 @@ pub enum RuntimeEnvError {
         actual: &'static str,
     },
     InvalidServerEntry(String),
+    InvalidCall(String),
 }
 
 impl fmt::Display for RuntimeEnvError {
@@ -56,7 +59,9 @@ impl fmt::Display for RuntimeEnvError {
                 formatter,
                 "Runtime ENV value `{name}` is {actual}, expected {expected}"
             ),
-            Self::InvalidServerEntry(message) => formatter.write_str(message),
+            Self::InvalidServerEntry(message) | Self::InvalidCall(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -69,6 +74,23 @@ impl RuntimeEnv {
             values: Arc::new(BTreeMap::new()),
             origins: Arc::new(BTreeMap::new()),
         }
+    }
+
+    pub fn from_snapshot(snapshot: JsonValue) -> Result<Self, RuntimeEnvError> {
+        let JsonValue::Object(values) = snapshot else {
+            return Err(RuntimeEnvError::InvalidServerEntry(
+                "Runtime ENV image snapshot must be a JSON object".into(),
+            ));
+        };
+        let values = values.into_iter().collect::<BTreeMap<_, _>>();
+        let origins = values
+            .keys()
+            .map(|name| (name.clone(), RuntimeEnvOrigin::ImageSnapshot))
+            .collect::<BTreeMap<_, _>>();
+        Ok(Self {
+            values: Arc::new(values),
+            origins: Arc::new(origins),
+        })
     }
 
     /// Resolves Runtime ENV with the contract:
@@ -137,6 +159,45 @@ impl RuntimeEnv {
             values: Arc::new(values),
             origins: Arc::new(origins),
         })
+    }
+
+    pub(crate) fn call_rel(
+        &self,
+        function: &str,
+        args: &[Value],
+    ) -> Result<Value, RuntimeEnvError> {
+        let name = match args {
+            [Value::String(name)] => name.as_str(),
+            _ => {
+                return Err(RuntimeEnvError::InvalidCall(format!(
+                    "ENV.{function}() requires exactly one string key"
+                )))
+            }
+        };
+        match function {
+            "has" => Ok(Value::Bool(self.has(name))),
+            "get" => Ok(self.get(name).map(json_to_rel).unwrap_or(Value::Null)),
+            "require" => self.require(name).map(json_to_rel),
+            "string" => self
+                .string(name)
+                .map(|value| Value::String(value.to_string())),
+            "number" => self.number(name).map(Value::Number),
+            "bool" => self.bool(name).map(Value::Bool),
+            "object" => self.object(name).map(|value| {
+                Value::Object(
+                    value
+                        .iter()
+                        .map(|(key, value)| (key.clone(), json_to_rel(value)))
+                        .collect(),
+                )
+            }),
+            "array" => self
+                .array(name)
+                .map(|value| Value::Array(value.iter().map(json_to_rel).collect())),
+            other => Err(RuntimeEnvError::InvalidCall(format!(
+                "ENV.{other}() does not exist"
+            ))),
+        }
     }
 
     pub fn can_read(kind: RelSourceKind) -> bool {
@@ -212,6 +273,22 @@ impl RuntimeEnv {
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
         )
+    }
+}
+
+fn json_to_rel(value: &JsonValue) -> Value {
+    match value {
+        JsonValue::Null => Value::Null,
+        JsonValue::Bool(value) => Value::Bool(*value),
+        JsonValue::Number(value) => Value::Number(value.as_f64().unwrap_or(0.0)),
+        JsonValue::String(value) => Value::String(value.clone()),
+        JsonValue::Array(values) => Value::Array(values.iter().map(json_to_rel).collect()),
+        JsonValue::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), json_to_rel(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -302,6 +379,51 @@ mod tests {
         assert!(env.bool("LOCKED").unwrap());
         assert_eq!(env.origin("LOCKED"), Some(RuntimeEnvOrigin::ForcedServer));
         assert_eq!(env.origin("APP_NAME"), Some(RuntimeEnvOrigin::Settings));
+    }
+
+    #[test]
+    fn rel_call_surface_preserves_json_types() {
+        let server = compile_server_source("server Main {}").unwrap();
+        let settings = BTreeMap::from([
+            ("NAME".to_string(), JsonValue::String("rbe".into())),
+            ("COUNT".to_string(), JsonValue::from(7)),
+            ("FLAGS".to_string(), serde_json::json!([true, false])),
+        ]);
+        let env = RuntimeEnv::resolve(&BTreeMap::new(), &server, &settings).unwrap();
+        assert!(matches!(
+            env.call_rel("string", &[Value::String("NAME".into())]).unwrap(),
+            Value::String(value) if value == "rbe"
+        ));
+        assert!(matches!(
+            env.call_rel("number", &[Value::String("COUNT".into())]).unwrap(),
+            Value::Number(value) if value == 7.0
+        ));
+        assert!(matches!(
+            env.call_rel("array", &[Value::String("FLAGS".into())]).unwrap(),
+            Value::Array(values) if values.len() == 2
+        ));
+        assert!(matches!(
+            env.call_rel("get", &[Value::String("MISSING".into())])
+                .unwrap(),
+            Value::Null
+        ));
+        assert!(env
+            .call_rel("require", &[Value::String("MISSING".into())])
+            .is_err());
+    }
+
+    #[test]
+    fn image_snapshot_round_trip_keeps_runtime_env_types() {
+        let env = RuntimeEnv::from_snapshot(serde_json::json!({
+            "NAME": "rbe",
+            "COUNT": 7,
+            "FLAGS": [true, false]
+        }))
+        .unwrap();
+        assert_eq!(env.string("NAME").unwrap(), "rbe");
+        assert_eq!(env.number("COUNT").unwrap(), 7.0);
+        assert_eq!(env.array("FLAGS").unwrap().len(), 2);
+        assert_eq!(env.origin("NAME"), Some(RuntimeEnvOrigin::ImageSnapshot));
     }
 
     #[test]
