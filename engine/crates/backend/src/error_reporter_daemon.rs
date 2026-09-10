@@ -217,6 +217,7 @@ struct StatusReport {
     processed_count: u64,
     duplicate_count: u64,
     dropped_count: u64,
+    recovery_decision_count: u64,
     last_error_message: Option<String>,
 }
 
@@ -289,6 +290,7 @@ pub async fn run(
     let mut processed_count = 0u64;
     let mut duplicate_count = 0u64;
     let mut dropped_count = 0u64;
+    let mut recovery_decision_count = 0u64;
     let mut last_error_message: Option<String> = None;
 
     tracing::info!(
@@ -339,15 +341,21 @@ pub async fn run(
             }
             _ = recovery_interval.tick(), if recovery_key.is_some() => {
                 if let Some(key) = recovery_key.as_ref() {
-                    if let Err(error) = crate::er_recovery::process_pending_requests(
+                    match crate::er_recovery::process_pending_requests(
                         &io,
                         &admin_dir,
                         key,
                         signing_key,
                     ) {
-                        last_error_message = Some(format!(
-                            "CONTROL ER recovery queue failed: {error}"
-                        ));
+                        Ok(processed) => {
+                            recovery_decision_count = recovery_decision_count
+                                .saturating_add(processed as u64);
+                        }
+                        Err(error) => {
+                            last_error_message = Some(format!(
+                                "CONTROL ER recovery queue failed: {error}"
+                            ));
+                        }
                     }
                 }
             }
@@ -366,6 +374,7 @@ pub async fn run(
                     processed_count,
                     duplicate_count,
                     dropped_count,
+                    recovery_decision_count,
                     last_error_message: last_error_message.clone(),
                 });
             }
@@ -393,6 +402,7 @@ pub async fn run(
             processed_count,
             duplicate_count,
             dropped_count,
+            recovery_decision_count,
             last_error_message,
         },
     );

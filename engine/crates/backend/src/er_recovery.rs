@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +14,7 @@ use crate::host_bootstrap::ErControlKey;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const PROTOCOL_VERSION: u8 = 1;
+const PROTOCOL_VERSION: u8 = 2;
 const REQUEST_MAX_BYTES: usize = 64 * 1024;
 const RESPONSE_MAX_BYTES: usize = 16 * 1024;
 const REQUEST_TTL: Duration = Duration::from_secs(5);
@@ -46,6 +47,66 @@ impl RecoveryBootstrapFrame {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessExitReport {
+    pub component: String,
+    pub process_image: String,
+    pub pid: u32,
+    pub exit_success: bool,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub previous_restart_attempts: u32,
+    pub uptime_ms: u64,
+    pub expected: bool,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_error: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub context: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+enum RecoverySubject {
+    Service(ServiceExitReport),
+    CriticalProcess(ProcessExitReport),
+}
+
+fn validate_process_report(report: &ProcessExitReport) -> anyhow::Result<()> {
+    fn safe(label: &str, value: &str, max: usize) -> anyhow::Result<()> {
+        if value.is_empty()
+            || value.len() > max
+            || value
+                .chars()
+                .any(|character| character.is_control() || character == '\0')
+        {
+            anyhow::bail!("CONTROL ER {label} is invalid or exceeds {max} bytes");
+        }
+        Ok(())
+    }
+
+    safe("component", &report.component, 80)?;
+    safe("process image", &report.process_image, 80)?;
+    safe("phase", &report.phase, 96)?;
+    if let Some(operation) = report.last_operation.as_deref() {
+        safe("last operation", operation, 128)?;
+    }
+    if let Some(error) = report.observation_error.as_deref() {
+        safe("observation error", error, 1024)?;
+    }
+    if report.context.len() > 16 {
+        anyhow::bail!("CONTROL ER process context exceeded 16 fields");
+    }
+    for (name, value) in &report.context {
+        safe("context key", name, 64)?;
+        safe("context value", value, 256)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ErRecoveryClient {
     root: PathBuf,
@@ -60,10 +121,13 @@ impl ErRecoveryClient {
         }
     }
 
-    async fn decide_inner(
+    async fn decide_subject(
         &self,
-        report: ServiceExitReport,
+        report: RecoverySubject,
     ) -> anyhow::Result<ServiceRestartDirective> {
+        if let RecoverySubject::CriticalProcess(process) = &report {
+            validate_process_report(process)?;
+        }
         ensure_layout(&self.root)?;
         let request_id = random_request_id();
         let created_at_ms = now_unix_ms();
@@ -115,11 +179,19 @@ impl ErRecoveryClient {
             tokio::time::sleep(CLIENT_POLL).await;
         }
     }
+
+    pub async fn decide_process(
+        &self,
+        report: ProcessExitReport,
+    ) -> anyhow::Result<ServiceRestartDirective> {
+        self.decide_subject(RecoverySubject::CriticalProcess(report))
+            .await
+    }
 }
 
 impl ServiceRestartAuthority for ErRecoveryClient {
     fn decide<'a>(&'a self, report: ServiceExitReport) -> ServiceRestartAuthorityFuture<'a> {
-        Box::pin(async move { self.decide_inner(report).await })
+        Box::pin(async move { self.decide_subject(RecoverySubject::Service(report)).await })
     }
 }
 
@@ -128,7 +200,7 @@ struct SignedRecoveryRequest {
     version: u8,
     request_id: String,
     created_at_ms: u64,
-    report: ServiceExitReport,
+    report: RecoverySubject,
     mac: String,
 }
 
@@ -137,7 +209,7 @@ struct RequestMacPayload<'a> {
     version: u8,
     request_id: &'a str,
     created_at_ms: u64,
-    report: &'a ServiceExitReport,
+    report: &'a RecoverySubject,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -205,6 +277,12 @@ pub fn process_pending_requests(
             let _ = std::fs::remove_file(&path);
             continue;
         }
+        if let RecoverySubject::CriticalProcess(report) = &request.report {
+            if validate_process_report(report).is_err() {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        }
 
         let directive = compute_directive(&request.report);
         let why = explain_exit(&request.report);
@@ -245,8 +323,20 @@ pub fn process_pending_requests(
     Ok(processed)
 }
 
-fn compute_directive(report: &ServiceExitReport) -> ServiceRestartDirective {
-    let why = explain_exit(report);
+fn compute_directive(report: &RecoverySubject) -> ServiceRestartDirective {
+    match report {
+        RecoverySubject::Service(report) => compute_service_directive(report),
+        RecoverySubject::CriticalProcess(report) => compute_process_directive(report),
+    }
+}
+
+fn compute_service_directive(report: &ServiceExitReport) -> ServiceRestartDirective {
+    let why = explain_status(
+        report.exit_success,
+        report.exit_code,
+        report.exit_signal,
+        None,
+    );
     if report.expected {
         return ServiceRestartDirective::Stop {
             reason: format!("planned exit: {why}"),
@@ -273,29 +363,106 @@ fn compute_directive(report: &ServiceExitReport) -> ServiceRestartDirective {
     }
 }
 
-fn explain_exit(report: &ServiceExitReport) -> String {
-    if let Some(signal) = report.exit_signal {
+fn compute_process_directive(report: &ProcessExitReport) -> ServiceRestartDirective {
+    let why = explain_status(
+        report.exit_success,
+        report.exit_code,
+        report.exit_signal,
+        report.observation_error.as_deref(),
+    );
+    if report.expected {
+        return ServiceRestartDirective::Stop {
+            reason: format!("planned {} exit: {why}", report.component),
+        };
+    }
+    let crash_loop_floor = if report.previous_restart_attempts >= 6 {
+        5_000
+    } else {
+        0
+    };
+    ServiceRestartDirective::Restart {
+        minimum_backoff_ms: crash_loop_floor,
+        reason: format!(
+            "CONTROL ER authorized critical-process recovery for {}: {why}",
+            report.component
+        ),
+    }
+}
+
+fn explain_status(
+    exit_success: bool,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    observation_error: Option<&str>,
+) -> String {
+    if let Some(error) = observation_error {
+        return format!("supervisor could not observe a normal exit status: {error}");
+    }
+    if let Some(signal) = exit_signal {
         return format!("terminated by signal {signal}");
     }
-    if let Some(code) = report.exit_code {
+    if let Some(code) = exit_code {
         return format!("exited with code {code}");
     }
-    if report.exit_success {
+    if exit_success {
         "exited successfully".into()
     } else {
         "process exited without a portable code or signal".into()
     }
 }
 
-fn explain_activity(report: &ServiceExitReport) -> String {
-    let operation = report
-        .last_operation
-        .as_deref()
-        .unwrap_or("idle-or-unknown");
-    format!(
-        "phase={} operation={} active_calls={} uptime_ms={} idle_for_ms={}",
-        report.phase, operation, report.active_calls, report.uptime_ms, report.idle_for_ms
-    )
+fn explain_exit(report: &RecoverySubject) -> String {
+    match report {
+        RecoverySubject::Service(report) => explain_status(
+            report.exit_success,
+            report.exit_code,
+            report.exit_signal,
+            None,
+        ),
+        RecoverySubject::CriticalProcess(report) => explain_status(
+            report.exit_success,
+            report.exit_code,
+            report.exit_signal,
+            report.observation_error.as_deref(),
+        ),
+    }
+}
+
+fn operation_label(report: &RecoverySubject) -> &str {
+    match report {
+        RecoverySubject::Service(report) => report
+            .last_operation
+            .as_deref()
+            .unwrap_or("idle-or-unknown"),
+        RecoverySubject::CriticalProcess(report) => report
+            .last_operation
+            .as_deref()
+            .unwrap_or("idle-or-unknown"),
+    }
+}
+
+fn explain_activity(report: &RecoverySubject) -> String {
+    match report {
+        RecoverySubject::Service(report) => format!(
+            "phase={} operation={} active_calls={} uptime_ms={} idle_for_ms={}",
+            report.phase,
+            operation_label(&RecoverySubject::Service(report.clone())),
+            report.active_calls,
+            report.uptime_ms,
+            report.idle_for_ms
+        ),
+        RecoverySubject::CriticalProcess(report) => format!(
+            "phase={} operation={} uptime_ms={} previous_restart_attempts={} context_fields={}",
+            report.phase,
+            report
+                .last_operation
+                .as_deref()
+                .unwrap_or("idle-or-unknown"),
+            report.uptime_ms,
+            report.previous_restart_attempts,
+            report.context.len()
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -304,7 +471,7 @@ struct DecisionLogPayload<'a> {
     why: &'a str,
     how: &'a str,
     what_was_doing: &'a str,
-    report: &'a ServiceExitReport,
+    report: &'a RecoverySubject,
     directive: &'a ServiceRestartDirective,
 }
 
@@ -323,16 +490,13 @@ struct DecisionLogSignature {
 fn append_decision_log(
     io: &atomic_io::AtomicIo,
     root: &Path,
-    report: &ServiceExitReport,
+    report: &RecoverySubject,
     directive: &ServiceRestartDirective,
     why: &str,
     how: &str,
     report_signing_key: &str,
 ) -> anyhow::Result<()> {
-    let what_was_doing = report
-        .last_operation
-        .as_deref()
-        .unwrap_or("idle-or-unknown");
+    let what_was_doing = operation_label(report);
     let payload = DecisionLogPayload {
         recorded_at_ms: now_unix_ms(),
         why,
@@ -383,7 +547,7 @@ fn request_mac(
     version: u8,
     request_id: &str,
     created_at_ms: u64,
-    report: &ServiceExitReport,
+    report: &RecoverySubject,
 ) -> anyhow::Result<String> {
     let payload = RequestMacPayload {
         version,
@@ -578,29 +742,58 @@ mod tests {
         }
     }
 
+    fn service_subject(restart: RestartPolicy, success: bool, attempts: u32) -> RecoverySubject {
+        RecoverySubject::Service(report(restart, success, attempts))
+    }
+
     #[test]
     fn decision_respects_service_restart_policy() {
         assert!(matches!(
-            compute_directive(&report(RestartPolicy::Never, false, 0)),
+            compute_directive(&service_subject(RestartPolicy::Never, false, 0)),
             ServiceRestartDirective::Stop { .. }
         ));
         assert!(matches!(
-            compute_directive(&report(RestartPolicy::OnFailure, true, 0)),
+            compute_directive(&service_subject(RestartPolicy::OnFailure, true, 0)),
             ServiceRestartDirective::Stop { .. }
         ));
         assert!(matches!(
-            compute_directive(&report(RestartPolicy::OnFailure, false, 0)),
+            compute_directive(&service_subject(RestartPolicy::OnFailure, false, 0)),
             ServiceRestartDirective::Restart { .. }
         ));
     }
 
     #[test]
     fn crash_loop_gets_a_control_backoff_floor() {
-        match compute_directive(&report(RestartPolicy::Always, false, 6)) {
+        match compute_directive(&service_subject(RestartPolicy::Always, false, 6)) {
             ServiceRestartDirective::Restart {
                 minimum_backoff_ms, ..
             } => assert!(minimum_backoff_ms >= 5_000),
             other => panic!("expected restart directive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unexpected_critical_process_exit_is_always_recoverable() {
+        let process = ProcessExitReport {
+            component: "service-mother".into(),
+            process_image: "service".into(),
+            pid: 77,
+            exit_success: true,
+            exit_code: Some(0),
+            exit_signal: None,
+            previous_restart_attempts: 6,
+            uptime_ms: 500,
+            expected: false,
+            phase: "runtime-supervision".into(),
+            last_operation: Some("serve-fabric-and-supervise-services".into()),
+            observation_error: None,
+            context: BTreeMap::new(),
+        };
+        match compute_directive(&RecoverySubject::CriticalProcess(process)) {
+            ServiceRestartDirective::Restart {
+                minimum_backoff_ms, ..
+            } => assert!(minimum_backoff_ms >= 5_000),
+            other => panic!("expected critical-process restart directive, got {other:?}"),
         }
     }
 }

@@ -239,3 +239,30 @@ cannot shorten the manager's exponential backoff or exceed its configured cap.
 This path can only decide recovery for the service that exited; it cannot turn
 one service crash into a whole-RBE restart. Explicit operator restarts and
 planned shutdowns stay outside the unexpected-crash decision path.
+
+### CONTROL ER critical-process supervision
+
+CONTROL ER recovery protocol v2 also accepts a bounded `ProcessExitReport` for
+critical runtime supervisors. Service Mother is the first critical process wired
+to this path. On an unexpected Mother exit the backend records the stable process
+identity, PID, portable exit code or Unix signal, supervisor observation error
+when one exists, uptime, previous replacement attempts, runtime phase, a fixed
+non-sensitive activity label, the service-catalog fingerprint, Runtime ENV key
+count, and supervision scope. Runtime ENV values, service call arguments,
+credentials, request bodies, database rows, and arbitrary child memory are not
+included.
+
+The report is authenticated with the same per-backend-generation CONTROL key as
+`.service` recovery requests. ER records `why`, `how`, `what_was_doing`, the full
+bounded metadata report, and its signed Restart/Stop/Default decision in
+`er-process-decisions.log`; `error-reporter-status.json` exposes a cumulative
+`recoveryDecisionCount` for the current ER process generation.
+
+Service Mother remains a critical root. An unexpected Mother exit is locally
+restartable even if it returned exit code 0. CONTROL ER may raise the minimum
+replacement backoff (for example during a crash loop), but its delay is capped by
+the backend's Mother maximum. Missing/BASIC/dead/timed-out ER falls back to the
+local Mother supervisor. A `Stop` response for an unexpected critical Mother is
+treated as unsafe and ignored, so an ER bug cannot permanently remove the
+`.service` tree. Planned backend shutdown bypasses this crash-decision path.
+

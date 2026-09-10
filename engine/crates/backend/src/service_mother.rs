@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ pub struct ServiceMotherProcess {
     manager: ServiceManager,
     child: Child,
     _liveness: ChildStdin,
+    pid: u32,
     started_at: Instant,
 }
 
@@ -518,6 +520,7 @@ async fn spawn_process(
         manager,
         child,
         _liveness: liveness,
+        pid: ready.pid,
         started_at: Instant::now(),
     })
 }
@@ -578,7 +581,7 @@ async fn supervise(
 ) {
     let mut restart_attempts = 0u32;
     loop {
-        tokio::select! {
+        let (authority_minimum_backoff, authority_reason) = tokio::select! {
             shutdown = &mut *shutdown_rx => {
                 let timeout = shutdown.unwrap_or(Duration::from_secs(5));
                 process.shutdown(timeout).await;
@@ -586,23 +589,48 @@ async fn supervise(
             }
             status = process.child.wait() => {
                 let uptime = process.started_at.elapsed();
+                let pid = process.pid;
                 manager.invalidate_remote().await;
-                match status {
-                    Ok(status) => tracing::warn!(%status, uptime_ms = uptime.as_millis(), "Service Mother exited; supervising replacement"),
-                    Err(error) => tracing::warn!(error = %error, uptime_ms = uptime.as_millis(), "failed watching Service Mother; supervising replacement"),
+                match &status {
+                    Ok(status) => tracing::warn!(
+                        %status,
+                        pid,
+                        uptime_ms = uptime.as_millis(),
+                        "Service Mother exited; supervising replacement"
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        pid,
+                        uptime_ms = uptime.as_millis(),
+                        "failed watching Service Mother; supervising replacement"
+                    ),
                 }
+
+                let report = service_mother_exit_report(
+                    pid,
+                    &status,
+                    uptime,
+                    restart_attempts,
+                    &expected_catalog_fingerprint,
+                    runtime_env.as_ref(),
+                );
+                let decision = decide_mother_recovery(er_control_key.as_ref(), report).await;
                 if uptime >= MOTHER_STABLE_WINDOW {
                     restart_attempts = 0;
                 }
+                decision
             }
-        }
+        };
 
         loop {
             restart_attempts = restart_attempts.saturating_add(1);
-            let delay = mother_restart_delay(restart_attempts);
+            let delay = mother_recovery_backoff(restart_attempts, authority_minimum_backoff);
             tracing::warn!(
                 attempt = restart_attempts,
                 backoff_ms = delay.as_millis(),
+                authority_reason = authority_reason
+                    .as_deref()
+                    .unwrap_or("local critical-process policy"),
                 "scheduling Service Mother replacement"
             );
             tokio::select! {
@@ -625,6 +653,9 @@ async fn supervise(
                 Ok(replacement) => {
                     tracing::info!(
                         attempt = restart_attempts,
+                        authority_reason = authority_reason
+                            .as_deref()
+                            .unwrap_or("local critical-process policy"),
                         "Service Mother replacement ready; shared service endpoint retargeted"
                     );
                     process = replacement;
@@ -633,11 +664,148 @@ async fn supervise(
                 Err(error) => tracing::error!(
                     attempt = restart_attempts,
                     error = %error,
+                    authority_reason = authority_reason.as_deref().unwrap_or("local critical-process policy"),
                     "Service Mother replacement failed"
                 ),
             }
         }
     }
+}
+
+fn service_mother_exit_report(
+    pid: u32,
+    status: &std::io::Result<ExitStatus>,
+    uptime: Duration,
+    previous_restart_attempts: u32,
+    expected_catalog_fingerprint: &str,
+    runtime_env: &serde_json::Value,
+) -> crate::er_recovery::ProcessExitReport {
+    let (exit_success, exit_code, exit_signal, observation_error) = match status {
+        Ok(status) => (
+            status.success(),
+            status.code(),
+            process_exit_signal(status),
+            None,
+        ),
+        Err(error) => (
+            false,
+            None,
+            None,
+            Some(bounded_diagnostic(&error.to_string(), 1024)),
+        ),
+    };
+    let mut context = BTreeMap::new();
+    context.insert(
+        "catalog_fingerprint".into(),
+        expected_catalog_fingerprint.to_string(),
+    );
+    context.insert(
+        "runtime_env_key_count".into(),
+        runtime_env
+            .as_object()
+            .map(|fields| fields.len())
+            .unwrap_or(0)
+            .to_string(),
+    );
+    context.insert("supervision_scope".into(), "service-tree-root".into());
+
+    crate::er_recovery::ProcessExitReport {
+        component: "service-mother".into(),
+        process_image: service_executable_name().into(),
+        pid,
+        exit_success,
+        exit_code,
+        exit_signal,
+        previous_restart_attempts,
+        uptime_ms: uptime.as_millis().min(u128::from(u64::MAX)) as u64,
+        expected: false,
+        phase: "runtime-supervision".into(),
+        last_operation: Some("serve-fabric-and-supervise-services".into()),
+        observation_error,
+        context,
+    }
+}
+
+async fn decide_mother_recovery(
+    key: Option<&crate::host_bootstrap::ErControlKey>,
+    report: crate::er_recovery::ProcessExitReport,
+) -> (Duration, Option<String>) {
+    let Some(key) = key else {
+        return (Duration::ZERO, None);
+    };
+    let client = crate::er_recovery::ErRecoveryClient::new(key.clone());
+    match tokio::time::timeout(Duration::from_millis(700), client.decide_process(report)).await {
+        Ok(Ok(service_runtime::ServiceRestartDirective::Restart {
+            minimum_backoff_ms,
+            reason,
+        })) => (
+            Duration::from_millis(minimum_backoff_ms).min(MOTHER_RESTART_MAX_DELAY),
+            Some(reason),
+        ),
+        Ok(Ok(service_runtime::ServiceRestartDirective::Default)) => (Duration::ZERO, None),
+        Ok(Ok(service_runtime::ServiceRestartDirective::Stop { reason })) => {
+            tracing::error!(
+                authority_reason = %reason,
+                "CONTROL ER requested Stop for unexpected critical Service Mother exit; ignoring unsafe stop directive"
+            );
+            (
+                Duration::ZERO,
+                Some(format!("unsafe CONTROL ER stop ignored: {reason}")),
+            )
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                "CONTROL ER Service Mother decision failed; using local critical-process policy"
+            );
+            (Duration::ZERO, None)
+        }
+        Err(_) => {
+            tracing::warn!(
+                "CONTROL ER Service Mother decision timed out; using local critical-process policy"
+            );
+            (Duration::ZERO, None)
+        }
+    }
+}
+
+fn mother_recovery_backoff(attempt: u32, authority_minimum: Duration) -> Duration {
+    mother_restart_delay(attempt)
+        .max(authority_minimum)
+        .min(MOTHER_RESTART_MAX_DELAY)
+}
+
+fn bounded_diagnostic(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value
+            .chars()
+            .filter(|character| !character.is_control() && *character != '\0')
+            .collect();
+    }
+    value
+        .chars()
+        .filter(|character| !character.is_control() && *character != '\0')
+        .scan(0usize, |used, character| {
+            let next = used.saturating_add(character.len_utf8());
+            if next > max_bytes {
+                None
+            } else {
+                *used = next;
+                Some(character)
+            }
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn process_exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn process_exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
 }
 
 fn mother_restart_delay(attempt: u32) -> Duration {
@@ -813,5 +981,21 @@ mod tests {
         assert_eq!(mother_restart_delay(2), Duration::from_millis(500));
         assert_eq!(mother_restart_delay(3), Duration::from_millis(1000));
         assert_eq!(mother_restart_delay(30), MOTHER_RESTART_MAX_DELAY);
+    }
+
+    #[test]
+    fn control_er_floor_can_only_delay_mother_recovery() {
+        assert_eq!(
+            mother_recovery_backoff(1, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            mother_recovery_backoff(6, Duration::from_millis(1)),
+            mother_restart_delay(6)
+        );
+        assert_eq!(
+            mother_recovery_backoff(1, Duration::from_secs(300)),
+            MOTHER_RESTART_MAX_DELAY
+        );
     }
 }
