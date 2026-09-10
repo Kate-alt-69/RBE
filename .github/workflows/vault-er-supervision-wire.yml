@@ -1,0 +1,77 @@
+name: CONTROL ER Vault Supervision
+
+on:
+  push:
+    paths:
+      - '.github/patches/vault-er-supervision-wire.py'
+      - '.github/workflows/vault-er-supervision-wire.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: er-vault-supervision-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Apply CONTROL ER Vault supervision
+        run: python .github/patches/vault-er-supervision-wire.py
+      - name: Format
+        run: |
+          cargo fmt --manifest-path engine/Cargo.toml --all
+          cargo fmt --manifest-path vault-process/Cargo.toml
+      - name: Check locked workspaces
+        run: |
+          cargo check --manifest-path engine/Cargo.toml --workspace --locked
+          cargo check --manifest-path vault-process/Cargo.toml --locked
+      - name: Test Vault supervision slices
+        run: |
+          cargo test --manifest-path vault-process/Cargo.toml --locked
+          cargo test --manifest-path engine/Cargo.toml -p backend --locked
+      - name: Clippy Vault supervision slices
+        run: |
+          cargo clippy --manifest-path vault-process/Cargo.toml --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path engine/Cargo.toml -p backend --all-targets --locked -- -D warnings
+      - name: Regenerate if main moved
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          latest="$(git rev-parse origin/main)"
+          if [[ "$latest" != "$GITHUB_SHA" ]]; then
+            echo "main moved to $latest; regenerating against latest source"
+            git reset --hard "$latest"
+            python .github/patches/vault-er-supervision-wire.py
+            cargo fmt --manifest-path engine/Cargo.toml --all
+            cargo fmt --manifest-path vault-process/Cargo.toml
+            cargo check --manifest-path engine/Cargo.toml --workspace --locked
+            cargo check --manifest-path vault-process/Cargo.toml --locked
+            cargo test --manifest-path vault-process/Cargo.toml --locked
+            cargo test --manifest-path engine/Cargo.toml -p backend --locked
+            cargo clippy --manifest-path vault-process/Cargo.toml --all-targets --locked -- -D warnings
+            cargo clippy --manifest-path engine/Cargo.toml -p backend --all-targets --locked -- -D warnings
+          fi
+      - name: Commit verified Vault supervision
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/patches/vault-er-supervision-wire.py
+          rm -f .github/workflows/vault-er-supervision-wire.yml
+          git add -A
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'FIX | BUG-ER-004 supervise Vault crashes through CONTROL ER'
+          git push origin HEAD:main
