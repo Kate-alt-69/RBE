@@ -24,7 +24,10 @@ pub(crate) const SERVICE_IPC_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const PARENT_BOOTSTRAP_JSON_MAX_BYTES: usize = 1024 * 1024;
 const SERVICE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SERVICE_ACCEPT_FAILURE_LIMIT: u32 = 8;
-pub use manager::{ServiceCallError, ServiceManager, ServiceRuntimeState, ServiceSnapshot};
+pub use manager::{
+    ServiceCallError, ServiceExitReport, ServiceManager, ServiceRestartAuthority,
+    ServiceRestartAuthorityFuture, ServiceRestartDirective, ServiceRuntimeState, ServiceSnapshot,
+};
 pub use mother::{
     new_service_mother_token, run_service_mother, ServiceMotherReady, ServiceMotherServer,
 };

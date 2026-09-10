@@ -1,4 +1,5 @@
 use std::process::Stdio;
+use std::sync::Arc;
 
 use rand::RngCore;
 use tokio::io::AsyncWriteExt;
@@ -11,6 +12,48 @@ pub struct HostBootstrapReady {
 impl HostBootstrapReady {
     pub fn er_control_enabled(self) -> bool {
         self.secure_credentials
+    }
+
+    pub fn issue_er_control_key(self) -> Option<ErControlKey> {
+        self.er_control_enabled().then(ErControlKey::random)
+    }
+}
+
+struct ErControlKeyMaterial([u8; 32]);
+
+impl Drop for ErControlKeyMaterial {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+#[derive(Clone)]
+pub struct ErControlKey(Arc<ErControlKeyMaterial>);
+
+impl ErControlKey {
+    fn random() -> Self {
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        Self(Arc::new(ErControlKeyMaterial(bytes)))
+    }
+
+    pub(crate) fn from_inherited_hex(value: &str) -> anyhow::Result<Self> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("ER CONTROL key must be a 32-byte hexadecimal value");
+        }
+        let decoded = hex::decode(value)?;
+        let bytes: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("ER CONTROL key decoded to the wrong length"))?;
+        Ok(Self(Arc::new(ErControlKeyMaterial(bytes))))
+    }
+
+    pub(crate) fn to_hex(&self) -> String {
+        hex::encode(self.as_bytes())
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0.as_ref().0
     }
 }
 
@@ -123,7 +166,10 @@ fn bounded_debug(value: &str) -> String {
     if value.len() <= MAX {
         return value.to_string();
     }
-    let start = value.len().saturating_sub(MAX);
+    let mut start = value.len().saturating_sub(MAX);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
     format!("[...truncated...]\n{}", &value[start..])
 }
 

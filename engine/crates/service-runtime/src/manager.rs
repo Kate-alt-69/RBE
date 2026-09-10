@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::pin::Pin;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,6 +48,26 @@ enum ServiceOperation {
 }
 
 impl ServiceOperation {
+    fn diagnostic_label(&self) -> String {
+        match self {
+            Self::Call { function, .. } => {
+                let function = function
+                    .chars()
+                    .filter(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+                    })
+                    .take(96)
+                    .collect::<String>();
+                if function.is_empty() {
+                    "call".into()
+                } else {
+                    format!("call:{function}")
+                }
+            }
+            Self::Event { .. } => "event".into(),
+        }
+    }
+
     fn into_request(self, token: String) -> ServiceRequest {
         match self {
             Self::Call { function, args } => ServiceRequest::Call {
@@ -66,6 +88,7 @@ struct Managed {
     restarting: bool,
     active_calls: Arc<AtomicU32>,
     last_activity: Instant,
+    last_operation: Option<String>,
 }
 
 impl Managed {
@@ -78,6 +101,7 @@ impl Managed {
             restarting: false,
             active_calls: Arc::new(AtomicU32::new(0)),
             last_activity: Instant::now(),
+            last_operation: None,
         }
     }
 
@@ -114,6 +138,48 @@ impl Drop for ActiveCallGuard {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceExitReport {
+    pub service: String,
+    pub title: String,
+    pub service_file: String,
+    pub pid: u32,
+    pub exit_success: bool,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub restart: RestartPolicy,
+    pub mode: ServiceMode,
+    pub previous_restart_attempts: u32,
+    pub uptime_ms: u64,
+    pub active_calls: u32,
+    pub idle_for_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_operation: Option<String>,
+    pub expected: bool,
+    pub phase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum ServiceRestartDirective {
+    Default,
+    Restart {
+        minimum_backoff_ms: u64,
+        reason: String,
+    },
+    Stop {
+        reason: String,
+    },
+}
+
+pub type ServiceRestartAuthorityFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<ServiceRestartDirective>> + Send + 'a>>;
+
+pub trait ServiceRestartAuthority: Send + Sync {
+    fn decide<'a>(&'a self, report: ServiceExitReport) -> ServiceRestartAuthorityFuture<'a>;
+}
+
 #[derive(Clone, Default)]
 pub struct ServiceManager {
     services: Arc<AsyncRwLock<HashMap<String, Arc<Mutex<Managed>>>>>,
@@ -121,6 +187,7 @@ pub struct ServiceManager {
     mother: Option<ServiceMotherClient>,
     fabric: Option<ServiceFabricEndpoint>,
     runtime_env: Option<Arc<Value>>,
+    restart_authority: Option<Arc<dyn ServiceRestartAuthority>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +273,7 @@ impl ServiceManager {
     }
 
     pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
-        let manager = Self::prepare_all(catalog, None, None).await;
+        let manager = Self::prepare_all(catalog, None, None, None).await;
         manager.start_prepared(catalog).await?;
         Ok(manager)
     }
@@ -215,7 +282,7 @@ impl ServiceManager {
         catalog: &ServiceCatalog,
         fabric: ServiceFabricEndpoint,
     ) -> Self {
-        Self::prepare_all(catalog, Some(fabric), None).await
+        Self::prepare_all(catalog, Some(fabric), None, None).await
     }
 
     pub async fn prepare_all_with_fabric_and_runtime_env(
@@ -223,17 +290,28 @@ impl ServiceManager {
         fabric: ServiceFabricEndpoint,
         runtime_env: Arc<Value>,
     ) -> Self {
-        Self::prepare_all(catalog, Some(fabric), Some(runtime_env)).await
+        Self::prepare_all(catalog, Some(fabric), Some(runtime_env), None).await
+    }
+
+    pub async fn prepare_all_with_fabric_runtime_env_and_restart_authority(
+        catalog: &ServiceCatalog,
+        fabric: ServiceFabricEndpoint,
+        runtime_env: Arc<Value>,
+        restart_authority: Option<Arc<dyn ServiceRestartAuthority>>,
+    ) -> Self {
+        Self::prepare_all(catalog, Some(fabric), Some(runtime_env), restart_authority).await
     }
 
     async fn prepare_all(
         catalog: &ServiceCatalog,
         fabric: Option<ServiceFabricEndpoint>,
         runtime_env: Option<Arc<Value>>,
+        restart_authority: Option<Arc<dyn ServiceRestartAuthority>>,
     ) -> Self {
         let manager = Self {
             fabric,
             runtime_env,
+            restart_authority,
             ..Self::default()
         };
         let mut services = manager.services.write().await;
@@ -374,7 +452,49 @@ impl ServiceManager {
                 continue;
             }
 
-            if !should_restart(service.file.restart, status.success()) {
+            let local_restart = should_restart(service.file.restart, status.success());
+            let mut authority_minimum_backoff = Duration::ZERO;
+            let mut authority_reason: Option<String> = None;
+            let restart = if let Some(authority) = self.restart_authority.as_ref() {
+                let report = build_service_exit_report(&service, &status, old_pid);
+                match tokio::time::timeout(Duration::from_millis(700), authority.decide(report))
+                    .await
+                {
+                    Ok(Ok(ServiceRestartDirective::Restart {
+                        minimum_backoff_ms,
+                        reason,
+                    })) => {
+                        authority_minimum_backoff =
+                            Duration::from_millis(minimum_backoff_ms).min(max_restart_backoff);
+                        authority_reason = Some(reason);
+                        true
+                    }
+                    Ok(Ok(ServiceRestartDirective::Stop { reason })) => {
+                        authority_reason = Some(reason);
+                        false
+                    }
+                    Ok(Ok(ServiceRestartDirective::Default)) => local_restart,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            service = %service.file.name,
+                            error = %error,
+                            "CONTROL ER restart decision failed; using local restart policy"
+                        );
+                        local_restart
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            service = %service.file.name,
+                            "CONTROL ER restart decision timed out; using local restart policy"
+                        );
+                        local_restart
+                    }
+                }
+            } else {
+                local_restart
+            };
+
+            if !restart {
                 service.exit_observed = true;
                 service.restarting = false;
                 tracing::warn!(
@@ -382,7 +502,8 @@ impl ServiceManager {
                     pid = old_pid,
                     %status,
                     restart = ?service.file.restart,
-                    "service process exited and restart policy leaves it stopped"
+                    authority_reason = authority_reason.as_deref().unwrap_or("local restart policy"),
+                    "service process exited and recovery policy leaves it stopped"
                 );
                 continue;
             }
@@ -395,7 +516,9 @@ impl ServiceManager {
             service.restart_attempts =
                 next_restart_attempt(service.restart_attempts, stable, service.restarting);
             let attempt = service.restart_attempts;
-            let delay = restart_delay(attempt, max_restart_backoff);
+            let delay = restart_delay(attempt, max_restart_backoff)
+                .max(authority_minimum_backoff)
+                .min(max_restart_backoff);
             let file = service.file.clone();
             service.restarting = true;
             tracing::warn!(
@@ -404,6 +527,7 @@ impl ServiceManager {
                 %status,
                 attempt,
                 backoff_ms = delay.as_millis() as u64,
+                authority_reason = authority_reason.as_deref().unwrap_or("local restart policy"),
                 "service process exited; scheduling restart"
             );
             drop(service);
@@ -675,6 +799,7 @@ impl ServiceManager {
                 service: service_name.to_string(),
             })?;
 
+        let operation_label = operation.diagnostic_label();
         let (address, token, active_call) = {
             let mut service = handle.lock().await;
             if self.shutting_down.load(Ordering::Acquire) {
@@ -693,6 +818,7 @@ impl ServiceManager {
             let address = process.ready.address;
             let token = process.token.clone();
             service.last_activity = Instant::now();
+            service.last_operation = Some(operation_label);
             let active_call = ActiveCallGuard::acquire(service.active_calls.clone());
             (address, token, active_call)
         };
@@ -985,6 +1111,61 @@ fn map_call_response(
             message,
         }),
     }
+}
+
+fn build_service_exit_report(
+    service: &Managed,
+    status: &ExitStatus,
+    pid: u32,
+) -> ServiceExitReport {
+    let uptime_ms = service
+        .process
+        .as_ref()
+        .map(|process| duration_ms_saturated(process.started_at.elapsed()))
+        .unwrap_or(0);
+    let service_file = service
+        .file
+        .path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{}.service", service.file.name));
+    ServiceExitReport {
+        service: service.file.name.clone(),
+        title: service.file.title.clone(),
+        service_file,
+        pid,
+        exit_success: status.success(),
+        exit_code: status.code(),
+        exit_signal: exit_signal(status),
+        restart: service.file.restart,
+        mode: service.file.mode,
+        previous_restart_attempts: service.restart_attempts,
+        uptime_ms,
+        active_calls: service.active_calls.load(Ordering::Acquire),
+        idle_for_ms: duration_ms_saturated(service.last_activity.elapsed()),
+        last_operation: service.last_operation.clone(),
+        expected: false,
+        phase: "runtime-monitor".into(),
+    }
+}
+
+fn duration_ms_saturated(duration: Duration) -> u64 {
+    duration
+        .as_millis()
+        .min(u128::from(u64::MAX))
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
 }
 
 fn should_restart(policy: RestartPolicy, success: bool) -> bool {
@@ -1452,6 +1633,24 @@ async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<Ser
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_operation_never_contains_call_arguments() {
+        let operation = ServiceOperation::Call {
+            function: "lookup_user".into(),
+            args: vec![serde_json::json!({"secret": "must-not-leak"})],
+        };
+        assert_eq!(operation.diagnostic_label(), "call:lookup_user");
+        assert!(!operation.diagnostic_label().contains("must-not-leak"));
+    }
+
+    #[test]
+    fn authority_backoff_is_never_allowed_to_shorten_local_backoff() {
+        let maximum = Duration::from_secs(30);
+        let local = restart_delay(6, maximum);
+        let authority = Duration::from_millis(1);
+        assert_eq!(local.max(authority).min(maximum), local);
+    }
+
     use super::*;
 
     #[tokio::test]

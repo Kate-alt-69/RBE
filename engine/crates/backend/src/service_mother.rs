@@ -122,6 +122,18 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
     } else {
         None
     };
+    let er_recovery_key = if args.iter().any(|arg| arg == "--er-recovery-frame") {
+        let value = service_runtime::read_parent_bootstrap_json_if_configured(
+            "Service Mother ER recovery",
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!("Service Mother ER recovery frame requires inherited bootstrap")
+        })?;
+        let frame: crate::er_recovery::RecoveryBootstrapFrame = serde_json::from_value(value)?;
+        Some(frame.into_key()?)
+    } else {
+        None
+    };
     if !args
         .iter()
         .any(|arg| arg == "--launch-separate" || arg == "--launch-saperate")
@@ -161,10 +173,15 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
     let ready = server.ready().clone();
     let manager = match catalog.as_ref() {
         Some(catalog) => {
-            ServiceManager::prepare_all_with_fabric_and_runtime_env(
+            let restart_authority = er_recovery_key.clone().map(|key| {
+                Arc::new(crate::er_recovery::ErRecoveryClient::new(key))
+                    as Arc<dyn service_runtime::ServiceRestartAuthority>
+            });
+            ServiceManager::prepare_all_with_fabric_runtime_env_and_restart_authority(
                 catalog,
                 server.fabric_endpoint(),
                 runtime_env.clone(),
+                restart_authority,
             )
             .await
         }
@@ -319,6 +336,7 @@ async fn spawn_process(
     settings_path: impl AsRef<Path>,
     expected_catalog_fingerprint: &str,
     runtime_env: &serde_json::Value,
+    er_control_key: Option<&crate::host_bootstrap::ErControlKey>,
     existing_manager: Option<&ServiceManager>,
 ) -> anyhow::Result<ServiceMotherProcess> {
     if expected_catalog_fingerprint.len() != 64
@@ -343,8 +361,11 @@ async fn spawn_process(
     let token = new_service_mother_token();
     let mut command = Command::new(&service_exe);
     harden_service_mother_environment(&mut command, &settings_path);
+    command.args(["--service-mother", "--launch-separate"]);
+    if er_control_key.is_some() {
+        command.arg("--er-recovery-frame");
+    }
     let mut child = match command
-        .args(["--service-mother", "--launch-separate"])
         .arg("--service-catalog-fingerprint")
         .arg(expected_catalog_fingerprint)
         .arg("--service-runtime-digest")
@@ -386,6 +407,19 @@ async fn spawn_process(
         return Err(anyhow::anyhow!(
             "send Service Mother Runtime ENV snapshot: {error}"
         ));
+    }
+    if let Some(er_control_key) = er_control_key {
+        let frame = serde_json::to_value(crate::er_recovery::RecoveryBootstrapFrame::from_key(
+            er_control_key,
+        ))?;
+        if let Err(error) =
+            service_runtime::write_parent_bootstrap_json(&mut liveness, &frame).await
+        {
+            cleanup_failed_spawn(&mut child).await;
+            return Err(anyhow::anyhow!(
+                "send Service Mother ER recovery capability: {error}"
+            ));
+        }
     }
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
@@ -492,6 +526,7 @@ pub async fn spawn(
     settings_path: impl AsRef<Path>,
     expected_catalog_fingerprint: &str,
     runtime_env: Arc<serde_json::Value>,
+    er_control_key: Option<crate::host_bootstrap::ErControlKey>,
 ) -> anyhow::Result<ServiceMotherSupervisor> {
     let settings_path = std::fs::canonicalize(settings_path.as_ref()).with_context(|| {
         format!(
@@ -504,6 +539,7 @@ pub async fn spawn(
         &settings_path,
         &expected_catalog_fingerprint,
         runtime_env.as_ref(),
+        er_control_key.as_ref(),
         None,
     )
     .await?;
@@ -518,6 +554,7 @@ pub async fn spawn(
             supervisor_settings,
             supervisor_fingerprint,
             runtime_env,
+            er_control_key,
             supervisor_manager,
             &mut shutdown_rx,
         )
@@ -535,6 +572,7 @@ async fn supervise(
     settings_path: PathBuf,
     expected_catalog_fingerprint: String,
     runtime_env: Arc<serde_json::Value>,
+    er_control_key: Option<crate::host_bootstrap::ErControlKey>,
     manager: ServiceManager,
     shutdown_rx: &mut tokio::sync::oneshot::Receiver<Duration>,
 ) {
@@ -579,6 +617,7 @@ async fn supervise(
                 &settings_path,
                 &expected_catalog_fingerprint,
                 runtime_env.as_ref(),
+                er_control_key.as_ref(),
                 Some(&manager),
             )
             .await

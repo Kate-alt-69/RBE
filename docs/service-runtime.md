@@ -211,3 +211,31 @@ process identity, and bounded stack/message metadata) for later recovery-policy
 decisions. Actual process execution remains owned by the relevant supervisor;
 CONTROL is authority to decide/authorize recovery, not permission to spawn an
 arbitrary executable.
+
+
+### CONTROL ER recovery decisions
+
+A verified HostBootstrap now issues one per-backend-generation ER CONTROL key in
+RAM. The backend sends that same capability independently to the Error Reporter
+and Service Mother through inherited one-shot bootstrap pipes. It never appears
+in a command line, environment variable, or key file. Refreshing the ER rotates
+its ephemeral report-signing key while retaining the backend-generation recovery
+capability, so Mother does not need to be restarted merely because ER refreshes.
+
+For an unexpected `.service` exit, Mother sends CONTROL ER a bounded,
+authenticated `ServiceExitReport` containing only process/runtime metadata:
+service identity, `.service` filename, PID, exit code or Unix signal, restart
+policy, mode, uptime, prior restart attempts, active-call count, idle duration,
+and a non-sensitive last-operation label such as `call:lookup_user`. Arguments,
+request bodies, event payloads, credentials, Runtime ENV values, and database
+rows are never included. CONTROL ER returns a service-local Restart/Stop/Default
+directive and records a signed detailed decision report including `why`, `how`,
+and `what_was_doing`.
+
+The Service Manager waits only a bounded time for CONTROL ER. Missing, BASIC,
+crashed, unauthenticated, stale, or timed-out ER responses fall back to the
+existing local `.service` restart policy. ER can request a longer delay but
+cannot shorten the manager's exponential backoff or exceed its configured cap.
+This path can only decide recovery for the service that exited; it cannot turn
+one service crash into a whole-RBE restart. Explicit operator restarts and
+planned shutdowns stay outside the unexpected-crash decision path.

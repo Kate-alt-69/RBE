@@ -13,6 +13,7 @@ use core_lib::{AppState, ContainerClient, MaintenanceMetrics};
 use supervisor::{BackendState, RestartPolicy, Supervisor};
 
 mod container_process;
+mod er_recovery;
 mod error_reporter_daemon;
 mod host_bootstrap;
 mod maintenance_notice;
@@ -227,7 +228,7 @@ async fn run_error_reporter_daemon(
 fn spawn_error_reporter_daemon_process(
     maintenance: Arc<MaintenanceMetrics>,
     refresh_interval: Duration,
-    control_enabled: bool,
+    control_key: Option<host_bootstrap::ErControlKey>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let exe = std::env::current_exe().map_err(|error| {
         anyhow::anyhow!("could not resolve current_exe to spawn the error-reporter daemon: {error}")
@@ -236,7 +237,9 @@ fn spawn_error_reporter_daemon_process(
         const RETRY_DELAY: Duration = Duration::from_secs(3);
         let mut consecutive_failures = 0u32;
         loop {
-            let frame = control_enabled.then(error_reporter_daemon::ParentBootstrapFrame::control);
+            let frame = control_key
+                .as_ref()
+                .map(error_reporter_daemon::ParentBootstrapFrame::control);
             let mut command = tokio::process::Command::new(&exe);
             command.args(["--er", "--separate-process", "--launch"]);
             if frame.is_some() {
@@ -291,7 +294,11 @@ fn spawn_error_reporter_daemon_process(
             consecutive_failures = 0;
             tracing::info!(
                 pid = child.id(),
-                authority = if control_enabled { "control" } else { "basic" },
+                authority = if control_key.is_some() {
+                    "control"
+                } else {
+                    "basic"
+                },
                 "error-reporter daemon process spawned"
             );
 
@@ -347,6 +354,7 @@ fn resolve_settings_path() -> String {
 }
 
 async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow::Result<()> {
+    let er_control_key = host_ready.issue_er_control_key();
     boot_trace("start");
     boot_trace(format!(
         "exe={}",
@@ -448,7 +456,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     let error_reporter_task = spawn_error_reporter_daemon_process(
         maintenance.clone(),
         refresh_interval,
-        host_ready.er_control_enabled(),
+        er_control_key.clone(),
     )?;
 
     boot_trace(format!(
@@ -514,6 +522,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
                 &settings_path,
                 &catalog.fingerprint(),
                 service_runtime_env.clone(),
+                er_control_key.clone(),
             )
             .await?,
         ),

@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use error_client::{IssueCategory, IssueLevel, QueueEntry};
+
+use crate::host_bootstrap::ErControlKey;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -56,12 +58,12 @@ pub struct ParentBootstrapFrame {
 }
 
 impl ParentBootstrapFrame {
-    pub fn control() -> Self {
+    pub fn control(control_key: &ErControlKey) -> Self {
         Self {
             version: 1,
             authority: ErAuthority::Control,
             signing_key_hex: random_key_hex(),
-            control_key_hex: Some(random_key_hex()),
+            control_key_hex: Some(control_key.to_hex()),
         }
     }
 }
@@ -110,8 +112,11 @@ impl ErBootstrap {
         self.authority
     }
 
-    pub fn control_key(&self) -> Option<&str> {
-        self.control_key.as_deref()
+    pub fn recovery_key(&self) -> anyhow::Result<Option<ErControlKey>> {
+        self.control_key
+            .as_deref()
+            .map(ErControlKey::from_inherited_hex)
+            .transpose()
     }
 }
 
@@ -260,7 +265,8 @@ pub async fn run(
     std::fs::create_dir_all(&admin_dir)?;
     let authority = bootstrap.authority();
     let restart_control = authority.can_control_restarts();
-    let com_key_in_memory = bootstrap.control_key().is_some();
+    let recovery_key = bootstrap.recovery_key()?;
+    let com_key_in_memory = recovery_key.is_some();
     let signing_key = bootstrap.signing_key.as_str();
 
     let queue_path = admin_dir.join(error_client::QUEUE_FILE_NAME);
@@ -299,6 +305,7 @@ pub async fn run(
 
     let mut poll_interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
     let mut status_interval = tokio::time::interval(STATUS_FLUSH_INTERVAL);
+    let mut recovery_interval = tokio::time::interval(Duration::from_millis(25));
 
     loop {
         tokio::select! {
@@ -327,6 +334,20 @@ pub async fn run(
                             dropped_count = dropped_count.saturating_add(1);
                             last_error_message = Some(format!("malformed queue entry: {error}"));
                         }
+                    }
+                }
+            }
+            _ = recovery_interval.tick(), if recovery_key.is_some() => {
+                if let Some(key) = recovery_key.as_ref() {
+                    if let Err(error) = crate::er_recovery::process_pending_requests(
+                        &io,
+                        &admin_dir,
+                        key,
+                        signing_key,
+                    ) {
+                        last_error_message = Some(format!(
+                            "CONTROL ER recovery queue failed: {error}"
+                        ));
                     }
                 }
             }
@@ -708,12 +729,13 @@ mod tests {
         let bootstrap = ErBootstrap::basic();
         assert_eq!(bootstrap.authority(), ErAuthority::Basic);
         assert!(!bootstrap.authority().can_control_restarts());
-        assert!(bootstrap.control_key().is_none());
+        assert!(bootstrap.recovery_key().unwrap().is_none());
     }
 
     #[test]
     fn control_frame_carries_only_memory_bootstrap_material() {
-        let frame = ParentBootstrapFrame::control();
+        let key = ErControlKey::from_inherited_hex(&random_key_hex()).unwrap();
+        let frame = ParentBootstrapFrame::control(&key);
         assert_eq!(frame.authority, ErAuthority::Control);
         assert!(frame
             .control_key_hex
