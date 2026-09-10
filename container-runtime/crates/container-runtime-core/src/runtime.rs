@@ -731,6 +731,12 @@ impl Runtime {
     pub fn has_environment(&self, id: EnvironmentId) -> bool {
         self.environment(id).is_some()
     }
+    pub fn environment_storage(
+        &self,
+        id: EnvironmentId,
+    ) -> Option<Arc<crate::storage::EnvironmentStorageManager>> {
+        self.environment(id).map(EnvironmentRuntime::storage)
+    }
     pub fn global_queue_len(&self) -> usize {
         self.global_queue
             .lock()

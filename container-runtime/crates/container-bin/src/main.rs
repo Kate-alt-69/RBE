@@ -18,12 +18,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use container_runtime_core::{
-    EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost,
+    CapabilityBroker, EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost,
 };
 use execution_engine::{ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
     decode_request, read_frame, read_worker_input, write_frame, write_worker_result, Request,
-    Response, WorkerResultFrame, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS,
+    Response, WorkerResultFrame, CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS,
     MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES, PROTOCOL_VERSION,
 };
 use resource_limits::ResourceLimits;
@@ -116,6 +116,7 @@ fn main() -> anyhow::Result<()> {
         workers_per_swamp,
         rebalance_interval_ms: 25,
     });
+    let capability_broker = Arc::new(CapabilityBroker::new(debug));
     let accepting = Arc::new(AtomicBool::new(true));
 
     emit_event(
@@ -158,7 +159,13 @@ fn main() -> anyhow::Result<()> {
         let token = token.ok_or_else(|| {
             anyhow::anyhow!("RBE_CONTAINER_TOKEN must be set when --listen is used")
         })?;
-        run_control_server(&address, token, runtime.clone(), accepting)?;
+        run_control_server(
+            &address,
+            token,
+            runtime.clone(),
+            accepting,
+            capability_broker,
+        )?;
     } else if !debug {
         println!("container: no control socket requested; exiting after initialization");
     }
@@ -428,6 +435,7 @@ fn run_control_server(
     token: String,
     runtime: Arc<Runtime>,
     accepting: Arc<AtomicBool>,
+    capability_broker: Arc<CapabilityBroker>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
     println!(
@@ -441,8 +449,11 @@ fn run_control_server(
                 let token = token.clone();
                 let runtime = Arc::clone(&runtime);
                 let accepting = Arc::clone(&accepting);
+                let capability_broker = Arc::clone(&capability_broker);
                 thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &token, &runtime, &accepting) {
+                    if let Err(err) =
+                        handle_connection(stream, &token, &runtime, &accepting, &capability_broker)
+                    {
                         tracing::warn!(%err, "container control connection closed with error");
                     }
                 });
@@ -458,6 +469,7 @@ fn handle_connection(
     token: &str,
     runtime: &Runtime,
     accepting: &AtomicBool,
+    capability_broker: &CapabilityBroker,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let request = decode_request(&read_frame(&mut reader)?)?;
@@ -501,6 +513,43 @@ fn handle_connection(
                         request_id: Some(request.request_id),
                         code: "ARTIFACT_HASH_MISMATCH".into(),
                         message,
+                    },
+                }
+            }
+        }
+        Request::RegisterCapabilityManifest(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else {
+                match capability_broker.register_manifest(&request) {
+                    Ok(grants) => {
+                        emit_event(
+                            "capability_manifest_registered",
+                            &format!(
+                                "runtime_image={} source_id={} environment={} generation={} grants={grants}",
+                                request.runtime_image,
+                                request.source_id,
+                                request.environment,
+                                request.generation
+                            ),
+                        );
+                        Response::CapabilityManifestRegistered {
+                            request_id: request.request_id,
+                            runtime_image: request.runtime_image,
+                            source_id: request.source_id,
+                            environment: request.environment,
+                            generation: request.generation,
+                            grants,
+                        }
+                    }
+                    Err(error) => Response::Error {
+                        request_id: Some(request.request_id),
+                        code: error.code.into(),
+                        message: error.message,
                     },
                 }
             }
@@ -627,6 +676,8 @@ fn handle_connection(
                     request_id: request.request_id,
                     body: serde_json::json!({
                         "protocol": PROTOCOL_VERSION,
+                        "capability_abi": CAPABILITY_ABI_VERSION,
+                        "capability_manifests": capability_broker.manifest_count(),
                         "process": "container",
                         "pid": std::process::id(),
                         "accepting_executions": accepting.load(Ordering::Acquire),
@@ -701,10 +752,15 @@ fn handle_connection(
             } else if let Some(environment) =
                 parse_environment(&request.environment).filter(|id| runtime.has_environment(*id))
             {
+                let previous_generation = runtime.environment_generation(environment);
+                let revoked = capability_broker
+                    .revoke_environment_generation(&request.environment, previous_generation);
                 let requeued = runtime.restart_environment(environment);
                 emit_event(
                     "environment_restart",
-                    &format!("environment={environment} requeued={requeued}"),
+                    &format!(
+                        "environment={environment} requeued={requeued} revoked_manifests={revoked}"
+                    ),
                 );
                 Response::Restarted {
                     request_id: request.request_id,

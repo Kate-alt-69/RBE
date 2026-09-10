@@ -4,11 +4,13 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
+pub const CAPABILITY_ABI_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EXECUTION_INPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_EXECUTION_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CAPABILITY_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_AWAIT_RESULT_MS: u64 = 30_000;
 pub const MAX_WORKER_ERROR_BYTES: usize = 64 * 1024;
 const WORKER_PIPE_MAGIC: [u8; 4] = *b"RBW1";
@@ -27,6 +29,42 @@ pub struct RegisterArtifactRequest {
     pub auth_token: String,
     pub artifact_hash: String,
     pub wasm: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    Service,
+    Network,
+    Storage,
+    Vault,
+    HostFile,
+    Video,
+    Debug,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityGrant {
+    pub kind: CapabilityKind,
+    /// Logical target, never a host socket/path. Examples: `uac`,
+    /// `api.example.com:443`, `service.uac`, or `video`.
+    pub target: String,
+    /// Exact allowed operation names. Wildcards are intentionally unsupported.
+    pub operations: Vec<String>,
+    pub max_request_bytes: u64,
+    pub max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterCapabilityManifestRequest {
+    pub request_id: String,
+    pub auth_token: String,
+    pub capability_abi: u16,
+    pub runtime_image: String,
+    pub source_id: String,
+    pub environment: String,
+    pub generation: u64,
+    pub grants: Vec<CapabilityGrant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +131,7 @@ pub struct ResumeRequest {
 pub enum Request {
     Hello(Hello),
     RegisterArtifact(RegisterArtifactRequest),
+    RegisterCapabilityManifest(RegisterCapabilityManifestRequest),
     Execute(ExecuteRequest),
     AwaitResult(AwaitResultRequest),
     Cancel(CancelRequest),
@@ -126,6 +165,14 @@ pub enum Response {
         request_id: String,
         artifact_hash: String,
         already_present: bool,
+    },
+    CapabilityManifestRegistered {
+        request_id: String,
+        runtime_image: String,
+        source_id: String,
+        environment: String,
+        generation: u64,
+        grants: usize,
     },
     Accepted {
         request_id: String,
@@ -382,6 +429,35 @@ mod tests {
             panic!("expected execute request");
         };
         assert_eq!(decoded.input, b"request-body");
+    }
+
+    #[test]
+    fn capability_manifest_round_trip_preserves_exact_grants() {
+        let request = Request::RegisterCapabilityManifest(RegisterCapabilityManifestRequest {
+            request_id: "cap-1".into(),
+            auth_token: "secret".into(),
+            capability_abi: CAPABILITY_ABI_VERSION,
+            runtime_image: "ab".repeat(32),
+            source_id: "route:api/me".into(),
+            environment: "general-1".into(),
+            generation: 7,
+            grants: vec![CapabilityGrant {
+                kind: CapabilityKind::Service,
+                target: "uac".into(),
+                operations: vec!["get_user".into()],
+                max_request_bytes: 4096,
+                max_response_bytes: 65536,
+            }],
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();
+        let Request::RegisterCapabilityManifest(decoded) = decoded else {
+            panic!("expected capability-manifest request");
+        };
+        assert_eq!(decoded.capability_abi, CAPABILITY_ABI_VERSION);
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.grants[0].target, "uac");
     }
 
     #[test]
