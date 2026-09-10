@@ -52,7 +52,7 @@ jobs:
           path = Path('engine/crates/route-engine/src/module_runtime.rs')
           text = path.read_text(encoding='utf-8')
           old = ':import[module&b.missing as missing]\\nexport function run() { return true; }'
-          new = ':import[\"./module/b\".missing as missing]\\nexport function run() { return true; }'
+          new = r':import[\"./module/b\".missing as missing]\nexport function run() { return true; }'
           if old not in text:
               raise SystemExit('missing direct module import fixture repair anchor')
           path.write_text(text.replace(old, new, 1), encoding='utf-8')
@@ -90,7 +90,7 @@ jobs:
           grep -q 'Status: \*\*IMPLEMENTED / EXECUTABLE\*\*' docs/module-language.md
           grep -q "fn request_name<'a>" engine/crates/route-engine/src/modules.rs
           grep -q "fn security_string<'a>" engine/crates/route-engine/src/modules.rs
-          grep -Fq ':import["./module/b".missing as missing]' engine/crates/route-engine/src/module_runtime.rs
+          grep -Fq ':import[\"./module/b\".missing as missing]' engine/crates/route-engine/src/module_runtime.rs
           ! grep -q 'BuiltinModule::Request) => Err' engine/crates/route-engine/src/modules.rs
           ! grep -q 'BuiltinModule::Security) => Err' engine/crates/route-engine/src/modules.rs
 
