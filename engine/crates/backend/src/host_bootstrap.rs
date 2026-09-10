@@ -4,13 +4,13 @@ use std::sync::Arc;
 use rand::RngCore;
 use tokio::io::AsyncWriteExt;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct HostBootstrapReady {
     secure_credentials: bool,
 }
 
 impl HostBootstrapReady {
-    pub fn er_control_enabled(self) -> bool {
+    pub fn er_control_enabled(&self) -> bool {
         self.secure_credentials
     }
 

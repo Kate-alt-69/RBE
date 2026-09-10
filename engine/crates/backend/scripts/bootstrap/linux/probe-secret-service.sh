@@ -1,6 +1,20 @@
 #!/bin/sh
 set -u
 
+has_session_bus() {
+    if command -v dbus-send >/dev/null 2>&1; then
+        dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply \
+            /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 && return 0
+    fi
+    if command -v gdbus >/dev/null 2>&1; then
+        gdbus call --session \
+            --dest org.freedesktop.DBus \
+            --object-path /org/freedesktop/DBus \
+            --method org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
 has_secret_service() {
     if command -v gdbus >/dev/null 2>&1; then
         gdbus call --session \
@@ -16,9 +30,16 @@ has_secret_service() {
     return 1
 }
 
-if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && has_secret_service; then
-    echo 'RBE_RESULT=READY'
-    exit 0
+if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    if has_secret_service; then
+        echo 'RBE_RESULT=READY'
+        exit 0
+    fi
+    # A stale inherited bus address must not block headless recovery. It is local
+    # to this embedded shell; a replacement address is exported explicitly below.
+    if ! has_session_bus; then
+        unset DBUS_SESSION_BUS_ADDRESS
+    fi
 fi
 
 # Do not create a private session bus merely to discover that there is no
@@ -70,7 +91,7 @@ while [ "$i" -lt 20 ]; do
     fi
     i=$((i + 1))
     sleep 0.05
- done
+done
 
 # The bus was created solely for this failed bootstrap attempt. Do not strand it.
 case "$started_bus_pid" in
