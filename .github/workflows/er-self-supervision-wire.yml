@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/patches/er-self-supervision-wire.py'
+      - '.github/patches/er-self-cross-target-cleanup.py'
       - '.github/workflows/er-self-supervision-wire.yml'
 
 permissions:
@@ -27,20 +28,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: Apply ER self supervision
-        run: python .github/patches/er-self-supervision-wire.py
+      - name: Apply ER self supervision and cross-target cleanup
+        run: |
+          python .github/patches/er-self-supervision-wire.py
+          python .github/patches/er-self-cross-target-cleanup.py
       - name: Format
         working-directory: engine
         run: cargo fmt --all
       - name: Check workspace locked
         working-directory: engine
         run: cargo check --workspace --locked
-      - name: Test backend supervision
+      - name: Test critical supervision
         working-directory: engine
-        run: cargo test -p backend --locked
-      - name: Clippy backend supervision
+        run: cargo test -p backend -p service-runtime --locked
+      - name: Clippy critical supervision
         working-directory: engine
-        run: cargo clippy -p backend --all-targets --locked -- -D warnings
+        run: cargo clippy -p backend -p service-runtime --all-targets --locked -- -D warnings
+      - name: Check Windows release warning cleanliness
+        working-directory: engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-msvc
+          RUSTFLAGS='-D warnings' cargo check -p backend -p service-runtime --target x86_64-pc-windows-msvc --locked
       - name: Regenerate if main moved
         shell: bash
         run: |
@@ -51,20 +61,24 @@ jobs:
             echo "main moved to $latest; regenerating against latest source"
             git reset --hard "$latest"
             python .github/patches/er-self-supervision-wire.py
+            python .github/patches/er-self-cross-target-cleanup.py
             cd engine
             cargo fmt --all
             cargo check --workspace --locked
-            cargo test -p backend --locked
-            cargo clippy -p backend --all-targets --locked -- -D warnings
+            cargo test -p backend -p service-runtime --locked
+            cargo clippy -p backend -p service-runtime --all-targets --locked -- -D warnings
+            rustup target add x86_64-pc-windows-msvc
+            RUSTFLAGS='-D warnings' cargo check -p backend -p service-runtime --target x86_64-pc-windows-msvc --locked
           fi
       - name: Commit verified ER self supervision
         shell: bash
         run: |
           set -euo pipefail
           rm -f .github/patches/er-self-supervision-wire.py
+          rm -f .github/patches/er-self-cross-target-cleanup.py
           rm -f .github/workflows/er-self-supervision-wire.yml
           git add -A
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'FIX | BUG-ER-005 preserve ER self-crash postmortems'
+          git commit -m 'FIX | BUG-ER-005 preserve ER self-crash postmortems and clean release warnings'
           git push origin HEAD:main
