@@ -7,14 +7,15 @@
     1. builds container-bin first;
     2. exposes that exact artifact as RBE_CONTAINER_BIN_PATH;
     3. supplies RBE_BUILD_ID and an ephemeral local Ed25519 signing key (or an externally supplied release key);
-    4. builds backend.exe with the container SHA-256/build-id/target and Ed25519
-       signature compiled into the backend;
-    5. packages the exact same container artifact at dist\<target>\dep\container.exe
+    4. prompts for the Control Room admin password unless RBE_ADMIN_PASSWORD is supplied;
+    5. builds backend.exe with the container SHA-256/build-id/target and Ed25519
+       signature plus a salted password verifier compiled into the backend;
+    6. packages the exact same container artifact at dist\<target>\dep\container.exe
        (or container on Linux).
 
-  There is no editable .sha256 sidecar and no embedded fallback container copy.
-  The backend fails closed when dep\container.exe is missing or fails integrity
-  verification.
+  The Control Room password itself is never written to dist or passed into Cargo.
+  This wrapper derives a salted PBKDF2 verifier first; only that verifier is
+  inherited by the Rust build and embedded into the backend.
 
   Local developer builds generate a fresh signing key in memory for each script
   invocation and never persist it to disk. CI/release builds can provide a stable
@@ -29,6 +30,7 @@ $ContainerDir = Join-Path $RepoRoot 'container-runtime'
 $EngineDir = Join-Path $RepoRoot 'engine'
 $DistRoot = Join-Path $RepoRoot 'dist'
 $script:GeneratedContainerSigningKey = $false
+$script:GeneratedAdminVerifier = $false
 
 function Remove-LegacyContainerSigningKey {
     $keyDir = if ($env:RBE_CONFIG_HOME) { $env:RBE_CONFIG_HOME } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'RBE' } else { $null }
@@ -67,7 +69,93 @@ function Initialize-ContainerSigningKey {
     Write-Host 'Generated ephemeral local RBE container signing key (not written to disk).' -ForegroundColor DarkGray
 }
 
+function Initialize-AdminPasswordVerifier {
+    $rounds = 120000
+    $haveSalt = -not [string]::IsNullOrWhiteSpace($env:RBE_ADMIN_AUTH_SALT_HEX)
+    $haveVerifier = -not [string]::IsNullOrWhiteSpace($env:RBE_ADMIN_AUTH_VERIFIER_HEX)
+    $haveRounds = -not [string]::IsNullOrWhiteSpace($env:RBE_ADMIN_AUTH_ROUNDS)
+
+    if ($haveSalt -or $haveVerifier -or $haveRounds) {
+        if (-not ($haveSalt -and $haveVerifier -and $haveRounds)) {
+            throw 'RBE admin verifier variables must be supplied together.'
+        }
+        if ($env:RBE_ADMIN_AUTH_SALT_HEX -notmatch '^[0-9a-fA-F]{16}$') {
+            throw 'RBE_ADMIN_AUTH_SALT_HEX must contain exactly 16 hexadecimal characters.'
+        }
+        if ($env:RBE_ADMIN_AUTH_VERIFIER_HEX -notmatch '^[0-9a-fA-F]{64}$') {
+            throw 'RBE_ADMIN_AUTH_VERIFIER_HEX must contain exactly 64 hexadecimal characters.'
+        }
+        $parsedRounds = 0
+        if (-not [uint32]::TryParse($env:RBE_ADMIN_AUTH_ROUNDS, [ref]$parsedRounds) -or $parsedRounds -lt 10000) {
+            throw 'RBE_ADMIN_AUTH_ROUNDS must be an integer >= 10000.'
+        }
+        Write-Host 'Using externally supplied Control Room password verifier for this build.' -ForegroundColor DarkGray
+        return
+    }
+
+    $password = $null
+    $firstSecure = $null
+    $secondSecure = $null
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($env:RBE_ADMIN_PASSWORD)) {
+            $password = $env:RBE_ADMIN_PASSWORD
+            Remove-Item Env:RBE_ADMIN_PASSWORD -ErrorAction SilentlyContinue
+            Write-Host 'Consuming externally supplied Control Room admin password for this build.' -ForegroundColor DarkGray
+        } else {
+            if (-not [Environment]::UserInteractive) {
+                throw 'RBE_ADMIN_PASSWORD or a complete RBE_ADMIN_AUTH_* verifier is required for non-interactive packaged builds.'
+            }
+
+            Write-Host ''
+            Write-Host 'RBE Control Room authentication' -ForegroundColor Cyan
+            Write-Host 'Set the password that will unlock this exact backend.exe build.' -ForegroundColor DarkGray
+            $firstSecure = Read-Host 'Admin password (12+ characters)' -AsSecureString
+            $secondSecure = Read-Host 'Confirm admin password' -AsSecureString
+            $first = ConvertFrom-SecureString $firstSecure -AsPlainText
+            $second = ConvertFrom-SecureString $secondSecure -AsPlainText
+            if ($first -ne $second) {
+                throw 'Admin passwords did not match.'
+            }
+            $password = $first
+            $first = $null
+            $second = $null
+        }
+
+        if ($password.Length -lt 12) {
+            throw 'Admin password must contain at least 12 characters.'
+        }
+        if ($password.Length -gt 1024) {
+            throw 'Admin password is unreasonably large.'
+        }
+
+        $salt = [byte[]]::new(8)
+        [System.Security.Cryptography.RandomNumberGenerator]::Fill($salt)
+        $verifier = [System.Security.Cryptography.Rfc2898DeriveBytes]::Pbkdf2(
+            $password,
+            $salt,
+            $rounds,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            32
+        )
+        $env:RBE_ADMIN_AUTH_ROUNDS = [string]$rounds
+        $env:RBE_ADMIN_AUTH_SALT_HEX = [Convert]::ToHexString($salt).ToLowerInvariant()
+        $env:RBE_ADMIN_AUTH_VERIFIER_HEX = [Convert]::ToHexString($verifier).ToLowerInvariant()
+        $script:GeneratedAdminVerifier = $true
+        [Array]::Clear($salt, 0, $salt.Length)
+        [Array]::Clear($verifier, 0, $verifier.Length)
+        Write-Host 'Admin password accepted. Only a salted PBKDF2 verifier is passed into Cargo.' -ForegroundColor Green
+    } finally {
+        $password = $null
+        if ($firstSecure) { $firstSecure.Dispose() }
+        if ($secondSecure) { $secondSecure.Dispose() }
+        Remove-Item Env:RBE_ADMIN_PASSWORD -ErrorAction SilentlyContinue
+    }
+}
+
 try {
+    if (-not ($args -contains '--help' -or $args -contains '-h' -or $args -contains '-?')) {
+        Initialize-AdminPasswordVerifier
+    }
     Initialize-ContainerSigningKey
 
     $BuildWin = $false; $BuildLinux = $false; $BuildMacos = $false; $BuildAll = $false
@@ -205,6 +293,12 @@ try {
 
     Write-Host ""; Write-Host "Done. Output in $DistRoot" -ForegroundColor Green
 } finally {
+    if ($script:GeneratedAdminVerifier) {
+        Remove-Item Env:RBE_ADMIN_AUTH_ROUNDS -ErrorAction SilentlyContinue
+        Remove-Item Env:RBE_ADMIN_AUTH_SALT_HEX -ErrorAction SilentlyContinue
+        Remove-Item Env:RBE_ADMIN_AUTH_VERIFIER_HEX -ErrorAction SilentlyContinue
+        $script:GeneratedAdminVerifier = $false
+    }
     if ($script:GeneratedContainerSigningKey) {
         Remove-Item Env:RBE_CONTAINER_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
         $script:GeneratedContainerSigningKey = $false

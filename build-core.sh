@@ -2,9 +2,8 @@
 # RBE secure release builder.
 # Builds container-bin first, binds its exact bytes to backend.exe at build time,
 # and packages the same artifact as dist/<target>/dep/container(.exe).
-# Packaged builds require RBE_CONTAINER_SIGNING_PRIVATE_KEY in the environment.
-# --no-embed is retained only for CLI compatibility; production still requires
-# the standalone signed dep/container artifact.
+# Packaged builds require RBE_CONTAINER_SIGNING_PRIVATE_KEY plus a derived
+# RBE_ADMIN_AUTH_* verifier. Prefer build.sh for interactive password entry.
 set -e
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,7 +38,7 @@ for arg in "$@"; do
 done
 
 if [ "$SHOW_HELP" = true ]; then
-    sed -n '1,70p' "$REPO_ROOT/build.sh"
+    sed -n '1,80p' "$REPO_ROOT/build.sh"
     exit 0
 fi
 
@@ -73,7 +72,6 @@ else
 fi
 echo "Targets: ${targets[*]}" >&2
 
-# Linux -> Windows uses cargo-zigbuild through build.sh's cargo-xwin shim.
 CROSS_CMD=""
 command -v cross >/dev/null 2>&1 && CROSS_CMD=cross
 [ -z "$CROSS_CMD" ] && command -v cargo-zigbuild >/dev/null 2>&1 && CROSS_CMD=cargo-zigbuild
@@ -89,12 +87,18 @@ invoke_cargo_build() {
 }
 get_built_binary_path() { local workspace="$1" bin="$2" target="$3" release="$4"; local profile=debug; [ "$release" = true ] && profile=release; local file="$bin"; [ "$(get_target_os "$target")" = windows ] && file="$bin.exe"; [ -n "${CARGO_TARGET_DIR:-}" ] && echo "$CARGO_TARGET_DIR/$target/$profile/$file" || echo "$workspace/target/$target/$profile/$file"; }
 
-# Secure packaged builds always require the signing key.
 if [ -z "${RBE_CONTAINER_SIGNING_PRIVATE_KEY:-}" ]; then
     echo "ERROR: RBE_CONTAINER_SIGNING_PRIVATE_KEY is required for packaged builds." >&2
     echo 'For a temporary local key: export RBE_CONTAINER_SIGNING_PRIVATE_KEY="$(openssl rand -hex 32)"' >&2
     exit 1
 fi
+if [ -z "${RBE_ADMIN_AUTH_ROUNDS:-}" ] || [ -z "${RBE_ADMIN_AUTH_SALT_HEX:-}" ] || [ -z "${RBE_ADMIN_AUTH_VERIFIER_HEX:-}" ]; then
+    echo "ERROR: a complete RBE_ADMIN_AUTH_* verifier is required for packaged builds. Use build.sh for interactive password entry." >&2
+    exit 1
+fi
+[[ "$RBE_ADMIN_AUTH_ROUNDS" =~ ^[0-9]+$ ]] && [ "$RBE_ADMIN_AUTH_ROUNDS" -ge 10000 ] || { echo "ERROR: invalid RBE_ADMIN_AUTH_ROUNDS." >&2; exit 1; }
+[[ "$RBE_ADMIN_AUTH_SALT_HEX" =~ ^[0-9a-fA-F]{16}$ ]] || { echo "ERROR: invalid RBE_ADMIN_AUTH_SALT_HEX." >&2; exit 1; }
+[[ "$RBE_ADMIN_AUTH_VERIFIER_HEX" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "ERROR: invalid RBE_ADMIN_AUTH_VERIFIER_HEX." >&2; exit 1; }
 
 DIST_ROOT="$REPO_ROOT/dist"; ENGINE_DIR="$REPO_ROOT/engine"; CONTAINER_DIR="$REPO_ROOT/container-runtime"
 for target in "${targets[@]}"; do
@@ -134,4 +138,5 @@ for target in "${targets[@]}"; do
     echo "  -> $out_dir" >&2
 done
 
+unset RBE_ADMIN_AUTH_ROUNDS RBE_ADMIN_AUTH_SALT_HEX RBE_ADMIN_AUTH_VERIFIER_HEX || true
 echo "Done. Output in $DIST_ROOT" >&2

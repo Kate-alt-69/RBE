@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#080b12">
+<title>RBE Control Room</title>
+<link rel="stylesheet" href="dashboard.css">
+<script src="dashboard.js" defer></script>
+</head>
+<body>
+<div id="login-screen" class="login-screen">
+  <form id="login-form" class="login-card" autocomplete="off">
+    <div class="brand-mark large"><span></span><span></span><span></span></div>
+    <div class="eyebrow">RBE CONTROL PLANE</div>
+    <h1>Unlock Control Room</h1>
+    <p id="login-copy">This backend requires the admin password bound into the executable at build time.</p>
+    <label class="field-label" for="admin-password">Admin password</label>
+    <div class="password-row">
+      <input id="admin-password" type="password" minlength="12" maxlength="1024" autocomplete="current-password" autofocus>
+      <button type="button" id="toggle-password" class="icon-button" aria-label="Show password">SHOW</button>
+    </div>
+    <button id="login-button" class="primary-button wide" type="submit">Unlock dashboard</button>
+    <div id="login-error" class="form-error" role="alert"></div>
+    <div class="login-foot"><i></i> Listener restricted to 127.0.0.1:5799</div>
+  </form>
+</div>
+
+<div id="app" class="app-shell hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><span></span><span></span><span></span></div>
+      <div class="brand-copy"><strong>RBE</strong><small>CONTROL ROOM</small></div>
+    </div>
+    <div class="nav-label">CONTROL</div>
+    <nav aria-label="Dashboard sections">
+      <button class="nav-item active" data-tab="overview"><span class="nav-icon">OV</span><span>Overview</span></button>
+      <button class="nav-item" data-tab="backend"><span class="nav-icon">BE</span><span>Backend</span></button>
+      <button class="nav-item" data-tab="container"><span class="nav-icon">CT</span><span>Container</span></button>
+      <button class="nav-item" data-tab="security"><span class="nav-icon">SC</span><span>Security</span></button>
+      <button class="nav-item" data-tab="settings"><span class="nav-icon">ST</span><span>Settings</span><span id="settings-dot" class="dirty-dot hidden"></span></button>
+    </nav>
+    <div class="sidebar-spacer"></div>
+    <button id="logout-button" class="nav-item logout"><span class="nav-icon">↪</span><span>Lock dashboard</span></button>
+    <div class="sidebar-footer">
+      <div class="local-pill"><i></i><span>Authenticated · loopback</span></div>
+      <small>127.0.0.1:5799</small>
+    </div>
+  </aside>
+
+  <div class="workspace">
+    <header class="topbar">
+      <div>
+        <div id="section-eyebrow" class="eyebrow">RUNTIME TELEMETRY</div>
+        <h1 id="page-title">Overview</h1>
+      </div>
+      <div class="top-actions">
+        <div class="live-state"><i></i><span>LIVE</span><small id="last-refresh">waiting…</small></div>
+      </div>
+    </header>
+
+    <main>
+      <section id="overview" class="tab active"><div id="overview-view" class="loading">Loading telemetry…</div></section>
+      <section id="backend" class="tab"><div id="backend-view" class="loading">Loading backend…</div></section>
+      <section id="container" class="tab"><div id="container-view" class="loading">Loading container…</div></section>
+      <section id="security" class="tab"><div id="security-view" class="loading">Loading security…</div></section>
+      <section id="settings" class="tab">
+        <div class="settings-head">
+          <div>
+            <div class="eyebrow">LIVE CONFIG EDITOR</div>
+            <h2>Runtime settings</h2>
+            <p>Edit the actual settings.json tree. Schema validation runs before disk replacement.</p>
+          </div>
+          <div class="settings-actions">
+            <span id="save-state" class="save-state">Clean</span>
+            <button id="reload-settings" class="secondary-button">Reload</button>
+            <button id="save-settings" class="primary-button" disabled>Save settings</button>
+          </div>
+        </div>
+        <div id="restart-banner" class="restart-banner hidden"></div>
+        <div class="editor-toolbar">
+          <div class="mode-switch">
+            <button id="tree-mode" class="mode-button active">Tree</button>
+            <button id="raw-mode" class="mode-button">Raw JSON</button>
+          </div>
+          <div class="editor-add">
+            <button data-root-add="value" class="secondary-button small">+ Value</button>
+            <button data-root-add="object" class="secondary-button small">+ Group</button>
+            <button data-root-add="array" class="secondary-button small">+ Array</button>
+          </div>
+          <span id="settings-source" class="source-pill">settings.json</span>
+        </div>
+        <div id="settings-error" class="editor-error hidden"></div>
+        <div id="tree-editor" class="tree-editor"></div>
+        <textarea id="raw-editor" class="raw-editor hidden" spellcheck="false" aria-label="Raw settings JSON"></textarea>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+</body>
+</html>

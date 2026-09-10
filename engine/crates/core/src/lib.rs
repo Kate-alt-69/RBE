@@ -7,6 +7,7 @@ mod container_client;
 mod metrics;
 mod video_language;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use config::Config;
@@ -21,6 +22,15 @@ pub use metrics::{
     BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
 };
 pub use video_language::{VideoLanguage, VideoLanguageError};
+
+/// Validate a candidate settings file with the exact same typed loader used at
+/// backend startup. The dashboard uses this before replacing `settings.json`,
+/// so editing cannot bypass schema or semantic validation.
+pub fn validate_settings_file(path: impl AsRef<Path>) -> Result<(), String> {
+    Config::load(path)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
 
 /// Shared application state, cloned cheaply into every Axum handler.
 #[derive(Clone)]
