@@ -1,0 +1,62 @@
+name: Container Control Plane Wire
+
+on:
+  push:
+    branches:
+      - work/container-control-plane
+    paths:
+      - '.github/patches/container-control-plane-wire.py'
+      - '.github/workflows/container-control-plane-wire.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: container-control-plane-wire
+  cancel-in-progress: true
+
+jobs:
+  wire-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: work/container-control-plane
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            container-runtime
+            engine
+      - name: Wire capability broker into Controller
+        run: python .github/patches/container-control-plane-wire.py
+      - name: Format Container workspace
+        run: cargo fmt --manifest-path container-runtime/Cargo.toml --all
+      - name: Check Container workspace
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Test Container workspace
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - name: Check Engine integration
+        run: cargo check --manifest-path engine/Cargo.toml --workspace --locked
+      - name: Test Engine core integration
+        run: cargo test --manifest-path engine/Cargo.toml -p core-lib --locked
+      - name: Diff hygiene
+        run: git diff --check
+      - name: Commit validated Controller wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/patches/container-control-plane-wire.py
+          rm -f .github/workflows/container-control-plane-wire.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "FIX | BUG-CTR-003 wire Controller capability manifests"
+          git push origin HEAD:work/container-control-plane
