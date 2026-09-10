@@ -783,7 +783,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
 
     let api_dir = route_engine::default_api_dir();
     boot_trace(format!("building router api dir={}", api_dir.display()));
-    let cache_dir = runtime_paths::binary_dir().join(".cache").join("backend");
+    let cache_dir = runtime_paths::binary_dir().join(".cache");
     match route_engine::cache::sync(&io, &api_dir, &cache_dir) {
         Ok(outcomes) => {
             let regenerated = outcomes

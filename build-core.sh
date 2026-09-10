@@ -125,7 +125,7 @@ for target in "${targets[@]}"; do
     backend_path=$(get_built_binary_path "$ENGINE_DIR" backend "$target" "$RELEASE")
     [ -f "$backend_path" ] || { echo "ERROR: backend artifact missing: $backend_path" >&2; exit 1; }
     cp "$backend_path" "$out_dir/"
-    service_dest="$out_dir/service"; [ "$(get_target_os "$target")" = windows ] && service_dest="$service_dest.exe"
+    service_dest="$dep_dir/service"; [ "$(get_target_os "$target")" = windows ] && service_dest="$service_dest.exe"
     cp "$service_path" "$service_dest"
 
     [ -f "$ENGINE_DIR/settings.json" ] && cp "$ENGINE_DIR/settings.json" "$out_dir/" 2>/dev/null || true

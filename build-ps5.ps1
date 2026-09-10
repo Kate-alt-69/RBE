@@ -545,9 +545,11 @@ foreach ($target in $targets) {
 
     Copy-Item $backendPath -Destination $outDir -Force
     Write-Host "  -> $outDir\$(Split-Path -Leaf $backendPath)" -ForegroundColor Green
+    $serviceDepDir = Join-Path $outDir "dep"
+    New-Item -ItemType Directory -Force -Path $serviceDepDir | Out-Null
     $serviceName = if ((Get-TargetOs $target) -eq "windows") { "service.exe" } else { "service" }
-    Copy-Item $servicePath -Destination (Join-Path $outDir $serviceName) -Force
-    Write-Host "  -> $outDir\$serviceName" -ForegroundColor Green
+    Copy-Item $servicePath -Destination (Join-Path $serviceDepDir $serviceName) -Force
+    Write-Host "  -> $serviceDepDir\$serviceName" -ForegroundColor Green
 
     if ($NoEmbed -and $containerBinPath -and (Test-Path $containerBinPath)) {
         Copy-Item $containerBinPath -Destination $outDir -Force

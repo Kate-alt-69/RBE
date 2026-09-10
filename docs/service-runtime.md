@@ -51,7 +51,7 @@ The mother process and service child both load the same typed settings so omitte
 
 ## Process model
 
-Each active service is a separate OS process. RBE now uses one canonical sibling executable named `service` (`service.exe` on Windows). The Service Mother and every active Service REL worker are separate processes of that same canonical image; per-service executable aliases under `.runtime/process/` are no longer created.
+Each active service is a separate OS process. RBE now uses one canonical dependency executable at `./dep/service` (`./dep/service.exe` on Windows). The Service Mother and every active Service REL worker are separate processes of that same canonical image; per-service executable aliases under `.runtime/process/` are no longer created.
 
 Typical Windows process layout:
 
@@ -63,7 +63,7 @@ backend.exe
    └─ service.exe           service - Mail | service.exe
 ```
 
-The packaged `service.exe` is now a separately linked executable target. It contains the Service Mother/worker entrypoints, `.service` compiler/executor path, Service Fabric IPC, Runtime ENV bootstrap, CONTROL-ER recovery client, and restart controls, but it does not expose the normal backend API/Vault/container/HostBootstrap/ER-daemon boot path. The release builder compiles `service` first, passes its exact artifact to the backend build, and backend embeds that Service SHA-256. At runtime backend requires the sibling `service.exe`/`service` to match that build-time digest and explicitly refuses a Service image whose bytes are identical to backend. Backend never repairs, copies, or hard-links itself into the Service path.
+The packaged `service.exe` is now a separately linked executable target. It contains the Service Mother/worker entrypoints, `.service` compiler/executor path, Service Fabric IPC, Runtime ENV bootstrap, CONTROL-ER recovery client, and restart controls, but it does not expose the normal backend API/Vault/container/HostBootstrap/ER-daemon boot path. The release builder compiles `service` first, passes its exact artifact to the backend build, and backend embeds that Service SHA-256. At runtime backend requires `./dep/service.exe`/`./dep/service` to match that build-time digest and explicitly refuses a Service image whose bytes are identical to backend. Backend never repairs, copies, or hard-links itself into the Service path.
 
 The child binds a loopback-only TCP IPC endpoint and prints one readiness record to stdout. The parent consumes that record, verifies the service identity, then continuously drains the remaining stdout stream into structured logging.
 

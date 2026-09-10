@@ -326,7 +326,7 @@ fn ensure_canonical_service_executable(
         anyhow::bail!("backend was built without a valid standalone Service integrity binding");
     }
 
-    let service = parent.join(service_executable_name());
+    let service = parent.join("dep").join(service_executable_name());
     if !service.is_file() {
         anyhow::bail!(
             "standalone Service runtime {} is missing; backend will not synthesize it from itself",

@@ -195,7 +195,7 @@ try {
         if (-not (Test-Path $backendPath)) { throw "backend was not produced: $backendPath" }
         Copy-Item $backendPath $outDir -Force
         $serviceName = if ((Get-TargetOs $target) -eq 'windows') { 'service.exe' } else { 'service' }
-        Copy-Item $servicePath (Join-Path $outDir $serviceName) -Force
+        Copy-Item $servicePath (Join-Path $depDir $serviceName) -Force
 
         $settings = Join-Path $EngineDir 'settings.json'; if (Test-Path $settings) { Copy-Item $settings $outDir -Force }
         if ($DevContent) { Copy-Item (Join-Path $RepoRoot 'api') $outDir -Recurse -Force -ErrorAction SilentlyContinue; Copy-Item (Join-Path $RepoRoot 'module') $outDir -Recurse -Force -ErrorAction SilentlyContinue }
