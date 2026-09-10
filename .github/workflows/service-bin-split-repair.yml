@@ -49,36 +49,13 @@ jobs:
           from pathlib import Path
           path = Path('engine/crates/backend/src/service_mother.rs')
           text = path.read_text(encoding='utf-8')
-          old_call = '''        supervise(
-              initial,
-              supervisor_settings,
-              supervisor_fingerprint,
-              runtime_env,
-          '''
-          if old_call not in text:
-              old_call = '''        supervise(
-            initial,
-            supervisor_settings,
-            supervisor_fingerprint,
-            runtime_env,
-'''
-          new_call = old_call.replace('            runtime_env,\n', '            expected_service_sha256,\n            runtime_env,\n')
+          old_call = "            supervisor_fingerprint,\n            runtime_env,\n"
+          new_call = "            supervisor_fingerprint,\n            expected_service_sha256,\n            runtime_env,\n"
           if old_call not in text:
               raise SystemExit('Service Mother supervise call anchor changed')
           text = text.replace(old_call, new_call, 1)
-          old_sig = '''async fn supervise(
-    mut process: ServiceMotherProcess,
-    settings_path: PathBuf,
-    expected_catalog_fingerprint: String,
-    runtime_env: Arc<serde_json::Value>,
-'''
-          new_sig = '''async fn supervise(
-    mut process: ServiceMotherProcess,
-    settings_path: PathBuf,
-    expected_catalog_fingerprint: String,
-    expected_service_sha256: String,
-    runtime_env: Arc<serde_json::Value>,
-'''
+          old_sig = "    expected_catalog_fingerprint: String,\n    runtime_env: Arc<serde_json::Value>,\n"
+          new_sig = "    expected_catalog_fingerprint: String,\n    expected_service_sha256: String,\n    runtime_env: Arc<serde_json::Value>,\n"
           if old_sig not in text:
               raise SystemExit('Service Mother supervise signature anchor changed')
           path.write_text(text.replace(old_sig, new_sig, 1), encoding='utf-8')
