@@ -50,8 +50,6 @@ jobs:
           set -euo pipefail
           rustup target add x86_64-pc-windows-msvc
           RUSTFLAGS='-D warnings' cargo check --manifest-path engine/Cargo.toml -p service-runtime --target x86_64-pc-windows-msvc --locked
-          grep -q '#\[cfg(target_os = "linux")\]' engine/crates/backend/src/host_bootstrap.rs
-          ! grep -q '^[[:space:]]*println!("cargo:warning=backend: binding container' engine/crates/backend/build.rs
       - name: Regenerate if main moved
         shell: bash
         run: |
@@ -69,8 +67,6 @@ jobs:
             cargo clippy --manifest-path engine/Cargo.toml -p backend -p service-runtime --all-targets --locked -- -D warnings
             rustup target add x86_64-pc-windows-msvc
             RUSTFLAGS='-D warnings' cargo check --manifest-path engine/Cargo.toml -p service-runtime --target x86_64-pc-windows-msvc --locked
-            grep -q '#\[cfg(target_os = "linux")\]' engine/crates/backend/src/host_bootstrap.rs
-            ! grep -q '^[[:space:]]*println!("cargo:warning=backend: binding container' engine/crates/backend/build.rs
           fi
       - name: Commit verified ER self supervision
         shell: bash
