@@ -373,22 +373,24 @@ impl EnvironmentProcessSupervisor {
             timeout_ms: task.limits.wall_time_ms.max(1),
             input: task.payload.clone(),
         };
-        write_frame(&mut stream, &request)
-            .map_err(|error| format!("send Environment execution: {error}"))?;
-        let result = read_typed::<ChildResponse, _>(&mut BufReader::new(stream))
-            .map_err(|error| format!("read Environment execution result: {error}"))
-            .and_then(|response| match response {
-                ChildResponse::Finished {
-                    request_id: returned,
-                    output,
-                } if returned == request_id => Ok(output),
-                ChildResponse::Error {
-                    request_id: Some(returned),
-                    code,
-                    message,
-                } if returned == request_id => Err(format!("{code}: {message}")),
-                _ => Err("Environment process returned a mismatched response".into()),
-            });
+        let result = (|| -> Result<Vec<u8>, String> {
+            write_frame(&mut stream, &request)
+                .map_err(|error| format!("send Environment execution: {error}"))?;
+            read_typed::<ChildResponse, _>(&mut BufReader::new(stream))
+                .map_err(|error| format!("read Environment execution result: {error}"))
+                .and_then(|response| match response {
+                    ChildResponse::Finished {
+                        request_id: returned,
+                        output,
+                    } if returned == request_id => Ok(output),
+                    ChildResponse::Error {
+                        request_id: Some(returned),
+                        code,
+                        message,
+                    } if returned == request_id => Err(format!("{code}: {message}")),
+                    _ => Err("Environment process returned a mismatched response".into()),
+                })
+        })();
         self.executions
             .lock()
             .map_err(|_| "Environment execution ownership table poisoned".to_string())?
@@ -785,87 +787,72 @@ fn execute_isolated_worker(
         .lock()
         .map_err(|_| "Environment active execution table poisoned".to_string())?
         .insert(execution_id.to_string(), generation);
-    if take_cancelled(cancelled, execution_id)? {
-        let _ = child.kill();
-        let _ = child.wait();
-        active_executions
-            .lock()
-            .map_err(|_| "Environment active execution table poisoned".to_string())?
-            .remove(execution_id);
-        return Err("execution cancelled".into());
-    }
-    let mut worker_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "Environment worker stdin unavailable".to_string())?;
-    if let Err(error) = write_worker_input(&mut worker_stdin, input) {
-        let _ = child.kill();
-        let _ = child.wait();
-        active_executions
-            .lock()
-            .map_err(|_| "Environment active execution table poisoned".to_string())?
-            .remove(execution_id);
-        let _ = take_cancelled(cancelled, execution_id);
-        return Err(format!("write Environment worker input: {error}"));
-    }
-    drop(worker_stdin);
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Environment worker stdout unavailable".to_string())?;
-    let reader = thread::Builder::new()
-        .name("rbe-env-worker-result".into())
-        .spawn(move || read_worker_result(&mut BufReader::new(stdout)))
-        .map_err(|error| error.to_string())?;
-    let started = std::time::Instant::now();
-    let timeout = Duration::from_millis(timeout_ms.max(1));
-    loop {
-        if is_cancelled(cancelled, execution_id)? {
+    let result = (|| -> Result<Vec<u8>, String> {
+        if take_cancelled(cancelled, execution_id)? {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = reader.join();
-            active_executions
-                .lock()
-                .map_err(|_| "Environment active execution table poisoned".to_string())?
-                .remove(execution_id);
-            let _ = take_cancelled(cancelled, execution_id);
             return Err("execution cancelled".into());
         }
-        if started.elapsed() >= timeout {
+        let mut worker_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Environment worker stdin unavailable".to_string())?;
+        if let Err(error) = write_worker_input(&mut worker_stdin, input) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = reader.join();
-            active_executions
-                .lock()
-                .map_err(|_| "Environment active execution table poisoned".to_string())?
-                .remove(execution_id);
-            return Err(format!(
-                "Environment worker timed out after {timeout_ms} ms"
-            ));
+            return Err(format!("write Environment worker input: {error}"));
         }
-        match child.try_wait().map_err(|error| error.to_string())? {
-            Some(status) => {
-                let frame = reader
-                    .join()
-                    .map_err(|_| "Environment worker result reader panicked".to_string())?
-                    .map_err(|error| format!("invalid Environment worker result: {error}"))?;
-                active_executions
-                    .lock()
-                    .map_err(|_| "Environment active execution table poisoned".to_string())?
-                    .remove(execution_id);
-                let _ = take_cancelled(cancelled, execution_id);
-                if !status.success() {
-                    return Err(format!("Environment worker exited with status {status}"));
-                }
-                return match frame {
-                    WorkerResultFrame::Success(output) => Ok(output),
-                    WorkerResultFrame::Error(message) => Err(message),
-                };
+        drop(worker_stdin);
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Environment worker stdout unavailable".to_string())?;
+        let reader = thread::Builder::new()
+            .name("rbe-env-worker-result".into())
+            .spawn(move || read_worker_result(&mut BufReader::new(stdout)))
+            .map_err(|error| error.to_string())?;
+        let started = std::time::Instant::now();
+        let timeout = Duration::from_millis(timeout_ms.max(1));
+        loop {
+            if is_cancelled(cancelled, execution_id)? {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("execution cancelled".into());
             }
-            None => thread::sleep(Duration::from_millis(10)),
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(format!(
+                    "Environment worker timed out after {timeout_ms} ms"
+                ));
+            }
+            match child.try_wait().map_err(|error| error.to_string())? {
+                Some(status) => {
+                    let frame = reader
+                        .join()
+                        .map_err(|_| "Environment worker result reader panicked".to_string())?
+                        .map_err(|error| format!("invalid Environment worker result: {error}"))?;
+                    if !status.success() {
+                        return Err(format!("Environment worker exited with status {status}"));
+                    }
+                    return match frame {
+                        WorkerResultFrame::Success(output) => Ok(output),
+                        WorkerResultFrame::Error(message) => Err(message),
+                    };
+                }
+                None => thread::sleep(Duration::from_millis(10)),
+            }
         }
-    }
+    })();
+    active_executions
+        .lock()
+        .map_err(|_| "Environment active execution table poisoned".to_string())?
+        .remove(execution_id);
+    let _ = take_cancelled(cancelled, execution_id);
+    result
 }
 
 fn mark_cancelled(

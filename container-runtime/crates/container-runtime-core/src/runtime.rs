@@ -32,7 +32,17 @@ struct ResultStore {
     retained_bytes: usize,
 }
 
+#[derive(Default)]
+struct ExecutionLifecycle {
+    /// Submitted/recovered executions remain live until an outcome is published.
+    /// Cancellation and completion serialize through this one lock, giving
+    /// cancel() a real linearization point instead of racing worker snapshots.
+    live: HashSet<String>,
+    cancelled: HashSet<String>,
+}
+
 type SharedResults = Arc<(Mutex<ResultStore>, Condvar)>;
+type SharedLifecycle = Arc<Mutex<ExecutionLifecycle>>;
 
 fn outcome_retained_bytes(outcome: &ExecutionOutcome) -> usize {
     outcome
@@ -307,7 +317,7 @@ pub struct Runtime {
     next_execution: AtomicU64,
     global_queue: Mutex<VecDeque<(EnvironmentId, ExecutionTask)>>,
     global_queue_changed: Condvar,
-    cancelled: Arc<Mutex<HashSet<String>>>,
+    lifecycle: SharedLifecycle,
     generations: Mutex<HashMap<EnvironmentId, u64>>,
     environments: Vec<EnvironmentRuntime>,
     cache: Arc<ArtifactCache>,
@@ -350,27 +360,27 @@ impl Runtime {
         let executor = Arc::new(WasmExecutor::new().expect("failed to initialize WASM executor"));
         let journal = Journal::open();
         let (recovered, max_sequence) = journal.recover();
-        let cancelled = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let lifecycle: SharedLifecycle = Arc::new(Mutex::new(ExecutionLifecycle::default()));
         let results: SharedResults = Arc::new((Mutex::new(ResultStore::default()), Condvar::new()));
 
         let runner: Runner = {
             let cache = Arc::clone(&cache);
-            let cancelled = Arc::clone(&cancelled);
+            let lifecycle = Arc::clone(&lifecycle);
             Arc::new(move |task| {
-                if is_cancelled(&cancelled, task) {
+                if is_cancelled(&lifecycle, task) {
                     return Err("execution cancelled before start".into());
                 }
                 let output = if cache.contains_artifact(&task.artifact_hash) {
                     match artifact_runner.as_ref() {
                         Some(runner) => runner(task)?,
-                        None => run_isolated_worker(task, &cancelled)?,
+                        None => run_isolated_worker(task, &lifecycle)?,
                     }
                 } else if task.work_ms > 0 {
-                    run_simulated_work(task, &cancelled)?
+                    run_simulated_work(task, &lifecycle)?
                 } else {
                     Vec::new()
                 };
-                if is_cancelled(&cancelled, task) {
+                if is_cancelled(&lifecycle, task) {
                     return Err("execution cancelled".into());
                 }
                 Ok(output)
@@ -379,15 +389,18 @@ impl Runtime {
 
         let completion: Completion = {
             let cache = Arc::clone(&cache);
-            let cancelled = Arc::clone(&cancelled);
+            let lifecycle = Arc::clone(&lifecycle);
             let journal = Arc::clone(&journal);
             let results = Arc::clone(&results);
             Arc::new(move |task, elapsed_ms, result| {
                 let succeeded = result.is_ok();
-                let was_cancelled = cancelled
-                    .lock()
-                    .expect("cancel table poisoned")
-                    .remove(&task.id.to_string());
+                let was_cancelled = {
+                    let mut lifecycle = lifecycle.lock().expect("execution lifecycle poisoned");
+                    let execution_id = task.id.to_string();
+                    let was_cancelled = lifecycle.cancelled.remove(&execution_id);
+                    lifecycle.live.remove(&execution_id);
+                    was_cancelled
+                };
                 if succeeded && !was_cancelled {
                     cache.record(&task.artifact_hash, elapsed_ms, task.declared_cost);
                 }
@@ -462,7 +475,7 @@ impl Runtime {
             next_execution: AtomicU64::new(max_sequence.saturating_add(1).max(1)),
             global_queue: Mutex::new(VecDeque::new()),
             global_queue_changed: Condvar::new(),
-            cancelled: Arc::clone(&cancelled),
+            lifecycle: Arc::clone(&lifecycle),
             generations: Mutex::new(generations),
             environments,
             cache,
@@ -475,6 +488,12 @@ impl Runtime {
         for task in recovered {
             if let Some(environment) = parse_environment(&task.environment) {
                 if runtime.has_environment(environment) {
+                    runtime
+                        .lifecycle
+                        .lock()
+                        .expect("execution lifecycle poisoned")
+                        .live
+                        .insert(task.id.to_string());
                     runtime
                         .global_queue
                         .lock()
@@ -547,6 +566,11 @@ impl Runtime {
     ) -> ExecutionId {
         let artifact_hash = artifact_hash.into();
         let id = ExecutionId::new(self.next_execution.fetch_add(1, Ordering::Relaxed));
+        self.lifecycle
+            .lock()
+            .expect("execution lifecycle poisoned")
+            .live
+            .insert(id.to_string());
         self.journal.append(JournalEvent {
             kind: "queued".into(),
             epoch_ns: id.epoch_ns(),
@@ -610,6 +634,17 @@ impl Runtime {
     }
 
     pub fn cancel(&self, execution_id: &str) -> bool {
+        // Cancellation linearizes against completion here. If completion removes
+        // `live` first, this call is too late and returns false. If cancellation
+        // marks first, completion must publish a cancelled outcome.
+        {
+            let mut lifecycle = self.lifecycle.lock().expect("execution lifecycle poisoned");
+            if !lifecycle.live.contains(execution_id) {
+                return false;
+            }
+            lifecycle.cancelled.insert(execution_id.to_string());
+        }
+
         let mut removed_queued = false;
         {
             let mut queue = self.global_queue.lock().expect("global queue poisoned");
@@ -621,22 +656,10 @@ impl Runtime {
             removed_queued |= environment.cancel_queued_by_string(execution_id);
         }
 
-        let running = self.snapshots().iter().any(|environment| {
-            environment.swamps.iter().any(|swamp| {
-                swamp.workers.iter().any(|worker| {
-                    worker
-                        .current
-                        .map(|id| id.to_string() == execution_id)
-                        .unwrap_or(false)
-                })
-            })
-        });
-
-        if running {
-            self.cancelled
-                .lock()
-                .expect("cancel table poisoned")
-                .insert(execution_id.to_string());
+        // If dispatch has already left a queue, route cancellation into the
+        // Environment supervisor. Its own pending-cancel table closes the race
+        // before execution ownership is registered there.
+        if !removed_queued {
             if let Some(canceller) = self.artifact_canceller.as_ref() {
                 if let Err(error) = canceller(execution_id) {
                     tracing::warn!(
@@ -646,24 +669,26 @@ impl Runtime {
                 }
             }
         }
-        if removed_queued || running {
-            self.journal.append_cancel_string(execution_id);
-            if removed_queued && !running {
-                record_execution_outcome(
-                    &self.results,
-                    execution_id,
-                    ExecutionOutcome {
-                        output: Vec::new(),
-                        error: Some("execution cancelled before start".into()),
-                        elapsed_ms: 0,
-                        cancelled: true,
-                    },
-                );
+
+        self.journal.append_cancel_string(execution_id);
+        if removed_queued {
+            {
+                let mut lifecycle = self.lifecycle.lock().expect("execution lifecycle poisoned");
+                lifecycle.cancelled.remove(execution_id);
+                lifecycle.live.remove(execution_id);
             }
-            true
-        } else {
-            false
+            record_execution_outcome(
+                &self.results,
+                execution_id,
+                ExecutionOutcome {
+                    output: Vec::new(),
+                    error: Some("execution cancelled before start".into()),
+                    elapsed_ms: 0,
+                    cancelled: true,
+                },
+            );
         }
+        true
     }
 
     pub fn wait_for_result(
@@ -851,22 +876,23 @@ fn parse_execution_id(value: &str) -> Result<(u64, u64), ()> {
     Ok((epoch_ns, sequence))
 }
 
-fn is_cancelled(cancelled: &Arc<Mutex<HashSet<String>>>, task: &ExecutionTask) -> bool {
-    cancelled
+fn is_cancelled(lifecycle: &SharedLifecycle, task: &ExecutionTask) -> bool {
+    lifecycle
         .lock()
-        .expect("cancel table poisoned")
+        .expect("execution lifecycle poisoned")
+        .cancelled
         .contains(&task.id.to_string())
 }
 
 fn run_simulated_work(
     task: &ExecutionTask,
-    cancelled: &Arc<Mutex<HashSet<String>>>,
+    lifecycle: &SharedLifecycle,
 ) -> Result<Vec<u8>, String> {
     let started = Instant::now();
     let work = Duration::from_millis(task.work_ms);
     let timeout = Duration::from_millis(task.limits.wall_time_ms.max(1));
     loop {
-        if is_cancelled(cancelled, task) {
+        if is_cancelled(lifecycle, task) {
             return Err("execution cancelled".into());
         }
         let elapsed = started.elapsed();
@@ -885,7 +911,7 @@ fn run_simulated_work(
 
 fn run_isolated_worker(
     task: &ExecutionTask,
-    cancelled: &Arc<Mutex<HashSet<String>>>,
+    lifecycle: &SharedLifecycle,
 ) -> Result<Vec<u8>, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let artifact = &task.artifact_hash;
@@ -944,7 +970,7 @@ fn run_isolated_worker(
     let timeout = Duration::from_millis(task.limits.wall_time_ms.max(1));
 
     loop {
-        if is_cancelled(cancelled, task) {
+        if is_cancelled(lifecycle, task) {
             let _ = child.kill();
             let _ = child.wait();
             let _ = result_reader.join();
