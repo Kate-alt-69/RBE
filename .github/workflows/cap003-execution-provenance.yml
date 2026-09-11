@@ -1,0 +1,96 @@
+name: CAP-003 execution provenance
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap003-execution-provenance.py'
+      - '.github/workflows/cap003-execution-provenance.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap003-execution-provenance
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+
+      - name: Apply CAP-003 provenance hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+
+          # The patch appends focused runtime tests at the final module boundary.
+          # Teach its strict replacement helper to use the last generic closing
+          # brace only for that one append operation; every other anchor remains
+          # exact-count fail-closed.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/patches/cap003-execution-provenance.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''    if found != count:\n        raise SystemExit(f"{path}: expected {count} anchors, found {found}: {old[:160]!r}")\n    p.write_text(text.replace(old, new, count), encoding="utf-8")\n'''
+          new = '''    if found != count:\n        if path.endswith("runtime.rs") and old == "    }\\n}\\n" and count == 1:\n            head, sep, tail = text.rpartition(old)\n            if not sep:\n                raise SystemExit(f"{path}: final runtime module boundary not found")\n            p.write_text(head + new + tail, encoding="utf-8")\n            return\n        raise SystemExit(f"{path}: expected {count} anchors, found {found}: {old[:160]!r}")\n    p.write_text(text.replace(old, new, count), encoding="utf-8")\n'''
+          if text.count(old) != 1:
+              raise SystemExit('CAP-003 patch helper anchor changed')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
+          python3 .github/patches/cap003-execution-provenance.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+
+      - name: Check Container workspace
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+      - name: Test Container workspace
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Verify CAP-003 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub struct ExecutionProvenance' container-runtime/crates/container-runtime-core/src/execution.rs
+          grep -q 'pub provenance: Option<ExecutionProvenance>' container-runtime/crates/container-runtime-core/src/execution.rs
+          grep -q 'environment_generation: Option<u64>' container-runtime/crates/container-runtime-core/src/runtime.rs
+          grep -q 'journal_recovery_preserves_execution_provenance' container-runtime/crates/container-runtime-core/src/runtime.rs
+          grep -q 'CAPABILITY_MANIFEST_CONFLICT' container-runtime/crates/container-runtime-core/src/control_plane.rs
+          grep -q 'manifest_registration_is_idempotent_but_immutable' container-runtime/crates/container-runtime-core/src/control_plane.rs
+          grep -q 'const CHILD_PROTOCOL_VERSION: u16 = 2' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'provenance.generation != endpoint.generation' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'execution provenance is required for Environment dispatch' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'Some(provenance)' container-runtime/crates/container-bin/src/main.rs
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap003-execution-provenance.yml
+          git rm .github/patches/cap003-execution-provenance.py
+          git add container-runtime
+          git commit -m "FIX | BUG-CAP-003 preserve execution provenance and manifest authority"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
