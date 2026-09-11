@@ -1,0 +1,82 @@
+name: CAP-016 synchronous timeout cancellation
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap016-timeout-cancellation.py'
+      - '.github/workflows/cap016-timeout-cancellation.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap016-timeout-cancellation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply CAP-016 timeout cancellation hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap016-timeout-cancellation.py
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check Engine timeout path locked
+        run: cargo check --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --all-targets --locked
+      - name: Test Engine timeout path locked
+        run: cargo test --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --locked
+      - name: Clippy Engine timeout path locked
+        run: cargo clippy --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --all-targets --locked -- -D warnings
+
+      - name: Verify CAP-016 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub const PUBLIC_HTTP_MAX_TIMEOUT_MS: u64 = 10_000' engine/crates/core/src/network_broker.rs
+          grep -q 'pub async fn cancel_execution' engine/crates/core/src/container_client.rs
+          grep -q 'Request::Cancel(CancelRequest' engine/crates/core/src/container_client.rs
+          grep -q 'cancellation was accepted' engine/crates/core/src/container_client.rs
+          grep -q 'Duration::from_millis(100)' engine/crates/core/src/container_client.rs
+          grep -q 'execute_and_wait_cancels_execution_when_synchronous_deadline_expires' engine/crates/core/src/container_client.rs
+          grep -q 'cancellation_not_found_recovers_completion_race' engine/crates/core/src/container_client.rs
+          grep -q 'NATIVE_ROUTE_TIMEOUT_HEADROOM_MS: u64 = 2_000' engine/crates/route-engine/src/discovery.rs
+          grep -q 'PUBLIC_HTTP_MAX_TIMEOUT_MS.saturating_add' engine/crates/route-engine/src/discovery.rs
+          grep -q 'native_route_wait_budget_exceeds_public_http_broker_timeout' engine/crates/route-engine/src/discovery.rs
+          grep -q 'authenticated Container cancellation' doc/runtime-image.md
+          git diff --check
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap016-timeout-cancellation.yml
+          git rm -f .github/patches/cap016-timeout-cancellation.py
+          git add engine doc/runtime-image.md
+          git commit -m "FIX | BUG-CAP-016 cancel synchronous Container work on timeout"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
