@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
+use sha2::{Digest, Sha256};
+
 use crate::ast::{ModuleFile, RouteFile, ServiceProgram};
 use crate::dependency_graph::{SymbolDependencyGraph, SymbolId};
 use crate::middleware_plan::MiddlewarePlan;
@@ -35,7 +37,7 @@ pub enum RuntimeExecutable {
 #[derive(Debug, Clone)]
 pub struct RuntimeImage {
     pub image_id: String,
-    pub source_hash: u64,
+    pub source_hash: String,
     pub server_policy: ServerPolicy,
     pub environment: RuntimeEnv,
     pub routes: Vec<SourceId>,
@@ -136,43 +138,39 @@ impl RuntimeImageSlot {
 
 pub(crate) fn stable_source_hash<'a>(
     sources: impl Iterator<Item = (&'a SourceId, &'a str)>,
-) -> u64 {
-    // Explicit FNV-1a avoids relying on std's non-contractual DefaultHasher
-    // algorithm for Runtime Image identity.
-    let mut hash = 0xcbf29ce484222325u64;
+) -> String {
+    // Runtime Image authority is security-sensitive. Canonicalize the source
+    // set and bind the complete SourceId + source bytes with SHA-256 instead of
+    // the former 64-bit non-cryptographic FNV identity.
+    let mut sources = sources.collect::<Vec<_>>();
+    sources.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+    let mut hash = Sha256::new();
+    feed_hash(&mut hash, b"RBE_SOURCE_SET_V1");
+    feed_hash(&mut hash, &(sources.len() as u64).to_be_bytes());
     for (id, source) in sources {
-        for byte in id
-            .as_str()
-            .bytes()
-            .chain([0])
-            .chain(source.bytes())
-            .chain([0xff])
-        {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
+        feed_hash(&mut hash, id.as_str().as_bytes());
+        feed_hash(&mut hash, source.as_bytes());
     }
-    hash
+    hex::encode(hash.finalize())
 }
 
-pub(crate) fn stable_image_hash(source_hash: u64, settings: &serde_json::Value) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    feed_hash(&mut hash, b"RBE_RUNTIME_IMAGE_V2");
-    feed_hash(&mut hash, &source_hash.to_be_bytes());
+pub(crate) fn stable_image_hash(source_hash: &str, settings: &serde_json::Value) -> String {
+    let mut hash = Sha256::new();
+    feed_hash(&mut hash, b"RBE_RUNTIME_IMAGE_V3");
+    feed_hash(&mut hash, source_hash.as_bytes());
     feed_hash(&mut hash, &ROUTE_WASM_ABI_VERSION.to_be_bytes());
     feed_hash(&mut hash, &ROUTE_WASM_COMPILER_VERSION.to_be_bytes());
     hash_json(&mut hash, settings);
-    hash
+    hex::encode(hash.finalize())
 }
 
-fn feed_hash(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x100000001b3);
-    }
+fn feed_hash(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
 }
 
-fn hash_json(hash: &mut u64, value: &serde_json::Value) {
+fn hash_json(hash: &mut Sha256, value: &serde_json::Value) {
     match value {
         serde_json::Value::Null => feed_hash(hash, b"N"),
         serde_json::Value::Bool(value) => feed_hash(hash, if *value { b"T" } else { b"F" }),
@@ -214,18 +212,17 @@ mod tests {
 
     #[test]
     fn image_hash_is_sensitive_to_settings_and_key_order_is_stable() {
-        let source_hash = 42;
+        let source_hash = "2a".repeat(32);
         let first = serde_json::json!({"runtimeEnv": {"A": 1, "B": true}});
         let reordered = serde_json::json!({"runtimeEnv": {"B": true, "A": 1}});
         let changed = serde_json::json!({"runtimeEnv": {"A": 2, "B": true}});
-        assert_eq!(
-            stable_image_hash(source_hash, &first),
-            stable_image_hash(source_hash, &reordered)
-        );
-        assert_ne!(
-            stable_image_hash(source_hash, &first),
-            stable_image_hash(source_hash, &changed)
-        );
+        let first_hash = stable_image_hash(&source_hash, &first);
+        assert_eq!(first_hash, stable_image_hash(&source_hash, &reordered));
+        assert_ne!(first_hash, stable_image_hash(&source_hash, &changed));
+        assert_eq!(first_hash.len(), 64);
+        assert!(first_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
     }
 
     #[test]
@@ -236,5 +233,9 @@ mod tests {
         let other = stable_source_hash(std::iter::once((&id, "two")));
         assert_eq!(first, same);
         assert_ne!(first, other);
+        assert_eq!(first.len(), 64);
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
     }
 }

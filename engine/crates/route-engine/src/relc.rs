@@ -362,9 +362,10 @@ pub fn compile_runtime_image(
     // PASS 10: immutable Runtime Image link.
     let source_hash =
         stable_source_hash(registry.iter().map(|source| (source.id(), source.source())));
-    let image_hash = stable_image_hash(source_hash, settings_json);
+    let image_hash = stable_image_hash(&source_hash, settings_json);
     Ok(RuntimeImage {
-        image_id: format!("rbe-{image_hash:016x}"),
+        // The Controller Capability Firewall uses this exact SHA-256 identity.
+        image_id: image_hash,
         source_hash,
         server_policy,
         environment,

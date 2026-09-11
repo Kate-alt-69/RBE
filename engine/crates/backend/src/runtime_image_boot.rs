@@ -31,7 +31,7 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
         .map_err(|error| anyhow::anyhow!("Runtime Image compile failed: {error}"))?;
     tracing::info!(
         image = %image.image_id,
-        source_hash = format_args!("{:016x}", image.source_hash),
+        source_hash = %image.source_hash,
         routes = image.routes.len(),
         modules = image.modules.len(),
         services = image.services.len(),
