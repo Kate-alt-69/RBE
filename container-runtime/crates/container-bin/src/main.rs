@@ -19,7 +19,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use container_runtime_core::{
-    CapabilityBroker, EnvironmentId, EnvironmentRegistry, Runtime, RuntimeConfig, WorkCost,
+    CapabilityBroker, EnvironmentId, EnvironmentRegistry, ExecutionProvenance, Runtime,
+    RuntimeConfig, WorkCost,
 };
 use execution_engine::{ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
@@ -642,12 +643,20 @@ fn handle_connection(
                     io: request.declared_cost.io,
                     network: request.declared_cost.network,
                 };
+                let provenance = ExecutionProvenance {
+                    runtime_image: request.runtime_image,
+                    source_id: request.source_id,
+                    capability_abi: request.capability_abi,
+                    environment: request.environment.clone(),
+                    generation,
+                };
                 let execution_id = runtime.submit_with_policy(
                     environment,
                     request.artifact_hash,
                     cost,
                     ResourceLimits::default(),
                     SandboxPolicy::default(),
+                    Some(provenance),
                     0,
                     request.input,
                 );

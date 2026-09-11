@@ -14,13 +14,13 @@ use container_runtime_core::{
 };
 use ipc_protocol::{
     read_frame, read_worker_result, write_frame, write_worker_input, WorkerResultFrame,
-    MAX_EXECUTION_INPUT_BYTES,
+    CAPABILITY_ABI_VERSION, MAX_EXECUTION_INPUT_BYTES,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CHILD_PROTOCOL_VERSION: u16 = 1;
+const CHILD_PROTOCOL_VERSION: u16 = 2;
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_MAX_BYTES: usize = 128;
@@ -42,6 +42,9 @@ enum ChildRequest {
     Execute {
         request_id: String,
         session: String,
+        runtime_image: String,
+        source_id: String,
+        capability_abi: u16,
         environment: String,
         generation: u64,
         artifact_hash: String,
@@ -115,15 +118,26 @@ struct ExecutionOwner {
     generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveExecutionIdentity {
+    generation: u64,
+    runtime_image: String,
+    source_id: String,
+    capability_abi: u16,
+}
+
 struct EnvironmentChildState {
     storage: Arc<EnvironmentStorageManager>,
-    active_executions: Mutex<HashMap<String, u64>>,
+    active_executions: Mutex<HashMap<String, ActiveExecutionIdentity>>,
     cancelled: Mutex<HashMap<String, Instant>>,
 }
 
 struct WorkerExecution<'a> {
     execution_id: &'a str,
     generation: u64,
+    runtime_image: &'a str,
+    source_id: &'a str,
+    capability_abi: u16,
     artifact_hash: &'a str,
     fuel: u64,
     max_memory_bytes: u64,
@@ -333,6 +347,25 @@ impl EnvironmentProcessSupervisor {
             }
         };
 
+        let provenance = task.provenance.as_ref().ok_or_else(|| {
+            "execution provenance is required for Environment dispatch".to_string()
+        })?;
+        if provenance.environment != task.environment {
+            return Err("execution provenance Environment does not match the queued task".into());
+        }
+        if provenance.generation != endpoint.generation {
+            return Err(format!(
+                "execution provenance generation {} is stale; live Environment generation is {}",
+                provenance.generation, endpoint.generation
+            ));
+        }
+        if provenance.capability_abi != CAPABILITY_ABI_VERSION
+            || !valid_runtime_image(&provenance.runtime_image)
+            || !valid_source_id(&provenance.source_id)
+        {
+            return Err("execution provenance identity is invalid".into());
+        }
+
         let mut stream = TcpStream::connect_timeout(&endpoint.address, CONNECT_TIMEOUT)
             .map_err(|error| format!("connect Environment {}: {error}", task.environment))?;
         let io_timeout =
@@ -365,8 +398,11 @@ impl EnvironmentProcessSupervisor {
         let request = ChildRequest::Execute {
             request_id: request_id.clone(),
             session: endpoint.session,
+            runtime_image: provenance.runtime_image.clone(),
+            source_id: provenance.source_id.clone(),
+            capability_abi: provenance.capability_abi,
             environment: task.environment.clone(),
-            generation: endpoint.generation,
+            generation: provenance.generation,
             artifact_hash: task.artifact_hash.clone(),
             fuel: task.limits.cpu_millis.saturating_mul(10_000).max(1_000_000),
             max_memory_bytes: task.limits.memory_bytes.max(64 * 1024),
@@ -606,6 +642,9 @@ fn handle_child_connection(
         ChildRequest::Execute {
             request_id,
             session,
+            runtime_image,
+            source_id,
+            capability_abi,
             environment,
             generation,
             artifact_hash,
@@ -626,6 +665,15 @@ fn handle_child_connection(
                     "ENVIRONMENT_IDENTITY_MISMATCH",
                     "Environment/generation does not match the child process",
                 )
+            } else if capability_abi != CAPABILITY_ABI_VERSION
+                || !valid_runtime_image(&runtime_image)
+                || !valid_source_id(&source_id)
+            {
+                child_error(
+                    Some(request_id),
+                    "EXECUTION_PROVENANCE_INVALID",
+                    "Runtime Image/SourceId/capability ABI provenance is invalid",
+                )
             } else if input.len() > MAX_EXECUTION_INPUT_BYTES {
                 child_error(
                     Some(request_id),
@@ -642,6 +690,9 @@ fn handle_child_connection(
                 let worker = WorkerExecution {
                     execution_id: &request_id,
                     generation,
+                    runtime_image: &runtime_image,
+                    source_id: &source_id,
+                    capability_abi,
                     artifact_hash: &artifact_hash,
                     fuel,
                     max_memory_bytes,
@@ -723,8 +774,13 @@ fn handle_child_connection(
                     .lock()
                     .map_err(|_| anyhow!("Environment active execution table poisoned"))?
                     .get(&execution_id)
-                    .copied()
-                    == Some(generation);
+                    .map(|identity| {
+                        identity.generation == generation
+                            && identity.capability_abi == CAPABILITY_ABI_VERSION
+                            && valid_runtime_image(&identity.runtime_image)
+                            && valid_source_id(&identity.source_id)
+                    })
+                    .unwrap_or(false);
                 ChildResponse::CancelAccepted {
                     request_id,
                     execution_id,
@@ -749,6 +805,9 @@ fn execute_isolated_worker(
     let WorkerExecution {
         execution_id,
         generation,
+        runtime_image,
+        source_id,
+        capability_abi,
         artifact_hash,
         fuel,
         max_memory_bytes,
@@ -786,7 +845,15 @@ fn execute_isolated_worker(
     active_executions
         .lock()
         .map_err(|_| "Environment active execution table poisoned".to_string())?
-        .insert(execution_id.to_string(), generation);
+        .insert(
+            execution_id.to_string(),
+            ActiveExecutionIdentity {
+                generation,
+                runtime_image: runtime_image.to_string(),
+                source_id: source_id.to_string(),
+                capability_abi,
+            },
+        );
     let result = (|| -> Result<Vec<u8>, String> {
         if take_cancelled(cancelled, execution_id)? {
             let _ = child.kill();
@@ -889,6 +956,20 @@ fn is_cancelled(
     Ok(table.contains_key(execution_id))
 }
 
+fn valid_runtime_image(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_source_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && !value.contains('\0')
+        && !value.chars().any(char::is_control)
+}
+
 fn child_error(request_id: Option<String>, code: &str, message: &str) -> ChildResponse {
     ChildResponse::Error {
         request_id,
@@ -984,6 +1065,15 @@ mod tests {
         );
         assert_eq!(parse_environment("payment"), Some(EnvironmentId::Payment));
         assert_eq!(parse_environment("visitor-ip-123"), None);
+    }
+
+    #[test]
+    fn execution_provenance_format_is_strict() {
+        assert!(valid_runtime_image(&"ab".repeat(32)));
+        assert!(!valid_runtime_image(&"AB".repeat(32)));
+        assert!(valid_source_id("route:api/me"));
+        assert!(!valid_source_id(""));
+        assert!(!valid_source_id("route:\napi"));
     }
 
     #[test]

@@ -63,6 +63,18 @@ impl WorkCost {
     }
 }
 
+/// Controller-stamped identity that authorized one execution. The caller
+/// supplies Runtime Image / SourceId / ABI, but only Container Controller may
+/// bind those values to an Environment generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionProvenance {
+    pub runtime_image: String,
+    pub source_id: String,
+    pub capability_abi: u16,
+    pub environment: String,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionState {
     Queued,
@@ -79,6 +91,9 @@ pub enum ExecutionState {
 pub struct ExecutionTask {
     pub id: ExecutionId,
     pub environment: String,
+    /// None exists only for trusted internal/simulated work and legacy journal
+    /// decoding. Production Environment dispatch rejects unattributed tasks.
+    pub provenance: Option<ExecutionProvenance>,
     pub artifact_hash: String,
     pub declared_cost: WorkCost,
     pub limits: ResourceLimits,

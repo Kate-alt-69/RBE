@@ -229,6 +229,7 @@ mod tests {
         ExecutionTask {
             id: ExecutionId::from_parts(1, sequence),
             environment: "general-1".into(),
+            provenance: None,
             artifact_hash: "test".into(),
             declared_cost: WorkCost {
                 cpu: cost,

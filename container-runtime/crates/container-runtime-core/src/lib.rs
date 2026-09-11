@@ -24,7 +24,8 @@ pub use cache::{ArtifactCache, ExecutionProfile};
 pub use control_plane::{AuthorizedCapability, CapabilityBroker, CapabilityCall, CapabilityError};
 pub use environment::EnvironmentSnapshot;
 pub use execution::{
-    ExecutionId, ExecutionOutcome, ExecutionRecord, ExecutionState, ExecutionTask, WorkCost,
+    ExecutionId, ExecutionOutcome, ExecutionProvenance, ExecutionRecord, ExecutionState,
+    ExecutionTask, WorkCost,
 };
 pub use runtime::{Runtime, RuntimeConfig, DEFAULT_ENVIRONMENT_STORAGE_BYTES};
 pub use storage::{EnvironmentStorageManager, StorageCommit, StorageSnapshot, StorageTransaction};

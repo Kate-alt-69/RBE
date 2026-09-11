@@ -20,7 +20,7 @@ struct ManifestKey {
     generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CapabilityManifest {
     grants: Vec<CapabilityGrant>,
 }
@@ -131,16 +131,26 @@ impl CapabilityBroker {
             environment: request.environment.clone(),
             generation,
         };
-        self.manifests
+        let proposed = CapabilityManifest {
+            grants: request.grants.clone(),
+        };
+        let mut manifests = self
+            .manifests
             .write()
-            .expect("capability manifest table poisoned")
-            .insert(
-                key,
-                CapabilityManifest {
-                    grants: request.grants.clone(),
-                },
-            );
-        Ok(request.grants.len())
+            .expect("capability manifest table poisoned");
+        match manifests.get(&key) {
+            Some(existing) if existing == &proposed => Ok(request.grants.len()),
+            Some(_) => Err(CapabilityError {
+                code: "CAPABILITY_MANIFEST_CONFLICT",
+                message:
+                    "an exact Runtime Image/SourceId/Environment generation manifest is immutable"
+                        .into(),
+            }),
+            None => {
+                manifests.insert(key, proposed);
+                Ok(request.grants.len())
+            }
+        }
     }
 
     /// Verify that an execution identity is explicitly bound to a manifest
@@ -511,6 +521,23 @@ mod tests {
                 .code,
             "CAPABILITY_ABI_UNSUPPORTED"
         );
+    }
+
+    #[test]
+    fn manifest_registration_is_idempotent_but_immutable() {
+        let broker = CapabilityBroker::new(false);
+        let original = request(vec![service_grant()]);
+        assert_eq!(broker.register_manifest(&original, 4).unwrap(), 1);
+        assert_eq!(broker.register_manifest(&original, 4).unwrap(), 1);
+        assert_eq!(broker.manifest_count(), 1);
+
+        let mut changed = request(vec![service_grant()]);
+        changed.grants[0].max_request_bytes = 2048;
+        assert_eq!(
+            broker.register_manifest(&changed, 4).unwrap_err().code,
+            "CAPABILITY_MANIFEST_CONFLICT"
+        );
+        assert_eq!(broker.manifest_count(), 1);
     }
 
     #[test]

@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 
 use crate::cache::ArtifactCache;
 use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot, EnvironmentStorage};
-use crate::execution::{ExecutionId, ExecutionOutcome, ExecutionTask, WorkCost};
+use crate::execution::{
+    ExecutionId, ExecutionOutcome, ExecutionProvenance, ExecutionTask, WorkCost,
+};
 use crate::worker::{Canceller, Completion, Runner, WorkerState};
 
 pub const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
@@ -96,6 +98,14 @@ struct JournalEvent {
     epoch_ns: u64,
     sequence: u64,
     environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability_abi: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment_generation: Option<u64>,
     artifact_hash: String,
     cpu: u64,
     memory: u64,
@@ -196,6 +206,10 @@ impl Journal {
             epoch_ns,
             sequence,
             environment: "unknown".into(),
+            runtime_image: None,
+            source_id: None,
+            capability_abi: None,
+            environment_generation: None,
             artifact_hash: "unknown".into(),
             cpu: 0,
             memory: 0,
@@ -250,6 +264,10 @@ fn checkpoint_event(sequence: u64) -> JournalEvent {
         epoch_ns: 0,
         sequence,
         environment: "checkpoint".into(),
+        runtime_image: None,
+        source_id: None,
+        capability_abi: None,
+        environment_generation: None,
         artifact_hash: "checkpoint".into(),
         cpu: 0,
         memory: 0,
@@ -268,9 +286,28 @@ fn checkpoint_event(sequence: u64) -> JournalEvent {
 
 fn event_to_task(event: JournalEvent) -> Option<ExecutionTask> {
     let environment = parse_environment(&event.environment)?;
+    let provenance_environment = event.environment.clone();
+    let provenance = match (
+        event.runtime_image,
+        event.source_id,
+        event.capability_abi,
+        event.environment_generation,
+    ) {
+        (Some(runtime_image), Some(source_id), Some(capability_abi), Some(generation)) => {
+            Some(ExecutionProvenance {
+                runtime_image,
+                source_id,
+                capability_abi,
+                environment: provenance_environment,
+                generation,
+            })
+        }
+        _ => None,
+    };
     Some(ExecutionTask {
         id: ExecutionId::from_parts(event.epoch_ns, event.sequence),
         environment: environment.to_string(),
+        provenance,
         artifact_hash: event.artifact_hash,
         declared_cost: WorkCost {
             cpu: event.cpu,
@@ -429,6 +466,22 @@ impl Runtime {
                     epoch_ns: task.id.epoch_ns(),
                     sequence: task.id.sequence(),
                     environment: task.environment.clone(),
+                    runtime_image: task
+                        .provenance
+                        .as_ref()
+                        .map(|provenance| provenance.runtime_image.clone()),
+                    source_id: task
+                        .provenance
+                        .as_ref()
+                        .map(|provenance| provenance.source_id.clone()),
+                    capability_abi: task
+                        .provenance
+                        .as_ref()
+                        .map(|provenance| provenance.capability_abi),
+                    environment_generation: task
+                        .provenance
+                        .as_ref()
+                        .map(|provenance| provenance.generation),
                     artifact_hash: task.artifact_hash.clone(),
                     cpu: task.declared_cost.cpu,
                     memory: task.declared_cost.memory,
@@ -548,6 +601,7 @@ impl Runtime {
             cost,
             ResourceLimits::default(),
             SandboxPolicy::default(),
+            None,
             work_ms,
             Vec::new(),
         )
@@ -561,6 +615,7 @@ impl Runtime {
         cost: WorkCost,
         limits: ResourceLimits,
         sandbox: SandboxPolicy,
+        provenance: Option<ExecutionProvenance>,
         work_ms: u64,
         payload: Vec<u8>,
     ) -> ExecutionId {
@@ -576,6 +631,16 @@ impl Runtime {
             epoch_ns: id.epoch_ns(),
             sequence: id.sequence(),
             environment: environment.to_string(),
+            runtime_image: provenance
+                .as_ref()
+                .map(|provenance| provenance.runtime_image.clone()),
+            source_id: provenance
+                .as_ref()
+                .map(|provenance| provenance.source_id.clone()),
+            capability_abi: provenance
+                .as_ref()
+                .map(|provenance| provenance.capability_abi),
+            environment_generation: provenance.as_ref().map(|provenance| provenance.generation),
             artifact_hash: artifact_hash.clone(),
             cpu: cost.cpu,
             memory: cost.memory,
@@ -598,6 +663,7 @@ impl Runtime {
                 ExecutionTask {
                     id,
                     environment: environment.to_string(),
+                    provenance,
                     artifact_hash,
                     declared_cost: cost,
                     limits,
@@ -1003,5 +1069,52 @@ fn run_isolated_worker(
             }
             None => thread::sleep(Duration::from_millis(10)),
         }
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    fn journal_event(with_provenance: bool) -> JournalEvent {
+        JournalEvent {
+            kind: "queued".into(),
+            epoch_ns: 7,
+            sequence: 9,
+            environment: "general-1".into(),
+            runtime_image: with_provenance.then(|| "ab".repeat(32)),
+            source_id: with_provenance.then(|| "route:api/me".into()),
+            capability_abi: with_provenance.then_some(1),
+            environment_generation: with_provenance.then_some(4),
+            artifact_hash: "cd".repeat(32),
+            cpu: 1,
+            memory: 2,
+            io: 3,
+            network: 4,
+            work_ms: 0,
+            limit_cpu_millis: 100,
+            limit_memory_bytes: 1024,
+            limit_disk_bytes: 1024,
+            limit_network_bytes: 1024,
+            limit_max_processes: 1,
+            limit_max_file_descriptors: 16,
+            limit_wall_time_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn journal_recovery_preserves_execution_provenance() {
+        let task = event_to_task(journal_event(true)).expect("recover task");
+        let provenance = task.provenance.expect("recover provenance");
+        assert_eq!(provenance.runtime_image, "ab".repeat(32));
+        assert_eq!(provenance.source_id, "route:api/me");
+        assert_eq!(provenance.environment, "general-1");
+        assert_eq!(provenance.generation, 4);
+    }
+
+    #[test]
+    fn legacy_journal_recovery_remains_unattributed() {
+        let task = event_to_task(journal_event(false)).expect("recover legacy task");
+        assert!(task.provenance.is_none());
     }
 }
