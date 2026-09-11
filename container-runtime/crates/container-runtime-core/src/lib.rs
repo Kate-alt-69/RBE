@@ -29,7 +29,7 @@ pub use execution::{
 pub use runtime::{Runtime, RuntimeConfig, DEFAULT_ENVIRONMENT_STORAGE_BYTES};
 pub use storage::{EnvironmentStorageManager, StorageCommit, StorageSnapshot, StorageTransaction};
 pub use swamp::SwampSnapshot;
-pub use worker::{Runner, WorkerSnapshot, WorkerState};
+pub use worker::{Canceller, Runner, WorkerSnapshot, WorkerState};
 
 pub use environments::{
     AbuseDimension, AbuseVerdict, EncryptedPayload, EnvironmentId, EnvironmentKind,

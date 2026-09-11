@@ -5,11 +5,11 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use container_runtime_core::{
-    EnvironmentId, EnvironmentStorageManager, ExecutionTask, Runner,
+    Canceller, EnvironmentId, EnvironmentStorageManager, ExecutionTask, Runner,
     DEFAULT_ENVIRONMENT_STORAGE_BYTES,
 };
 use ipc_protocol::{
@@ -24,6 +24,7 @@ const CHILD_PROTOCOL_VERSION: u16 = 1;
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_MAX_BYTES: usize = 128;
+const PENDING_CANCEL_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Bootstrap {
@@ -57,6 +58,13 @@ enum ChildRequest {
         request_id: String,
         session: String,
     },
+    Cancel {
+        request_id: String,
+        session: String,
+        environment: String,
+        generation: u64,
+        execution_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +90,11 @@ enum ChildResponse {
     VolatileReset {
         request_id: String,
     },
+    CancelAccepted {
+        request_id: String,
+        execution_id: String,
+        active: bool,
+    },
     Error {
         request_id: Option<String>,
         code: String,
@@ -94,6 +107,30 @@ struct Endpoint {
     address: SocketAddr,
     session: String,
     generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExecutionOwner {
+    environment: EnvironmentId,
+    generation: u64,
+}
+
+struct EnvironmentChildState {
+    storage: Arc<EnvironmentStorageManager>,
+    active_executions: Mutex<HashMap<String, u64>>,
+    cancelled: Mutex<HashMap<String, Instant>>,
+}
+
+struct WorkerExecution<'a> {
+    execution_id: &'a str,
+    generation: u64,
+    artifact_hash: &'a str,
+    fuel: u64,
+    max_memory_bytes: u64,
+    timeout_ms: u64,
+    input: &'a [u8],
+    debug: bool,
+    environment: &'a str,
 }
 
 struct ManagedEnvironment {
@@ -126,6 +163,8 @@ pub struct EnvironmentProcessSupervisor {
     session_root: [u8; 32],
     next_session: AtomicU64,
     processes: Mutex<HashMap<EnvironmentId, ManagedEnvironment>>,
+    executions: Mutex<HashMap<String, ExecutionOwner>>,
+    cancelled: Mutex<HashMap<String, Instant>>,
 }
 
 impl EnvironmentProcessSupervisor {
@@ -139,6 +178,8 @@ impl EnvironmentProcessSupervisor {
             session_root: make_session_root(controller_token),
             next_session: AtomicU64::new(1),
             processes: Mutex::new(HashMap::new()),
+            executions: Mutex::new(HashMap::new()),
+            cancelled: Mutex::new(HashMap::new()),
         });
         for id in active_environment_ids(general_environments) {
             let managed = supervisor.spawn_one(id, 0)?;
@@ -154,6 +195,72 @@ impl EnvironmentProcessSupervisor {
     pub fn runner(self: &Arc<Self>) -> Runner {
         let supervisor = Arc::clone(self);
         Arc::new(move |task| supervisor.execute(task))
+    }
+
+    pub fn canceller(self: &Arc<Self>) -> Canceller {
+        let supervisor = Arc::clone(self);
+        Arc::new(move |execution_id| supervisor.cancel_execution(execution_id))
+    }
+
+    fn cancel_execution(&self, execution_id: &str) -> Result<bool, String> {
+        mark_cancelled(&self.cancelled, execution_id)?;
+        let owner = self
+            .executions
+            .lock()
+            .map_err(|_| "Environment execution ownership table poisoned".to_string())?
+            .get(execution_id)
+            .copied();
+        let Some(owner) = owner else {
+            return Ok(true);
+        };
+        let endpoint = {
+            let table = self
+                .processes
+                .lock()
+                .map_err(|_| "Environment process table poisoned".to_string())?;
+            let managed = table.get(&owner.environment).ok_or_else(|| {
+                format!("Environment process {} is unavailable", owner.environment)
+            })?;
+            if managed.endpoint.generation != owner.generation {
+                return Ok(false);
+            }
+            managed.endpoint.clone()
+        };
+        let mut stream = TcpStream::connect_timeout(&endpoint.address, CONNECT_TIMEOUT)
+            .map_err(|error| format!("connect Environment for cancellation: {error}"))?;
+        stream
+            .set_read_timeout(Some(CONNECT_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(CONNECT_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        let request_id = format!("cancel-{execution_id}");
+        write_frame(
+            &mut stream,
+            &ChildRequest::Cancel {
+                request_id: request_id.clone(),
+                session: endpoint.session,
+                environment: owner.environment.to_string(),
+                generation: owner.generation,
+                execution_id: execution_id.to_string(),
+            },
+        )
+        .map_err(|e| format!("send Environment cancellation: {e}"))?;
+        match read_typed::<ChildResponse, _>(&mut BufReader::new(stream))
+            .map_err(|e| format!("read Environment cancellation: {e}"))?
+        {
+            ChildResponse::CancelAccepted {
+                request_id: returned,
+                execution_id: returned_exec,
+                ..
+            } if returned == request_id && returned_exec == execution_id => Ok(true),
+            ChildResponse::Error {
+                request_id: Some(returned),
+                code,
+                message,
+            } if returned == request_id => Err(format!("{code}: {message}")),
+            _ => Err("Environment returned a mismatched cancellation response".into()),
+        }
     }
 
     pub fn restart(&self, id: EnvironmentId, generation: u64) -> Result<()> {
@@ -238,6 +345,23 @@ impl EnvironmentProcessSupervisor {
             .map_err(|error| format!("set Environment write timeout: {error}"))?;
 
         let request_id = task.id.to_string();
+        self.executions
+            .lock()
+            .map_err(|_| "Environment execution ownership table poisoned".to_string())?
+            .insert(
+                request_id.clone(),
+                ExecutionOwner {
+                    environment: id,
+                    generation: endpoint.generation,
+                },
+            );
+        if take_cancelled(&self.cancelled, &request_id)? {
+            self.executions
+                .lock()
+                .map_err(|_| "Environment execution ownership table poisoned".to_string())?
+                .remove(&request_id);
+            return Err("execution cancelled before Environment dispatch".into());
+        }
         let request = ChildRequest::Execute {
             request_id: request_id.clone(),
             session: endpoint.session,
@@ -251,20 +375,26 @@ impl EnvironmentProcessSupervisor {
         };
         write_frame(&mut stream, &request)
             .map_err(|error| format!("send Environment execution: {error}"))?;
-        let response: ChildResponse = read_typed(&mut BufReader::new(stream))
-            .map_err(|error| format!("read Environment execution result: {error}"))?;
-        match response {
-            ChildResponse::Finished {
-                request_id: returned,
-                output,
-            } if returned == request_id => Ok(output),
-            ChildResponse::Error {
-                request_id: Some(returned),
-                code,
-                message,
-            } if returned == request_id => Err(format!("{code}: {message}")),
-            _ => Err("Environment process returned a mismatched response".into()),
-        }
+        let result = read_typed::<ChildResponse, _>(&mut BufReader::new(stream))
+            .map_err(|error| format!("read Environment execution result: {error}"))
+            .and_then(|response| match response {
+                ChildResponse::Finished {
+                    request_id: returned,
+                    output,
+                } if returned == request_id => Ok(output),
+                ChildResponse::Error {
+                    request_id: Some(returned),
+                    code,
+                    message,
+                } if returned == request_id => Err(format!("{code}: {message}")),
+                _ => Err("Environment process returned a mismatched response".into()),
+            });
+        self.executions
+            .lock()
+            .map_err(|_| "Environment execution ownership table poisoned".to_string())?
+            .remove(&request_id);
+        let _ = take_cancelled(&self.cancelled, &request_id);
+        result
     }
 
     fn spawn_one(&self, id: EnvironmentId, generation: u64) -> Result<ManagedEnvironment> {
@@ -442,13 +572,18 @@ pub fn run_environment_child() -> Result<()> {
         })?;
 
     let bootstrap = Arc::new(bootstrap);
+    let state = Arc::new(EnvironmentChildState {
+        storage,
+        active_executions: Mutex::new(HashMap::new()),
+        cancelled: Mutex::new(HashMap::new()),
+    });
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
                 let bootstrap = Arc::clone(&bootstrap);
-                let storage = Arc::clone(&storage);
+                let state = Arc::clone(&state);
                 thread::spawn(move || {
-                    if let Err(error) = handle_child_connection(stream, &bootstrap, &storage) {
+                    if let Err(error) = handle_child_connection(stream, &bootstrap, &state) {
                         tracing::warn!(%error, "Environment child connection failed");
                     }
                 });
@@ -462,7 +597,7 @@ pub fn run_environment_child() -> Result<()> {
 fn handle_child_connection(
     mut stream: TcpStream,
     bootstrap: &Bootstrap,
-    storage: &EnvironmentStorageManager,
+    state: &EnvironmentChildState,
 ) -> Result<()> {
     let request: ChildRequest = read_typed(&mut BufReader::new(stream.try_clone()?))?;
     let response = match request {
@@ -495,17 +630,29 @@ fn handle_child_connection(
                     "EXECUTION_INPUT_TOO_LARGE",
                     "Environment invocation exceeds Container input limit",
                 )
+            } else if take_cancelled(&state.cancelled, &request_id).unwrap_or(false) {
+                child_error(
+                    Some(request_id),
+                    "EXECUTION_CANCELLED",
+                    "execution cancelled before worker start",
+                )
             } else {
-                match execute_isolated_worker(
-                    &artifact_hash,
+                let worker = WorkerExecution {
+                    execution_id: &request_id,
+                    generation,
+                    artifact_hash: &artifact_hash,
                     fuel,
                     max_memory_bytes,
                     timeout_ms,
-                    &input,
-                    bootstrap.debug,
-                    &bootstrap.environment,
-                ) {
+                    input: &input,
+                    debug: bootstrap.debug,
+                    environment: &bootstrap.environment,
+                };
+                match execute_isolated_worker(worker, state) {
                     Ok(output) => ChildResponse::Finished { request_id, output },
+                    Err(error) if error == "execution cancelled" => {
+                        child_error(Some(request_id), "EXECUTION_CANCELLED", &error)
+                    }
                     Err(error) => child_error(Some(request_id), "EXECUTION_FAILED", &error),
                 }
             }
@@ -539,11 +686,47 @@ fn handle_child_connection(
                     "Environment session rejected",
                 )
             } else {
-                match storage.reset_volatile() {
+                match state.storage.reset_volatile() {
                     Ok(()) => ChildResponse::VolatileReset { request_id },
                     Err(error) => {
                         child_error(Some(request_id), "STORAGE_RESET_FAILED", &error.to_string())
                     }
+                }
+            }
+        }
+        ChildRequest::Cancel {
+            request_id,
+            session,
+            environment,
+            generation,
+            execution_id,
+        } => {
+            if !valid_session(bootstrap, &session) {
+                child_error(
+                    Some(request_id),
+                    "AUTH_FAILED",
+                    "Environment session rejected",
+                )
+            } else if environment != bootstrap.environment || generation != bootstrap.generation {
+                child_error(
+                    Some(request_id),
+                    "ENVIRONMENT_IDENTITY_MISMATCH",
+                    "Environment/generation does not match the child process",
+                )
+            } else if let Err(error) = mark_cancelled(&state.cancelled, &execution_id) {
+                child_error(Some(request_id), "CANCEL_STATE_FAILED", &error)
+            } else {
+                let active = state
+                    .active_executions
+                    .lock()
+                    .map_err(|_| anyhow!("Environment active execution table poisoned"))?
+                    .get(&execution_id)
+                    .copied()
+                    == Some(generation);
+                ChildResponse::CancelAccepted {
+                    request_id,
+                    execution_id,
+                    active,
                 }
             }
         }
@@ -558,14 +741,22 @@ fn handle_child_connection(
 }
 
 fn execute_isolated_worker(
-    artifact_hash: &str,
-    fuel: u64,
-    max_memory_bytes: u64,
-    timeout_ms: u64,
-    input: &[u8],
-    debug: bool,
-    environment: &str,
+    worker: WorkerExecution<'_>,
+    state: &EnvironmentChildState,
 ) -> Result<Vec<u8>, String> {
+    let WorkerExecution {
+        execution_id,
+        generation,
+        artifact_hash,
+        fuel,
+        max_memory_bytes,
+        timeout_ms,
+        input,
+        debug,
+        environment,
+    } = worker;
+    let active_executions = &state.active_executions;
+    let cancelled = &state.cancelled;
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = Command::new(exe);
     command
@@ -590,6 +781,19 @@ fn execute_isolated_worker(
             Stdio::null()
         });
     let mut child = command.spawn().map_err(|error| error.to_string())?;
+    active_executions
+        .lock()
+        .map_err(|_| "Environment active execution table poisoned".to_string())?
+        .insert(execution_id.to_string(), generation);
+    if take_cancelled(cancelled, execution_id)? {
+        let _ = child.kill();
+        let _ = child.wait();
+        active_executions
+            .lock()
+            .map_err(|_| "Environment active execution table poisoned".to_string())?
+            .remove(execution_id);
+        return Err("execution cancelled".into());
+    }
     let mut worker_stdin = child
         .stdin
         .take()
@@ -597,6 +801,11 @@ fn execute_isolated_worker(
     if let Err(error) = write_worker_input(&mut worker_stdin, input) {
         let _ = child.kill();
         let _ = child.wait();
+        active_executions
+            .lock()
+            .map_err(|_| "Environment active execution table poisoned".to_string())?
+            .remove(execution_id);
+        let _ = take_cancelled(cancelled, execution_id);
         return Err(format!("write Environment worker input: {error}"));
     }
     drop(worker_stdin);
@@ -612,10 +821,25 @@ fn execute_isolated_worker(
     let started = std::time::Instant::now();
     let timeout = Duration::from_millis(timeout_ms.max(1));
     loop {
+        if is_cancelled(cancelled, execution_id)? {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            active_executions
+                .lock()
+                .map_err(|_| "Environment active execution table poisoned".to_string())?
+                .remove(execution_id);
+            let _ = take_cancelled(cancelled, execution_id);
+            return Err("execution cancelled".into());
+        }
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
+            active_executions
+                .lock()
+                .map_err(|_| "Environment active execution table poisoned".to_string())?
+                .remove(execution_id);
             return Err(format!(
                 "Environment worker timed out after {timeout_ms} ms"
             ));
@@ -626,6 +850,11 @@ fn execute_isolated_worker(
                     .join()
                     .map_err(|_| "Environment worker result reader panicked".to_string())?
                     .map_err(|error| format!("invalid Environment worker result: {error}"))?;
+                active_executions
+                    .lock()
+                    .map_err(|_| "Environment active execution table poisoned".to_string())?
+                    .remove(execution_id);
+                let _ = take_cancelled(cancelled, execution_id);
                 if !status.success() {
                     return Err(format!("Environment worker exited with status {status}"));
                 }
@@ -637,6 +866,40 @@ fn execute_isolated_worker(
             None => thread::sleep(Duration::from_millis(10)),
         }
     }
+}
+
+fn mark_cancelled(
+    table: &Mutex<HashMap<String, Instant>>,
+    execution_id: &str,
+) -> Result<(), String> {
+    let mut table = table
+        .lock()
+        .map_err(|_| "Environment cancellation table poisoned".to_string())?;
+    table.retain(|_, created| created.elapsed() < PENDING_CANCEL_TTL);
+    table.insert(execution_id.to_string(), Instant::now());
+    Ok(())
+}
+
+fn take_cancelled(
+    table: &Mutex<HashMap<String, Instant>>,
+    execution_id: &str,
+) -> Result<bool, String> {
+    let mut table = table
+        .lock()
+        .map_err(|_| "Environment cancellation table poisoned".to_string())?;
+    table.retain(|_, created| created.elapsed() < PENDING_CANCEL_TTL);
+    Ok(table.remove(execution_id).is_some())
+}
+
+fn is_cancelled(
+    table: &Mutex<HashMap<String, Instant>>,
+    execution_id: &str,
+) -> Result<bool, String> {
+    let mut table = table
+        .lock()
+        .map_err(|_| "Environment cancellation table poisoned".to_string())?;
+    table.retain(|_, created| created.elapsed() < PENDING_CANCEL_TTL);
+    Ok(table.contains_key(execution_id))
 }
 
 fn child_error(request_id: Option<String>, code: &str, message: &str) -> ChildResponse {

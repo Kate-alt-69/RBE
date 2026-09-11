@@ -41,7 +41,7 @@ The default quota metadata is **100 MiB per Environment**, and the workspace is 
 
 The standalone Container Controller now launches one persistent child `container` process per configured Environment. Swamps remain controller-side schedulers in this slice, but real WASM execution is forwarded over a localhost, session-authenticated child channel and the Environment process launches the disposable worker. The session capability is delivered over inherited bootstrap stdin, is distinct from `RBE_CONTAINER_TOKEN`, and the child exits when the Controller liveness pipe closes. `--debug` is propagated visibly to children/workers but is not itself the authority.
 
-This is intentionally an intermediate ownership step: transactional Environment storage is initialized in the Environment process and the child listener is the future attachment point for the authenticated Unix-like debug shell and Container Controller capability calls. Later slices can move Swamp ownership itself behind the same process boundary without changing the external Container IPC.
+Transactional Environment storage is initialized only in the Environment process when the standalone Controller uses the process runner; the Controller scheduler keeps only storage metadata and never opens a competing writer. Cancellation is generation-bound and crosses the authenticated child channel, where the Environment execution loop kills the matching disposable WASM worker. The child listener remains the attachment point for the authenticated Unix-like debug shell and Container Controller capability calls.
 
 ## Swamps and workers
 

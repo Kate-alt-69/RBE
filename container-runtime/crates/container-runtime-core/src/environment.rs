@@ -25,7 +25,7 @@ pub struct EnvironmentRuntime {
     swamps: Mutex<Vec<Arc<Swamp>>>,
     storage: EnvironmentStorage,
     storage_path: PathBuf,
-    storage_manager: Arc<EnvironmentStorageManager>,
+    storage_manager: Option<Arc<EnvironmentStorageManager>>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +47,7 @@ impl EnvironmentRuntime {
         swamp_count: usize,
         workers_per_swamp: usize,
         storage: EnvironmentStorage,
+        manage_storage_locally: bool,
         runner: Runner,
         on_complete: Completion,
     ) -> Self {
@@ -59,13 +60,14 @@ impl EnvironmentRuntime {
             .join("container-runtime")
             .join("environments")
             .join(id.to_string());
-        let storage_manager =
+        let storage_manager = manage_storage_locally.then(|| {
             EnvironmentStorageManager::open(storage_path.clone(), storage.limit_bytes)
                 .unwrap_or_else(|error| {
                     panic!(
                         "failed to initialize transactional storage for Environment {id}: {error}"
                     )
-                });
+                })
+        });
         let swamps = Self::build_swamps(swamp_count, workers_per_swamp, &runner, &on_complete);
         Self {
             id,
@@ -82,14 +84,14 @@ impl EnvironmentRuntime {
 
     fn reset_ephemeral_storage(&self) {
         if self.storage.ephemeral {
-            self.storage_manager
-                .reset_volatile()
-                .unwrap_or_else(|error| {
+            if let Some(storage_manager) = self.storage_manager.as_ref() {
+                storage_manager.reset_volatile().unwrap_or_else(|error| {
                     panic!(
                         "failed to reset volatile storage for Environment {}: {error}",
                         self.id
                     )
                 });
+            }
         }
     }
 
@@ -166,8 +168,8 @@ impl EnvironmentRuntime {
         }
     }
 
-    pub fn storage(&self) -> Arc<EnvironmentStorageManager> {
-        Arc::clone(&self.storage_manager)
+    pub fn storage(&self) -> Option<Arc<EnvironmentStorageManager>> {
+        self.storage_manager.as_ref().map(Arc::clone)
     }
 
     pub fn snapshot(&self) -> EnvironmentSnapshot {

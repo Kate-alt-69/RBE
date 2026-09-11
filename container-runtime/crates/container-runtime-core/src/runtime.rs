@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::cache::ArtifactCache;
 use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot, EnvironmentStorage};
 use crate::execution::{ExecutionId, ExecutionOutcome, ExecutionTask, WorkCost};
-use crate::worker::{Completion, Runner, WorkerState};
+use crate::worker::{Canceller, Completion, Runner, WorkerState};
 
 pub const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 const JOURNAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -314,22 +314,28 @@ pub struct Runtime {
     executor: Arc<WasmExecutor>,
     journal: Arc<Journal>,
     results: SharedResults,
+    artifact_canceller: Option<Canceller>,
 }
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Arc<Self> {
-        Self::build(config, None)
+        Self::build(config, None, None)
     }
 
-    /// Build the scheduler with an external artifact runner. The standalone
-    /// Container Controller uses this to route executable work through the
-    /// dedicated per-Environment `container` child process. Tests and library
-    /// embedders may keep using [`Runtime::new`] and the legacy local runner.
-    pub fn new_with_runner(config: RuntimeConfig, artifact_runner: Runner) -> Arc<Self> {
-        Self::build(config, Some(artifact_runner))
+    /// Build with an external Environment runner and hard-cancellation hook.
+    pub fn new_with_runner(
+        config: RuntimeConfig,
+        artifact_runner: Runner,
+        artifact_canceller: Canceller,
+    ) -> Arc<Self> {
+        Self::build(config, Some(artifact_runner), Some(artifact_canceller))
     }
 
-    fn build(config: RuntimeConfig, artifact_runner: Option<Runner>) -> Arc<Self> {
+    fn build(
+        config: RuntimeConfig,
+        artifact_runner: Option<Runner>,
+        artifact_canceller: Option<Canceller>,
+    ) -> Arc<Self> {
         let config = RuntimeConfig {
             general_environments: config
                 .general_environments
@@ -339,6 +345,7 @@ impl Runtime {
             rebalance_interval_ms: config.rebalance_interval_ms.max(1),
         };
         let active_ids = active_environment_ids(config.general_environments);
+        let manage_storage_locally = artifact_runner.is_none();
         let cache = Arc::new(ArtifactCache::default());
         let executor = Arc::new(WasmExecutor::new().expect("failed to initialize WASM executor"));
         let journal = Journal::open();
@@ -443,6 +450,7 @@ impl Runtime {
                         limit_bytes: DEFAULT_ENVIRONMENT_STORAGE_BYTES,
                         ephemeral: true,
                     },
+                    manage_storage_locally,
                     Arc::clone(&runner),
                     Arc::clone(&completion),
                 )
@@ -461,6 +469,7 @@ impl Runtime {
             executor,
             journal,
             results,
+            artifact_canceller,
         });
 
         for task in recovered {
@@ -628,6 +637,14 @@ impl Runtime {
                 .lock()
                 .expect("cancel table poisoned")
                 .insert(execution_id.to_string());
+            if let Some(canceller) = self.artifact_canceller.as_ref() {
+                if let Err(error) = canceller(execution_id) {
+                    tracing::warn!(
+                        execution = execution_id,
+                        "Environment hard-cancel failed: {error}"
+                    );
+                }
+            }
         }
         if removed_queued || running {
             self.journal.append_cancel_string(execution_id);
@@ -750,7 +767,7 @@ impl Runtime {
         &self,
         id: EnvironmentId,
     ) -> Option<Arc<crate::storage::EnvironmentStorageManager>> {
-        self.environment(id).map(EnvironmentRuntime::storage)
+        self.environment(id).and_then(EnvironmentRuntime::storage)
     }
     pub fn global_queue_len(&self) -> usize {
         self.global_queue

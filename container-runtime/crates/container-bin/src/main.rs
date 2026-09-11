@@ -128,6 +128,7 @@ fn main() -> anyhow::Result<()> {
             rebalance_interval_ms: 25,
         },
         environment_processes.runner(),
+        environment_processes.canceller(),
     );
     let capability_broker = Arc::new(CapabilityBroker::new(debug));
     let accepting = Arc::new(AtomicBool::new(true));
