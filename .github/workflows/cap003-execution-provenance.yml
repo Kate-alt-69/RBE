@@ -86,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           git rm .github/workflows/cap003-execution-provenance.yml
-          git rm .github/patches/cap003-execution-provenance.py
+          git rm -f .github/patches/cap003-execution-provenance.py
           git rm .github/patches/cap003-execution-provenance-fix.py
           git add container-runtime
           git commit -m "FIX | BUG-CAP-003 preserve execution provenance and manifest authority"
