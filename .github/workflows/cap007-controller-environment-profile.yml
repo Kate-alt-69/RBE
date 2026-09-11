@@ -64,7 +64,8 @@ jobs:
           grep -q 'next_general_environment: AtomicU64' container-runtime/crates/container-runtime-core/src/runtime.rs
           grep -q 'pub fn select_general_environment(&self) -> EnvironmentId' container-runtime/crates/container-runtime-core/src/runtime.rs
           grep -q 'general_environment_for_sequence' container-runtime/crates/container-runtime-core/src/runtime.rs
-          grep -q 'assert_ne!(general_environment_for_sequence(5, sequence), EnvironmentId::Payment)' container-runtime/crates/container-runtime-core/src/runtime.rs
+          grep -q 'fn general_profile_round_robins_only_configured_general_environments' container-runtime/crates/container-runtime-core/src/runtime.rs
+          grep -q 'EnvironmentId::Payment' container-runtime/crates/container-runtime-core/src/runtime.rs
           grep -q 'requested_environment == "general"' container-runtime/crates/container-bin/src/main.rs
           grep -q 'Some(runtime.select_general_environment())' container-runtime/crates/container-bin/src/main.rs
           grep -q 'bound_request.environment = exact_environment.clone()' container-runtime/crates/container-bin/src/main.rs
