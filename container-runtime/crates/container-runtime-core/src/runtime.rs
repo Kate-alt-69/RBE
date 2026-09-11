@@ -20,7 +20,7 @@ use crate::environment::{EnvironmentRuntime, EnvironmentSnapshot, EnvironmentSto
 use crate::execution::{ExecutionId, ExecutionOutcome, ExecutionTask, WorkCost};
 use crate::worker::{Completion, Runner, WorkerState};
 
-const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
+pub const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
 const JOURNAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const RESULT_STORE_MAX_RECORDS: usize = 1024;
 const RESULT_STORE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -318,6 +318,18 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Arc<Self> {
+        Self::build(config, None)
+    }
+
+    /// Build the scheduler with an external artifact runner. The standalone
+    /// Container Controller uses this to route executable work through the
+    /// dedicated per-Environment `container` child process. Tests and library
+    /// embedders may keep using [`Runtime::new`] and the legacy local runner.
+    pub fn new_with_runner(config: RuntimeConfig, artifact_runner: Runner) -> Arc<Self> {
+        Self::build(config, Some(artifact_runner))
+    }
+
+    fn build(config: RuntimeConfig, artifact_runner: Option<Runner>) -> Arc<Self> {
         let config = RuntimeConfig {
             general_environments: config
                 .general_environments
@@ -342,7 +354,10 @@ impl Runtime {
                     return Err("execution cancelled before start".into());
                 }
                 let output = if cache.contains_artifact(&task.artifact_hash) {
-                    run_isolated_worker(task, &cancelled)?
+                    match artifact_runner.as_ref() {
+                        Some(runner) => runner(task)?,
+                        None => run_isolated_worker(task, &cancelled)?,
+                    }
                 } else if task.work_ms > 0 {
                     run_simulated_work(task, &cancelled)?
                 } else {

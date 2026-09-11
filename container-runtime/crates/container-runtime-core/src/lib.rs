@@ -26,7 +26,7 @@ pub use environment::EnvironmentSnapshot;
 pub use execution::{
     ExecutionId, ExecutionOutcome, ExecutionRecord, ExecutionState, ExecutionTask, WorkCost,
 };
-pub use runtime::{Runtime, RuntimeConfig};
+pub use runtime::{Runtime, RuntimeConfig, DEFAULT_ENVIRONMENT_STORAGE_BYTES};
 pub use storage::{EnvironmentStorageManager, StorageCommit, StorageSnapshot, StorageTransaction};
 pub use swamp::SwampSnapshot;
 pub use worker::{Runner, WorkerSnapshot, WorkerState};

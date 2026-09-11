@@ -1,48 +1,4 @@
-from pathlib import Path
-
-
-def replace_once(path: str, old: str, new: str) -> None:
-    p = Path(path)
-    text = p.read_text(encoding="utf-8")
-    if old not in text:
-        raise SystemExit(f"missing anchor in {path}: {old[:120]!r}")
-    p.write_text(text.replace(old, new, 1), encoding="utf-8")
-
-
-# container-bin gets a small private child-process protocol. The controller
-# session token is derived, never forwarded as the backend/container token.
-replace_once(
-    "container-runtime/crates/container-bin/Cargo.toml",
-    'serde_json = "1"\ntracing = "0.1"\n',
-    'serde = { version = "1", features = ["derive"] }\nserde_json = "1"\nsha2 = "0.10"\nhex = "0.4"\ntracing = "0.1"\n',
-)
-
-# Export the storage default so controller and Environment child cannot drift.
-replace_once(
-    "container-runtime/crates/container-runtime-core/src/runtime.rs",
-    "const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;",
-    "pub const DEFAULT_ENVIRONMENT_STORAGE_BYTES: u64 = 100 * 1024 * 1024;",
-)
-replace_once(
-    "container-runtime/crates/container-runtime-core/src/lib.rs",
-    "pub use runtime::{Runtime, RuntimeConfig};",
-    "pub use runtime::{Runtime, RuntimeConfig, DEFAULT_ENVIRONMENT_STORAGE_BYTES};",
-)
-
-# Let the standalone controller inject the per-Environment process runner while
-# preserving the in-process/default runner for unit tests and embedders.
-replace_once(
-    "container-runtime/crates/container-runtime-core/src/runtime.rs",
-    "impl Runtime {\n    pub fn new(config: RuntimeConfig) -> Arc<Self> {\n        let config = RuntimeConfig {",
-    "impl Runtime {\n    pub fn new(config: RuntimeConfig) -> Arc<Self> {\n        Self::build(config, None)\n    }\n\n    /// Build the scheduler with an external artifact runner. The standalone\n    /// Container Controller uses this to route executable work through the\n    /// dedicated per-Environment `container` child process. Tests and library\n    /// embedders may keep using [`Runtime::new`] and the legacy local runner.\n    pub fn new_with_runner(config: RuntimeConfig, artifact_runner: Runner) -> Arc<Self> {\n        Self::build(config, Some(artifact_runner))\n    }\n\n    fn build(config: RuntimeConfig, artifact_runner: Option<Runner>) -> Arc<Self> {\n        let config = RuntimeConfig {",
-)
-replace_once(
-    "container-runtime/crates/container-runtime-core/src/runtime.rs",
-    "                let output = if cache.contains_artifact(&task.artifact_hash) {\n                    run_isolated_worker(task, &cancelled)?\n                } else if task.work_ms > 0 {",
-    "                let output = if cache.contains_artifact(&task.artifact_hash) {\n                    match artifact_runner.as_ref() {\n                        Some(runner) => runner(task)?,\n                        None => run_isolated_worker(task, &cancelled)?,\n                    }\n                } else if task.work_ms > 0 {",
-)
-
-module = r'''use std::collections::HashMap;
+use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -56,7 +12,6 @@ use container_runtime_core::{
     EnvironmentId, EnvironmentStorageManager, ExecutionTask, Runner,
     DEFAULT_ENVIRONMENT_STORAGE_BYTES,
 };
-use execution_engine::WasmExecutor;
 use ipc_protocol::{
     read_frame, read_worker_result, write_frame, write_worker_input, WorkerResultFrame,
     MAX_EXECUTION_INPUT_BYTES,
@@ -251,9 +206,9 @@ impl EnvironmentProcessSupervisor {
                 .processes
                 .lock()
                 .map_err(|_| "Environment process table poisoned".to_string())?;
-            let managed = table
-                .get_mut(&id)
-                .ok_or_else(|| format!("Environment process {} is unavailable", task.environment))?;
+            let managed = table.get_mut(&id).ok_or_else(|| {
+                format!("Environment process {} is unavailable", task.environment)
+            })?;
             match managed.child.try_wait() {
                 Ok(None) => managed.endpoint.clone(),
                 Ok(Some(status)) => {
@@ -273,7 +228,8 @@ impl EnvironmentProcessSupervisor {
 
         let mut stream = TcpStream::connect_timeout(&endpoint.address, CONNECT_TIMEOUT)
             .map_err(|error| format!("connect Environment {}: {error}", task.environment))?;
-        let io_timeout = Duration::from_millis(task.limits.wall_time_ms.max(1).saturating_add(2_000));
+        let io_timeout =
+            Duration::from_millis(task.limits.wall_time_ms.max(1).saturating_add(2_000));
         stream
             .set_read_timeout(Some(io_timeout))
             .map_err(|error| format!("set Environment read timeout: {error}"))?;
@@ -446,8 +402,9 @@ pub fn run_environment_child() -> Result<()> {
         .join("container-runtime")
         .join("environments")
         .join(environment.to_string());
-    let storage = EnvironmentStorageManager::open(storage_root.clone(), bootstrap.storage_limit_bytes)
-        .context("open Environment transactional storage")?;
+    let storage =
+        EnvironmentStorageManager::open(storage_root.clone(), bootstrap.storage_limit_bytes)
+            .context("open Environment transactional storage")?;
     storage
         .reset_volatile()
         .context("reset Environment volatile storage")?;
@@ -521,7 +478,11 @@ fn handle_child_connection(
             input,
         } => {
             if !valid_session(bootstrap, &session) {
-                child_error(Some(request_id), "AUTH_FAILED", "Environment session rejected")
+                child_error(
+                    Some(request_id),
+                    "AUTH_FAILED",
+                    "Environment session rejected",
+                )
             } else if environment != bootstrap.environment || generation != bootstrap.generation {
                 child_error(
                     Some(request_id),
@@ -549,9 +510,16 @@ fn handle_child_connection(
                 }
             }
         }
-        ChildRequest::Ping { request_id, session } => {
+        ChildRequest::Ping {
+            request_id,
+            session,
+        } => {
             if !valid_session(bootstrap, &session) {
-                child_error(Some(request_id), "AUTH_FAILED", "Environment session rejected")
+                child_error(
+                    Some(request_id),
+                    "AUTH_FAILED",
+                    "Environment session rejected",
+                )
             } else {
                 ChildResponse::Pong {
                     request_id,
@@ -560,17 +528,22 @@ fn handle_child_connection(
                 }
             }
         }
-        ChildRequest::ResetVolatile { request_id, session } => {
+        ChildRequest::ResetVolatile {
+            request_id,
+            session,
+        } => {
             if !valid_session(bootstrap, &session) {
-                child_error(Some(request_id), "AUTH_FAILED", "Environment session rejected")
+                child_error(
+                    Some(request_id),
+                    "AUTH_FAILED",
+                    "Environment session rejected",
+                )
             } else {
                 match storage.reset_volatile() {
                     Ok(()) => ChildResponse::VolatileReset { request_id },
-                    Err(error) => child_error(
-                        Some(request_id),
-                        "STORAGE_RESET_FAILED",
-                        &error.to_string(),
-                    ),
+                    Err(error) => {
+                        child_error(Some(request_id), "STORAGE_RESET_FAILED", &error.to_string())
+                    }
                 }
             }
         }
@@ -611,7 +584,11 @@ fn execute_isolated_worker(
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(if debug { Stdio::inherit() } else { Stdio::null() });
+        .stderr(if debug {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let mut worker_stdin = child
         .stdin
@@ -639,7 +616,9 @@ fn execute_isolated_worker(
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
-            return Err(format!("Environment worker timed out after {timeout_ms} ms"));
+            return Err(format!(
+                "Environment worker timed out after {timeout_ms} ms"
+            ));
         }
         match child.try_wait().map_err(|error| error.to_string())? {
             Some(status) => {
@@ -694,7 +673,10 @@ fn validate_bootstrap(bootstrap: &Bootstrap) -> Result<()> {
     }
     if bootstrap.session.len() != 64
         || bootstrap.session.len() > SESSION_MAX_BYTES
-        || !bootstrap.session.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !bootstrap
+            .session
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
     {
         bail!("Environment session identity is invalid");
     }
@@ -717,9 +699,8 @@ fn make_session_root(controller_token: Option<&str>) -> [u8; 32] {
 }
 
 fn active_environment_ids(general_count: usize) -> Vec<EnvironmentId> {
-    let mut ids = EnvironmentId::GENERAL
-        [..general_count.clamp(1, EnvironmentId::GENERAL.len())]
-        .to_vec();
+    let mut ids =
+        EnvironmentId::GENERAL[..general_count.clamp(1, EnvironmentId::GENERAL.len())].to_vec();
     ids.push(EnvironmentId::Payment);
     ids
 }
@@ -747,7 +728,10 @@ mod tests {
 
     #[test]
     fn environment_parser_is_closed_set() {
-        assert_eq!(parse_environment("general-1"), Some(EnvironmentId::General1));
+        assert_eq!(
+            parse_environment("general-1"),
+            Some(EnvironmentId::General1)
+        );
         assert_eq!(parse_environment("payment"), Some(EnvironmentId::Payment));
         assert_eq!(parse_environment("visitor-ip-123"), None);
     }
@@ -766,87 +750,3 @@ mod tests {
         assert!(!valid_session(&bootstrap, &"ac".repeat(32)));
     }
 }
-'''
-Path("container-runtime/crates/container-bin/src/environment_process.rs").write_text(module, encoding="utf-8")
-
-# Wire the controller startup, health, inspect and restart paths.
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "mod dashboard;\n",
-    "mod dashboard;\nmod environment_process;\n",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "    if args.iter().any(|arg| arg == \"--monitor\") {\n        return run_monitor(&args);\n    }\n",
-    "    if args.iter().any(|arg| arg == \"--environment-child\") {\n        return environment_process::run_environment_child();\n    }\n    if args.iter().any(|arg| arg == \"--monitor\") {\n        return run_monitor(&args);\n    }\n",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "    let runtime = Runtime::new(RuntimeConfig {\n        general_environments,\n        swamps_per_environment,\n        workers_per_swamp,\n        rebalance_interval_ms: 25,\n    });\n    let capability_broker = Arc::new(CapabilityBroker::new(debug));\n    let accepting = Arc::new(AtomicBool::new(true));",
-    "    let token = env::var(\"RBE_CONTAINER_TOKEN\").ok();\n    let environment_processes = environment_process::EnvironmentProcessSupervisor::start(\n        general_environments,\n        debug,\n        token.as_deref(),\n    )?;\n    let runtime = Runtime::new_with_runner(\n        RuntimeConfig {\n            general_environments,\n            swamps_per_environment,\n            workers_per_swamp,\n            rebalance_interval_ms: 25,\n        },\n        environment_processes.runner(),\n    );\n    let capability_broker = Arc::new(CapabilityBroker::new(debug));\n    let accepting = Arc::new(AtomicBool::new(true));",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "    let token = env::var(\"RBE_CONTAINER_TOKEN\").ok();\n    if !dashboard_disabled {",
-    "    if !dashboard_disabled {",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "            capability_broker,\n        )?;",
-    "            capability_broker,\n            environment_processes,\n        )?;",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "fn run_control_server(\n    address: &str,\n    token: String,\n    runtime: Arc<Runtime>,\n    accepting: Arc<AtomicBool>,\n    capability_broker: Arc<CapabilityBroker>,\n) -> anyhow::Result<()> {",
-    "fn run_control_server(\n    address: &str,\n    token: String,\n    runtime: Arc<Runtime>,\n    accepting: Arc<AtomicBool>,\n    capability_broker: Arc<CapabilityBroker>,\n    environment_processes: Arc<environment_process::EnvironmentProcessSupervisor>,\n) -> anyhow::Result<()> {",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "                let capability_broker = Arc::clone(&capability_broker);\n                thread::spawn(move || {\n                    if let Err(err) =\n                        handle_connection(stream, &token, &runtime, &accepting, &capability_broker)\n                    {",
-    "                let capability_broker = Arc::clone(&capability_broker);\n                let environment_processes = Arc::clone(&environment_processes);\n                thread::spawn(move || {\n                    if let Err(err) = handle_connection(\n                        stream,\n                        &token,\n                        &runtime,\n                        &accepting,\n                        &capability_broker,\n                        &environment_processes,\n                    ) {",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "fn handle_connection(\n    mut stream: TcpStream,\n    token: &str,\n    runtime: &Runtime,\n    accepting: &AtomicBool,\n    capability_broker: &CapabilityBroker,\n) -> anyhow::Result<()> {",
-    "fn handle_connection(\n    mut stream: TcpStream,\n    token: &str,\n    runtime: &Runtime,\n    accepting: &AtomicBool,\n    capability_broker: &CapabilityBroker,\n    environment_processes: &environment_process::EnvironmentProcessSupervisor,\n) -> anyhow::Result<()> {",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "                let snapshots = runtime.snapshots();\n                let (swamps, workers, busy, completed, failed) = topology_totals(&snapshots);\n                Response::Health {",
-    "                let snapshots = runtime.snapshots();\n                let process_snapshots = environment_processes.snapshots();\n                let environment_processes_alive =\n                    process_snapshots.iter().filter(|process| process.alive).count();\n                let (swamps, workers, busy, completed, failed) = topology_totals(&snapshots);\n                Response::Health {",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    '                        "capability_manifests": capability_broker.manifest_count(),\n                        "process": "container",',
-    '                        "capability_manifests": capability_broker.manifest_count(),\n                        "environment_processes": process_snapshots.len(),\n                        "environment_processes_alive": environment_processes_alive,\n                        "process": "container",',
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "                let requeued = runtime.restart_environment(environment);\n                emit_event(\n                    \"environment_restart\",\n                    &format!(\n                        \"environment={environment} requeued={requeued} revoked_manifests={revoked}\"\n                    ),\n                );\n                Response::Restarted {",
-    "                let requeued = runtime.restart_environment(environment);\n                let generation = runtime.environment_generation(environment);\n                if let Err(error) = environment_processes.restart(environment, generation) {\n                    emit_event(\n                        \"environment_process_restart_failed\",\n                        &format!(\"environment={environment} generation={generation} error={error}\"),\n                    );\n                    return write_frame(\n                        &mut stream,\n                        &Response::Error {\n                            request_id: Some(request.request_id),\n                            code: \"ENVIRONMENT_PROCESS_RESTART_FAILED\".into(),\n                            message: error.to_string(),\n                        },\n                    )\n                    .map_err(Into::into);\n                }\n                emit_event(\n                    \"environment_restart\",\n                    &format!(\n                        \"environment={environment} generation={generation} requeued={requeued} revoked_manifests={revoked}\"\n                    ),\n                );\n                Response::Restarted {",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "                    inspection_body(\n                        runtime,\n                        request.execution_id,\n                        accepting.load(Ordering::Acquire),\n                    ),",
-    "                    inspection_body(\n                        runtime,\n                        request.execution_id,\n                        accepting.load(Ordering::Acquire),\n                        environment_processes,\n                    ),",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    "fn inspection_body(\n    runtime: &Runtime,\n    execution_id: Option<String>,\n    accepting: bool,\n) -> serde_json::Value {\n    let snapshots = runtime.snapshots();",
-    "fn inspection_body(\n    runtime: &Runtime,\n    execution_id: Option<String>,\n    accepting: bool,\n    environment_processes: &environment_process::EnvironmentProcessSupervisor,\n) -> serde_json::Value {\n    let snapshots = runtime.snapshots();\n    let environment_processes = environment_processes\n        .snapshots()\n        .into_iter()\n        .map(|process| serde_json::json!({\n            \"environment\": process.environment,\n            \"pid\": process.pid,\n            \"generation\": process.generation,\n            \"address\": process.address,\n            \"alive\": process.alive,\n            \"debug\": process.debug\n        }))\n        .collect::<Vec<_>>();",
-)
-replace_once(
-    "container-runtime/crates/container-bin/src/main.rs",
-    '        "security": {\n            "policy": "deny-by-default",',
-    '        "environment_processes": environment_processes,\n        "security": {\n            "policy": "deny-by-default",\n            "environment_boundary": "controller -> Environment process -> disposable WASM worker",',
-)
-
-# Keep docs honest: Swamps are still controller schedulers in this slice, while
-# executable work now crosses a persistent Environment process boundary.
-readme = Path("container-runtime/README.md")
-text = readme.read_text(encoding="utf-8")
-anchor = "## Swamps and workers\n"
-if anchor not in text:
-    raise SystemExit("missing README Swamps anchor")
-insert = '''## Environment process boundary\n\nThe standalone Container Controller now launches one persistent child `container` process per configured Environment. Swamps remain controller-side schedulers in this slice, but real WASM execution is forwarded over a localhost, session-authenticated child channel and the Environment process launches the disposable worker. The session capability is delivered over inherited bootstrap stdin, is distinct from `RBE_CONTAINER_TOKEN`, and the child exits when the Controller liveness pipe closes. `--debug` is propagated visibly to children/workers but is not itself the authority.\n\nThis is intentionally an intermediate ownership step: transactional Environment storage is initialized in the Environment process and the child listener is the future attachment point for the authenticated Unix-like debug shell and Container Controller capability calls. Later slices can move Swamp ownership itself behind the same process boundary without changing the external Container IPC.\n\n'''
-readme.write_text(text.replace(anchor, insert + anchor, 1), encoding="utf-8")

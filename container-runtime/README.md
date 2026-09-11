@@ -37,6 +37,12 @@ Each Environment owns an ephemeral workspace under:
 
 The default quota metadata is **100 MiB per Environment**, and the workspace is wiped/recreated when that Environment is restarted. The current WASM ABI does not expose arbitrary host filesystem access yet, so the 100 MiB value is currently the Environment storage budget and lifecycle boundary rather than a filesystem-level quota primitive. Production Linux filesystem enforcement still belongs in the hardened rootfs/tmpfs layer.
 
+## Environment process boundary
+
+The standalone Container Controller now launches one persistent child `container` process per configured Environment. Swamps remain controller-side schedulers in this slice, but real WASM execution is forwarded over a localhost, session-authenticated child channel and the Environment process launches the disposable worker. The session capability is delivered over inherited bootstrap stdin, is distinct from `RBE_CONTAINER_TOKEN`, and the child exits when the Controller liveness pipe closes. `--debug` is propagated visibly to children/workers but is not itself the authority.
+
+This is intentionally an intermediate ownership step: transactional Environment storage is initialized in the Environment process and the child listener is the future attachment point for the authenticated Unix-like debug shell and Container Controller capability calls. Later slices can move Swamp ownership itself behind the same process boundary without changing the external Container IPC.
+
 ## Swamps and workers
 
 A **Swamp** is an Environment-local execution workshop. It owns a local queue, reusable workers, queue-cost accounting, throughput measurements, and local rebalancing.

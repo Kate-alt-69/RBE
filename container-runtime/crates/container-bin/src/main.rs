@@ -6,6 +6,7 @@
 //! recycled periodically so long-running process-local allocations are bounded.
 
 mod dashboard;
+mod environment_process;
 
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -57,6 +58,9 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = env::args().skip(1).collect::<Vec<_>>();
 
+    if args.iter().any(|arg| arg == "--environment-child") {
+        return environment_process::run_environment_child();
+    }
     if args.iter().any(|arg| arg == "--monitor") {
         return run_monitor(&args);
     }
@@ -110,12 +114,21 @@ fn main() -> anyhow::Result<()> {
     let workers_per_swamp = value_after(&args, "--workers-per-swamp")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(defaults.workers_per_swamp);
-    let runtime = Runtime::new(RuntimeConfig {
+    let token = env::var("RBE_CONTAINER_TOKEN").ok();
+    let environment_processes = environment_process::EnvironmentProcessSupervisor::start(
         general_environments,
-        swamps_per_environment,
-        workers_per_swamp,
-        rebalance_interval_ms: 25,
-    });
+        debug,
+        token.as_deref(),
+    )?;
+    let runtime = Runtime::new_with_runner(
+        RuntimeConfig {
+            general_environments,
+            swamps_per_environment,
+            workers_per_swamp,
+            rebalance_interval_ms: 25,
+        },
+        environment_processes.runner(),
+    );
     let capability_broker = Arc::new(CapabilityBroker::new(debug));
     let accepting = Arc::new(AtomicBool::new(true));
 
@@ -129,7 +142,6 @@ fn main() -> anyhow::Result<()> {
         ),
     );
 
-    let token = env::var("RBE_CONTAINER_TOKEN").ok();
     if !dashboard_disabled {
         match token.as_ref() {
             Some(token) => {
@@ -165,6 +177,7 @@ fn main() -> anyhow::Result<()> {
             runtime.clone(),
             accepting,
             capability_broker,
+            environment_processes,
         )?;
     } else if !debug {
         println!("container: no control socket requested; exiting after initialization");
@@ -436,6 +449,7 @@ fn run_control_server(
     runtime: Arc<Runtime>,
     accepting: Arc<AtomicBool>,
     capability_broker: Arc<CapabilityBroker>,
+    environment_processes: Arc<environment_process::EnvironmentProcessSupervisor>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
     println!(
@@ -450,10 +464,16 @@ fn run_control_server(
                 let runtime = Arc::clone(&runtime);
                 let accepting = Arc::clone(&accepting);
                 let capability_broker = Arc::clone(&capability_broker);
+                let environment_processes = Arc::clone(&environment_processes);
                 thread::spawn(move || {
-                    if let Err(err) =
-                        handle_connection(stream, &token, &runtime, &accepting, &capability_broker)
-                    {
+                    if let Err(err) = handle_connection(
+                        stream,
+                        &token,
+                        &runtime,
+                        &accepting,
+                        &capability_broker,
+                        &environment_processes,
+                    ) {
                         tracing::warn!(%err, "container control connection closed with error");
                     }
                 });
@@ -470,6 +490,7 @@ fn handle_connection(
     runtime: &Runtime,
     accepting: &AtomicBool,
     capability_broker: &CapabilityBroker,
+    environment_processes: &environment_process::EnvironmentProcessSupervisor,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let request = decode_request(&read_frame(&mut reader)?)?;
@@ -671,6 +692,11 @@ fn handle_connection(
                 }
             } else {
                 let snapshots = runtime.snapshots();
+                let process_snapshots = environment_processes.snapshots();
+                let environment_processes_alive = process_snapshots
+                    .iter()
+                    .filter(|process| process.alive)
+                    .count();
                 let (swamps, workers, busy, completed, failed) = topology_totals(&snapshots);
                 Response::Health {
                     request_id: request.request_id,
@@ -678,6 +704,8 @@ fn handle_connection(
                         "protocol": PROTOCOL_VERSION,
                         "capability_abi": CAPABILITY_ABI_VERSION,
                         "capability_manifests": capability_broker.manifest_count(),
+                        "environment_processes": process_snapshots.len(),
+                        "environment_processes_alive": environment_processes_alive,
                         "process": "container",
                         "pid": std::process::id(),
                         "accepting_executions": accepting.load(Ordering::Acquire),
@@ -732,6 +760,7 @@ fn handle_connection(
                         runtime,
                         request.execution_id,
                         accepting.load(Ordering::Acquire),
+                        environment_processes,
                     ),
                 }
             }
@@ -756,10 +785,26 @@ fn handle_connection(
                 let revoked = capability_broker
                     .revoke_environment_generation(&request.environment, previous_generation);
                 let requeued = runtime.restart_environment(environment);
+                let generation = runtime.environment_generation(environment);
+                if let Err(error) = environment_processes.restart(environment, generation) {
+                    emit_event(
+                        "environment_process_restart_failed",
+                        &format!("environment={environment} generation={generation} error={error}"),
+                    );
+                    return write_frame(
+                        &mut stream,
+                        &Response::Error {
+                            request_id: Some(request.request_id),
+                            code: "ENVIRONMENT_PROCESS_RESTART_FAILED".into(),
+                            message: error.to_string(),
+                        },
+                    )
+                    .map_err(Into::into);
+                }
                 emit_event(
                     "environment_restart",
                     &format!(
-                        "environment={environment} requeued={requeued} revoked_manifests={revoked}"
+                        "environment={environment} generation={generation} requeued={requeued} revoked_manifests={revoked}"
                     ),
                 );
                 Response::Restarted {
@@ -838,8 +883,23 @@ fn inspection_body(
     runtime: &Runtime,
     execution_id: Option<String>,
     accepting: bool,
+    environment_processes: &environment_process::EnvironmentProcessSupervisor,
 ) -> serde_json::Value {
     let snapshots = runtime.snapshots();
+    let environment_processes = environment_processes
+        .snapshots()
+        .into_iter()
+        .map(|process| {
+            serde_json::json!({
+                "environment": process.environment,
+                "pid": process.pid,
+                "generation": process.generation,
+                "address": process.address,
+                "alive": process.alive,
+                "debug": process.debug
+            })
+        })
+        .collect::<Vec<_>>();
     let (swamps_total, workers_total, workers_busy, completed, failed) =
         topology_totals(&snapshots);
     let environments = snapshots.into_iter().map(|environment| {
@@ -927,8 +987,10 @@ fn inspection_body(
             "durable_profiles": true,
             "durable_artifacts": true
         },
+        "environment_processes": environment_processes,
         "security": {
             "policy": "deny-by-default",
+            "environment_boundary": "controller -> Environment process -> disposable WASM worker",
             "wasm": "wasmtime",
             "linux": "namespaces + no_new_privs + seccomp + cgroup-v2 + timeout"
         },
