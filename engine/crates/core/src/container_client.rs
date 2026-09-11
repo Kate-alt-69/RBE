@@ -30,6 +30,17 @@ pub struct ContainerExecutionIdentity<'a> {
     pub environment: &'a str,
 }
 
+#[derive(Debug)]
+pub struct ContainerAuthorizedExecution<'a> {
+    pub identity: ContainerExecutionIdentity<'a>,
+    pub artifact_hash: &'a str,
+    pub wasm: Vec<u8>,
+    pub grants: Vec<CapabilityGrant>,
+    pub input: Vec<u8>,
+    pub declared_cost: IpcWorkCost,
+    pub timeout: Duration,
+}
+
 #[derive(Clone)]
 struct Endpoint {
     address: SocketAddr,
@@ -228,6 +239,37 @@ impl ContainerClient {
                 anyhow::bail!("container execution {execution_id} is still pending after timeout")
             }
         }
+    }
+
+    /// Admit and execute one immutable artifact under one exact capability
+    /// identity. Registration is deliberately repeated/idempotent so an
+    /// Environment generation restart cannot leave a stale backend-side cache
+    /// authorizing work that Controller has already invalidated.
+    pub async fn execute_authorized(
+        &self,
+        request: ContainerAuthorizedExecution<'_>,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.register_artifact(request.artifact_hash, request.wasm)
+            .await?;
+        let generation = self
+            .register_capability_manifest(request.identity, request.grants)
+            .await?;
+        tracing::debug!(
+            runtime_image = request.identity.runtime_image,
+            source_id = request.identity.source_id,
+            environment = request.identity.environment,
+            generation,
+            artifact_hash = request.artifact_hash,
+            "Container execution authority admitted"
+        );
+        self.execute_and_wait(
+            request.identity,
+            request.artifact_hash,
+            request.input,
+            request.declared_cost,
+            request.timeout,
+        )
+        .await
     }
 
     pub async fn health(&self) -> anyhow::Result<serde_json::Value> {

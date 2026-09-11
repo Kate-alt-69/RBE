@@ -17,7 +17,14 @@ use supervisor::BackendState;
 use tokio::sync::watch;
 use video_manager::VideoManager;
 
-pub use container_client::{ContainerClient, ContainerEndpointSnapshot};
+pub use container_client::{
+    ContainerAuthorizedExecution, ContainerClient, ContainerEndpointSnapshot,
+    ContainerExecutionIdentity,
+};
+pub use ipc_protocol::{
+    CapabilityGrant as ContainerCapabilityGrant, CapabilityKind as ContainerCapabilityKind,
+    WorkCost as ContainerWorkCost,
+};
 pub use metrics::{
     BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
 };

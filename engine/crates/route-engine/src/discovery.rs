@@ -10,6 +10,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path as AxumPath, Query, Request, State};
@@ -17,7 +18,9 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::MethodRouter;
 use axum::Router;
-use core_lib::AppState;
+use core_lib::{
+    AppState, ContainerAuthorizedExecution, ContainerExecutionIdentity, ContainerWorkCost,
+};
 
 use crate::analyzer::{analyze, Severity};
 use crate::ast::{FunctionDef, ModuleFile, RouteFile, Value};
@@ -27,9 +30,11 @@ use crate::module_runtime::{ModuleProgram, ServiceInterfaces};
 use crate::modules::binding_name;
 use crate::parser::Parser;
 use crate::runtime_image::RuntimeImage;
+use crate::source_registry::SourceId;
 use crate::terminal::Terminal;
 use crate::transpiler::transpile_file;
 use crate::video_host::RuntimeHostCapabilities;
+use crate::wasm_compiler::RouteWasmArtifact;
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -487,15 +492,138 @@ fn rel_http_response(value: &Value) -> Result<Option<Response>, String> {
         .map_err(|error| error.to_string())
 }
 
-async fn execute(
+const NATIVE_ROUTE_ENVIRONMENT: &str = "general-1";
+const NATIVE_ROUTE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+struct NativeRoutePlan {
+    runtime_image: String,
+    source_id: SourceId,
+    artifact: RouteWasmArtifact,
+}
+
+fn route_value_response(path: &str, value: Value) -> Response {
+    match rel_http_response(&value) {
+        Ok(Some(response)) => response,
+        Ok(None) => Json(value_to_json(&value)).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, path = %path, "REL response descriptor rejected");
+            append_runtime_error(path, &error);
+            request_error(StatusCode::INTERNAL_SERVER_ERROR, error)
+        }
+    }
+}
+
+async fn execute_native_route(
+    plan: &NativeRoutePlan,
+    image: &RuntimeImage,
+    state: &AppState,
+    path: &str,
+) -> Response {
+    if image.image_id != plan.runtime_image {
+        let error = "native Route-WASM identity no longer matches the active Runtime Image";
+        tracing::error!(
+            path = %path,
+            expected_image = %plan.runtime_image,
+            active_image = %image.image_id,
+            source = %plan.source_id,
+            "native route authority changed underneath the router"
+        );
+        append_runtime_error(path, error);
+        return request_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+
+    if image
+        .capabilities
+        .get(&plan.source_id)
+        .is_some_and(|capabilities| !capabilities.is_empty())
+    {
+        let error = "native Route-WASM declares capabilities not lowered by the native compiler";
+        tracing::error!(path = %path, source = %plan.source_id, "native route capability invariant failed");
+        append_runtime_error(path, error);
+        return request_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+
+    let identity = ContainerExecutionIdentity {
+        runtime_image: &plan.runtime_image,
+        source_id: plan.source_id.as_str(),
+        environment: NATIVE_ROUTE_ENVIRONMENT,
+    };
+    let output = match state
+        .container
+        .execute_authorized(ContainerAuthorizedExecution {
+            identity,
+            artifact_hash: &plan.artifact.sha256,
+            wasm: plan.artifact.bytes.clone(),
+            grants: Vec::new(),
+            input: Vec::new(),
+            declared_cost: ContainerWorkCost {
+                cpu: 1,
+                memory: 1,
+                io: 0,
+                network: 0,
+            },
+            timeout: NATIVE_ROUTE_TIMEOUT,
+        })
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                path = %path,
+                source = %plan.source_id,
+                image = %plan.runtime_image,
+                "native Route-WASM Container execution failed"
+            );
+            append_runtime_error(path, "native Route-WASM Container execution failed");
+            return request_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "native route execution failed",
+            );
+        }
+    };
+
+    let value = match serde_json::from_slice::<serde_json::Value>(&output) {
+        Ok(value) => json_to_value(value),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                path = %path,
+                source = %plan.source_id,
+                "native Route-WASM returned invalid JSON"
+            );
+            append_runtime_error(path, "native Route-WASM returned invalid JSON");
+            return request_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "native route returned an invalid result",
+            );
+        }
+    };
+    route_value_response(path, value)
+}
+
+#[derive(Clone)]
+struct RouteHandlerPlan {
     inline_file: Arc<ModuleFile>,
     module_program: Arc<ModuleProgram>,
+    native_plan: Option<Arc<NativeRoutePlan>>,
     takes_request: bool,
+}
+
+async fn execute(
+    plan: RouteHandlerPlan,
     state: AppState,
     params: HashMap<String, String>,
     query: HashMap<String, String>,
     request: Request,
 ) -> Response {
+    let RouteHandlerPlan {
+        inline_file,
+        module_program,
+        native_plan,
+        takes_request,
+    } = plan;
     let path = request.uri().path().to_string();
     let image = match request
         .extensions()
@@ -523,6 +651,9 @@ async fn execute(
         .await;
         Vec::new()
     };
+    if let Some(plan) = native_plan.as_deref() {
+        return execute_native_route(plan, image.as_ref(), &state, &path).await;
+    }
     let executor = ModuleExecutor::with_services_and_host_capabilities(
         module_program.as_ref(),
         state.services.clone(),
@@ -532,15 +663,7 @@ async fn execute(
         .call_inline(inline_file, INLINE_ROUTE_HANDLER, args)
         .await
     {
-        Ok(value) => match rel_http_response(&value) {
-            Ok(Some(response)) => response,
-            Ok(None) => Json(value_to_json(&value)).into_response(),
-            Err(error) => {
-                tracing::error!(error = %error, path = %path, "REL response descriptor rejected");
-                append_runtime_error(&path, &error);
-                request_error(StatusCode::INTERNAL_SERVER_ERROR, error)
-            }
-        },
+        Ok(value) => route_value_response(&path, value),
         Err(err) => {
             tracing::error!(error = %err, path = %path, "route evaluation failed");
             append_runtime_error(&path, &err.to_string());
@@ -556,7 +679,7 @@ async fn execute(
 fn build_method_router(
     file: &RouteFile,
     module_program: Arc<ModuleProgram>,
-    _url_path: String,
+    native_plan: Option<Arc<NativeRoutePlan>>,
 ) -> MethodRouter<AppState> {
     let mut router = MethodRouter::<AppState>::new();
     for method_def in &file.methods {
@@ -571,27 +694,19 @@ fn build_method_router(
             functions,
             exports: Vec::new(),
         });
-        let takes_request = method_def.param_name.is_some();
-        let module_program = module_program.clone();
+        let handler_plan = RouteHandlerPlan {
+            inline_file,
+            module_program: module_program.clone(),
+            native_plan: native_plan.clone(),
+            takes_request: method_def.param_name.is_some(),
+        };
         let verb = method_def.verb.clone();
         let handler = move |State(state): State<AppState>,
                             AxumPath(params): AxumPath<HashMap<String, String>>,
                             Query(query): Query<HashMap<String, String>>,
                             request: Request| {
-            let inline_file = inline_file.clone();
-            let module_program = module_program.clone();
-            async move {
-                execute(
-                    inline_file,
-                    module_program,
-                    takes_request,
-                    state,
-                    params,
-                    query,
-                    request,
-                )
-                .await
-            }
+            let handler_plan = handler_plan.clone();
+            async move { execute(handler_plan, state, params, query, request).await }
         };
         router = match verb.as_str() {
             "get" => router.get(handler),
@@ -1030,7 +1145,7 @@ pub fn build_routes(
 
         router = router.route(
             &url_path,
-            build_method_router(&route_file, module_program.clone(), url_path.clone()),
+            build_method_router(&route_file, module_program.clone(), None),
         );
     }
 
@@ -1072,13 +1187,16 @@ pub fn build_routes_from_image(
             methods = ?route_file.methods.iter().map(|method| &method.verb).collect::<Vec<_>>(),
             "registered Runtime Image Route REL"
         );
+        let native_plan = image.route_wasm_artifact(id).map(|artifact| {
+            Arc::new(NativeRoutePlan {
+                runtime_image: image.image_id.clone(),
+                source_id: id.clone(),
+                artifact: artifact.clone(),
+            })
+        });
         router = router.route(
             &url_path,
-            build_method_router(
-                route_file.as_ref(),
-                module_program.clone(),
-                url_path.clone(),
-            ),
+            build_method_router(route_file.as_ref(), module_program.clone(), native_plan),
         );
     }
     Ok(router)

@@ -150,7 +150,9 @@ For routes inside the current native compiler subset, the image stores exact det
 
 Routes outside the subset store an explicit fallback reason instead of being mislabeled as native.
 
-The public HTTP route dispatcher still retains the linked REL evaluator path while native dispatch coverage expands. Native compilation existing in the image does not mean every HTTP request is already executed through the Container runtime.
+The public HTTP route dispatcher now executes a linked native Route-WASM artifact through the standalone Container runtime when that exact Runtime Image + SourceId has a native artifact. Admission registers the immutable artifact and an exact capability manifest before execution; the current native subset has no imports, so its manifest is intentionally empty.
+
+Routes outside the native compiler subset continue through the linked REL evaluator using their explicit fallback reason. Once a route is native, Container admission/execution failure is fail-closed and does **not** silently fall back to the in-process evaluator.
 
 ## What `imageId` does not guarantee
 
