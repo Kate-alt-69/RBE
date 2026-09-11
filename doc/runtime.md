@@ -38,6 +38,8 @@ The exact number of active Service workers depends on service mode/lifecycle. Th
 
 The backend builds Route/Module execution from the Runtime Image snapshot rather than treating raw source files as request-time authority.
 
+The active image now has a full lowercase SHA-256 `imageId` derived from the canonical source hash, Route-WASM ABI/compiler versions, and effective settings. See [`runtime-image.md`](runtime-image.md) for the exact identity contract.
+
 ## Service Runtime
 
 Service REL runs under a separately linked canonical `service` executable, not inside `backend` and not through a copy of `backend.exe`.
@@ -102,9 +104,9 @@ RuntimeImage SHA-256
 + Environment generation
 ```
 
-A grant identifies a capability kind, logical target, allowed operation(s), and request/response byte limits. Wildcards are rejected. Debug/host-file capabilities are refused by a non-debug Controller.
+The Runtime Image value must be the lowercase 64-character image identity produced by RELC. A grant identifies a capability kind, logical target, allowed operation(s), and request/response byte limits. Wildcards are rejected. Debug/host-file capabilities are refused by a non-debug Controller.
 
-Replacing an Environment generation invalidates authority tied to the old generation.
+Replacing either the active image identity or an Environment generation requires authority to be registered for the new exact identity; old Environment-generation grants can be revoked when the generation is replaced.
 
 ## Execution recovery
 
@@ -163,6 +165,8 @@ compile candidate -> validate candidate -> atomically activate
                          v
                     keep current image
 ```
+
+The image identity is deterministic, but it is not a digital signature and does not by itself authenticate the publisher. See [`runtime-image.md`](runtime-image.md) and [`source-security.md`](source-security.md).
 
 A complete automatic source watcher/hot-reload coordinator remains separate work.
 

@@ -32,7 +32,7 @@ PASS 6   resolve typed Runtime ENV
 PASS 7   compile supported Route REL to native WASM
          record explicit fallback reason for unsupported routes
 PASS 8   collect immutable executable REL program snapshots
-PASS 9   derive deterministic image/source identity metadata
+PASS 9   derive SHA-256 source/image identity metadata
 PASS 10  link RuntimeImage
 ```
 
@@ -176,7 +176,36 @@ RuntimeImage {
 
 `executables` contains immutable parsed Route/Module/Service/Server program objects. Normal runtime construction therefore consumes the linked image instead of reopening Route/Module source files.
 
-Image identity is deterministic over linked source/settings/compiler ABI inputs.
+### Cryptographic source identity
+
+`sourceHash` is now a full SHA-256 identity rather than the former small non-cryptographic hash. RELC sorts the complete source set by `SourceId`, domain-separates the hash with `RBE_SOURCE_SET_V1`, and length-delimits each identity/source input before hashing.
+
+Conceptually:
+
+```text
+sourceHash = SHA-256(
+    RBE_SOURCE_SET_V1
+    + source-count
+    + sorted(SourceId + exact source bytes)
+)
+```
+
+The result is lowercase 64-character hexadecimal text.
+
+### Cryptographic Runtime Image identity
+
+`imageId` is also a lowercase 64-character SHA-256 identity. The current `RBE_RUNTIME_IMAGE_V3` identity binds:
+
+- `sourceHash`;
+- `ROUTE_WASM_ABI_VERSION`;
+- `ROUTE_WASM_COMPILER_VERSION`;
+- the effective settings JSON.
+
+Settings hashing is deterministic: object keys are sorted, arrays remain ordered, JSON types are preserved, and encoded values are length-delimited. Equivalent settings objects with different object-key ordering therefore hash identically, while meaningful source/settings/compiler-ABI changes produce a different image identity.
+
+The Container capability broker validates and binds grants to this exact Runtime Image SHA-256 identity. These hashes are content identities, **not digital signatures**; publisher authenticity belongs to the future signed RBI format.
+
+See [`runtime-image.md`](runtime-image.md) for the full identity/activation contract.
 
 ## Activation and reload
 
@@ -204,4 +233,4 @@ RELC errors identify source identity and the failing stage (source registration,
 
 A successfully linked image is the runtime authority. Native artifacts and executable program snapshots are pinned to it, while Service activation additionally verifies the parent-validated Service source digest. Raw source files remain deployment/restart inputs until a persistent signed source-less Runtime Image artifact is implemented.
 
-See [`source-security.md`](source-security.md).
+See [`runtime-image.md`](runtime-image.md) and [`source-security.md`](source-security.md).

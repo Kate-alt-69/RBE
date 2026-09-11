@@ -6,6 +6,7 @@ This directory is the authoritative user-facing documentation for the current RB
 
 - [`rbe.md`](rbe.md) — RBE's current architecture and why the runtime is structured this way.
 - [`runtime.md`](runtime.md) — process boundaries, Runtime Image ownership, Service/Container/Vault supervision, CONTROL ER, and the Control Room.
+- [`runtime-image.md`](runtime-image.md) — the Runtime Image data contract, cryptographic identity, capability binding, and atomic activation model.
 - [`rel.md`](rel.md) — REL (Runtime Engine Language), shared grammar, capabilities, ENV, embedded sources, and recursion rules.
 - [`relc.md`](relc.md) — the implemented RELC compilation/link pipeline and Runtime Image format.
 - [`source-security.md`](source-security.md) — source integrity, Runtime ENV hardening, process/capability boundaries, and sealed deployment.
@@ -41,7 +42,9 @@ settings.json + server.server + *.route + *.module + *.service
                                       disposable WASM worker
 ```
 
-The active Runtime Image now carries resolved ServerPolicy, typed Runtime ENV, middleware plan, source/symbol/dependency metadata, executable REL program snapshots, route-WASM artifacts/fallback reasons, service assignments, and capability metadata.
+The active Runtime Image carries resolved ServerPolicy, typed Runtime ENV, middleware plan, source/symbol/dependency metadata, executable REL program snapshots, route-WASM artifacts/fallback reasons, service assignments, and capability metadata.
+
+The current `sourceHash` and `imageId` are deterministic SHA-256 identities. `imageId` is the authority identity used when binding Container capability manifests to an exact linked application image; see [`runtime-image.md`](runtime-image.md).
 
 ## Documentation rules
 
@@ -59,6 +62,7 @@ The active Runtime Image now carries resolved ServerPolicy, typed Runtime ENV, m
 - **REL** — Runtime Engine Language.
 - **RELC** — Runtime Engine Language Compiler.
 - **Runtime Image** — the immutable validated application snapshot produced by RELC and activated by RBE.
+- **Runtime Image ID** — lowercase 64-character SHA-256 identity of the linked source/settings/compiler-ABI inputs.
 - **Service Mother** — the canonical Service runtime supervisor process that owns Service REL worker creation/recovery.
 - **Container Controller** — the standalone Container runtime control process that owns Environment execution infrastructure.
 - **CONTROL ER** — the recovery-authority mode of the Error Reporter; it can authorize bounded recovery decisions but does not gain arbitrary process-spawn authority.

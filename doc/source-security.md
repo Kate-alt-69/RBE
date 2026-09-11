@@ -12,10 +12,33 @@ Current guarantees include:
 - Module REL resolves from linked `ModuleFile` snapshots.
 - Service source is fingerprinted during catalog compilation and checked before child activation.
 - Server REL policy/ENV/middleware outputs are resolved into the image before request serving.
-- native Route-WASM bytes, SHA-256 identity, ABI/compiler version inputs, and interpreter-fallback reasons are pinned to the image.
-- an image source/settings change produces a different image/source identity rather than silently mutating the active program.
+- native Route-WASM bytes, SHA-256 artifact identity, ABI/compiler version inputs, and interpreter-fallback reasons are pinned to the image.
+- source/settings/compiler-ABI changes produce a different Runtime Image identity rather than silently mutating the active program.
 
 This closes the important source time-of-check/time-of-use class of bugs: editing a source file after RELC validation must not change the code already represented by the active image.
+
+## Cryptographic Runtime Image identity
+
+Runtime Image authority now uses full SHA-256 content identities.
+
+`sourceHash` binds the canonical REL source set. RELC sorts sources by `SourceId`, domain-separates the hash with `RBE_SOURCE_SET_V1`, and length-delimits each identity/source input before hashing.
+
+`imageId` is a second SHA-256 identity domain-separated with `RBE_RUNTIME_IMAGE_V3`. It binds:
+
+```text
+sourceHash
++ ROUTE_WASM_ABI_VERSION
++ ROUTE_WASM_COMPILER_VERSION
++ canonical effective settings JSON
+```
+
+Both values are lowercase 64-character hexadecimal strings. Settings objects are canonicalized for hashing by sorting object keys while preserving array order and JSON value types.
+
+The Container capability broker validates Runtime Image IDs in this exact SHA-256 form and binds manifests to the image identity together with `SourceId`, Environment and Environment generation.
+
+These hashes provide deterministic content identity, **not publisher authenticity**. A malicious host capable of replacing the entire trusted runtime/deployment can still replace inputs and compute new hashes. Signed persistent RBI packaging remains the future authenticity/deployment layer.
+
+See [`runtime-image.md`](runtime-image.md).
 
 ## Runtime ENV is not process environment
 
@@ -47,7 +70,7 @@ Container execution is a separate process boundary. The Container Controller own
 Container capability manifests are deny-by-default and bound to the exact tuple:
 
 ```text
-Runtime Image
+Runtime Image SHA-256
 + SourceId
 + Environment
 + Environment generation
@@ -56,6 +79,16 @@ Runtime Image
 A capability grant names a logical capability kind/target/operation and request/response byte limits. It does not expose Service PIDs, raw IPC addresses, Vault credentials, or host handles to the workload. Wildcard capability targets/operations are rejected. Debug/host-file grants are rejected when the Controller is not running with debug authority.
 
 Generation replacement invalidates the old Environment's capability manifests.
+
+## Environment process ownership
+
+Real external-runner execution now crosses a persistent per-Environment process boundary before the Environment child launches the disposable WASM worker.
+
+The Environment child owns the transactional ephemeral storage manager for this delegated path. Controller-side scheduler state does not pretend to be the authoritative storage owner once execution has crossed into the child process.
+
+Cancellation is also routed into the owning Environment generation. Running disposable workers can be terminated through the Environment supervisor rather than only being marked cancelled in Controller bookkeeping.
+
+Cancellation and completion are linearized through one execution-lifecycle state: if cancellation wins while the execution is live, the published outcome is cancelled; if completion removes the execution first, a later cancel is correctly treated as too late. Generation-bound cancellation prevents stale cancellation authority from silently targeting a replacement Environment process.
 
 ## Container sandbox status
 
@@ -92,6 +125,7 @@ Source deletion is not a substitute for:
 - filesystem/OS access control;
 - Vault-backed secrets;
 - immutable Runtime Image execution;
+- cryptographic source/image content identity;
 - source/catalog fingerprints;
 - authenticated child/bootstrap IPC;
 - Container sandbox/capability policy;
