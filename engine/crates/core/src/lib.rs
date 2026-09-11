@@ -24,6 +24,7 @@ pub use container_client::{
 pub use ipc_protocol::{
     CapabilityGrant as ContainerCapabilityGrant, CapabilityKind as ContainerCapabilityKind,
     WorkCost as ContainerWorkCost,
+    MAX_EXECUTION_INPUT_BYTES as CONTAINER_MAX_EXECUTION_INPUT_BYTES,
 };
 pub use metrics::{
     BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,

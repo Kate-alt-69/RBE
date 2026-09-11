@@ -20,6 +20,7 @@ use axum::routing::MethodRouter;
 use axum::Router;
 use core_lib::{
     AppState, ContainerAuthorizedExecution, ContainerExecutionIdentity, ContainerWorkCost,
+    CONTAINER_MAX_EXECUTION_INPUT_BYTES,
 };
 
 use crate::analyzer::{analyze, Severity};
@@ -34,7 +35,7 @@ use crate::source_registry::SourceId;
 use crate::terminal::Terminal;
 use crate::transpiler::transpile_file;
 use crate::video_host::RuntimeHostCapabilities;
-use crate::wasm_compiler::RouteWasmArtifact;
+use crate::wasm_compiler::{RouteWasmArtifact, RouteWasmInput};
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -519,6 +520,7 @@ async fn execute_native_route(
     image: &RuntimeImage,
     state: &AppState,
     path: &str,
+    input: Vec<u8>,
 ) -> Response {
     if image.image_id != plan.runtime_image {
         let error = "native Route-WASM identity no longer matches the active Runtime Image";
@@ -555,7 +557,7 @@ async fn execute_native_route(
             artifact_hash: &plan.artifact.sha256,
             wasm: plan.artifact.bytes.clone(),
             grants: Vec::new(),
-            input: Vec::new(),
+            input,
             declared_cost: ContainerWorkCost {
                 cpu: 1,
                 memory: 1,
@@ -651,7 +653,36 @@ async fn execute(
         Vec::new()
     };
     if let Some(plan) = native_plan.as_deref() {
-        return execute_native_route(plan, image.as_ref(), &state, &path).await;
+        let input = match plan.artifact.input {
+            RouteWasmInput::None => Vec::new(),
+            RouteWasmInput::JsonBody => {
+                let body = args
+                    .first()
+                    .and_then(|request| match request {
+                        Value::Object(fields) => fields.get("body"),
+                        _ => None,
+                    })
+                    .unwrap_or(&Value::Null);
+                let input = match serde_json::to_vec(&value_to_json(body)) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        tracing::error!(error = %error, path = %path, "encode native req.body input");
+                        return request_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "native route input could not be encoded",
+                        );
+                    }
+                };
+                if input.len() > CONTAINER_MAX_EXECUTION_INPUT_BYTES {
+                    return request_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "native route body exceeds the Container execution input limit",
+                    );
+                }
+                input
+            }
+        };
+        return execute_native_route(plan, image.as_ref(), &state, &path, input).await;
     }
     let executor = ModuleExecutor::with_services_and_host_capabilities(
         module_program.as_ref(),

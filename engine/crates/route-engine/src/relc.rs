@@ -1076,7 +1076,7 @@ mod tests {
                 RelSourceKind::Route,
                 "dynamic",
                 "api/dynamic.route",
-                "class Route { post(req) { return req.body; } }",
+                "class Route { post(req) { return req.query; } }",
             ),
         ];
         let image =
@@ -1109,7 +1109,7 @@ mod tests {
         assert!(image
             .route_wasm_fallback(dynamic_id)
             .unwrap()
-            .contains("runtime REL evaluation"));
+            .contains("outside the native Route-WASM v2 subset"));
     }
 
     #[test]

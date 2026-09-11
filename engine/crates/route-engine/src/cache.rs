@@ -395,13 +395,35 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_route_records_explicit_interpreter_fallback_without_wasm() {
-        let root = temp_dir("wasm-fallback");
+    fn request_body_route_emits_native_wasm() {
+        let root = temp_dir("wasm-request-body");
         let api_dir = root.join("api");
         std::fs::create_dir_all(&api_dir).unwrap();
         std::fs::write(
             api_dir.join("echo.route"),
             "class Route { post(req) { return req.body; } }",
+        )
+        .unwrap();
+
+        let cache_root = root.join(".cache");
+        let io = atomic_io::AtomicIo::new();
+        let first = sync(&io, &api_dir, &cache_root).unwrap();
+        assert_eq!(first[0].result, Ok(SyncAction::Regenerated));
+        let wasm = std::fs::read(&first[0].wasm_path).unwrap();
+        wasmparser::validate(&wasm).unwrap();
+        let manifest = std::fs::read_to_string(&first[0].manifest_path).unwrap();
+        assert!(manifest.contains("\"status\": \"native\""));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unsupported_dynamic_route_records_explicit_interpreter_fallback_without_wasm() {
+        let root = temp_dir("wasm-fallback");
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        std::fs::write(
+            api_dir.join("echo.route"),
+            "class Route { post(req) { return req.query; } }",
         )
         .unwrap();
 

@@ -148,7 +148,7 @@ The activation primitive is implemented. A complete automatic file-watcher/reloa
 
 ## Native Route-WASM artifacts
 
-For routes inside the current native compiler subset, the image stores exact deterministic WASM bytes and artifact identity. Those bytes are the eligible payload for Container artifact registration. Artifact persistence is durable-or-fail, cached WASM is SHA-256 verified again when reloaded from disk, corrupt hash-path files are quarantined/removed, and the isolated worker independently re-hashes bytes immediately before execution.
+For routes inside the current native compiler subset, the image stores exact deterministic WASM bytes and artifact identity. Route-WASM ABI v2 additionally defines invocation input for native `return req.body;` routes as the JSON encoding of the evaluator-visible body value; bodies above the Container execution-input ceiling fail with `413 Payload Too Large` rather than escaping to the interpreter. Those bytes are the eligible payload for Container artifact registration. Artifact persistence is durable-or-fail, cached WASM is SHA-256 verified again when reloaded from disk, corrupt hash-path files are quarantined/removed, and the isolated worker independently re-hashes bytes immediately before execution.
 
 Routes outside the subset store an explicit fallback reason instead of being mislabeled as native.
 

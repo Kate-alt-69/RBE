@@ -5,6 +5,7 @@
 //! classified as an explicit interpreter fallback. Native artifacts use the
 //! RBE worker ABI and return JSON bytes through `rbe.output_write`.
 
+use core_lib::CONTAINER_MAX_EXECUTION_INPUT_BYTES;
 use sha2::{Digest, Sha256};
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
@@ -13,16 +14,25 @@ use wasm_encoder::{
 
 use crate::ast::{Expr, RouteFile, Statement};
 
-pub const ROUTE_WASM_ABI_VERSION: u32 = 1;
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 1;
+pub const ROUTE_WASM_ABI_VERSION: u32 = 2;
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 2;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteWasmInput {
+    None,
+    /// Invocation input is the JSON encoding of the evaluator-visible `req.body`
+    /// value. This keeps strings/null/objects/arrays semantically identical.
+    JsonBody,
+}
 
 #[derive(Debug, Clone)]
 pub struct RouteWasmArtifact {
     pub verb: String,
     pub bytes: Vec<u8>,
     pub sha256: String,
+    pub input: RouteWasmInput,
 }
 
 #[derive(Debug, Clone)]
@@ -59,25 +69,29 @@ pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let [Statement::Return(expr)] = method.body.as_slice() else {
         return fallback("native route body currently requires one literal return statement");
     };
-    let Some(value) = static_json(expr) else {
-        return fallback("route return value depends on runtime REL evaluation");
-    };
-    let output = match serde_json::to_vec(&value) {
-        Ok(output) => output,
-        Err(error) => {
-            return fallback(format!("static route result could not be encoded: {error}"))
+    let (bytes, input) = if let Some(value) = static_json(expr) {
+        let output = match serde_json::to_vec(&value) {
+            Ok(output) => output,
+            Err(error) => {
+                return fallback(format!("static route result could not be encoded: {error}"))
+            }
+        };
+        if output.len() > MAX_STATIC_OUTPUT_BYTES {
+            return fallback("static route result exceeds the WASM execution output limit");
         }
+        (encode_static_json_module(&output), RouteWasmInput::None)
+    } else if returns_request_body(method.param_name.as_deref(), expr) {
+        (encode_input_echo_module(), RouteWasmInput::JsonBody)
+    } else {
+        return fallback("route return value is outside the native Route-WASM v2 subset");
     };
-    if output.len() > MAX_STATIC_OUTPUT_BYTES {
-        return fallback("static route result exceeds the WASM execution output limit");
-    }
 
-    let bytes = encode_static_json_module(&output);
     let sha256 = hex::encode(Sha256::digest(&bytes));
     RouteWasmCompilation::Native(RouteWasmArtifact {
         verb: method.verb.clone(),
         bytes,
         sha256,
+        input,
     })
 }
 
@@ -85,6 +99,17 @@ fn fallback(reason: impl Into<String>) -> RouteWasmCompilation {
     RouteWasmCompilation::InterpreterFallback {
         reason: reason.into(),
     }
+}
+
+fn returns_request_body(parameter: Option<&str>, expr: &Expr) -> bool {
+    let Some(parameter) = parameter else {
+        return false;
+    };
+    matches!(
+        expr,
+        Expr::Member(target, field)
+            if field == "body" && matches!(target.as_ref(), Expr::Ident(name) if name == parameter)
+    )
 }
 
 fn static_json(expr: &Expr) -> Option<serde_json::Value> {
@@ -111,6 +136,68 @@ fn static_json(expr: &Expr) -> Option<serde_json::Value> {
         | Expr::UnaryNot(_)
         | Expr::Binary { .. } => None,
     }
+}
+
+fn encode_input_echo_module() -> Vec<u8> {
+    // Route-WASM ABI v2 body passthrough: input bytes are already the JSON
+    // encoding of req.body, so the guest only needs bounded input/output copy.
+    let mut types = TypeSection::new();
+    types.ty().function([], [ValType::I32]);
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32], [ValType::I32]);
+
+    let mut imports = ImportSection::new();
+    imports.import("rbe", "input_len", EntityType::Function(0));
+    imports.import("rbe", "input_read", EntityType::Function(1));
+    imports.import("rbe", "output_write", EntityType::Function(1));
+
+    let mut functions = FunctionSection::new();
+    functions.function(0);
+
+    let pages = CONTAINER_MAX_EXECUTION_INPUT_BYTES
+        .max(1)
+        .div_ceil(WASM_PAGE_BYTES) as u64;
+    let mut memories = MemorySection::new();
+    memories.memory(MemoryType {
+        minimum: pages,
+        maximum: Some(pages),
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+
+    let mut exports = ExportSection::new();
+    exports.export("memory", ExportKind::Memory, 0);
+    // input_len/input_read/output_write occupy function indices 0..=2.
+    exports.export("run", ExportKind::Func, 3);
+
+    let mut run = Function::new([(1, ValType::I32)]);
+    run.instructions()
+        .call(0)
+        .local_set(0)
+        .i32_const(0)
+        .local_get(0)
+        .call(1)
+        .drop()
+        .i32_const(0)
+        .local_get(0)
+        .call(2)
+        .drop()
+        .i32_const(0)
+        .end();
+    let mut code = CodeSection::new();
+    code.function(&run);
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&imports)
+        .section(&functions)
+        .section(&memories)
+        .section(&exports)
+        .section(&code);
+    module.finish()
 }
 
 fn encode_static_json_module(output: &[u8]) -> Vec<u8> {
@@ -190,6 +277,7 @@ mod tests {
             panic!("literal route should be native");
         };
         assert_eq!(first.verb, "get");
+        assert_eq!(first.input, RouteWasmInput::None);
         assert_eq!(first.bytes, second.bytes);
         assert_eq!(first.sha256, second.sha256);
         assert_eq!(&first.bytes[..4], b"\0asm");
@@ -197,12 +285,22 @@ mod tests {
     }
 
     #[test]
-    fn runtime_expression_is_explicit_interpreter_fallback() {
+    fn request_body_passthrough_is_native_v2_input() {
         let route = parse("class Route { post(req) { return req.body; } }");
-        let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
-            panic!("dynamic route must not pretend to be native WASM");
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("req.body passthrough should lower through Route-WASM v2 input");
         };
-        assert!(reason.contains("runtime REL evaluation"));
+        assert_eq!(artifact.input, RouteWasmInput::JsonBody);
+        wasmparser::validate(&artifact.bytes).unwrap();
+    }
+
+    #[test]
+    fn other_runtime_expression_is_explicit_interpreter_fallback() {
+        let route = parse("class Route { post(req) { return req.query; } }");
+        let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
+            panic!("unsupported dynamic route must remain interpreter fallback");
+        };
+        assert!(reason.contains("outside the native Route-WASM v2 subset"));
     }
 
     #[test]
