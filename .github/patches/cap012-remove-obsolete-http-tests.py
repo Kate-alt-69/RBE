@@ -2,6 +2,8 @@ from pathlib import Path
 
 path = Path("engine/crates/route-engine/src/video_host.rs")
 text = path.read_text(encoding="utf-8")
+# CAP-012 moves HTTP policy out of video_host, so HashMap is no longer needed.
+text = text.replace("use std::collections::HashMap;\n", "", 1)
 marker = "\n#[cfg(test)]\nmod tests {"
 start = text.find(marker)
 if start < 0:
