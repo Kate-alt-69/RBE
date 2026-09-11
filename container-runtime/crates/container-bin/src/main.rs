@@ -603,45 +603,59 @@ fn handle_connection(
                     code: "AUTH_FAILED".into(),
                     message: "container control authentication failed".into(),
                 }
-            } else if let Some(environment) =
-                parse_environment(&request.environment).filter(|id| runtime.has_environment(*id))
-            {
+            } else {
+                let requested_environment = request.environment.clone();
+                let environment = if requested_environment == "general" {
+                    Some(runtime.select_general_environment())
+                } else {
+                    parse_environment(&requested_environment)
+                        .filter(|id| runtime.has_environment(*id))
+                };
+                let Some(environment) = environment else {
+                    return write_frame(
+                        &mut stream,
+                        &Response::Error {
+                            request_id: Some(request.request_id),
+                            code: "INVALID_ENVIRONMENT".into(),
+                            message: format!(
+                                "container environment/profile is unavailable: {requested_environment}"
+                            ),
+                        },
+                    )
+                    .map_err(Into::into);
+                };
+
+                let exact_environment = environment.to_string();
                 let generation = runtime.environment_generation(environment);
-                match capability_broker.register_manifest(&request, generation) {
+                let mut bound_request = request;
+                bound_request.environment = exact_environment.clone();
+                match capability_broker.register_manifest(&bound_request, generation) {
                     Ok(grants) => {
                         emit_event(
                             "capability_manifest_registered",
                             &format!(
-                                "runtime_image={} source_id={} environment={} generation={} grants={grants}",
-                                request.runtime_image,
-                                request.source_id,
-                                request.environment,
+                                "runtime_image={} source_id={} requested_environment={} environment={} generation={} grants={grants}",
+                                bound_request.runtime_image,
+                                bound_request.source_id,
+                                requested_environment,
+                                exact_environment,
                                 generation
                             ),
                         );
                         Response::CapabilityManifestRegistered {
-                            request_id: request.request_id,
-                            runtime_image: request.runtime_image,
-                            source_id: request.source_id,
-                            environment: request.environment,
+                            request_id: bound_request.request_id,
+                            runtime_image: bound_request.runtime_image,
+                            source_id: bound_request.source_id,
+                            environment: exact_environment,
                             generation,
                             grants,
                         }
                     }
                     Err(error) => Response::Error {
-                        request_id: Some(request.request_id),
+                        request_id: Some(bound_request.request_id),
                         code: error.code.into(),
                         message: error.message,
                     },
-                }
-            } else {
-                Response::Error {
-                    request_id: Some(request.request_id),
-                    code: "INVALID_ENVIRONMENT".into(),
-                    message: format!(
-                        "container environment is unavailable: {}",
-                        request.environment
-                    ),
                 }
             }
         }

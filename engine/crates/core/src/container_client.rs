@@ -30,6 +30,12 @@ pub struct ContainerExecutionIdentity<'a> {
     pub environment: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerCapabilityBinding {
+    pub environment: String,
+    pub generation: u64,
+}
+
 #[derive(Debug)]
 pub struct ContainerAuthorizedExecution<'a> {
     pub identity: ContainerExecutionIdentity<'a>,
@@ -119,13 +125,14 @@ impl ContainerClient {
         }
     }
 
-    /// Register the exact capability set for one Runtime Image source.
-    /// Container Controller supplies and returns the live Environment generation.
+    /// Register one source's capability set against an exact Environment or
+    /// a Controller-owned logical profile such as `general`. Controller returns
+    /// the exact Environment + generation it bound; callers never mint either.
     pub async fn register_capability_manifest(
         &self,
         identity: ContainerExecutionIdentity<'_>,
         grants: Vec<CapabilityGrant>,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<ContainerCapabilityBinding> {
         let endpoint = self
             .endpoint
             .read()
@@ -141,7 +148,14 @@ impl ContainerClient {
             grants,
         });
         match call(endpoint, request, Duration::from_secs(5)).await? {
-            Response::CapabilityManifestRegistered { generation, .. } => Ok(generation),
+            Response::CapabilityManifestRegistered {
+                environment,
+                generation,
+                ..
+            } => Ok(ContainerCapabilityBinding {
+                environment,
+                generation,
+            }),
             Response::Error { code, message, .. } => {
                 anyhow::bail!("container capability registration failed [{code}]: {message}")
             }
@@ -251,19 +265,25 @@ impl ContainerClient {
     ) -> anyhow::Result<Vec<u8>> {
         self.register_artifact(request.artifact_hash, request.wasm)
             .await?;
-        let generation = self
+        let binding = self
             .register_capability_manifest(request.identity, request.grants)
             .await?;
+        let exact_identity = ContainerExecutionIdentity {
+            runtime_image: request.identity.runtime_image,
+            source_id: request.identity.source_id,
+            environment: &binding.environment,
+        };
         tracing::debug!(
-            runtime_image = request.identity.runtime_image,
-            source_id = request.identity.source_id,
-            environment = request.identity.environment,
-            generation,
+            runtime_image = exact_identity.runtime_image,
+            source_id = exact_identity.source_id,
+            requested_environment = request.identity.environment,
+            environment = exact_identity.environment,
+            generation = binding.generation,
             artifact_hash = request.artifact_hash,
             "Container execution authority admitted"
         );
         self.execute_and_wait(
-            request.identity,
+            exact_identity,
             request.artifact_hash,
             request.input,
             request.declared_cost,

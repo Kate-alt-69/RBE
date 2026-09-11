@@ -18,8 +18,8 @@ use tokio::sync::watch;
 use video_manager::VideoManager;
 
 pub use container_client::{
-    ContainerAuthorizedExecution, ContainerClient, ContainerEndpointSnapshot,
-    ContainerExecutionIdentity,
+    ContainerAuthorizedExecution, ContainerCapabilityBinding, ContainerClient,
+    ContainerEndpointSnapshot, ContainerExecutionIdentity,
 };
 pub use ipc_protocol::{
     CapabilityGrant as ContainerCapabilityGrant, CapabilityKind as ContainerCapabilityKind,

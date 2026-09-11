@@ -154,6 +154,8 @@ The public HTTP route dispatcher now executes a linked native Route-WASM artifac
 
 Routes outside the native compiler subset continue through the linked REL evaluator using their explicit fallback reason. Once a route is native, Container admission/execution failure is fail-closed and does **not** silently fall back to the in-process evaluator.
 
+Native routes request the logical `general` Environment profile during manifest admission. Container Controller resolves that profile round-robin across the configured `general-N` Environments and returns one exact Environment + generation binding. The Execute request then uses that exact Environment; `general` is never accepted as wildcard execution authority, and the dedicated Payment Environment is never selected by the general profile.
+
 ## What `imageId` does not guarantee
 
 The cryptographic identity does **not** by itself provide:

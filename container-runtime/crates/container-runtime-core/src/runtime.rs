@@ -352,6 +352,7 @@ impl Default for RuntimeConfig {
 pub struct Runtime {
     config: RuntimeConfig,
     next_execution: AtomicU64,
+    next_general_environment: AtomicU64,
     global_queue: Mutex<VecDeque<(EnvironmentId, ExecutionTask)>>,
     global_queue_changed: Condvar,
     lifecycle: SharedLifecycle,
@@ -526,6 +527,7 @@ impl Runtime {
         let runtime = Arc::new(Self {
             config,
             next_execution: AtomicU64::new(max_sequence.saturating_add(1).max(1)),
+            next_general_environment: AtomicU64::new(0),
             global_queue: Mutex::new(VecDeque::new()),
             global_queue_changed: Condvar::new(),
             lifecycle: Arc::clone(&lifecycle),
@@ -813,6 +815,16 @@ impl Runtime {
             .unwrap_or(0)
     }
 
+    /// Resolve the logical `general` profile inside Controller authority. The
+    /// caller receives an exact Environment binding and never participates in
+    /// generation selection. Payment is deliberately outside this pool.
+    pub fn select_general_environment(&self) -> EnvironmentId {
+        let sequence = self
+            .next_general_environment
+            .fetch_add(1, Ordering::Relaxed);
+        general_environment_for_sequence(self.config.general_environments, sequence)
+    }
+
     pub fn rebalance_once(&self) {
         let pending = {
             let mut queue = self.global_queue.lock().expect("global queue poisoned");
@@ -892,6 +904,11 @@ fn active_environment_ids(general_count: usize) -> Vec<EnvironmentId> {
         EnvironmentId::GENERAL[..general_count.clamp(1, EnvironmentId::GENERAL.len())].to_vec();
     ids.push(EnvironmentId::Payment);
     ids
+}
+
+fn general_environment_for_sequence(general_count: usize, sequence: u64) -> EnvironmentId {
+    let count = general_count.clamp(1, EnvironmentId::GENERAL.len());
+    EnvironmentId::GENERAL[(sequence % count as u64) as usize]
 }
 
 fn physical_core_count() -> usize {
@@ -1116,5 +1133,41 @@ mod provenance_tests {
     fn legacy_journal_recovery_remains_unattributed() {
         let task = event_to_task(journal_event(false)).expect("recover legacy task");
         assert!(task.provenance.is_none());
+    }
+
+    #[test]
+    fn general_profile_round_robins_only_configured_general_environments() {
+        assert_eq!(
+            general_environment_for_sequence(3, 0),
+            EnvironmentId::General1
+        );
+        assert_eq!(
+            general_environment_for_sequence(3, 1),
+            EnvironmentId::General2
+        );
+        assert_eq!(
+            general_environment_for_sequence(3, 2),
+            EnvironmentId::General3
+        );
+        assert_eq!(
+            general_environment_for_sequence(3, 3),
+            EnvironmentId::General1
+        );
+        for sequence in 0..32 {
+            assert_ne!(
+                general_environment_for_sequence(5, sequence),
+                EnvironmentId::Payment
+            );
+        }
+    }
+
+    #[test]
+    fn general_profile_respects_single_environment_configuration() {
+        for sequence in 0..8 {
+            assert_eq!(
+                general_environment_for_sequence(1, sequence),
+                EnvironmentId::General1
+            );
+        }
     }
 }

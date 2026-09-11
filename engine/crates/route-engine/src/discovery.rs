@@ -492,7 +492,7 @@ fn rel_http_response(value: &Value) -> Result<Option<Response>, String> {
         .map_err(|error| error.to_string())
 }
 
-const NATIVE_ROUTE_ENVIRONMENT: &str = "general-1";
+const NATIVE_ROUTE_ENVIRONMENT_PROFILE: &str = "general";
 const NATIVE_ROUTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
@@ -547,7 +547,7 @@ async fn execute_native_route(
     let identity = ContainerExecutionIdentity {
         runtime_image: &plan.runtime_image,
         source_id: plan.source_id.as_str(),
-        environment: NATIVE_ROUTE_ENVIRONMENT,
+        environment: NATIVE_ROUTE_ENVIRONMENT_PROFILE,
     };
     let output = match state
         .container
