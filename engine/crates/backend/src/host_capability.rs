@@ -2,6 +2,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use core_lib::{call_public_http, PUBLIC_HTTP_TARGET};
 use ipc_protocol::{
     CapabilityKind, HostCapabilityRequest, HostCapabilityResponse,
     HOST_CAPABILITY_PROTOCOL_VERSION, MAX_CAPABILITY_PAYLOAD_BYTES,
@@ -162,16 +163,78 @@ async fn dispatch_request(
             "invalid execution identity",
         );
     }
-    if request.kind != CapabilityKind::Service {
-        return error(
-            "CAPABILITY_KIND_UNSUPPORTED",
-            "this trusted host adapter only supports Service capabilities",
-        );
-    }
     if request.payload.len() > MAX_CAPABILITY_PAYLOAD_BYTES {
         return error(
             "CAPABILITY_REQUEST_TOO_LARGE",
-            "service capability request exceeded protocol limit",
+            "capability request exceeded protocol limit",
+        );
+    }
+    if request.kind == CapabilityKind::Network {
+        if request.target != PUBLIC_HTTP_TARGET {
+            return error(
+                "CAPABILITY_HOST_INVALID_TARGET",
+                "invalid logical Network capability target",
+            );
+        }
+        if !matches!(request.operation.as_str(), "get" | "post" | "request") {
+            return error(
+                "CAPABILITY_HOST_INVALID_OPERATION",
+                "invalid public HTTP capability operation",
+            );
+        }
+        let args: Vec<Value> = match serde_json::from_slice(&request.payload) {
+            Ok(args) => args,
+            Err(_) => {
+                return error(
+                    "CAPABILITY_NETWORK_ARGS_INVALID",
+                    "public HTTP capability payload must be a JSON argument array",
+                )
+            }
+        };
+        let value = match call_public_http(&request.operation, &args).await {
+            Ok(value) => value,
+            Err(call_error) => {
+                tracing::warn!(
+                    execution_id = %request.execution_id,
+                    call_id = request.call_id,
+                    operation = %request.operation,
+                    error = %call_error,
+                    "authorized sandbox Network capability call failed"
+                );
+                return error(
+                    "CAPABILITY_NETWORK_CALL_FAILED",
+                    "trusted public HTTP request failed",
+                );
+            }
+        };
+        let payload = match serde_json::to_vec(&value) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return error(
+                    "CAPABILITY_NETWORK_RESPONSE_INVALID",
+                    "trusted public HTTP broker returned an unserializable response",
+                )
+            }
+        };
+        let response_limit = request
+            .max_response_bytes
+            .min(MAX_CAPABILITY_PAYLOAD_BYTES as u64) as usize;
+        if payload.len() > response_limit {
+            return error(
+                "CAPABILITY_RESPONSE_TOO_LARGE",
+                "trusted public HTTP response exceeded the capability grant",
+            );
+        }
+        return HostCapabilityResponse::Success {
+            execution_id: request.execution_id,
+            call_id: request.call_id,
+            payload,
+        };
+    }
+    if request.kind != CapabilityKind::Service {
+        return error(
+            "CAPABILITY_KIND_UNSUPPORTED",
+            "this trusted host adapter does not support that capability kind",
         );
     }
     let Some(service_name) = normalize_service_target(&request.target) else {
@@ -314,6 +377,13 @@ mod tests {
         assert_eq!(normalize_service_target("mail"), Some("mail"));
         assert_eq!(normalize_service_target("../mail"), None);
         assert_eq!(normalize_service_target("service:mail/socket"), None);
+    }
+
+    #[test]
+    fn network_target_is_fixed_logical_public_http() {
+        assert_eq!(PUBLIC_HTTP_TARGET, "public-http");
+        assert_ne!(PUBLIC_HTTP_TARGET, "127.0.0.1:80");
+        assert_ne!(PUBLIC_HTTP_TARGET, "example.com:443");
     }
 
     #[test]

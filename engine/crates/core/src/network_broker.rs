@@ -1,29 +1,4 @@
-from pathlib import Path
-
-
-def replace_once(path: Path, old: str, new: str, label: str) -> None:
-    text = path.read_text(encoding="utf-8")
-    count = text.count(old)
-    if count != 1:
-        raise SystemExit(f"{label}: expected one anchor, found {count}")
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
-
-
-# Move public HTTP policy into core-lib so interpreter and trusted host bridge
-# share one SSRF/headers/body/timeout implementation.
-core_cargo = Path("engine/crates/core/Cargo.toml")
-replace_once(
-    core_cargo,
-    '''anyhow = { workspace = true }
-''',
-    '''anyhow = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-''',
-    "core reqwest dependency",
-)
-
-network = Path("engine/crates/core/src/network_broker.rs")
-network.write_text(r'''//! Trusted public HTTP egress broker shared by REL interpreter and Container
+//! Trusted public HTTP egress broker shared by REL interpreter and Container
 //! host-capability dispatch. The broker owns network policy; callers provide
 //! logical operations and JSON arguments, never sockets or resolver handles.
 
@@ -207,10 +182,10 @@ fn parse_http_call(operation: &str, args: &[Value]) -> Result<HttpCall, PublicHt
             let url = value_string(options.get("url"), "HTTP URL")?.to_string();
             let timeout_ms = match options.get("timeoutMs") {
                 None => PUBLIC_HTTP_DEFAULT_TIMEOUT_MS,
-                Some(Value::Number(value))
-                    if value.as_u64().is_some_and(|value| value >= 1) =>
-                {
-                    value.as_u64().unwrap_or(PUBLIC_HTTP_DEFAULT_TIMEOUT_MS)
+                Some(Value::Number(value)) if value.as_u64().is_some_and(|value| value >= 1) => {
+                    value
+                        .as_u64()
+                        .unwrap_or(PUBLIC_HTTP_DEFAULT_TIMEOUT_MS)
                         .min(PUBLIC_HTTP_MAX_TIMEOUT_MS)
                 }
                 Some(_) => return Err(http_error("HTTP timeoutMs must be a positive integer")),
@@ -287,10 +262,7 @@ fn parse_http_call(operation: &str, args: &[Value]) -> Result<HttpCall, PublicHt
     })
 }
 
-pub async fn call_public_http(
-    operation: &str,
-    args: &[Value],
-) -> Result<Value, PublicHttpError> {
+pub async fn call_public_http(operation: &str, args: &[Value]) -> Result<Value, PublicHttpError> {
     let call = parse_http_call(operation, args)?;
     let pinned = resolve_public_destination(&call.url).await?;
     let host = call.url.host_str().map(str::to_string);
@@ -328,7 +300,8 @@ pub async fn call_public_http(
     for (name, value) in response.headers().iter().take(PUBLIC_HTTP_MAX_HEADERS) {
         if let Ok(value) = value.to_str() {
             if value.len() <= PUBLIC_HTTP_MAX_HEADER_VALUE_BYTES {
-                response_headers.insert(name.as_str().to_string(), Value::String(value.to_string()));
+                response_headers
+                    .insert(name.as_str().to_string(), Value::String(value.to_string()));
             }
         }
     }
@@ -410,215 +383,3 @@ mod tests {
         assert!(!PUBLIC_HTTP_TARGET.contains(':'));
     }
 }
-''', encoding="utf-8")
-
-core_lib = Path("engine/crates/core/src/lib.rs")
-replace_once(
-    core_lib,
-    '''mod metrics;
-mod video_language;''',
-    '''mod metrics;
-mod network_broker;
-mod video_language;''',
-    "core network module",
-)
-replace_once(
-    core_lib,
-    '''pub use metrics::{
-    BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
-};''',
-    '''pub use metrics::{
-    BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
-};
-pub use network_broker::{
-    call_public_http, PublicHttpError, PUBLIC_HTTP_REQUEST_MAX_BYTES, PUBLIC_HTTP_RESPONSE_MAX_BYTES,
-    PUBLIC_HTTP_TARGET,
-};''',
-    "core network exports",
-)
-
-# Interpreter now delegates HTTP to the exact same trusted broker.
-route_cargo = Path("engine/crates/route-engine/Cargo.toml")
-replace_once(
-    route_cargo,
-    '''reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-''',
-    '''''',
-    "remove route-engine reqwest dependency",
-)
-
-video = Path("engine/crates/route-engine/src/video_host.rs")
-replace_once(
-    video,
-    '''use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
-
-use core_lib::{AppState, VideoLanguage};''',
-    '''use std::collections::HashMap;
-use std::sync::Arc;
-
-use core_lib::{call_public_http, AppState, VideoLanguage};''',
-    "interpreter network imports",
-)
-replace_once(
-    video,
-    '''            if module == "http" {
-                return call_http(function, args).await.map(Some);
-            }''',
-    '''            if module == "http" {
-                let args = args.into_iter().map(value_to_json).collect::<Vec<_>>();
-                let value = call_public_http(function, &args)
-                    .await
-                    .map_err(|error| ModuleEvalError {
-                        code: error.code,
-                        message: error.message,
-                    })?;
-                return value_from_json(value).map(Some);
-            }''',
-    "interpreter uses shared HTTP broker",
-)
-# Remove the old route-engine HTTP implementation as one contiguous block.
-text = video.read_text(encoding="utf-8")
-start = text.find("const HTTP_RESPONSE_MAX_BYTES")
-end = text.find("fn value_to_json", start)
-if start < 0 or end < 0:
-    raise SystemExit("route-engine HTTP policy block anchors changed")
-text = text[:start] + text[end:]
-video.write_text(text, encoding="utf-8")
-
-# Backend trusted adapter gains only the fixed logical Network/public-http
-# target. Controller authorization still occurs before this adapter is called.
-host = Path("engine/crates/backend/src/host_capability.rs")
-replace_once(
-    host,
-    '''use ipc_protocol::{
-    CapabilityKind, HostCapabilityRequest, HostCapabilityResponse,
-    HOST_CAPABILITY_PROTOCOL_VERSION, MAX_CAPABILITY_PAYLOAD_BYTES,
-    MAX_HOST_CAPABILITY_FRAME_BYTES,
-};''',
-    '''use core_lib::{call_public_http, PUBLIC_HTTP_TARGET};
-use ipc_protocol::{
-    CapabilityKind, HostCapabilityRequest, HostCapabilityResponse,
-    HOST_CAPABILITY_PROTOCOL_VERSION, MAX_CAPABILITY_PAYLOAD_BYTES,
-    MAX_HOST_CAPABILITY_FRAME_BYTES,
-};''',
-    "Backend network broker import",
-)
-replace_once(
-    host,
-    '''    if request.kind != CapabilityKind::Service {
-        return error(
-            "CAPABILITY_KIND_UNSUPPORTED",
-            "this trusted host adapter only supports Service capabilities",
-        );
-    }
-    if request.payload.len() > MAX_CAPABILITY_PAYLOAD_BYTES {
-        return error(
-            "CAPABILITY_REQUEST_TOO_LARGE",
-            "service capability request exceeded protocol limit",
-        );
-    }
-    let Some(service_name) = normalize_service_target(&request.target) else {''',
-    '''    if request.payload.len() > MAX_CAPABILITY_PAYLOAD_BYTES {
-        return error(
-            "CAPABILITY_REQUEST_TOO_LARGE",
-            "capability request exceeded protocol limit",
-        );
-    }
-    if request.kind == CapabilityKind::Network {
-        if request.target != PUBLIC_HTTP_TARGET {
-            return error(
-                "CAPABILITY_HOST_INVALID_TARGET",
-                "invalid logical Network capability target",
-            );
-        }
-        if !matches!(request.operation.as_str(), "get" | "post" | "request") {
-            return error(
-                "CAPABILITY_HOST_INVALID_OPERATION",
-                "invalid public HTTP capability operation",
-            );
-        }
-        let args: Vec<Value> = match serde_json::from_slice(&request.payload) {
-            Ok(args) => args,
-            Err(_) => {
-                return error(
-                    "CAPABILITY_NETWORK_ARGS_INVALID",
-                    "public HTTP capability payload must be a JSON argument array",
-                )
-            }
-        };
-        let value = match call_public_http(&request.operation, &args).await {
-            Ok(value) => value,
-            Err(call_error) => {
-                tracing::warn!(
-                    execution_id = %request.execution_id,
-                    call_id = request.call_id,
-                    operation = %request.operation,
-                    error = %call_error,
-                    "authorized sandbox Network capability call failed"
-                );
-                return error(
-                    "CAPABILITY_NETWORK_CALL_FAILED",
-                    "trusted public HTTP request failed",
-                );
-            }
-        };
-        let payload = match serde_json::to_vec(&value) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return error(
-                    "CAPABILITY_NETWORK_RESPONSE_INVALID",
-                    "trusted public HTTP broker returned an unserializable response",
-                )
-            }
-        };
-        let response_limit = request
-            .max_response_bytes
-            .min(MAX_CAPABILITY_PAYLOAD_BYTES as u64) as usize;
-        if payload.len() > response_limit {
-            return error(
-                "CAPABILITY_RESPONSE_TOO_LARGE",
-                "trusted public HTTP response exceeded the capability grant",
-            );
-        }
-        return HostCapabilityResponse::Success {
-            execution_id: request.execution_id,
-            call_id: request.call_id,
-            payload,
-        };
-    }
-    if request.kind != CapabilityKind::Service {
-        return error(
-            "CAPABILITY_KIND_UNSUPPORTED",
-            "this trusted host adapter does not support that capability kind",
-        );
-    }
-    let Some(service_name) = normalize_service_target(&request.target) else {''',
-    "Backend Network dispatch",
-)
-replace_once(
-    host,
-    '''    #[test]
-    fn host_token_comparison_is_exact() {''',
-    '''    #[test]
-    fn network_target_is_fixed_logical_public_http() {
-        assert_eq!(PUBLIC_HTTP_TARGET, "public-http");
-        assert_ne!(PUBLIC_HTTP_TARGET, "127.0.0.1:80");
-        assert_ne!(PUBLIC_HTTP_TARGET, "example.com:443");
-    }
-
-    #[test]
-    fn host_token_comparison_is_exact() {''',
-    "Backend Network target test",
-)
-
-# Document the shared broker boundary.
-doc = Path("doc/runtime-image.md")
-replace_once(
-    doc,
-    '''These compiler requirements are not themselves Controller grants; native lowering must still bind exact policy/limits before registration.''',
-    '''These compiler requirements are not themselves Controller grants; native lowering must still bind exact policy/limits before registration. Public HTTP execution is centralized in `core_lib` as the `public-http` Network Broker: interpreter calls and authenticated Container host calls share the same public-address DNS pinning, redirect/proxy denial, controlled-header rules, request/response ceilings, and timeouts.''',
-    "shared network broker documentation",
-)

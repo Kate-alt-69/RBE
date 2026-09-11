@@ -5,6 +5,7 @@
 
 mod container_client;
 mod metrics;
+mod network_broker;
 mod video_language;
 
 use std::path::Path;
@@ -28,6 +29,10 @@ pub use ipc_protocol::{
 };
 pub use metrics::{
     BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
+};
+pub use network_broker::{
+    call_public_http, PublicHttpError, PUBLIC_HTTP_REQUEST_MAX_BYTES,
+    PUBLIC_HTTP_RESPONSE_MAX_BYTES, PUBLIC_HTTP_TARGET,
 };
 pub use video_language::{VideoLanguage, VideoLanguageError};
 
