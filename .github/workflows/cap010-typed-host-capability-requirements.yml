@@ -1,0 +1,84 @@
+name: CAP-010 typed host capability requirements
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap010-typed-host-capability-requirements.py'
+      - '.github/workflows/cap010-typed-host-capability-requirements.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap010-typed-host-capability-requirements
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply CAP-010 typed capability analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap010-typed-host-capability-requirements.py
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check Engine capability path locked
+        run: cargo check --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --all-targets --locked
+      - name: Test Engine capability path locked
+        run: cargo test --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --locked
+      - name: Clippy Engine capability path locked
+        run: cargo clippy --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --all-targets --locked -- -D warnings
+
+      - name: Verify CAP-010 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub enum RuntimeCapabilityRequirement' engine/crates/route-engine/src/runtime_image.rs
+          grep -q 'PublicHttp { operation: String }' engine/crates/route-engine/src/runtime_image.rs
+          grep -q 'Video { operation: String }' engine/crates/route-engine/src/runtime_image.rs
+          grep -q 'Service { service: String, operation: String }' engine/crates/route-engine/src/runtime_image.rs
+          grep -q 'BTreeSet<RuntimeCapabilityRequirement>' engine/crates/route-engine/src/runtime_image.rs
+          grep -q 'fn capability_requirements(' engine/crates/route-engine/src/relc.rs
+          grep -q 'fn direct_capability_requirements(' engine/crates/route-engine/src/relc.rs
+          grep -q 'fn imported_module_sources(' engine/crates/route-engine/src/relc.rs
+          grep -q 'Module code executes in the caller' engine/crates/route-engine/src/relc.rs
+          grep -q 'typed_host_requirements_ignore_local_builtins' engine/crates/route-engine/src/relc.rs
+          grep -q 'module_host_requirements_propagate_to_route_callers' engine/crates/route-engine/src/relc.rs
+          grep -q 'service_namespace_import_expands_exported_operations' engine/crates/route-engine/src/relc.rs
+          grep -q 'capability_requirements(&plan.source_id)' engine/crates/route-engine/src/discovery.rs
+          grep -q 'typed host-capability requirements' doc/runtime-image.md
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap010-typed-host-capability-requirements.yml
+          git rm -f .github/patches/cap010-typed-host-capability-requirements.py
+          git add engine doc/runtime-image.md
+          git commit -m "FIX | BUG-CAP-010 type and propagate host capability requirements"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
