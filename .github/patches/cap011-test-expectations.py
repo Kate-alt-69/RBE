@@ -39,7 +39,7 @@ replace_once(
 replace_once(
     cache,
     '''    #[test]
-    fn dynamic_route_records_explicit_interpreter_fallback_without_wasm() {''',
+    fn unsupported_dynamic_route_records_explicit_interpreter_fallback_without_wasm() {''',
     '''    #[test]
     fn request_body_route_emits_native_wasm() {
         let root = temp_dir("wasm-request-body");
@@ -63,7 +63,7 @@ replace_once(
     }
 
     #[test]
-    fn dynamic_route_records_explicit_interpreter_fallback_without_wasm() {''',
+    fn unsupported_dynamic_route_records_explicit_interpreter_fallback_without_wasm() {''',
     "cache native request-body test insertion anchor",
 )
 
