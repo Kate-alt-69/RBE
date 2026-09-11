@@ -23,7 +23,7 @@ RuntimeImage {
     recursiveGroups
     middlewarePlan
     serviceAssignments
-    capabilities
+    capabilities (typed host requirements)
     routeWasmArtifacts
     routeWasmFallbacks
     executables
@@ -122,7 +122,7 @@ Current behavior includes:
 - deterministic MiddlewarePlan stored in the image;
 - symbol/dependency/recursion metadata stored in the image;
 - native Route-WASM artifacts/fallbacks pinned to the image;
-- Service assignments/capability metadata pinned to the image.
+- Service assignments and typed host-capability requirements pinned to the image. RELC distinguishes local language helpers from host-crossing HTTP, Video Manager, and Service operations and propagates Module requirements to callers. These compiler requirements are not themselves Controller grants; native lowering must still bind exact policy/limits before registration.
 
 Service child activation still has its own source/catalog fingerprint contract until Service execution is transported entirely as a persistent image artifact.
 

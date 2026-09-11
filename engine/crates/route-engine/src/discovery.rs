@@ -534,11 +534,10 @@ async fn execute_native_route(
     }
 
     if image
-        .capabilities
-        .get(&plan.source_id)
+        .capability_requirements(&plan.source_id)
         .is_some_and(|capabilities| !capabilities.is_empty())
     {
-        let error = "native Route-WASM declares capabilities not lowered by the native compiler";
+        let error = "native Route-WASM declares host capability requirements not lowered by the native compiler";
         tracing::error!(path = %path, source = %plan.source_id, "native route capability invariant failed");
         append_runtime_error(path, error);
         return request_error(StatusCode::INTERNAL_SERVER_ERROR, error);

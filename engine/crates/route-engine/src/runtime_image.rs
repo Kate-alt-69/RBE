@@ -16,6 +16,16 @@ use crate::wasm_compiler::{
     RouteWasmArtifact, ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
 };
 
+/// Host-crossing operations RELC discovered for a source. These are
+/// compiler requirements, not Controller grants: target policy/byte limits and
+/// reachability are still lowered explicitly before native execution.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RuntimeCapabilityRequirement {
+    PublicHttp { operation: String },
+    Video { operation: String },
+    Service { service: String, operation: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeSourceManifest {
     pub id: SourceId,
@@ -49,7 +59,7 @@ pub struct RuntimeImage {
     pub recursive_groups: Vec<Vec<SymbolId>>,
     pub middleware_plan: MiddlewarePlan,
     pub service_assignments: BTreeMap<String, String>,
-    pub capabilities: BTreeMap<SourceId, BTreeSet<String>>,
+    pub capabilities: BTreeMap<SourceId, BTreeSet<RuntimeCapabilityRequirement>>,
     /// Exact native route artifacts pinned at image-link time. These bytes
     /// are the only route WASM payloads eligible for Container registration.
     pub route_wasm_artifacts: BTreeMap<SourceId, RouteWasmArtifact>,
@@ -69,6 +79,13 @@ impl RuntimeImage {
 
     pub fn executable(&self, id: &SourceId) -> Option<&RuntimeExecutable> {
         self.executables.get(id)
+    }
+
+    pub fn capability_requirements(
+        &self,
+        id: &SourceId,
+    ) -> Option<&BTreeSet<RuntimeCapabilityRequirement>> {
+        self.capabilities.get(id)
     }
 
     pub fn route_wasm_artifact(&self, id: &SourceId) -> Option<&RouteWasmArtifact> {
