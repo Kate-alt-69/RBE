@@ -20,7 +20,7 @@ use axum::routing::MethodRouter;
 use axum::Router;
 use core_lib::{
     AppState, ContainerAuthorizedExecution, ContainerCapabilityKind, ContainerExecutionIdentity,
-    ContainerWorkCost, CONTAINER_MAX_EXECUTION_INPUT_BYTES,
+    ContainerWorkCost, CONTAINER_MAX_EXECUTION_INPUT_BYTES, PUBLIC_HTTP_MAX_TIMEOUT_MS,
 };
 
 use crate::analyzer::{analyze, Severity};
@@ -494,7 +494,10 @@ fn rel_http_response(value: &Value) -> Result<Option<Response>, String> {
 }
 
 const NATIVE_ROUTE_ENVIRONMENT_PROFILE: &str = "general";
-const NATIVE_ROUTE_TIMEOUT: Duration = Duration::from_secs(10);
+const NATIVE_ROUTE_TIMEOUT_HEADROOM_MS: u64 = 2_000;
+const NATIVE_ROUTE_TIMEOUT: Duration = Duration::from_millis(
+    PUBLIC_HTTP_MAX_TIMEOUT_MS.saturating_add(NATIVE_ROUTE_TIMEOUT_HEADROOM_MS),
+);
 
 #[derive(Debug, Clone)]
 struct NativeRoutePlan {
@@ -1261,6 +1264,18 @@ mod http_edge_tests {
         );
         assert_eq!(collision_key_for("/api/users/:uid"), "/api/users/:");
         assert_eq!(collision_key_for("/api/users/:name"), "/api/users/:");
+    }
+
+    #[test]
+    fn native_route_wait_budget_exceeds_public_http_broker_timeout() {
+        assert!(
+            NATIVE_ROUTE_TIMEOUT.as_millis() > u128::from(PUBLIC_HTTP_MAX_TIMEOUT_MS),
+            "outer Container wait must leave IPC/cancellation headroom after broker timeout"
+        );
+        assert_eq!(
+            NATIVE_ROUTE_TIMEOUT.as_millis(),
+            u128::from(PUBLIC_HTTP_MAX_TIMEOUT_MS + NATIVE_ROUTE_TIMEOUT_HEADROOM_MS)
+        );
     }
 
     #[test]
