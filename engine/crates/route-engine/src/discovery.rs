@@ -535,15 +535,22 @@ async fn execute_native_route(
         return request_error(StatusCode::INTERNAL_SERVER_ERROR, error);
     }
 
-    if image
-        .capability_requirements(&plan.source_id)
-        .is_some_and(|capabilities| !capabilities.is_empty())
-    {
-        let error = "native Route-WASM declares host capability requirements not lowered by the native compiler";
-        tracing::error!(path = %path, source = %plan.source_id, "native route capability invariant failed");
-        append_runtime_error(path, error);
-        return request_error(StatusCode::INTERNAL_SERVER_ERROR, error);
-    }
+    let grants = match image.container_capability_grants(&plan.source_id) {
+        Ok(grants) => grants,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                path = %path,
+                source = %plan.source_id,
+                "native route capability lowering failed closed"
+            );
+            append_runtime_error(path, &error.to_string());
+            return request_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "native route capability requirements are not executable",
+            );
+        }
+    };
 
     let identity = ContainerExecutionIdentity {
         runtime_image: &plan.runtime_image,
@@ -556,7 +563,7 @@ async fn execute_native_route(
             identity,
             artifact_hash: &plan.artifact.sha256,
             wasm: plan.artifact.bytes.clone(),
-            grants: Vec::new(),
+            grants,
             input,
             declared_cost: ContainerWorkCost {
                 cpu: 1,
