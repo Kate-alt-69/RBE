@@ -40,7 +40,9 @@ jobs:
           python3 .github/patches/container-env-process-fix.py
           python3 .github/patches/container-env-process.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
-      - name: Check Container workspace
+      - name: Resolve Container dependency graph
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace
+      - name: Check Container workspace locked
         run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --locked
       - name: Test Container workspace
         run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
