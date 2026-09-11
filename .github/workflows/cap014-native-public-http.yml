@@ -6,6 +6,7 @@ name: CAP-014 native public HTTP WASM
     paths:
       - '.github/patches/cap014-native-public-http.py'
       - '.github/patches/cap014-doc-native-manifest.py'
+      - '.github/patches/cap014-normalize-network-anchor.py'
       - '.github/workflows/cap014-native-public-http.yml'
 
 permissions:
@@ -38,6 +39,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           git reset --hard origin/main
+          python3 .github/patches/cap014-normalize-network-anchor.py
           python3 .github/patches/cap014-native-public-http.py
           python3 .github/patches/cap014-doc-native-manifest.py
           cargo fmt --manifest-path engine/Cargo.toml --all
@@ -79,6 +81,7 @@ jobs:
           git rm .github/workflows/cap014-native-public-http.yml
           git rm -f .github/patches/cap014-native-public-http.py
           git rm -f .github/patches/cap014-doc-native-manifest.py
+          git rm -f .github/patches/cap014-normalize-network-anchor.py
           git add engine doc/runtime-image.md
           git commit -m "FIX | BUG-CAP-014 execute static public HTTP through native WASM"
 
