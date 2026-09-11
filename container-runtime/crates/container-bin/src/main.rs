@@ -19,8 +19,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use container_runtime_core::{
-    CapabilityBroker, EnvironmentId, EnvironmentRegistry, ExecutionProvenance, Runtime,
-    RuntimeConfig, WorkCost,
+    artifact_sha256_matches, CapabilityBroker, EnvironmentId, EnvironmentRegistry,
+    ExecutionProvenance, Runtime, RuntimeConfig, WorkCost,
 };
 use execution_engine::{CapabilityHost, ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
@@ -436,6 +436,9 @@ fn run_worker_inner(args: &[String]) -> anyhow::Result<Vec<u8>> {
         .join(format!("{artifact}.wasm"));
     let wasm =
         fs::read(path).map_err(|e| anyhow::anyhow!("worker: failed to read artifact: {e}"))?;
+    if !artifact_sha256_matches(&artifact, &wasm) {
+        anyhow::bail!("worker: artifact SHA-256 integrity check failed");
+    }
     let fuel = value_after(args, "--fuel")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(10_000_000);

@@ -20,7 +20,7 @@ mod storage;
 mod swamp;
 mod worker;
 
-pub use cache::{ArtifactCache, ExecutionProfile};
+pub use cache::{artifact_sha256_matches, ArtifactCache, ExecutionProfile};
 pub use control_plane::{AuthorizedCapability, CapabilityBroker, CapabilityCall, CapabilityError};
 pub use environment::EnvironmentSnapshot;
 pub use execution::{

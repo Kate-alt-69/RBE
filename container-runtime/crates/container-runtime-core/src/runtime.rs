@@ -696,7 +696,7 @@ impl Runtime {
         }
         let already_present = self.cache.contains_artifact(artifact_hash);
         if !already_present {
-            self.cache.put_artifact(computed, wasm);
+            self.cache.put_artifact(computed, wasm)?;
         }
         Ok(already_present)
     }
