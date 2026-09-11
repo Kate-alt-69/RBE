@@ -5,6 +5,7 @@ name: Container Environment authority and cancellation
     branches: [main]
     paths:
       - '.github/patches/container-env-authority-cancel.py'
+      - '.github/patches/container-env-authority-cancel-clippy.py'
       - '.github/workflows/container-env-authority-cancel.yml'
 
 permissions:
@@ -37,6 +38,7 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           python3 .github/patches/container-env-authority-cancel.py
+          python3 .github/patches/container-env-authority-cancel-clippy.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
       - name: Check Container workspace locked
         run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --locked
@@ -52,6 +54,7 @@ jobs:
           grep -q 'storage_manager: Option<Arc<EnvironmentStorageManager>>' container-runtime/crates/container-runtime-core/src/environment.rs
           grep -q 'pub type Canceller' container-runtime/crates/container-runtime-core/src/worker.rs
           grep -q 'ChildRequest::Cancel' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'struct WorkerExecution' container-runtime/crates/container-bin/src/environment_process.rs
           grep -q 'active_executions' container-runtime/crates/container-bin/src/environment_process.rs
           grep -q 'environment_processes.canceller()' container-runtime/crates/container-bin/src/main.rs
           grep -q 'generation: owner.generation' container-runtime/crates/container-bin/src/environment_process.rs
@@ -61,6 +64,7 @@ jobs:
           set -euo pipefail
           git rm .github/workflows/container-env-authority-cancel.yml
           git rm .github/patches/container-env-authority-cancel.py
+          git rm .github/patches/container-env-authority-cancel-clippy.py
           git add container-runtime
           git commit -m "FIX | BUG-CTR-003 make Environment storage authoritative and hard-cancellable"
           git fetch origin main
