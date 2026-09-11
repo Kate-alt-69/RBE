@@ -26,7 +26,11 @@ pub struct ContainerProcess {
 }
 
 impl ContainerProcess {
-    pub async fn spawn(binary: &Path, settings: &config::ContainersConfig) -> anyhow::Result<Self> {
+    pub async fn spawn(
+        binary: &Path,
+        settings: &config::ContainersConfig,
+        host_capability: &crate::host_capability::HostCapabilityEndpoint,
+    ) -> anyhow::Result<Self> {
         verify_container(binary)?;
         const MAX_SPAWN_ATTEMPTS: u32 = 3;
         let mut last_err = None;
@@ -55,6 +59,11 @@ impl ContainerProcess {
             }
             command
                 .env("RBE_CONTAINER_TOKEN", &token)
+                .env(
+                    "RBE_HOST_CAPABILITY_ADDR",
+                    host_capability.address().to_string(),
+                )
+                .env("RBE_HOST_CAPABILITY_TOKEN", host_capability.token())
                 .kill_on_drop(true);
 
             let child = command.spawn().map_err(|err| {

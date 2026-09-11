@@ -14,8 +14,9 @@ use container_runtime_core::{
 };
 use ipc_protocol::{
     read_frame, read_worker_output, write_frame, write_worker_capability_result,
-    write_worker_input, CapabilityKind, WorkerCapabilityCall, WorkerCapabilityResult,
-    WorkerOutputFrame, WorkerResultFrame, CAPABILITY_ABI_VERSION, MAX_CAPABILITY_PAYLOAD_BYTES,
+    write_worker_input, CapabilityKind, HostCapabilityRequest, HostCapabilityResponse,
+    WorkerCapabilityCall, WorkerCapabilityResult, WorkerOutputFrame, WorkerResultFrame,
+    CAPABILITY_ABI_VERSION, HOST_CAPABILITY_PROTOCOL_VERSION, MAX_CAPABILITY_PAYLOAD_BYTES,
     MAX_EXECUTION_INPUT_BYTES,
 };
 use serde::de::DeserializeOwned;
@@ -161,6 +162,7 @@ struct WorkerExecution<'a> {
 #[derive(Debug, Clone)]
 pub struct CapabilityDispatchRequest {
     pub execution_id: String,
+    pub call_id: u64,
     pub kind: CapabilityKind,
     pub target: String,
     pub operation: String,
@@ -182,6 +184,7 @@ pub fn unavailable_capability_dispatcher() -> CapabilityDispatcher {
     Arc::new(|request| {
         let _consumed_metadata = (
             request.execution_id.as_str(),
+            request.call_id,
             request.kind,
             request.target.as_str(),
             request.operation.as_str(),
@@ -193,6 +196,92 @@ pub fn unavailable_capability_dispatcher() -> CapabilityDispatcher {
             message: "no trusted host capability dispatcher is configured".into(),
         })
     })
+}
+
+pub fn authenticated_host_capability_dispatcher(
+    address: SocketAddr,
+    token: String,
+) -> Result<CapabilityDispatcher> {
+    if !address.ip().is_loopback() {
+        bail!("trusted host capability endpoint must be loopback");
+    }
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("trusted host capability token must be 256-bit hexadecimal");
+    }
+
+    Ok(Arc::new(move |request| {
+        let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).map_err(|_| {
+            CapabilityDispatchError {
+                code: "CAPABILITY_HOST_UNAVAILABLE".into(),
+                message: "trusted host capability endpoint is unavailable".into(),
+            }
+        })?;
+        stream
+            .set_nodelay(true)
+            .map_err(|_| CapabilityDispatchError {
+                code: "CAPABILITY_HOST_IO".into(),
+                message: "failed to configure trusted host capability channel".into(),
+            })?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .map_err(|_| CapabilityDispatchError {
+                code: "CAPABILITY_HOST_IO".into(),
+                message: "failed to configure trusted host capability channel".into(),
+            })?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .map_err(|_| CapabilityDispatchError {
+                code: "CAPABILITY_HOST_IO".into(),
+                message: "failed to configure trusted host capability channel".into(),
+            })?;
+
+        let execution_id = request.execution_id.clone();
+        let call_id = request.call_id;
+        let host_request = HostCapabilityRequest {
+            version: HOST_CAPABILITY_PROTOCOL_VERSION,
+            auth_token: token.clone(),
+            execution_id: execution_id.clone(),
+            call_id,
+            kind: request.kind,
+            target: request.target,
+            operation: request.operation,
+            payload: request.payload,
+            max_response_bytes: request.max_response_bytes,
+        };
+        write_frame(&mut stream, &host_request).map_err(|_| CapabilityDispatchError {
+            code: "CAPABILITY_HOST_IO".into(),
+            message: "failed to send trusted host capability request".into(),
+        })?;
+        let frame = read_frame(&mut stream).map_err(|_| CapabilityDispatchError {
+            code: "CAPABILITY_HOST_IO".into(),
+            message: "failed to read trusted host capability response".into(),
+        })?;
+        let response: HostCapabilityResponse =
+            serde_json::from_slice(&frame).map_err(|_| CapabilityDispatchError {
+                code: "CAPABILITY_HOST_PROTOCOL".into(),
+                message: "trusted host capability response was malformed".into(),
+            })?;
+        match response {
+            HostCapabilityResponse::Success {
+                execution_id: returned_execution,
+                call_id: returned_call,
+                payload,
+            } if returned_execution == execution_id && returned_call == call_id => Ok(payload),
+            HostCapabilityResponse::Error {
+                execution_id: returned_execution,
+                call_id: returned_call,
+                code,
+                message,
+            } if returned_execution == execution_id && returned_call == call_id => {
+                Err(CapabilityDispatchError { code, message })
+            }
+            _ => Err(CapabilityDispatchError {
+                code: "CAPABILITY_HOST_PROTOCOL".into(),
+                message: "trusted host capability response identity did not match the request"
+                    .into(),
+            }),
+        }
+    }))
 }
 
 struct ManagedEnvironment {
@@ -544,6 +633,7 @@ impl EnvironmentProcessSupervisor {
         };
         let request = CapabilityDispatchRequest {
             execution_id: task.id.to_string(),
+            call_id: call.call_id,
             kind: call.kind,
             target: call.target,
             operation: call.operation,
@@ -576,7 +666,11 @@ impl EnvironmentProcessSupervisor {
     fn spawn_one(&self, id: EnvironmentId, generation: u64) -> Result<ManagedEnvironment> {
         let session = self.new_session(id, generation);
         let mut command = Command::new(std::env::current_exe()?);
-        command.arg("--environment-child");
+        command
+            .arg("--environment-child")
+            .env_remove("RBE_CONTAINER_TOKEN")
+            .env_remove("RBE_HOST_CAPABILITY_ADDR")
+            .env_remove("RBE_HOST_CAPABILITY_TOKEN");
         if self.debug {
             // Visible diagnostic propagation only. The session capability on the
             // inherited bootstrap pipe remains the actual authority.

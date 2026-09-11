@@ -6,11 +6,13 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 6;
 pub const CAPABILITY_ABI_VERSION: u16 = 1;
+pub const HOST_CAPABILITY_PROTOCOL_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EXECUTION_INPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_EXECUTION_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CAPABILITY_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_HOST_CAPABILITY_FRAME_BYTES: usize = MAX_CAPABILITY_PAYLOAD_BYTES + 64 * 1024;
 pub const MAX_AWAIT_RESULT_MS: u64 = 30_000;
 pub const MAX_WORKER_ERROR_BYTES: usize = 64 * 1024;
 const WORKER_PIPE_MAGIC: [u8; 4] = *b"RBW1";
@@ -184,6 +186,35 @@ pub enum WorkerCapabilityResult {
         payload: Vec<u8>,
     },
     Error {
+        call_id: u64,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCapabilityRequest {
+    pub version: u16,
+    pub auth_token: String,
+    pub execution_id: String,
+    pub call_id: u64,
+    pub kind: CapabilityKind,
+    pub target: String,
+    pub operation: String,
+    pub payload: Vec<u8>,
+    pub max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum HostCapabilityResponse {
+    Success {
+        execution_id: String,
+        call_id: u64,
+        payload: Vec<u8>,
+    },
+    Error {
+        execution_id: String,
         call_id: u64,
         code: String,
         message: String,

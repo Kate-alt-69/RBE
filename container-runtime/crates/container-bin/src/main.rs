@@ -11,7 +11,7 @@ mod environment_process;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -118,7 +118,23 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(defaults.workers_per_swamp);
     let token = env::var("RBE_CONTAINER_TOKEN").ok();
     let capability_broker = Arc::new(CapabilityBroker::new(debug));
-    let capability_dispatcher = environment_process::unavailable_capability_dispatcher();
+    let capability_dispatcher = match (
+        env::var("RBE_HOST_CAPABILITY_ADDR").ok(),
+        env::var("RBE_HOST_CAPABILITY_TOKEN").ok(),
+    ) {
+        (Some(address), Some(host_token)) => {
+            let address = address
+                .parse::<SocketAddr>()
+                .map_err(|error| anyhow::anyhow!("invalid RBE_HOST_CAPABILITY_ADDR: {error}"))?;
+            environment_process::authenticated_host_capability_dispatcher(address, host_token)?
+        }
+        (None, None) => environment_process::unavailable_capability_dispatcher(),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "trusted host capability endpoint requires both address and token"
+            ));
+        }
+    };
     let environment_processes = environment_process::EnvironmentProcessSupervisor::start(
         general_environments,
         debug,
@@ -201,6 +217,9 @@ fn spawn_monitor_supervisor() -> anyhow::Result<()> {
         .spawn(move || loop {
             let mut child = match std::process::Command::new(&exe)
                 .arg("--monitor")
+                .env_remove("RBE_CONTAINER_TOKEN")
+                .env_remove("RBE_HOST_CAPABILITY_ADDR")
+                .env_remove("RBE_HOST_CAPABILITY_TOKEN")
                 .arg("--pid")
                 .arg(watched_pid.to_string())
                 .arg("--events")

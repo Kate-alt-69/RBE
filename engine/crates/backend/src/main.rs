@@ -17,6 +17,7 @@ mod container_process;
 mod er_recovery;
 mod error_reporter_daemon;
 mod host_bootstrap;
+mod host_capability;
 mod maintenance_notice;
 mod port_guard;
 mod runtime_image_boot;
@@ -656,8 +657,19 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         );
     }
 
-    let initial_container =
-        container_process::ContainerProcess::spawn(&container_path, &config.containers).await?;
+    let host_capability_bridge = host_capability::HostCapabilityBridge::start().await?;
+    let host_capability_endpoint = host_capability_bridge.endpoint();
+    tracing::info!(
+        address = %host_capability_endpoint.address(),
+        "trusted host capability bridge ready"
+    );
+
+    let initial_container = container_process::ContainerProcess::spawn(
+        &container_path,
+        &config.containers,
+        &host_capability_endpoint,
+    )
+    .await?;
     let (address, token, pid) = initial_container.endpoint();
     let container_client = ContainerClient::new(address, token, pid);
     boot_trace(format!(
@@ -667,11 +679,14 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     let container_supervisor_task = spawn_container_supervisor(
         container_path.clone(),
         config.containers.clone(),
-        container_process.clone(),
-        container_client.clone(),
-        maintenance.clone(),
-        refresh_interval,
-        er_control_key.clone(),
+        ContainerSupervisorContext {
+            host_capability: host_capability_endpoint.clone(),
+            process: container_process.clone(),
+            client: container_client.clone(),
+            maintenance: maintenance.clone(),
+            refresh_interval,
+            er_control_key: er_control_key.clone(),
+        },
     );
 
     let service_runtime_env = Arc::new(runtime_image.snapshot().environment.to_json());
@@ -692,6 +707,10 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         .as_ref()
         .map(|mother| mother.manager())
         .unwrap_or_default();
+    host_capability_bridge
+        .install_service_manager(service_manager.clone())
+        .await;
+    tracing::info!("trusted host capability bridge attached to Service Manager");
 
     let (video_manager, video_worker_task) = if config.video_manager.enabled {
         if config.video_manager.default_database != video_manager::DEFAULT_DATABASE_NAME {
@@ -902,15 +921,28 @@ async fn bind_backend_listener(addr: &str) -> anyhow::Result<tokio::net::TcpList
     ))
 }
 
-fn spawn_container_supervisor(
-    binary: PathBuf,
-    settings: config::ContainersConfig,
+struct ContainerSupervisorContext {
+    host_capability: host_capability::HostCapabilityEndpoint,
     process: Arc<tokio::sync::Mutex<container_process::ContainerProcess>>,
     client: ContainerClient,
     maintenance: Arc<MaintenanceMetrics>,
     refresh_interval: Duration,
     er_control_key: Option<host_bootstrap::ErControlKey>,
+}
+
+fn spawn_container_supervisor(
+    binary: PathBuf,
+    settings: config::ContainersConfig,
+    context: ContainerSupervisorContext,
 ) -> tokio::task::JoinHandle<()> {
+    let ContainerSupervisorContext {
+        host_capability,
+        process,
+        client,
+        maintenance,
+        refresh_interval,
+        er_control_key,
+    } = context;
     tokio::spawn(async move {
         const DRAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
         const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
@@ -981,7 +1013,13 @@ fn spawn_container_supervisor(
                         );
                         tokio::time::sleep(delay).await;
 
-                        match container_process::ContainerProcess::spawn(&binary, &settings).await {
+                        match container_process::ContainerProcess::spawn(
+                            &binary,
+                            &settings,
+                            &host_capability,
+                        )
+                        .await
+                        {
                             Ok(replacement) => {
                                 let (address, token, new_pid) = replacement.endpoint();
                                 let old = {
@@ -1033,7 +1071,13 @@ fn spawn_container_supervisor(
                         continue;
                     }
 
-                    match container_process::ContainerProcess::spawn(&binary, &settings).await {
+                    match container_process::ContainerProcess::spawn(
+                        &binary,
+                        &settings,
+                        &host_capability,
+                    )
+                    .await
+                    {
                         Ok(replacement) => {
                             let (address, token, pid) = replacement.endpoint();
                             let old = {
