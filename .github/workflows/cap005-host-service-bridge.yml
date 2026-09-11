@@ -1,0 +1,96 @@
+name: CAP-005 authenticated host service bridge
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap005-host-service-bridge.py'
+      - '.github/workflows/cap005-host-service-bridge.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap005-host-service-bridge
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            container-runtime
+            engine
+
+      - name: Apply CAP-005 bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap005-host-service-bridge.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check Container workspace locked
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+      - name: Test Container workspace locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace locked
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Check Backend locked
+        run: cargo check --manifest-path engine/Cargo.toml -p backend --all-targets --locked
+      - name: Test Backend locked
+        run: cargo test --manifest-path engine/Cargo.toml -p backend --locked
+      - name: Clippy Backend locked
+        run: cargo clippy --manifest-path engine/Cargo.toml -p backend --all-targets --locked -- -D warnings
+
+      - name: Verify CAP-005 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub struct HostCapabilityRequest' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub enum HostCapabilityResponse' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'authenticated_host_capability_dispatcher' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'capability_broker.authorize' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'call_id: call.call_id' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'env_remove("RBE_CONTAINER_TOKEN")' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'env_remove("RBE_HOST_CAPABILITY_TOKEN")' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'env_remove("RBE_HOST_CAPABILITY_TOKEN")' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'CapabilityKind::Service' engine/crates/backend/src/host_capability.rs
+          grep -q 'manager.call(service_name' engine/crates/backend/src/host_capability.rs
+          grep -q 'Ipv4Addr::LOCALHOST' engine/crates/backend/src/host_capability.rs
+          grep -q 'constant_time_eq' engine/crates/backend/src/host_capability.rs
+          grep -q 'RBE_HOST_CAPABILITY_ADDR' engine/crates/backend/src/container_process.rs
+          grep -q 'RBE_HOST_CAPABILITY_TOKEN' engine/crates/backend/src/container_process.rs
+          grep -q 'HostCapabilityBridge::start().await' engine/crates/backend/src/main.rs
+          grep -q 'install_service_manager(service_manager.clone())' engine/crates/backend/src/main.rs
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap005-host-service-bridge.yml
+          git rm -f .github/patches/cap005-host-service-bridge.py
+          git add container-runtime engine
+          git commit -m "FIX | BUG-CAP-005 bridge authorized Service capabilities to Backend"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
