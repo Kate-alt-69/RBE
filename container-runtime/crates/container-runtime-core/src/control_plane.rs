@@ -84,6 +84,7 @@ impl CapabilityBroker {
     pub fn register_manifest(
         &self,
         request: &RegisterCapabilityManifestRequest,
+        generation: u64,
     ) -> Result<usize, CapabilityError> {
         validate_runtime_image(&request.runtime_image)?;
         validate_source_id(&request.source_id)?;
@@ -128,7 +129,7 @@ impl CapabilityBroker {
             runtime_image: request.runtime_image.clone(),
             source_id: request.source_id.clone(),
             environment: request.environment.clone(),
-            generation: request.generation,
+            generation,
         };
         self.manifests
             .write()
@@ -140,6 +141,50 @@ impl CapabilityBroker {
                 },
             );
         Ok(request.grants.len())
+    }
+
+    /// Verify that an execution identity is explicitly bound to a manifest
+    /// for the Controller's current Environment generation. Empty manifests are
+    /// valid and intentionally distinguish "no host capabilities" from
+    /// "identity was never registered".
+    pub fn authorize_execution(
+        &self,
+        runtime_image: &str,
+        source_id: &str,
+        environment: &str,
+        generation: u64,
+        capability_abi: u16,
+    ) -> Result<(), CapabilityError> {
+        validate_runtime_image(runtime_image)?;
+        validate_source_id(source_id)?;
+        validate_environment(environment)?;
+        if capability_abi != CAPABILITY_ABI_VERSION {
+            return Err(CapabilityError {
+                code: "CAPABILITY_ABI_UNSUPPORTED",
+                message: format!(
+                    "capability ABI {capability_abi} is unsupported; controller supports {CAPABILITY_ABI_VERSION}"
+                ),
+            });
+        }
+        let key = ManifestKey {
+            runtime_image: runtime_image.to_string(),
+            source_id: source_id.to_string(),
+            environment: environment.to_string(),
+            generation,
+        };
+        if self
+            .manifests
+            .read()
+            .expect("capability manifest table poisoned")
+            .contains_key(&key)
+        {
+            Ok(())
+        } else {
+            Err(CapabilityError {
+                code: "CAPABILITY_MANIFEST_UNKNOWN",
+                message: "execution has no exact capability manifest for this Runtime Image/SourceId/Environment generation".into(),
+            })
+        }
     }
 
     pub fn authorize(
@@ -362,7 +407,6 @@ mod tests {
             runtime_image: "ab".repeat(32),
             source_id: "route:api/me".into(),
             environment: "general-1".into(),
-            generation: 4,
             grants,
         }
     }
@@ -401,7 +445,7 @@ mod tests {
     fn exact_grant_authorizes_and_enforces_request_bound() {
         let broker = CapabilityBroker::new(false);
         broker
-            .register_manifest(&request(vec![service_grant()]))
+            .register_manifest(&request(vec![service_grant()]), 4)
             .unwrap();
         let authorized = broker.authorize(call(4, "get_user", 1000)).unwrap();
         assert_eq!(authorized.max_response_bytes, 4096);
@@ -413,7 +457,7 @@ mod tests {
     fn wrong_operation_and_generation_fail_closed() {
         let broker = CapabilityBroker::new(false);
         broker
-            .register_manifest(&request(vec![service_grant()]))
+            .register_manifest(&request(vec![service_grant()]), 4)
             .unwrap();
         assert_eq!(
             broker
@@ -429,6 +473,47 @@ mod tests {
     }
 
     #[test]
+    fn execution_binding_requires_exact_controller_generation_and_abi() {
+        let broker = CapabilityBroker::new(false);
+        broker.register_manifest(&request(Vec::new()), 4).unwrap();
+        broker
+            .authorize_execution(
+                &"ab".repeat(32),
+                "route:api/me",
+                "general-1",
+                4,
+                CAPABILITY_ABI_VERSION,
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .authorize_execution(
+                    &"ab".repeat(32),
+                    "route:api/me",
+                    "general-1",
+                    5,
+                    CAPABILITY_ABI_VERSION,
+                )
+                .unwrap_err()
+                .code,
+            "CAPABILITY_MANIFEST_UNKNOWN"
+        );
+        assert_eq!(
+            broker
+                .authorize_execution(
+                    &"ab".repeat(32),
+                    "route:api/me",
+                    "general-1",
+                    4,
+                    CAPABILITY_ABI_VERSION + 1,
+                )
+                .unwrap_err()
+                .code,
+            "CAPABILITY_ABI_UNSUPPORTED"
+        );
+    }
+
+    #[test]
     fn production_controller_refuses_debug_and_host_file_grants() {
         let broker = CapabilityBroker::new(false);
         for kind in [CapabilityKind::Debug, CapabilityKind::HostFile] {
@@ -437,7 +522,7 @@ mod tests {
             grant.target = "shell".into();
             assert_eq!(
                 broker
-                    .register_manifest(&request(vec![grant]))
+                    .register_manifest(&request(vec![grant]), 4)
                     .unwrap_err()
                     .code,
                 "DEBUG_DISABLED"
@@ -449,7 +534,7 @@ mod tests {
     fn revoke_is_bound_to_environment_generation() {
         let broker = CapabilityBroker::new(false);
         broker
-            .register_manifest(&request(vec![service_grant()]))
+            .register_manifest(&request(vec![service_grant()]), 4)
             .unwrap();
         assert_eq!(broker.revoke_environment_generation("general-1", 4), 1);
         assert_eq!(broker.manifest_count(), 0);

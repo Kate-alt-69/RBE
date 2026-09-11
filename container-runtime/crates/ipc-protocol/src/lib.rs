@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const CAPABILITY_ABI_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
@@ -63,7 +63,8 @@ pub struct RegisterCapabilityManifestRequest {
     pub runtime_image: String,
     pub source_id: String,
     pub environment: String,
-    pub generation: u64,
+    /// The caller deliberately does not provide an Environment generation.
+    /// Container Controller binds the manifest to its current live generation.
     pub grants: Vec<CapabilityGrant>,
 }
 
@@ -71,6 +72,13 @@ pub struct RegisterCapabilityManifestRequest {
 pub struct ExecuteRequest {
     pub request_id: String,
     pub auth_token: String,
+    /// Identity of the immutable Runtime Image that selected this execution.
+    pub runtime_image: String,
+    /// Exact REL source identity inside the Runtime Image.
+    pub source_id: String,
+    /// Capability ABI expected by this caller. Environment generation is
+    /// intentionally absent: only Container Controller may stamp generation.
+    pub capability_abi: u16,
     pub environment: String,
     pub artifact_hash: String,
     pub declared_cost: WorkCost,
@@ -412,6 +420,9 @@ mod tests {
         let execute = Request::Execute(ExecuteRequest {
             request_id: "exec-1".into(),
             auth_token: "secret".into(),
+            runtime_image: "ab".repeat(32),
+            source_id: "route:api/me".into(),
+            capability_abi: CAPABILITY_ABI_VERSION,
             environment: "general-1".into(),
             artifact_hash: "ab".repeat(32),
             declared_cost: WorkCost {
@@ -440,7 +451,6 @@ mod tests {
             runtime_image: "ab".repeat(32),
             source_id: "route:api/me".into(),
             environment: "general-1".into(),
-            generation: 7,
             grants: vec![CapabilityGrant {
                 kind: CapabilityKind::Service,
                 target: "uac".into(),
@@ -456,7 +466,6 @@ mod tests {
             panic!("expected capability-manifest request");
         };
         assert_eq!(decoded.capability_abi, CAPABILITY_ABI_VERSION);
-        assert_eq!(decoded.generation, 7);
         assert_eq!(decoded.grants[0].target, "uac");
     }
 

@@ -546,8 +546,11 @@ fn handle_connection(
                     code: "AUTH_FAILED".into(),
                     message: "container control authentication failed".into(),
                 }
-            } else {
-                match capability_broker.register_manifest(&request) {
+            } else if let Some(environment) =
+                parse_environment(&request.environment).filter(|id| runtime.has_environment(*id))
+            {
+                let generation = runtime.environment_generation(environment);
+                match capability_broker.register_manifest(&request, generation) {
                     Ok(grants) => {
                         emit_event(
                             "capability_manifest_registered",
@@ -556,7 +559,7 @@ fn handle_connection(
                                 request.runtime_image,
                                 request.source_id,
                                 request.environment,
-                                request.generation
+                                generation
                             ),
                         );
                         Response::CapabilityManifestRegistered {
@@ -564,7 +567,7 @@ fn handle_connection(
                             runtime_image: request.runtime_image,
                             source_id: request.source_id,
                             environment: request.environment,
-                            generation: request.generation,
+                            generation,
                             grants,
                         }
                     }
@@ -573,6 +576,15 @@ fn handle_connection(
                         code: error.code.into(),
                         message: error.message,
                     },
+                }
+            } else {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "INVALID_ENVIRONMENT".into(),
+                    message: format!(
+                        "container environment is unavailable: {}",
+                        request.environment
+                    ),
                 }
             }
         }
@@ -604,6 +616,26 @@ fn handle_connection(
             } else if let Some(environment) =
                 parse_environment(&request.environment).filter(|id| runtime.has_environment(*id))
             {
+                // Generation is Controller state. The backend supplies immutable
+                // Runtime Image/Source identity only; it cannot mint generation.
+                let generation = runtime.environment_generation(environment);
+                if let Err(error) = capability_broker.authorize_execution(
+                    &request.runtime_image,
+                    &request.source_id,
+                    &request.environment,
+                    generation,
+                    request.capability_abi,
+                ) {
+                    return write_frame(
+                        &mut stream,
+                        &Response::Error {
+                            request_id: Some(request.request_id),
+                            code: error.code.into(),
+                            message: error.message,
+                        },
+                    )
+                    .map_err(Into::into);
+                }
                 let cost = WorkCost {
                     cpu: request.declared_cost.cpu,
                     memory: request.declared_cost.memory,

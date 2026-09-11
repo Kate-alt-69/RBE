@@ -4,10 +4,11 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ipc_protocol::{
-    decode_response, read_frame, write_frame, AwaitResultRequest, ExecuteRequest, HealthRequest,
-    InspectRequest, PrepareRefreshRequest, RegisterArtifactRequest, Request, Response,
-    ResumeRequest, WorkCost as IpcWorkCost, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS,
-    MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES,
+    decode_response, read_frame, write_frame, AwaitResultRequest, CapabilityGrant, ExecuteRequest,
+    HealthRequest, InspectRequest, PrepareRefreshRequest, RegisterArtifactRequest,
+    RegisterCapabilityManifestRequest, Request, Response, ResumeRequest, WorkCost as IpcWorkCost,
+    CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES,
+    MAX_EXECUTION_OUTPUT_BYTES,
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -17,6 +18,16 @@ pub struct ContainerEndpointSnapshot {
     pub address: SocketAddr,
     pub pid: Option<u32>,
     pub generation: u64,
+}
+
+/// Immutable caller identity used for capability registration and execution.
+/// Environment generation is deliberately absent because Container Controller
+/// is the sole authority allowed to stamp the live generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerExecutionIdentity<'a> {
+    pub runtime_image: &'a str,
+    pub source_id: &'a str,
+    pub environment: &'a str,
 }
 
 #[derive(Clone)]
@@ -97,9 +108,39 @@ impl ContainerClient {
         }
     }
 
+    /// Register the exact capability set for one Runtime Image source.
+    /// Container Controller supplies and returns the live Environment generation.
+    pub async fn register_capability_manifest(
+        &self,
+        identity: ContainerExecutionIdentity<'_>,
+        grants: Vec<CapabilityGrant>,
+    ) -> anyhow::Result<u64> {
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request = Request::RegisterCapabilityManifest(RegisterCapabilityManifestRequest {
+            request_id: next_request_id(),
+            auth_token: endpoint.token.clone(),
+            capability_abi: CAPABILITY_ABI_VERSION,
+            runtime_image: identity.runtime_image.to_string(),
+            source_id: identity.source_id.to_string(),
+            environment: identity.environment.to_string(),
+            grants,
+        });
+        match call(endpoint, request, Duration::from_secs(5)).await? {
+            Response::CapabilityManifestRegistered { generation, .. } => Ok(generation),
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("container capability registration failed [{code}]: {message}")
+            }
+            other => anyhow::bail!("unexpected capability registration response: {other:?}"),
+        }
+    }
+
     pub async fn execute(
         &self,
-        environment: &str,
+        identity: ContainerExecutionIdentity<'_>,
         artifact_hash: &str,
         input: Vec<u8>,
         declared_cost: IpcWorkCost,
@@ -115,7 +156,10 @@ impl ContainerClient {
         let request = Request::Execute(ExecuteRequest {
             request_id: next_request_id(),
             auth_token: endpoint.token.clone(),
-            environment: environment.to_string(),
+            runtime_image: identity.runtime_image.to_string(),
+            source_id: identity.source_id.to_string(),
+            capability_abi: CAPABILITY_ABI_VERSION,
+            environment: identity.environment.to_string(),
             artifact_hash: artifact_hash.to_string(),
             declared_cost,
             input,
@@ -169,14 +213,14 @@ impl ContainerClient {
 
     pub async fn execute_and_wait(
         &self,
-        environment: &str,
+        identity: ContainerExecutionIdentity<'_>,
         artifact_hash: &str,
         input: Vec<u8>,
         declared_cost: IpcWorkCost,
         timeout: Duration,
     ) -> anyhow::Result<Vec<u8>> {
         let execution_id = self
-            .execute(environment, artifact_hash, input, declared_cost)
+            .execute(identity, artifact_hash, input, declared_cost)
             .await?;
         match self.await_result(&execution_id, timeout).await? {
             Some(output) => Ok(output),
