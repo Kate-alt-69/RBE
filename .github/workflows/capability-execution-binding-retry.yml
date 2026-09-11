@@ -1,0 +1,99 @@
+name: Controller capability execution binding retry
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/capability-execution-binding-client-fix.py'
+      - '.github/workflows/capability-execution-binding-retry.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: capability-execution-binding
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine
+            container-runtime
+
+      - name: Apply typed capability execution binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/capability-execution-binding.py
+          python3 .github/patches/capability-execution-binding-fix.py
+          python3 .github/patches/capability-execution-binding-client-fix.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check Container workspace
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+      - name: Test Container workspace
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Check backend Container client
+        run: cargo check --manifest-path engine/Cargo.toml -p core-lib --all-targets --locked
+      - name: Test backend Container client
+        run: cargo test --manifest-path engine/Cargo.toml -p core-lib --locked
+      - name: Clippy backend Container client
+        run: cargo clippy --manifest-path engine/Cargo.toml -p core-lib --all-targets --locked -- -D warnings
+
+      - name: Verify capability binding invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub const PROTOCOL_VERSION: u16 = 6' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub fn authorize_execution' container-runtime/crates/container-runtime-core/src/control_plane.rs
+          grep -q 'register_manifest(&request, generation)' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'runtime.environment_generation(environment)' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'capability_broker.authorize_execution' container-runtime/crates/container-bin/src/main.rs
+          grep -q "pub struct ContainerExecutionIdentity<'a>" engine/crates/core/src/container_client.rs
+          grep -q "identity: ContainerExecutionIdentity<'_>" engine/crates/core/src/container_client.rs
+          grep -q 'capability_abi: CAPABILITY_ABI_VERSION' engine/crates/core/src/container_client.rs
+          if grep -R -q 'request\.generation' \
+            container-runtime/crates/container-bin/src/main.rs \
+            container-runtime/crates/container-runtime-core/src/control_plane.rs; then
+            echo 'caller-owned Environment generation survived CAP-002' >&2
+            exit 1
+          fi
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/capability-execution-binding.yml
+          git rm .github/workflows/capability-execution-binding-retry.yml
+          git rm .github/patches/capability-execution-binding.py
+          git rm .github/patches/capability-execution-binding-fix.py
+          git rm .github/patches/capability-execution-binding-client-fix.py
+          git add container-runtime engine/crates/core
+          git commit -m "FIX | BUG-CAP-002 bind execution identity to Controller capability manifests"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
