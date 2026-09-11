@@ -1,0 +1,92 @@
+name: CAP-017 attested host capability provenance
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap017-attested-host-provenance.py'
+      - '.github/workflows/cap017-attested-host-provenance.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap017-attested-host-provenance
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine
+            container-runtime
+
+      - name: Apply CAP-017 attested host provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap017-attested-host-provenance.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check Container workspace locked
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+      - name: Test Container workspace locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace locked
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - name: Check Engine host bridge locked
+        run: cargo check --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --all-targets --locked
+      - name: Test Engine host bridge locked
+        run: cargo test --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --locked
+      - name: Clippy Engine host bridge locked
+        run: cargo clippy --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --all-targets --locked -- -D warnings
+
+      - name: Verify CAP-017 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'HOST_CAPABILITY_PROTOCOL_VERSION: u16 = 2' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub runtime_image: String' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub source_id: String' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub environment: String' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'host_capability_protocol_round_trip_preserves_attested_provenance' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'runtime_image: provenance.runtime_image.clone()' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'source_id: provenance.source_id.clone()' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'generation: provenance.generation' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'CAPABILITY_HOST_PROVENANCE_INVALID' engine/crates/backend/src/host_capability.rs
+          grep -q 'request.capability_abi != CAPABILITY_ABI_VERSION' engine/crates/backend/src/host_capability.rs
+          grep -q 'host_bridge_rejects_invalid_attested_provenance_before_dispatch' engine/crates/backend/src/host_capability.rs
+          grep -q 'never accepted from guest WASM' doc/runtime-image.md
+          git diff --check
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap017-attested-host-provenance.yml
+          git rm -f .github/patches/cap017-attested-host-provenance.py
+          git add container-runtime engine doc/runtime-image.md
+          git commit -m "FIX | BUG-CAP-017 carry Controller-attested host capability provenance"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
