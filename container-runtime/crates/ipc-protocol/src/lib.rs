@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 7;
 pub const CAPABILITY_ABI_VERSION: u16 = 1;
-pub const HOST_CAPABILITY_PROTOCOL_VERSION: u16 = 1;
+pub const HOST_CAPABILITY_PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EXECUTION_INPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -200,6 +200,13 @@ pub struct HostCapabilityRequest {
     pub version: u16,
     pub auth_token: String,
     pub execution_id: String,
+    /// Controller-attested execution provenance. These fields are copied from
+    /// the admitted ExecutionTask and are never supplied by the WASM guest.
+    pub runtime_image: String,
+    pub source_id: String,
+    pub capability_abi: u16,
+    pub environment: String,
+    pub generation: u64,
     pub call_id: u64,
     pub kind: CapabilityKind,
     pub target: String,
@@ -672,6 +679,36 @@ mod tests {
         };
         assert_eq!(decoded.timeout_ms, 250);
         assert!(decoded.execution_id.starts_with("exec-"));
+    }
+
+    #[test]
+    fn host_capability_protocol_round_trip_preserves_attested_provenance() {
+        let request = HostCapabilityRequest {
+            version: HOST_CAPABILITY_PROTOCOL_VERSION,
+            auth_token: "secret".into(),
+            execution_id: "exec-1".into(),
+            runtime_image: "ab".repeat(32),
+            source_id: "route:api/video".into(),
+            capability_abi: CAPABILITY_ABI_VERSION,
+            environment: "general-2".into(),
+            generation: 7,
+            call_id: 9,
+            kind: CapabilityKind::Video,
+            target: "video".into(),
+            operation: "status".into(),
+            payload: b"[]".to_vec(),
+            max_response_bytes: 4096,
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let frame = read_frame(&mut bytes.as_slice()).unwrap();
+        let decoded: HostCapabilityRequest = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.runtime_image, "ab".repeat(32));
+        assert_eq!(decoded.source_id, "route:api/video");
+        assert_eq!(decoded.capability_abi, CAPABILITY_ABI_VERSION);
+        assert_eq!(decoded.environment, "general-2");
+        assert_eq!(decoded.generation, 7);
     }
 
     #[test]

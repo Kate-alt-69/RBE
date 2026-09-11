@@ -101,7 +101,7 @@ Runtime Image ID
 + Environment generation
 ```
 
-The Container capability broker validates the Runtime Image ID as a lowercase 64-character SHA-256 string. A manifest registered for one image cannot silently authorize a different linked image.
+The Container capability broker validates the Runtime Image ID as a lowercase 64-character SHA-256 string. A manifest registered for one image cannot silently authorize a different linked image. Authorized host-capability dispatch uses protocol v2 to carry Controller-attested Runtime Image, SourceId, capability ABI, exact Environment, and generation alongside each call; those ownership fields come from admitted execution provenance and are never accepted from guest WASM.
 
 Native WASM artifact registration is also bound to the exact `Runtime Image ID + SourceId + capability ABI`. Artifact bytes remain deduplicated by SHA-256 in the Container cache, but cache presence alone is never execution authority: Execute must present an artifact hash explicitly registered for that Runtime Image source.
 

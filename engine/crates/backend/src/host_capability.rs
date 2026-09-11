@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use core_lib::{call_public_http, PUBLIC_HTTP_TARGET};
 use ipc_protocol::{
-    CapabilityKind, HostCapabilityRequest, HostCapabilityResponse,
+    CapabilityKind, HostCapabilityRequest, HostCapabilityResponse, CAPABILITY_ABI_VERSION,
     HOST_CAPABILITY_PROTOCOL_VERSION, MAX_CAPABILITY_PAYLOAD_BYTES,
     MAX_HOST_CAPABILITY_FRAME_BYTES,
 };
@@ -22,6 +22,7 @@ const HOST_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IN_FLIGHT: usize = 64;
 const MAX_EXECUTION_ID_BYTES: usize = 128;
 const MAX_LOGICAL_NAME_BYTES: usize = 256;
+const MAX_SOURCE_ID_BYTES: usize = 512;
 
 #[derive(Clone)]
 pub struct HostCapabilityEndpoint {
@@ -163,6 +164,16 @@ async fn dispatch_request(
             "invalid execution identity",
         );
     }
+    if request.capability_abi != CAPABILITY_ABI_VERSION
+        || !valid_runtime_image(&request.runtime_image)
+        || !valid_source_id(&request.source_id)
+        || !valid_environment_identity(&request.environment)
+    {
+        return error(
+            "CAPABILITY_HOST_PROVENANCE_INVALID",
+            "trusted host capability provenance is invalid",
+        );
+    }
     if request.payload.len() > MAX_CAPABILITY_PAYLOAD_BYTES {
         return error(
             "CAPABILITY_REQUEST_TOO_LARGE",
@@ -196,6 +207,10 @@ async fn dispatch_request(
             Err(call_error) => {
                 tracing::warn!(
                     execution_id = %request.execution_id,
+                    runtime_image = %request.runtime_image,
+                    source_id = %request.source_id,
+                    environment = %request.environment,
+                    generation = request.generation,
                     call_id = request.call_id,
                     operation = %request.operation,
                     error = %call_error,
@@ -273,6 +288,10 @@ async fn dispatch_request(
         Err(call_error) => {
             tracing::warn!(
                 execution_id = %request.execution_id,
+                runtime_image = %request.runtime_image,
+                source_id = %request.source_id,
+                environment = %request.environment,
+                generation = request.generation,
                 call_id = request.call_id,
                 service = %service_name,
                 operation = %request.operation,
@@ -309,6 +328,27 @@ async fn dispatch_request(
         call_id: request.call_id,
         payload,
     }
+}
+
+fn valid_runtime_image(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_source_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SOURCE_ID_BYTES
+        && !value.contains('\0')
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_environment_identity(value: &str) -> bool {
+    matches!(
+        value,
+        "general-1" | "general-2" | "general-3" | "general-4" | "general-5" | "payment"
+    )
 }
 
 fn normalize_service_target(target: &str) -> Option<&str> {
@@ -367,6 +407,44 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attested_host_provenance_format_is_strict() {
+        assert!(valid_runtime_image(&"ab".repeat(32)));
+        assert!(!valid_runtime_image(&"AB".repeat(32)));
+        assert!(valid_source_id("module:physical:media/player"));
+        assert!(!valid_source_id("route:\napi"));
+        assert!(valid_environment_identity("general-5"));
+        assert!(valid_environment_identity("payment"));
+        assert!(!valid_environment_identity("general"));
+        assert!(!valid_environment_identity("visitor-ip-1"));
+    }
+
+    #[tokio::test]
+    async fn host_bridge_rejects_invalid_attested_provenance_before_dispatch() {
+        let services = Arc::new(RwLock::new(None));
+        let request = HostCapabilityRequest {
+            version: HOST_CAPABILITY_PROTOCOL_VERSION,
+            auth_token: "secret".into(),
+            execution_id: "exec-1".into(),
+            runtime_image: "NOT-A-RUNTIME-IMAGE".into(),
+            source_id: "route:api/test".into(),
+            capability_abi: CAPABILITY_ABI_VERSION,
+            environment: "general-1".into(),
+            generation: 3,
+            call_id: 1,
+            kind: CapabilityKind::Network,
+            target: PUBLIC_HTTP_TARGET.into(),
+            operation: "get".into(),
+            payload: br#"["https://example.com"]"#.to_vec(),
+            max_response_bytes: 4096,
+        };
+        let response = dispatch_request(request, "secret", &services).await;
+        let HostCapabilityResponse::Error { code, .. } = response else {
+            panic!("malformed provenance must fail before capability dispatch");
+        };
+        assert_eq!(code, "CAPABILITY_HOST_PROVENANCE_INVALID");
+    }
 
     #[test]
     fn service_target_normalization_is_logical_only() {

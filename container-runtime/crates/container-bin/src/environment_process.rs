@@ -162,6 +162,11 @@ struct WorkerExecution<'a> {
 #[derive(Debug, Clone)]
 pub struct CapabilityDispatchRequest {
     pub execution_id: String,
+    pub runtime_image: String,
+    pub source_id: String,
+    pub capability_abi: u16,
+    pub environment: String,
+    pub generation: u64,
     pub call_id: u64,
     pub kind: CapabilityKind,
     pub target: String,
@@ -184,6 +189,11 @@ pub fn unavailable_capability_dispatcher() -> CapabilityDispatcher {
     Arc::new(|request| {
         let _consumed_metadata = (
             request.execution_id.as_str(),
+            request.runtime_image.as_str(),
+            request.source_id.as_str(),
+            request.capability_abi,
+            request.environment.as_str(),
+            request.generation,
             request.call_id,
             request.kind,
             request.target.as_str(),
@@ -241,6 +251,11 @@ pub fn authenticated_host_capability_dispatcher(
             version: HOST_CAPABILITY_PROTOCOL_VERSION,
             auth_token: token.clone(),
             execution_id: execution_id.clone(),
+            runtime_image: request.runtime_image,
+            source_id: request.source_id,
+            capability_abi: request.capability_abi,
+            environment: request.environment,
+            generation: request.generation,
             call_id,
             kind: request.kind,
             target: request.target,
@@ -633,6 +648,11 @@ impl EnvironmentProcessSupervisor {
         };
         let request = CapabilityDispatchRequest {
             execution_id: task.id.to_string(),
+            runtime_image: provenance.runtime_image.clone(),
+            source_id: provenance.source_id.clone(),
+            capability_abi: provenance.capability_abi,
+            environment: provenance.environment.clone(),
+            generation: provenance.generation,
             call_id: call.call_id,
             kind: call.kind,
             target: call.target,
