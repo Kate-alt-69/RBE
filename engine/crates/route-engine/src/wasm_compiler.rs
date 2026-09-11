@@ -5,17 +5,19 @@
 //! classified as an explicit interpreter fallback. Native artifacts use the
 //! RBE worker ABI and return JSON bytes through `rbe.output_write`.
 
-use core_lib::CONTAINER_MAX_EXECUTION_INPUT_BYTES;
+use core_lib::{
+    CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES, CONTAINER_MAX_EXECUTION_INPUT_BYTES, PUBLIC_HTTP_TARGET,
+};
 use sha2::{Digest, Sha256};
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
     FunctionSection, ImportSection, MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
-use crate::ast::{Expr, RouteFile, Statement};
+use crate::ast::{Expr, ImportTarget, RouteFile, Statement};
 
-pub const ROUTE_WASM_ABI_VERSION: u32 = 2;
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 2;
+pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 3;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 
@@ -49,15 +51,27 @@ impl RouteWasmCompilation {
 
 /// Compile the currently supported native route subset.
 ///
-/// The first slice is intentionally strict: one route method whose result is a
-/// JSON-literal REL value and no imported/helper execution. This already
-/// produces real WebAssembly executed by Wasmtime. Dynamic request expressions,
-/// local functions and host capabilities remain explicit interpreter fallback
-/// until their individual ABI lowering is implemented.
+/// Native lowering remains intentionally strict: one HTTP method, one return,
+/// no helper functions. In addition to literals and req.body passthrough, ABI v3
+/// permits one directly imported `http.get/post/request` function with fully
+/// static JSON arguments. Namespace imports stay interpreter-only so native
+/// grants remain operation-exact rather than widening authority.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
-    if !file.imports.is_empty() {
-        return fallback("route imports are not WASM-native yet");
-    }
+    let http_import =
+        match file.imports.as_slice() {
+            [] => None,
+            [import] => match direct_http_import(import) {
+                Some(import) => Some(import),
+                None => return fallback(
+                    "native Route-WASM v3 only supports one direct http.get/post/request import",
+                ),
+            },
+            _ => {
+                return fallback(
+                    "native Route-WASM v3 supports at most one direct host capability import",
+                )
+            }
+        };
     if !file.functions.is_empty() {
         return fallback("route helper functions are not WASM-native yet");
     }
@@ -69,7 +83,24 @@ pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let [Statement::Return(expr)] = method.body.as_slice() else {
         return fallback("native route body currently requires one literal return statement");
     };
-    let (bytes, input) = if let Some(value) = static_json(expr) {
+    let (bytes, input) = if let Some((binding, operation)) = http_import.as_ref() {
+        let Some(args) = static_direct_call(binding, expr) else {
+            return fallback(
+                "native public HTTP calls require the imported function as the return value with static JSON arguments",
+            );
+        };
+        let payload = match serde_json::to_vec(&args) {
+            Ok(payload) => payload,
+            Err(error) => return fallback(format!("encode native HTTP arguments: {error}")),
+        };
+        if payload.len() > CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES {
+            return fallback("native HTTP argument payload exceeds the capability envelope");
+        }
+        (
+            encode_public_http_module(operation, &payload),
+            RouteWasmInput::None,
+        )
+    } else if let Some(value) = static_json(expr) {
         let output = match serde_json::to_vec(&value) {
             Ok(output) => output,
             Err(error) => {
@@ -83,7 +114,7 @@ pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     } else if returns_request_body(method.param_name.as_deref(), expr) {
         (encode_input_echo_module(), RouteWasmInput::JsonBody)
     } else {
-        return fallback("route return value is outside the native Route-WASM v2 subset");
+        return fallback("route return value is outside the native Route-WASM v3 subset");
     };
 
     let sha256 = hex::encode(Sha256::digest(&bytes));
@@ -99,6 +130,33 @@ fn fallback(reason: impl Into<String>) -> RouteWasmCompilation {
     RouteWasmCompilation::InterpreterFallback {
         reason: reason.into(),
     }
+}
+
+fn direct_http_import(import: &ImportTarget) -> Option<(String, String)> {
+    let (binding, module, function) = match import {
+        ImportTarget::BuiltinFunction { module, function } => {
+            (function.clone(), module.as_str(), function.as_str())
+        }
+        ImportTarget::Aliased { target, alias } => match target.as_ref() {
+            ImportTarget::BuiltinFunction { module, function } => {
+                (alias.clone(), module.as_str(), function.as_str())
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (module == "http" && matches!(function, "get" | "post" | "request"))
+        .then(|| (binding, function.to_string()))
+}
+
+fn static_direct_call(binding: &str, expr: &Expr) -> Option<Vec<serde_json::Value>> {
+    let Expr::Call(target, args) = expr else {
+        return None;
+    };
+    if !matches!(target.as_ref(), Expr::Ident(name) if name == binding) {
+        return None;
+    }
+    args.iter().map(static_json).collect()
 }
 
 fn returns_request_body(parameter: Option<&str>, expr: &Expr) -> bool {
@@ -136,6 +194,113 @@ fn static_json(expr: &Expr) -> Option<serde_json::Value> {
         | Expr::UnaryNot(_)
         | Expr::Binary { .. } => None,
     }
+}
+
+fn encode_public_http_module(operation: &str, payload: &[u8]) -> Vec<u8> {
+    const NETWORK_CAPABILITY_KIND: i32 = 1;
+    let target = PUBLIC_HTTP_TARGET.as_bytes();
+    let operation = operation.as_bytes();
+    let target_offset = 0usize;
+    let operation_offset = target_offset + target.len();
+    let payload_offset = operation_offset + operation.len();
+    let response_offset = (payload_offset + payload.len() + 15) & !15usize;
+    let memory_bytes = response_offset + CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES;
+
+    let mut types = TypeSection::new();
+    types.ty().function(
+        [
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+        ],
+        [ValType::I32],
+    );
+    types.ty().function([], [ValType::I32]);
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32], [ValType::I32]);
+
+    let mut imports = ImportSection::new();
+    imports.import("rbe", "capability_call", EntityType::Function(0));
+    imports.import("rbe", "capability_response_len", EntityType::Function(1));
+    imports.import("rbe", "capability_response_read", EntityType::Function(2));
+    imports.import("rbe", "output_write", EntityType::Function(2));
+
+    let mut functions = FunctionSection::new();
+    functions.function(1);
+
+    let pages = memory_bytes.max(1).div_ceil(WASM_PAGE_BYTES) as u64;
+    let mut memories = MemorySection::new();
+    memories.memory(MemoryType {
+        minimum: pages,
+        maximum: Some(pages),
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+
+    let mut exports = ExportSection::new();
+    exports.export("memory", ExportKind::Memory, 0);
+    // Four capability/output imports occupy function indices 0..=3.
+    exports.export("run", ExportKind::Func, 4);
+
+    let mut run = Function::new([(1, ValType::I32)]);
+    run.instructions()
+        .i32_const(NETWORK_CAPABILITY_KIND)
+        .i32_const(target_offset as i32)
+        .i32_const(target.len() as i32)
+        .i32_const(operation_offset as i32)
+        .i32_const(operation.len() as i32)
+        .i32_const(payload_offset as i32)
+        .i32_const(payload.len() as i32)
+        .call(0)
+        .drop()
+        .call(1)
+        .local_set(0)
+        .i32_const(response_offset as i32)
+        .local_get(0)
+        .call(2)
+        .drop()
+        .i32_const(response_offset as i32)
+        .local_get(0)
+        .call(3)
+        .drop()
+        .i32_const(0)
+        .end();
+    let mut code = CodeSection::new();
+    code.function(&run);
+
+    let mut data = DataSection::new();
+    data.active(
+        0,
+        &ConstExpr::i32_const(target_offset as i32),
+        target.iter().copied(),
+    );
+    data.active(
+        0,
+        &ConstExpr::i32_const(operation_offset as i32),
+        operation.iter().copied(),
+    );
+    data.active(
+        0,
+        &ConstExpr::i32_const(payload_offset as i32),
+        payload.iter().copied(),
+    );
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&imports)
+        .section(&functions)
+        .section(&memories)
+        .section(&exports)
+        .section(&code)
+        .section(&data);
+    module.finish()
 }
 
 fn encode_input_echo_module() -> Vec<u8> {
@@ -285,10 +450,65 @@ mod tests {
     }
 
     #[test]
-    fn request_body_passthrough_is_native_v2_input() {
+    fn direct_static_http_get_is_native_v3_capability_call() {
+        let route = parse(
+            r#":import[http.get]
+               class Route { get(req) { return get("https://example.com/data"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("direct static http.get should lower to native capability ABI");
+        };
+        assert_eq!(artifact.input, RouteWasmInput::None);
+        wasmparser::validate(&artifact.bytes).unwrap();
+        assert!(artifact
+            .bytes
+            .windows(PUBLIC_HTTP_TARGET.len())
+            .any(|window| window == PUBLIC_HTTP_TARGET.as_bytes()));
+        assert!(artifact.bytes.windows(3).any(|window| window == b"get"));
+        assert!(artifact
+            .bytes
+            .windows(b"https://example.com/data".len())
+            .any(|window| window == b"https://example.com/data"));
+    }
+
+    #[test]
+    fn aliased_static_http_get_is_native() {
+        let route = parse(
+            r#":import[http.get as fetch]
+               class Route { get(req) { return fetch("https://example.com/"); } }"#,
+        );
+        assert!(compile_route(&route).is_native());
+    }
+
+    #[test]
+    fn http_namespace_import_stays_interpreter_fallback() {
+        let route = parse(
+            r#":import[http]
+               class Route { get(req) { return http.get("https://example.com/"); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
+            panic!("namespace import must not widen native Network authority");
+        };
+        assert!(reason.contains("one direct http.get/post/request import"));
+    }
+
+    #[test]
+    fn dynamic_http_argument_stays_interpreter_fallback() {
+        let route = parse(
+            r#":import[http.get]
+               class Route { post(req) { return get(req.body); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
+            panic!("dynamic HTTP argument is outside the v3 native subset");
+        };
+        assert!(reason.contains("static JSON arguments"));
+    }
+
+    #[test]
+    fn request_body_passthrough_is_native_v3_input() {
         let route = parse("class Route { post(req) { return req.body; } }");
         let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
-            panic!("req.body passthrough should lower through Route-WASM v2 input");
+            panic!("req.body passthrough should lower through Route-WASM v3 input");
         };
         assert_eq!(artifact.input, RouteWasmInput::JsonBody);
         wasmparser::validate(&artifact.bytes).unwrap();
@@ -300,7 +520,7 @@ mod tests {
         let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
             panic!("unsupported dynamic route must remain interpreter fallback");
         };
-        assert!(reason.contains("outside the native Route-WASM v2 subset"));
+        assert!(reason.contains("outside the native Route-WASM v3 subset"));
     }
 
     #[test]

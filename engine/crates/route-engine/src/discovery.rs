@@ -19,8 +19,8 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::MethodRouter;
 use axum::Router;
 use core_lib::{
-    AppState, ContainerAuthorizedExecution, ContainerExecutionIdentity, ContainerWorkCost,
-    CONTAINER_MAX_EXECUTION_INPUT_BYTES,
+    AppState, ContainerAuthorizedExecution, ContainerCapabilityKind, ContainerExecutionIdentity,
+    ContainerWorkCost, CONTAINER_MAX_EXECUTION_INPUT_BYTES,
 };
 
 use crate::analyzer::{analyze, Severity};
@@ -552,6 +552,11 @@ async fn execute_native_route(
         }
     };
 
+    let network_cost = u64::from(
+        grants
+            .iter()
+            .any(|grant| grant.kind == ContainerCapabilityKind::Network),
+    );
     let identity = ContainerExecutionIdentity {
         runtime_image: &plan.runtime_image,
         source_id: plan.source_id.as_str(),
@@ -569,7 +574,7 @@ async fn execute_native_route(
                 cpu: 1,
                 memory: 1,
                 io: 0,
-                network: 0,
+                network: network_cost,
             },
             timeout: NATIVE_ROUTE_TIMEOUT,
         })

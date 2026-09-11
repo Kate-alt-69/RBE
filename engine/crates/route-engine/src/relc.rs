@@ -1109,7 +1109,34 @@ mod tests {
         assert!(image
             .route_wasm_fallback(dynamic_id)
             .unwrap()
-            .contains("outside the native Route-WASM v2 subset"));
+            .contains("outside the native Route-WASM v3 subset"));
+    }
+
+    #[test]
+    fn direct_http_get_links_native_artifact_with_exact_network_requirement() {
+        let routes = vec![PhysicalRelSource::new(
+            RelSourceKind::Route,
+            "fetch",
+            "api/fetch.route",
+            r#":import[http.get]
+               class Route { get(req) { return get("https://example.com/data"); } }"#,
+        )];
+        let image =
+            compile_runtime_image("server Main {}", routes, &serde_json::json!({})).unwrap();
+        let route = image.routes.first().unwrap();
+        assert!(image.route_wasm_artifact(route).is_some());
+        let requirements = image.capability_requirements(route).unwrap();
+        assert_eq!(
+            requirements,
+            &BTreeSet::from([RuntimeCapabilityRequirement::PublicHttp {
+                operation: "get".into(),
+            }])
+        );
+        let grants = image.container_capability_grants(route).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Network);
+        assert_eq!(grants[0].target, core_lib::PUBLIC_HTTP_TARGET);
+        assert_eq!(grants[0].operations, vec!["get"]);
     }
 
     #[test]

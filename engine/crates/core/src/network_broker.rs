@@ -5,6 +5,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use ipc_protocol::MAX_CAPABILITY_PAYLOAD_BYTES;
 use serde_json::{Map, Value};
 
 pub const PUBLIC_HTTP_TARGET: &str = "public-http";
@@ -230,6 +231,11 @@ fn parse_http_call(operation: &str, args: &[Value]) -> Result<HttpCall, PublicHt
                     "HTTP header {name:?} is controlled by RBE"
                 )));
             }
+            if value.len() > PUBLIC_HTTP_MAX_HEADER_VALUE_BYTES {
+                return Err(http_error(format!(
+                    "HTTP header {name:?} exceeds the maximum value size"
+                )));
+            }
             let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|error| http_error(format!("HTTP header name is invalid: {error}")))?;
             let value = reqwest::header::HeaderValue::from_str(value)
@@ -263,6 +269,13 @@ fn parse_http_call(operation: &str, args: &[Value]) -> Result<HttpCall, PublicHt
 }
 
 pub async fn call_public_http(operation: &str, args: &[Value]) -> Result<Value, PublicHttpError> {
+    let request_envelope = serde_json::to_vec(args)
+        .map_err(|error| http_error(format!("encode HTTP capability request: {error}")))?;
+    if request_envelope.len() > MAX_CAPABILITY_PAYLOAD_BYTES {
+        return Err(http_error(
+            "HTTP capability request exceeds the capability envelope",
+        ));
+    }
     let call = parse_http_call(operation, args)?;
     let pinned = resolve_public_destination(&call.url).await?;
     let host = call.url.host_str().map(str::to_string);
@@ -317,7 +330,7 @@ pub async fn call_public_http(operation: &str, args: &[Value]) -> Result<Value, 
         body.extend_from_slice(&chunk);
     }
 
-    Ok(Value::Object(Map::from_iter([
+    let value = Value::Object(Map::from_iter([
         ("status".into(), Value::Number(status.as_u16().into())),
         ("ok".into(), Value::Bool(status.is_success())),
         ("headers".into(), Value::Object(response_headers)),
@@ -329,7 +342,13 @@ pub async fn call_public_http(operation: &str, args: &[Value]) -> Result<Value, 
             "contentType".into(),
             content_type.map(Value::String).unwrap_or(Value::Null),
         ),
-    ])))
+    ]));
+    let response_envelope = serde_json::to_vec(&value)
+        .map_err(|error| http_error(format!("encode HTTP capability response: {error}")))?;
+    if response_envelope.len() > MAX_CAPABILITY_PAYLOAD_BYTES {
+        return Err(http_error("HTTP response exceeds the capability envelope"));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -374,6 +393,22 @@ mod tests {
             "headers": {"Host": "evil.example"}
         });
         assert!(parse_http_call("request", &[request]).is_err());
+    }
+
+    #[test]
+    fn oversized_capability_request_envelope_fails_before_network_access() {
+        let oversized = Value::String("x".repeat(MAX_CAPABILITY_PAYLOAD_BYTES));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(call_public_http(
+                "post",
+                &[Value::String("https://example.com".into()), oversized],
+            ))
+            .expect_err("capability envelope must fail before dispatch");
+        assert!(error.message.contains("capability envelope"));
     }
 
     #[test]
