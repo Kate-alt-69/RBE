@@ -5,6 +5,7 @@ name: Controller capability execution binding
     branches: [main]
     paths:
       - '.github/patches/capability-execution-binding.py'
+      - '.github/patches/capability-execution-binding-fix.py'
       - '.github/workflows/capability-execution-binding.yml'
 
 permissions:
@@ -40,6 +41,7 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           python3 .github/patches/capability-execution-binding.py
+          python3 .github/patches/capability-execution-binding-fix.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
           cargo fmt --manifest-path engine/Cargo.toml --all
 
@@ -81,6 +83,7 @@ jobs:
           set -euo pipefail
           git rm .github/workflows/capability-execution-binding.yml
           git rm .github/patches/capability-execution-binding.py
+          git rm .github/patches/capability-execution-binding-fix.py
           git add container-runtime engine/crates/core
           git commit -m "FIX | BUG-CAP-002 bind execution identity to Controller capability manifests"
 
