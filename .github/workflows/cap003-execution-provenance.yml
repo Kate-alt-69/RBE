@@ -5,6 +5,7 @@ name: CAP-003 execution provenance
     branches: [main]
     paths:
       - '.github/patches/cap003-execution-provenance.py'
+      - '.github/patches/cap003-execution-provenance-fix.py'
       - '.github/workflows/cap003-execution-provenance.yml'
 
 permissions:
@@ -54,6 +55,7 @@ jobs:
           PY
 
           python3 .github/patches/cap003-execution-provenance.py
+          python3 .github/patches/cap003-execution-provenance-fix.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
 
       - name: Check Container workspace
@@ -76,6 +78,7 @@ jobs:
           grep -q 'const CHILD_PROTOCOL_VERSION: u16 = 2' container-runtime/crates/container-bin/src/environment_process.rs
           grep -q 'provenance.generation != endpoint.generation' container-runtime/crates/container-bin/src/environment_process.rs
           grep -q 'execution provenance is required for Environment dispatch' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'provenance: None' container-runtime/crates/container-runtime-core/src/swamp.rs
           grep -q 'Some(provenance)' container-runtime/crates/container-bin/src/main.rs
 
       - name: Land validated implementation
@@ -84,6 +87,7 @@ jobs:
           set -euo pipefail
           git rm .github/workflows/cap003-execution-provenance.yml
           git rm .github/patches/cap003-execution-provenance.py
+          git rm .github/patches/cap003-execution-provenance-fix.py
           git add container-runtime
           git commit -m "FIX | BUG-CAP-003 preserve execution provenance and manifest authority"
 
