@@ -126,38 +126,40 @@ fn authorized_session(headers: &HeaderMap) -> Option<AdminSession> {
     state.sessions.get(token).cloned()
 }
 
-fn require_auth(peer: SocketAddr, headers: &HeaderMap) -> Result<AdminSession, Response> {
+type AdminAuthResult = Result<AdminSession, Box<Response>>;
+
+fn require_auth(peer: SocketAddr, headers: &HeaderMap) -> AdminAuthResult {
     if let Some(response) = local_only(peer) {
-        return Err(response);
+        return Err(Box::new(response));
     }
     if !build_auth::ADMIN_PASSWORD_CONFIGURED {
-        return Err(json_response(
+        return Err(Box::new(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             json!({
                 "error": "admin password is not configured in this backend build",
                 "code": "ADMIN_PASSWORD_UNCONFIGURED"
             }),
-        ));
+        )));
     }
     authorized_session(headers).ok_or_else(|| {
-        json_response(
+        Box::new(json_response(
             StatusCode::UNAUTHORIZED,
             json!({ "error": "admin authentication required" }),
-        )
+        ))
     })
 }
 
-fn require_mutation_auth(peer: SocketAddr, headers: &HeaderMap) -> Result<AdminSession, Response> {
+fn require_mutation_auth(peer: SocketAddr, headers: &HeaderMap) -> AdminAuthResult {
     let session = require_auth(peer, headers)?;
     let csrf = headers
         .get(CSRF_HEADER)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if !admin_hash::constant_time_eq(csrf.as_bytes(), session.csrf.as_bytes()) {
-        return Err(json_response(
+        return Err(Box::new(json_response(
             StatusCode::FORBIDDEN,
             json!({ "error": "admin mutation token rejected" }),
-        ));
+        )));
     }
     Ok(session)
 }
@@ -302,7 +304,7 @@ async fn login(
 
 async fn logout(ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
     if let Err(response) = require_mutation_auth(peer, &headers) {
-        return response;
+        return *response;
     }
     if let Some(token) = session_token(&headers) {
         if let Ok(mut state) = auth_state().lock() {
@@ -375,7 +377,7 @@ async fn overview(
     headers: HeaderMap,
 ) -> Response {
     if let Err(response) = require_auth(peer, &headers) {
-        return response;
+        return *response;
     }
     let metrics = state.backend_metrics.snapshot();
     let maintenance = state.maintenance.snapshot();
@@ -426,7 +428,7 @@ async fn backend(
     headers: HeaderMap,
 ) -> Response {
     if let Err(response) = require_auth(peer, &headers) {
-        return response;
+        return *response;
     }
     let metrics = state.backend_metrics.snapshot();
     json_response(
@@ -465,7 +467,7 @@ async fn container(
     headers: HeaderMap,
 ) -> Response {
     if let Err(response) = require_auth(peer, &headers) {
-        return response;
+        return *response;
     }
     let endpoint = state.container.endpoint_snapshot();
     match state.container.inspect().await {
@@ -497,7 +499,7 @@ async fn security(
     headers: HeaderMap,
 ) -> Response {
     if let Err(response) = require_auth(peer, &headers) {
-        return response;
+        return *response;
     }
     let bans = state
         .ip_strikes
@@ -579,7 +581,7 @@ async fn settings(
     headers: HeaderMap,
 ) -> Response {
     if let Err(response) = require_auth(peer, &headers) {
-        return response;
+        return *response;
     }
     let path = settings_path();
     match read_settings_document(&path) {
@@ -616,7 +618,7 @@ async fn update_settings(
     Json(request): Json<UpdateSettingsRequest>,
 ) -> Response {
     if let Err(response) = require_mutation_auth(peer, &headers) {
-        return response;
+        return *response;
     }
 
     let _guard = SETTINGS_WRITE_LOCK
@@ -740,7 +742,7 @@ fn write_candidate(original: &Path, temp: &Path, bytes: &[u8]) -> std::io::Resul
 
 fn replace_settings_file(path: &Path, temp: &Path) -> std::io::Result<()> {
     match fs::rename(temp, path) {
-        Ok(()) => return Ok(()),
+        Ok(()) => Ok(()),
         Err(_first_error) if path.exists() => {
             let backup = path.with_extension(format!(
                 "rbe-admin-backup-{}",
@@ -828,7 +830,6 @@ mod tests {
         if build_auth::ADMIN_PASSWORD_CONFIGURED {
             assert_eq!(build_auth::ADMIN_PASSWORD_SALT_HEX.len(), 16);
             assert_eq!(build_auth::ADMIN_PASSWORD_VERIFIER_HEX.len(), 64);
-            assert!(build_auth::ADMIN_PASSWORD_ROUNDS >= 1);
         }
     }
 }

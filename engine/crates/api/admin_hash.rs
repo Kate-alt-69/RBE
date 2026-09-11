@@ -1,8 +1,6 @@
 // Shared build/runtime password verifier primitives.
 // Kept std-only so the API control room does not grow another crypto dependency.
 
-pub const DEFAULT_ROUNDS: u32 = 120_000;
-
 pub fn derive(password: &str, salt: &[u8], rounds: u32) -> [u8; 32] {
     // PBKDF2-HMAC-SHA256, one 32-byte block. Keeping the implementation here
     // std-only lets the build script and runtime verifier share byte-for-byte
@@ -65,11 +63,11 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub fn hex_decode(input: &str) -> Option<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(input.len() / 2);
-    for chunk in input.as_bytes().chunks_exact(2) {
+    for chunk in input.as_bytes().as_chunks::<2>().0 {
         let high = hex_nibble(chunk[0])?;
         let low = hex_nibble(chunk[1])?;
         out.push((high << 4) | low);
@@ -114,7 +112,7 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_slice().as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (index, word) in w.iter_mut().take(16).enumerate() {
             let start = index * 4;
