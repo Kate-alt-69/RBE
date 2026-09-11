@@ -5,6 +5,7 @@ name: CAP-011 native request body execution
     branches: [main]
     paths:
       - '.github/patches/cap011-native-request-body.py'
+      - '.github/patches/cap011-test-expectations.py'
       - '.github/workflows/cap011-native-request-body.yml'
 
 permissions:
@@ -38,6 +39,7 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           python3 .github/patches/cap011-native-request-body.py
+          python3 .github/patches/cap011-test-expectations.py
           cargo fmt --manifest-path engine/Cargo.toml --all
 
       - name: Check Engine native path locked
@@ -59,6 +61,8 @@ jobs:
           grep -q 'fn returns_request_body' engine/crates/route-engine/src/wasm_compiler.rs
           grep -q 'fn encode_input_echo_module' engine/crates/route-engine/src/wasm_compiler.rs
           grep -q 'request_body_passthrough_is_native_v2_input' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q 'request_body_route_emits_native_wasm' engine/crates/route-engine/src/cache.rs
+          grep -q 'unsupported_dynamic_route_records_explicit_interpreter_fallback_without_wasm' engine/crates/route-engine/src/cache.rs
           grep -q 'RouteWasmInput::JsonBody' engine/crates/route-engine/src/discovery.rs
           grep -q 'native route body exceeds the Container execution input limit' engine/crates/route-engine/src/discovery.rs
           grep -q 'input,' engine/crates/route-engine/src/discovery.rs
@@ -70,6 +74,7 @@ jobs:
           set -euo pipefail
           git rm .github/workflows/cap011-native-request-body.yml
           git rm -f .github/patches/cap011-native-request-body.py
+          git rm -f .github/patches/cap011-test-expectations.py
           git add engine doc/runtime-image.md
           git commit -m "FIX | BUG-CAP-011 execute req.body routes through native WASM"
 
