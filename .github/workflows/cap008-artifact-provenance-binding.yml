@@ -1,0 +1,96 @@
+name: CAP-008 artifact provenance binding
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap008-artifact-provenance-binding.py'
+      - '.github/workflows/cap008-artifact-provenance-binding.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap008-artifact-provenance-binding
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            container-runtime
+            engine
+
+      - name: Apply CAP-008 artifact provenance binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap008-artifact-provenance-binding.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check Container workspace locked
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+      - name: Test Container workspace locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace locked
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Check Core Route Engine Backend locked
+        run: cargo check --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --all-targets --locked
+      - name: Test Core Route Engine Backend locked
+        run: cargo test --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --locked
+      - name: Clippy Core Route Engine Backend locked
+        run: cargo clippy --manifest-path engine/Cargo.toml -p core-lib -p route-engine -p backend --all-targets --locked -- -D warnings
+
+      - name: Verify CAP-008 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub const PROTOCOL_VERSION: u16 = 7' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub struct RegisterArtifactRequest' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub runtime_image: String' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub source_id: String' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub capability_abi: u16' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'struct ArtifactBindingKey' container-runtime/crates/container-runtime-core/src/control_plane.rs
+          grep -q 'artifact_bindings: RwLock<HashSet<ArtifactBindingKey>>' container-runtime/crates/container-runtime-core/src/control_plane.rs
+          grep -q 'pub fn register_artifact_binding' container-runtime/crates/container-runtime-core/src/control_plane.rs
+          grep -q 'ARTIFACT_BINDING_UNKNOWN' container-runtime/crates/container-runtime-core/src/control_plane.rs
+          grep -q 'register_artifact_binding' container-runtime/crates/container-bin/src/main.rs
+          grep -q '&request.artifact_hash' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'identity: ContainerExecutionIdentity' engine/crates/core/src/container_client.rs
+          grep -q 'runtime_image: identity.runtime_image.to_string()' engine/crates/core/src/container_client.rs
+          grep -q 'source_id: identity.source_id.to_string()' engine/crates/core/src/container_client.rs
+          grep -q 'register_artifact(request.identity' engine/crates/core/src/container_client.rs
+          grep -q 'cache presence alone is never execution authority' doc/runtime-image.md
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap008-artifact-provenance-binding.yml
+          git rm -f .github/patches/cap008-artifact-provenance-binding.py
+          git add container-runtime engine doc/runtime-image.md
+          git commit -m "FIX | BUG-CAP-008 bind artifacts to Runtime Image provenance"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
