@@ -12,7 +12,7 @@ text = text.replace(old, new)
 
 # The staged Environment module does not execute Wasmtime directly; it forwards
 # work to the existing disposable --worker role, so do not keep a dead import.
-unused = 'use execution_engine::WasmExecutor;\\n'
+unused = 'use execution_engine::WasmExecutor;\n'
 if unused not in text:
     raise SystemExit('missing staged WasmExecutor import')
 text = text.replace(unused, '', 1)
