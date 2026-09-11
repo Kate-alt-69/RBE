@@ -10,7 +10,7 @@ def replace_once(path: str, old: str, new: str) -> None:
     p.write_text(text.replace(old, new, 1), encoding='utf-8')
 
 admin = 'engine/crates/api/admin_hash.rs'
-replace_once(admin, 'pub const DEFAULT_ROUNDS: u32 = 120_000;', '#[cfg(test)]\npub const DEFAULT_ROUNDS: u32 = 120_000;')
+replace_once(admin, 'pub const DEFAULT_ROUNDS: u32 = 120_000;\n\n', '')
 replace_once(admin, 'if input.len() % 2 != 0 {', 'if !input.len().is_multiple_of(2) {')
 replace_once(admin, 'for chunk in input.as_bytes().chunks_exact(2) {', 'for chunk in input.as_bytes().as_chunks::<2>().0 {')
 replace_once(admin, 'for chunk in padded.chunks_exact(64) {', 'for chunk in padded.as_slice().as_chunks::<64>().0 {')
