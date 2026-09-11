@@ -5,6 +5,7 @@ name: CAP-005 authenticated host service bridge
     branches: [main]
     paths:
       - '.github/patches/cap005-host-service-bridge.py'
+      - '.github/patches/cap005-host-service-bridge-clippyfix.py'
       - '.github/workflows/cap005-host-service-bridge.yml'
 
 permissions:
@@ -40,6 +41,7 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           python3 .github/patches/cap005-host-service-bridge.py
+          python3 .github/patches/cap005-host-service-bridge-clippyfix.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
           cargo fmt --manifest-path engine/Cargo.toml --all
 
@@ -77,6 +79,7 @@ jobs:
           grep -q 'RBE_HOST_CAPABILITY_TOKEN' engine/crates/backend/src/container_process.rs
           grep -q 'HostCapabilityBridge::start().await' engine/crates/backend/src/main.rs
           grep -q 'install_service_manager(service_manager.clone())' engine/crates/backend/src/main.rs
+          grep -q 'struct ContainerSupervisorContext' engine/crates/backend/src/main.rs
 
       - name: Land validated implementation
         shell: bash
@@ -84,6 +87,7 @@ jobs:
           set -euo pipefail
           git rm .github/workflows/cap005-host-service-bridge.yml
           git rm -f .github/patches/cap005-host-service-bridge.py
+          git rm -f .github/patches/cap005-host-service-bridge-clippyfix.py
           git add container-runtime engine
           git commit -m "FIX | BUG-CAP-005 bridge authorized Service capabilities to Backend"
 
