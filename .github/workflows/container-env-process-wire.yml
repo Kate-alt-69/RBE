@@ -1,0 +1,80 @@
+name: Container Environment process boundary
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/container-env-process.py'
+      - '.github/workflows/container-env-process-wire.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: container-env-process-wire
+  cancel-in-progress: false
+
+jobs:
+  wire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+      - name: Apply Environment process boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/container-env-process.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+      - name: Check Container workspace
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Test Container workspace
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - name: Smoke Environment children
+        shell: bash
+        run: |
+          set -euo pipefail
+          RBE_CONTAINER_TOKEN='ci-container-token-not-a-runtime-secret' \
+            cargo run --manifest-path container-runtime/Cargo.toml -p container-bin -- --debug --demo 0
+      - name: Verify process-boundary invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q -- '--environment-child' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'Runtime::new_with_runner' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'environment_processes_alive' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'reset_volatile' container-runtime/crates/container-bin/src/environment_process.rs
+          if grep -q 'RBE_CONTAINER_TOKEN.*arg' container-runtime/crates/container-bin/src/environment_process.rs; then
+            echo 'controller token must never be forwarded in argv' >&2
+            exit 1
+          fi
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/container-env-process-wire.yml
+          git rm .github/patches/container-env-process.py
+          git add container-runtime
+          git commit -m "FIX | BUG-CTR-002 execute work through per-Environment container processes"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
