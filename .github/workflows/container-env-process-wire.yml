@@ -5,6 +5,7 @@ name: Container Environment process boundary
     branches: [main]
     paths:
       - '.github/patches/container-env-process.py'
+      - '.github/patches/container-env-process-fix.py'
       - '.github/workflows/container-env-process-wire.yml'
 
 permissions:
@@ -36,6 +37,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           git reset --hard origin/main
+          python3 .github/patches/container-env-process-fix.py
           python3 .github/patches/container-env-process.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
       - name: Check Container workspace
@@ -68,6 +70,7 @@ jobs:
           set -euo pipefail
           git rm .github/workflows/container-env-process-wire.yml
           git rm .github/patches/container-env-process.py
+          git rm .github/patches/container-env-process-fix.py
           git add container-runtime
           git commit -m "FIX | BUG-CTR-002 execute work through per-Environment container processes"
 
