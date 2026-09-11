@@ -50,10 +50,15 @@ jobs:
         run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
       - name: Smoke Environment children
         shell: bash
+        env:
+          # CI-only deterministic key for the throw-away fallback Vault under the
+          # runner workspace. Production still requires Secret Service or an
+          # externally supplied 32-byte key and never falls back to plaintext.
+          RBE_VAULT_FALLBACK_MASTER_KEY: '4242424242424242424242424242424242424242424242424242424242424242'
+          RBE_CONTAINER_TOKEN: 'ci-container-token-not-a-runtime-secret'
         run: |
           set -euo pipefail
-          RBE_CONTAINER_TOKEN='ci-container-token-not-a-runtime-secret' \
-            cargo run --manifest-path container-runtime/Cargo.toml -p container-bin -- --debug --demo 0
+          cargo run --manifest-path container-runtime/Cargo.toml -p container-bin -- --debug --demo 0
       - name: Verify process-boundary invariants
         shell: bash
         run: |
