@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 def replace_once(path: str, old: str, new: str) -> None:
@@ -35,13 +36,20 @@ replace_once(
     '        return Err(json_response(\n            StatusCode::FORBIDDEN,\n            json!({ "error": "admin mutation token rejected" }),\n        ));',
     '        return Err(Box::new(json_response(\n            StatusCode::FORBIDDEN,\n            json!({ "error": "admin mutation token rejected" }),\n        )));',
 )
-# All seven auth call sites return the boxed response back to Axum.
+
+# Only auth helpers now return Box<Response>. Do not touch local_only() call
+# sites, which still return Response directly.
 p = Path(dash)
 text = p.read_text(encoding='utf-8')
-needle = 'if let Err(response) = require_'
-if text.count(needle) != 7:
-    raise SystemExit(f'expected 7 dashboard auth call sites, found {text.count(needle)}')
-text = text.replace('        return response;\n', '        return *response;\n', 7)
+pattern = re.compile(
+    r'(if let Err\(response\) = require_(?:mutation_)?auth\([^)]*\) \{\n)([ \t]*)return response;'
+)
+text, replaced = pattern.subn(
+    lambda match: f'{match.group(1)}{match.group(2)}return *response;',
+    text,
+)
+if replaced != 7:
+    raise SystemExit(f'expected 7 dashboard auth call sites, rewrote {replaced}')
 p.write_text(text, encoding='utf-8')
 
 replace_once(dash, '        Ok(()) => return Ok(()),', '        Ok(()) => Ok(()),')
