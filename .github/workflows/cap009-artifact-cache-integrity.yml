@@ -1,0 +1,79 @@
+name: CAP-009 artifact cache integrity
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap009-artifact-cache-integrity.py'
+      - '.github/workflows/cap009-artifact-cache-integrity.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap009-artifact-cache-integrity
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+
+      - name: Apply CAP-009 artifact integrity hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap009-artifact-cache-integrity.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+
+      - name: Check Container workspace locked
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+      - name: Test Container workspace locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace locked
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Verify CAP-009 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub fn artifact_sha256_matches' container-runtime/crates/container-runtime-core/src/cache.rs
+          grep -q 'fn quarantine_corrupt_artifact' container-runtime/crates/container-runtime-core/src/cache.rs
+          grep -q 'persist artifact atomically' container-runtime/crates/container-runtime-core/src/cache.rs
+          grep -q 'quarantine_corrupt_artifact(&path, artifact_hash)' container-runtime/crates/container-runtime-core/src/cache.rs
+          grep -q 'self.cache.put_artifact(computed, wasm)?' container-runtime/crates/container-runtime-core/src/runtime.rs
+          grep -q 'artifact_sha256_matches, ArtifactCache' container-runtime/crates/container-runtime-core/src/lib.rs
+          grep -q 'artifact SHA-256 integrity check failed' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'artifact_sha256_matches(&artifact, &wasm)' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'Artifact persistence is durable-or-fail' doc/runtime-image.md
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap009-artifact-cache-integrity.yml
+          git rm -f .github/patches/cap009-artifact-cache-integrity.py
+          git add container-runtime doc/runtime-image.md
+          git commit -m "FIX | BUG-CAP-009 verify persisted artifact integrity before execution"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
