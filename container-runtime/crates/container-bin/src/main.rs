@@ -583,10 +583,26 @@ fn handle_connection(
                 }
             } else {
                 match runtime.register_artifact(&request.artifact_hash, request.wasm) {
-                    Ok(already_present) => Response::ArtifactRegistered {
-                        request_id: request.request_id,
-                        artifact_hash: request.artifact_hash,
-                        already_present,
+                    Ok(already_present) => match capability_broker.register_artifact_binding(
+                        &request.runtime_image,
+                        &request.source_id,
+                        request.capability_abi,
+                        &request.artifact_hash,
+                    ) {
+                        Ok(already_bound) => Response::ArtifactRegistered {
+                            request_id: request.request_id,
+                            runtime_image: request.runtime_image,
+                            source_id: request.source_id,
+                            capability_abi: request.capability_abi,
+                            artifact_hash: request.artifact_hash,
+                            already_present,
+                            already_bound,
+                        },
+                        Err(error) => Response::Error {
+                            request_id: Some(request.request_id),
+                            code: error.code.into(),
+                            message: error.message,
+                        },
                     },
                     Err(message) => Response::Error {
                         request_id: Some(request.request_id),
@@ -696,6 +712,7 @@ fn handle_connection(
                     &request.environment,
                     generation,
                     request.capability_abi,
+                    &request.artifact_hash,
                 ) {
                     return write_frame(
                         &mut stream,

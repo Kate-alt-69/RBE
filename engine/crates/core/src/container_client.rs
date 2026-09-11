@@ -97,6 +97,7 @@ impl ContainerClient {
 
     pub async fn register_artifact(
         &self,
+        identity: ContainerExecutionIdentity<'_>,
         artifact_hash: &str,
         wasm: Vec<u8>,
     ) -> anyhow::Result<bool> {
@@ -111,13 +112,28 @@ impl ContainerClient {
         let request = Request::RegisterArtifact(RegisterArtifactRequest {
             request_id: next_request_id(),
             auth_token: endpoint.token.clone(),
+            runtime_image: identity.runtime_image.to_string(),
+            source_id: identity.source_id.to_string(),
+            capability_abi: CAPABILITY_ABI_VERSION,
             artifact_hash: artifact_hash.to_string(),
             wasm,
         });
         match call(endpoint, request, Duration::from_secs(10)).await? {
             Response::ArtifactRegistered {
-                already_present, ..
-            } => Ok(already_present),
+                runtime_image,
+                source_id,
+                capability_abi,
+                already_present,
+                ..
+            } if runtime_image == identity.runtime_image
+                && source_id == identity.source_id
+                && capability_abi == CAPABILITY_ABI_VERSION =>
+            {
+                Ok(already_present)
+            }
+            Response::ArtifactRegistered { .. } => {
+                anyhow::bail!("Container returned a mismatched artifact provenance binding")
+            }
             Response::Error { code, message, .. } => {
                 anyhow::bail!("container artifact registration failed [{code}]: {message}")
             }
@@ -263,7 +279,7 @@ impl ContainerClient {
         &self,
         request: ContainerAuthorizedExecution<'_>,
     ) -> anyhow::Result<Vec<u8>> {
-        self.register_artifact(request.artifact_hash, request.wasm)
+        self.register_artifact(request.identity, request.artifact_hash, request.wasm)
             .await?;
         let binding = self
             .register_capability_manifest(request.identity, request.grants)

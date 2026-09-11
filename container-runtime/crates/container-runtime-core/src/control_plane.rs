@@ -20,6 +20,14 @@ struct ManifestKey {
     generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ArtifactBindingKey {
+    runtime_image: String,
+    source_id: String,
+    capability_abi: u16,
+    artifact_hash: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapabilityManifest {
     grants: Vec<CapabilityGrant>,
@@ -67,6 +75,7 @@ impl std::error::Error for CapabilityError {}
 pub struct CapabilityBroker {
     debug_enabled: bool,
     manifests: RwLock<HashMap<ManifestKey, CapabilityManifest>>,
+    artifact_bindings: RwLock<HashSet<ArtifactBindingKey>>,
 }
 
 impl CapabilityBroker {
@@ -74,6 +83,7 @@ impl CapabilityBroker {
         Self {
             debug_enabled,
             manifests: RwLock::new(HashMap::new()),
+            artifact_bindings: RwLock::new(HashSet::new()),
         }
     }
 
@@ -153,21 +163,19 @@ impl CapabilityBroker {
         }
     }
 
-    /// Verify that an execution identity is explicitly bound to a manifest
-    /// for the Controller's current Environment generation. Empty manifests are
-    /// valid and intentionally distinguish "no host capabilities" from
-    /// "identity was never registered".
-    pub fn authorize_execution(
+    /// Bind immutable WASM identity to the exact Runtime Image source that
+    /// registered it. The same artifact bytes may be intentionally shared by
+    /// multiple sources/images, but each authority edge must be explicit.
+    pub fn register_artifact_binding(
         &self,
         runtime_image: &str,
         source_id: &str,
-        environment: &str,
-        generation: u64,
         capability_abi: u16,
-    ) -> Result<(), CapabilityError> {
+        artifact_hash: &str,
+    ) -> Result<bool, CapabilityError> {
         validate_runtime_image(runtime_image)?;
         validate_source_id(source_id)?;
-        validate_environment(environment)?;
+        validate_artifact_hash(artifact_hash)?;
         if capability_abi != CAPABILITY_ABI_VERSION {
             return Err(CapabilityError {
                 code: "CAPABILITY_ABI_UNSUPPORTED",
@@ -176,23 +184,79 @@ impl CapabilityBroker {
                 ),
             });
         }
-        let key = ManifestKey {
+        let key = ArtifactBindingKey {
+            runtime_image: runtime_image.to_string(),
+            source_id: source_id.to_string(),
+            capability_abi,
+            artifact_hash: artifact_hash.to_string(),
+        };
+        let mut bindings = self
+            .artifact_bindings
+            .write()
+            .expect("artifact binding table poisoned");
+        Ok(!bindings.insert(key))
+    }
+
+    /// Verify that execution has both an exact capability manifest for the live
+    /// Environment generation and an explicit artifact provenance binding.
+    pub fn authorize_execution(
+        &self,
+        runtime_image: &str,
+        source_id: &str,
+        environment: &str,
+        generation: u64,
+        capability_abi: u16,
+        artifact_hash: &str,
+    ) -> Result<(), CapabilityError> {
+        validate_runtime_image(runtime_image)?;
+        validate_source_id(source_id)?;
+        validate_environment(environment)?;
+        validate_artifact_hash(artifact_hash)?;
+        if capability_abi != CAPABILITY_ABI_VERSION {
+            return Err(CapabilityError {
+                code: "CAPABILITY_ABI_UNSUPPORTED",
+                message: format!(
+                    "capability ABI {capability_abi} is unsupported; controller supports {CAPABILITY_ABI_VERSION}"
+                ),
+            });
+        }
+        let manifest_key = ManifestKey {
             runtime_image: runtime_image.to_string(),
             source_id: source_id.to_string(),
             environment: environment.to_string(),
             generation,
         };
-        if self
+        if !self
             .manifests
             .read()
             .expect("capability manifest table poisoned")
-            .contains_key(&key)
+            .contains_key(&manifest_key)
+        {
+            return Err(CapabilityError {
+                code: "CAPABILITY_MANIFEST_UNKNOWN",
+                message: "execution has no exact capability manifest for this Runtime Image/SourceId/Environment generation".into(),
+            });
+        }
+
+        let artifact_key = ArtifactBindingKey {
+            runtime_image: runtime_image.to_string(),
+            source_id: source_id.to_string(),
+            capability_abi,
+            artifact_hash: artifact_hash.to_string(),
+        };
+        if self
+            .artifact_bindings
+            .read()
+            .expect("artifact binding table poisoned")
+            .contains(&artifact_key)
         {
             Ok(())
         } else {
             Err(CapabilityError {
-                code: "CAPABILITY_MANIFEST_UNKNOWN",
-                message: "execution has no exact capability manifest for this Runtime Image/SourceId/Environment generation".into(),
+                code: "ARTIFACT_BINDING_UNKNOWN",
+                message:
+                    "execution artifact is not bound to this Runtime Image/SourceId/capability ABI"
+                        .into(),
             })
         }
     }
@@ -288,6 +352,13 @@ impl CapabilityBroker {
             .expect("capability manifest table poisoned")
             .len()
     }
+
+    pub fn artifact_binding_count(&self) -> usize {
+        self.artifact_bindings
+            .read()
+            .expect("artifact binding table poisoned")
+            .len()
+    }
 }
 
 fn validate_grant(grant: &CapabilityGrant, debug_enabled: bool) -> Result<(), CapabilityError> {
@@ -348,6 +419,20 @@ fn validate_source_id(value: &str) -> Result<(), CapabilityError> {
         return Err(invalid_identity(
             "source_id",
             "is empty, too long, or invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_hash(value: &str) -> Result<(), CapabilityError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(invalid_identity(
+            "artifact_hash",
+            "must be lowercase 64-character SHA-256",
         ));
     }
     Ok(())
@@ -483,9 +568,27 @@ mod tests {
     }
 
     #[test]
-    fn execution_binding_requires_exact_controller_generation_and_abi() {
+    fn execution_binding_requires_exact_generation_abi_and_artifact() {
         let broker = CapabilityBroker::new(false);
+        let artifact = "cd".repeat(32);
         broker.register_manifest(&request(Vec::new()), 4).unwrap();
+        assert!(!broker
+            .register_artifact_binding(
+                &"ab".repeat(32),
+                "route:api/me",
+                CAPABILITY_ABI_VERSION,
+                &artifact,
+            )
+            .unwrap());
+        assert!(broker
+            .register_artifact_binding(
+                &"ab".repeat(32),
+                "route:api/me",
+                CAPABILITY_ABI_VERSION,
+                &artifact,
+            )
+            .unwrap());
+        assert_eq!(broker.artifact_binding_count(), 1);
         broker
             .authorize_execution(
                 &"ab".repeat(32),
@@ -493,6 +596,7 @@ mod tests {
                 "general-1",
                 4,
                 CAPABILITY_ABI_VERSION,
+                &artifact,
             )
             .unwrap();
         assert_eq!(
@@ -503,6 +607,7 @@ mod tests {
                     "general-1",
                     5,
                     CAPABILITY_ABI_VERSION,
+                    &artifact,
                 )
                 .unwrap_err()
                 .code,
@@ -516,10 +621,25 @@ mod tests {
                     "general-1",
                     4,
                     CAPABILITY_ABI_VERSION + 1,
+                    &artifact,
                 )
                 .unwrap_err()
                 .code,
             "CAPABILITY_ABI_UNSUPPORTED"
+        );
+        assert_eq!(
+            broker
+                .authorize_execution(
+                    &"ab".repeat(32),
+                    "route:api/me",
+                    "general-1",
+                    4,
+                    CAPABILITY_ABI_VERSION,
+                    &"ef".repeat(32),
+                )
+                .unwrap_err()
+                .code,
+            "ARTIFACT_BINDING_UNKNOWN"
         );
     }
 

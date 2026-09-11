@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const CAPABILITY_ABI_VERSION: u16 = 1;
 pub const HOST_CAPABILITY_PROTOCOL_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -32,6 +32,9 @@ pub struct Hello {
 pub struct RegisterArtifactRequest {
     pub request_id: String,
     pub auth_token: String,
+    pub runtime_image: String,
+    pub source_id: String,
+    pub capability_abi: u16,
     pub artifact_hash: String,
     pub wasm: Vec<u8>,
 }
@@ -234,8 +237,12 @@ pub enum Response {
     },
     ArtifactRegistered {
         request_id: String,
+        runtime_image: String,
+        source_id: String,
+        capability_abi: u16,
         artifact_hash: String,
         already_present: bool,
+        already_bound: bool,
     },
     CapabilityManifestRegistered {
         request_id: String,
@@ -580,13 +587,22 @@ mod tests {
         let request = Request::RegisterArtifact(RegisterArtifactRequest {
             request_id: "artifact-1".into(),
             auth_token: "secret".into(),
-            artifact_hash: "ab".repeat(32),
+            runtime_image: "ab".repeat(32),
+            source_id: "route:api/me".into(),
+            capability_abi: CAPABILITY_ABI_VERSION,
+            artifact_hash: "cd".repeat(32),
             wasm: vec![0, 97, 115, 109],
         });
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &request).unwrap();
         let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();
-        assert!(matches!(decoded, Request::RegisterArtifact(_)));
+        let Request::RegisterArtifact(decoded) = decoded else {
+            panic!("expected artifact registration request");
+        };
+        assert_eq!(decoded.runtime_image, "ab".repeat(32));
+        assert_eq!(decoded.source_id, "route:api/me");
+        assert_eq!(decoded.capability_abi, CAPABILITY_ABI_VERSION);
+        assert_eq!(decoded.artifact_hash, "cd".repeat(32));
 
         let execute = Request::Execute(ExecuteRequest {
             request_id: "exec-1".into(),
