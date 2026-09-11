@@ -76,7 +76,9 @@ jobs:
         run: |
           set -euo pipefail
           git rm .github/workflows/container-env-process-wire.yml
-          git rm .github/patches/container-env-process.py
+          # The repair script intentionally rewrites the primary patch in-place
+          # before application, so force removal is required at finalization.
+          git rm -f .github/patches/container-env-process.py
           git rm .github/patches/container-env-process-fix.py
           git add container-runtime
           git commit -m "FIX | BUG-CTR-002 execute work through per-Environment container processes"
