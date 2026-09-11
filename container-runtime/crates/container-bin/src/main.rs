@@ -22,11 +22,12 @@ use container_runtime_core::{
     CapabilityBroker, EnvironmentId, EnvironmentRegistry, ExecutionProvenance, Runtime,
     RuntimeConfig, WorkCost,
 };
-use execution_engine::{ExecutionLimits, WasmExecutor};
+use execution_engine::{CapabilityHost, ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
-    decode_request, read_frame, read_worker_input, write_frame, write_worker_result, Request,
-    Response, WorkerResultFrame, CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS,
-    MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES, PROTOCOL_VERSION,
+    decode_request, read_frame, read_worker_capability_result, read_worker_input, write_frame,
+    write_worker_capability_call, write_worker_result, Request, Response, WorkerCapabilityCall,
+    WorkerCapabilityResult, WorkerResultFrame, CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES,
+    MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES, PROTOCOL_VERSION,
 };
 use resource_limits::ResourceLimits;
 use sandbox_primitives::{install_restricted_seccomp, set_no_new_privileges, SandboxPolicy};
@@ -116,10 +117,14 @@ fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(defaults.workers_per_swamp);
     let token = env::var("RBE_CONTAINER_TOKEN").ok();
+    let capability_broker = Arc::new(CapabilityBroker::new(debug));
+    let capability_dispatcher = environment_process::unavailable_capability_dispatcher();
     let environment_processes = environment_process::EnvironmentProcessSupervisor::start(
         general_environments,
         debug,
         token.as_deref(),
+        Arc::clone(&capability_broker),
+        capability_dispatcher,
     )?;
     let runtime = Runtime::new_with_runner(
         RuntimeConfig {
@@ -131,7 +136,6 @@ fn main() -> anyhow::Result<()> {
         environment_processes.runner(),
         environment_processes.canceller(),
     );
-    let capability_broker = Arc::new(CapabilityBroker::new(debug));
     let accepting = Arc::new(AtomicBool::new(true));
 
     emit_event(
@@ -391,9 +395,11 @@ fn run_worker_inner(args: &[String]) -> anyhow::Result<Vec<u8>> {
     install_restricted_seccomp()
         .map_err(|e| anyhow::anyhow!("worker: failed to install seccomp: {e}"))?;
 
-    let mut stdin = std::io::stdin().lock();
-    let input = read_worker_input(&mut stdin)
-        .map_err(|e| anyhow::anyhow!("worker: invalid invocation frame: {e}"))?;
+    let input = {
+        let mut stdin = std::io::stdin().lock();
+        read_worker_input(&mut stdin)
+            .map_err(|e| anyhow::anyhow!("worker: invalid invocation frame: {e}"))?
+    };
 
     let artifact = value_after(args, "--artifact")
         .ok_or_else(|| anyhow::anyhow!("worker: --artifact is required"))?;
@@ -418,7 +424,37 @@ fn run_worker_inner(args: &[String]) -> anyhow::Result<Vec<u8>> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(64 * 1024 * 1024);
     let executor = WasmExecutor::new()?;
-    let result = executor.execute_with_input(
+    let mut capability_stdin = std::io::stdin();
+    let mut capability_stdout = std::io::stdout();
+    let mut next_capability_call = 1u64;
+    let host: CapabilityHost = Box::new(move |request| {
+        let call_id = next_capability_call;
+        next_capability_call = next_capability_call.saturating_add(1);
+        let call = WorkerCapabilityCall {
+            call_id,
+            kind: request.kind,
+            target: request.target,
+            operation: request.operation,
+            payload: request.payload,
+        };
+        write_worker_capability_call(&mut capability_stdout, &call)
+            .map_err(|error| format!("send capability request to Environment: {error}"))?;
+        match read_worker_capability_result(&mut capability_stdin)
+            .map_err(|error| format!("read capability response from Environment: {error}"))?
+        {
+            WorkerCapabilityResult::Success {
+                call_id: returned,
+                payload,
+            } if returned == call_id => Ok(payload),
+            WorkerCapabilityResult::Error {
+                call_id: returned,
+                code,
+                message,
+            } if returned == call_id => Err(format!("{code}: {message}")),
+            _ => Err("capability response identity mismatch".into()),
+        }
+    });
+    let result = executor.execute_with_input_and_capabilities(
         &wasm,
         &input,
         ExecutionLimits {
@@ -426,6 +462,7 @@ fn run_worker_inner(args: &[String]) -> anyhow::Result<Vec<u8>> {
             max_memory_bytes,
             max_output_bytes: MAX_EXECUTION_OUTPUT_BYTES as u64,
         },
+        Some(host),
     )?;
     if result.exit_code != 0 {
         anyhow::bail!("worker: WASM exited with status {}", result.exit_code);

@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1"
+ipc-protocol = { path = "../ipc-protocol" }
 # Security-reviewed 45.x baseline.
 # default-features=false keeps the optional Wasmtime cache layer disabled so
 # zstd-sys is not pulled into cross-builds. The executor needs std error

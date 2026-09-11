@@ -9,18 +9,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use container_runtime_core::{
-    Canceller, EnvironmentId, EnvironmentStorageManager, ExecutionTask, Runner,
-    DEFAULT_ENVIRONMENT_STORAGE_BYTES,
+    Canceller, CapabilityBroker, CapabilityCall, EnvironmentId, EnvironmentStorageManager,
+    ExecutionTask, Runner, DEFAULT_ENVIRONMENT_STORAGE_BYTES,
 };
 use ipc_protocol::{
-    read_frame, read_worker_result, write_frame, write_worker_input, WorkerResultFrame,
-    CAPABILITY_ABI_VERSION, MAX_EXECUTION_INPUT_BYTES,
+    read_frame, read_worker_output, write_frame, write_worker_capability_result,
+    write_worker_input, CapabilityKind, WorkerCapabilityCall, WorkerCapabilityResult,
+    WorkerOutputFrame, WorkerResultFrame, CAPABILITY_ABI_VERSION, MAX_CAPABILITY_PAYLOAD_BYTES,
+    MAX_EXECUTION_INPUT_BYTES,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CHILD_PROTOCOL_VERSION: u16 = 2;
+const CHILD_PROTOCOL_VERSION: u16 = 3;
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_MAX_BYTES: usize = 128;
@@ -68,6 +70,11 @@ enum ChildRequest {
         generation: u64,
         execution_id: String,
     },
+    CapabilityResult {
+        session: String,
+        execution_id: String,
+        result: WorkerCapabilityResult,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +104,10 @@ enum ChildResponse {
         request_id: String,
         execution_id: String,
         active: bool,
+    },
+    CapabilityCall {
+        request_id: String,
+        call: WorkerCapabilityCall,
     },
     Error {
         request_id: Option<String>,
@@ -147,6 +158,43 @@ struct WorkerExecution<'a> {
     environment: &'a str,
 }
 
+#[derive(Debug, Clone)]
+pub struct CapabilityDispatchRequest {
+    pub execution_id: String,
+    pub kind: CapabilityKind,
+    pub target: String,
+    pub operation: String,
+    pub payload: Vec<u8>,
+    pub max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapabilityDispatchError {
+    pub code: String,
+    pub message: String,
+}
+
+pub type CapabilityDispatcher = Arc<
+    dyn Fn(CapabilityDispatchRequest) -> Result<Vec<u8>, CapabilityDispatchError> + Send + Sync,
+>;
+
+pub fn unavailable_capability_dispatcher() -> CapabilityDispatcher {
+    Arc::new(|request| {
+        let _consumed_metadata = (
+            request.execution_id.as_str(),
+            request.kind,
+            request.target.as_str(),
+            request.operation.as_str(),
+            request.payload.len(),
+            request.max_response_bytes,
+        );
+        Err(CapabilityDispatchError {
+            code: "CAPABILITY_DISPATCH_UNAVAILABLE".into(),
+            message: "no trusted host capability dispatcher is configured".into(),
+        })
+    })
+}
+
 struct ManagedEnvironment {
     child: Child,
     // Keeping the write side alive is the parent-liveness lease. The child has
@@ -179,6 +227,8 @@ pub struct EnvironmentProcessSupervisor {
     processes: Mutex<HashMap<EnvironmentId, ManagedEnvironment>>,
     executions: Mutex<HashMap<String, ExecutionOwner>>,
     cancelled: Mutex<HashMap<String, Instant>>,
+    capability_broker: Arc<CapabilityBroker>,
+    capability_dispatcher: CapabilityDispatcher,
 }
 
 impl EnvironmentProcessSupervisor {
@@ -186,6 +236,8 @@ impl EnvironmentProcessSupervisor {
         general_environments: usize,
         debug: bool,
         controller_token: Option<&str>,
+        capability_broker: Arc<CapabilityBroker>,
+        capability_dispatcher: CapabilityDispatcher,
     ) -> Result<Arc<Self>> {
         let supervisor = Arc::new(Self {
             debug,
@@ -194,6 +246,8 @@ impl EnvironmentProcessSupervisor {
             processes: Mutex::new(HashMap::new()),
             executions: Mutex::new(HashMap::new()),
             cancelled: Mutex::new(HashMap::new()),
+            capability_broker,
+            capability_dispatcher,
         });
         for id in active_environment_ids(general_environments) {
             let managed = supervisor.spawn_one(id, 0)?;
@@ -397,7 +451,7 @@ impl EnvironmentProcessSupervisor {
         }
         let request = ChildRequest::Execute {
             request_id: request_id.clone(),
-            session: endpoint.session,
+            session: endpoint.session.clone(),
             runtime_image: provenance.runtime_image.clone(),
             source_id: provenance.source_id.clone(),
             capability_abi: provenance.capability_abi,
@@ -412,20 +466,42 @@ impl EnvironmentProcessSupervisor {
         let result = (|| -> Result<Vec<u8>, String> {
             write_frame(&mut stream, &request)
                 .map_err(|error| format!("send Environment execution: {error}"))?;
-            read_typed::<ChildResponse, _>(&mut BufReader::new(stream))
-                .map_err(|error| format!("read Environment execution result: {error}"))
-                .and_then(|response| match response {
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .map_err(|error| format!("clone Environment execution socket: {error}"))?,
+            );
+            loop {
+                let response = read_typed::<ChildResponse, _>(&mut reader)
+                    .map_err(|error| format!("read Environment execution result: {error}"))?;
+                match response {
+                    ChildResponse::CapabilityCall {
+                        request_id: returned,
+                        call,
+                    } if returned == request_id => {
+                        let result = self.dispatch_capability(task, call);
+                        write_frame(
+                            &mut stream,
+                            &ChildRequest::CapabilityResult {
+                                session: endpoint.session.clone(),
+                                execution_id: request_id.clone(),
+                                result,
+                            },
+                        )
+                        .map_err(|error| format!("send Environment capability result: {error}"))?;
+                    }
                     ChildResponse::Finished {
                         request_id: returned,
                         output,
-                    } if returned == request_id => Ok(output),
+                    } if returned == request_id => return Ok(output),
                     ChildResponse::Error {
                         request_id: Some(returned),
                         code,
                         message,
-                    } if returned == request_id => Err(format!("{code}: {message}")),
-                    _ => Err("Environment process returned a mismatched response".into()),
-                })
+                    } if returned == request_id => return Err(format!("{code}: {message}")),
+                    _ => return Err("Environment process returned a mismatched response".into()),
+                }
+            }
         })();
         self.executions
             .lock()
@@ -433,6 +509,68 @@ impl EnvironmentProcessSupervisor {
             .remove(&request_id);
         let _ = take_cancelled(&self.cancelled, &request_id);
         result
+    }
+
+    fn dispatch_capability(
+        &self,
+        task: &ExecutionTask,
+        call: WorkerCapabilityCall,
+    ) -> WorkerCapabilityResult {
+        let Some(provenance) = task.provenance.as_ref() else {
+            return WorkerCapabilityResult::Error {
+                call_id: call.call_id,
+                code: "CAPABILITY_PROVENANCE_MISSING".into(),
+                message: "execution has no trusted capability provenance".into(),
+            };
+        };
+        let authorized = match self.capability_broker.authorize(CapabilityCall {
+            runtime_image: &provenance.runtime_image,
+            source_id: &provenance.source_id,
+            environment: &provenance.environment,
+            generation: provenance.generation,
+            kind: call.kind,
+            target: &call.target,
+            operation: &call.operation,
+            request_bytes: call.payload.len(),
+        }) {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                return WorkerCapabilityResult::Error {
+                    call_id: call.call_id,
+                    code: error.code.into(),
+                    message: error.message,
+                };
+            }
+        };
+        let request = CapabilityDispatchRequest {
+            execution_id: task.id.to_string(),
+            kind: call.kind,
+            target: call.target,
+            operation: call.operation,
+            payload: call.payload,
+            max_response_bytes: authorized.max_response_bytes,
+        };
+        match (self.capability_dispatcher)(request) {
+            Ok(payload)
+                if payload.len() <= MAX_CAPABILITY_PAYLOAD_BYTES
+                    && payload.len() as u64 <= authorized.max_response_bytes =>
+            {
+                WorkerCapabilityResult::Success {
+                    call_id: call.call_id,
+                    payload,
+                }
+            }
+            Ok(_) => WorkerCapabilityResult::Error {
+                call_id: call.call_id,
+                code: "CAPABILITY_RESPONSE_TOO_LARGE".into(),
+                message: "trusted dispatcher response exceeded the capability grant".into(),
+            },
+            Err(error) => WorkerCapabilityResult::Error {
+                call_id: call.call_id,
+                code: error.code,
+                message: error.message,
+            },
+        }
     }
 
     fn spawn_one(&self, id: EnvironmentId, generation: u64) -> Result<ManagedEnvironment> {
@@ -701,7 +839,7 @@ fn handle_child_connection(
                     debug: bootstrap.debug,
                     environment: &bootstrap.environment,
                 };
-                match execute_isolated_worker(worker, state) {
+                match execute_isolated_worker(worker, state, &mut stream, &bootstrap.session) {
                     Ok(output) => ChildResponse::Finished { request_id, output },
                     Err(error) if error == "execution cancelled" => {
                         child_error(Some(request_id), "EXECUTION_CANCELLED", &error)
@@ -788,6 +926,11 @@ fn handle_child_connection(
                 }
             }
         }
+        ChildRequest::CapabilityResult { .. } => child_error(
+            None,
+            "CAPABILITY_RESULT_UNEXPECTED",
+            "capability results are only accepted during an active execution",
+        ),
         ChildRequest::Bootstrap(_) => child_error(
             None,
             "BOOTSTRAP_REPLAY",
@@ -801,6 +944,8 @@ fn handle_child_connection(
 fn execute_isolated_worker(
     worker: WorkerExecution<'_>,
     state: &EnvironmentChildState,
+    controller: &mut TcpStream,
+    session: &str,
 ) -> Result<Vec<u8>, String> {
     let WorkerExecution {
         execution_id,
@@ -869,15 +1014,24 @@ fn execute_isolated_worker(
             let _ = child.wait();
             return Err(format!("write Environment worker input: {error}"));
         }
-        drop(worker_stdin);
 
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| "Environment worker stdout unavailable".to_string())?;
+        let (frame_tx, frame_rx) = mpsc::channel();
         let reader = thread::Builder::new()
-            .name("rbe-env-worker-result".into())
-            .spawn(move || read_worker_result(&mut BufReader::new(stdout)))
+            .name("rbe-env-worker-output".into())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let frame = read_worker_output(&mut reader);
+                    let terminal = matches!(&frame, Ok(WorkerOutputFrame::Result(_)) | Err(_));
+                    if frame_tx.send(frame).is_err() || terminal {
+                        break;
+                    }
+                }
+            })
             .map_err(|error| error.to_string())?;
         let started = std::time::Instant::now();
         let timeout = Duration::from_millis(timeout_ms.max(1));
@@ -896,12 +1050,42 @@ fn execute_isolated_worker(
                     "Environment worker timed out after {timeout_ms} ms"
                 ));
             }
-            match child.try_wait().map_err(|error| error.to_string())? {
-                Some(status) => {
-                    let frame = reader
+            match frame_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(Ok(WorkerOutputFrame::CapabilityCall(call))) => {
+                    write_frame(
+                        controller,
+                        &ChildResponse::CapabilityCall {
+                            request_id: execution_id.to_string(),
+                            call: call.clone(),
+                        },
+                    )
+                    .map_err(|error| format!("relay capability call to Controller: {error}"))?;
+                    let response: ChildRequest =
+                        read_typed(&mut BufReader::new(controller.try_clone().map_err(
+                            |error| format!("clone capability relay socket: {error}"),
+                        )?))
+                        .map_err(|error| format!("read Controller capability response: {error}"))?;
+                    let result = match response {
+                        ChildRequest::CapabilityResult {
+                            session: returned_session,
+                            execution_id: returned_execution,
+                            result,
+                        } if returned_session == session
+                            && returned_execution == execution_id
+                            && capability_result_id(&result) == call.call_id =>
+                        {
+                            result
+                        }
+                        _ => return Err("Controller capability response identity mismatch".into()),
+                    };
+                    write_worker_capability_result(&mut worker_stdin, &result)
+                        .map_err(|error| format!("send capability result to worker: {error}"))?;
+                }
+                Ok(Ok(WorkerOutputFrame::Result(frame))) => {
+                    let status = child.wait().map_err(|error| error.to_string())?;
+                    reader
                         .join()
-                        .map_err(|_| "Environment worker result reader panicked".to_string())?
-                        .map_err(|error| format!("invalid Environment worker result: {error}"))?;
+                        .map_err(|_| "Environment worker output reader panicked".to_string())?;
                     if !status.success() {
                         return Err(format!("Environment worker exited with status {status}"));
                     }
@@ -910,7 +1094,26 @@ fn execute_isolated_worker(
                         WorkerResultFrame::Error(message) => Err(message),
                     };
                 }
-                None => thread::sleep(Duration::from_millis(10)),
+                Ok(Err(error)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err(format!("invalid Environment worker output: {error}"));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                        let _ = reader.join();
+                        return Err(format!(
+                            "Environment worker exited without terminal result: {status}"
+                        ));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err("Environment worker output channel disconnected".into());
+                }
             }
         }
     })();
@@ -920,6 +1123,13 @@ fn execute_isolated_worker(
         .remove(execution_id);
     let _ = take_cancelled(cancelled, execution_id);
     result
+}
+
+fn capability_result_id(result: &WorkerCapabilityResult) -> u64 {
+    match result {
+        WorkerCapabilityResult::Success { call_id, .. }
+        | WorkerCapabilityResult::Error { call_id, .. } => *call_id,
+    }
 }
 
 fn mark_cancelled(

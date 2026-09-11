@@ -5,6 +5,7 @@
 //! environment variables, and files are not exposed to the guest.
 
 use anyhow::Result;
+use ipc_protocol::{CapabilityKind, MAX_CAPABILITY_PAYLOAD_BYTES};
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 #[derive(Debug, Clone, Copy)]
@@ -31,12 +32,24 @@ pub struct ExecutionResult {
     pub output: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCapabilityRequest {
+    pub kind: CapabilityKind,
+    pub target: String,
+    pub operation: String,
+    pub payload: Vec<u8>,
+}
+
+pub type CapabilityHost = Box<dyn FnMut(HostCapabilityRequest) -> Result<Vec<u8>, String>>;
+
 struct ExecutionState {
     limits: StoreLimits,
     input: Vec<u8>,
     output: Vec<u8>,
     max_output_bytes: usize,
     abi_error: Option<String>,
+    capability_host: Option<CapabilityHost>,
+    capability_response: Vec<u8>,
 }
 
 pub struct WasmExecutor {
@@ -63,6 +76,16 @@ impl WasmExecutor {
         input: &[u8],
         limits: ExecutionLimits,
     ) -> Result<ExecutionResult> {
+        self.execute_with_input_and_capabilities(wasm, input, limits, None)
+    }
+
+    pub fn execute_with_input_and_capabilities(
+        &self,
+        wasm: &[u8],
+        input: &[u8],
+        limits: ExecutionLimits,
+        capability_host: Option<CapabilityHost>,
+    ) -> Result<ExecutionResult> {
         let module = Module::new(&self.engine, wasm)
             .map_err(|error| anyhow::anyhow!("compile WASM artifact: {error}"))?;
 
@@ -85,6 +108,8 @@ impl WasmExecutor {
                 output: Vec::new(),
                 max_output_bytes,
                 abi_error: None,
+                capability_host,
+                capability_response: Vec::new(),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -166,6 +191,127 @@ impl WasmExecutor {
                 length as i32
             },
         )?;
+        linker.func_wrap(
+            "rbe",
+            "capability_call",
+            |mut caller: Caller<'_, ExecutionState>,
+             kind: i32,
+             target_ptr: i32,
+             target_len: i32,
+             operation_ptr: i32,
+             operation_len: i32,
+             payload_ptr: i32,
+             payload_len: i32|
+             -> i32 {
+                let Some(kind) = capability_kind_from_abi(kind) else {
+                    return set_abi_error(&mut caller, "capability_call received an unknown kind");
+                };
+                let target = match read_guest_bytes(
+                    &mut caller,
+                    target_ptr,
+                    target_len,
+                    512,
+                    "capability target",
+                ) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return set_abi_error(&mut caller, "capability target is not UTF-8")
+                        }
+                    },
+                    Err(error) => return set_abi_error(&mut caller, &error),
+                };
+                let operation = match read_guest_bytes(
+                    &mut caller,
+                    operation_ptr,
+                    operation_len,
+                    256,
+                    "capability operation",
+                ) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return set_abi_error(&mut caller, "capability operation is not UTF-8")
+                        }
+                    },
+                    Err(error) => return set_abi_error(&mut caller, &error),
+                };
+                let payload = match read_guest_bytes(
+                    &mut caller,
+                    payload_ptr,
+                    payload_len,
+                    MAX_CAPABILITY_PAYLOAD_BYTES,
+                    "capability payload",
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return set_abi_error(&mut caller, &error),
+                };
+                caller.data_mut().capability_response.clear();
+                let request = HostCapabilityRequest {
+                    kind,
+                    target,
+                    operation,
+                    payload,
+                };
+                let response = match caller.data_mut().capability_host.as_mut() {
+                    Some(host) => host(request),
+                    None => Err("capability host is unavailable".into()),
+                };
+                match response {
+                    Ok(response) if response.len() <= MAX_CAPABILITY_PAYLOAD_BYTES => {
+                        let length = i32::try_from(response.len()).unwrap_or(i32::MAX);
+                        caller.data_mut().capability_response = response;
+                        length
+                    }
+                    Ok(_) => set_abi_error(&mut caller, "capability response exceeds maximum size"),
+                    Err(error) => {
+                        set_abi_error(&mut caller, &format!("capability call failed: {error}"))
+                    }
+                }
+            },
+        )?;
+        linker.func_wrap(
+            "rbe",
+            "capability_response_len",
+            |caller: Caller<'_, ExecutionState>| -> i32 {
+                i32::try_from(caller.data().capability_response.len()).unwrap_or(i32::MAX)
+            },
+        )?;
+        linker.func_wrap(
+            "rbe",
+            "capability_response_read",
+            |mut caller: Caller<'_, ExecutionState>, ptr: i32, capacity: i32| -> i32 {
+                if ptr < 0 || capacity < 0 {
+                    return set_abi_error(
+                        &mut caller,
+                        "capability_response_read received a negative pointer or capacity",
+                    );
+                }
+                let response = caller.data().capability_response.clone();
+                if (capacity as usize) < response.len() {
+                    return set_abi_error(
+                        &mut caller,
+                        "capability_response_read capacity is too small",
+                    );
+                }
+                let Some(memory) = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                else {
+                    return set_abi_error(
+                        &mut caller,
+                        "module does not export memory for capability_response_read",
+                    );
+                };
+                if memory.write(&mut caller, ptr as usize, &response).is_err() {
+                    return set_abi_error(
+                        &mut caller,
+                        "capability_response_read points outside guest memory",
+                    );
+                }
+                response.len() as i32
+            },
+        )?;
 
         let instance = linker
             .instantiate(&mut store, &module)
@@ -188,6 +334,44 @@ impl WasmExecutor {
             output,
         })
     }
+}
+
+fn capability_kind_from_abi(value: i32) -> Option<CapabilityKind> {
+    match value {
+        0 => Some(CapabilityKind::Service),
+        1 => Some(CapabilityKind::Network),
+        2 => Some(CapabilityKind::Storage),
+        3 => Some(CapabilityKind::Vault),
+        4 => Some(CapabilityKind::HostFile),
+        5 => Some(CapabilityKind::Video),
+        6 => Some(CapabilityKind::Debug),
+        _ => None,
+    }
+}
+
+fn read_guest_bytes(
+    caller: &mut Caller<'_, ExecutionState>,
+    ptr: i32,
+    length: i32,
+    max: usize,
+    label: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    if ptr < 0 || length < 0 {
+        return Err(format!("{label} received a negative pointer or length"));
+    }
+    let length = length as usize;
+    if length > max {
+        return Err(format!("{label} exceeds maximum size"));
+    }
+    let memory = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+        .ok_or_else(|| format!("module does not export memory for {label}"))?;
+    let mut bytes = vec![0u8; length];
+    memory
+        .read(&*caller, ptr as usize, &mut bytes)
+        .map_err(|_| format!("{label} points outside guest memory"))?;
+    Ok(bytes)
 }
 
 fn set_abi_error(caller: &mut Caller<'_, ExecutionState>, message: &str) -> i32 {
@@ -241,6 +425,56 @@ mod tests {
             .unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.output, b"hello\0rbe");
+    }
+
+    #[test]
+    fn capability_host_abi_round_trips_through_trusted_callback() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "rbe" "capability_call" (func $call (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "rbe" "capability_response_len" (func $response_len (result i32)))
+                (import "rbe" "capability_response_read" (func $response_read (param i32 i32) (result i32)))
+                (import "rbe" "output_write" (func $output_write (param i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "uac")
+                (data (i32.const 16) "get_user")
+                (data (i32.const 32) "req")
+                (func (export "run") (result i32)
+                    (local $len i32)
+                    i32.const 0
+                    i32.const 0
+                    i32.const 3
+                    i32.const 16
+                    i32.const 8
+                    i32.const 32
+                    i32.const 3
+                    call $call
+                    drop
+                    call $response_len
+                    local.set $len
+                    i32.const 64
+                    local.get $len
+                    call $response_read
+                    drop
+                    i32.const 64
+                    local.get $len
+                    call $output_write
+                    drop
+                    i32.const 0))"#,
+        )
+        .unwrap();
+        let executor = WasmExecutor::new().unwrap();
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, CapabilityKind::Service);
+            assert_eq!(request.target, "uac");
+            assert_eq!(request.operation, "get_user");
+            assert_eq!(request.payload, b"req");
+            Ok(b"trusted-response".to_vec())
+        });
+        let result = executor
+            .execute_with_input_and_capabilities(&wasm, &[], ExecutionLimits::default(), Some(host))
+            .unwrap();
+        assert_eq!(result.output, b"trusted-response");
     }
 
     #[test]

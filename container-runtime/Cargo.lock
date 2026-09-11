@@ -803,6 +803,7 @@ name = "execution-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ipc-protocol",
  "wasmtime",
  "wat",
 ]

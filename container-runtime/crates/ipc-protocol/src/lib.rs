@@ -14,6 +14,9 @@ pub const MAX_CAPABILITY_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_AWAIT_RESULT_MS: u64 = 30_000;
 pub const MAX_WORKER_ERROR_BYTES: usize = 64 * 1024;
 const WORKER_PIPE_MAGIC: [u8; 4] = *b"RBW1";
+const WORKER_CAPABILITY_CALL_MAGIC: [u8; 4] = *b"RBCQ";
+const WORKER_CAPABILITY_RESULT_MAGIC: [u8; 4] = *b"RBCR";
+const WORKER_CAPABILITY_FRAME_BYTES: usize = MAX_CAPABILITY_PAYLOAD_BYTES + 16 * 1024;
 const WORKER_STATUS_SUCCESS: u8 = 0;
 const WORKER_STATUS_ERROR: u8 = 1;
 
@@ -162,6 +165,35 @@ pub struct WorkCost {
 pub enum WorkerResultFrame {
     Success(Vec<u8>),
     Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCapabilityCall {
+    pub call_id: u64,
+    pub kind: CapabilityKind,
+    pub target: String,
+    pub operation: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkerCapabilityResult {
+    Success {
+        call_id: u64,
+        payload: Vec<u8>,
+    },
+    Error {
+        call_id: u64,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerOutputFrame {
+    CapabilityCall(WorkerCapabilityCall),
+    Result(WorkerResultFrame),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +346,89 @@ pub fn write_worker_result<W: Write>(writer: &mut W, result: &WorkerResultFrame)
 
 pub fn read_worker_result<R: Read>(reader: &mut R) -> io::Result<WorkerResultFrame> {
     expect_worker_magic(reader)?;
+    read_worker_result_body(reader)
+}
+
+pub fn write_worker_capability_call<W: Write>(
+    writer: &mut W,
+    call: &WorkerCapabilityCall,
+) -> io::Result<()> {
+    if call.payload.len() > MAX_CAPABILITY_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker capability request exceeds maximum size",
+        ));
+    }
+    writer.write_all(&WORKER_CAPABILITY_CALL_MAGIC)?;
+    write_worker_json(writer, call)
+}
+
+pub fn write_worker_capability_result<W: Write>(
+    writer: &mut W,
+    result: &WorkerCapabilityResult,
+) -> io::Result<()> {
+    if matches!(
+        result,
+        WorkerCapabilityResult::Success { payload, .. }
+            if payload.len() > MAX_CAPABILITY_PAYLOAD_BYTES
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker capability response exceeds maximum size",
+        ));
+    }
+    writer.write_all(&WORKER_CAPABILITY_RESULT_MAGIC)?;
+    write_worker_json(writer, result)
+}
+
+pub fn read_worker_capability_result<R: Read>(
+    reader: &mut R,
+) -> io::Result<WorkerCapabilityResult> {
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if magic != WORKER_CAPABILITY_RESULT_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid worker capability response magic",
+        ));
+    }
+    let result: WorkerCapabilityResult = read_worker_json(reader)?;
+    if matches!(
+        &result,
+        WorkerCapabilityResult::Success { payload, .. }
+            if payload.len() > MAX_CAPABILITY_PAYLOAD_BYTES
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker capability response exceeds maximum size",
+        ));
+    }
+    Ok(result)
+}
+
+pub fn read_worker_output<R: Read>(reader: &mut R) -> io::Result<WorkerOutputFrame> {
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if magic == WORKER_PIPE_MAGIC {
+        return read_worker_result_body(reader).map(WorkerOutputFrame::Result);
+    }
+    if magic == WORKER_CAPABILITY_CALL_MAGIC {
+        let call: WorkerCapabilityCall = read_worker_json(reader)?;
+        if call.payload.len() > MAX_CAPABILITY_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker capability request exceeds maximum size",
+            ));
+        }
+        return Ok(WorkerOutputFrame::CapabilityCall(call));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid worker output protocol magic",
+    ))
+}
+
+fn read_worker_result_body<R: Read>(reader: &mut R) -> io::Result<WorkerResultFrame> {
     let mut status = [0u8; 1];
     reader.read_exact(&mut status)?;
     match status[0] {
@@ -340,6 +455,31 @@ pub fn read_worker_result<R: Read>(reader: &mut R) -> io::Result<WorkerResultFra
             format!("unknown worker result status {other}"),
         )),
     }
+}
+
+fn write_worker_json<W: Write>(writer: &mut W, value: &impl Serialize) -> io::Result<()> {
+    let body = serde_json::to_vec(value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if body.len() > WORKER_CAPABILITY_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker capability frame exceeds maximum size",
+        ));
+    }
+    writer.write_all(&(body.len() as u32).to_be_bytes())?;
+    writer.write_all(&body)?;
+    writer.flush()
+}
+
+fn read_worker_json<T: for<'de> Deserialize<'de>, R: Read>(reader: &mut R) -> io::Result<T> {
+    let length = read_worker_length(
+        reader,
+        WORKER_CAPABILITY_FRAME_BYTES,
+        "worker capability frame",
+    )?;
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn expect_worker_magic<R: Read>(reader: &mut R) -> io::Result<()> {
@@ -498,6 +638,34 @@ mod tests {
         let mut encoded = Vec::new();
         write_worker_result(&mut encoded, &frame).unwrap();
         assert_eq!(read_worker_result(&mut encoded.as_slice()).unwrap(), frame);
+    }
+
+    #[test]
+    fn worker_capability_pipe_round_trips_requests_and_results() {
+        let call = WorkerCapabilityCall {
+            call_id: 7,
+            kind: CapabilityKind::Service,
+            target: "uac".into(),
+            operation: "get_user".into(),
+            payload: b"request".to_vec(),
+        };
+        let mut encoded = Vec::new();
+        write_worker_capability_call(&mut encoded, &call).unwrap();
+        assert_eq!(
+            read_worker_output(&mut encoded.as_slice()).unwrap(),
+            WorkerOutputFrame::CapabilityCall(call)
+        );
+
+        let result = WorkerCapabilityResult::Success {
+            call_id: 7,
+            payload: b"response".to_vec(),
+        };
+        let mut encoded = Vec::new();
+        write_worker_capability_result(&mut encoded, &result).unwrap();
+        assert_eq!(
+            read_worker_capability_result(&mut encoded.as_slice()).unwrap(),
+            result
+        );
     }
 
     #[test]
