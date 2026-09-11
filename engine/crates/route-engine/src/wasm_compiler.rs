@@ -426,6 +426,7 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+    use execution_engine::{CapabilityHost, ExecutionLimits, WasmExecutor};
 
     fn parse(source: &str) -> RouteFile {
         let tokens = Lexer::new(source).tokenize().unwrap();
@@ -469,6 +470,73 @@ mod tests {
             .bytes
             .windows(b"https://example.com/data".len())
             .any(|window| window == b"https://example.com/data"));
+    }
+
+    #[test]
+    fn generated_http_wasm_round_trips_through_real_capability_host_abi() {
+        let route = parse(
+            r#":import[http.get]
+               class Route { get(req) { return get("https://example.com/data"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("direct HTTP route should compile natively");
+        };
+        let expected =
+            br#"{"status":200,"ok":true,"headers":{},"body":"ok","contentType":"text/plain"}"#;
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, core_lib::ContainerCapabilityKind::Network);
+            assert_eq!(request.target, PUBLIC_HTTP_TARGET);
+            assert_eq!(request.operation, "get");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["https://example.com/data"])
+            );
+            Ok(
+                br#"{"status":200,"ok":true,"headers":{},"body":"ok","contentType":"text/plain"}"#
+                    .to_vec(),
+            )
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.output, expected);
+        assert!(result.fuel_consumed > 0);
+    }
+
+    #[test]
+    fn generated_http_wasm_fails_closed_when_host_denies_capability() {
+        let route = parse(
+            r#":import[http.get]
+               class Route { get(req) { return get("https://example.com/data"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("direct HTTP route should compile natively");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, core_lib::ContainerCapabilityKind::Network);
+            assert_eq!(request.target, PUBLIC_HTTP_TARGET);
+            assert_eq!(request.operation, "get");
+            Err("CAPABILITY_DENIED: test denial".into())
+        });
+        let error = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .expect_err("host denial must fail the whole WASM execution");
+        let message = error.to_string();
+        assert!(message.contains("WASM ABI violation"));
+        assert!(message.contains("CAPABILITY_DENIED"));
     }
 
     #[test]

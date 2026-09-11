@@ -20,3 +20,4 @@ wasm-encoder = "0.248"
 
 [dev-dependencies]
 wasmparser = "0.248"
+execution-engine = { path = "../../../container-runtime/crates/execution-engine" }
