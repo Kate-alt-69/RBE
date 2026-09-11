@@ -5,6 +5,7 @@ name: CAP-004 worker capability relay
     branches: [main]
     paths:
       - '.github/patches/cap004-capability-relay.py'
+      - '.github/patches/cap004-capability-relay-stagefix.py'
       - '.github/workflows/cap004-capability-relay.yml'
 
 permissions:
@@ -37,6 +38,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           git reset --hard origin/main
+          python3 .github/patches/cap004-capability-relay-stagefix.py
           python3 .github/patches/cap004-capability-relay.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
           # Adding the existing ipc-protocol workspace crate as an execution-engine
@@ -70,7 +72,8 @@ jobs:
         run: |
           set -euo pipefail
           git rm .github/workflows/cap004-capability-relay.yml
-          git rm .github/patches/cap004-capability-relay.py
+          git rm -f .github/patches/cap004-capability-relay.py
+          git rm .github/patches/cap004-capability-relay-stagefix.py
           git add container-runtime
           git commit -m "FIX | BUG-CAP-004 relay sandbox capability calls through Controller authority"
 
