@@ -1,71 +1,45 @@
 # `*.route` — Route REL
 
-Route REL defines HTTP entrypoints. It uses the global REL grammar, but its runtime powers are intentionally route-scoped.
+Route REL defines HTTP entrypoints. It uses the common REL grammar while keeping HTTP authority narrow and explicit.
 
-## Purpose
-
-A `.route` file maps to an HTTP route and may define HTTP verb handlers such as:
+## Structure
 
 ```text
-get
-post
-put
-delete
-patch
-head
-options
-```
-
-The current parser recognizes those verbs. Support for additional standardized methods such as `QUERY`, wildcard/all-method handlers, and richer route matching is planned.
-
-## Grammar
-
-Route REL should receive the same higher-level REL grammar as Module, Service, and Server REL:
-
-- helper functions
-- variables/constants
-- objects/arrays
-- expressions/operators
-- conditionals
-- async syntax
-- classes/methods
-- recursion where semantically valid
-- future higher-level REL constructs
-
-Route REL is not supposed to be a deliberately crippled grammar. Its restrictions are capability and lifecycle restrictions.
-
-## Current structure
-
-```text
-:import[json, net]
+:import[json, response]
 
 function helper(value) {
-    if (value) {
-        return { ok: true };
-    }
-    return { ok: false };
+    return { ok: value != null };
 }
 
 class Route {
     async get(req) {
-        return helper(req.path);
+        return response.json(helper(req.query.value), 200);
     }
 }
 ```
 
-## Imports and capabilities
+Current HTTP method parsing includes:
 
-Routes can import only capabilities allowed at the HTTP boundary. Privileged capabilities remain restricted even if another REL source type can use them.
+```text
+get post put delete patch head options
+```
 
-Current built-in route-safe concepts include `net`, `json`, `crypto`, `time`, `http`, `request`, `log`, `security`, `response`, and read-only `private`, but several registered names still have incomplete runtime implementations. Documentation must distinguish a registered capability name from a working callable API.
+Additional methods/wildcard handlers may be added later.
 
-Routes do not directly import `.service` sources. Service access should flow through reusable modules / controlled runtime interfaces rather than exposing service authority directly to every endpoint.
+## File routing
 
-See [`../x.module/`](../x.module/) and [`../x.service/`](../x.service/).
+Filesystem routing is active, including dynamic/catch-all parameters:
 
-## Request object
+```text
+api/users/[uid].route       -> /api/users/:uid
+api/files/[...path].route   -> /api/files/*path
+```
 
-Route handlers now receive the real request snapshot when they declare a request parameter:
+Two routes whose shapes differ only by parameter name collide at boot; `[id]` and `[slug]` are not treated as distinct URL shapes.
+
+## Request snapshot
+
+A declared route parameter receives the bounded request snapshot:
 
 ```text
 request.method
@@ -86,36 +60,15 @@ request.contentType
 request.contentLength
 ```
 
-JSON bodies are decoded into native REL values. Other body types are exposed as strings in the current v1 transport. Body reads are bounded by the configured security payload limit. Invalid JSON returns HTTP 400 and oversized bodies return HTTP 413 before REL execution.
+JSON bodies are decoded to REL values. Other current v1 body types are exposed as strings. Invalid JSON returns HTTP 400 and configured body-limit violations return HTTP 413 before REL execution.
 
-Proxy-derived client IP/protocol information is used only when `security.trustedProxyHeaders` is enabled. Otherwise forwarded headers are treated as untrusted input and `request.ip` comes from the socket peer.
+Forwarded client/protocol data is trusted only when `trustedProxyHeaders` policy is enabled. Otherwise `request.ip` is derived from the socket peer.
 
-File-system route parameters are active:
+Current transport limitations include collapsed duplicate query keys, joined duplicate request headers, and no first-class binary-body value type.
 
-```text
-api/users/[uid].route       -> /api/users/:uid
-api/files/[...path].route   -> /api/files/*path
-```
+## Responses
 
-Parameter names do not make two otherwise-identical route shapes distinct; `[id]` and `[slug]` for the same method/path collide at boot.
-
-Current v1 limitations: duplicate query keys collapse to one value, duplicate request headers are joined for the REL object, and binary body APIs are not yet a first-class byte type.
-
-## Response object
-
-Plain REL return values remain JSON with status 200 for compatibility. Import `response` when explicit HTTP behavior is needed:
-
-```text
-:import[response]
-
-class Route {
-    post(request) {
-        return response.json({ ok: true }, 201);
-    }
-}
-```
-
-Implemented response helpers:
+A plain REL return value remains a JSON `200 OK` response for compatibility. Import `response` for explicit HTTP behavior:
 
 ```text
 response.json(body, status?)
@@ -129,55 +82,72 @@ response.cookie(responseValue, name, value, options?)
 response.clearCookie(responseValue, name, options?)
 ```
 
-Header names/values and cookies are validated again at the Rust HTTP boundary; newline/header injection is rejected. Cookie options currently support `path`, `domain`, `maxAge`, `httpOnly`, `secure`, and `sameSite`.
+Header/cookie values are validated again at the Rust HTTP boundary. Cookie options include `path`, `domain`, `maxAge`, `httpOnly`, `secure`, and `sameSite`.
 
-Streaming bodies, first-class binary responses, file sends and SSE remain later transport extensions rather than being pretended complete.
+Streaming responses, first-class binary responses, file sends, and SSE remain later transport work.
 
-## Dynamic routing target
+## Imports and authority
 
-Planned file routing includes forms such as:
+Route-safe built-in concepts include the currently registered HTTP-side capabilities such as `net`, `json`, `crypto`, `time`, `http`, `request`, `log`, `security`, `response`, and read-only `private`, subject to each capability's implemented operation set.
 
-```text
-api/user/[uid].route       -> /api/user/:uid
-api/files/[...path].route  -> wildcard path
-```
+Important deny rules:
 
-Optional segments and constrained/pattern segments may be added after the basic dynamic-segment model is stable.
+- Route REL cannot directly import `service:*`.
+- Route REL cannot import/read shared `ENV` by default.
+- Route REL cannot import `quickDB`.
+- Route REL cannot directly import Video Manager (`vm` / `video-manager`).
 
-## Responses
+The normal route-to-service shape is Route -> Module -> Service.
 
-Current successful route execution serializes the returned REL value as JSON, generally with `200 OK`.
+## Server middleware
 
-Target response support includes:
-
-- explicit status codes
-- JSON/text/HTML
-- response headers
-- cookies and cookie clearing
-- redirects
-- files/downloads
-- binary bodies
-- streams
-- SSE
-- no-content responses
-
-The `response` capability should become a real typed HTTP response API instead of a registered-but-unimplemented built-in.
-
-## Middleware
-
-Normal server middleware is configured through Server REL, not imported into every route as package-style middleware. Route-specific overrides/inheritance may be added through the MiddlewarePlan model.
-
-Custom application logic that should run across routes belongs in Module REL or Service REL middleware stages once that feature lands.
+Global HTTP middleware/policy is configured by `server.server`, not imported package-by-package into each route. Server REL lowers middleware into an ordered `MiddlewarePlan`; the backend combines applicable plan-driven settings with its native security stack.
 
 See [`../server.server/`](../server.server/).
 
-## Runtime model
+## Runtime Image execution
 
-Route sources are discovered and compiled during boot. The current active runtime still executes parsed/evaluated bodies rather than a final native AOT artifact. RELC's target is to link routes into the Runtime Image so normal requests do not reread route source from disk.
+Route sources are discovered/parsed during boot and linked as immutable `RouteFile` program snapshots in the Runtime Image. Normal HTTP execution does not reread the `.route` source on each request.
 
-## Cross-file example
+RELC also attempts native WebAssembly lowering for every route.
 
-A route should stay thin and delegate reusable logic:
+### Native subset today
+
+A Route can currently compile to native WASM when all of the following are true:
+
+- it has exactly one HTTP method;
+- it has no imports;
+- it has no helper functions;
+- the method body is exactly one `return` statement;
+- that returned expression is a static JSON literal/value.
+
+Example:
+
+```text
+class Route {
+    get(req) {
+        return { ok: true, version: 1 };
+    }
+}
+```
+
+The compiler emits deterministic WASM using the RBE output ABI and stores the artifact SHA-256 in the Runtime Image. Dynamic request expressions, helpers, imports, multiple methods, and other unsupported constructs are recorded with an explicit interpreter-fallback reason.
+
+The public HTTP dispatcher still retains the immutable REL evaluator path while native artifact dispatch coverage is expanded. “WASM artifact exists” and “this request is dispatched through WASM” are therefore intentionally documented as separate things.
+
+## Server status gate
+
+The active Runtime Image's `ServerStatus` is checked for normal requests:
+
+- `online` — normal traffic allowed.
+- `readonly` — GET/HEAD/OPTIONS allowed; mutating requests rejected.
+- `maintenance`, `draining`, `offline` — normal traffic returns service-unavailable behavior.
+
+Health/admin/maintenance control-plane routes are exempt so operators can inspect/recover the server.
+
+## Thin-route pattern
+
+Keep reusable logic in modules:
 
 ```text
 :import[module&users]
@@ -189,4 +159,4 @@ class Route {
 }
 ```
 
-For the imported file contract, see [`../x.module/`](../x.module/).
+See [`../x.module/`](../x.module/).

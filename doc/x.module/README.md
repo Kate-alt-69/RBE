@@ -1,27 +1,13 @@
 # `*.module` — Module REL
 
-Module REL is reusable in-process backend logic. Modules use the global REL grammar and are compiled/loaded as reusable programs owned by the RBE backend runtime.
+Module REL is reusable **in-process** backend logic. Module programs are linked into the Runtime Image and execute inside the backend rather than receiving their own Service process.
 
 ## Purpose
 
-Use `.module` for:
-
-- reusable functions
-- shared backend logic
-- request-independent helpers
-- controlled access to service calls
-- shared ENV access
-- future middleware stages
-- heavier logic that should not be repeated inside routes
-
-## Grammar
-
-Module REL receives the same higher-level grammar as the other REL source types. It is not a weaker language than Server REL.
-
-Modules may define arbitrary functions and exports:
+Use `.module` for reusable functions, validation/transformation logic, request-independent helpers, controlled Service calls, typed Runtime ENV access, and privileged module-scoped facilities such as Video Manager.
 
 ```text
-:import[json]
+:import[json, ENV]
 
 function normalize(value) {
     if (value == null) {
@@ -31,53 +17,29 @@ function normalize(value) {
 }
 
 export function find(value) {
-    return normalize(value);
+    return {
+        app: ENV.get("APP_NAME"),
+        value: normalize(value)
+    };
 }
 ```
 
 ## Imports
 
-Modules can import built-ins, other modules, and service interfaces where policy allows.
+Modules can import built-ins, other modules, and Service interfaces:
 
 ```text
 :import[json, time]
 :import[module&validation]
 :import[service:mail as mail]
+:import[service:search.find as lookup]
 ```
 
-The active engine already discovers and parses `.module` files, validates dependency graphs, exports functions, and resolves module-to-module references. Documentation that still labels the entire `.module` system as unimplemented is legacy and should not be treated as authoritative.
+RELC validates logical targets/capabilities, and the executable ModuleProgram validates requested exports/interfaces before the application becomes runnable.
 
-## Module-to-module dependencies
+## Module -> Service
 
-A file-level dependency cycle is not automatically an error in the target RELC architecture.
-
-```text
-A.module -> B.module -> D.module -> C.module -> A.module
-```
-
-RELC must inspect symbol-level dependencies. If `C` calls `A.FUNC_B` while the original path began in `A.FUNC_A`, there may be no recursive execution at all.
-
-Even a real recursive function graph is not automatically invalid; see [`../relc.md`](../relc.md).
-
-## ENV
-
-Module REL is a primary consumer of the shared Runtime ENV.
-
-Target import/surface:
-
-```text
-:import[ENV]
-
-export function appName() {
-    return ENV.require("APP_NAME");
-}
-```
-
-Runtime ENV is owned by the root RBE process and resolved from `settings.json` plus `server.server` defaults/policy. It should be typed rather than limited to strings.
-
-## Service calls
-
-Modules are the normal application-facing bridge to managed services.
+Module REL is the normal application-facing bridge to Service REL:
 
 ```text
 :import[service:mail as mail]
@@ -87,42 +49,78 @@ export async function sendWelcome(user) {
 }
 ```
 
-Service calls are asynchronous and should route through the central Service Runtime/Fabric rather than granting raw process-to-process authority.
+Service calls are routed through the central Service Runtime/Fabric rather than giving the module raw Service process addresses/tokens.
 
 See [`../x.service/`](../x.service/).
 
-## Future middleware role
+## Runtime ENV — implemented
 
-A module may eventually expose middleware lifecycle hooks through a reserved middleware class/contract. Module middleware executes in-process and should receive only the request/response capabilities granted by ServerPolicy.
-
-Target phases include concepts such as:
+Module REL can explicitly import the typed Runtime Image ENV snapshot:
 
 ```text
-beforeRoute
-afterRoute
-beforeResponse
-onError
+:import[ENV]
+
+export function region() {
+    return ENV.require("REGION");
+}
 ```
 
-The final syntax should use global REL grammar while keeping middleware semantics explicit and deterministic.
+Available accessors are `has`, `get`, `require`, `string`, `number`, `bool`, `object`, and `array`. Types are preserved from linked configuration.
+
+`ENV` is not a secret store and is not the process environment. Use Vault-backed capabilities for credentials.
+
+## Video Manager — Module-only privileged capability
+
+Video Manager is exposed to Module REL through explicit imports:
+
+```text
+:import[vm]
+:import[video-manager as media]
+:import[video-manager.status as videoStatus]
+```
+
+The legacy name `video` is intentionally rejected. Module ownership is used to scope asset/job access; language code does not receive raw media filesystem paths, arbitrary FFmpeg arguments, or raw network/process execution.
+
+See [`../video-manager.md`](../video-manager.md).
+
+## Module dependency graph
+
+RELC builds symbol-level dependency metadata and recursive groups. That model intentionally distinguishes a source import cycle from a true function recursion cycle.
+
+However, the current executable `ModuleProgram` compatibility validator still performs source-level module cycle detection while constructing runtime module state. Therefore:
+
+- ordinary function recursion is supported within runtime budgets;
+- symbol recursion metadata exists in the Runtime Image;
+- **cyclic module-import graphs should still be avoided today** because the compatibility validator can reject them during boot/runtime construction.
+
+This is one of the remaining areas where the RELC graph is ahead of the older execution compatibility layer.
 
 ## Embedded modules
 
-An embedded module in `server.server` is still Module REL:
+RELC can extract a Module REL block from `server.server`, register it with a virtual `SourceId`, parse it with Module REL rules, and include it in the Runtime Image:
 
 ```text
 [file-start:module.Auth]
 :import[ENV]
-export function verify(value) { ... }
+
+export function appName() {
+    return ENV.require("APP_NAME");
+}
 [file-end:module]
 ```
 
-It can import physical or embedded modules and is compiled through the same Module REL path. See [`../server.server/`](../server.server/).
+Physical and embedded modules share the same logical namespace. Duplicate logical targets are rejected.
 
 ## Runtime ownership
 
-Modules execute in the backend process, unlike `.service` programs which execute in managed child processes. That distinction affects resource isolation, IPC, restart policy, and failure containment even though both file types share REL grammar.
+Module executable programs are stored in the immutable Runtime Image and ModuleProgram can be constructed from those linked snapshots. Normal request-time module resolution therefore does not need to reopen the module source file.
 
-## Capability direction
+This is a different isolation model from `.service`: a module failure remains in the backend execution domain, while a Service worker has its own process lifecycle, resource boundary, restart policy, and IPC.
 
-The exact capability list evolves with implementation, but the design rule is stable: a capability must be explicitly exposed to Module REL and validated by RELC. Shared grammar never becomes an ambient host escape hatch.
+## Middleware status
+
+Reusable application logic can live in Module REL, but a general user-defined Module middleware lifecycle (`beforeRoute`, `afterRoute`, etc.) is not a completed runtime contract yet. Native server middleware is configured through `server.server`/`MiddlewarePlan` today.
+
+## Capability rule
+
+The exact built-in operation set evolves, but the rule does not: a host capability must be explicitly importable by Module REL and enforced by the compiler/runtime. Common REL grammar never grants ambient host authority.

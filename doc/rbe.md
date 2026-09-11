@@ -1,19 +1,17 @@
 # RBE
 
-RBE is a Rust backend engine designed to run backend applications through a controlled runtime rather than by exposing an unrestricted general-purpose JavaScript/TypeScript process.
+RBE is a Rust backend engine built around a controlled application runtime instead of an unrestricted general-purpose JavaScript/TypeScript host. Application code is written in **REL — Runtime Engine Language** and linked by **RELC — Runtime Engine Language Compiler** into an immutable **Runtime Image** during boot.
 
-RBE is built around four REL source types:
+RBE currently recognizes four REL source roles:
 
-- `*.route` — HTTP entrypoints.
+- `*.route` — HTTP entrypoints and request/response logic.
 - `*.module` — reusable in-process backend logic.
-- `*.service` — isolated service programs managed by the Service Runtime/Fabric.
-- `server.server` — root server composition, policy, middleware, ENV defaults, forced settings, and embedded REL files.
+- `*.service` — isolated programs managed by the Service Runtime/Fabric.
+- `server.server` — root server composition, policy, Runtime ENV defaults/FORCE values, middleware selection, and embedded REL sources.
 
-The language used by these files is **REL — Runtime Engine Language**. The compiler is **RELC — Runtime Engine Language Compiler**.
+## What RBE does today
 
-## What RBE is trying to become
-
-RBE's target architecture is a backend runtime where source is discovered and compiled at boot into a validated **Runtime Image**. The running process then executes that image instead of repeatedly depending on source files being present on disk.
+Normal boot builds one application image from the server root, discovered physical REL files, embedded REL blocks, the validated Service catalog, and typed settings.
 
 ```text
 settings.json
@@ -25,47 +23,94 @@ service/**/*.service
         v
        RELC
         |
+        +-- source/import/capability validation
+        +-- symbol + dependency graph
+        +-- Runtime ENV resolution
+        +-- ServerPolicy resolution
+        +-- MiddlewarePlan lowering
+        +-- route WASM compilation where supported
+        |
         v
    Runtime Image
         |
-        v
-     RBE Engine
+        +-- HTTP/Route runtime
+        +-- Module runtime
+        +-- Service Runtime/Fabric
+        +-- Container execution runtime
 ```
 
-This gives RBE a place to enforce capability boundaries, middleware policy, service isolation, resource limits, dependency analysis, deterministic configuration, and runtime safety before requests are accepted.
+The backend then builds Route/Module execution from the image snapshot rather than reopening mutable `.route`/`.module` source on every request. Service activation also rechecks the parent-validated Service source fingerprint before a child is trusted.
 
-## Why the source types stay separate
+## Why the source roles remain separate
 
-The source types are intentionally individual because their jobs are different.
+REL grammar is shared, but runtime authority is not:
 
-- Route REL owns HTTP request/response entrypoints.
-- Module REL owns reusable code that runs in the backend process.
-- Service REL owns code that executes through managed service processes.
-- Server REL owns whole-server composition and policy.
+- Route REL owns HTTP handlers but cannot control the listener or directly call Service REL.
+- Module REL owns reusable in-process exports and is the normal bridge to managed services and privileged module-only facilities such as Video Manager.
+- Service REL owns process lifecycle, process-local memory, Service Fabric calls, and Service-only facilities such as `quickDB`.
+- Server REL owns whole-server policy, Runtime ENV defaults/FORCE values, native middleware configuration, server status, and embedded source composition.
 
-They share REL grammar, but they do **not** share every capability or lifecycle.
+See [`compatibility.md`](compatibility.md) for the current matrix.
 
-## Global grammar, scoped functionality
+## Runtime Image ownership
 
-A higher-level grammar feature belongs to REL globally. If REL gains richer functions, conditions, classes, structured expressions, pattern matching, recursion syntax, or another language construct, all source types should be able to use that grammar where the construct makes semantic sense.
+The Runtime Image is the authoritative linked application snapshot. It currently includes:
 
-What differs is functionality. For example:
+```text
+imageId / sourceHash
+ServerPolicy
+typed RuntimeEnv
+route/module/service source identities
+immutable executable REL program snapshots
+symbol table + dependency graph + recursive groups
+MiddlewarePlan
+service assignments
+capability metadata
+native route-WASM artifacts
+explicit route interpreter-fallback reasons
+```
 
-- `.route` can define HTTP handlers but cannot manage the server listener.
-- `.module` can expose reusable functions but does not own service process lifecycle.
-- `.service` can define `class Service` lifecycle behavior but does not own server CORS policy.
-- `server.server` can force server policy and embed other REL files, but an embedded module is still governed by Module REL capabilities.
+`RuntimeImageSlot` supports immutable snapshots and atomic image replacement. Full automatic source watching/hot-reload orchestration is still separate work; the slot itself is already transactional.
 
-See [`compatibility.md`](compatibility.md).
+## Process isolation
 
-## Runtime ownership
+RBE deliberately splits authority across processes rather than putting every subsystem into `backend.exe`:
 
-The root RBE process (the Mother/Grandmother runtime) owns the authoritative application image and shared public runtime configuration. Public ENV values from `settings.json` and fallback/default values from `server.server` are resolved into a runtime-owned environment snapshot that authorized REL sources can read.
+- `backend` owns HTTP, the active Runtime Image, shared state, and top-level supervision.
+- `service`/`service.exe` is a separately linked canonical Service executable. One Mother process supervises separate Service REL worker processes.
+- `container`/`container.exe` is a standalone execution service. Its Controller launches persistent per-Environment child processes, which in turn launch disposable WASM workers for untrusted execution.
+- Vault uses a supervised child process boundary.
+- Error Reporter/CONTROL ER participates in bounded crash-recovery decisions without taking arbitrary spawn authority away from the owning supervisors.
 
-"Public" here means shared within the REL backend runtime. It does not mean automatically exposed over HTTP.
+See [`runtime.md`](runtime.md).
+
+## Configuration and policy
+
+`settings.json` remains the operator/deployment configuration input, but it is no longer the only policy layer. Server REL is resolved with explicit precedence:
+
+```text
+built-in defaults
+    < normal server.server values
+    < settings.json overlays
+    < server.server FORCE values
+```
+
+Hard engine safety ceilings remain above all of those and cannot be forced away.
+
+Typed Runtime ENV uses the same basic precedence model and remains JSON typed. It is not the operating-system process environment and is not a secret store. Credentials belong in Vault.
+
+## Native route compilation
+
+RELC now contains a real `.route -> WebAssembly` compiler for a deliberately small native subset. At present, a route can compile natively when it has exactly one HTTP method, no imports/helper functions, and returns one static JSON-literal value. Unsupported/dynamic routes are recorded as **explicit interpreter fallbacks** rather than being mislabeled as WASM.
+
+The artifact bytes, SHA-256, ABI/compiler versions, and fallback reason are pinned into the Runtime Image. The current HTTP route execution path still retains the immutable REL evaluator path while native dispatch coverage is expanded.
+
+## Reliability and operations
+
+RBE now includes bounded supervision/recovery for critical children, a separate Container runtime with durable artifact/execution metadata, service restart policies, server status gating, and an authenticated loopback Control Room. The Control Room is intentionally served on a separate loopback listener rather than exposed directly on the public API listener.
 
 ## Is RBE worth using?
 
-RBE is useful when the project benefits from a backend runtime with strong control over what application code can access and how the server is assembled. Its value comes from integration: compiler diagnostics, explicit capabilities, service isolation, native middleware, runtime images, resource control, and a backend-specific language/runtime designed together.
+RBE is useful when a project benefits from explicit backend authority boundaries instead of giving application code ambient host access. Its main value is the integration of language/compiler rules, policy resolution, process isolation, native middleware, service supervision, sandbox execution, media infrastructure, and security controls into one runtime contract.
 
-RBE is still evolving. Some parts are implemented today while others in these docs are the target contract being built. Every reference page marks planned features instead of pretending parser support equals finished runtime behavior.
+It is still evolving. The docs in this directory call out partial areas—especially full route-to-WASM coverage, complete plan-controlled middleware behavior, source-less sealed Runtime Images, multi-instance Service REL, and stronger platform-specific Container isolation—without pretending they are finished.

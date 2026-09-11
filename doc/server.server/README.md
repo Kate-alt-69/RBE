@@ -1,33 +1,23 @@
 # `server.server` — Server REL
 
-`server.server` is the root Server REL composition and policy file. It uses the same global REL grammar as every other REL source type, but it owns server-only functionality.
+`server.server` is the root Server REL composition and policy source. It shares common REL function/expression grammar with the other source roles, but it owns server-wide authority that Route/Module/Service REL do not receive.
 
-## Server-only responsibilities
+## Current responsibilities
 
-Server REL may configure or define:
+Server REL currently participates in:
 
-- server status and lifecycle policy
-- listener host/port
-- request/body/time limits
-- CORS
-- native middleware
-- compression
-- security headers / CSP / HSTS
-- proxy/trusted-forwarding policy
-- rate limiting and IP-ban policy
-- service-runtime requirements
-- runtime recursion/deadlock policy
-- environment defaults
-- forced/locked settings
-- environment/profile blocks
-- embedded REL files
-- server helper functions
+- server status;
+- listener host/port policy;
+- request/body/time limits;
+- typed Runtime ENV defaults and FORCE values;
+- native middleware ordering/configuration;
+- CORS/security/CSP policy inputs;
+- recursion/runtime safety budgets;
+- settings precedence/locks;
+- embedded Route/Module/Service REL blocks;
+- Server helper functions and imports used by the Server source itself.
 
-A `.route`, `.module`, or `.service` file does not gain these server-control capabilities merely because it shares REL grammar.
-
-## Implemented structural syntax
-
-The first `server.server` parser/compiler front-end is implemented. The root shape is:
+## Root syntax
 
 ```text
 :import[json]
@@ -48,21 +38,14 @@ server Main {
 
     middleware {
         correlationId;
-        realIp;
-
-        json {
-            limit 2mb;
-            strict true;
-        }
-    }
-
-    function helper(value) {
-        return value;
+        json { limit 2mb; strict true; }
+        compression { algorithms [br, gzip]; threshold 1kb; }
+        errorHandler;
     }
 }
 ```
 
-Server policy entries currently have four structural forms:
+Policy entries support:
 
 ```text
 name;
@@ -71,93 +54,71 @@ name { ... }
 force name value;
 ```
 
-A FORCE block is also accepted:
+and nested FORCE blocks:
 
 ```text
 force {
-    timeout 30s;
-    listener {
-        port 7044;
-    }
+    requestTimeoutMs 30s;
+    listener { port 7044; }
 }
 ```
 
-FORCE propagates into nested entries in that block. This records lock intent only; final FORCE precedence against `settings.json` belongs to the later `ServerPolicy` resolution pass.
+Structural values include strings, numbers, booleans, null, identifiers, attached-unit quantities such as `2mb`/`30s`, and arrays.
 
-Supported structural values are:
+## Policy precedence — implemented
 
-```text
-"string"
-123
-true
-false
-null
-identifier
-2mb
-30s
-[br, gzip, zstd]
-```
+Server policy is no longer just parser metadata. RELC resolves it before Runtime Image activation.
 
-Quantity units must be attached to their number (`2mb`, not `2 mb`). Unit interpretation and per-setting range validation happen in later typed policy lowering.
-
-The parser does not duplicate common REL function/import grammar. Leading `:import[...]` declarations and Server REL helper functions are parsed through the shared REL parser, so adding grammar to the common function/import grammar does not require a Server-only copy.
-
-Current semantic checks already include:
-
-- only one root `server NAME { ... }` declaration per compiled source
-- duplicate Server helper function rejection
-- known server status validation (`online`, `maintenance`, `draining`, `readonly`, `offline`)
-- `listener`, `env`, and `middleware` block-shape validation
-- duplicate Runtime ENV default rejection inside one `env` block
-- Runtime ENV defaults must have values rather than bare flags/nested blocks
-
-## Configuration precedence
-
-Target precedence:
+Current precedence is:
 
 ```text
-RBE hard safety invariants
-        |
-server.server FORCE declarations
-        |
-settings.json deployment/operator values
-        |
-normal server.server defaults
-        |
 RBE built-in defaults
+    < normal server.server values
+    < supported settings.json overlays
+    < server.server FORCE values
+    < non-disableable engine safety ceilings
 ```
 
-`force` is intended to lock a server policy value against a conflicting `settings.json` value. It cannot disable a hard engine safety invariant.
+Current built-in policy defaults include an `online` server, `127.0.0.1:8080`, a 30-second request timeout, a 10 MiB body limit, and bounded recursion/invocation budgets.
 
-The parser now records whether a setting is forced. The precedence algorithm itself is intentionally not implemented in the parser; it belongs to the later typed `ServerPolicy` resolution stage.
+Current hard ceilings include a 1 GiB request-body maximum, recursion depth 1024, repeated-symbol depth 512, and 10,000,000 operations per invocation. FORCE cannot disable those ceilings.
 
-## Public runtime ENV
+Not every arbitrary `settings.json` field is a ServerPolicy overlay. RELC currently maps the supported API/security policy inputs such as listener host/port, request timeout/body size, trusted proxy behavior, CORS origins, JSON payload limit, and CSP.
 
-`settings.json` may provide shared public runtime values. Server REL may provide a value when settings did not set it.
+## Typed Runtime ENV — implemented
+
+The `env` block contributes typed Runtime Image configuration:
 
 ```text
 server Main {
     env {
         APP_NAME "RBE";
-        REGION local;
+        DEBUG false;
         SESSION_TTL 86400;
+    }
+
+    force env {
+        REGION "production";
     }
 }
 ```
 
-Settings values win over normal Server REL ENV defaults. Forced values may be introduced where policy requires them.
+Runtime ENV precedence is:
 
-Public ENV means readable by authorized backend REL code; it is not automatically exposed to HTTP clients.
+```text
+built-ins
+    < normal server.server env defaults
+    < settings.json runtimeEnv
+    < forced server.server env values
+```
 
-The structural `env` block is now parsed and validated. Runtime ENV construction/merging is the next RELC stage.
+Values remain JSON typed; they are not flattened into OS-style strings. Authorized Module/Service/Server REL reads the linked snapshot via `ENV`. Route REL is denied `ENV` by default.
 
-See [`../rel.md`](../rel.md) for `ENV` access and [`../compatibility.md`](../compatibility.md) for which source types may read it.
+Secrets do not belong here; use Vault.
 
-## Native middleware
+## Native MiddlewarePlan — implemented
 
-Server REL is the intended place to compile native Rust middleware into a deterministic `MiddlewarePlan`.
-
-Target built-ins include:
+RELC lowers the declared `middleware` block to a deterministic ordered `MiddlewarePlan`. Current recognized names are:
 
 ```text
 correlationId
@@ -185,129 +146,90 @@ auth
 errorHandler
 ```
 
-The structural middleware syntax is now implemented:
+The compiler rejects unknown stages, duplicate stages, and `errorHandler` when it is not the final stage. Middleware-specific validation also checks values such as byte-size limits, compression algorithms, and boolean CORS options.
 
-```text
-server Main {
-    middleware {
-        correlationId;
-        realIp;
-        requestTiming;
+### What the active runtime currently materializes
 
-        json {
-            limit 2mb;
-            strict true;
-        }
+Plan lowering and full runtime behavior are separate layers. Current boot/runtime wiring directly applies plan values for:
 
-        cors {
-            enabled true;
-            credentials true;
-        }
+- `json.limit`;
+- request `timeout`;
+- disabling CORS through `cors.enabled false`;
+- API rate-limit window/request count;
+- IP-ban threshold/window/duration;
+- CSP policy;
+- enabling the native compression layer when `compression` is present.
 
-        compression {
-            threshold 1kb;
-            algorithms [br, gzip, zstd];
-        }
+RBE also has an always-installed native security/request stack for request metrics, status gating, request timing, IP-ban checks, correlation IDs, tracing, global/API rate limits, body limits, security headers, CORS, and request timeout. Some recognized MiddlewarePlan stages therefore still need finer plan-controlled enable/disable/options wiring before the plan alone describes every installed HTTP layer.
 
-        securityHeaders;
-        rateLimit;
-    }
-}
-```
+## Server status — active
 
-This front-end preserves middleware declaration order. Lowering these declarations to native Rust middleware and validating middleware-specific options belongs to the later `MiddlewarePlan` pass.
-
-## Server status
-
-Implemented states are:
+Supported states are:
 
 ```text
 online
+readonly
 maintenance
 draining
-readonly
 offline
 ```
 
-Status policy may later define route exceptions and responses, for example allowing health/admin endpoints during maintenance while rejecting normal traffic.
+The active Runtime Image status gates normal HTTP requests:
 
-## Server functions
+- `online` allows normal traffic;
+- `readonly` allows GET/HEAD/OPTIONS and rejects mutating requests;
+- `maintenance`, `draining`, and `offline` reject normal traffic with service-unavailable behavior.
 
-Server REL may contain normal REL helper functions. Higher-level grammar is not exclusive to Server REL; the difference is that these helpers can participate in Server REL policy/configuration evaluation.
+Health/admin/maintenance control-plane paths remain reachable so the server can be inspected/recovered.
 
-A helper is not automatically global to every file. Reusable application code should live in a `.module` or an embedded Module REL file.
+## Recursion policy
 
-The current Server REL front-end deliberately delegates helper-function parsing to the same parser used for common REL functions instead of maintaining a separate Server-only function grammar.
+ServerPolicy carries runtime recursion limits used by the REL invocation tracker:
 
-## Embedded literal REL files
+```text
+recursion.maxDepth
+recursion.repeatedSymbolDepth
+recursion.operationBudget
+```
 
-`server.server` may contain complete literal sources.
+The current defaults are bounded and the hard ceilings above remain non-disableable.
+
+## Embedded REL files — implemented
+
+RELC extracts embedded blocks **before** compiling the remaining Server REL source:
 
 ```text
 [file-start:module.Auth]
 :import[ENV]
-
 export function appName() {
-    return ENV.get("APP_NAME");
+    return ENV.require("APP_NAME");
 }
 [file-end:module]
 ```
 
-Planned forms:
+Supported source roles are Route, Module, and Service. Embedded routes can carry route metadata such as `path`.
 
-```text
-[file-start:module.NAME]
-[file-end:module]
+After extraction, each block is registered with a virtual `SourceId` and compiled according to its own role. An embedded Module therefore receives Module capabilities, not Server capabilities.
 
-[file-start:route.NAME path="/health"]
-[file-end:route]
+Physical and embedded sources share one logical namespace. Duplicate logical identities are rejected instead of silently overriding one another.
 
-[file-start:service.NAME]
-[file-end:service]
-```
+## Server helpers
 
-RELC will extract each block **before** normal Server REL parsing. The contents are then registered in `RelSourceRegistry` and compiled by their own source-role path with the same capability rules as physical files.
+Server REL helper functions use the common REL function parser rather than a separate Server-only programming language. They remain local to the Server source; reusable application logic belongs in Module REL.
 
-Embedded extraction is not implemented yet, so literal blocks are not currently accepted by `compile_server_source`. This is deliberate ordering rather than a separate grammar restriction.
+Do not infer that an arbitrary helper can mutate every resolved policy value at runtime: policy/ENV/middleware are linked during RELC compilation and the Runtime Image is immutable after activation.
 
-Embedded sources may import each other. Dependencies are resolved by SourceId/symbol identity, not by deciding that one literal block must be fully compiled first.
+## Runtime Image ownership
 
-See [`../relc.md`](../relc.md).
+The resolved ServerPolicy, RuntimeEnv, MiddlewarePlan, Server executable snapshot, and embedded source metadata are stored in the Runtime Image. `settings.json` and `server.server` remain boot/deployment inputs rather than mutable per-request authority.
 
-## Duplicate identity
+See [`../relc.md`](../relc.md) and [`../source-security.md`](../source-security.md).
 
-If a physical source and embedded source claim the same logical identity, RELC now rejects the collision in `RelSourceRegistry` rather than silently choosing one.
+## Remaining work
 
-Example:
+Important incomplete pieces include:
 
-```text
-module/Auth.module
-server:Main#module:Auth
-```
-
-Both identify the logical Module REL target `Auth`, so they cannot coexist without a future explicit override mechanism.
-
-## Current implementation status
-
-Implemented now:
-
-- RELC source identity/registry foundation
-- root `server NAME { ... }` structural parser
-- shared REL import parsing for Server REL
-- shared REL helper-function parsing for Server REL
-- nested policy/config blocks
-- flags, scalar values, quantities, arrays
-- FORCE intent recording and FORCE blocks
-- server-status validation
-- structural `listener`, `env`, and `middleware` validation
-
-Still subsequent stages:
-
-- Runtime ENV construction and merge rules
-- embedded `[file-start:*]` extraction
-- typed `ServerPolicy`
-- FORCE precedence resolution against `settings.json`
-- native `MiddlewarePlan` lowering
-- Runtime Image linking/reload
-
-Existing `settings.json` remains the active runtime configuration source until those later Server REL stages are connected to boot/runtime activation.
+- complete plan-driven control for every recognized middleware stage;
+- richer Server helper/policy evaluation where deliberately designed;
+- complete hot-reload/watch orchestration around `RuntimeImageSlot`;
+- persistent signed source-less Runtime Image deployment.
