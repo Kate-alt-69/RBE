@@ -12,6 +12,13 @@ pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EXECUTION_INPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_EXECUTION_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CAPABILITY_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+/// Shared manifest-shape ceilings. These values are part of the capability
+/// control-plane contract: producers must fail before registration rather than
+/// constructing manifests the Controller is guaranteed to reject.
+pub const MAX_CAPABILITY_GRANTS_PER_MANIFEST: usize = 128;
+pub const MAX_CAPABILITY_OPERATIONS_PER_GRANT: usize = 64;
+pub const MAX_CAPABILITY_TARGET_BYTES: usize = 256;
+pub const MAX_CAPABILITY_OPERATION_BYTES: usize = 128;
 pub const MAX_HOST_CAPABILITY_FRAME_BYTES: usize = MAX_CAPABILITY_PAYLOAD_BYTES + 64 * 1024;
 pub const MAX_AWAIT_RESULT_MS: u64 = 30_000;
 pub const MAX_WORKER_ERROR_BYTES: usize = 64 * 1024;

@@ -8,8 +8,8 @@ use core_lib::{
 };
 use ipc_protocol::{
     CapabilityKind, HostCapabilityRequest, HostCapabilityResponse, CAPABILITY_ABI_VERSION,
-    HOST_CAPABILITY_PROTOCOL_VERSION, MAX_CAPABILITY_PAYLOAD_BYTES,
-    MAX_HOST_CAPABILITY_FRAME_BYTES,
+    HOST_CAPABILITY_PROTOCOL_VERSION, MAX_CAPABILITY_OPERATION_BYTES, MAX_CAPABILITY_PAYLOAD_BYTES,
+    MAX_CAPABILITY_TARGET_BYTES, MAX_HOST_CAPABILITY_FRAME_BYTES,
 };
 use rand::RngCore;
 use serde::de::DeserializeOwned;
@@ -26,7 +26,6 @@ use tokio::task::JoinHandle;
 const HOST_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IN_FLIGHT: usize = 64;
 const MAX_EXECUTION_ID_BYTES: usize = 128;
-const MAX_LOGICAL_NAME_BYTES: usize = 256;
 const MAX_SOURCE_ID_BYTES: usize = 512;
 
 #[derive(Clone)]
@@ -342,7 +341,7 @@ async fn dispatch_request(
             "invalid logical service target",
         );
     };
-    if !valid_logical_name(&request.operation) {
+    if !valid_logical_name(&request.operation, MAX_CAPABILITY_OPERATION_BYTES) {
         return error(
             "CAPABILITY_HOST_INVALID_OPERATION",
             "invalid logical service operation",
@@ -436,18 +435,28 @@ fn valid_environment_identity(value: &str) -> bool {
 }
 
 fn normalize_video_target(target: &str) -> Option<&str> {
+    if target.len() > MAX_CAPABILITY_TARGET_BYTES {
+        return None;
+    }
     let owner = target.strip_prefix(VIDEO_CAPABILITY_TARGET_PREFIX)?;
-    valid_logical_name(owner).then_some(owner)
+    valid_logical_name(
+        owner,
+        MAX_CAPABILITY_TARGET_BYTES.saturating_sub(VIDEO_CAPABILITY_TARGET_PREFIX.len()),
+    )
+    .then_some(owner)
 }
 
 fn normalize_service_target(target: &str) -> Option<&str> {
+    if target.len() > MAX_CAPABILITY_TARGET_BYTES {
+        return None;
+    }
     let service = target.strip_prefix(SERVICE_CAPABILITY_TARGET_PREFIX)?;
     service_capability_name_allowed(service).then_some(service)
 }
 
-fn valid_logical_name(value: &str) -> bool {
+fn valid_logical_name(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
-        && value.len() <= MAX_LOGICAL_NAME_BYTES
+        && value.len() <= max_bytes
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
@@ -583,6 +592,28 @@ mod tests {
         assert_eq!(normalize_service_target("mail"), None);
         assert_eq!(normalize_service_target("../mail"), None);
         assert_eq!(normalize_service_target("service:mail/socket"), None);
+    }
+
+    #[test]
+    fn trusted_host_adapter_uses_shared_capability_size_limits() {
+        let max_video_owner = "x".repeat(
+            MAX_CAPABILITY_TARGET_BYTES.saturating_sub(VIDEO_CAPABILITY_TARGET_PREFIX.len()),
+        );
+        let max_video_target = format!("{VIDEO_CAPABILITY_TARGET_PREFIX}{max_video_owner}");
+        assert_eq!(
+            normalize_video_target(&max_video_target),
+            Some(max_video_owner.as_str())
+        );
+        assert!(normalize_video_target(&format!("{max_video_target}x")).is_none());
+
+        assert!(valid_logical_name(
+            &"x".repeat(MAX_CAPABILITY_OPERATION_BYTES),
+            MAX_CAPABILITY_OPERATION_BYTES,
+        ));
+        assert!(!valid_logical_name(
+            &"x".repeat(MAX_CAPABILITY_OPERATION_BYTES + 1),
+            MAX_CAPABILITY_OPERATION_BYTES,
+        ));
     }
 
     #[test]

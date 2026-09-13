@@ -3,14 +3,11 @@ use std::sync::RwLock;
 
 use ipc_protocol::{
     CapabilityGrant, CapabilityKind, RegisterCapabilityManifestRequest, CAPABILITY_ABI_VERSION,
-    MAX_CAPABILITY_PAYLOAD_BYTES,
+    MAX_CAPABILITY_GRANTS_PER_MANIFEST, MAX_CAPABILITY_OPERATIONS_PER_GRANT,
+    MAX_CAPABILITY_OPERATION_BYTES, MAX_CAPABILITY_PAYLOAD_BYTES, MAX_CAPABILITY_TARGET_BYTES,
 };
 
-const MAX_GRANTS_PER_SOURCE: usize = 128;
-const MAX_OPERATIONS_PER_GRANT: usize = 64;
 const MAX_SOURCE_ID_BYTES: usize = 512;
-const MAX_TARGET_BYTES: usize = 256;
-const MAX_OPERATION_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ManifestKey {
@@ -108,11 +105,11 @@ impl CapabilityBroker {
                 ),
             });
         }
-        if request.grants.len() > MAX_GRANTS_PER_SOURCE {
+        if request.grants.len() > MAX_CAPABILITY_GRANTS_PER_MANIFEST {
             return Err(CapabilityError {
                 code: "CAPABILITY_MANIFEST_TOO_LARGE",
                 message: format!(
-                    "capability manifest contains {} grants; maximum is {MAX_GRANTS_PER_SOURCE}",
+                    "capability manifest contains {} grants; maximum is {MAX_CAPABILITY_GRANTS_PER_MANIFEST}",
                     request.grants.len()
                 ),
             });
@@ -363,11 +360,11 @@ impl CapabilityBroker {
 
 fn validate_grant(grant: &CapabilityGrant, debug_enabled: bool) -> Result<(), CapabilityError> {
     validate_target(&grant.target)?;
-    if grant.operations.is_empty() || grant.operations.len() > MAX_OPERATIONS_PER_GRANT {
+    if grant.operations.is_empty() || grant.operations.len() > MAX_CAPABILITY_OPERATIONS_PER_GRANT {
         return Err(CapabilityError {
             code: "CAPABILITY_GRANT_INVALID",
             message: format!(
-                "capability grant must contain 1..={MAX_OPERATIONS_PER_GRANT} operations"
+                "capability grant must contain 1..={MAX_CAPABILITY_OPERATIONS_PER_GRANT} operations"
             ),
         });
     }
@@ -453,7 +450,7 @@ fn validate_environment(value: &str) -> Result<(), CapabilityError> {
 
 fn validate_target(value: &str) -> Result<(), CapabilityError> {
     if value.is_empty()
-        || value.len() > MAX_TARGET_BYTES
+        || value.len() > MAX_CAPABILITY_TARGET_BYTES
         || value.contains('*')
         || value.contains('\0')
         || value.chars().any(char::is_control)
@@ -469,7 +466,7 @@ fn validate_target(value: &str) -> Result<(), CapabilityError> {
 
 fn validate_operation(value: &str) -> Result<(), CapabilityError> {
     if value.is_empty()
-        || value.len() > MAX_OPERATION_BYTES
+        || value.len() > MAX_CAPABILITY_OPERATION_BYTES
         || value.contains('*')
         || !value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
@@ -527,6 +524,60 @@ mod tests {
             operation,
             request_bytes: bytes,
         }
+    }
+
+    #[test]
+    fn shared_manifest_shape_limits_are_enforced() {
+        let broker = CapabilityBroker::new(false);
+
+        let mut too_many_operations = service_grant();
+        too_many_operations.operations = (0..=MAX_CAPABILITY_OPERATIONS_PER_GRANT)
+            .map(|index| format!("op{index}"))
+            .collect();
+        assert_eq!(
+            broker
+                .register_manifest(&request(vec![too_many_operations]), 4)
+                .unwrap_err()
+                .code,
+            "CAPABILITY_GRANT_INVALID"
+        );
+
+        let mut long_target = service_grant();
+        long_target.target = "x".repeat(MAX_CAPABILITY_TARGET_BYTES + 1);
+        assert_eq!(
+            broker
+                .register_manifest(&request(vec![long_target]), 4)
+                .unwrap_err()
+                .code,
+            "CAPABILITY_GRANT_INVALID"
+        );
+
+        let mut long_operation = service_grant();
+        long_operation.operations = vec!["x".repeat(MAX_CAPABILITY_OPERATION_BYTES + 1)];
+        assert_eq!(
+            broker
+                .register_manifest(&request(vec![long_operation]), 4)
+                .unwrap_err()
+                .code,
+            "CAPABILITY_GRANT_INVALID"
+        );
+
+        let too_many_grants = (0..=MAX_CAPABILITY_GRANTS_PER_MANIFEST)
+            .map(|index| CapabilityGrant {
+                kind: CapabilityKind::Service,
+                target: format!("service:svc{index}"),
+                operations: vec!["call".into()],
+                max_request_bytes: 1024,
+                max_response_bytes: 4096,
+            })
+            .collect();
+        assert_eq!(
+            broker
+                .register_manifest(&request(too_many_grants), 4)
+                .unwrap_err()
+                .code,
+            "CAPABILITY_MANIFEST_TOO_LARGE"
+        );
     }
 
     #[test]

@@ -5,7 +5,9 @@ use std::sync::{Arc, RwLock};
 
 use core_lib::{
     video_language_operation_allowed, ContainerCapabilityGrant, ContainerCapabilityKind,
-    CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES, PUBLIC_HTTP_TARGET, VIDEO_CAPABILITY_TARGET_PREFIX,
+    CONTAINER_MAX_CAPABILITY_GRANTS_PER_MANIFEST, CONTAINER_MAX_CAPABILITY_OPERATIONS_PER_GRANT,
+    CONTAINER_MAX_CAPABILITY_OPERATION_BYTES, CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES,
+    CONTAINER_MAX_CAPABILITY_TARGET_BYTES, PUBLIC_HTTP_TARGET, VIDEO_CAPABILITY_TARGET_PREFIX,
 };
 use service_runtime::{service_capability_name_allowed, SERVICE_CAPABILITY_TARGET_PREFIX};
 use sha2::{Digest, Sha256};
@@ -136,12 +138,60 @@ fn lower_container_grants(
             max_response_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
         });
     }
+    validate_lowered_grant_shape(&grants)?;
     Ok(grants)
+}
+
+fn validate_lowered_grant_shape(
+    grants: &[ContainerCapabilityGrant],
+) -> Result<(), RuntimeCapabilityLoweringError> {
+    if grants.len() > CONTAINER_MAX_CAPABILITY_GRANTS_PER_MANIFEST {
+        return Err(RuntimeCapabilityLoweringError {
+            message: format!(
+                "lowered capability manifest contains {} grants; Controller permits at most {}",
+                grants.len(),
+                CONTAINER_MAX_CAPABILITY_GRANTS_PER_MANIFEST
+            ),
+        });
+    }
+    for grant in grants {
+        if grant.target.is_empty() || grant.target.len() > CONTAINER_MAX_CAPABILITY_TARGET_BYTES {
+            return Err(RuntimeCapabilityLoweringError {
+                message: format!(
+                    "lowered capability target {:?} exceeds the Controller target ceiling of {} bytes",
+                    grant.target, CONTAINER_MAX_CAPABILITY_TARGET_BYTES
+                ),
+            });
+        }
+        if grant.operations.is_empty()
+            || grant.operations.len() > CONTAINER_MAX_CAPABILITY_OPERATIONS_PER_GRANT
+        {
+            return Err(RuntimeCapabilityLoweringError {
+                message: format!(
+                    "lowered capability grant {:?} contains {} operations; Controller permits 1..={} operations",
+                    grant.target,
+                    grant.operations.len(),
+                    CONTAINER_MAX_CAPABILITY_OPERATIONS_PER_GRANT
+                ),
+            });
+        }
+        if let Some(operation) = grant.operations.iter().find(|operation| {
+            operation.is_empty() || operation.len() > CONTAINER_MAX_CAPABILITY_OPERATION_BYTES
+        }) {
+            return Err(RuntimeCapabilityLoweringError {
+                message: format!(
+                    "lowered capability operation {operation:?} exceeds the Controller operation ceiling of {} bytes",
+                    CONTAINER_MAX_CAPABILITY_OPERATION_BYTES
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn valid_service_operation(operation: &str) -> bool {
     !operation.is_empty()
-        && operation.len() <= 128
+        && operation.len() <= CONTAINER_MAX_CAPABILITY_OPERATION_BYTES
         && operation
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
@@ -149,7 +199,9 @@ fn valid_service_operation(operation: &str) -> bool {
 
 fn valid_video_owner(owner: &str) -> bool {
     !owner.is_empty()
-        && owner.len() <= 249
+        && owner.len()
+            <= CONTAINER_MAX_CAPABILITY_TARGET_BYTES
+                .saturating_sub(VIDEO_CAPABILITY_TARGET_PREFIX.len())
         && owner
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
@@ -494,6 +546,43 @@ mod tests {
         ] {
             assert!(lower_container_grants(&BTreeSet::from([requirement])).is_err());
         }
+    }
+
+    #[test]
+    fn compiler_rejects_manifest_shapes_above_shared_controller_limits() {
+        let too_many_operations = (0..=CONTAINER_MAX_CAPABILITY_OPERATIONS_PER_GRANT)
+            .map(|index| RuntimeCapabilityRequirement::Service {
+                service: "bulk".into(),
+                operation: format!("op{index}"),
+            })
+            .collect::<BTreeSet<_>>();
+        let error = lower_container_grants(&too_many_operations)
+            .expect_err("compiler must reject a grant Controller cannot register");
+        assert!(error.message.contains("operations"));
+
+        let too_many_grants = (0..=CONTAINER_MAX_CAPABILITY_GRANTS_PER_MANIFEST)
+            .map(|index| RuntimeCapabilityRequirement::Service {
+                service: format!("svc{index}"),
+                operation: "call".into(),
+            })
+            .collect::<BTreeSet<_>>();
+        let error = lower_container_grants(&too_many_grants)
+            .expect_err("compiler must reject a manifest Controller cannot register");
+        assert!(error.message.contains("grants"));
+
+        let long_operation = RuntimeCapabilityRequirement::Service {
+            service: "mail".into(),
+            operation: "x".repeat(CONTAINER_MAX_CAPABILITY_OPERATION_BYTES + 1),
+        };
+        assert!(lower_container_grants(&BTreeSet::from([long_operation])).is_err());
+
+        let long_owner = RuntimeCapabilityRequirement::Video {
+            owner: "x".repeat(
+                CONTAINER_MAX_CAPABILITY_TARGET_BYTES - VIDEO_CAPABILITY_TARGET_PREFIX.len() + 1,
+            ),
+            operation: "status".into(),
+        };
+        assert!(lower_container_grants(&BTreeSet::from([long_owner])).is_err());
     }
 
     #[test]
