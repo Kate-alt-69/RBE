@@ -5,6 +5,7 @@ name: CTR-006 secure Environment authority
     branches: [main]
     paths:
       - '.github/patches/ctr006-secure-authority.py'
+      - '.github/patches/ctr006-test-isolation.py'
       - '.github/workflows/ctr006-secure-authority.yml'
 
 permissions:
@@ -38,6 +39,7 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           python3 .github/patches/ctr006-secure-authority.py
+          python3 .github/patches/ctr006-test-isolation.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
 
       - name: Check Container workspace locked
@@ -64,6 +66,7 @@ jobs:
           set -euo pipefail
           git rm .github/workflows/ctr006-secure-authority.yml
           git rm .github/patches/ctr006-secure-authority.py
+          git rm .github/patches/ctr006-test-isolation.py
           git add container-runtime/crates/container-bin/src/environment_process.rs \
                   container-runtime/crates/container-runtime-core/src/control_plane.rs
           git commit -m "FIX | BUG-CTR-006 reduce authority for secure Environment profile"
