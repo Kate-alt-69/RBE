@@ -6,6 +6,7 @@ name: CTR-007 worker crash circuit
     paths:
       - '.github/patches/ctr007-worker-crash-circuit.py'
       - '.github/patches/ctr007-stagefix.py'
+      - '.github/patches/ctr007-stagefix2.py'
       - '.github/workflows/ctr007-worker-crash-circuit.yml'
 
 permissions:
@@ -39,6 +40,7 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           python3 .github/patches/ctr007-stagefix.py
+          python3 .github/patches/ctr007-stagefix2.py
           python3 .github/patches/ctr007-worker-crash-circuit.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
 
@@ -62,6 +64,7 @@ jobs:
           grep -q 'ARTIFACT_CRASH_CIRCUIT_OPEN' container-runtime/crates/container-bin/src/environment_process.rs
           grep -q 'code: "WORKER_CRASH"' container-runtime/crates/container-bin/src/environment_process.rs
           grep -q 'artifact_crash_circuits_open' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'environment_process_snapshots' container-runtime/crates/container-bin/src/main.rs
           grep -q 'crash_circuit_opens_then_allows_one_half_open_probe' container-runtime/crates/container-bin/src/environment_process.rs
           grep -q 'secure_environment_never_inherits_controller_debug' container-runtime/crates/container-bin/src/environment_process.rs
           git diff --check
@@ -73,6 +76,7 @@ jobs:
           git rm -f .github/workflows/ctr007-worker-crash-circuit.yml
           git rm -f .github/patches/ctr007-worker-crash-circuit.py
           git rm -f .github/patches/ctr007-stagefix.py
+          git rm -f .github/patches/ctr007-stagefix2.py
           git add container-runtime/crates/container-bin/src/environment_process.rs container-runtime/crates/container-bin/src/main.rs
           git commit -m "FIX | BUG-CTR-007 quarantine crashing workers and guarantee teardown"
           git fetch origin main
