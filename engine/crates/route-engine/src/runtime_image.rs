@@ -26,7 +26,7 @@ use crate::wasm_compiler::{
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuntimeCapabilityRequirement {
     PublicHttp { operation: String },
-    Video { operation: String },
+    Video { owner: String, operation: String },
     Service { service: String, operation: String },
 }
 
@@ -59,10 +59,10 @@ fn lower_container_grants(
                 }
                 public_http_operations.insert(operation.clone());
             }
-            RuntimeCapabilityRequirement::Video { operation } => {
+            RuntimeCapabilityRequirement::Video { owner, operation } => {
                 return Err(RuntimeCapabilityLoweringError {
                     message: format!(
-                        "Video capability operation {operation:?} has no native Container grant lowering yet"
+                        "Video capability principal {owner:?} operation {operation:?} has no native Container grant lowering yet"
                     ),
                 });
             }
@@ -351,6 +351,7 @@ mod tests {
     fn unsupported_native_capability_requirements_fail_closed() {
         for requirement in [
             RuntimeCapabilityRequirement::Video {
+                owner: "media.bridge".into(),
                 operation: "status".into(),
             },
             RuntimeCapabilityRequirement::Service {

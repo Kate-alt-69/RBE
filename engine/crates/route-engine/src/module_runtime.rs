@@ -460,6 +460,17 @@ fn normalize(path: &Path) -> PathBuf {
 fn module_owner(module_dir: &Path, path: &Path) -> String {
     let root = normalize(module_dir);
     let relative = path.strip_prefix(&root).unwrap_or(path).with_extension("");
+    canonical_module_owner(&relative)
+}
+
+/// Canonical capability principal for one linked Module REL logical name.
+/// RELC uses this exact function so propagated host authority has the same
+/// owner identity that ModuleExecutor supplies to VideoLanguage at runtime.
+pub(crate) fn module_owner_from_logical_name(logical_name: &str) -> String {
+    canonical_module_owner(Path::new(logical_name))
+}
+
+fn canonical_module_owner(relative: &Path) -> String {
     let parts = relative
         .components()
         .filter_map(|component| match component {
@@ -693,6 +704,18 @@ mod tests {
             .expect("nested module should resolve");
         assert_eq!(owner, "learning.catalog");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linked_logical_name_uses_same_canonical_owner_as_runtime_resolution() {
+        assert_eq!(
+            module_owner_from_logical_name("learning/catalog"),
+            "learning.catalog"
+        );
+        assert_eq!(
+            module_owner_from_logical_name("user data/auth"),
+            "user_20data.auth"
+        );
     }
 
     #[test]

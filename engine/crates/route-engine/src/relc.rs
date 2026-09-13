@@ -17,6 +17,7 @@ use crate::dependency_graph::{SymbolDependencyGraph, SymbolId};
 use crate::embedded_rel::{extract_embedded_rel, EmbeddedRelError};
 use crate::lexer::Lexer;
 use crate::middleware_plan::{MiddlewarePlan, MiddlewarePlanError};
+use crate::module_runtime::module_owner_from_logical_name;
 use crate::modules::binding_name;
 use crate::parser::{ParseError, Parser};
 use crate::runtime_env::{RuntimeEnv, RuntimeEnvError};
@@ -784,15 +785,25 @@ const VIDEO_HOST_OPERATIONS: &[&str] = &[
 ];
 
 fn builtin_host_requirements(
+    source: &SourceId,
     module: &str,
     function: Option<&str>,
-) -> BTreeSet<RuntimeCapabilityRequirement> {
+    video_owner: Option<&str>,
+) -> Result<BTreeSet<RuntimeCapabilityRequirement>, RelcError> {
     let operations = match module {
         "http" => HTTP_HOST_OPERATIONS,
         "vm" | "video-manager" => VIDEO_HOST_OPERATIONS,
-        _ => return BTreeSet::new(),
+        _ => return Ok(BTreeSet::new()),
     };
-    operations
+    let video_owner = if matches!(module, "vm" | "video-manager") {
+        Some(video_owner.ok_or_else(|| RelcError::Capability {
+            source: source.clone(),
+            message: "Video Manager authority is module-owned; direct Video capability requirements must originate from Module REL".into(),
+        })?)
+    } else {
+        None
+    };
+    Ok(operations
         .iter()
         .copied()
         .filter(|operation| function.is_none_or(|function| function == *operation))
@@ -801,25 +812,44 @@ fn builtin_host_requirements(
                 operation: operation.to_string(),
             },
             _ => RuntimeCapabilityRequirement::Video {
+                owner: video_owner
+                    .expect("Video owner validated above")
+                    .to_string(),
                 operation: operation.to_string(),
             },
         })
-        .collect()
+        .collect())
 }
 
 fn direct_capability_requirements(
+    source: &SourceId,
     registry: &RelSourceRegistry,
     compiled: &BTreeMap<SourceId, CompiledUnit>,
     imports: &[ImportTarget],
 ) -> Result<BTreeSet<RuntimeCapabilityRequirement>, RelcError> {
+    let source_record = registry
+        .get(source)
+        .ok_or_else(|| RelcError::Link(format!("compiled source {source} is not registered")))?;
+    let video_owner = (source_record.kind() == RelSourceKind::Module)
+        .then(|| module_owner_from_logical_name(source_record.logical_name()));
     let mut out = BTreeSet::new();
     for import in imports {
         match import_base(import) {
             ImportTarget::Builtin(module) => {
-                out.extend(builtin_host_requirements(module, None));
+                out.extend(builtin_host_requirements(
+                    source,
+                    module,
+                    None,
+                    video_owner.as_deref(),
+                )?);
             }
             ImportTarget::BuiltinFunction { module, function } => {
-                out.extend(builtin_host_requirements(module, Some(function)));
+                out.extend(builtin_host_requirements(
+                    source,
+                    module,
+                    Some(function),
+                    video_owner.as_deref(),
+                )?);
             }
             ImportTarget::Service(service) => {
                 let target = registry
@@ -875,7 +905,7 @@ fn capability_requirements(
     for (source, unit) in compiled {
         requirements.insert(
             source.clone(),
-            direct_capability_requirements(registry, compiled, unit.imports())?,
+            direct_capability_requirements(source, registry, compiled, unit.imports())?,
         );
         module_dependencies.insert(
             source.clone(),
@@ -1211,6 +1241,7 @@ mod tests {
             })
         );
         assert!(requirements.contains(&RuntimeCapabilityRequirement::Video {
+            owner: "hosted".into(),
             operation: "status".into(),
         }));
         assert_eq!(
@@ -1246,6 +1277,89 @@ mod tests {
                 operation: "post".into(),
             }
         ));
+    }
+
+    #[test]
+    fn video_principal_survives_nested_module_to_route_propagation() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "learning/catalog",
+                "module/learning/catalog.module",
+                r#":import[video-manager.status]
+                   export function run(value) { return value; }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "catalog-status",
+                "api/catalog-status.route",
+                r#":import["./module/learning/catalog"]
+                   class Route { get(req) { return true; } }"#,
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        let expected = RuntimeCapabilityRequirement::Video {
+            owner: "learning.catalog".into(),
+            operation: "status".into(),
+        };
+        let module = image
+            .modules
+            .iter()
+            .find(|id| {
+                image
+                    .source(id)
+                    .is_some_and(|source| source.logical_name == "learning/catalog")
+            })
+            .unwrap();
+        assert!(image
+            .capability_requirements(module)
+            .unwrap()
+            .contains(&expected));
+        let route = image.routes.first().unwrap();
+        assert!(
+            image
+                .capability_requirements(route)
+                .unwrap()
+                .contains(&expected),
+            "propagation must preserve the declaring module principal"
+        );
+    }
+
+    #[test]
+    fn distinct_video_modules_keep_distinct_principals() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "media/alpha",
+                "module/media/alpha.module",
+                r#":import[vm.status]
+                   export function run(value) { return value; }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "media/beta",
+                "module/media/beta.module",
+                r#":import[vm.status]
+                   export function run(value) { return value; }"#,
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        let owners = image
+            .modules
+            .iter()
+            .flat_map(|id| image.capability_requirements(id).into_iter().flatten())
+            .filter_map(|requirement| match requirement {
+                RuntimeCapabilityRequirement::Video { owner, operation }
+                    if operation == "status" =>
+                {
+                    Some(owner.as_str())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(owners, BTreeSet::from(["media.alpha", "media.beta"]));
     }
 
     #[test]
