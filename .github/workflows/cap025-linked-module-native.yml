@@ -1,0 +1,85 @@
+name: CAP-025 linked Module native capability calls
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap025-linked-module-native.py'
+      - '.github/workflows/cap025-linked-module-native.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap025-linked-module-native
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply CAP-025 linked Module compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap025-linked-module-native.py
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check Route Engine linked compiler locked
+        run: cargo check --manifest-path engine/Cargo.toml -p route-engine --all-targets --locked
+      - name: Test Route Engine linked compiler locked
+        run: cargo test --manifest-path engine/Cargo.toml -p route-engine --locked
+      - name: Clippy Route Engine linked compiler locked
+        run: cargo clippy --manifest-path engine/Cargo.toml -p route-engine --all-targets --locked -- -D warnings
+      - name: Check Backend integration locked
+        run: cargo check --manifest-path engine/Cargo.toml -p backend --all-targets --locked
+
+      - name: Verify CAP-025 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub const ROUTE_WASM_COMPILER_VERSION: u32 = 4' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q 'struct RouteWasmLinkContext' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q 'lower_linked_module_capability_call' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q 'module_owner_from_logical_name(source.logical_name())' engine/crates/route-engine/src/relc.rs
+          grep -q 'linked_video_module_wrapper_compiles_native_with_exact_owner_grant' engine/crates/route-engine/src/relc.rs
+          grep -q 'linked_service_module_wrapper_compiles_native_with_exact_service_grant' engine/crates/route-engine/src/relc.rs
+          grep -q 'linked_module_dynamic_route_argument_stays_interpreter_fallback' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q 'Route-WASM compiler v4' doc/runtime-image.md
+          # Route privilege remains unchanged: direct Service imports are still forbidden.
+          grep -q 'Route REL cannot directly import Service REL; use a module boundary' engine/crates/route-engine/src/relc.rs
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap025-linked-module-native.yml
+          git rm -f .github/patches/cap025-linked-module-native.py
+          git add \
+            engine/crates/route-engine/src/wasm_compiler.rs \
+            engine/crates/route-engine/src/relc.rs \
+            doc/runtime-image.md
+          git commit -m "FIX | BUG-CAP-025 compile strict linked Module host calls natively"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
