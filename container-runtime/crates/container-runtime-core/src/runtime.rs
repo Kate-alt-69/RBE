@@ -408,7 +408,7 @@ impl Runtime {
                 if is_cancelled(&lifecycle, task) {
                     return Err("execution cancelled before start".into());
                 }
-                let output = if cache.verified_artifact_available(&task.artifact_hash) {
+                let output = if cache.contains_artifact(&task.artifact_hash) {
                     match artifact_runner.as_ref() {
                         Some(runner) => runner(task)?,
                         None => run_isolated_worker(task, &lifecycle)?,

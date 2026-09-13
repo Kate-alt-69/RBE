@@ -730,10 +730,7 @@ fn handle_connection(
                     code: "EXECUTION_INPUT_TOO_LARGE".into(),
                     message: format!("execution input exceeds {MAX_EXECUTION_INPUT_BYTES} bytes"),
                 }
-            } else if !runtime
-                .cache()
-                .verified_artifact_available(&request.artifact_hash)
-            {
+            } else if !runtime.cache().contains_artifact(&request.artifact_hash) {
                 Response::Error {
                     request_id: Some(request.request_id),
                     code: "ARTIFACT_NOT_FOUND".into(),
