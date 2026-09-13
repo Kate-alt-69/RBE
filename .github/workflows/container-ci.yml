@@ -1,0 +1,43 @@
+name: Container CI
+
+on:
+  push:
+    paths:
+      - 'container-runtime/**'
+      - '.github/workflows/container-ci.yml'
+  pull_request:
+    paths:
+      - 'container-runtime/**'
+      - '.github/workflows/container-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: container-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+      - name: fmt check
+        run: cargo fmt --all -- --check
+      - name: check
+        run: cargo check --workspace --all-targets --locked
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --locked
