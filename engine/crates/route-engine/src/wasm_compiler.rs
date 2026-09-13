@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 
 use core_lib::{
     video_language_operation_allowed, ContainerCapabilityKind,
-    CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES, CONTAINER_MAX_EXECUTION_INPUT_BYTES,
-    PUBLIC_HTTP_TARGET, VIDEO_CAPABILITY_TARGET_PREFIX,
+    CONTAINER_MAX_CAPABILITY_OPERATION_BYTES, CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES,
+    CONTAINER_MAX_CAPABILITY_TARGET_BYTES, CONTAINER_MAX_EXECUTION_INPUT_BYTES, PUBLIC_HTTP_TARGET,
+    VIDEO_CAPABILITY_TARGET_PREFIX,
 };
-use service_runtime::SERVICE_CAPABILITY_TARGET_PREFIX;
+use service_runtime::{service_capability_name_allowed, SERVICE_CAPABILITY_TARGET_PREFIX};
 use sha2::{Digest, Sha256};
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
@@ -23,10 +24,10 @@ use crate::ast::{Expr, FunctionDef, ImportTarget, RouteFile, Statement};
 use crate::modules::binding_name;
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-/// Generation history: `pub const ROUTE_WASM_COMPILER_VERSION: u32 = 4`
-/// introduced direct host-capability lowering. Generation 5 adds strict
-/// immutable linked-Module host-call lowering while capability ABI v3 stays stable.
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 5;
+/// Generation 6 removes the unreachable direct Route-to-Service lowering
+/// left by generation 4. Service and Video host calls now require RELC's linked
+/// Module authority boundary; capability ABI v3 stays stable.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 6;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 
@@ -123,13 +124,13 @@ pub(crate) fn compile_route_with_links(
                 linked_import = Some((binding, linked));
             } else {
                 return fallback(
-                    "native Route-WASM v5 only supports one direct http.get/post/request or service:<name>.<operation> import or one linked Module function import",
+                    "native Route-WASM v6 only supports one direct http.get/post/request import or one linked Module function import",
                 );
             }
         }
         _ => {
             return fallback(
-                "native Route-WASM v5 supports at most one direct or linked host-call import",
+                "native Route-WASM v6 supports at most one direct or linked host-call import",
             )
         }
     }
@@ -214,8 +215,7 @@ struct DirectCapabilityImport {
 fn direct_capability_import(import: &ImportTarget) -> Option<DirectCapabilityImport> {
     let (binding, base) = match import {
         ImportTarget::Aliased { target, alias } => (alias.clone(), target.as_ref()),
-        ImportTarget::BuiltinFunction { function, .. }
-        | ImportTarget::ServiceFunction { function, .. } => (function.clone(), import),
+        ImportTarget::BuiltinFunction { function, .. } => (function.clone(), import),
         _ => return None,
     };
 
@@ -230,12 +230,6 @@ fn direct_capability_import(import: &ImportTarget) -> Option<DirectCapabilityImp
                 operation: function.clone(),
             })
         }
-        ImportTarget::ServiceFunction { service, function } => Some(DirectCapabilityImport {
-            binding,
-            kind: ContainerCapabilityKind::Service,
-            target: format!("{SERVICE_CAPABILITY_TARGET_PREFIX}{service}"),
-            operation: function.clone(),
-        }),
         _ => None,
     }
 }
@@ -251,23 +245,57 @@ fn direct_linked_capability_import(
     import: &ImportTarget,
     owner: &str,
 ) -> Option<DirectCapabilityImport> {
-    if let Some(import) = direct_capability_import(import) {
-        return Some(import);
-    }
-    let ImportTarget::BuiltinFunction { module, function } = base_import(import) else {
-        return None;
+    let binding = binding_name(import);
+    let (kind, target, operation) = match base_import(import) {
+        ImportTarget::BuiltinFunction { module, function }
+            if module == "http" && matches!(function.as_str(), "get" | "post" | "request") =>
+        {
+            (
+                ContainerCapabilityKind::Network,
+                PUBLIC_HTTP_TARGET.to_string(),
+                function.clone(),
+            )
+        }
+        ImportTarget::BuiltinFunction { module, function }
+            if matches!(module.as_str(), "vm" | "video-manager")
+                && video_language_operation_allowed(function) =>
+        {
+            (
+                ContainerCapabilityKind::Video,
+                format!("{VIDEO_CAPABILITY_TARGET_PREFIX}{owner}"),
+                function.clone(),
+            )
+        }
+        ImportTarget::ServiceFunction { service, function }
+            if service_capability_name_allowed(service) && valid_capability_operation(function) =>
+        {
+            (
+                ContainerCapabilityKind::Service,
+                format!("{SERVICE_CAPABILITY_TARGET_PREFIX}{service}"),
+                function.clone(),
+            )
+        }
+        _ => return None,
     };
-    if !matches!(module.as_str(), "vm" | "video-manager")
-        || !video_language_operation_allowed(function)
+    if target.len() > CONTAINER_MAX_CAPABILITY_TARGET_BYTES
+        || operation.len() > CONTAINER_MAX_CAPABILITY_OPERATION_BYTES
     {
         return None;
     }
     Some(DirectCapabilityImport {
-        binding: binding_name(import),
-        kind: ContainerCapabilityKind::Video,
-        target: format!("{VIDEO_CAPABILITY_TARGET_PREFIX}{owner}"),
-        operation: function.clone(),
+        binding,
+        kind,
+        target,
+        operation,
     })
+}
+
+fn valid_capability_operation(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= CONTAINER_MAX_CAPABILITY_OPERATION_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn lower_linked_module_capability_call(
@@ -905,89 +933,15 @@ mod tests {
     }
 
     #[test]
-    fn direct_static_service_call_is_native_v4_capability_call() {
+    fn direct_service_route_import_stays_outside_native_subset() {
         let route = parse(
             r#":import[service:uac.get_user]
                class Route { get(req) { return get_user("alice"); } }"#,
         );
-        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
-            panic!("direct static Service call should lower to native capability ABI");
-        };
-        assert_eq!(artifact.input, RouteWasmInput::None);
-        wasmparser::validate(&artifact.bytes).unwrap();
-        assert!(artifact
-            .bytes
-            .windows(b"service:uac".len())
-            .any(|window| window == b"service:uac"));
-        assert!(artifact
-            .bytes
-            .windows(b"get_user".len())
-            .any(|window| window == b"get_user"));
-    }
-
-    #[test]
-    fn generated_service_wasm_round_trips_through_real_capability_host_abi() {
-        let route = parse(
-            r#":import[service:uac.get_user]
-               class Route { get(req) { return get_user("alice", 7); } }"#,
-        );
-        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
-            panic!("direct Service route should compile natively");
-        };
-        let host: CapabilityHost = Box::new(|request| {
-            assert_eq!(request.kind, ContainerCapabilityKind::Service);
-            assert_eq!(request.target, "service:uac");
-            assert_eq!(request.operation, "get_user");
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
-                serde_json::json!(["alice", 7.0])
-            );
-            Ok(br#"{"id":"alice","ok":true}"#.to_vec())
-        });
-        let result = WasmExecutor::new()
-            .unwrap()
-            .execute_with_input_and_capabilities(
-                &artifact.bytes,
-                &[],
-                ExecutionLimits::default(),
-                Some(host),
-            )
-            .unwrap();
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(result.output, br#"{"id":"alice","ok":true}"#);
-    }
-
-    #[test]
-    fn aliased_static_service_call_is_native() {
-        let route = parse(
-            r#":import[service:uac.get_user as lookup]
-               class Route { get(req) { return lookup("alice"); } }"#,
-        );
-        assert!(compile_route(&route).is_native());
-    }
-
-    #[test]
-    fn service_namespace_import_stays_interpreter_fallback() {
-        let route = parse(
-            r#":import[service:uac]
-               class Route { get(req) { return uac.get_user("alice"); } }"#,
-        );
         let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
-            panic!("Service namespace import must not widen native authority");
+            panic!("Route-to-Service must remain behind an exported Module boundary");
         };
-        assert!(reason.contains("service:<name>.<operation>"));
-    }
-
-    #[test]
-    fn dynamic_service_argument_stays_interpreter_fallback() {
-        let route = parse(
-            r#":import[service:uac.get_user]
-               class Route { post(req) { return get_user(req.body); } }"#,
-        );
-        let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
-            panic!("dynamic Service argument is outside the v4 native subset");
-        };
-        assert!(reason.contains("static JSON arguments"));
+        assert!(reason.contains("linked Module function"));
     }
 
     #[test]
@@ -1008,8 +962,9 @@ mod tests {
         let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
             panic!("namespace import must not widen native Network authority");
         };
-        assert!(reason
-            .contains("one direct http.get/post/request or service:<name>.<operation> import"));
+        assert!(reason.contains(
+            "one direct http.get/post/request import or one linked Module function import"
+        ));
     }
 
     #[test]
