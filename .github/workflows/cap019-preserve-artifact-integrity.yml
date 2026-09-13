@@ -1,0 +1,75 @@
+name: CAP-019 durable artifact admission checks
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap019-preserve-artifact-integrity.py'
+      - '.github/workflows/cap019-preserve-artifact-integrity.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap019-preserve-artifact-integrity
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+
+      - name: Apply CAP-019 durable artifact admission checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap019-preserve-artifact-integrity.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+
+      - name: Check Container workspace locked
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+      - name: Test Container workspace locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace locked
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Verify CAP-019 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'Request::BindArtifact(request)' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'verified_artifact_available(&request.artifact_hash)' container-runtime/crates/container-bin/src/main.rs
+          grep -q '!runtime.cache().contains_artifact(&request.artifact_hash)' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'if cache.contains_artifact(&task.artifact_hash)' container-runtime/crates/container-runtime-core/src/runtime.rs
+          grep -q 'isolated worker verifies it again immediately before Wasmtime execution' doc/runtime-image.md
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap019-preserve-artifact-integrity.yml
+          git rm -f .github/patches/cap019-preserve-artifact-integrity.py
+          git add container-runtime doc/runtime-image.md
+          git commit -m "FIX | BUG-CAP-019 preserve durable artifact integrity checks"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
