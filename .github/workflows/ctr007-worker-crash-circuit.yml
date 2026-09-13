@@ -40,8 +40,8 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           python3 .github/patches/ctr007-stagefix.py
-          python3 .github/patches/ctr007-stagefix2.py
           python3 .github/patches/ctr007-worker-crash-circuit.py
+          python3 .github/patches/ctr007-stagefix2.py
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
 
       - name: Check Container workspace locked
