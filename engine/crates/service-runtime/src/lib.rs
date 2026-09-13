@@ -21,6 +21,20 @@ mod mother;
 pub(crate) const SERVICE_IPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SERVICE_IPC_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const SERVICE_IPC_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Container-visible Service targets are logical catalog names only. The
+/// prefix makes them unambiguous from every other capability kind/namespace.
+pub const SERVICE_CAPABILITY_TARGET_PREFIX: &str = "service:";
+
+/// Keep the complete logical target within Container Controller's 256-byte
+/// capability-target ceiling and reject path/socket-like names.
+pub fn service_capability_name_allowed(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 248
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
 const PARENT_BOOTSTRAP_JSON_MAX_BYTES: usize = 1024 * 1024;
 const SERVICE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SERVICE_ACCEPT_FAILURE_LIMIT: u32 = 8;

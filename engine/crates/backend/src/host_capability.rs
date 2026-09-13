@@ -15,7 +15,9 @@ use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
-use service_runtime::ServiceManager;
+use service_runtime::{
+    service_capability_name_allowed, ServiceManager, SERVICE_CAPABILITY_TARGET_PREFIX,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
@@ -439,8 +441,8 @@ fn normalize_video_target(target: &str) -> Option<&str> {
 }
 
 fn normalize_service_target(target: &str) -> Option<&str> {
-    let target = target.strip_prefix("service:").unwrap_or(target);
-    valid_logical_name(target).then_some(target)
+    let service = target.strip_prefix(SERVICE_CAPABILITY_TARGET_PREFIX)?;
+    service_capability_name_allowed(service).then_some(service)
 }
 
 fn valid_logical_name(value: &str) -> bool {
@@ -573,12 +575,12 @@ mod tests {
     }
 
     #[test]
-    fn service_target_normalization_is_logical_only() {
+    fn service_target_normalization_is_prefixed_and_logical_only() {
         assert_eq!(
             normalize_service_target("service:uac-cache"),
             Some("uac-cache")
         );
-        assert_eq!(normalize_service_target("mail"), Some("mail"));
+        assert_eq!(normalize_service_target("mail"), None);
         assert_eq!(normalize_service_target("../mail"), None);
         assert_eq!(normalize_service_target("service:mail/socket"), None);
     }

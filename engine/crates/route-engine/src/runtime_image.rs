@@ -7,6 +7,7 @@ use core_lib::{
     video_language_operation_allowed, ContainerCapabilityGrant, ContainerCapabilityKind,
     CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES, PUBLIC_HTTP_TARGET, VIDEO_CAPABILITY_TARGET_PREFIX,
 };
+use service_runtime::{service_capability_name_allowed, SERVICE_CAPABILITY_TARGET_PREFIX};
 use sha2::{Digest, Sha256};
 
 use crate::ast::{ModuleFile, RouteFile, ServiceProgram};
@@ -48,6 +49,7 @@ fn lower_container_grants(
 ) -> Result<Vec<ContainerCapabilityGrant>, RuntimeCapabilityLoweringError> {
     let mut public_http_operations = BTreeSet::new();
     let mut video_operations = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut service_operations = BTreeMap::<String, BTreeSet<String>>::new();
     for requirement in requirements {
         match requirement {
             RuntimeCapabilityRequirement::PublicHttp { operation } => {
@@ -81,11 +83,24 @@ fn lower_container_grants(
                     .insert(operation.clone());
             }
             RuntimeCapabilityRequirement::Service { service, operation } => {
-                return Err(RuntimeCapabilityLoweringError {
-                    message: format!(
-                        "Service capability {service:?}.{operation} has no native Container grant lowering yet"
-                    ),
-                });
+                if !service_capability_name_allowed(service) {
+                    return Err(RuntimeCapabilityLoweringError {
+                        message: format!(
+                            "Service capability target {service:?} is not a valid logical Service name"
+                        ),
+                    });
+                }
+                if !valid_service_operation(operation) {
+                    return Err(RuntimeCapabilityLoweringError {
+                        message: format!(
+                            "Service capability operation {operation:?} is not a valid exported operation"
+                        ),
+                    });
+                }
+                service_operations
+                    .entry(service.clone())
+                    .or_default()
+                    .insert(operation.clone());
             }
         }
     }
@@ -112,7 +127,24 @@ fn lower_container_grants(
             max_response_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
         });
     }
+    for (service, operations) in service_operations {
+        grants.push(ContainerCapabilityGrant {
+            kind: ContainerCapabilityKind::Service,
+            target: format!("{SERVICE_CAPABILITY_TARGET_PREFIX}{service}"),
+            operations: operations.into_iter().collect(),
+            max_request_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
+            max_response_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
+        });
+    }
     Ok(grants)
+}
+
+fn valid_service_operation(operation: &str) -> bool {
+    !operation.is_empty()
+        && operation.len() <= 128
+        && operation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn valid_video_owner(owner: &str) -> bool {
@@ -421,16 +453,47 @@ mod tests {
     }
 
     #[test]
-    fn service_requirements_remain_fail_closed() {
-        let requirement = RuntimeCapabilityRequirement::Service {
-            service: "uac".into(),
-            operation: "get_user".into(),
-        };
-        let error = lower_container_grants(&BTreeSet::from([requirement]))
-            .expect_err("Service lowering is not implemented yet");
-        assert!(error
-            .message
-            .contains("no native Container grant lowering yet"));
+    fn service_requirements_lower_to_exact_prefixed_grants() {
+        let requirements = BTreeSet::from([
+            RuntimeCapabilityRequirement::Service {
+                service: "uac-cache".into(),
+                operation: "get_user".into(),
+            },
+            RuntimeCapabilityRequirement::Service {
+                service: "uac-cache".into(),
+                operation: "has_user".into(),
+            },
+            RuntimeCapabilityRequirement::Service {
+                service: "mailer".into(),
+                operation: "send".into(),
+            },
+        ]);
+        let grants = lower_container_grants(&requirements).unwrap();
+        let service_grants = grants
+            .iter()
+            .filter(|grant| grant.kind == ContainerCapabilityKind::Service)
+            .collect::<Vec<_>>();
+        assert_eq!(service_grants.len(), 2);
+        assert_eq!(service_grants[0].target, "service:mailer");
+        assert_eq!(service_grants[0].operations, vec!["send"]);
+        assert_eq!(service_grants[1].target, "service:uac-cache");
+        assert_eq!(service_grants[1].operations, vec!["get_user", "has_user"]);
+    }
+
+    #[test]
+    fn invalid_service_target_or_operation_fails_closed() {
+        for requirement in [
+            RuntimeCapabilityRequirement::Service {
+                service: "../uac".into(),
+                operation: "get_user".into(),
+            },
+            RuntimeCapabilityRequirement::Service {
+                service: "uac".into(),
+                operation: "../../secret".into(),
+            },
+        ] {
+            assert!(lower_container_grants(&BTreeSet::from([requirement])).is_err());
+        }
     }
 
     #[test]
