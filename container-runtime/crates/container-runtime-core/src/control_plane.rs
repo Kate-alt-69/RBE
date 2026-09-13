@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
+use environments::EnvironmentProfile;
 use ipc_protocol::{
     CapabilityGrant, CapabilityKind, RegisterCapabilityManifestRequest, CAPABILITY_ABI_VERSION,
     MAX_CAPABILITY_GRANTS_PER_MANIFEST, MAX_CAPABILITY_OPERATIONS_PER_GRANT,
@@ -95,7 +96,7 @@ impl CapabilityBroker {
     ) -> Result<usize, CapabilityError> {
         validate_runtime_image(&request.runtime_image)?;
         validate_source_id(&request.source_id)?;
-        validate_environment(&request.environment)?;
+        let environment_profile = validate_environment(&request.environment)?;
         if request.capability_abi != CAPABILITY_ABI_VERSION {
             return Err(CapabilityError {
                 code: "CAPABILITY_ABI_UNSUPPORTED",
@@ -117,7 +118,7 @@ impl CapabilityBroker {
 
         let mut seen = HashSet::new();
         for grant in &request.grants {
-            validate_grant(grant, self.debug_enabled)?;
+            validate_grant(grant, self.debug_enabled, environment_profile)?;
             for operation in &grant.operations {
                 let identity = (grant.kind, grant.target.as_str(), operation.as_str());
                 if !seen.insert(identity) {
@@ -264,16 +265,23 @@ impl CapabilityBroker {
     ) -> Result<AuthorizedCapability, CapabilityError> {
         validate_runtime_image(call.runtime_image)?;
         validate_source_id(call.source_id)?;
-        validate_environment(call.environment)?;
+        let environment_profile = validate_environment(call.environment)?;
         validate_target(call.target)?;
         validate_operation(call.operation)?;
-        if matches!(call.kind, CapabilityKind::Debug | CapabilityKind::HostFile)
-            && !self.debug_enabled
-        {
-            return Err(CapabilityError {
-                code: "DEBUG_DISABLED",
-                message: "debug-only capability is disabled by the Container Controller".into(),
-            });
+        if matches!(call.kind, CapabilityKind::Debug | CapabilityKind::HostFile) {
+            if environment_profile == EnvironmentProfile::Secure {
+                return Err(CapabilityError {
+                    code: "CAPABILITY_DENIED",
+                    message: "debug/host-file capabilities are unavailable to secure Environments"
+                        .into(),
+                });
+            }
+            if !self.debug_enabled {
+                return Err(CapabilityError {
+                    code: "DEBUG_DISABLED",
+                    message: "debug-only capability is disabled by the Container Controller".into(),
+                });
+            }
         }
         if call.request_bytes > MAX_CAPABILITY_PAYLOAD_BYTES {
             return Err(CapabilityError {
@@ -358,7 +366,11 @@ impl CapabilityBroker {
     }
 }
 
-fn validate_grant(grant: &CapabilityGrant, debug_enabled: bool) -> Result<(), CapabilityError> {
+fn validate_grant(
+    grant: &CapabilityGrant,
+    debug_enabled: bool,
+    environment_profile: EnvironmentProfile,
+) -> Result<(), CapabilityError> {
     validate_target(&grant.target)?;
     if grant.operations.is_empty() || grant.operations.len() > MAX_CAPABILITY_OPERATIONS_PER_GRANT {
         return Err(CapabilityError {
@@ -383,12 +395,21 @@ fn validate_grant(grant: &CapabilityGrant, debug_enabled: bool) -> Result<(), Ca
             ),
         });
     }
-    if matches!(grant.kind, CapabilityKind::Debug | CapabilityKind::HostFile) && !debug_enabled {
-        return Err(CapabilityError {
-            code: "DEBUG_DISABLED",
-            message: "debug/host-file grants cannot be registered in a production Controller"
-                .into(),
-        });
+    if matches!(grant.kind, CapabilityKind::Debug | CapabilityKind::HostFile) {
+        if environment_profile == EnvironmentProfile::Secure {
+            return Err(CapabilityError {
+                code: "CAPABILITY_DENIED",
+                message: "debug/host-file grants cannot be registered for secure Environments"
+                    .into(),
+            });
+        }
+        if !debug_enabled {
+            return Err(CapabilityError {
+                code: "DEBUG_DISABLED",
+                message: "debug/host-file grants cannot be registered in a production Controller"
+                    .into(),
+            });
+        }
     }
     Ok(())
 }
@@ -435,17 +456,17 @@ fn validate_artifact_hash(value: &str) -> Result<(), CapabilityError> {
     Ok(())
 }
 
-fn validate_environment(value: &str) -> Result<(), CapabilityError> {
-    if !matches!(
-        value,
-        "general-1" | "general-2" | "general-3" | "general-4" | "general-5" | "payment"
-    ) {
-        return Err(invalid_identity(
+fn validate_environment(value: &str) -> Result<EnvironmentProfile, CapabilityError> {
+    match value {
+        "general-1" | "general-2" | "general-3" | "general-4" | "general-5" => {
+            Ok(EnvironmentProfile::General)
+        }
+        "payment" => Ok(EnvironmentProfile::Secure),
+        _ => Err(invalid_identity(
             "environment",
             "is not a configured RBE Environment",
-        ));
+        )),
     }
-    Ok(())
 }
 
 fn validate_target(value: &str) -> Result<(), CapabilityError> {
@@ -709,6 +730,72 @@ mod tests {
             "CAPABILITY_MANIFEST_CONFLICT"
         );
         assert_eq!(broker.manifest_count(), 1);
+    }
+
+    #[test]
+    fn debug_controller_still_denies_debug_and_host_file_to_secure_profile() {
+        for kind in [CapabilityKind::Debug, CapabilityKind::HostFile] {
+            // Each capability kind gets a fresh broker because manifests are
+            // intentionally immutable for one exact identity/generation key.
+            let broker = CapabilityBroker::new(true);
+            let mut general_grant = service_grant();
+            general_grant.kind = kind;
+            general_grant.target = "shell".into();
+            broker
+                .register_manifest(&request(vec![general_grant]), 4)
+                .expect("debug general Environment should retain debug authority");
+
+            let mut secure_request = request(vec![{
+                let mut grant = service_grant();
+                grant.kind = kind;
+                grant.target = "shell".into();
+                grant
+            }]);
+            secure_request.environment = "payment".into();
+            assert_eq!(
+                broker
+                    .register_manifest(&secure_request, 4)
+                    .unwrap_err()
+                    .code,
+                "CAPABILITY_DENIED"
+            );
+        }
+    }
+
+    #[test]
+    fn call_time_guard_denies_secure_debug_even_if_manifest_table_is_injected() {
+        let broker = CapabilityBroker::new(true);
+        let grant = CapabilityGrant {
+            kind: CapabilityKind::Debug,
+            target: "shell".into(),
+            operations: vec!["inspect".into()],
+            max_request_bytes: 1024,
+            max_response_bytes: 4096,
+        };
+        broker.manifests.write().unwrap().insert(
+            ManifestKey {
+                runtime_image: "ab".repeat(32),
+                source_id: "route:api/me".into(),
+                environment: "payment".into(),
+                generation: 4,
+            },
+            CapabilityManifest {
+                grants: vec![grant],
+            },
+        );
+        let error = broker
+            .authorize(CapabilityCall {
+                runtime_image: &"ab".repeat(32),
+                source_id: "route:api/me",
+                environment: "payment",
+                generation: 4,
+                kind: CapabilityKind::Debug,
+                target: "shell",
+                operation: "inspect",
+                request_bytes: 1,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "CAPABILITY_DENIED");
     }
 
     #[test]

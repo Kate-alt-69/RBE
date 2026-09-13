@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use container_runtime_core::{
-    Canceller, CapabilityBroker, CapabilityCall, EnvironmentId, EnvironmentStorageManager,
-    ExecutionTask, Runner, DEFAULT_ENVIRONMENT_STORAGE_BYTES,
+    Canceller, CapabilityBroker, CapabilityCall, EnvironmentId, EnvironmentProfile,
+    EnvironmentStorageManager, ExecutionTask, Runner, DEFAULT_ENVIRONMENT_STORAGE_BYTES,
 };
 use ipc_protocol::{
     read_frame, read_worker_output, write_frame, write_worker_capability_result,
@@ -685,19 +685,20 @@ impl EnvironmentProcessSupervisor {
 
     fn spawn_one(&self, id: EnvironmentId, generation: u64) -> Result<ManagedEnvironment> {
         let session = self.new_session(id, generation);
+        let child_debug = environment_debug_enabled(self.debug, id);
         let mut command = Command::new(std::env::current_exe()?);
         command
             .arg("--environment-child")
             .env_remove("RBE_CONTAINER_TOKEN")
             .env_remove("RBE_HOST_CAPABILITY_ADDR")
             .env_remove("RBE_HOST_CAPABILITY_TOKEN");
-        if self.debug {
+        if child_debug {
             // Visible diagnostic propagation only. The session capability on the
             // inherited bootstrap pipe remains the actual authority.
             command.arg("--debug");
         }
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
-        if self.debug {
+        if child_debug {
             command.stderr(Stdio::inherit());
         } else {
             command.stderr(Stdio::null());
@@ -719,7 +720,7 @@ impl EnvironmentProcessSupervisor {
             environment: id.to_string(),
             generation,
             storage_limit_bytes: DEFAULT_ENVIRONMENT_STORAGE_BYTES,
-            debug: self.debug,
+            debug: child_debug,
             session: session.clone(),
         });
         if let Err(error) = write_frame(&mut stdin, &bootstrap) {
@@ -761,7 +762,7 @@ impl EnvironmentProcessSupervisor {
             || ready_generation != generation
             || pid != child.id()
             || echoed_session != session
-            || debug != self.debug
+            || debug != child_debug
         {
             let _ = child.kill();
             let _ = child.wait();
@@ -779,7 +780,7 @@ impl EnvironmentProcessSupervisor {
                 session,
                 generation,
             },
-            debug: self.debug,
+            debug: child_debug,
         })
     }
 
@@ -1353,6 +1354,10 @@ fn make_session_root(controller_token: Option<&str>) -> [u8; 32] {
     hash.finalize().into()
 }
 
+fn environment_debug_enabled(controller_debug: bool, id: EnvironmentId) -> bool {
+    controller_debug && id.profile() != EnvironmentProfile::Secure
+}
+
 fn active_environment_ids(general_count: usize) -> Vec<EnvironmentId> {
     let mut ids =
         EnvironmentId::GENERAL[..general_count.clamp(1, EnvironmentId::GENERAL.len())].to_vec();
@@ -1398,6 +1403,14 @@ mod tests {
         assert!(valid_source_id("route:api/me"));
         assert!(!valid_source_id(""));
         assert!(!valid_source_id("route:\napi"));
+    }
+
+    #[test]
+    fn secure_environment_never_inherits_controller_debug() {
+        assert!(environment_debug_enabled(true, EnvironmentId::General1));
+        assert!(!environment_debug_enabled(true, EnvironmentId::Payment));
+        assert!(!environment_debug_enabled(false, EnvironmentId::General1));
+        assert!(!environment_debug_enabled(false, EnvironmentId::Payment));
     }
 
     #[test]
