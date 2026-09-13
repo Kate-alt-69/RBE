@@ -203,7 +203,7 @@ impl WasmExecutor {
              payload_ptr: i32,
              payload_len: i32|
              -> i32 {
-                let Some(kind) = capability_kind_from_abi(kind) else {
+                let Some(kind) = CapabilityKind::from_abi_code(kind) else {
                     return set_abi_error(&mut caller, "capability_call received an unknown kind");
                 };
                 let target = match read_guest_bytes(
@@ -333,19 +333,6 @@ impl WasmExecutor {
             fuel_consumed: limits.fuel.saturating_sub(remaining),
             output,
         })
-    }
-}
-
-fn capability_kind_from_abi(value: i32) -> Option<CapabilityKind> {
-    match value {
-        0 => Some(CapabilityKind::Service),
-        1 => Some(CapabilityKind::Network),
-        2 => Some(CapabilityKind::Storage),
-        3 => Some(CapabilityKind::Vault),
-        4 => Some(CapabilityKind::HostFile),
-        5 => Some(CapabilityKind::Video),
-        6 => Some(CapabilityKind::Debug),
-        _ => None,
     }
 }
 

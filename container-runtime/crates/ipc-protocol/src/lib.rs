@@ -64,6 +64,36 @@ pub enum CapabilityKind {
     Debug,
 }
 
+impl CapabilityKind {
+    /// Stable numeric representation used by the guest WASM capability ABI.
+    /// This mapping is part of CAPABILITY_ABI_VERSION and must never be inferred
+    /// from Rust enum discriminants or serde ordering.
+    pub const fn abi_code(self) -> i32 {
+        match self {
+            Self::Service => 0,
+            Self::Network => 1,
+            Self::Storage => 2,
+            Self::Vault => 3,
+            Self::HostFile => 4,
+            Self::Video => 5,
+            Self::Debug => 6,
+        }
+    }
+
+    pub const fn from_abi_code(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Service),
+            1 => Some(Self::Network),
+            2 => Some(Self::Storage),
+            3 => Some(Self::Vault),
+            4 => Some(Self::HostFile),
+            5 => Some(Self::Video),
+            6 => Some(Self::Debug),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityGrant {
     pub kind: CapabilityKind,
@@ -678,6 +708,24 @@ mod tests {
         assert_eq!(decoded.source_id, "route:api/me");
         assert_eq!(decoded.capability_abi, CAPABILITY_ABI_VERSION);
         assert_eq!(decoded.artifact_hash, "cd".repeat(32));
+    }
+
+    #[test]
+    fn capability_kind_numeric_abi_is_explicit_and_round_trips() {
+        for (kind, code) in [
+            (CapabilityKind::Service, 0),
+            (CapabilityKind::Network, 1),
+            (CapabilityKind::Storage, 2),
+            (CapabilityKind::Vault, 3),
+            (CapabilityKind::HostFile, 4),
+            (CapabilityKind::Video, 5),
+            (CapabilityKind::Debug, 6),
+        ] {
+            assert_eq!(kind.abi_code(), code);
+            assert_eq!(CapabilityKind::from_abi_code(code), Some(kind));
+        }
+        assert_eq!(CapabilityKind::from_abi_code(-1), None);
+        assert_eq!(CapabilityKind::from_abi_code(7), None);
     }
 
     #[test]

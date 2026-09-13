@@ -6,7 +6,8 @@
 //! RBE worker ABI and return JSON bytes through `rbe.output_write`.
 
 use core_lib::{
-    CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES, CONTAINER_MAX_EXECUTION_INPUT_BYTES, PUBLIC_HTTP_TARGET,
+    ContainerCapabilityKind, CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES,
+    CONTAINER_MAX_EXECUTION_INPUT_BYTES, PUBLIC_HTTP_TARGET,
 };
 use sha2::{Digest, Sha256};
 use wasm_encoder::{
@@ -97,7 +98,12 @@ pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
             return fallback("native HTTP argument payload exceeds the capability envelope");
         }
         (
-            encode_public_http_module(operation, &payload),
+            encode_capability_call_module(
+                ContainerCapabilityKind::Network,
+                PUBLIC_HTTP_TARGET,
+                operation,
+                &payload,
+            ),
             RouteWasmInput::None,
         )
     } else if let Some(value) = static_json(expr) {
@@ -196,9 +202,13 @@ fn static_json(expr: &Expr) -> Option<serde_json::Value> {
     }
 }
 
-fn encode_public_http_module(operation: &str, payload: &[u8]) -> Vec<u8> {
-    const NETWORK_CAPABILITY_KIND: i32 = 1;
-    let target = PUBLIC_HTTP_TARGET.as_bytes();
+fn encode_capability_call_module(
+    kind: ContainerCapabilityKind,
+    target: &str,
+    operation: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    let target = target.as_bytes();
     let operation = operation.as_bytes();
     let target_offset = 0usize;
     let operation_offset = target_offset + target.len();
@@ -250,7 +260,7 @@ fn encode_public_http_module(operation: &str, payload: &[u8]) -> Vec<u8> {
 
     let mut run = Function::new([(1, ValType::I32)]);
     run.instructions()
-        .i32_const(NETWORK_CAPABILITY_KIND)
+        .i32_const(kind.abi_code())
         .i32_const(target_offset as i32)
         .i32_const(target.len() as i32)
         .i32_const(operation_offset as i32)
@@ -537,6 +547,45 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("WASM ABI violation"));
         assert!(message.contains("CAPABILITY_DENIED"));
+    }
+
+    #[test]
+    fn generic_capability_emitter_uses_versioned_kind_mapping_for_video_and_service() {
+        for (kind, target, operation) in [
+            (
+                ContainerCapabilityKind::Video,
+                "module:media.bridge",
+                "status",
+            ),
+            (
+                ContainerCapabilityKind::Service,
+                "service:uac-cache",
+                "get_user",
+            ),
+        ] {
+            let wasm = encode_capability_call_module(kind, target, operation, b"[]");
+            wasmparser::validate(&wasm).unwrap();
+            let expected_kind = kind;
+            let expected_target = target.to_string();
+            let expected_operation = operation.to_string();
+            let host: CapabilityHost = Box::new(move |request| {
+                assert_eq!(request.kind, expected_kind);
+                assert_eq!(request.target, expected_target);
+                assert_eq!(request.operation, expected_operation);
+                assert_eq!(request.payload, b"[]");
+                Ok(br#"{"ok":true}"#.to_vec())
+            });
+            let result = WasmExecutor::new()
+                .unwrap()
+                .execute_with_input_and_capabilities(
+                    &wasm,
+                    &[],
+                    ExecutionLimits::default(),
+                    Some(host),
+                )
+                .unwrap();
+            assert_eq!(result.output, br#"{"ok":true}"#);
+        }
     }
 
     #[test]
