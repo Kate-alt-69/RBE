@@ -188,7 +188,7 @@ impl ContainerClient {
     }
 
     /// Register one source's capability set against an exact Environment or
-    /// a Controller-owned logical profile such as `general`. Controller returns
+    /// a Controller-owned logical profile such as `general` or `secure`. Controller returns
     /// the exact Environment + generation it bound; callers never mint either.
     pub async fn register_capability_manifest(
         &self,

@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use environments::EnvironmentId;
+use environments::{EnvironmentId, EnvironmentProfile};
 use execution_engine::WasmExecutor;
 use ipc_protocol::{read_worker_result, write_worker_input, WorkerResultFrame};
 use resource_limits::ResourceLimits;
@@ -823,6 +823,17 @@ impl Runtime {
             .next_general_environment
             .fetch_add(1, Ordering::Relaxed);
         general_environment_for_sequence(self.config.general_environments, sequence)
+    }
+
+    /// Resolve a logical profile to one exact live Environment. Profiles
+    /// never become provenance identities; callers receive the exact binding.
+    pub fn select_environment_profile(&self, profile: EnvironmentProfile) -> Option<EnvironmentId> {
+        match profile {
+            EnvironmentProfile::General => Some(self.select_general_environment()),
+            EnvironmentProfile::Secure => EnvironmentId::SECURE
+                .into_iter()
+                .find(|id| self.has_environment(*id)),
+        }
     }
 
     pub fn rebalance_once(&self) {

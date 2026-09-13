@@ -31,6 +31,6 @@ mod registry;
 
 pub use abuse::{AbuseDetector, AbuseDimension, AbuseThresholds, AbuseVerdict};
 pub use health::{HealthMonitor, HealthStatus, HealthThresholds};
-pub use id::{EnvironmentId, EnvironmentKind};
+pub use id::{EnvironmentId, EnvironmentKind, EnvironmentProfile};
 pub use payment::{EncryptedPayload, PaymentEnvironment, VAULT_CALLER_IDENTITY};
 pub use registry::EnvironmentRegistry;

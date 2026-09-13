@@ -19,8 +19,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use container_runtime_core::{
-    artifact_sha256_matches, CapabilityBroker, EnvironmentId, EnvironmentRegistry,
-    ExecutionProvenance, Runtime, RuntimeConfig, WorkCost,
+    artifact_sha256_matches, CapabilityBroker, EnvironmentId, EnvironmentProfile,
+    EnvironmentRegistry, ExecutionProvenance, Runtime, RuntimeConfig, WorkCost,
 };
 use execution_engine::{CapabilityHost, ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
@@ -663,12 +663,13 @@ fn handle_connection(
                 }
             } else {
                 let requested_environment = request.environment.clone();
-                let environment = if requested_environment == "general" {
-                    Some(runtime.select_general_environment())
-                } else {
-                    parse_environment(&requested_environment)
-                        .filter(|id| runtime.has_environment(*id))
-                };
+                let environment =
+                    if let Some(profile) = EnvironmentProfile::parse(&requested_environment) {
+                        runtime.select_environment_profile(profile)
+                    } else {
+                        parse_environment(&requested_environment)
+                            .filter(|id| runtime.has_environment(*id))
+                    };
                 let Some(environment) = environment else {
                     return write_frame(
                         &mut stream,

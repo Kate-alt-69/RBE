@@ -34,5 +34,5 @@ pub use worker::{Canceller, Runner, WorkerSnapshot, WorkerState};
 
 pub use environments::{
     AbuseDimension, AbuseVerdict, EncryptedPayload, EnvironmentId, EnvironmentKind,
-    EnvironmentRegistry, HealthStatus, PaymentEnvironment,
+    EnvironmentProfile, EnvironmentRegistry, HealthStatus, PaymentEnvironment,
 };

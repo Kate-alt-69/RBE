@@ -1,8 +1,8 @@
-//! Six sandboxed execution environments: five general-purpose, one
-//! dedicated to payment processing. Kept as a fixed, closed set (not
-//! an arbitrary/dynamic pool) — the payment environment in particular
-//! needs to be a known, specifically-configured thing, not "whichever
-//! environment happened to be free."
+//! Fixed Environment identities plus Controller-owned logical profiles.
+//!
+//! Exact Environment IDs remain the execution/provenance identity. Profiles are
+//! admission-time selectors only: Controller resolves a profile to one exact ID
+//! and generation before registering capabilities or executing code.
 
 use serde::Serialize;
 
@@ -35,6 +35,18 @@ impl EnvironmentId {
         EnvironmentId::General5,
     ];
 
+    /// Current members of the logical `secure` profile. Payment remains the
+    /// compatibility identity for the first secure Environment; future secure
+    /// instances can join this set without changing profile callers.
+    pub const SECURE: [EnvironmentId; 1] = [EnvironmentId::Payment];
+
+    pub fn profile(self) -> EnvironmentProfile {
+        match self {
+            EnvironmentId::Payment => EnvironmentProfile::Secure,
+            _ => EnvironmentProfile::General,
+        }
+    }
+
     pub fn kind(self) -> EnvironmentKind {
         match self {
             EnvironmentId::Payment => EnvironmentKind::Payment,
@@ -56,7 +68,38 @@ impl EnvironmentId {
 
 impl std::fmt::Display for EnvironmentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.label())
+        f.write_str(self.label())
+    }
+}
+
+/// Logical scheduling/trust class owned by Container Controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentProfile {
+    General,
+    Secure,
+}
+
+impl EnvironmentProfile {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Secure => "secure",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "general" => Some(Self::General),
+            "secure" => Some(Self::Secure),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for EnvironmentProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -64,10 +107,32 @@ impl std::fmt::Display for EnvironmentId {
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentKind {
     General,
-    /// The one environment allowed to touch payment data. Everything
-    /// it processes goes through encryption (see `payment` module) —
-    /// never a "trusted because it's the payment one" exception to
-    /// the abuse detection and health monitoring every environment
-    /// gets; those apply here too, in addition to the encryption.
+    /// Compatibility kind for the first secure-profile Environment. Payment's
+    /// encryption boundary remains intact while scheduling authority moves to
+    /// the reusable `secure` profile abstraction.
     Payment,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiles_are_distinct_from_exact_environment_ids() {
+        assert_eq!(
+            EnvironmentProfile::parse("general"),
+            Some(EnvironmentProfile::General)
+        );
+        assert_eq!(
+            EnvironmentProfile::parse("secure"),
+            Some(EnvironmentProfile::Secure)
+        );
+        assert_eq!(EnvironmentProfile::parse("payment"), None);
+        assert_eq!(
+            EnvironmentId::General3.profile(),
+            EnvironmentProfile::General
+        );
+        assert_eq!(EnvironmentId::Payment.profile(), EnvironmentProfile::Secure);
+        assert_eq!(EnvironmentId::SECURE, [EnvironmentId::Payment]);
+    }
 }
