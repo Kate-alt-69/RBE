@@ -17,6 +17,7 @@ mod environment;
 mod execution;
 mod runtime;
 mod storage;
+mod storage_capability;
 mod swamp;
 mod worker;
 
@@ -29,6 +30,10 @@ pub use execution::{
 };
 pub use runtime::{Runtime, RuntimeConfig, DEFAULT_ENVIRONMENT_STORAGE_BYTES};
 pub use storage::{EnvironmentStorageManager, StorageCommit, StorageSnapshot, StorageTransaction};
+pub use storage_capability::{
+    dispatch_storage_capability, storage_capability_operation_allowed, storage_capability_target,
+    StorageCapabilityError, STORAGE_CAPABILITY_OPERATIONS, STORAGE_CAPABILITY_TARGET_PREFIX,
+};
 pub use swamp::SwampSnapshot;
 pub use worker::{Canceller, Runner, WorkerSnapshot, WorkerState};
 
