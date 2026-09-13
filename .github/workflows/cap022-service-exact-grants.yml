@@ -1,0 +1,84 @@
+name: CAP-022 exact Service grants
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap022-service-exact-grants.py'
+      - '.github/workflows/cap022-service-exact-grants.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap022-service-exact-grants
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine
+            container-runtime
+
+      - name: Apply CAP-022 exact Service grants
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap022-service-exact-grants.py
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check Engine Service capability path locked
+        run: cargo check --manifest-path engine/Cargo.toml -p service-runtime -p route-engine -p backend --all-targets --locked
+      - name: Test Engine Service capability path locked
+        run: cargo test --manifest-path engine/Cargo.toml -p service-runtime -p route-engine -p backend --locked
+      - name: Clippy Engine Service capability path locked
+        run: cargo clippy --manifest-path engine/Cargo.toml -p service-runtime -p route-engine -p backend --all-targets --locked -- -D warnings
+      - name: Recheck Controller capability broker locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml -p container-runtime-core control_plane --locked
+
+      - name: Verify CAP-022 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub const SERVICE_CAPABILITY_TARGET_PREFIX: &str = "service:"' engine/crates/service-runtime/src/lib.rs
+          grep -q 'pub fn service_capability_name_allowed' engine/crates/service-runtime/src/lib.rs
+          grep -q 'let mut service_operations = BTreeMap' engine/crates/route-engine/src/runtime_image.rs
+          grep -q 'kind: ContainerCapabilityKind::Service' engine/crates/route-engine/src/runtime_image.rs
+          grep -q 'target: format!("{SERVICE_CAPABILITY_TARGET_PREFIX}{service}")' engine/crates/route-engine/src/runtime_image.rs
+          grep -q 'service_requirements_lower_to_exact_prefixed_grants' engine/crates/route-engine/src/runtime_image.rs
+          grep -q 'let service = target.strip_prefix(SERVICE_CAPABILITY_TARGET_PREFIX)?' engine/crates/backend/src/host_capability.rs
+          grep -q 'service_target_normalization_is_prefixed_and_logical_only' engine/crates/backend/src/host_capability.rs
+          grep -q 'Service/service:<name>' doc/runtime-image.md
+          grep -q 'no linked-module Service/Video call producer' doc/runtime-image.md
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap022-service-exact-grants.yml
+          git rm -f .github/patches/cap022-service-exact-grants.py
+          git add engine doc/runtime-image.md
+          git commit -m "FIX | BUG-CAP-022 lower exact Service capability grants"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
