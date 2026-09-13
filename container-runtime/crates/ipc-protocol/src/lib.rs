@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const CAPABILITY_ABI_VERSION: u16 = 1;
 pub const HOST_CAPABILITY_PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -37,6 +37,19 @@ pub struct RegisterArtifactRequest {
     pub capability_abi: u16,
     pub artifact_hash: String,
     pub wasm: Vec<u8>,
+}
+
+/// Bind an artifact that Controller has already SHA-256 verified and retained.
+/// No executable bytes cross IPC on this fast path; a cache miss must fall back
+/// to RegisterArtifact so Backend can never assert cache presence by itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindArtifactRequest {
+    pub request_id: String,
+    pub auth_token: String,
+    pub runtime_image: String,
+    pub source_id: String,
+    pub capability_abi: u16,
+    pub artifact_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -146,6 +159,7 @@ pub struct ResumeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Hello(Hello),
+    BindArtifact(BindArtifactRequest),
     RegisterArtifact(RegisterArtifactRequest),
     RegisterCapabilityManifest(RegisterCapabilityManifestRequest),
     Execute(ExecuteRequest),
@@ -249,6 +263,14 @@ pub enum Response {
         capability_abi: u16,
         artifact_hash: String,
         already_present: bool,
+        already_bound: bool,
+    },
+    ArtifactBound {
+        request_id: String,
+        runtime_image: String,
+        source_id: String,
+        capability_abi: u16,
+        artifact_hash: String,
         already_bound: bool,
     },
     CapabilityManifestRegistered {
@@ -634,6 +656,28 @@ mod tests {
             panic!("expected execute request");
         };
         assert_eq!(decoded.input, b"request-body");
+    }
+
+    #[test]
+    fn cached_artifact_binding_round_trip_carries_identity_without_wasm() {
+        let request = Request::BindArtifact(BindArtifactRequest {
+            request_id: "bind-1".into(),
+            auth_token: "secret".into(),
+            runtime_image: "ab".repeat(32),
+            source_id: "route:api/me".into(),
+            capability_abi: CAPABILITY_ABI_VERSION,
+            artifact_hash: "cd".repeat(32),
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let decoded = decode_request(&read_frame(&mut bytes.as_slice()).unwrap()).unwrap();
+        let Request::BindArtifact(decoded) = decoded else {
+            panic!("expected cached artifact binding request");
+        };
+        assert_eq!(decoded.runtime_image, "ab".repeat(32));
+        assert_eq!(decoded.source_id, "route:api/me");
+        assert_eq!(decoded.capability_abi, CAPABILITY_ABI_VERSION);
+        assert_eq!(decoded.artifact_hash, "cd".repeat(32));
     }
 
     #[test]

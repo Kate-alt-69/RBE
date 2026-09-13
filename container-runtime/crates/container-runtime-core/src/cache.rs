@@ -180,6 +180,22 @@ impl ArtifactCache {
         Ok(())
     }
 
+    /// Fast path for an artifact already verified during this Controller
+    /// process. On a cold process this falls through to the durable cache and
+    /// verifies SHA-256 before admitting the hash into memory. Workers still
+    /// independently verify the bytes they execute.
+    pub fn verified_artifact_available(&self, artifact_hash: &str) -> bool {
+        if self
+            .artifacts
+            .lock()
+            .expect("artifact cache poisoned")
+            .contains_key(artifact_hash)
+        {
+            return true;
+        }
+        self.contains_artifact(artifact_hash)
+    }
+
     pub fn contains_artifact(&self, artifact_hash: &str) -> bool {
         if artifact_hash.len() != 64
             || !artifact_hash

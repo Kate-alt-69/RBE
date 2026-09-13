@@ -4,11 +4,11 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ipc_protocol::{
-    decode_response, read_frame, write_frame, AwaitResultRequest, CancelRequest, CapabilityGrant,
-    ExecuteRequest, HealthRequest, InspectRequest, PrepareRefreshRequest, RegisterArtifactRequest,
-    RegisterCapabilityManifestRequest, Request, Response, ResumeRequest, WorkCost as IpcWorkCost,
-    CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES,
-    MAX_EXECUTION_OUTPUT_BYTES,
+    decode_response, read_frame, write_frame, AwaitResultRequest, BindArtifactRequest,
+    CancelRequest, CapabilityGrant, ExecuteRequest, HealthRequest, InspectRequest,
+    PrepareRefreshRequest, RegisterArtifactRequest, RegisterCapabilityManifestRequest, Request,
+    Response, ResumeRequest, WorkCost as IpcWorkCost, CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES,
+    MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES,
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -92,6 +92,52 @@ impl ContainerClient {
             address: endpoint.address,
             pid: endpoint.pid,
             generation: endpoint.generation,
+        }
+    }
+
+    /// Ask Controller to bind an already verified cached artifact to this
+    /// exact Runtime Image source. `false` means Controller does not have the
+    /// artifact and the caller must send bytes through RegisterArtifact.
+    pub async fn bind_cached_artifact(
+        &self,
+        identity: ContainerExecutionIdentity<'_>,
+        artifact_hash: &str,
+    ) -> anyhow::Result<bool> {
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request = Request::BindArtifact(BindArtifactRequest {
+            request_id: next_request_id(),
+            auth_token: endpoint.token.clone(),
+            runtime_image: identity.runtime_image.to_string(),
+            source_id: identity.source_id.to_string(),
+            capability_abi: CAPABILITY_ABI_VERSION,
+            artifact_hash: artifact_hash.to_string(),
+        });
+        match call(endpoint, request, Duration::from_secs(5)).await? {
+            Response::ArtifactBound {
+                runtime_image,
+                source_id,
+                capability_abi,
+                artifact_hash: returned_hash,
+                ..
+            } if runtime_image == identity.runtime_image
+                && source_id == identity.source_id
+                && capability_abi == CAPABILITY_ABI_VERSION
+                && returned_hash == artifact_hash =>
+            {
+                Ok(true)
+            }
+            Response::ArtifactBound { .. } => {
+                anyhow::bail!("Container returned a mismatched cached artifact binding")
+            }
+            Response::Error { code, .. } if code == "ARTIFACT_NOT_FOUND" => Ok(false),
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("container cached artifact binding failed [{code}]: {message}")
+            }
+            other => anyhow::bail!("unexpected cached artifact binding response: {other:?}"),
         }
     }
 
@@ -330,15 +376,20 @@ impl ContainerClient {
     }
 
     /// Admit and execute one immutable artifact under one exact capability
-    /// identity. Registration is deliberately repeated/idempotent so an
-    /// Environment generation restart cannot leave a stale backend-side cache
-    /// authorizing work that Controller has already invalidated.
+    /// identity. Controller is queried on every call so Backend never keeps a
+    /// stale authority cache, but verified WASM bytes are only transferred when
+    /// Controller reports a cache miss.
     pub async fn execute_authorized(
         &self,
         request: ContainerAuthorizedExecution<'_>,
     ) -> anyhow::Result<Vec<u8>> {
-        self.register_artifact(request.identity, request.artifact_hash, request.wasm)
-            .await?;
+        if !self
+            .bind_cached_artifact(request.identity, request.artifact_hash)
+            .await?
+        {
+            self.register_artifact(request.identity, request.artifact_hash, request.wasm)
+                .await?;
+        }
         let binding = self
             .register_capability_manifest(request.identity, request.grants)
             .await?;
@@ -473,6 +524,88 @@ mod tests {
 
     fn respond(stream: &mut TcpStream, response: &Response) {
         write_frame(stream, response).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_artifact_binding_uses_identity_only_fast_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "test-container-token".to_string();
+        let server_token = token.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let frame = read_frame(&mut stream).unwrap();
+            let request: Request = serde_json::from_slice(&frame).unwrap();
+            let Request::BindArtifact(request) = request else {
+                panic!("cached bind must not resend RegisterArtifact WASM bytes");
+            };
+            assert_eq!(request.auth_token, server_token);
+            assert_eq!(request.runtime_image, "ab".repeat(32));
+            assert_eq!(request.source_id, "route:api/test");
+            assert_eq!(request.artifact_hash, "cd".repeat(32));
+            respond(
+                &mut stream,
+                &Response::ArtifactBound {
+                    request_id: request.request_id,
+                    runtime_image: request.runtime_image,
+                    source_id: request.source_id,
+                    capability_abi: request.capability_abi,
+                    artifact_hash: request.artifact_hash,
+                    already_bound: true,
+                },
+            );
+        });
+
+        let client = ContainerClient::new(address, token, None);
+        assert!(client
+            .bind_cached_artifact(
+                ContainerExecutionIdentity {
+                    runtime_image: &"ab".repeat(32),
+                    source_id: "route:api/test",
+                    environment: "general",
+                },
+                &"cd".repeat(32),
+            )
+            .await
+            .unwrap());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_artifact_binding_reports_controller_miss_without_faking_authority() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "test-container-token".to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let frame = read_frame(&mut stream).unwrap();
+            let request: Request = serde_json::from_slice(&frame).unwrap();
+            let Request::BindArtifact(request) = request else {
+                panic!("expected cached artifact binding request");
+            };
+            respond(
+                &mut stream,
+                &Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "ARTIFACT_NOT_FOUND".into(),
+                    message: "cold Controller cache".into(),
+                },
+            );
+        });
+
+        let client = ContainerClient::new(address, token, None);
+        assert!(!client
+            .bind_cached_artifact(
+                ContainerExecutionIdentity {
+                    runtime_image: &"ab".repeat(32),
+                    source_id: "route:api/test",
+                    environment: "general",
+                },
+                &"cd".repeat(32),
+            )
+            .await
+            .unwrap());
+        server.join().unwrap();
     }
 
     #[tokio::test]

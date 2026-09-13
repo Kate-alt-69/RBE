@@ -569,6 +569,45 @@ fn handle_connection(
                 }
             }
         }
+        Request::BindArtifact(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else if !runtime
+                .cache()
+                .verified_artifact_available(&request.artifact_hash)
+            {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "ARTIFACT_NOT_FOUND".into(),
+                    message: "verified artifact is not present in the Controller cache".into(),
+                }
+            } else {
+                match capability_broker.register_artifact_binding(
+                    &request.runtime_image,
+                    &request.source_id,
+                    request.capability_abi,
+                    &request.artifact_hash,
+                ) {
+                    Ok(already_bound) => Response::ArtifactBound {
+                        request_id: request.request_id,
+                        runtime_image: request.runtime_image,
+                        source_id: request.source_id,
+                        capability_abi: request.capability_abi,
+                        artifact_hash: request.artifact_hash,
+                        already_bound,
+                    },
+                    Err(error) => Response::Error {
+                        request_id: Some(request.request_id),
+                        code: error.code.into(),
+                        message: error.message,
+                    },
+                }
+            }
+        }
         Request::RegisterArtifact(request) => {
             if request.auth_token != token {
                 Response::Error {
@@ -691,7 +730,10 @@ fn handle_connection(
                     code: "EXECUTION_INPUT_TOO_LARGE".into(),
                     message: format!("execution input exceeds {MAX_EXECUTION_INPUT_BYTES} bytes"),
                 }
-            } else if !runtime.cache().contains_artifact(&request.artifact_hash) {
+            } else if !runtime
+                .cache()
+                .verified_artifact_available(&request.artifact_hash)
+            {
                 Response::Error {
                     request_id: Some(request.request_id),
                     code: "ARTIFACT_NOT_FOUND".into(),
