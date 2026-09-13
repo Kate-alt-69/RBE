@@ -1,0 +1,89 @@
+name: CAP-023 canonical capability kind ABI
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/cap023-capability-kind-abi.py'
+      - '.github/workflows/cap023-capability-kind-abi.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cap023-capability-kind-abi
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            container-runtime
+            engine
+
+      - name: Apply CAP-023 canonical capability kind ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/cap023-capability-kind-abi.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Check Container ABI path locked
+        run: cargo check --manifest-path container-runtime/Cargo.toml -p ipc-protocol -p execution-engine --all-targets --locked
+      - name: Test Container ABI path locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml -p ipc-protocol -p execution-engine --locked
+      - name: Clippy Container ABI path locked
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml -p ipc-protocol -p execution-engine --all-targets --locked -- -D warnings
+
+      - name: Check Route compiler ABI path locked
+        run: cargo check --manifest-path engine/Cargo.toml -p route-engine --all-targets --locked
+      - name: Test Route compiler ABI path locked
+        run: cargo test --manifest-path engine/Cargo.toml -p route-engine --locked
+      - name: Clippy Route compiler ABI path locked
+        run: cargo clippy --manifest-path engine/Cargo.toml -p route-engine --all-targets --locked -- -D warnings
+
+      - name: Verify CAP-023 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub const fn abi_code(self) -> i32' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'pub const fn from_abi_code(value: i32)' container-runtime/crates/ipc-protocol/src/lib.rs
+          grep -q 'CapabilityKind::from_abi_code(kind)' container-runtime/crates/execution-engine/src/lib.rs
+          ! grep -q 'fn capability_kind_from_abi' container-runtime/crates/execution-engine/src/lib.rs
+          grep -q 'fn encode_capability_call_module' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q '.i32_const(kind.abi_code())' engine/crates/route-engine/src/wasm_compiler.rs
+          ! grep -q 'NETWORK_CAPABILITY_KIND' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q 'generic_capability_emitter_uses_versioned_kind_mapping_for_video_and_service' engine/crates/route-engine/src/wasm_compiler.rs
+          grep -q 'Capability kind integers are defined centrally' doc/runtime-image.md
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cap023-capability-kind-abi.yml
+          git rm -f .github/patches/cap023-capability-kind-abi.py
+          git add container-runtime engine/crates/route-engine doc/runtime-image.md
+          git commit -m "FIX | BUG-CAP-023 centralize capability kind ABI mapping"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
