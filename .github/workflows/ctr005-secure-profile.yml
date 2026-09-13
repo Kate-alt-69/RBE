@@ -1,0 +1,289 @@
+name: CTR-005 secure Environment profile
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ctr005-secure-profile.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ctr005-secure-profile
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+
+      - name: Apply secure Environment profile authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str, label: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one anchor, found {count}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          id_path = 'container-runtime/crates/environments/src/id.rs'
+          replace_once(
+              id_path,
+              '''    pub const GENERAL: [EnvironmentId; 5] = [
+                  EnvironmentId::General1,
+                  EnvironmentId::General2,
+                  EnvironmentId::General3,
+                  EnvironmentId::General4,
+                  EnvironmentId::General5,
+              ];
+
+              pub fn kind(self) -> EnvironmentKind {''',
+              '''    pub const GENERAL: [EnvironmentId; 5] = [
+                  EnvironmentId::General1,
+                  EnvironmentId::General2,
+                  EnvironmentId::General3,
+                  EnvironmentId::General4,
+                  EnvironmentId::General5,
+              ];
+
+              /// Current members of the hardened logical `secure` profile.
+              /// Payment remains the compatibility identity for the first secure
+              /// Environment; future secure-N instances can join this set without
+              /// changing callers that request the logical profile.
+              pub const SECURE: [EnvironmentId; 1] = [EnvironmentId::Payment];
+
+              pub fn profile(self) -> EnvironmentProfile {
+                  match self {
+                      EnvironmentId::Payment => EnvironmentProfile::Secure,
+                      _ => EnvironmentProfile::General,
+                  }
+              }
+
+              pub fn kind(self) -> EnvironmentKind {''',
+              'Environment secure profile membership',
+          )
+          replace_once(
+              id_path,
+              '''impl std::fmt::Display for EnvironmentId {
+              fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                  write!(f, "{}", self.label())
+              }
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]''',
+              '''impl std::fmt::Display for EnvironmentId {
+              fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                  write!(f, "{}", self.label())
+              }
+          }
+
+          /// Logical Controller-owned scheduling/trust profile. A profile is not
+          /// an execution identity: Controller always resolves it to one exact
+          /// Environment and generation before capability admission.
+          #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+          #[serde(rename_all = "snake_case")]
+          pub enum EnvironmentProfile {
+              General,
+              Secure,
+          }
+
+          impl EnvironmentProfile {
+              pub const fn label(self) -> &'static str {
+                  match self {
+                      Self::General => "general",
+                      Self::Secure => "secure",
+                  }
+              }
+
+              pub fn parse(value: &str) -> Option<Self> {
+                  match value {
+                      "general" => Some(Self::General),
+                      "secure" => Some(Self::Secure),
+                      _ => None,
+                  }
+              }
+          }
+
+          impl std::fmt::Display for EnvironmentProfile {
+              fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                  f.write_str(self.label())
+              }
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]''',
+              'EnvironmentProfile type',
+          )
+          p = Path(id_path)
+          text = p.read_text(encoding='utf-8')
+          if '#[cfg(test)]' in text:
+              raise SystemExit('id.rs unexpectedly already has a test module')
+          text += '''
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+
+              #[test]
+              fn logical_profiles_are_distinct_from_exact_environment_ids() {
+                  assert_eq!(EnvironmentProfile::parse("general"), Some(EnvironmentProfile::General));
+                  assert_eq!(EnvironmentProfile::parse("secure"), Some(EnvironmentProfile::Secure));
+                  assert_eq!(EnvironmentProfile::parse("payment"), None);
+                  assert_eq!(EnvironmentId::General3.profile(), EnvironmentProfile::General);
+                  assert_eq!(EnvironmentId::Payment.profile(), EnvironmentProfile::Secure);
+                  assert_eq!(EnvironmentId::SECURE, [EnvironmentId::Payment]);
+              }
+          }
+          '''
+          p.write_text(text, encoding='utf-8')
+
+          replace_once(
+              'container-runtime/crates/environments/src/lib.rs',
+              'pub use id::{EnvironmentId, EnvironmentKind};',
+              'pub use id::{EnvironmentId, EnvironmentKind, EnvironmentProfile};',
+              'environments profile export',
+          )
+          replace_once(
+              'container-runtime/crates/container-runtime-core/src/lib.rs',
+              '''    AbuseDimension, AbuseVerdict, EncryptedPayload, EnvironmentId, EnvironmentKind,
+              EnvironmentRegistry, HealthStatus, PaymentEnvironment,''',
+              '''    AbuseDimension, AbuseVerdict, EncryptedPayload, EnvironmentId, EnvironmentKind,
+              EnvironmentProfile, EnvironmentRegistry, HealthStatus, PaymentEnvironment,''',
+              'core profile re-export',
+          )
+          replace_once(
+              'container-runtime/crates/container-runtime-core/src/runtime.rs',
+              'use environments::EnvironmentId;',
+              'use environments::{EnvironmentId, EnvironmentProfile};',
+              'runtime profile import',
+          )
+          replace_once(
+              'container-runtime/crates/container-runtime-core/src/runtime.rs',
+              '''    pub fn select_general_environment(&self) -> EnvironmentId {
+                  let sequence = self
+                      .next_general_environment
+                      .fetch_add(1, Ordering::Relaxed);
+                  general_environment_for_sequence(self.config.general_environments, sequence)
+              }
+
+              pub fn rebalance_once(&self) {''',
+              '''    pub fn select_general_environment(&self) -> EnvironmentId {
+                  let sequence = self
+                      .next_general_environment
+                      .fetch_add(1, Ordering::Relaxed);
+                  general_environment_for_sequence(self.config.general_environments, sequence)
+              }
+
+              /// Resolve a logical profile to one exact live Environment. The
+              /// returned Environment is the only identity that may be stamped
+              /// into capability manifests/execution provenance.
+              pub fn select_environment_profile(
+                  &self,
+                  profile: EnvironmentProfile,
+              ) -> Option<EnvironmentId> {
+                  match profile {
+                      EnvironmentProfile::General => Some(self.select_general_environment()),
+                      EnvironmentProfile::Secure => EnvironmentId::SECURE
+                          .into_iter()
+                          .find(|id| self.has_environment(*id)),
+                  }
+              }
+
+              pub fn rebalance_once(&self) {''',
+              'runtime logical profile resolver',
+          )
+          replace_once(
+              'container-runtime/crates/container-bin/src/main.rs',
+              '''    artifact_sha256_matches, CapabilityBroker, EnvironmentId, EnvironmentRegistry,
+              ExecutionProvenance, Runtime, RuntimeConfig, WorkCost,''',
+              '''    artifact_sha256_matches, CapabilityBroker, EnvironmentId, EnvironmentProfile,
+              EnvironmentRegistry, ExecutionProvenance, Runtime, RuntimeConfig, WorkCost,''',
+              'Controller profile import',
+          )
+          replace_once(
+              'container-runtime/crates/container-bin/src/main.rs',
+              '''                let requested_environment = request.environment.clone();
+                  let environment = if requested_environment == "general" {
+                      Some(runtime.select_general_environment())
+                  } else {
+                      parse_environment(&requested_environment)
+                          .filter(|id| runtime.has_environment(*id))
+                  };''',
+              '''                let requested_environment = request.environment.clone();
+                  let environment = if let Some(profile) =
+                      EnvironmentProfile::parse(&requested_environment)
+                  {
+                      runtime.select_environment_profile(profile)
+                  } else {
+                      parse_environment(&requested_environment)
+                          .filter(|id| runtime.has_environment(*id))
+                  };''',
+              'Controller profile admission',
+          )
+          replace_once(
+              'engine/crates/core/src/container_client.rs',
+              '/// a Controller-owned logical profile such as `general`. Controller returns',
+              '/// a Controller-owned logical profile such as `general` or `secure`. Controller returns',
+              'client profile contract docs',
+          )
+          PY
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+
+      - name: Check Container workspace locked
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Test Environment profile contract locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml -p environments -p container-runtime-core --locked
+      - name: Clippy Container workspace locked
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - name: Verify CTR-005 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'pub enum EnvironmentProfile' container-runtime/crates/environments/src/id.rs
+          grep -q 'Self::Secure => "secure"' container-runtime/crates/environments/src/id.rs
+          grep -q 'pub const SECURE: \[EnvironmentId; 1\]' container-runtime/crates/environments/src/id.rs
+          grep -q 'select_environment_profile' container-runtime/crates/container-runtime-core/src/runtime.rs
+          grep -q 'EnvironmentProfile::parse(&requested_environment)' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'such as `general` or `secure`' engine/crates/core/src/container_client.rs
+          git diff --check
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/ctr005-secure-profile.yml
+          git add container-runtime/crates/environments/src/id.rs \
+                  container-runtime/crates/environments/src/lib.rs \
+                  container-runtime/crates/container-runtime-core/src/lib.rs \
+                  container-runtime/crates/container-runtime-core/src/runtime.rs \
+                  container-runtime/crates/container-bin/src/main.rs \
+                  engine/crates/core/src/container_client.rs
+          git commit -m "FIX | BUG-CTR-005 introduce Controller-owned secure Environment profile"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
