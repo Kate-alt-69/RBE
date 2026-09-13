@@ -35,7 +35,10 @@ pub use network_broker::{
     call_public_http, PublicHttpError, PUBLIC_HTTP_MAX_TIMEOUT_MS, PUBLIC_HTTP_REQUEST_MAX_BYTES,
     PUBLIC_HTTP_RESPONSE_MAX_BYTES, PUBLIC_HTTP_TARGET,
 };
-pub use video_language::{VideoLanguage, VideoLanguageError};
+pub use video_language::{
+    video_language_operation_allowed, VideoLanguage, VideoLanguageError,
+    VIDEO_CAPABILITY_TARGET_PREFIX, VIDEO_LANGUAGE_OPERATIONS,
+};
 
 /// Validate a candidate settings file with the exact same typed loader used at
 /// backend startup. The dashboard uses this before replacing `settings.json`,

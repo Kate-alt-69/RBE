@@ -2,7 +2,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use core_lib::{call_public_http, PUBLIC_HTTP_TARGET};
+use core_lib::{
+    call_public_http, video_language_operation_allowed, VideoLanguage, PUBLIC_HTTP_TARGET,
+    VIDEO_CAPABILITY_TARGET_PREFIX,
+};
 use ipc_protocol::{
     CapabilityKind, HostCapabilityRequest, HostCapabilityResponse, CAPABILITY_ABI_VERSION,
     HOST_CAPABILITY_PROTOCOL_VERSION, MAX_CAPABILITY_PAYLOAD_BYTES,
@@ -43,6 +46,7 @@ impl HostCapabilityEndpoint {
 pub struct HostCapabilityBridge {
     endpoint: HostCapabilityEndpoint,
     services: Arc<RwLock<Option<ServiceManager>>>,
+    video: Arc<RwLock<VideoLanguage>>,
     server_task: JoinHandle<()>,
 }
 
@@ -59,7 +63,9 @@ impl HostCapabilityBridge {
             token: token.clone(),
         };
         let services = Arc::new(RwLock::new(None));
+        let video = Arc::new(RwLock::new(VideoLanguage::new(None)));
         let server_services = Arc::clone(&services);
+        let server_video = Arc::clone(&video);
         let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let server_task = tokio::spawn(async move {
             loop {
@@ -82,12 +88,13 @@ impl HostCapabilityBridge {
                     }
                 };
                 let services = Arc::clone(&server_services);
+                let video = Arc::clone(&server_video);
                 let expected_token = token.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     match tokio::time::timeout(
                         HOST_CAPABILITY_TIMEOUT,
-                        handle_connection(stream, expected_token, services),
+                        handle_connection(stream, expected_token, services, video),
                     )
                     .await
                     {
@@ -104,6 +111,7 @@ impl HostCapabilityBridge {
         Ok(Self {
             endpoint,
             services,
+            video,
             server_task,
         })
     }
@@ -114,6 +122,10 @@ impl HostCapabilityBridge {
 
     pub async fn install_service_manager(&self, manager: ServiceManager) {
         *self.services.write().await = Some(manager);
+    }
+
+    pub async fn install_video_manager(&self, manager: Option<Arc<video_manager::VideoManager>>) {
+        *self.video.write().await = VideoLanguage::new(manager);
     }
 }
 
@@ -127,9 +139,10 @@ async fn handle_connection(
     mut stream: TcpStream,
     expected_token: String,
     services: Arc<RwLock<Option<ServiceManager>>>,
+    video: Arc<RwLock<VideoLanguage>>,
 ) -> anyhow::Result<()> {
     let request: HostCapabilityRequest = read_typed_frame(&mut stream).await?;
-    let response = dispatch_request(request, &expected_token, &services).await;
+    let response = dispatch_request(request, &expected_token, &services, &video).await;
     write_typed_frame(&mut stream, &response).await?;
     Ok(())
 }
@@ -138,6 +151,7 @@ async fn dispatch_request(
     request: HostCapabilityRequest,
     expected_token: &str,
     services: &Arc<RwLock<Option<ServiceManager>>>,
+    video: &Arc<RwLock<VideoLanguage>>,
 ) -> HostCapabilityResponse {
     let error = |code: &str, message: &str| HostCapabilityResponse::Error {
         execution_id: request.execution_id.clone(),
@@ -238,6 +252,74 @@ async fn dispatch_request(
             return error(
                 "CAPABILITY_RESPONSE_TOO_LARGE",
                 "trusted public HTTP response exceeded the capability grant",
+            );
+        }
+        return HostCapabilityResponse::Success {
+            execution_id: request.execution_id,
+            call_id: request.call_id,
+            payload,
+        };
+    }
+    if request.kind == CapabilityKind::Video {
+        let Some(module_owner) = normalize_video_target(&request.target) else {
+            return error(
+                "CAPABILITY_HOST_INVALID_TARGET",
+                "Video capability target must be an exact module principal",
+            );
+        };
+        if !video_language_operation_allowed(&request.operation) {
+            return error(
+                "CAPABILITY_HOST_INVALID_OPERATION",
+                "invalid Video capability operation",
+            );
+        }
+        let args: Vec<Value> = match serde_json::from_slice(&request.payload) {
+            Ok(args) => args,
+            Err(_) => {
+                return error(
+                    "CAPABILITY_VIDEO_ARGS_INVALID",
+                    "Video capability payload must be a JSON argument array",
+                )
+            }
+        };
+        let language = video.read().await.clone();
+        let value = match language.call(module_owner, &request.operation, &args) {
+            Ok(value) => value,
+            Err(call_error) => {
+                tracing::warn!(
+                    execution_id = %request.execution_id,
+                    runtime_image = %request.runtime_image,
+                    source_id = %request.source_id,
+                    environment = %request.environment,
+                    generation = request.generation,
+                    call_id = request.call_id,
+                    module_owner,
+                    operation = %request.operation,
+                    error = %call_error,
+                    "authorized sandbox Video capability call failed"
+                );
+                return error(
+                    "CAPABILITY_VIDEO_CALL_FAILED",
+                    "trusted Video Manager call failed",
+                );
+            }
+        };
+        let payload = match serde_json::to_vec(&value) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return error(
+                    "CAPABILITY_VIDEO_RESPONSE_INVALID",
+                    "trusted Video Manager returned an unserializable response",
+                )
+            }
+        };
+        let response_limit = request
+            .max_response_bytes
+            .min(MAX_CAPABILITY_PAYLOAD_BYTES as u64) as usize;
+        if payload.len() > response_limit {
+            return error(
+                "CAPABILITY_RESPONSE_TOO_LARGE",
+                "trusted Video Manager response exceeded the capability grant",
             );
         }
         return HostCapabilityResponse::Success {
@@ -351,6 +433,11 @@ fn valid_environment_identity(value: &str) -> bool {
     )
 }
 
+fn normalize_video_target(target: &str) -> Option<&str> {
+    let owner = target.strip_prefix(VIDEO_CAPABILITY_TARGET_PREFIX)?;
+    valid_logical_name(owner).then_some(owner)
+}
+
 fn normalize_service_target(target: &str) -> Option<&str> {
     let target = target.strip_prefix("service:").unwrap_or(target);
     valid_logical_name(target).then_some(target)
@@ -423,6 +510,7 @@ mod tests {
     #[tokio::test]
     async fn host_bridge_rejects_invalid_attested_provenance_before_dispatch() {
         let services = Arc::new(RwLock::new(None));
+        let video = Arc::new(RwLock::new(VideoLanguage::new(None)));
         let request = HostCapabilityRequest {
             version: HOST_CAPABILITY_PROTOCOL_VERSION,
             auth_token: "secret".into(),
@@ -439,11 +527,49 @@ mod tests {
             payload: br#"["https://example.com"]"#.to_vec(),
             max_response_bytes: 4096,
         };
-        let response = dispatch_request(request, "secret", &services).await;
+        let response = dispatch_request(request, "secret", &services, &video).await;
         let HostCapabilityResponse::Error { code, .. } = response else {
             panic!("malformed provenance must fail before capability dispatch");
         };
         assert_eq!(code, "CAPABILITY_HOST_PROVENANCE_INVALID");
+    }
+
+    #[test]
+    fn video_target_requires_exact_module_principal() {
+        assert_eq!(
+            normalize_video_target("module:learning.catalog"),
+            Some("learning.catalog")
+        );
+        assert_eq!(normalize_video_target("learning.catalog"), None);
+        assert_eq!(normalize_video_target("module:../catalog"), None);
+        assert_eq!(normalize_video_target("module:learning/catalog"), None);
+    }
+
+    #[tokio::test]
+    async fn video_dispatch_uses_authorized_target_as_owner_and_not_payload_identity() {
+        let services = Arc::new(RwLock::new(None));
+        let video = Arc::new(RwLock::new(VideoLanguage::new(None)));
+        let request = HostCapabilityRequest {
+            version: HOST_CAPABILITY_PROTOCOL_VERSION,
+            auth_token: "secret".into(),
+            execution_id: "exec-video-1".into(),
+            runtime_image: "ab".repeat(32),
+            source_id: "route:physical:api/catalog".into(),
+            capability_abi: CAPABILITY_ABI_VERSION,
+            environment: "general-1".into(),
+            generation: 3,
+            call_id: 9,
+            kind: CapabilityKind::Video,
+            target: "module:learning.catalog".into(),
+            operation: "status".into(),
+            payload: b"[]".to_vec(),
+            max_response_bytes: 4096,
+        };
+        let response = dispatch_request(request, "secret", &services, &video).await;
+        let HostCapabilityResponse::Error { code, .. } = response else {
+            panic!("disabled Video Manager should fail inside the Video adapter");
+        };
+        assert_eq!(code, "CAPABILITY_VIDEO_CALL_FAILED");
     }
 
     #[test]

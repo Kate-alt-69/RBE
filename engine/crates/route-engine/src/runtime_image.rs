@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use core_lib::{
-    ContainerCapabilityGrant, ContainerCapabilityKind, CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES,
-    PUBLIC_HTTP_TARGET,
+    video_language_operation_allowed, ContainerCapabilityGrant, ContainerCapabilityKind,
+    CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES, PUBLIC_HTTP_TARGET, VIDEO_CAPABILITY_TARGET_PREFIX,
 };
 use sha2::{Digest, Sha256};
 
@@ -47,6 +47,7 @@ fn lower_container_grants(
     requirements: &BTreeSet<RuntimeCapabilityRequirement>,
 ) -> Result<Vec<ContainerCapabilityGrant>, RuntimeCapabilityLoweringError> {
     let mut public_http_operations = BTreeSet::new();
+    let mut video_operations = BTreeMap::<String, BTreeSet<String>>::new();
     for requirement in requirements {
         match requirement {
             RuntimeCapabilityRequirement::PublicHttp { operation } => {
@@ -60,11 +61,24 @@ fn lower_container_grants(
                 public_http_operations.insert(operation.clone());
             }
             RuntimeCapabilityRequirement::Video { owner, operation } => {
-                return Err(RuntimeCapabilityLoweringError {
-                    message: format!(
-                        "Video capability principal {owner:?} operation {operation:?} has no native Container grant lowering yet"
-                    ),
-                });
+                if !valid_video_owner(owner) {
+                    return Err(RuntimeCapabilityLoweringError {
+                        message: format!(
+                            "Video capability principal {owner:?} is not a canonical Module owner"
+                        ),
+                    });
+                }
+                if !video_language_operation_allowed(operation) {
+                    return Err(RuntimeCapabilityLoweringError {
+                        message: format!(
+                            "Video capability operation {operation:?} is not part of the Video language surface"
+                        ),
+                    });
+                }
+                video_operations
+                    .entry(owner.clone())
+                    .or_default()
+                    .insert(operation.clone());
             }
             RuntimeCapabilityRequirement::Service { service, operation } => {
                 return Err(RuntimeCapabilityLoweringError {
@@ -76,20 +90,37 @@ fn lower_container_grants(
         }
     }
 
-    if public_http_operations.is_empty() {
-        return Ok(Vec::new());
+    let mut grants = Vec::new();
+    if !public_http_operations.is_empty() {
+        grants.push(ContainerCapabilityGrant {
+            kind: ContainerCapabilityKind::Network,
+            target: PUBLIC_HTTP_TARGET.to_string(),
+            operations: public_http_operations.into_iter().collect(),
+            // These are capability-envelope limits, not HTTP body limits. The
+            // shared Network Broker applies the stricter HTTP request/response
+            // policy after Controller authorization.
+            max_request_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
+            max_response_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
+        });
     }
+    for (owner, operations) in video_operations {
+        grants.push(ContainerCapabilityGrant {
+            kind: ContainerCapabilityKind::Video,
+            target: format!("{VIDEO_CAPABILITY_TARGET_PREFIX}{owner}"),
+            operations: operations.into_iter().collect(),
+            max_request_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
+            max_response_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
+        });
+    }
+    Ok(grants)
+}
 
-    Ok(vec![ContainerCapabilityGrant {
-        kind: ContainerCapabilityKind::Network,
-        target: PUBLIC_HTTP_TARGET.to_string(),
-        operations: public_http_operations.into_iter().collect(),
-        // These are capability-envelope limits, not HTTP body limits. The
-        // shared Network Broker applies the stricter HTTP request/response
-        // policy after Controller authorization.
-        max_request_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
-        max_response_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
-    }])
+fn valid_video_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= 249
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 #[derive(Debug, Clone)]
@@ -348,23 +379,58 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_native_capability_requirements_fail_closed() {
-        for requirement in [
+    fn video_requirements_lower_to_exact_module_principal_grants() {
+        let requirements = BTreeSet::from([
             RuntimeCapabilityRequirement::Video {
                 owner: "media.bridge".into(),
                 operation: "status".into(),
             },
-            RuntimeCapabilityRequirement::Service {
-                service: "uac".into(),
-                operation: "get_user".into(),
+            RuntimeCapabilityRequirement::Video {
+                owner: "media.bridge".into(),
+                operation: "get".into(),
+            },
+            RuntimeCapabilityRequirement::Video {
+                owner: "media.other".into(),
+                operation: "variants".into(),
+            },
+        ]);
+        let grants = lower_container_grants(&requirements).unwrap();
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[0].kind, ContainerCapabilityKind::Video);
+        assert_eq!(grants[0].target, "module:media.bridge");
+        assert_eq!(grants[0].operations, vec!["get", "status"]);
+        assert_eq!(grants[1].kind, ContainerCapabilityKind::Video);
+        assert_eq!(grants[1].target, "module:media.other");
+        assert_eq!(grants[1].operations, vec!["variants"]);
+    }
+
+    #[test]
+    fn invalid_video_operation_or_principal_fails_closed() {
+        for requirement in [
+            RuntimeCapabilityRequirement::Video {
+                owner: "media.bridge".into(),
+                operation: "deleteEverything".into(),
+            },
+            RuntimeCapabilityRequirement::Video {
+                owner: "../media".into(),
+                operation: "status".into(),
             },
         ] {
-            let error = lower_container_grants(&BTreeSet::from([requirement]))
-                .expect_err("unsupported capability must not be silently dropped");
-            assert!(error
-                .message
-                .contains("no native Container grant lowering yet"));
+            assert!(lower_container_grants(&BTreeSet::from([requirement])).is_err());
         }
+    }
+
+    #[test]
+    fn service_requirements_remain_fail_closed() {
+        let requirement = RuntimeCapabilityRequirement::Service {
+            service: "uac".into(),
+            operation: "get_user".into(),
+        };
+        let error = lower_container_grants(&BTreeSet::from([requirement]))
+            .expect_err("Service lowering is not implemented yet");
+        assert!(error
+            .message
+            .contains("no native Container grant lowering yet"));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use core_lib::VIDEO_LANGUAGE_OPERATIONS;
 use serde_json::Value as JsonValue;
 use service_runtime::ServiceCatalog;
 
@@ -766,23 +767,6 @@ fn logical_module_name(path: &str) -> String {
 }
 
 const HTTP_HOST_OPERATIONS: &[&str] = &["get", "post", "request"];
-const VIDEO_HOST_OPERATIONS: &[&str] = &[
-    "status",
-    "databaseHealth",
-    "database_health",
-    "get",
-    "job",
-    "variants",
-    "create",
-    "queueDownload",
-    "queue_download",
-    "reserveLive",
-    "reserve_live",
-    "liveSession",
-    "live_session",
-    "endLive",
-    "end_live",
-];
 
 fn builtin_host_requirements(
     source: &SourceId,
@@ -792,7 +776,7 @@ fn builtin_host_requirements(
 ) -> Result<BTreeSet<RuntimeCapabilityRequirement>, RelcError> {
     let operations = match module {
         "http" => HTTP_HOST_OPERATIONS,
-        "vm" | "video-manager" => VIDEO_HOST_OPERATIONS,
+        "vm" | "video-manager" => VIDEO_LANGUAGE_OPERATIONS,
         _ => return Ok(BTreeSet::new()),
     };
     let video_owner = if matches!(module, "vm" | "video-manager") {

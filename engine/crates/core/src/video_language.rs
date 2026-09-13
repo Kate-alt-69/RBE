@@ -12,6 +12,35 @@ use video_manager::{
     VideoLiveSession, VideoManager, VideoSourceType, VideoVariant,
 };
 
+/// Exact public operation names accepted by the Video language facade. RELC,
+/// Container grant lowering, and the trusted host adapter all consume this one
+/// list so authority cannot drift from the actual language surface.
+pub const VIDEO_LANGUAGE_OPERATIONS: &[&str] = &[
+    "status",
+    "databaseHealth",
+    "database_health",
+    "get",
+    "job",
+    "variants",
+    "create",
+    "queueDownload",
+    "queue_download",
+    "reserveLive",
+    "reserve_live",
+    "liveSession",
+    "live_session",
+    "endLive",
+    "end_live",
+];
+
+/// Controller-visible Video targets are principals, never sockets or database
+/// handles. The suffix is the canonical Module owner supplied by RELC.
+pub const VIDEO_CAPABILITY_TARGET_PREFIX: &str = "module:";
+
+pub fn video_language_operation_allowed(operation: &str) -> bool {
+    VIDEO_LANGUAGE_OPERATIONS.contains(&operation)
+}
+
 #[derive(Clone)]
 pub struct VideoLanguage {
     manager: Option<Arc<VideoManager>>,
@@ -418,6 +447,15 @@ mod tests {
             "rbe-video-language-{name}-{}-{nonce}.db",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn exported_operation_allowlist_matches_language_aliases() {
+        for operation in VIDEO_LANGUAGE_OPERATIONS {
+            assert!(video_language_operation_allowed(operation));
+        }
+        assert!(!video_language_operation_allowed("deleteEverything"));
+        assert_eq!(VIDEO_CAPABILITY_TARGET_PREFIX, "module:");
     }
 
     #[test]

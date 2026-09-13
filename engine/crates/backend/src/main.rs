@@ -777,6 +777,14 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         (None, None)
     };
 
+    host_capability_bridge
+        .install_video_manager(video_manager.clone())
+        .await;
+    tracing::info!(
+        enabled = video_manager.is_some(),
+        "trusted host capability bridge attached to Video Manager"
+    );
+
     let app_state = AppState::new(
         config.clone(),
         state_rx,
