@@ -1,0 +1,84 @@
+name: CTR-007 worker crash circuit
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/ctr007-worker-crash-circuit.py'
+      - '.github/patches/ctr007-stagefix.py'
+      - '.github/workflows/ctr007-worker-crash-circuit.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ctr007-worker-crash-circuit
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+
+      - name: Apply CTR-007 crash circuit and teardown fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/ctr007-stagefix.py
+          python3 .github/patches/ctr007-worker-crash-circuit.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+
+      - name: Check Container workspace locked
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+      - name: Test Container workspace locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace locked
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Verify CTR-007 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'const WORKER_CRASH_THRESHOLD: u32 = 3' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'const WORKER_CRASH_WINDOW: Duration = Duration::from_secs(30)' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'const WORKER_CRASH_COOLDOWN: Duration = Duration::from_secs(60)' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'struct WorkerChildGuard' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'fn terminate(&mut self)' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'impl Drop for WorkerChildGuard' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'ARTIFACT_CRASH_CIRCUIT_OPEN' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'code: "WORKER_CRASH"' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'artifact_crash_circuits_open' container-runtime/crates/container-bin/src/main.rs
+          grep -q 'crash_circuit_opens_then_allows_one_half_open_probe' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'secure_environment_never_inherits_controller_debug' container-runtime/crates/container-bin/src/environment_process.rs
+          git diff --check
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm -f .github/workflows/ctr007-worker-crash-circuit.yml
+          git rm -f .github/patches/ctr007-worker-crash-circuit.py
+          git rm -f .github/patches/ctr007-stagefix.py
+          git add container-runtime/crates/container-bin/src/environment_process.rs container-runtime/crates/container-bin/src/main.rs
+          git commit -m "FIX | BUG-CTR-007 quarantine crashing workers and guarantee teardown"
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
