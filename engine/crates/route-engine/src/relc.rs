@@ -29,7 +29,7 @@ use crate::runtime_image::{
 use crate::server_policy::{ServerPolicy, ServerPolicyError};
 use crate::server_rel::{compile_server_source, ServerCompileError, ServerProgram};
 use crate::source_registry::{RelSourceKind, RelSourceRegistry, SourceId, SourceRegistryError};
-use crate::wasm_compiler::{compile_route, RouteWasmCompilation};
+use crate::wasm_compiler::{compile_route_with_links, RouteWasmCompilation, RouteWasmLinkContext};
 
 #[derive(Debug, Clone)]
 pub struct PhysicalRelSource {
@@ -321,7 +321,8 @@ pub fn compile_runtime_image(
         let CompiledUnit::Route(file) = unit else {
             continue;
         };
-        match compile_route(file) {
+        let link_context = route_wasm_link_context(&registry, &compiled, file);
+        match compile_route_with_links(file, &link_context) {
             RouteWasmCompilation::Native(artifact) => {
                 route_wasm_artifacts.insert(id.clone(), artifact);
             }
@@ -385,6 +386,43 @@ pub fn compile_runtime_image(
         route_wasm_fallbacks,
         executables,
     })
+}
+
+fn route_wasm_link_context(
+    registry: &RelSourceRegistry,
+    compiled: &BTreeMap<SourceId, CompiledUnit>,
+    route: &RouteFile,
+) -> RouteWasmLinkContext {
+    let mut context = RouteWasmLinkContext::default();
+    for import in &route.imports {
+        let ImportTarget::CustomFunction { path, function } = import_base(import) else {
+            continue;
+        };
+        let logical = logical_module_name(path);
+        let Some(source) = registry.get_logical(RelSourceKind::Module, &logical) else {
+            continue;
+        };
+        let Some(CompiledUnit::Module(module)) = compiled.get(source.id()) else {
+            continue;
+        };
+        if !module.exports.iter().any(|export| export == function) {
+            continue;
+        }
+        let Some(function_def) = module
+            .functions
+            .iter()
+            .find(|candidate| candidate.name == *function)
+        else {
+            continue;
+        };
+        context.insert_module_function(
+            binding_name(import),
+            module_owner_from_logical_name(source.logical_name()),
+            function_def.clone(),
+            module.imports.clone(),
+        );
+    }
+    context
 }
 
 fn runtime_env_from_settings(
@@ -1261,6 +1299,73 @@ mod tests {
                 operation: "post".into(),
             }
         ));
+    }
+
+    #[test]
+    fn linked_video_module_wrapper_compiles_native_with_exact_owner_grant() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "media/status",
+                "module/media/status.module",
+                r#":import[video-manager.status as vmStatus]
+                   export function videoStatus() { return vmStatus(); }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "video-status",
+                "api/video-status.route",
+                r#":import["./module/media/status".videoStatus]
+                   class Route { get(req) { return videoStatus(); } }"#,
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        let route = image.routes.first().unwrap();
+        assert!(image.route_wasm_artifact(route).is_some());
+        assert!(image.route_wasm_fallback(route).is_none());
+        let grants = image.container_capability_grants(route).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Video);
+        assert_eq!(grants[0].target, "module:media.status");
+        assert_eq!(grants[0].operations, vec!["status"]);
+    }
+
+    #[test]
+    fn linked_service_module_wrapper_compiles_native_with_exact_service_grant() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Service,
+                "uac",
+                "service/uac.service",
+                r#":service[name = uac]
+                   export function get_user(id) { return id; }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "accounts",
+                "module/accounts.module",
+                r#":import[service:uac.get_user as getUser]
+                   export function lookup(id) { return getUser(id); }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "account-lookup",
+                "api/account-lookup.route",
+                r#":import["./module/accounts".lookup]
+                   class Route { get(req) { return lookup("kate"); } }"#,
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        let route = image.routes.first().unwrap();
+        assert!(image.route_wasm_artifact(route).is_some());
+        assert!(image.route_wasm_fallback(route).is_none());
+        let grants = image.container_capability_grants(route).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Service);
+        assert_eq!(grants[0].target, "service:uac");
+        assert_eq!(grants[0].operations, vec!["get_user"]);
     }
 
     #[test]

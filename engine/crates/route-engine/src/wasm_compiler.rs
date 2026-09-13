@@ -5,9 +5,12 @@
 //! classified as an explicit interpreter fallback. Native artifacts use the
 //! RBE worker ABI and return JSON bytes through `rbe.output_write`.
 
+use std::collections::BTreeMap;
+
 use core_lib::{
-    ContainerCapabilityKind, CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES,
-    CONTAINER_MAX_EXECUTION_INPUT_BYTES, PUBLIC_HTTP_TARGET,
+    video_language_operation_allowed, ContainerCapabilityKind,
+    CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES, CONTAINER_MAX_EXECUTION_INPUT_BYTES,
+    PUBLIC_HTTP_TARGET, VIDEO_CAPABILITY_TARGET_PREFIX,
 };
 use service_runtime::SERVICE_CAPABILITY_TARGET_PREFIX;
 use sha2::{Digest, Sha256};
@@ -16,10 +19,14 @@ use wasm_encoder::{
     FunctionSection, ImportSection, MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
-use crate::ast::{Expr, ImportTarget, RouteFile, Statement};
+use crate::ast::{Expr, FunctionDef, ImportTarget, RouteFile, Statement};
+use crate::modules::binding_name;
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 4;
+/// Generation history: `pub const ROUTE_WASM_COMPILER_VERSION: u32 = 4`
+/// introduced direct host-capability lowering. Generation 5 adds strict
+/// immutable linked-Module host-call lowering while capability ABI v3 stays stable.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 5;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 
@@ -51,29 +58,81 @@ impl RouteWasmCompilation {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RouteWasmLinkContext {
+    module_functions: BTreeMap<String, LinkedModuleFunction>,
+}
+
+#[derive(Debug, Clone)]
+struct LinkedModuleFunction {
+    owner: String,
+    function: FunctionDef,
+    imports: Vec<ImportTarget>,
+}
+
+impl RouteWasmLinkContext {
+    pub(crate) fn insert_module_function(
+        &mut self,
+        route_binding: String,
+        owner: String,
+        function: FunctionDef,
+        imports: Vec<ImportTarget>,
+    ) {
+        self.module_functions.insert(
+            route_binding,
+            LinkedModuleFunction {
+                owner,
+                function,
+                imports,
+            },
+        );
+    }
+}
+
 /// Compile the currently supported native route subset.
 ///
 /// Native lowering remains intentionally strict: one HTTP method, one return,
-/// no helper functions. In addition to literals and req.body passthrough, compiler
-/// generation v4 permits one directly imported host-capability function with fully
-/// static JSON arguments: `http.get/post/request` or one exact Service export.
-/// Namespace imports stay interpreter-only so native grants remain operation-exact
-/// rather than widening authority.
+/// no route helper functions. Compiler generation v5 keeps ABI v3 and adds one
+/// immutable linked Module function supplied by RELC. The linked function must
+/// itself be exactly one return of one direct HTTP, Video, or Service host call,
+/// and every Route/host argument must resolve to static JSON. Namespace imports,
+/// dynamic arguments, wider Module bodies, and nested chains remain interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
-    let host_import = match file.imports.as_slice() {
-        [] => None,
-        [import] => match direct_capability_import(import) {
-            Some(import) => Some(import),
-            None => return fallback(
-                "native Route-WASM v4 only supports one direct http.get/post/request or service:<name>.<operation> import",
-            ),
-        },
+    let links = RouteWasmLinkContext::default();
+    compile_route_with_links(file, &links)
+}
+
+pub(crate) fn compile_route_with_links(
+    file: &RouteFile,
+    links: &RouteWasmLinkContext,
+) -> RouteWasmCompilation {
+    let mut host_import = None;
+    let mut linked_import = None;
+    match file.imports.as_slice() {
+        [] => {}
+        [import] => {
+            if let Some(found) = direct_capability_import(import) {
+                host_import = Some(found);
+            } else if matches!(base_import(import), ImportTarget::CustomFunction { .. }) {
+                let binding = binding_name(import);
+                let Some(linked) = links.module_functions.get(&binding) else {
+                    return fallback(
+                        "native linked Module function has no immutable RELC link context",
+                    );
+                };
+                linked_import = Some((binding, linked));
+            } else {
+                return fallback(
+                    "native Route-WASM v5 only supports one direct http.get/post/request or service:<name>.<operation> import or one linked Module function import",
+                );
+            }
+        }
         _ => {
             return fallback(
-                "native Route-WASM v4 supports at most one direct host capability import",
+                "native Route-WASM v5 supports at most one direct or linked host-call import",
             )
         }
-    };
+    }
     if !file.functions.is_empty() {
         return fallback("route helper functions are not WASM-native yet");
     }
@@ -100,6 +159,16 @@ pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
         }
         (
             encode_capability_call_module(import.kind, &import.target, &import.operation, &payload),
+            RouteWasmInput::None,
+        )
+    } else if let Some((binding, linked)) = linked_import.as_ref() {
+        let (kind, target, operation, payload) =
+            match lower_linked_module_capability_call(binding, linked, expr) {
+                Ok(call) => call,
+                Err(reason) => return fallback(reason),
+            };
+        (
+            encode_capability_call_module(kind, &target, &operation, &payload),
             RouteWasmInput::None,
         )
     } else if let Some(value) = static_json(expr) {
@@ -171,6 +240,94 @@ fn direct_capability_import(import: &ImportTarget) -> Option<DirectCapabilityImp
     }
 }
 
+fn base_import(import: &ImportTarget) -> &ImportTarget {
+    match import {
+        ImportTarget::Aliased { target, .. } => base_import(target),
+        other => other,
+    }
+}
+
+fn direct_linked_capability_import(
+    import: &ImportTarget,
+    owner: &str,
+) -> Option<DirectCapabilityImport> {
+    if let Some(import) = direct_capability_import(import) {
+        return Some(import);
+    }
+    let ImportTarget::BuiltinFunction { module, function } = base_import(import) else {
+        return None;
+    };
+    if !matches!(module.as_str(), "vm" | "video-manager")
+        || !video_language_operation_allowed(function)
+    {
+        return None;
+    }
+    Some(DirectCapabilityImport {
+        binding: binding_name(import),
+        kind: ContainerCapabilityKind::Video,
+        target: format!("{VIDEO_CAPABILITY_TARGET_PREFIX}{owner}"),
+        operation: function.clone(),
+    })
+}
+
+fn lower_linked_module_capability_call(
+    route_binding: &str,
+    linked: &LinkedModuleFunction,
+    route_expr: &Expr,
+) -> Result<(ContainerCapabilityKind, String, String, Vec<u8>), String> {
+    let route_args = static_direct_call(route_binding, route_expr).ok_or_else(|| {
+        "native linked Module calls require the imported function as the return value with static JSON arguments".to_string()
+    })?;
+    if route_args.len() != linked.function.params.len() {
+        return Err(format!(
+            "native linked Module call arity mismatch: Route supplied {}, Module function expects {}",
+            route_args.len(),
+            linked.function.params.len()
+        ));
+    }
+    let [Statement::Return(module_expr)] = linked.function.body.as_slice() else {
+        return Err(
+            "native linked Module function must contain exactly one return statement".into(),
+        );
+    };
+    let [module_import] = linked.imports.as_slice() else {
+        return Err(
+            "native linked Module function requires exactly one direct host capability import"
+                .into(),
+        );
+    };
+    let host = direct_linked_capability_import(module_import, &linked.owner).ok_or_else(|| {
+        "native linked Module import must be one exact HTTP, Video, or Service function".to_string()
+    })?;
+    let Expr::Call(target, host_args) = module_expr else {
+        return Err("native linked Module return must directly call its host import".into());
+    };
+    if !matches!(target.as_ref(), Expr::Ident(name) if name == &host.binding) {
+        return Err("native linked Module return must call the imported host binding".into());
+    }
+
+    let bindings = linked
+        .function
+        .params
+        .iter()
+        .cloned()
+        .zip(route_args)
+        .collect::<BTreeMap<_, _>>();
+    let args = host_args
+        .iter()
+        .map(|argument| static_json_with_bindings(argument, &bindings))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            "native linked Module host arguments must resolve to static JSON values".to_string()
+        })?;
+    let payload = serde_json::to_vec(&args)
+        .map_err(|error| format!("encode native linked Module arguments: {error}"))?;
+    if payload.len() > CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES {
+        return Err("native linked Module argument payload exceeds the capability envelope".into());
+    }
+    Ok((host.kind, host.target, host.operation, payload))
+}
+
 fn static_direct_call(binding: &str, expr: &Expr) -> Option<Vec<serde_json::Value>> {
     let Expr::Call(target, args) = expr else {
         return None;
@@ -179,6 +336,32 @@ fn static_direct_call(binding: &str, expr: &Expr) -> Option<Vec<serde_json::Valu
         return None;
     }
     args.iter().map(static_json).collect()
+}
+
+fn static_json_with_bindings(
+    expr: &Expr,
+    bindings: &BTreeMap<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match expr {
+        Expr::Ident(name) => bindings.get(name).cloned(),
+        Expr::String(value) => Some(serde_json::Value::String(value.clone())),
+        Expr::Number(value) => serde_json::Number::from_f64(*value).map(serde_json::Value::Number),
+        Expr::Bool(value) => Some(serde_json::Value::Bool(*value)),
+        Expr::Null => Some(serde_json::Value::Null),
+        Expr::Array(values) => values
+            .iter()
+            .map(|value| static_json_with_bindings(value, bindings))
+            .collect::<Option<Vec<_>>>()
+            .map(serde_json::Value::Array),
+        Expr::Object(fields) => {
+            let mut object = serde_json::Map::new();
+            for (name, value) in fields {
+                object.insert(name.clone(), static_json_with_bindings(value, bindings)?);
+            }
+            Some(serde_json::Value::Object(object))
+        }
+        Expr::Member(_, _) | Expr::Call(_, _) | Expr::UnaryNot(_) | Expr::Binary { .. } => None,
+    }
 }
 
 fn returns_request_body(parameter: Option<&str>, expr: &Expr) -> bool {
@@ -459,6 +642,33 @@ mod tests {
         Parser::new(tokens).parse_file().unwrap()
     }
 
+    fn parse_module(source: &str) -> crate::ast::ModuleFile {
+        let tokens = Lexer::new(source).tokenize().unwrap();
+        Parser::new(tokens).parse_module_file().unwrap()
+    }
+
+    fn link_module_function(
+        route_binding: &str,
+        owner: &str,
+        module: &crate::ast::ModuleFile,
+        function: &str,
+    ) -> RouteWasmLinkContext {
+        let mut links = RouteWasmLinkContext::default();
+        let function = module
+            .functions
+            .iter()
+            .find(|candidate| candidate.name == function)
+            .unwrap()
+            .clone();
+        links.insert_module_function(
+            route_binding.to_string(),
+            owner.to_string(),
+            function,
+            module.imports.clone(),
+        );
+        links
+    }
+
     #[test]
     fn compiles_literal_route_to_valid_deterministic_wasm() {
         let route = parse("class Route { get(req) { return { ok: true, count: 7 }; } }");
@@ -563,6 +773,96 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("WASM ABI violation"));
         assert!(message.contains("CAPABILITY_DENIED"));
+    }
+
+    #[test]
+    fn linked_module_service_call_substitutes_static_route_arguments() {
+        let module = parse_module(
+            r#":import[service:uac.get_user as getUser]
+               export function lookup(id) { return getUser(id); }"#,
+        );
+        let links = link_module_function("lookup", "accounts", &module, "lookup");
+        let route = parse(
+            r#":import["./module/accounts".lookup]
+               class Route { get(req) { return lookup("kate"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("strict linked Service wrapper should compile natively");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Service);
+            assert_eq!(request.target, "service:uac");
+            assert_eq!(request.operation, "get_user");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["kate"])
+            );
+            Ok(br#"{"id":"kate"}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"id":"kate"}"#);
+    }
+
+    #[test]
+    fn linked_module_video_call_uses_canonical_module_owner() {
+        let module = parse_module(
+            r#":import[video-manager.status as vmStatus]
+               export function status() { return vmStatus(); }"#,
+        );
+        let links = link_module_function("status", "media.status", &module, "status");
+        let route = parse(
+            r#":import["./module/media/status".status]
+               class Route { get(req) { return status(); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("strict linked Video wrapper should compile natively");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Video);
+            assert_eq!(request.target, "module:media.status");
+            assert_eq!(request.operation, "status");
+            assert_eq!(request.payload, b"[]");
+            Ok(br#"{"ok":true}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn linked_module_dynamic_route_argument_stays_interpreter_fallback() {
+        let module = parse_module(
+            r#":import[service:uac.get_user as getUser]
+               export function lookup(id) { return getUser(id); }"#,
+        );
+        let links = link_module_function("lookup", "accounts", &module, "lookup");
+        let route = parse(
+            r#":import["./module/accounts".lookup]
+               class Route { post(req) { return lookup(req.body); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { reason } =
+            compile_route_with_links(&route, &links)
+        else {
+            panic!("dynamic linked arguments must remain interpreter-only");
+        };
+        assert!(reason.contains("static JSON arguments"));
     }
 
     #[test]
