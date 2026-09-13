@@ -9,6 +9,7 @@ use core_lib::{
     ContainerCapabilityKind, CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES,
     CONTAINER_MAX_EXECUTION_INPUT_BYTES, PUBLIC_HTTP_TARGET,
 };
+use service_runtime::SERVICE_CAPABILITY_TARGET_PREFIX;
 use sha2::{Digest, Sha256};
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
@@ -18,7 +19,7 @@ use wasm_encoder::{
 use crate::ast::{Expr, ImportTarget, RouteFile, Statement};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 3;
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 4;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 
@@ -53,26 +54,26 @@ impl RouteWasmCompilation {
 /// Compile the currently supported native route subset.
 ///
 /// Native lowering remains intentionally strict: one HTTP method, one return,
-/// no helper functions. In addition to literals and req.body passthrough, ABI v3
-/// permits one directly imported `http.get/post/request` function with fully
-/// static JSON arguments. Namespace imports stay interpreter-only so native
-/// grants remain operation-exact rather than widening authority.
+/// no helper functions. In addition to literals and req.body passthrough, compiler
+/// generation v4 permits one directly imported host-capability function with fully
+/// static JSON arguments: `http.get/post/request` or one exact Service export.
+/// Namespace imports stay interpreter-only so native grants remain operation-exact
+/// rather than widening authority.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
-    let http_import =
-        match file.imports.as_slice() {
-            [] => None,
-            [import] => match direct_http_import(import) {
-                Some(import) => Some(import),
-                None => return fallback(
-                    "native Route-WASM v3 only supports one direct http.get/post/request import",
-                ),
-            },
-            _ => {
-                return fallback(
-                    "native Route-WASM v3 supports at most one direct host capability import",
-                )
-            }
-        };
+    let host_import = match file.imports.as_slice() {
+        [] => None,
+        [import] => match direct_capability_import(import) {
+            Some(import) => Some(import),
+            None => return fallback(
+                "native Route-WASM v4 only supports one direct http.get/post/request or service:<name>.<operation> import",
+            ),
+        },
+        _ => {
+            return fallback(
+                "native Route-WASM v4 supports at most one direct host capability import",
+            )
+        }
+    };
     if !file.functions.is_empty() {
         return fallback("route helper functions are not WASM-native yet");
     }
@@ -84,26 +85,21 @@ pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let [Statement::Return(expr)] = method.body.as_slice() else {
         return fallback("native route body currently requires one literal return statement");
     };
-    let (bytes, input) = if let Some((binding, operation)) = http_import.as_ref() {
-        let Some(args) = static_direct_call(binding, expr) else {
+    let (bytes, input) = if let Some(import) = host_import.as_ref() {
+        let Some(args) = static_direct_call(&import.binding, expr) else {
             return fallback(
-                "native public HTTP calls require the imported function as the return value with static JSON arguments",
+                "native host capability calls require the directly imported function as the return value with static JSON arguments",
             );
         };
         let payload = match serde_json::to_vec(&args) {
             Ok(payload) => payload,
-            Err(error) => return fallback(format!("encode native HTTP arguments: {error}")),
+            Err(error) => return fallback(format!("encode native capability arguments: {error}")),
         };
         if payload.len() > CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES {
-            return fallback("native HTTP argument payload exceeds the capability envelope");
+            return fallback("native capability argument payload exceeds the capability envelope");
         }
         (
-            encode_capability_call_module(
-                ContainerCapabilityKind::Network,
-                PUBLIC_HTTP_TARGET,
-                operation,
-                &payload,
-            ),
+            encode_capability_call_module(import.kind, &import.target, &import.operation, &payload),
             RouteWasmInput::None,
         )
     } else if let Some(value) = static_json(expr) {
@@ -138,21 +134,41 @@ fn fallback(reason: impl Into<String>) -> RouteWasmCompilation {
     }
 }
 
-fn direct_http_import(import: &ImportTarget) -> Option<(String, String)> {
-    let (binding, module, function) = match import {
-        ImportTarget::BuiltinFunction { module, function } => {
-            (function.clone(), module.as_str(), function.as_str())
-        }
-        ImportTarget::Aliased { target, alias } => match target.as_ref() {
-            ImportTarget::BuiltinFunction { module, function } => {
-                (alias.clone(), module.as_str(), function.as_str())
-            }
-            _ => return None,
-        },
+#[derive(Debug, Clone)]
+struct DirectCapabilityImport {
+    binding: String,
+    kind: ContainerCapabilityKind,
+    target: String,
+    operation: String,
+}
+
+fn direct_capability_import(import: &ImportTarget) -> Option<DirectCapabilityImport> {
+    let (binding, base) = match import {
+        ImportTarget::Aliased { target, alias } => (alias.clone(), target.as_ref()),
+        ImportTarget::BuiltinFunction { function, .. }
+        | ImportTarget::ServiceFunction { function, .. } => (function.clone(), import),
         _ => return None,
     };
-    (module == "http" && matches!(function, "get" | "post" | "request"))
-        .then(|| (binding, function.to_string()))
+
+    match base {
+        ImportTarget::BuiltinFunction { module, function }
+            if module == "http" && matches!(function.as_str(), "get" | "post" | "request") =>
+        {
+            Some(DirectCapabilityImport {
+                binding,
+                kind: ContainerCapabilityKind::Network,
+                target: PUBLIC_HTTP_TARGET.to_string(),
+                operation: function.clone(),
+            })
+        }
+        ImportTarget::ServiceFunction { service, function } => Some(DirectCapabilityImport {
+            binding,
+            kind: ContainerCapabilityKind::Service,
+            target: format!("{SERVICE_CAPABILITY_TARGET_PREFIX}{service}"),
+            operation: function.clone(),
+        }),
+        _ => None,
+    }
 }
 
 fn static_direct_call(binding: &str, expr: &Expr) -> Option<Vec<serde_json::Value>> {
@@ -589,6 +605,92 @@ mod tests {
     }
 
     #[test]
+    fn direct_static_service_call_is_native_v4_capability_call() {
+        let route = parse(
+            r#":import[service:uac.get_user]
+               class Route { get(req) { return get_user("alice"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("direct static Service call should lower to native capability ABI");
+        };
+        assert_eq!(artifact.input, RouteWasmInput::None);
+        wasmparser::validate(&artifact.bytes).unwrap();
+        assert!(artifact
+            .bytes
+            .windows(b"service:uac".len())
+            .any(|window| window == b"service:uac"));
+        assert!(artifact
+            .bytes
+            .windows(b"get_user".len())
+            .any(|window| window == b"get_user"));
+    }
+
+    #[test]
+    fn generated_service_wasm_round_trips_through_real_capability_host_abi() {
+        let route = parse(
+            r#":import[service:uac.get_user]
+               class Route { get(req) { return get_user("alice", 7); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("direct Service route should compile natively");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Service);
+            assert_eq!(request.target, "service:uac");
+            assert_eq!(request.operation, "get_user");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["alice", 7.0])
+            );
+            Ok(br#"{"id":"alice","ok":true}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.output, br#"{"id":"alice","ok":true}"#);
+    }
+
+    #[test]
+    fn aliased_static_service_call_is_native() {
+        let route = parse(
+            r#":import[service:uac.get_user as lookup]
+               class Route { get(req) { return lookup("alice"); } }"#,
+        );
+        assert!(compile_route(&route).is_native());
+    }
+
+    #[test]
+    fn service_namespace_import_stays_interpreter_fallback() {
+        let route = parse(
+            r#":import[service:uac]
+               class Route { get(req) { return uac.get_user("alice"); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
+            panic!("Service namespace import must not widen native authority");
+        };
+        assert!(reason.contains("service:<name>.<operation>"));
+    }
+
+    #[test]
+    fn dynamic_service_argument_stays_interpreter_fallback() {
+        let route = parse(
+            r#":import[service:uac.get_user]
+               class Route { post(req) { return get_user(req.body); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
+            panic!("dynamic Service argument is outside the v4 native subset");
+        };
+        assert!(reason.contains("static JSON arguments"));
+    }
+
+    #[test]
     fn aliased_static_http_get_is_native() {
         let route = parse(
             r#":import[http.get as fetch]
@@ -606,7 +708,8 @@ mod tests {
         let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
             panic!("namespace import must not widen native Network authority");
         };
-        assert!(reason.contains("one direct http.get/post/request import"));
+        assert!(reason
+            .contains("one direct http.get/post/request or service:<name>.<operation> import"));
     }
 
     #[test]
