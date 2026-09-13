@@ -119,17 +119,17 @@ pub fn dispatch_storage_capability(
                     "commit expects exactly one mutation-array argument",
                 ));
             };
-            let mutations: Vec<StorageMutationRequest> =
-                serde_json::from_value(mutations.clone()).map_err(|_| {
-                    invalid_args("commit mutations must use put/delete objects")
-                })?;
+            let mutations: Vec<StorageMutationRequest> = serde_json::from_value(mutations.clone())
+                .map_err(|_| invalid_args("commit mutations must use put/delete objects"))?;
             if mutations.is_empty() || mutations.len() > MAX_COMMIT_MUTATIONS {
                 return Err(invalid_args(
                     "commit mutation count must be between 1 and 256",
                 ));
             }
 
-            let mut transaction = storage.begin(namespace).map_err(|_| storage_call_failed())?;
+            let mut transaction = storage
+                .begin(namespace)
+                .map_err(|_| storage_call_failed())?;
             for mutation in mutations {
                 match mutation {
                     StorageMutationRequest::Put { path, data_hex } => {
@@ -295,13 +295,7 @@ mod tests {
         assert_eq!(committed["generation"], 1);
         assert_eq!(committed["changedPaths"], 2);
 
-        let read = dispatch(
-            &storage,
-            &target,
-            "read",
-            json!(["users/kate.bin"]),
-        )
-        .unwrap();
+        let read = dispatch(&storage, &target, "read", json!(["users/kate.bin"])).unwrap();
         assert_eq!(read["found"], true);
         assert_eq!(read["dataHex"], "6b617465");
 
@@ -341,14 +335,9 @@ mod tests {
             storage_capability_target("../host").unwrap_err().code,
             "CAPABILITY_STORAGE_TARGET_INVALID"
         );
-        let error = dispatch_storage_capability(
-            &storage,
-            "storage:uac",
-            "open_host_file",
-            b"[]",
-            1024,
-        )
-        .unwrap_err();
+        let error =
+            dispatch_storage_capability(&storage, "storage:uac", "open_host_file", b"[]", 1024)
+                .unwrap_err();
         assert_eq!(error.code, "CAPABILITY_STORAGE_OPERATION_INVALID");
 
         dispatch(
@@ -359,8 +348,8 @@ mod tests {
         )
         .unwrap();
         let payload = serde_json::to_vec(&json!(["blob"])).unwrap();
-        let error = dispatch_storage_capability(&storage, "storage:uac", "read", &payload, 8)
-            .unwrap_err();
+        let error =
+            dispatch_storage_capability(&storage, "storage:uac", "read", &payload, 8).unwrap_err();
         assert_eq!(error.code, "CAPABILITY_RESPONSE_TOO_LARGE");
         let _ = std::fs::remove_dir_all(root);
     }
