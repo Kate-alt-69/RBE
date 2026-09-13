@@ -5,6 +5,7 @@ name: CAP-020 Video capability principal propagation
     branches: [main]
     paths:
       - '.github/patches/cap020-video-principal.py'
+      - '.github/patches/cap020-fix-nested-import.py'
       - '.github/workflows/cap020-video-principal.yml'
 
 permissions:
@@ -38,6 +39,7 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           python3 .github/patches/cap020-video-principal.py
+          python3 .github/patches/cap020-fix-nested-import.py
           cargo fmt --manifest-path engine/Cargo.toml --all
 
       - name: Check Route Engine locked
@@ -67,6 +69,7 @@ jobs:
           set -euo pipefail
           git rm .github/workflows/cap020-video-principal.yml
           git rm -f .github/patches/cap020-video-principal.py
+          git rm -f .github/patches/cap020-fix-nested-import.py
           git add engine/crates/route-engine doc/runtime-image.md
           git commit -m "FIX | BUG-CAP-020 preserve Video capability principal during propagation"
 
