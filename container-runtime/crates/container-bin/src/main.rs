@@ -893,7 +893,8 @@ fn handle_connection(
                         "sandbox_policy": "deny-by-default",
                         "wasm_engine": "wasmtime",
                         "artifact_cache": runtime.cache().artifact_count(),
-                        "profile_cache": runtime.cache().len()
+                        "profile_cache": runtime.cache().len(),
+                        "artifact_crash_circuits_open": environment_processes.open_artifact_crash_circuit_count()
                     }),
                 }
             }
@@ -1058,7 +1059,7 @@ fn inspection_body(
     environment_processes: &environment_process::EnvironmentProcessSupervisor,
 ) -> serde_json::Value {
     let snapshots = runtime.snapshots();
-    let environment_processes = environment_processes
+    let environment_process_snapshots = environment_processes
         .snapshots()
         .into_iter()
         .map(|process| {
@@ -1107,6 +1108,19 @@ fn inspection_body(
             "swamps": swamps
         })
     }).collect::<Vec<_>>();
+
+    let artifact_crash_circuits = environment_processes
+        .artifact_crash_circuits()
+        .into_iter()
+        .map(|circuit| {
+            serde_json::json!({
+                "artifact_hash": circuit.artifact_hash,
+                "consecutive_crashes": circuit.consecutive_crashes,
+                "open_remaining_ms": circuit.open_remaining_ms,
+                "half_open_probe": circuit.half_open_probe
+            })
+        })
+        .collect::<Vec<_>>();
 
     let cache_profiles = runtime
         .cache()
@@ -1159,7 +1173,8 @@ fn inspection_body(
             "durable_profiles": true,
             "durable_artifacts": true
         },
-        "environment_processes": environment_processes,
+        "artifact_crash_circuits": artifact_crash_circuits,
+        "environment_processes": environment_process_snapshots,
         "security": {
             "policy": "deny-by-default",
             "environment_boundary": "controller -> Environment process -> disposable WASM worker",
