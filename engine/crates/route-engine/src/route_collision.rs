@@ -30,27 +30,11 @@ pub(crate) fn validate(api_dir: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let error_path = PathBuf::from("data")
-        .join("admin")
-        .join("compiler-error.txt");
-    if let Some(parent) = error_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut report = String::new();
-    for collision in &collisions {
-        report.push_str(&format!(
-            "E3013: {}: {}\n",
-            collision.path.display(),
-            collision.message
-        ));
-    }
-    fs::write(&error_path, report)?;
-
-    Err(anyhow::anyhow!(
-        "route compiler found {} route collision(s); see {}",
-        collisions.len(),
-        error_path.display()
+    let report_path = write_collision_report(&collisions)?;
+    Err(collision_error(
+        "route compiler validation failed",
+        &collisions,
+        &report_path,
     ))
 }
 
@@ -106,17 +90,46 @@ pub(crate) fn validate_image(image: &RuntimeImage) -> anyhow::Result<()> {
     if collisions.is_empty() {
         return Ok(());
     }
-    write_collision_report(&collisions)?;
-    Err(anyhow::anyhow!(
-        "Runtime Image contains {} route collision(s)",
-        collisions.len()
+
+    let report_path = write_collision_report(&collisions)?;
+    Err(collision_error(
+        "Runtime Image route validation failed",
+        &collisions,
+        &report_path,
     ))
 }
 
-fn write_collision_report(collisions: &[RouteCollision]) -> anyhow::Result<()> {
-    let error_path = PathBuf::from("data")
-        .join("admin")
-        .join("compiler-error.txt");
+fn collision_error(
+    context: &str,
+    collisions: &[RouteCollision],
+    report_path: &Path,
+) -> anyhow::Error {
+    const MAX_INLINE_COLLISIONS: usize = 3;
+
+    let mut details = collisions
+        .iter()
+        .take(MAX_INLINE_COLLISIONS)
+        .map(|collision| format!("{}: {}", collision.path.display(), collision.message))
+        .collect::<Vec<_>>();
+    let hidden = collisions.len().saturating_sub(MAX_INLINE_COLLISIONS);
+    if hidden > 0 {
+        details.push(format!("+{hidden} more collision(s)"));
+    }
+
+    anyhow::anyhow!(
+        "{context}: {} route collision(s): {}; detailed report: {}",
+        collisions.len(),
+        details.join("; "),
+        report_path.display()
+    )
+}
+
+fn collision_report_path() -> PathBuf {
+    runtime_paths::default_admin_dir().join("compiler-error.txt")
+}
+
+fn write_collision_report(collisions: &[RouteCollision]) -> anyhow::Result<PathBuf> {
+    let error_path = collision_report_path();
     if let Some(parent) = error_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -129,7 +142,7 @@ fn write_collision_report(collisions: &[RouteCollision]) -> anyhow::Result<()> {
         ));
     }
     fs::write(&error_path, report)?;
-    Ok(())
+    Ok(error_path)
 }
 
 fn find_collisions(api_dir: &Path) -> anyhow::Result<Vec<RouteCollision>> {
@@ -284,5 +297,21 @@ mod tests {
             .message
             .contains("native API namespace `/api/auth`"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collision_error_surfaces_owner_reason_and_report_path() {
+        let collisions = vec![RouteCollision {
+            path: PathBuf::from("route:admin/build-requests"),
+            message: "route URL `/api/admin/build-requests` conflicts with native API namespace `/api/admin`".to_string(),
+        }];
+        let report_path = Path::new("data/admin/compiler-error.txt");
+        let error = collision_error("Runtime Image route validation failed", &collisions, report_path)
+            .to_string();
+
+        assert!(error.contains("route:admin/build-requests"));
+        assert!(error.contains("/api/admin/build-requests"));
+        assert!(error.contains("native API namespace `/api/admin`"));
+        assert!(error.contains("data/admin/compiler-error.txt"));
     }
 }
