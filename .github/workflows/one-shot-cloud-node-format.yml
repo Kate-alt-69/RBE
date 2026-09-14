@@ -1,0 +1,47 @@
+name: One-shot Cloud Node formatting
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-format.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-cloud-node-format
+  cancel-in-progress: false
+
+jobs:
+  format-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format and land
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          cd engine
+          cargo fmt --all
+          cd ..
+
+          rm -f .github/workflows/one-shot-cloud-node-format.yml
+          git add engine/crates/backend/src/maintenance_notice.rs \
+                  engine/crates/cloud-node/src/recovery.rs \
+                  engine/crates/cloud-node/src/transfer.rs \
+                  .github/workflows/one-shot-cloud-node-format.yml
+          git diff --cached --check
+          git commit -m 'chore: format Cloud Node recovery transport'
+          git pull --rebase origin main
+          git push origin HEAD:main
