@@ -1,0 +1,58 @@
+name: One-shot backend orphan cleanup
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-boot-orphan-cleanup.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: Apply, validate and land BUG-BOOT-002
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/patches/boot-orphan-cleanup.py
+          git rm .github/patches/boot-orphan-cleanup.py
+          git rm .github/workflows/one-shot-boot-orphan-cleanup.yml
+
+          cd engine
+          cargo fmt --all
+          cargo check -p backend --all-targets --locked
+          cargo test -p backend --locked
+          cargo clippy -p backend --all-targets --locked -- -D warnings
+          cd ../container-runtime
+          cargo fmt --all
+          cargo check -p container-bin --all-targets --locked
+          cargo test -p container-bin --locked
+          cargo clippy -p container-bin --all-targets --locked -- -D warnings
+          cd ..
+
+          ! grep -q 'std::process::exit' engine/crates/backend/src/main.rs
+          grep -q 'async fn main() -> ExitCode' engine/crates/backend/src/main.rs
+          grep -q '_parent_liveness: ChildStdin' engine/crates/backend/src/container_process.rs
+          grep -q -- '--parent-liveness-stdin' engine/crates/backend/src/container_process.rs
+          grep -q 'error-reporter parent liveness pipe closed' engine/crates/backend/src/error_reporter_daemon.rs
+          grep -q 'parent_liveness_closed' container-runtime/crates/container-bin/src/main.rs
+
+          git add -A
+          git diff --cached --check
+          git commit -m 'FIX | BUG-BOOT-002 prevent orphaned backend child processes'
+
+          git pull --rebase origin main
+          git push origin HEAD:main
