@@ -49,12 +49,13 @@ Unless an older subsystem already owns a range, new codes should use:
 
 ## Status labels
 
-The book distinguishes two states:
+The book distinguishes three states:
 
 - **Emitted** — current `main` can produce this code.
-- **Reserved** — the code and meaning are assigned, but a legacy unnumbered diagnostic may still need to be migrated to it.
+- **Assigned** — the code/meaning are fixed and implementation work is active or staged, but current `main` may not emit it yet.
+- **Reserved** — the code and meaning are reserved for migration from a legacy unnumbered diagnostic or a future implementation slice.
 
-Reserved codes must not be reused for another meaning.
+Assigned and reserved codes must not be reused for another meaning.
 
 ## Diagnostic UX contract
 
