@@ -596,7 +596,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         port_guard::reclaim_port_if_needed(config.api.port);
     }
 
-    let maintenance_notice =
+    let mut maintenance_notice =
         maintenance_notice::MaintenanceNoticeProcess::spawn(&config.api.host, config.api.port)
             .await?;
     tracing::info!(
@@ -606,6 +606,10 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         "temporary API maintenance responder ready"
     );
     boot_trace("temporary API maintenance responder ready");
+    maintenance_notice
+        .wait_for_required_cloud_node_recovery()
+        .await?;
+    boot_trace("Cloud Node boot recovery admission satisfied");
     lifecycle.set(BackendState::ServicesStarting);
 
     let error_reporter_task = spawn_error_reporter_daemon_process(

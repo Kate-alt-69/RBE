@@ -55,11 +55,25 @@ pub struct UpstreamSettings {
     pub reconnect_delay_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicationSettings {
     #[serde(default)]
+    pub require_boot_recovery: bool,
+    #[serde(default = "default_boot_recovery_timeout_ms")]
+    pub boot_recovery_timeout_ms: u64,
+    #[serde(default)]
     pub targets: Vec<ReplicationTarget>,
+}
+
+impl Default for ReplicationSettings {
+    fn default() -> Self {
+        Self {
+            require_boot_recovery: false,
+            boot_recovery_timeout_ms: default_boot_recovery_timeout_ms(),
+            targets: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +120,14 @@ impl CloudNodeSettings {
             if upstream.reconnect_delay_ms < 250 || upstream.reconnect_delay_ms > 300_000 {
                 anyhow::bail!("Cloud Node reconnectDelayMs must be between 250 and 300000");
             }
+        }
+        if !(1_000..=3_600_000).contains(&self.replication.boot_recovery_timeout_ms) {
+            anyhow::bail!("Cloud Node bootRecoveryTimeoutMs must be between 1000 and 3600000");
+        }
+        if self.replication.require_boot_recovery && self.replication.targets.is_empty() {
+            anyhow::bail!(
+                "Cloud Node requireBootRecovery needs at least one trusted replication target"
+            );
         }
         for target in &self.replication.targets {
             validate_node_id(&target.node_id)?;
@@ -162,6 +184,9 @@ const fn default_video_chunk_bytes() -> usize {
 const fn default_reconnect_delay_ms() -> u64 {
     2_000
 }
+const fn default_boot_recovery_timeout_ms() -> u64 {
+    60_000
+}
 
 #[cfg(test)]
 mod tests {
@@ -173,6 +198,8 @@ mod tests {
             serde_json::from_str(r#"{"node":{"id":"nas-main","storageRoot":"/srv/nas"}}"#).unwrap();
         assert_eq!(settings.node.backup_versions, 5);
         assert!(settings.node.preserve_original);
+        assert!(!settings.replication.require_boot_recovery);
+        assert_eq!(settings.replication.boot_recovery_timeout_ms, 60_000);
         settings.validate().unwrap();
     }
 }

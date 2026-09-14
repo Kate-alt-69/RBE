@@ -67,7 +67,7 @@ impl TransferChunk {
                     .map_err(|_| anyhow::anyhow!("transfer chunk size exceeds u64"))?,
             )
             .ok_or_else(|| anyhow::anyhow!("Cloud Node transfer range overflow"))?;
-        let mut chunk = Self {
+        let chunk = Self {
             kind,
             resource,
             final_chunk: end == total_size,

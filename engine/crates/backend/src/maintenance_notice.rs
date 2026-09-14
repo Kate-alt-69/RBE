@@ -10,9 +10,10 @@
 //! intentionally closes the pipe, the helper shuts down and releases the port.
 
 use std::collections::HashMap;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,22 +29,34 @@ use cloud_node::{
     MAX_AUTH_PROOF_BYTES, MAX_FRAME_BYTES, SESSION_PROOF_HEADER, SETTINGS_FILE_NAME, SYNC_PATH,
     TRANSFER_PATH,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HELPER_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAX_SYNC_HELLO_BYTES: usize = 4096;
 const MAX_TRANSFER_REQUEST_BYTES: usize = MAX_FRAME_BYTES + 32;
+const CONTROL_PREFIX: &str = "RBE-CN-CONTROL/1";
+const CONTROL_COMPLETE_PREFIX: &str = "RBE-CN-CONTROL/1 complete ";
+const CONTROL_POLICY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAINTENANCE_MARKER: &str = "x-rbe-maintenance";
 const BODY: &str =
     r#"{"ok":false,"status":"maintenance","message":"NOT AVAILABLE TRY AGAIN LATER"}"#;
 
+#[derive(Debug, Clone, Copy)]
+enum BootRecoveryAdmission {
+    Disabled,
+    Optional,
+    Required { timeout: Duration },
+}
+
 pub struct MaintenanceNoticeProcess {
     child: Child,
     lease: Option<ChildStdin>,
+    control: BufReader<ChildStdout>,
+    recovery_admission: BootRecoveryAdmission,
     host: String,
     port: u16,
 }
@@ -57,6 +70,8 @@ struct CloudNodeRuntime {
     authenticator: CloudNodeAuthenticator,
     store: CloudNodeStore,
     recoveries: Mutex<HashMap<[u8; 16], RecoveryState>>,
+    recovery_admission: BootRecoveryAdmission,
+    recovery_complete: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -77,6 +92,7 @@ impl MaintenanceNoticeProcess {
             .arg("--maintenance-port")
             .arg(&port_arg)
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|err| {
@@ -85,19 +101,82 @@ impl MaintenanceNoticeProcess {
         let lease = child.stdin.take().ok_or_else(|| {
             anyhow::anyhow!("maintenance responder stdin lifetime pipe was not created")
         })?;
+        let control = child.stdout.take().ok_or_else(|| {
+            anyhow::anyhow!("maintenance responder stdout control pipe was not created")
+        })?;
 
         let mut process = Self {
             child,
             lease: Some(lease),
+            control: BufReader::new(control),
+            recovery_admission: BootRecoveryAdmission::Disabled,
             host: host.to_string(),
             port,
         };
+        process.recovery_admission = process.read_admission_policy().await?;
         process.wait_until_ready().await?;
         Ok(process)
     }
 
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    pub async fn wait_for_required_cloud_node_recovery(&mut self) -> anyhow::Result<()> {
+        let timeout = match self.recovery_admission {
+            BootRecoveryAdmission::Disabled | BootRecoveryAdmission::Optional => return Ok(()),
+            BootRecoveryAdmission::Required { timeout } => timeout,
+        };
+        tracing::info!(
+            timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            "waiting for required Cloud Node boot recovery before runtime admission"
+        );
+        let line = self.read_control_line(timeout).await?;
+        let Some(root) = line.strip_prefix(CONTROL_COMPLETE_PREFIX) else {
+            anyhow::bail!("maintenance responder returned unexpected control message {line:?}");
+        };
+        if root.len() != 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("maintenance responder returned an invalid Cloud Node recovery root");
+        }
+        tracing::info!(root = %root, "required Cloud Node boot recovery completed");
+        Ok(())
+    }
+
+    async fn read_admission_policy(&mut self) -> anyhow::Result<BootRecoveryAdmission> {
+        let line = self.read_control_line(CONTROL_POLICY_TIMEOUT).await?;
+        if line == format!("{CONTROL_PREFIX} disabled") {
+            return Ok(BootRecoveryAdmission::Disabled);
+        }
+        if line == format!("{CONTROL_PREFIX} optional") {
+            return Ok(BootRecoveryAdmission::Optional);
+        }
+        if let Some(value) = line.strip_prefix(&format!("{CONTROL_PREFIX} required ")) {
+            let timeout_ms = value.parse::<u64>().map_err(|_| {
+                anyhow::anyhow!("maintenance responder returned an invalid recovery timeout")
+            })?;
+            return Ok(BootRecoveryAdmission::Required {
+                timeout: Duration::from_millis(timeout_ms),
+            });
+        }
+        anyhow::bail!("maintenance responder returned invalid control policy {line:?}")
+    }
+
+    async fn read_control_line(&mut self, timeout: Duration) -> anyhow::Result<String> {
+        let mut line = String::new();
+        let read = tokio::time::timeout(timeout, self.control.read_line(&mut line))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("timed out waiting for maintenance responder control message")
+            })??;
+        if read == 0 {
+            if let Some(status) = self.child.try_wait()? {
+                anyhow::bail!(
+                    "maintenance responder exited while waiting for Cloud Node control message: {status}"
+                );
+            }
+            anyhow::bail!("maintenance responder closed its Cloud Node control pipe");
+        }
+        Ok(line.trim().to_owned())
     }
 
     /// Close the lifetime pipe first so the helper can release the listener
@@ -150,6 +229,7 @@ impl MaintenanceNoticeProcess {
 /// Entry point for `backend(.exe) --maintenance-notice`.
 pub async fn run(host: String, port: u16) -> anyhow::Result<()> {
     let cloud_node = load_cloud_node_runtime()?;
+    emit_boot_recovery_policy(cloud_node.as_deref())?;
     if let Some(runtime) = &cloud_node {
         eprintln!(
             "backend maintenance responder enabled Cloud Node boot recovery for {} trusted peer(s)",
@@ -277,6 +357,13 @@ async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Re
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+
+    if remote_header == local_header {
+        if let Err(error) = signal_boot_recovery_complete(runtime, local_header) {
+            tracing::error!(error = %error, "Cloud Node could not signal completed boot recovery");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
 
     if remote_header != local_header {
         let mut recoveries = match runtime.recoveries.lock() {
@@ -455,6 +542,10 @@ async fn cloud_node_transfer(
                     }
                 }
             };
+            if let Err(error) = signal_boot_recovery_complete(runtime, actual) {
+                tracing::error!(error = %error, "Cloud Node could not signal activated boot recovery");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             if let Ok(mut recoveries) = runtime.recoveries.lock() {
                 recoveries.remove(&session.session);
             }
@@ -503,6 +594,53 @@ fn authorize_cloud_node_session(
             None
         }
     }
+}
+
+fn emit_boot_recovery_policy(runtime: Option<&CloudNodeRuntime>) -> anyhow::Result<()> {
+    let line = match runtime.map(|runtime| runtime.recovery_admission) {
+        None | Some(BootRecoveryAdmission::Disabled) => format!("{CONTROL_PREFIX} disabled"),
+        Some(BootRecoveryAdmission::Optional) => format!("{CONTROL_PREFIX} optional"),
+        Some(BootRecoveryAdmission::Required { timeout }) => format!(
+            "{CONTROL_PREFIX} required {}",
+            timeout.as_millis().min(u128::from(u64::MAX)) as u64
+        ),
+    };
+    write_control_line(&line)
+}
+
+fn signal_boot_recovery_complete(
+    runtime: &CloudNodeRuntime,
+    header: SyncPlanHeader,
+) -> anyhow::Result<()> {
+    if !matches!(
+        runtime.recovery_admission,
+        BootRecoveryAdmission::Required { .. }
+    ) {
+        return Ok(());
+    }
+    if runtime
+        .recovery_complete
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(());
+    }
+    let result = write_control_line(&format!(
+        "{CONTROL_COMPLETE_PREFIX}{}",
+        hex::encode(header.root_sha256)
+    ));
+    if result.is_err() {
+        runtime.recovery_complete.store(false, Ordering::Release);
+    }
+    result
+}
+
+fn write_control_line(line: &str) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    writeln!(stdout, "{line}")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 fn encode_cloud_node_response(frame: Frame, operation: &str) -> Response {
@@ -591,12 +729,21 @@ fn load_cloud_node_runtime() -> anyhow::Result<Option<Arc<CloudNodeRuntime>>> {
     if settings.replication.targets.is_empty() {
         return Ok(None);
     }
+    let recovery_admission = if settings.replication.require_boot_recovery {
+        BootRecoveryAdmission::Required {
+            timeout: Duration::from_millis(settings.replication.boot_recovery_timeout_ms),
+        }
+    } else {
+        BootRecoveryAdmission::Optional
+    };
     let authenticator = CloudNodeAuthenticator::from_env(&settings)?;
     let store = CloudNodeStore::open(&settings)?;
     Ok(Some(Arc::new(CloudNodeRuntime {
         authenticator,
         store,
         recoveries: Mutex::new(HashMap::new()),
+        recovery_admission,
+        recovery_complete: AtomicBool::new(false),
     })))
 }
 
