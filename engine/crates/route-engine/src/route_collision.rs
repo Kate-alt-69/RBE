@@ -306,8 +306,12 @@ mod tests {
             message: "route URL `/api/admin/build-requests` conflicts with native API namespace `/api/admin`".to_string(),
         }];
         let report_path = Path::new("data/admin/compiler-error.txt");
-        let error = collision_error("Runtime Image route validation failed", &collisions, report_path)
-            .to_string();
+        let error = collision_error(
+            "Runtime Image route validation failed",
+            &collisions,
+            report_path,
+        )
+        .to_string();
 
         assert!(error.contains("route:admin/build-requests"));
         assert!(error.contains("/api/admin/build-requests"));
