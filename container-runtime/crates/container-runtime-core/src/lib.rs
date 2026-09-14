@@ -14,6 +14,7 @@
 mod cache;
 mod control_plane;
 mod debug_replay;
+mod debug_replay_cursor;
 mod environment;
 mod execution;
 mod runtime;
@@ -31,6 +32,7 @@ pub use debug_replay::{
     MAX_DEBUG_REPLAY_INPUT_BYTES, MAX_DEBUG_REPLAY_RESULT_BYTES,
     MAX_DEBUG_REPLAY_TOTAL_RESULT_BYTES, MAX_DEBUG_REPLAY_TRACE_BYTES,
 };
+pub use debug_replay_cursor::DebugReplayCursor;
 pub use environment::EnvironmentSnapshot;
 pub use execution::{
     ExecutionId, ExecutionOutcome, ExecutionProvenance, ExecutionRecord, ExecutionState,
