@@ -21,6 +21,54 @@ mod mother;
 pub(crate) const SERVICE_IPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SERVICE_IPC_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const SERVICE_IPC_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const MALFORMED_IPC_PREVIEW_BYTES: usize = 64;
+
+pub(crate) fn malformed_ipc_class(bytes: &[u8]) -> &'static str {
+    if bytes.is_empty() || bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return "empty";
+    }
+    if bytes.starts_with(b"GET ")
+        || bytes.starts_with(b"HEAD ")
+        || bytes.starts_with(b"POST ")
+        || bytes.starts_with(b"PUT ")
+        || bytes.starts_with(b"PATCH ")
+        || bytes.starts_with(b"DELETE ")
+        || bytes.starts_with(b"OPTIONS ")
+        || bytes.starts_with(b"CONNECT ")
+        || bytes.starts_with(b"PRI *")
+    {
+        return "http-like";
+    }
+    if matches!(bytes.first().copied(), Some(b'{') | Some(b'[')) {
+        return "json-like";
+    }
+    if bytes
+        .iter()
+        .take(16)
+        .all(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+    {
+        "text-like"
+    } else {
+        "binary"
+    }
+}
+
+pub(crate) fn malformed_ipc_preview(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &byte in bytes.iter().take(MALFORMED_IPC_PREVIEW_BYTES) {
+        match byte {
+            b'\r' => out.push_str("\\r"),
+            b'\n' => out.push_str("\\n"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(char::from(byte)),
+            _ => out.push('.'),
+        }
+    }
+    if bytes.len() > MALFORMED_IPC_PREVIEW_BYTES {
+        out.push_str("...");
+    }
+    out
+}
 
 /// Parent/service compatibility protocol. This is deliberately separate from
 /// REL syntax versions: it describes process ABI and catalog identity only.
@@ -1089,7 +1137,24 @@ pub async fn run_service_host_with_executor_and_memory(
         let request: ServiceRequest = match serde_json::from_str(line.trim()) {
             Ok(request) => request,
             Err(error) => {
-                tracing::warn!(service = %file.name, error = %error, "invalid service IPC JSON");
+                let classification = malformed_ipc_class(line.as_bytes());
+                tracing::warn!(
+                    service = %file.name,
+                    %peer,
+                    classification,
+                    bytes = line.len(),
+                    error = %error,
+                    "invalid service IPC JSON"
+                );
+                if classification == "http-like" {
+                    let preview = malformed_ipc_preview(line.as_bytes());
+                    tracing::debug!(
+                        service = %file.name,
+                        %peer,
+                        %preview,
+                        "malformed service IPC HTTP-like preview"
+                    );
+                }
                 continue;
             }
         };
@@ -1513,6 +1578,28 @@ pub fn pause_for_interactive_exit() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_ipc_classifier_identifies_http_probes() {
+        assert_eq!(
+            super::malformed_ipc_class(b"GET / HTTP/1.1\r\n"),
+            "http-like"
+        );
+        assert_eq!(
+            super::malformed_ipc_preview(b"GET / HTTP/1.1\r\n"),
+            "GET / HTTP/1.1\\r\\n"
+        );
+    }
+
+    #[test]
+    fn malformed_ipc_classifier_distinguishes_json_and_binary() {
+        assert_eq!(
+            super::malformed_ipc_class(br#"{"token":"redacted"}"#),
+            "json-like"
+        );
+        assert_eq!(super::malformed_ipc_class(&[0, 1, 2, 3]), "binary");
+        assert_eq!(super::malformed_ipc_class(b"\r\n"), "empty");
+    }
+
     #[test]
     fn short_process_label_preserves_service_file_identity() {
         assert_eq!(

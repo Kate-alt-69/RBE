@@ -340,8 +340,10 @@ impl ServiceMotherServer {
                     let shutdown_tx = shutdown_tx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = handle_connection(stream, manager, token, shutdown_tx).await {
-                            tracing::warn!(error = %error, "Service Mother request failed");
+                        if let Err(error) =
+                            handle_connection(stream, peer, manager, token, shutdown_tx).await
+                        {
+                            tracing::warn!(%peer, error = %error, "Service Mother request failed");
                         }
                     });
                 }
@@ -361,6 +363,7 @@ pub async fn run_service_mother(manager: ServiceManager, token: String) -> anyho
 
 async fn handle_connection(
     stream: TcpStream,
+    peer: SocketAddr,
     manager: ServiceManager,
     token: Arc<str>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -372,7 +375,24 @@ async fn handle_connection(
     )
     .await
     .map_err(|_| anyhow::anyhow!("Service Mother request frame timed out"))??;
-    let request: ServiceMotherRequest = serde_json::from_str(line.trim())?;
+    let request: ServiceMotherRequest = match serde_json::from_str(line.trim()) {
+        Ok(request) => request,
+        Err(error) => {
+            let classification = crate::malformed_ipc_class(line.as_bytes());
+            tracing::warn!(
+                %peer,
+                classification,
+                bytes = line.len(),
+                error = %error,
+                "rejected malformed Service Mother IPC"
+            );
+            if classification == "http-like" {
+                let preview = crate::malformed_ipc_preview(line.as_bytes());
+                tracing::debug!(%peer, %preview, "malformed Service Mother HTTP-like preview");
+            }
+            return Ok(());
+        }
+    };
     if !constant_time_eq(request.token().as_bytes(), token.as_bytes()) {
         write_response(
             &mut write,
@@ -546,8 +566,8 @@ mod tests {
         let server_manager = manager.clone();
 
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, server_manager, server_token, shutdown_tx)
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_connection(stream, peer, server_manager, server_token, shutdown_tx)
                 .await
                 .unwrap();
         });

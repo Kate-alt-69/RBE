@@ -95,15 +95,27 @@ impl HostCapabilityBridge {
                     let _permit = permit;
                     match tokio::time::timeout(
                         HOST_CAPABILITY_TIMEOUT,
-                        handle_connection(stream, expected_token, services, video),
+                        handle_connection(stream, peer, expected_token, services, video),
                     )
                     .await
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
-                            tracing::warn!(error = %error, "host capability bridge call failed")
+                            if error.to_string() == "host capability frame length is invalid" {
+                                tracing::debug!(
+                                    %peer,
+                                    error = %error,
+                                    "host capability bridge rejected malformed call"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    %peer,
+                                    error = %error,
+                                    "host capability bridge call failed"
+                                );
+                            }
                         }
-                        Err(_) => tracing::warn!("host capability bridge call timed out"),
+                        Err(_) => tracing::warn!(%peer, "host capability bridge call timed out"),
                     }
                 });
             }
@@ -138,11 +150,12 @@ impl Drop for HostCapabilityBridge {
 
 async fn handle_connection(
     mut stream: TcpStream,
+    peer: SocketAddr,
     expected_token: String,
     services: Arc<RwLock<Option<ServiceManager>>>,
     video: Arc<RwLock<VideoLanguage>>,
 ) -> anyhow::Result<()> {
-    let request: HostCapabilityRequest = read_typed_frame(&mut stream).await?;
+    let request: HostCapabilityRequest = read_typed_frame(&mut stream, peer).await?;
     let response = dispatch_request(request, &expected_token, &services, &video).await;
     write_typed_frame(&mut stream, &response).await?;
     Ok(())
@@ -462,11 +475,66 @@ fn valid_logical_name(value: &str, max_bytes: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
-async fn read_typed_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> anyhow::Result<T> {
+fn malformed_host_prefix_class(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"GET ")
+        || bytes.starts_with(b"HEAD")
+        || bytes.starts_with(b"POST")
+        || bytes.starts_with(b"PUT ")
+        || bytes.starts_with(b"PATC")
+        || bytes.starts_with(b"DELE")
+        || bytes.starts_with(b"OPTI")
+        || bytes.starts_with(b"CONN")
+        || bytes.starts_with(b"PRI ")
+    {
+        "http-like"
+    } else if bytes.iter().all(|byte| *byte == 0) {
+        "zero-length-prefix"
+    } else if bytes
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+    {
+        "text-like"
+    } else {
+        "binary"
+    }
+}
+
+fn malformed_host_prefix_ascii(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                char::from(*byte)
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
+async fn read_typed_frame<T: DeserializeOwned>(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+) -> anyhow::Result<T> {
     let mut len = [0u8; 4];
     stream.read_exact(&mut len).await?;
     let length = u32::from_be_bytes(len) as usize;
     if length == 0 || length > MAX_HOST_CAPABILITY_FRAME_BYTES {
+        let classification = malformed_host_prefix_class(&len);
+        let first4_ascii = malformed_host_prefix_ascii(&len);
+        let first4_hex = format!(
+            "{:02x} {:02x} {:02x} {:02x}",
+            len[0], len[1], len[2], len[3]
+        );
+        tracing::warn!(
+            %peer,
+            classification,
+            decoded_length = length,
+            max_frame_bytes = MAX_HOST_CAPABILITY_FRAME_BYTES,
+            %first4_hex,
+            %first4_ascii,
+            "rejected malformed Host Capability frame"
+        );
         anyhow::bail!("host capability frame length is invalid");
     }
     let mut body = vec![0u8; length];
