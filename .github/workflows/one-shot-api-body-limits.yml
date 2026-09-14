@@ -30,12 +30,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          python3 .github/patches/diag-rel-errors-fix.py
           python3 .github/patches/diag-rel-errors.py
 
-          # Restore the pre-existing API one-shot workflow from the staging
-          # commit's parent; DIAG-001 must not steal or delete unrelated CI.
-          git checkout HEAD^ -- .github/workflows/one-shot-api-body-limits.yml
+          # Restore the unrelated API repair workflow from the known clean
+          # pre-DIAG staging commit. HEAD^ is no longer safe after a retry.
+          git show fa70e4c36fa3d965bc9dc621a25136326c36ee1a:.github/workflows/one-shot-api-body-limits.yml > .github/workflows/one-shot-api-body-limits.yml
           git rm .github/patches/diag-rel-errors.py
+          git rm .github/patches/diag-rel-errors-fix.py
 
           cd engine
           cargo fmt --all
