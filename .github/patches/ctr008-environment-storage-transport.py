@@ -380,7 +380,7 @@ test_marker = '''    #[test]
     fn session_comparison_rejects_wrong_value() {'''
 if text.count(test_marker) != 1:
     raise SystemExit(f"test insertion marker count={text.count(test_marker)}")
-tests = r'''    fn test_storage_state(name: &str) -> (PathBuf, Arc<EnvironmentChildState>) {
+tests = r'''    fn test_storage_state(name: &str) -> (std::path::PathBuf, Arc<EnvironmentChildState>) {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
