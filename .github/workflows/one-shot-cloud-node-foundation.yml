@@ -30,21 +30,78 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # The previous BUG-IPC-LNX-001 one-shot found one missed test call-site.
-          # Repair the patch in-place, apply it first, then clean its staging files.
+          # Finish the previously staged malformed-IPC diagnostic patch. Its
+          # first validation exposed one test helper that also needed the peer.
+          python3 .github/patches/ipc-lnx-diagnostics.py
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('.github/patches/ipc-lnx-diagnostics.py')
+          p = Path('engine/crates/service-runtime/src/mother.rs')
           text = p.read_text()
-          old = 'handle_connection(stream, server_manager, server_token, shutdown_tx)'
-          new = 'handle_connection(stream, peer, server_manager, server_token, shutdown_tx)'
+          old = '''        let server = tokio::spawn(async move {
+              let (stream, _) = listener.accept().await.unwrap();
+              handle_connection(stream, server_manager, server_token, shutdown_tx)
+                  .await
+                  .unwrap();
+          });'''.replace('              ', '            ')
+          new = '''        let server = tokio::spawn(async move {
+              let (stream, peer) = listener.accept().await.unwrap();
+              handle_connection(stream, peer, server_manager, server_token, shutdown_tx)
+                  .await
+                  .unwrap();
+          });'''.replace('              ', '            ')
           if old not in text:
-              raise SystemExit('BUG-IPC-LNX-001 test-call anchor was not found')
+              raise SystemExit('Service Mother shutdown test helper anchor was not found')
           p.write_text(text.replace(old, new, 1))
           PY
-          python3 .github/patches/ipc-lnx-diagnostics.py
 
           python3 .github/patches/cloud-node-foundation.py
+
+          # Small source-level corrections caught while reviewing the generated
+          # foundation before compilation.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('engine/crates/cloud-node/src/format.rs')
+          text = p.read_text()
+          text = text.replace(
+              'parent_content_sha256: has_parent.then_some(parent_raw),',
+              'parent_content_sha256: (has_parent == 1).then_some(parent_raw),',
+              1,
+          )
+          p.write_text(text)
+
+          p = Path('engine/crates/cloud-node/src/lib.rs')
+          text = p.read_text().replace(
+              'pub use config::{CloudNodeSettings, NodeMode, ReplicationTarget, UpstreamSettings};',
+              'pub use config::{CloudNodeSettings, NodeMode, NodeSettings, ReplicationSettings, ReplicationTarget, UpstreamSettings};',
+              1,
+          )
+          p.write_text(text)
+
+          p = Path('engine/crates/cloud-node/src/main.rs')
+          text = p.read_text()
+          old = '''    if command == "public-key" {
+        let signing = load_signing_key_from_env()?;
+        println!("{}", public_key_hex(&signing));
+        return Ok(());
+    }
+
+    let settings = CloudNodeSettings::load(&config_path)?;'''
+          new = '''    if matches!(command, "--help" | "-h") {
+        print_help();
+        return Ok(());
+    }
+    if command == "public-key" {
+        let signing = load_signing_key_from_env()?;
+        println!("{}", public_key_hex(&signing));
+        return Ok(());
+    }
+
+    let settings = CloudNodeSettings::load(&config_path)?;'''
+          if old not in text:
+              raise SystemExit('Cloud Node help/config anchor was not found')
+          p.write_text(text.replace(old, new, 1))
+          PY
 
           rm -f .github/patches/ipc-lnx-diagnostics.py
           rm -f .github/workflows/one-shot-ipc-lnx-diagnostics.yml
