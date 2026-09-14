@@ -9,10 +9,11 @@
 //! Its stdin is a parent-owned lifetime pipe: if the parent exits or
 //! intentionally closes the pipe, the helper shuts down and releases the port.
 
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -22,8 +23,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use cloud_node::{
-    CloudNodeAuthenticator, CloudNodeSettings, CloudNodeStore, Frame, FrameKind, KNOCK_PATH,
-    MAX_AUTH_PROOF_BYTES, SESSION_PROOF_HEADER, SETTINGS_FILE_NAME, SYNC_PATH,
+    AuthenticatedSession, CloudNodeAuthenticator, CloudNodeRecoveryReceiver, CloudNodeSettings,
+    CloudNodeStore, Frame, FrameKind, SyncPlanHeader, TransferChunk, KNOCK_PATH,
+    MAX_AUTH_PROOF_BYTES, MAX_FRAME_BYTES, SESSION_PROOF_HEADER, SETTINGS_FILE_NAME, SYNC_PATH,
+    TRANSFER_PATH,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,6 +36,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HELPER_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAX_SYNC_HELLO_BYTES: usize = 4096;
+const MAX_TRANSFER_REQUEST_BYTES: usize = MAX_FRAME_BYTES + 32;
 const MAINTENANCE_MARKER: &str = "x-rbe-maintenance";
 const BODY: &str =
     r#"{"ok":false,"status":"maintenance","message":"NOT AVAILABLE TRY AGAIN LATER"}"#;
@@ -44,9 +48,15 @@ pub struct MaintenanceNoticeProcess {
     port: u16,
 }
 
+struct RecoveryState {
+    expected: SyncPlanHeader,
+    receiver: CloudNodeRecoveryReceiver,
+}
+
 struct CloudNodeRuntime {
     authenticator: CloudNodeAuthenticator,
     store: CloudNodeStore,
+    recoveries: Mutex<HashMap<[u8; 16], RecoveryState>>,
 }
 
 #[derive(Clone)]
@@ -150,6 +160,7 @@ pub async fn run(host: String, port: u16) -> anyhow::Result<()> {
     let app = Router::new()
         .route(KNOCK_PATH, any(cloud_node_knock))
         .route(SYNC_PATH, any(cloud_node_sync))
+        .route(TRANSFER_PATH, any(cloud_node_transfer))
         .fallback(maintenance_response)
         .with_state(state);
 
@@ -234,32 +245,8 @@ async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Re
     {
         return hidden_not_found();
     }
-
-    let proof = match request
-        .headers()
-        .get(SESSION_PROOF_HEADER)
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(value) if value.len() <= MAX_AUTH_PROOF_BYTES.saturating_mul(2) => value,
-        _ => return hidden_not_found(),
-    };
-    let proof = match hex::decode(proof) {
-        Ok(proof) if proof.len() <= MAX_AUTH_PROOF_BYTES => proof,
-        _ => return hidden_not_found(),
-    };
-    let now_ms = match now_ms() {
-        Ok(now_ms) => now_ms,
-        Err(_) => return hidden_not_found(),
-    };
-    let session = match runtime
-        .authenticator
-        .authorize_session_proof(&proof, now_ms)
-    {
-        Ok(session) => session,
-        Err(error) => {
-            tracing::debug!(error = %error, "rejected hidden Cloud Node sync session proof");
-            return hidden_not_found();
-        }
+    let Some(session) = authorize_cloud_node_session(runtime, &request, "sync") else {
+        return hidden_not_found();
     };
 
     let body = match axum::body::to_bytes(request.into_body(), MAX_SYNC_HELLO_BYTES).await {
@@ -276,7 +263,7 @@ async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Re
     if frame.kind != FrameKind::SyncHello || frame.session != session.session {
         return hidden_not_found();
     }
-    let remote_header = match cloud_node::SyncPlanHeader::decode(&frame.payload) {
+    let remote_header = match SyncPlanHeader::decode(&frame.payload) {
         Ok(header) => header,
         Err(error) => {
             tracing::debug!(error = %error, "rejected malformed Cloud Node sync plan header");
@@ -291,6 +278,43 @@ async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Re
         }
     };
 
+    if remote_header != local_header {
+        let mut recoveries = match runtime.recoveries.lock() {
+            Ok(recoveries) => recoveries,
+            Err(_) => {
+                tracing::error!("Cloud Node recovery session table is poisoned");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        };
+        match recoveries.get(&session.session) {
+            Some(existing) if existing.expected != remote_header => {
+                tracing::warn!(peer = %session.node_id, "Cloud Node peer changed its negotiated recovery root");
+                return StatusCode::CONFLICT.into_response();
+            }
+            Some(_) => {}
+            None => {
+                if !recoveries.is_empty() {
+                    tracing::warn!(peer = %session.node_id, "Cloud Node recovery is already owned by another authenticated session");
+                    return StatusCode::CONFLICT.into_response();
+                }
+                let receiver = match CloudNodeRecoveryReceiver::open(&runtime.store, session.session) {
+                    Ok(receiver) => receiver,
+                    Err(error) => {
+                        tracing::error!(error = %error, "Cloud Node could not create recovery staging tree");
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                };
+                recoveries.insert(
+                    session.session,
+                    RecoveryState {
+                        expected: remote_header,
+                        receiver,
+                    },
+                );
+            }
+        }
+    }
+
     tracing::info!(
         peer = %session.node_id,
         remote_root = %hex::encode(remote_header.root_sha256),
@@ -304,10 +328,179 @@ async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Re
         session: session.session,
         payload: local_header.encode(),
     };
-    match response.encode() {
+    encode_cloud_node_response(response, "sync negotiation")
+}
+
+async fn cloud_node_transfer(
+    State(state): State<Arc<MaintenanceState>>,
+    request: Request,
+) -> Response {
+    if request.method() != Method::POST {
+        return hidden_not_found();
+    }
+    let Some(runtime) = &state.cloud_node else {
+        return hidden_not_found();
+    };
+    if !octet_stream_request(&request)
+        || advertised_body_too_large(&request, MAX_TRANSFER_REQUEST_BYTES)
+    {
+        return hidden_not_found();
+    }
+    let Some(session) = authorize_cloud_node_session(runtime, &request, "transfer") else {
+        return hidden_not_found();
+    };
+
+    let body = match axum::body::to_bytes(request.into_body(), MAX_TRANSFER_REQUEST_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return hidden_not_found(),
+    };
+    let frame = match Frame::decode(&body) {
+        Ok(frame) if frame.session == session.session => frame,
+        Ok(_) => return hidden_not_found(),
+        Err(error) => {
+            tracing::debug!(error = %error, "rejected malformed Cloud Node transfer frame");
+            return hidden_not_found();
+        }
+    };
+
+    match frame.kind {
+        FrameKind::ObjectChunk => {
+            let chunk = match TransferChunk::from_frame(&frame) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    tracing::debug!(error = %error, "rejected malformed Cloud Node object chunk");
+                    return StatusCode::CONFLICT.into_response();
+                }
+            };
+            let receipt = {
+                let mut recoveries = match runtime.recoveries.lock() {
+                    Ok(recoveries) => recoveries,
+                    Err(_) => {
+                        tracing::error!("Cloud Node recovery session table is poisoned");
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                };
+                let Some(recovery) = recoveries.get_mut(&session.session) else {
+                    return StatusCode::CONFLICT.into_response();
+                };
+                match recovery.receiver.accept_chunk(&chunk) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        tracing::warn!(
+                            peer = %session.node_id,
+                            error = %error,
+                            "Cloud Node rejected recovery object bytes"
+                        );
+                        return StatusCode::CONFLICT.into_response();
+                    }
+                }
+            };
+            if receipt.committed {
+                tracing::debug!(
+                    peer = %session.node_id,
+                    object = %hex::encode(chunk.object_key),
+                    resource = ?chunk.resource,
+                    duplicate = receipt.duplicate,
+                    video_reconstructed = receipt.video_reconstructed,
+                    "Cloud Node committed staged recovery resource"
+                );
+            }
+            encode_cloud_node_response(
+                Frame {
+                    kind: FrameKind::ObjectChunk,
+                    session: session.session,
+                    payload: Vec::new(),
+                },
+                "object transfer acknowledgement",
+            )
+        }
+        FrameKind::SyncComplete => {
+            let supplied = match SyncPlanHeader::decode(&frame.payload) {
+                Ok(header) => header,
+                Err(error) => {
+                    tracing::debug!(error = %error, "rejected malformed Cloud Node completion header");
+                    return StatusCode::CONFLICT.into_response();
+                }
+            };
+            let actual = {
+                let mut recoveries = match runtime.recoveries.lock() {
+                    Ok(recoveries) => recoveries,
+                    Err(_) => {
+                        tracing::error!("Cloud Node recovery session table is poisoned");
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                };
+                let Some(recovery) = recoveries.get_mut(&session.session) else {
+                    return StatusCode::CONFLICT.into_response();
+                };
+                if recovery.expected != supplied {
+                    tracing::warn!(peer = %session.node_id, "Cloud Node completion root differs from negotiated root");
+                    return StatusCode::CONFLICT.into_response();
+                }
+                match recovery.receiver.complete(&runtime.store, recovery.expected) {
+                    Ok(actual) => actual,
+                    Err(error) => {
+                        tracing::error!(
+                            peer = %session.node_id,
+                            error = %error,
+                            "Cloud Node recovery snapshot verification failed"
+                        );
+                        return StatusCode::CONFLICT.into_response();
+                    }
+                }
+            };
+            if let Ok(mut recoveries) = runtime.recoveries.lock() {
+                recoveries.remove(&session.session);
+            }
+            tracing::info!(
+                peer = %session.node_id,
+                root = %hex::encode(actual.root_sha256),
+                "Cloud Node recovery snapshot verified and activated"
+            );
+            encode_cloud_node_response(
+                Frame {
+                    kind: FrameKind::SyncComplete,
+                    session: session.session,
+                    payload: actual.encode(),
+                },
+                "recovery completion",
+            )
+        }
+        _ => hidden_not_found(),
+    }
+}
+
+fn authorize_cloud_node_session(
+    runtime: &CloudNodeRuntime,
+    request: &Request,
+    operation: &str,
+) -> Option<AuthenticatedSession> {
+    let proof = request
+        .headers()
+        .get(SESSION_PROOF_HEADER)
+        .and_then(|value| value.to_str().ok())?;
+    if proof.len() > MAX_AUTH_PROOF_BYTES.saturating_mul(2) {
+        return None;
+    }
+    let proof = hex::decode(proof).ok()?;
+    if proof.len() > MAX_AUTH_PROOF_BYTES {
+        return None;
+    }
+    let now_ms = now_ms().ok()?;
+    match runtime.authenticator.authorize_session_proof(&proof, now_ms) {
+        Ok(session) => Some(session),
+        Err(error) => {
+            tracing::debug!(error = %error, operation, "rejected hidden Cloud Node session proof");
+            None
+        }
+    }
+}
+
+fn encode_cloud_node_response(frame: Frame, operation: &str) -> Response {
+    match frame.encode() {
         Ok(encoded) => octet_stream_response(encoded),
         Err(error) => {
-            tracing::error!(error = %error, "Cloud Node could not encode sync negotiation response");
+            tracing::error!(error = %error, operation, "Cloud Node could not encode response");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
@@ -394,6 +587,7 @@ fn load_cloud_node_runtime() -> anyhow::Result<Option<Arc<CloudNodeRuntime>>> {
     Ok(Some(Arc::new(CloudNodeRuntime {
         authenticator,
         store,
+        recoveries: Mutex::new(HashMap::new()),
     })))
 }
 

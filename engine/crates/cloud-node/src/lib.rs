@@ -19,13 +19,15 @@ mod transfer;
 pub use auth::{random_session_and_nonce, NodeProof, NodeProofKind, DEFAULT_AUTH_SKEW_MS};
 #[cfg(feature = "client")]
 pub use client::{
-    negotiate_sync, probe_upstream, AuthenticatedPeer, SyncNegotiation, KNOCK_PATH,
-    SESSION_PROOF_HEADER, SYNC_PATH,
+    negotiate_sync, probe_upstream, synchronize_upstream, AuthenticatedPeer, SyncNegotiation,
+    KNOCK_PATH, SESSION_PROOF_HEADER, SYNC_PATH, TRANSFER_PATH,
 };
 #[cfg(not(feature = "client"))]
 pub const KNOCK_PATH: &str = "/.rbe/cn/v1/knock";
 #[cfg(not(feature = "client"))]
 pub const SYNC_PATH: &str = "/.rbe/cn/v1/sync";
+#[cfg(not(feature = "client"))]
+pub const TRANSFER_PATH: &str = "/.rbe/cn/v1/transfer";
 #[cfg(not(feature = "client"))]
 pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 pub use config::{
