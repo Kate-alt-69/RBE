@@ -13,6 +13,7 @@ mod protocol;
 mod server;
 mod store;
 mod sync;
+mod transfer;
 
 pub use auth::{random_session_and_nonce, NodeProof, NodeProofKind, DEFAULT_AUTH_SKEW_MS};
 #[cfg(feature = "client")]
@@ -44,3 +45,4 @@ pub use server::{
 };
 pub use store::{CloudNodeStore, StoreSummary, StoredObject};
 pub use sync::{SyncObject, SyncPlan, SyncPlanHeader};
+pub use transfer::{TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES};
