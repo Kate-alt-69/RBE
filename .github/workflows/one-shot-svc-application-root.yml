@@ -19,7 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
-      - name: Apply and validate Service application root ownership
+      - name: Apply and validate Service root ownership and diagnostics
         shell: bash
         run: |
           set -euo pipefail
@@ -29,10 +29,6 @@ jobs:
           staging="$(git rev-parse HEAD)"
           base="babb2d260c266ce10f59cac3a1da21823fc7415f"
 
-          # The Service Manager has repeated call shapes that all need the
-          # same propagation change. Keep the strict single-replacement rule
-          # for boot/Mother code, but intentionally replace every matching
-          # Manager callsite.
           python3 - <<'PY'
           from pathlib import Path
           path = Path('.github/patches/svc-application-root.py')
@@ -52,6 +48,224 @@ jobs:
 
           python3 .github/patches/svc-application-root.py
 
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: diagnostics expected one anchor, found {count}')
+              p.write_text(text.replace(old, new, 1))
+
+          # Shared catalog ABI.
+          path = 'engine/crates/service-runtime/src/lib.rs'
+          replace_once(
+              path,
+              'pub const SERVICE_CAPABILITY_TARGET_PREFIX: &str = "service:";\n',
+              'pub const SERVICE_CAPABILITY_TARGET_PREFIX: &str = "service:";\n\n'
+              '/// Version of the deterministic ServiceCatalog fingerprint contract.\n'
+              'pub const SERVICE_CATALOG_ABI: u32 = 1;\n',
+          )
+
+          # Same build identity compiled into backend.exe and service(.exe).
+          path = 'engine/crates/backend/build.rs'
+          replace_once(
+              path,
+              '    println!("cargo:rerun-if-env-changed=RBE_BUILD_TRACE");\n',
+              '    println!("cargo:rerun-if-env-changed=RBE_BUILD_TRACE");\n'
+              '    println!("cargo:rerun-if-env-changed=RBE_BUILD_ID");\n',
+          )
+          replace_once(
+              path,
+              '    let build_id = build_id();\n\n',
+              '    let build_id = build_id();\n'
+              '    if build_id.chars().any(char::is_control) {\n'
+              '        panic!("backend/build.rs: RBE build ID contains control characters");\n'
+              '    }\n'
+              '    println!("cargo:rustc-env=RBE_COMPILED_BUILD_ID={build_id}");\n'
+              '    println!("cargo:rustc-env=RBE_COMPILED_TARGET={target}");\n\n',
+          )
+
+          # service.exe probe + Logger-backed fatal output.
+          path = 'engine/crates/backend/src/service_main.rs'
+          replace_once(
+              path,
+              'fn process_label(args: &[String]) -> String {\n',
+              'const SERVICE_COMPAT_PROTOCOL: &str = "RBE-SERVICE-COMPAT/1";\n\n'
+              'fn emit_service_compat_probe() {\n'
+              '    let payload = serde_json::json!({\n'
+              '        "protocol": SERVICE_COMPAT_PROTOCOL,\n'
+              '        "buildId": env!("RBE_COMPILED_BUILD_ID"),\n'
+              '        "target": env!("RBE_COMPILED_TARGET"),\n'
+              '        "packageVersion": env!("CARGO_PKG_VERSION"),\n'
+              '        "catalogAbi": service_runtime::SERVICE_CATALOG_ABI,\n'
+              '    });\n'
+              '    println!("{}", serde_json::to_string(&payload).expect("serialize Service compatibility probe"));\n'
+              '}\n\n'
+              'fn init_service_logging(args: &[String]) {\n'
+              '    let logging_config = flag_value(args, "--settings")\n'
+              '        .and_then(|path| config::Config::load(path).ok())\n'
+              '        .map(|config| config.logging)\n'
+              '        .unwrap_or_default();\n'
+              '    let _ = logging::terminal::init(&logging_config);\n'
+              '}\n\n'
+              'fn process_label(args: &[String]) -> String {\n',
+          )
+          replace_once(
+              path,
+              'async fn main() {\n    let args: Vec<String> = std::env::args().skip(1).collect();\n\n',
+              'async fn main() {\n    let args: Vec<String> = std::env::args().skip(1).collect();\n'
+              '    if args.iter().any(|arg| arg == "--service-compat-probe") {\n'
+              '        emit_service_compat_probe();\n'
+              '        return;\n'
+              '    }\n\n'
+              '    init_service_logging(&args);\n'
+              '    let log = logging::Logger::new("SERVICE");\n\n',
+          )
+          replace_once(
+              path,
+              '    if let Err(error) = result {\n        if mother {\n            eprintln!("fatal Service Mother error: {error:#}");\n        } else {\n            eprintln!("fatal service worker error: {error:#}");\n        }\n        std::process::exit(1);\n    }\n',
+              '    if let Err(error) = result {\n'
+              '        let component = if mother { "MOTHER" } else { "WORKER" };\n'
+              '        log.child(component).error(format!("FATAL: {error:#}"));\n'
+              '        std::process::exit(1);\n'
+              '    }\n',
+          )
+
+          # Parent-side compatibility validation + actionable error classes.
+          path = 'engine/crates/backend/src/service_mother.rs'
+          replace_once(path, 'use sha2::{Digest, Sha256};\n', 'use serde::Deserialize;\nuse sha2::{Digest, Sha256};\n')
+          replace_once(
+              path,
+              'const MOTHER_STDOUT_LINE_MAX_BYTES: usize = 64 * 1024;\n',
+              'const MOTHER_STDOUT_LINE_MAX_BYTES: usize = 64 * 1024;\n'
+              'const SERVICE_COMPAT_PROTOCOL: &str = "RBE-SERVICE-COMPAT/1";\n'
+              'const SERVICE_COMPAT_MAX_BYTES: usize = 4 * 1024;\n'
+              'const SERVICE_COMPAT_TIMEOUT: Duration = Duration::from_secs(5);\n',
+          )
+          replace_once(
+              path,
+              '        anyhow::bail!("backend was built without a valid standalone Service integrity binding");\n',
+              '        anyhow::bail!("SVC5001: Service binary is not compatible with the current backend: this backend has no valid standalone Service integrity binding. Rebuild the complete RBE package.");\n',
+          )
+          replace_once(
+              path,
+              '            "standalone Service runtime {} is missing; backend will not synthesize it from itself",\n',
+              '            "SVC5001: Service binary is missing at {}. Rebuild RBE and copy the generated Service binary to this exact path.",\n',
+          )
+          replace_once(
+              path,
+              '            "standalone Service runtime {} failed build-time SHA-256 verification",\n',
+              '            "SVC5001: Service binary at {} is not compatible with the current backend (SHA-256 binding mismatch). Rebuild RBE and replace this file with the Service binary generated alongside this backend.",\n',
+          )
+          replace_once(
+              path,
+              '        anyhow::bail!("standalone Service runtime unexpectedly matches backend executable bytes");\n',
+              '        anyhow::bail!("SVC5001: standalone Service binary unexpectedly matches backend executable bytes; rebuild the complete RBE package");\n',
+          )
+
+          compat = r'''
+          #[derive(Debug, Deserialize)]
+          #[serde(rename_all = "camelCase")]
+          struct ServiceCompatProbe {
+              protocol: String,
+              build_id: String,
+              target: String,
+              package_version: String,
+              catalog_abi: u32,
+          }
+
+          async fn verify_service_compatibility(service: &Path) -> anyhow::Result<()> {
+              let mut command = Command::new(service);
+              command
+                  .arg("--service-compat-probe")
+                  .stdin(Stdio::null())
+                  .stdout(Stdio::piped())
+                  .stderr(Stdio::piped())
+                  .kill_on_drop(true);
+              let output = tokio::time::timeout(SERVICE_COMPAT_TIMEOUT, command.output())
+                  .await
+                  .map_err(|_| anyhow::anyhow!(
+                      "SVC5003: Service binary at {} did not answer the compatibility probe within {} ms. Recompile RBE and replace this Service binary.",
+                      service.display(), SERVICE_COMPAT_TIMEOUT.as_millis()
+                  ))?
+                  .with_context(|| format!("SVC5003: launch Service compatibility probe {}", service.display()))?;
+              if !output.status.success() {
+                  anyhow::bail!(
+                      "SVC5003: Service binary at {} could not understand/complete the compatibility probe (status {}). Recompile RBE and replace this Service binary.",
+                      service.display(), output.status
+                  );
+              }
+              if output.stdout.len() > SERVICE_COMPAT_MAX_BYTES {
+                  anyhow::bail!(
+                      "SVC5003: Service binary at {} returned an oversized compatibility response. Recompile RBE and replace this Service binary.",
+                      service.display()
+                  );
+              }
+              let probe: ServiceCompatProbe = serde_json::from_slice(&output.stdout).map_err(|error| anyhow::anyhow!(
+                  "SVC5003: Service binary at {} returned an unreadable compatibility response ({error}). Recompile RBE and replace this Service binary.",
+                  service.display()
+              ))?;
+              if probe.protocol != SERVICE_COMPAT_PROTOCOL {
+                  anyhow::bail!(
+                      "SVC5003: Service binary at {} uses compatibility protocol {:?}, expected {:?}. Recompile RBE and replace this Service binary.",
+                      service.display(), probe.protocol, SERVICE_COMPAT_PROTOCOL
+                  );
+              }
+              let expected_build = env!("RBE_COMPILED_BUILD_ID");
+              let expected_target = env!("RBE_COMPILED_TARGET");
+              let expected_version = env!("CARGO_PKG_VERSION");
+              let expected_catalog_abi = service_runtime::SERVICE_CATALOG_ABI;
+              if probe.build_id != expected_build
+                  || probe.target != expected_target
+                  || probe.package_version != expected_version
+                  || probe.catalog_abi != expected_catalog_abi
+              {
+                  anyhow::bail!(
+                      "SVC5001: Service binary is not compatible with the current backend. path={} helper(build={}, target={}, version={}, catalog_abi={}) backend(build={}, target={}, version={}, catalog_abi={}). Rebuild RBE and copy the generated Service binary to {}.",
+                      service.display(), probe.build_id, probe.target, probe.package_version,
+                      probe.catalog_abi, expected_build, expected_target, expected_version,
+                      expected_catalog_abi, service.display()
+                  );
+              }
+              logging::Logger::new("SERVICE:MOTHER").debug(format!(
+                  "verified Service compatibility build={} target={} catalog_abi={}",
+                  expected_build, expected_target, expected_catalog_abi
+              ));
+              Ok(())
+          }
+
+          '''
+          replace_once(path, 'async fn spawn_process(\n', compat + 'async fn spawn_process(\n')
+          replace_once(
+              path,
+              '    let service_exe = ensure_canonical_service_executable(&exe, parent, expected_service_sha256)?;\n\n',
+              '    let service_log = logging::Logger::new("SERVICE:MOTHER");\n'
+              '    let service_exe = ensure_canonical_service_executable(&exe, parent, expected_service_sha256)\n'
+              '        .map_err(|error| { service_log.error(format!("FATAL: {error:#}")); error })?;\n'
+              '    verify_service_compatibility(&service_exe)\n'
+              '        .await\n'
+              '        .map_err(|error| { service_log.error(format!("FATAL: {error:#}")); error })?;\n\n',
+          )
+          replace_once(
+              path,
+              '        if !expected.eq_ignore_ascii_case(&actual_fingerprint) {\n            anyhow::bail!(\n                "Service Mother catalog changed after parent validation (expected {expected}, compiled {actual_fingerprint})"\n            );\n        }\n',
+              '        if !expected.eq_ignore_ascii_case(&actual_fingerprint) {\n'
+              '            let service_root = application_root\n'
+              '                .as_deref()\n'
+              '                .map(|root| crate::service_boot::resolve_runtime_path_from(root, &config.services.directory))\n'
+              '                .unwrap_or_else(|| crate::service_boot::resolve_runtime_path(&config.services.directory));\n'
+              '            anyhow::bail!(\n'
+              '                "SVC5002: Service Mother compiled a different Service catalog than the backend validated. service_root={} service_binary={} expected_fingerprint={} compiled_fingerprint={}. Ensure .service files and Service settings are not changing during startup. If they are unchanged, rebuild RBE and replace the Service binary at {}.",\n'
+              '                service_root.display(), current_exe.display(), expected, actual_fingerprint, current_exe.display()\n'
+              '            );\n'
+              '        }\n',
+          )
+          print('BUG-SVC-002 diagnostics patch applied')
+          PY
+
           rm -f .github/workflows/one-shot-svc-application-root.yml
           rm -f .github/patches/svc-application-root.py
 
@@ -61,16 +275,31 @@ jobs:
           cargo test -p backend explicit_application_root_owns_relative_service_paths --locked
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo build -p backend --bin service --locked
+          probe="$(target/debug/service --service-compat-probe)"
+          python3 - "$probe" <<'PY'
+          import json, sys
+          probe = json.loads(sys.argv[1])
+          assert probe['protocol'] == 'RBE-SERVICE-COMPAT/1'
+          assert isinstance(probe['buildId'], str) and probe['buildId']
+          assert isinstance(probe['target'], str) and probe['target']
+          assert isinstance(probe['catalogAbi'], int) and probe['catalogAbi'] == 1
+          PY
           cd ..
 
           grep -q 'arg("--application-root")' engine/crates/backend/src/service_mother.rs
           grep -q 'compile_from_root' engine/crates/backend/src/service_mother.rs
           grep -q 'ModuleProgram::load(&root.join("module"))' engine/crates/backend/src/service_boot.rs
           grep -q 'prepare_all_for_mother' engine/crates/service-runtime/src/manager.rs
+          grep -q 'SVC5001' engine/crates/backend/src/service_mother.rs
+          grep -q 'SVC5002' engine/crates/backend/src/service_mother.rs
+          grep -q 'SVC5003' engine/crates/backend/src/service_mother.rs
+          grep -q 'Logger::new("SERVICE")' engine/crates/backend/src/service_main.rs
+          grep -q 'SERVICE_CATALOG_ABI' engine/crates/service-runtime/src/lib.rs
 
           git add -A
           tree="$(git write-tree)"
-          message='FIX | BUG-SVC-001 bind Service paths to application root'
+          message='FIX | BUG-SVC-001 bind Service runtime to application root and compatibility identity'
           final="$(printf '%s\n' "$message" | git commit-tree "$tree" -p "$base")"
 
           git fetch origin main
