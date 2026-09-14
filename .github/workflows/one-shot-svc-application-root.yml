@@ -34,6 +34,13 @@ jobs:
           python3 .github/patches/svc-application-root.py
           python3 .github/patches/svc-diagnostics-contract.py
           python3 .github/patches/svc-diagnostics-mother.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('engine/crates/backend/src/service_main.rs'); s=p.read_text()
+          old='mod service_integrity {\n    include!(concat!(env!("OUT_DIR"), "/service_integrity.rs"));\n}'
+          if s.count(old) != 1: raise SystemExit('service identity module anchor missing')
+          p.write_text(s.replace(old, '#[allow(dead_code)]\n'+old, 1))
+          PY
           rm -f .github/workflows/one-shot-svc-application-root.yml .github/patches/svc-application-root.py .github/patches/svc-diagnostics-contract.py .github/patches/svc-diagnostics-mother.py .ci-service-repair-guard
           cd engine
           cargo fmt --all
