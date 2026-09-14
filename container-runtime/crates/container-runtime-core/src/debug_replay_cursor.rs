@@ -194,9 +194,7 @@ mod tests {
     use sandbox_primitives::SandboxPolicy;
 
     use super::*;
-    use crate::{
-        DebugReplayRecorder, ExecutionId, ExecutionProvenance, ExecutionTask, WorkCost,
-    };
+    use crate::{DebugReplayRecorder, ExecutionId, ExecutionProvenance, ExecutionTask, WorkCost};
 
     fn temp_root(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -231,9 +229,7 @@ mod tests {
         }
     }
 
-    fn recorded_trace(
-        name: &str,
-    ) -> (PathBuf, DebugReplayStore, WorkerCapabilityCall, PathBuf) {
+    fn recorded_trace(name: &str) -> (PathBuf, DebugReplayStore, WorkerCapabilityCall, PathBuf) {
         let root = temp_root(name);
         let store = DebugReplayStore::new(root.clone());
         let task = task(10);
