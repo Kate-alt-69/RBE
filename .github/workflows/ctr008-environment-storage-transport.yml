@@ -1,0 +1,81 @@
+name: CTR-008 Environment Storage transport
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/ctr008-environment-storage-transport.py'
+      - '.github/workflows/ctr008-environment-storage-transport.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ctr008-environment-storage-transport
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+
+      - name: Apply CTR-008 Environment Storage transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+          python3 .github/patches/ctr008-environment-storage-transport.py
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+
+      - name: Check Container workspace locked
+        run: cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+      - name: Test Container workspace locked
+        run: cargo test --manifest-path container-runtime/Cargo.toml --workspace --locked
+      - name: Clippy Container workspace locked
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Verify CTR-008 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'const CHILD_PROTOCOL_VERSION: u16 = 4' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'StorageCapability {' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'StorageCapabilityResult {' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'fn dispatch_environment_storage' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'fn environment_owned_capability' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'kind == CapabilityKind::Storage' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'active_execution_identity_matches' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'CAPABILITY_EXECUTION_MISMATCH' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'storage_child_transport_commits_only_for_exact_active_provenance' container-runtime/crates/container-bin/src/environment_process.rs
+          grep -q 'dispatch_storage_capability' container-runtime/crates/container-bin/src/environment_process.rs
+          git diff --check
+
+      - name: Land validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm -f .github/workflows/ctr008-environment-storage-transport.yml
+          git rm -f .github/patches/ctr008-environment-storage-transport.py
+          git add container-runtime/crates/container-bin/src/environment_process.rs
+          git commit -m "FIX | BUG-CTR-008 keep Storage inside owning Environment"
+
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
+          git push origin HEAD:main
