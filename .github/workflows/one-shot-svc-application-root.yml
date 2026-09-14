@@ -1,0 +1,67 @@
+name: One-shot Service application-root repair
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-svc-application-root.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: Apply and validate Service application root ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          staging="$(git rev-parse HEAD)"
+          base="$(git rev-parse HEAD^1)"
+          python3 .github/patches/svc-application-root.py
+
+          rm -f .github/workflows/one-shot-svc-application-root.yml
+          rm -f .github/patches/svc-application-root.py
+
+          cd engine
+          cargo fmt --all
+          cargo check --workspace --locked
+          cargo test -p backend explicit_application_root_owns_relative_service_paths --locked
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cd ..
+
+          grep -q 'arg("--application-root")' engine/crates/backend/src/service_mother.rs
+          grep -q 'compile_from_root' engine/crates/backend/src/service_mother.rs
+          grep -q 'ModuleProgram::load(&root.join("module"))' engine/crates/backend/src/service_boot.rs
+          grep -q 'prepare_all_for_mother' engine/crates/service-runtime/src/manager.rs
+
+          git add -A
+          tree="$(git write-tree)"
+          message='FIX | BUG-SVC-001 bind Service paths to application root'
+          final="$(printf '%s\n' "$message" | git commit-tree "$tree" -p "$base")"
+
+          git fetch origin main
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$staging" ]; then
+            echo "main moved while Service fix was validating; refusing to overwrite concurrent work"
+            exit 1
+          fi
+
+          if git push --force-with-lease=refs/heads/main:"$staging" origin "$final":refs/heads/main; then
+            echo "landed squashed Service fix $final"
+          else
+            echo "force update rejected; preserving staging history and landing as fast-forward"
+            fallback="$(printf '%s\n' "$message" | git commit-tree "$tree" -p "$staging")"
+            git push origin "$fallback":refs/heads/main
+          fi
