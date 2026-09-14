@@ -140,6 +140,12 @@
       "doc": "service.md#svc5199"
     },
     {
+      "code": "REL1000",
+      "status": "emitted",
+      "title": "Lexical error not yet classified more narrowly",
+      "doc": "rel.md#rel1000"
+    },
+    {
       "code": "REL1001",
       "status": "reserved",
       "title": "Invalid token",
@@ -150,6 +156,12 @@
       "status": "reserved",
       "title": "Unterminated string or literal",
       "doc": "rel.md#rel1002"
+    },
+    {
+      "code": "REL1100",
+      "status": "emitted",
+      "title": "Syntax/parser error not yet classified more narrowly",
+      "doc": "rel.md#rel1100"
     },
     {
       "code": "REL1101",
@@ -194,6 +206,12 @@
       "doc": "rel.md#rel9001"
     },
     {
+      "code": "RELC1000",
+      "status": "emitted",
+      "title": "Source discovery/registration error not yet classified more narrowly",
+      "doc": "relc.md#relc1000"
+    },
+    {
       "code": "RELC1001",
       "status": "reserved",
       "title": "Duplicate source identity",
@@ -204,6 +222,12 @@
       "status": "reserved",
       "title": "Unsupported or inconsistent source role",
       "doc": "relc.md#relc1002"
+    },
+    {
+      "code": "RELC2000",
+      "status": "emitted",
+      "title": "Link/dependency error not yet classified more narrowly",
+      "doc": "relc.md#relc2000"
     },
     {
       "code": "RELC2001",
@@ -219,19 +243,25 @@
     },
     {
       "code": "RELC2101",
-      "status": "reserved",
+      "status": "emitted",
       "title": "Capability not permitted for source role",
       "doc": "relc.md#relc2101"
     },
     {
       "code": "RELC2102",
-      "status": "reserved",
+      "status": "emitted",
       "title": "Invalid capability target or operation",
       "doc": "relc.md#relc2102"
     },
     {
+      "code": "RELC2200",
+      "status": "emitted",
+      "title": "Runtime ENV/policy/middleware lowering error",
+      "doc": "relc.md#relc2200"
+    },
+    {
       "code": "RELC3001",
-      "status": "reserved",
+      "status": "emitted",
       "title": "Native Container execution required but lowering failed",
       "doc": "relc.md#relc3001"
     },

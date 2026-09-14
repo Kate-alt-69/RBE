@@ -16,6 +16,26 @@ Current REL parser/evaluator diagnostics are not all numbered yet. The ranges be
 | `REL3000-3999` | evaluator/runtime execution |
 | `REL9000-9099` | internal REL invariant failures / probable engine bugs |
 
+## Emitted migration umbrella codes
+
+<a id="rel1000"></a>
+### REL1000 — lexical error not yet classified more narrowly
+
+**Status:** Emitted by RELC-linked compilation.
+
+REL tokenization failed before a narrower stable lexer code had been assigned to that exact branch. The diagnostic still includes the original source location and lexer message.
+
+**Action:** fix the reported tokenization problem. As individual lexer branches migrate, new releases may emit a more specific `REL1001+` code for the same class of source mistake.
+
+<a id="rel1100"></a>
+### REL1100 — syntax/parser error not yet classified more narrowly
+
+**Status:** Emitted by RELC-linked compilation.
+
+The REL parser rejected the source, but that parser branch has not yet been migrated to a narrower stable `REL11xx` code. This is a syntax-layer problem, not a RELC linking or capability error.
+
+**Action:** use the reported line/column and parser message. Future releases may replace this umbrella code with a more specific `REL1101+` code without changing the underlying language rule.
+
 ## Reserved migration codes
 
 <a id="rel1001"></a>

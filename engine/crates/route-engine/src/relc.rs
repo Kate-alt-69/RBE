@@ -141,33 +141,68 @@ pub enum RelcError {
     Registry(SourceRegistryError),
     Embedded(EmbeddedRelError),
     Server(ServerCompileError),
-    Parse { source: SourceId, error: ParseError },
+    Parse {
+        source: SourceId,
+        code: &'static str,
+        error: ParseError,
+    },
     RuntimeEnv(RuntimeEnvError),
     Policy(ServerPolicyError),
     Middleware(MiddlewarePlanError),
-    Capability { source: SourceId, message: String },
+    Capability {
+        source: SourceId,
+        code: &'static str,
+        message: String,
+    },
     Link(String),
+}
+
+impl RelcError {
+    /// Stable public diagnostic code. Broad migration codes intentionally
+    /// remain broad until the originating compiler branch owns a narrower
+    /// code; callers must never infer codes from English error text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Registry(_) | Self::Embedded(_) | Self::Server(_) => "RELC1000",
+            Self::Parse { code, .. } | Self::Capability { code, .. } => code,
+            Self::RuntimeEnv(_) | Self::Policy(_) | Self::Middleware(_) => "RELC2200",
+            Self::Link(_) => "RELC2000",
+        }
+    }
+
+    /// Repository-relative long-form Error Code Book target.
+    pub fn help_path(&self) -> String {
+        let code = self.code();
+        let book = if code.starts_with("RELC") {
+            "relc.md"
+        } else {
+            "rel.md"
+        };
+        format!("doc/error-codes/{book}#{}", code.to_ascii_lowercase())
+    }
 }
 
 impl fmt::Display for RelcError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} ", self.code())?;
         match self {
             Self::Registry(error) => write!(formatter, "RELC source registry: {error}"),
             Self::Embedded(error) => write!(formatter, "{error}"),
             Self::Server(error) => write!(formatter, "{error}"),
-            Self::Parse { source, error } => write!(
+            Self::Parse { source, error, .. } => write!(
                 formatter,
-                "RELC parse error in {source} at {}:{}: {}",
+                "REL parse error in {source} at {}:{}: {}",
                 error.line, error.column, error.message
             ),
             Self::RuntimeEnv(error) => write!(formatter, "RELC Runtime ENV: {error}"),
             Self::Policy(error) => write!(formatter, "RELC ServerPolicy: {error}"),
             Self::Middleware(error) => write!(formatter, "RELC MiddlewarePlan: {error}"),
-            Self::Capability { source, message } => {
-                write!(formatter, "RELC capability error in {source}: {message}")
-            }
+            Self::Capability {
+                source, message, ..
+            } => write!(formatter, "RELC capability error in {source}: {message}"),
             Self::Link(message) => write!(formatter, "RELC link error: {message}"),
-        }
+        }?;
+        write!(formatter, "\nhelp: {}", self.help_path())
     }
 }
 
@@ -335,6 +370,7 @@ pub fn compile_runtime_image(
                 });
                 if requires_storage {
                     return Err(RelcError::Capability {
+                        code: "RELC3001",
                         source: id.clone(),
                         message: format!(
                             "Environment Storage authority requires native Container execution; Route-WASM v7 could not lower this Route: {reason}"
@@ -463,6 +499,7 @@ fn parse_registered_source(
         .tokenize()
         .map_err(|error| RelcError::Parse {
             source: id.clone(),
+            code: "REL1000",
             error: ParseError {
                 message: error.message,
                 line: error.line,
@@ -481,6 +518,7 @@ fn parse_registered_source(
     };
     result.map_err(|error| RelcError::Parse {
         source: id.clone(),
+        code: "REL1100",
         error,
     })
 }
@@ -497,18 +535,21 @@ fn validate_capabilities(
         {
             if name == "env" {
                 return Err(RelcError::Capability {
+                    code: "RELC2101",
                     source: source.clone(),
                     message: "legacy process environment capability `env` is disabled in RELC-linked applications; use typed `ENV` for public runtime configuration or Vault for secrets".into(),
                 });
             }
             if name == "ENV" && !RuntimeEnv::can_read(kind) {
                 return Err(RelcError::Capability {
+                    code: "RELC2101",
                     source: source.clone(),
                     message: "Runtime ENV is not exposed to Route REL by default".into(),
                 });
             }
             if name == "quickDB" && kind != RelSourceKind::Service {
                 return Err(RelcError::Capability {
+                    code: "RELC2101",
                     source: source.clone(),
                     message: "quickDB is a Service REL process-local capability".into(),
                 });
@@ -516,6 +557,7 @@ fn validate_capabilities(
             if name == "storage" {
                 if kind != RelSourceKind::Module {
                     return Err(RelcError::Capability {
+                        code: "RELC2101",
                         source: source.clone(),
                         message: "Environment Storage authority is Module-owned; import an exported Module function instead of using Storage directly"
                             .into(),
@@ -524,6 +566,7 @@ fn validate_capabilities(
                 match base {
                     ImportTarget::Builtin(_) => {
                         return Err(RelcError::Capability {
+                            code: "RELC2102",
                             source: source.clone(),
                             message: "Storage namespace imports are forbidden; import one exact operation such as `storage.read`"
                                 .into(),
@@ -533,6 +576,7 @@ fn validate_capabilities(
                         if !storage_capability_operation_allowed(function) =>
                     {
                         return Err(RelcError::Capability {
+                            code: "RELC2102",
                             source: source.clone(),
                             message: format!(
                                 "unsupported Environment Storage operation {function:?}; expected one of {:?}",
@@ -550,6 +594,7 @@ fn validate_capabilities(
         ) && kind == RelSourceKind::Route
         {
             return Err(RelcError::Capability {
+                code: "RELC2101",
                 source: source.clone(),
                 message: "Route REL cannot directly import Service REL; use a module boundary"
                     .into(),
@@ -864,6 +909,7 @@ fn builtin_host_requirements(
     };
     let module_owner = if matches!(module, "storage" | "vm" | "video-manager") {
         let owner = module_owner.ok_or_else(|| RelcError::Capability {
+            code: "RELC2101",
             source: source.clone(),
             message: format!(
                 "{module} authority is Module-owned; direct capability requirements must originate from Module REL"
@@ -871,6 +917,7 @@ fn builtin_host_requirements(
         })?;
         if module == "storage" && !storage_capability_owner_allowed(owner) {
             return Err(RelcError::Capability {
+                code: "RELC2102",
                 source: source.clone(),
                 message: format!(
                     "Module capability principal {owner:?} cannot be used as an Environment Storage namespace"
@@ -1036,6 +1083,7 @@ fn capability_requirements(
             RelSourceKind::Module | RelSourceKind::Route
         ) {
             return Err(RelcError::Capability {
+                code: "RELC2101",
                 source: source.clone(),
                 message: "Environment Storage authority may propagate through Module REL only into a Route that executes inside Container"
                     .into(),
@@ -1155,6 +1203,31 @@ fn add_functions(output: &mut Vec<(String, Vec<Statement>)>, functions: &[Functi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rel_parser_failures_emit_stable_rel_code_and_help() {
+        let routes = vec![PhysicalRelSource::new(
+            RelSourceKind::Route,
+            "broken",
+            "api/broken.route",
+            "class Route { get() {",
+        )];
+        let error = compile_runtime_image("server Main {}", routes, &serde_json::json!({}))
+            .expect_err("invalid REL syntax must fail compilation");
+        assert_eq!(error.code(), "REL1100");
+        let rendered = error.to_string();
+        assert!(rendered.starts_with("REL1100 "));
+        assert!(rendered.contains("help: doc/error-codes/rel.md#rel1100"));
+    }
+
+    #[test]
+    fn generic_relc_link_failures_emit_stable_code_and_help() {
+        let error = RelcError::Link("example link failure".into());
+        assert_eq!(error.code(), "RELC2000");
+        let rendered = error.to_string();
+        assert!(rendered.starts_with("RELC2000 "));
+        assert!(rendered.contains("help: doc/error-codes/relc.md#relc2000"));
+    }
 
     #[test]
     fn compiles_physical_and_embedded_sources_into_one_image() {
@@ -1517,7 +1590,10 @@ mod tests {
         )];
         let error = compile_runtime_image("server Main {}", sources, &serde_json::json!({}))
             .expect_err("Storage namespace import must fail closed");
-        assert!(error.to_string().contains("exact operation"));
+        assert_eq!(error.code(), "RELC2102");
+        let rendered = error.to_string();
+        assert!(rendered.contains("exact operation"));
+        assert!(rendered.contains("help: doc/error-codes/relc.md#relc2102"));
     }
 
     #[test]
@@ -1540,9 +1616,12 @@ mod tests {
         ];
         let error = compile_runtime_image("server Main {}", sources, &serde_json::json!({}))
             .expect_err("Storage authority must never escape to interpreter fallback");
+        assert_eq!(error.code(), "RELC3001");
         let message = error.to_string();
+        assert!(message.starts_with("RELC3001 "));
         assert!(message.contains("Storage authority requires native Container execution"));
         assert!(message.contains("static JSON arguments"));
+        assert!(message.contains("help: doc/error-codes/relc.md#relc3001"));
     }
 
     #[test]
@@ -1678,9 +1757,11 @@ mod tests {
             "api/bad.route",
             ":import[ENV] class Route { get() { return ENV.get(\"A\"); } }",
         )];
-        assert!(matches!(
-            compile_runtime_image(server, route, &serde_json::json!({})),
-            Err(RelcError::Capability { .. })
-        ));
+        let error = compile_runtime_image(server, route, &serde_json::json!({}))
+            .expect_err("Route Runtime ENV must fail capability validation");
+        assert_eq!(error.code(), "RELC2101");
+        assert!(error
+            .to_string()
+            .contains("help: doc/error-codes/relc.md#relc2101"));
     }
 }

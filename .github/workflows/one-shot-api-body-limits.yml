@@ -1,4 +1,4 @@
-name: One-shot REL diagnostic code validation
+name: One-shot API body limit repair
 
 "on":
   push:
@@ -10,52 +10,41 @@ permissions:
   contents: write
 
 jobs:
-  validate-and-land:
+  repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt,clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: engine
-      - name: Apply, validate and land DIAG-001
+          components: rustfmt
+      - name: Apply and validate API body limits
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
 
-          python3 .github/patches/diag-rel-errors-fix.py
-          python3 .github/patches/diag-rel-errors.py
-
-          # Restore the unrelated API repair workflow from the known clean
-          # pre-DIAG staging commit. HEAD^ is no longer safe after a retry.
-          git show fa70e4c36fa3d965bc9dc621a25136326c36ee1a:.github/workflows/one-shot-api-body-limits.yml > .github/workflows/one-shot-api-body-limits.yml
-          rm -f .github/patches/diag-rel-errors.py
-          rm -f .github/patches/diag-rel-errors-fix.py
+          python3 .github/patches/api-body-limits.py
 
           cd engine
           cargo fmt --all
-          cargo check -p route-engine --all-targets --locked
-          cargo test -p route-engine --locked
-          cargo clippy -p route-engine --all-targets --locked -- -D warnings
+          cargo test -p config rejects_inconsistent_api_body_limits
+          cargo check -p api
           cd ..
 
-          python3 -m json.tool doc/error-codes/catalog.json >/dev/null
-          grep -q 'pub fn code(&self)' engine/crates/route-engine/src/relc.rs
-          grep -q 'code: "RELC3001"' engine/crates/route-engine/src/relc.rs
-          grep -q 'help: doc/error-codes/relc.md#relc3001' engine/crates/route-engine/src/relc.rs
-          grep -q '### REL1100' doc/error-codes/rel.md
-          grep -q '### RELC2200' doc/error-codes/relc.md
+          git rm .github/workflows/one-shot-api-body-limits.yml
+          git rm .github/patches/api-body-limits.py
+          git add engine/Cargo.toml engine/crates/api/src/lib.rs engine/crates/config/src/lib.rs engine/Cargo.lock
+          git commit -m "FIX | BUG-API-003 enforce generic and JSON body limits"
 
-          git add -A
-          git diff --cached --check
-          git commit -m 'FIX | BUG-DIAG-001 emit stable REL and RELC error codes'
-
-          git pull --rebase origin main
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
           git push origin HEAD:main

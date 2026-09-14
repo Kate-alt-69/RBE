@@ -14,7 +14,30 @@ RELC codes describe whole-application compilation/linking rather than basic REL 
 | `RELC4000-4099` | activation/transition failures |
 | `RELC9000-9099` | compiler invariant failures / probable compiler bugs |
 
-## Reserved migration codes
+## Emitted migration umbrella codes
+
+<a id="relc1000"></a>
+### RELC1000 — source discovery/registration error not yet classified more narrowly
+
+**Status:** Emitted.
+
+RELC failed while discovering, extracting, registering, or initially compiling a source, but the originating branch does not yet own a narrower `RELC10xx` code.
+
+<a id="relc2000"></a>
+### RELC2000 — link/dependency error not yet classified more narrowly
+
+**Status:** Emitted.
+
+Whole-application linking failed before that branch had a narrower stable `RELC20xx` code. The original link reason remains in the diagnostic.
+
+<a id="relc2200"></a>
+### RELC2200 — Runtime ENV/policy/middleware lowering error
+
+**Status:** Emitted.
+
+RELC failed while resolving typed Runtime ENV, ServerPolicy, or MiddlewarePlan state used by the immutable Runtime Image.
+
+## Specific migration codes
 
 <a id="relc1001"></a>
 ### RELC1001 — duplicate source identity
@@ -57,7 +80,7 @@ RELC detected a dependency cycle that the current execution model cannot safely 
 <a id="relc2101"></a>
 ### RELC2101 — capability not permitted for source role
 
-**Status:** Reserved.
+**Status:** Emitted.
 
 The REL syntax/import exists, but the source role does not own that capability.
 
@@ -66,14 +89,14 @@ The REL syntax/import exists, but the source role does not own that capability.
 <a id="relc2102"></a>
 ### RELC2102 — capability target or operation is invalid
 
-**Status:** Reserved.
+**Status:** Emitted.
 
 A capability request does not map to an exact supported target/operation pair. RELC deliberately rejects wildcard or dynamically widened authority.
 
 <a id="relc3001"></a>
 ### RELC3001 — native Container execution required but lowering failed
 
-**Status:** Reserved; current Storage-linked routes already fail closed on this condition with an unnumbered RELC capability error.
+**Status:** Emitted.
 
 The linked Runtime Image requires a capability that is only safe through the Container Controller, but Route-WASM lowering could not produce an executable artifact for that route.
 
