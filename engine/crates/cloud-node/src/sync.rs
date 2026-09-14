@@ -53,8 +53,7 @@ impl SyncPlan {
             }
             let object_dir = entry.path();
             let object_name = entry.file_name().to_string_lossy().to_string();
-            if object_name.len() != 64
-                || !object_name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            if object_name.len() != 64 || !object_name.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
                 anyhow::bail!("invalid Cloud Node object directory {object_name:?}");
             }
@@ -323,8 +322,14 @@ mod tests {
         let plan = store.sync_plan().unwrap();
         assert_eq!(plan.object_count(), 3);
         let kinds = plan.ordered().map(|object| object.kind).collect::<Vec<_>>();
-        assert_eq!(kinds, vec![BlobKind::Folder, BlobKind::Video, BlobKind::File]);
-        assert_eq!(SyncPlanHeader::decode(&plan.header().unwrap().encode()).unwrap(), plan.header().unwrap());
+        assert_eq!(
+            kinds,
+            vec![BlobKind::Folder, BlobKind::Video, BlobKind::File]
+        );
+        assert_eq!(
+            SyncPlanHeader::decode(&plan.header().unwrap().encode()).unwrap(),
+            plan.header().unwrap()
+        );
         assert_ne!(plan.root_sha256, [0u8; 32]);
         fs::remove_dir_all(root).unwrap();
     }
