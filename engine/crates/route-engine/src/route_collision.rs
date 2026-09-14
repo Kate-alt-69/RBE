@@ -125,7 +125,10 @@ fn collision_error(
 }
 
 fn collision_report_path() -> PathBuf {
-    runtime_paths::default_admin_dir().join("compiler-error.txt")
+    crate::paths::binary_dir()
+        .join("data")
+        .join("admin")
+        .join("compiler-error.txt")
 }
 
 fn write_collision_report(collisions: &[RouteCollision]) -> anyhow::Result<PathBuf> {
