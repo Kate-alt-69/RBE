@@ -1,3 +1,4 @@
+# One-shot validator for the already-reviewed Cloud Node boot admission patch.
 name: One-shot Cloud Node boot recovery gate v4
 
 on:
