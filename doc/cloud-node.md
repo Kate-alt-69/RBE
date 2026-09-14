@@ -1,6 +1,6 @@
 # RBE Cloud Node
 
-Cloud Node is low-level RBE persistence infrastructure. It is deliberately below REL and RELC: language programs cannot read node private keys, choose peers, open node tunnels, or mutate topology.
+Cloud Node is low-level RBE persistence and disaster-recovery infrastructure. It is deliberately below REL and RELC: language programs cannot read node private keys, choose peers, open node tunnels, mutate topology, or bypass the authenticated recovery protocol.
 
 ## Build contract
 
@@ -41,10 +41,14 @@ Cloud Node reads `setting.node.cn.json`. Private keys never belong in this file.
     "reconnectDelayMs": 2000
   },
   "replication": {
+    "requireBootRecovery": true,
+    "bootRecoveryTimeoutMs": 60000,
     "targets": []
   }
 }
 ```
+
+`requireBootRecovery` defaults to `false`. When enabled, at least one trusted replication target must be configured. `bootRecoveryTimeoutMs` defaults to 60000 and accepts 1000 through 3600000 milliseconds.
 
 ## NAS layout
 
@@ -57,12 +61,14 @@ For a configured storage root `<ROOT>` Cloud Node owns:
 │       ├── file.blob.cn | video.blob.cn | folder.blob.cn
 │       ├── versions/<content-sha256>/...
 │       └── chunks/<chunk-sha256>.chunk       # video objects
-└── backup/
-    └── <same-object-sha256>/
-        ├── original/                         # first exact object, preserved
-        ├── latest/                           # latest exact object
-        ├── versions/<content-sha256>/...     # actual rolling revision payloads
-        └── history.blob.cn                   # binary rolling history, default 5
+├── backup/
+│   └── <same-object-sha256>/
+│       ├── original/                         # first exact object, preserved
+│       ├── latest/                           # latest exact object
+│       ├── versions/<content-sha256>/...     # actual rolling revision payloads
+│       └── history.blob.cn                   # binary rolling history, default 5
+└── recovery-staging/
+    └── <authenticated-session>/              # private full-snapshot recovery staging
 ```
 
 The directory SHA is a stable object identity derived from blob kind + normalized logical path. Every exact content revision has its own SHA-256 inside that object. This gives backup and active storage the same stable lookup key while still keeping immutable content generations.
@@ -73,9 +79,9 @@ The directory SHA is a stable object identity derived from blob kind + normalize
 
 `file.blob.cn` records exact byte-range replacements from the previous content generation. The immutable full payload remains under `versions/<content-sha256>/payload`, so history can reconstruct or verify any retained generation without pretending a database needs database-specific semantics.
 
-`video.blob.cn` uses large SHA-256-addressed chunks (4 MiB by default) so large media revisions can reuse unchanged chunks rather than duplicating a whole video in the active object store.
+`video.blob.cn` uses large SHA-256-addressed chunks (4 MiB by default) so large media revisions can reuse unchanged chunks rather than duplicating a whole video in the active object store. Recovery reconstructs the immutable video generation only after every declared chunk is present and hash-valid.
 
-`folder.blob.cn` is the filesystem topology manifest. During LOCAL -> REMOTE recovery the sync planner must send/validate data in this order:
+`folder.blob.cn` is the filesystem topology manifest. During LOCAL -> REMOTE recovery the transfer order is fixed:
 
 ```text
 folder.blob.cn / folder structure
@@ -85,12 +91,35 @@ video.blob.cn + requested video chunks
 file.blob.cn + requested file generations
 ```
 
-That ordering is part of the Cloud Node recovery contract and is intended to run while the RBE main node is in its `Evaluating..` phase before normal runtime admission.
+The receiver rejects phase regression, interleaved resource streams, non-contiguous chunk ranges, payloads arriving before their manifest, undeclared video chunks, malformed manifests, and hash/size mismatches.
 
-## Authentication foundation
+## Authenticated recovery transport
 
-Cloud Node uses domain-separated Ed25519 challenge signing. The private key is never sent in a ping, challenge, response, sync frame, or configuration file. The binary `RBE-CN/1` frame envelope already reserves distinct message types for Hello, challenge/response, sync negotiation, folder manifests, object requests/chunks, completion, and ping/pong.
+Cloud Node uses domain-separated Ed25519 challenge signing. The private key is never sent in a ping, challenge, response, sync frame, or configuration file. The binary `RBE-CN/1` frame envelope has distinct message types for authentication, sync negotiation, object transfer, completion, and ping/pong.
 
-Cloud Node authentication additionally has a compact binary `RBECNAU1` proof. A node signs its node id, timestamp, fresh session id, and nonce. The accepting RBE node returns a separately signed proof bound to that exact session and client nonce. `cloud_node probe-upstream` performs one mutual-authentication probe; `cloud_node run` retries the probe according to `reconnectDelayMs`. Invalid peers are intentionally expected to receive a generic not-found response once the backend-side knock endpoint is enabled.
+Cloud Node authentication additionally has a compact binary `RBECNAU1` proof. A node signs its node id, timestamp, fresh session id, and nonce. The accepting RBE node returns a separately signed proof bound to that exact session and client nonce. Follow-up requests use fresh signed session proofs, so a captured request proof cannot simply be replayed during the session lifetime.
 
-The storage/format/identity foundation in the Cloud Node crate intentionally does not expose any REL capability. The authenticated remote tunnel and backend Evaluating-phase sync admission are the next transport layer built on this contract.
+A sync begins by exchanging a `SyncPlanHeader` containing the canonical snapshot root plus folder/video/file counts. If the roots differ, the LOCAL node sends the complete ordered snapshot through bounded object-transfer frames. Every transfer chunk carries its own SHA-256, and the complete resource is verified against its declared resource hash before it can be committed to staging.
+
+Recovery is intentionally full-snapshot rather than merge-based. Stale objects on the REMOTE side must disappear. The receiver writes into `recovery-staging/<session>/storage`, verifies the completed staged tree against the exact root negotiated with the authenticated sender, then swaps that storage tree into the live Cloud Node store. If post-swap verification fails, the previous live storage tree is restored.
+
+## Evaluating-phase boot admission
+
+When `replication.requireBootRecovery` is enabled, the backend's temporary maintenance responder becomes the recovery endpoint while the main RBE process remains in `Evaluating..`.
+
+The main process and maintenance responder use a private parent/child control pipe for boot policy and completion. The responder reports whether Cloud Node recovery is disabled, optional, or required. For required recovery, normal runtime admission waits for a valid completion control message until `bootRecoveryTimeoutMs` expires.
+
+This gate occurs before RBE proceeds into normal service startup. Vault, Container-managed application execution, Service runtime admission, and the normal HTTP router are therefore not treated as ready merely because the maintenance listener is reachable.
+
+A required boot is admitted only when either:
+
+1. the authenticated LOCAL recovery peer proves that the negotiated snapshot already matches the REMOTE snapshot, or
+2. a differing snapshot is transferred, fully verified, atomically activated, and the activated root exactly equals the negotiated LOCAL root.
+
+Malformed control messages, an exited maintenance responder, timeout, authentication failure, transfer corruption, or a final root mismatch fail closed instead of silently admitting the normal runtime.
+
+## Current boundary
+
+Cloud Node recovery currently restores the Cloud Node-owned `storage/` snapshot. That is intentionally different from blindly writing recovered logical objects into arbitrary application/runtime filesystem paths. A separate ownership/materialization contract is required before recovered Cloud Node objects can be projected into normal application paths; recovery must not gain an implicit ability to overwrite RBE runtime files.
+
+The storage, authentication, transfer, staging, exact-root activation, and boot-admission layers remain outside REL capabilities. REL/RELC code cannot directly invoke or weaken this recovery boundary.
