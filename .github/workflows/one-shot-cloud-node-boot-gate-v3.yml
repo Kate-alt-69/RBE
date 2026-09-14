@@ -30,7 +30,12 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Fix the Clippy-only blocker found by the previous validation pass,
+          # then apply the already-staged boot admission patch.
+          sed -i 's/let mut chunk = Self {/let chunk = Self {/' engine/crates/cloud-node/src/transfer.rs
           python3 .github/patches/cloud-node-boot-gate.py
+
           cd engine
           cargo generate-lockfile
           cargo fmt --all
@@ -38,12 +43,15 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
           cd ..
+
           rm -f .github/patches/cloud-node-boot-gate.py
+          rm -f .github/workflows/one-shot-cloud-node-boot-auth-lock.yml
           rm -f .github/workflows/one-shot-cloud-node-boot-gate.yml
           rm -f .github/workflows/one-shot-cloud-node-boot-gate-v2.yml
           rm -f .github/workflows/one-shot-cloud-node-boot-gate-v3.yml
           git add -A .github/patches .github/workflows engine/Cargo.lock \
             engine/crates/cloud-node/src/config.rs \
+            engine/crates/cloud-node/src/transfer.rs \
             engine/crates/backend/src/maintenance_notice.rs \
             engine/crates/backend/src/main.rs
           git diff --cached --check
