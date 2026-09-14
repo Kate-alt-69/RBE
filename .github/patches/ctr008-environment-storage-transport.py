@@ -162,7 +162,7 @@ storage_method = r'''    fn dispatch_environment_storage(
                 )
             }
         };
-        let io_timeout = Duration::from_millis(task.limits.wall_time_ms.max(1).min(30_000));
+        let io_timeout = Duration::from_millis(task.limits.wall_time_ms.clamp(1, 30_000));
         if stream.set_read_timeout(Some(io_timeout)).is_err()
             || stream.set_write_timeout(Some(CONNECT_TIMEOUT)).is_err()
         {
