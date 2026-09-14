@@ -1,0 +1,52 @@
+name: One-shot Cloud Node boot recovery gate v3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-boot-gate-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Patch, validate, and land
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 .github/patches/cloud-node-boot-gate.py
+          cd engine
+          cargo generate-lockfile
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          cd ..
+          rm -f .github/patches/cloud-node-boot-gate.py
+          rm -f .github/workflows/one-shot-cloud-node-boot-gate.yml
+          rm -f .github/workflows/one-shot-cloud-node-boot-gate-v2.yml
+          rm -f .github/workflows/one-shot-cloud-node-boot-gate-v3.yml
+          git add -A .github/patches .github/workflows engine/Cargo.lock \
+            engine/crates/cloud-node/src/config.rs \
+            engine/crates/backend/src/maintenance_notice.rs \
+            engine/crates/backend/src/main.rs
+          git diff --cached --check
+          git commit -m 'feat: gate runtime admission on required Cloud Node recovery'
+          git pull --rebase origin main
+          git push origin HEAD:main
