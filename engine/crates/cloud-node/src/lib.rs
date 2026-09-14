@@ -8,6 +8,7 @@ mod crypto;
 mod format;
 mod protocol;
 mod store;
+mod sync;
 
 pub use config::{
     CloudNodeSettings, NodeMode, NodeSettings, ReplicationSettings, ReplicationTarget,
@@ -22,3 +23,4 @@ pub use format::{
 };
 pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
 pub use store::{CloudNodeStore, StoreSummary, StoredObject};
+pub use sync::{SyncObject, SyncPlan, SyncPlanHeader};

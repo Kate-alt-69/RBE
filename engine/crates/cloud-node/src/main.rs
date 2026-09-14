@@ -32,11 +32,30 @@ fn run() -> anyhow::Result<()> {
     match command {
         "evaluate" => {
             let summary = store.summary();
+            let plan = store.sync_plan()?;
             println!("Cloud Node {} ready", settings.node.id);
             println!("storage={}", summary.storage.display());
             println!("backup={}", summary.backup.display());
+            println!("syncRoot={}", plan.root_hex());
+            println!("syncObjects={}", plan.object_count());
             if let Some(upstream) = &settings.upstream {
                 println!("upstream={}", upstream.url);
+            }
+        }
+        "sync-plan" => {
+            let plan = store.sync_plan()?;
+            println!("root={}", plan.root_hex());
+            println!("folders={}", plan.folders.len());
+            println!("videos={}", plan.videos.len());
+            println!("files={}", plan.files.len());
+            for object in plan.ordered() {
+                println!(
+                    "{:?}\t{}\t{}\t{}",
+                    object.kind,
+                    hex::encode(object.object_key),
+                    hex::encode(object.content_sha256),
+                    object.logical_path
+                );
             }
         }
         "store-file" | "store-video" | "snapshot-folder" => {
@@ -58,7 +77,6 @@ fn run() -> anyhow::Result<()> {
         "verify" => {
             println!("verified={}", store.verify()?);
         }
-        "--help" | "-h" => print_help(),
         other => anyhow::bail!("unknown cloud_node command {other:?}; use --help"),
     }
     Ok(())
@@ -94,6 +112,6 @@ fn default_config_path() -> PathBuf {
 
 fn print_help() {
     println!(
-        "cloud_node [--config=<setting.node.cn.json>] [evaluate|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
+        "cloud_node [--config=<setting.node.cn.json>] [evaluate|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
     );
 }
