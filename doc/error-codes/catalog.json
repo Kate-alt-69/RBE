@@ -29,6 +29,11 @@
     {"code":"SVC5001","status":"assigned","title":"Service binary incompatible with backend","doc":"service.md#svc5001"},
     {"code":"SVC5002","status":"assigned","title":"Service catalog changed after backend validation","doc":"service.md#svc5002"},
     {"code":"SVC5003","status":"assigned","title":"Service compatibility probe failed","doc":"service.md#svc5003"},
+    {"code":"SVC5099","status":"assigned","title":"Unclassified Service Mother startup failure","doc":"service.md#svc5099"},
+    {"code":"SVC5100","status":"assigned","title":"Invalid Service control command","doc":"service.md#svc5100"},
+    {"code":"SVC5101","status":"assigned","title":"Service restart request could not be queued","doc":"service.md#svc5101"},
+    {"code":"SVC5102","status":"assigned","title":"Invalid internal Service executable mode","doc":"service.md#svc5102"},
+    {"code":"SVC5199","status":"assigned","title":"Unclassified Service worker startup failure","doc":"service.md#svc5199"},
 
     {"code":"REL1001","status":"reserved","title":"Invalid token","doc":"rel.md#rel1001"},
     {"code":"REL1002","status":"reserved","title":"Unterminated string or literal","doc":"rel.md#rel1002"},
