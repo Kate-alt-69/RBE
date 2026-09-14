@@ -467,7 +467,8 @@ fn module_owner(module_dir: &Path, path: &Path) -> String {
 /// RELC uses this exact function so propagated host authority has the same
 /// owner identity that ModuleExecutor supplies to VideoLanguage at runtime.
 pub(crate) fn module_owner_from_logical_name(logical_name: &str) -> String {
-    canonical_module_owner(Path::new(logical_name))
+    let parts = logical_name.split('/').map(encode_owner_segment).collect::<Vec<_>>();
+    canonical_module_owner_parts(parts)
 }
 
 fn canonical_module_owner(relative: &Path) -> String {
@@ -480,6 +481,10 @@ fn canonical_module_owner(relative: &Path) -> String {
             _ => None,
         })
         .collect::<Vec<_>>();
+    canonical_module_owner_parts(parts)
+}
+
+fn canonical_module_owner_parts(parts: Vec<String>) -> String {
     if parts.is_empty() {
         "root".into()
     } else {
@@ -489,9 +494,16 @@ fn canonical_module_owner(relative: &Path) -> String {
 
 fn encode_owner_segment(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    if value.is_empty() {
+        return "_00".into();
+    }
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.') {
+        // `.` is reserved exclusively as the path-component separator and `_`
+        // is reserved as the escape prefix. Escaping both makes this mapping
+        // injective instead of allowing `a/b`, `a.b`, and literal `_HH`
+        // spellings to collapse onto one capability principal.
+        if byte.is_ascii_alphanumeric() || *byte == b'-' {
             out.push(*byte as char);
         } else {
             out.push('_');
@@ -715,6 +727,31 @@ mod tests {
         assert_eq!(
             module_owner_from_logical_name("user data/auth"),
             "user_20data.auth"
+        );
+    }
+
+    #[test]
+    fn canonical_module_owner_does_not_collapse_separator_or_escape_spellings() {
+        let nested = module_owner_from_logical_name("accounts/cache");
+        let dotted = module_owner_from_logical_name("accounts.cache");
+        let escaped_literal = module_owner_from_logical_name("accounts_2Ecache");
+        assert_eq!(nested, "accounts.cache");
+        assert_eq!(dotted, "accounts_2Ecache");
+        assert_eq!(escaped_literal, "accounts_5F2Ecache");
+        assert_ne!(nested, dotted);
+        assert_ne!(dotted, escaped_literal);
+        assert_ne!(nested, escaped_literal);
+    }
+
+    #[test]
+    fn canonical_module_owner_preserves_empty_logical_path_segments() {
+        assert_ne!(
+            module_owner_from_logical_name("accounts//cache"),
+            module_owner_from_logical_name("accounts/cache")
+        );
+        assert_eq!(
+            module_owner_from_logical_name("accounts//cache"),
+            "accounts._00.cache"
         );
     }
 

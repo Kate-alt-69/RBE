@@ -22,12 +22,13 @@ use wasm_encoder::{
 
 use crate::ast::{Expr, FunctionDef, ImportTarget, RouteFile, Statement};
 use crate::modules::binding_name;
+use crate::runtime_image::{storage_capability_operation_allowed, storage_capability_target};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-/// Generation 6 removes the unreachable direct Route-to-Service lowering
-/// left by generation 4. Service and Video host calls now require RELC's linked
-/// Module authority boundary; capability ABI v3 stays stable.
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 6;
+/// Generation 7 adds exact Module-owned Environment Storage calls to the
+/// existing linked Module authority boundary. Direct Route-to-Storage remains
+/// unreachable and capability ABI v3 stays stable.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 7;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 
@@ -93,11 +94,12 @@ impl RouteWasmLinkContext {
 /// Compile the currently supported native route subset.
 ///
 /// Native lowering remains intentionally strict: one HTTP method, one return,
-/// no route helper functions. Compiler generation v5 keeps ABI v3 and adds one
-/// immutable linked Module function supplied by RELC. The linked function must
-/// itself be exactly one return of one direct HTTP, Video, or Service host call,
-/// and every Route/host argument must resolve to static JSON. Namespace imports,
-/// dynamic arguments, wider Module bodies, and nested chains remain interpreter-only.
+/// no route helper functions. Compiler generation v7 keeps ABI v3 and permits
+/// one immutable linked Module function supplied by RELC. The linked function
+/// must itself be exactly one return of one direct HTTP, Video, Service, or
+/// Storage host call, and every Route/host argument must resolve to static JSON.
+/// Namespace imports, dynamic arguments, wider Module bodies, and nested chains
+/// remain interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let links = RouteWasmLinkContext::default();
     compile_route_with_links(file, &links)
@@ -124,13 +126,13 @@ pub(crate) fn compile_route_with_links(
                 linked_import = Some((binding, linked));
             } else {
                 return fallback(
-                    "native Route-WASM v6 only supports one direct http.get/post/request import or one linked Module function import",
+                    "native Route-WASM v7 only supports one direct http.get/post/request import or one linked Module function import",
                 );
             }
         }
         _ => {
             return fallback(
-                "native Route-WASM v6 supports at most one direct or linked host-call import",
+                "native Route-WASM v7 supports at most one direct or linked host-call import",
             )
         }
     }
@@ -257,6 +259,15 @@ fn direct_linked_capability_import(
             )
         }
         ImportTarget::BuiltinFunction { module, function }
+            if module == "storage" && storage_capability_operation_allowed(function) =>
+        {
+            (
+                ContainerCapabilityKind::Storage,
+                storage_capability_target(owner)?,
+                function.clone(),
+            )
+        }
+        ImportTarget::BuiltinFunction { module, function }
             if matches!(module.as_str(), "vm" | "video-manager")
                 && video_language_operation_allowed(function) =>
         {
@@ -325,7 +336,8 @@ fn lower_linked_module_capability_call(
         );
     };
     let host = direct_linked_capability_import(module_import, &linked.owner).ok_or_else(|| {
-        "native linked Module import must be one exact HTTP, Video, or Service function".to_string()
+        "native linked Module import must be one exact HTTP, Video, Service, or Storage function"
+            .to_string()
     })?;
     let Expr::Call(target, host_args) = module_expr else {
         return Err("native linked Module return must directly call its host import".into());
@@ -841,6 +853,43 @@ mod tests {
     }
 
     #[test]
+    fn linked_module_storage_call_uses_canonical_module_owner() {
+        let module = parse_module(
+            r#":import[storage.read as readEntry]
+               export function load(path) { return readEntry(path); }"#,
+        );
+        let links = link_module_function("load", "accounts.cache", &module, "load");
+        let route = parse(
+            r#":import["./module/accounts/cache".load]
+               class Route { get(req) { return load("users/kate.json"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("strict linked Storage wrapper should compile natively");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Storage);
+            assert_eq!(request.target, "storage:accounts.cache");
+            assert_eq!(request.operation, "read");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["users/kate.json"])
+            );
+            Ok(br#"{"found":false}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"found":false}"#);
+    }
+
+    #[test]
     fn linked_module_video_call_uses_canonical_module_owner() {
         let module = parse_module(
             r#":import[video-manager.status as vmStatus]
@@ -894,8 +943,13 @@ mod tests {
     }
 
     #[test]
-    fn generic_capability_emitter_uses_versioned_kind_mapping_for_video_and_service() {
+    fn generic_capability_emitter_uses_versioned_kind_mapping() {
         for (kind, target, operation) in [
+            (
+                ContainerCapabilityKind::Storage,
+                "storage:accounts.cache",
+                "read",
+            ),
             (
                 ContainerCapabilityKind::Video,
                 "module:media.bridge",
@@ -940,6 +994,18 @@ mod tests {
         );
         let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
             panic!("Route-to-Service must remain behind an exported Module boundary");
+        };
+        assert!(reason.contains("linked Module function"));
+    }
+
+    #[test]
+    fn direct_storage_route_import_stays_outside_native_subset() {
+        let route = parse(
+            r#":import[storage.read]
+               class Route { get(req) { return read("users/kate.json"); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
+            panic!("Route-to-Storage must remain behind an exported Module boundary");
         };
         assert!(reason.contains("linked Module function"));
     }

@@ -23,12 +23,37 @@ use crate::wasm_compiler::{
     RouteWasmArtifact, ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
 };
 
+pub(crate) const STORAGE_CAPABILITY_TARGET_PREFIX: &str = "storage:";
+pub(crate) const STORAGE_CAPABILITY_OPERATIONS: [&str; 4] = ["read", "list", "snapshot", "commit"];
+pub(crate) const MAX_STORAGE_NAMESPACE_BYTES: usize = 64;
+
+pub(crate) fn storage_capability_operation_allowed(operation: &str) -> bool {
+    STORAGE_CAPABILITY_OPERATIONS.contains(&operation)
+}
+
+pub(crate) fn storage_capability_owner_allowed(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= MAX_STORAGE_NAMESPACE_BYTES
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+pub(crate) fn storage_capability_target(owner: &str) -> Option<String> {
+    if !storage_capability_owner_allowed(owner) {
+        return None;
+    }
+    let target = format!("{STORAGE_CAPABILITY_TARGET_PREFIX}{owner}");
+    (target.len() <= CONTAINER_MAX_CAPABILITY_TARGET_BYTES).then_some(target)
+}
+
 /// Host-crossing operations RELC discovered for a source. These are
 /// compiler requirements, not Controller grants: target policy/byte limits and
 /// reachability are still lowered explicitly before native execution.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuntimeCapabilityRequirement {
     PublicHttp { operation: String },
+    Storage { owner: String, operation: String },
     Video { owner: String, operation: String },
     Service { service: String, operation: String },
 }
@@ -50,6 +75,7 @@ fn lower_container_grants(
     requirements: &BTreeSet<RuntimeCapabilityRequirement>,
 ) -> Result<Vec<ContainerCapabilityGrant>, RuntimeCapabilityLoweringError> {
     let mut public_http_operations = BTreeSet::new();
+    let mut storage_operations = BTreeMap::<String, BTreeSet<String>>::new();
     let mut video_operations = BTreeMap::<String, BTreeSet<String>>::new();
     let mut service_operations = BTreeMap::<String, BTreeSet<String>>::new();
     for requirement in requirements {
@@ -63,6 +89,26 @@ fn lower_container_grants(
                     });
                 }
                 public_http_operations.insert(operation.clone());
+            }
+            RuntimeCapabilityRequirement::Storage { owner, operation } => {
+                if !storage_capability_owner_allowed(owner) {
+                    return Err(RuntimeCapabilityLoweringError {
+                        message: format!(
+                            "Storage capability principal {owner:?} is not a valid Environment Storage namespace"
+                        ),
+                    });
+                }
+                if !storage_capability_operation_allowed(operation) {
+                    return Err(RuntimeCapabilityLoweringError {
+                        message: format!(
+                            "Storage capability operation {operation:?} is not part of the Environment Storage surface"
+                        ),
+                    });
+                }
+                storage_operations
+                    .entry(owner.clone())
+                    .or_default()
+                    .insert(operation.clone());
             }
             RuntimeCapabilityRequirement::Video { owner, operation } => {
                 if !valid_video_owner(owner) {
@@ -116,6 +162,22 @@ fn lower_container_grants(
             // These are capability-envelope limits, not HTTP body limits. The
             // shared Network Broker applies the stricter HTTP request/response
             // policy after Controller authorization.
+            max_request_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
+            max_response_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
+        });
+    }
+    for (owner, operations) in storage_operations {
+        let target = storage_capability_target(&owner).ok_or_else(|| {
+            RuntimeCapabilityLoweringError {
+                message: format!(
+                    "Storage capability principal {owner:?} cannot be lowered to an exact target"
+                ),
+            }
+        })?;
+        grants.push(ContainerCapabilityGrant {
+            kind: ContainerCapabilityKind::Storage,
+            target,
+            operations: operations.into_iter().collect(),
             max_request_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
             max_response_bytes: CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64,
         });
@@ -460,6 +522,45 @@ mod tests {
             grant.max_response_bytes,
             CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES as u64
         );
+    }
+
+    #[test]
+    fn storage_requirements_lower_to_exact_module_namespace_grant() {
+        let requirements = BTreeSet::from([
+            RuntimeCapabilityRequirement::Storage {
+                owner: "accounts.cache".into(),
+                operation: "snapshot".into(),
+            },
+            RuntimeCapabilityRequirement::Storage {
+                owner: "accounts.cache".into(),
+                operation: "read".into(),
+            },
+        ]);
+        let grants = lower_container_grants(&requirements).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].kind, ContainerCapabilityKind::Storage);
+        assert_eq!(grants[0].target, "storage:accounts.cache");
+        assert_eq!(grants[0].operations, vec!["read", "snapshot"]);
+    }
+
+    #[test]
+    fn invalid_storage_operation_or_principal_fails_closed() {
+        for requirement in [
+            RuntimeCapabilityRequirement::Storage {
+                owner: "accounts.cache".into(),
+                operation: "erase_everything".into(),
+            },
+            RuntimeCapabilityRequirement::Storage {
+                owner: "../accounts".into(),
+                operation: "read".into(),
+            },
+            RuntimeCapabilityRequirement::Storage {
+                owner: "x".repeat(MAX_STORAGE_NAMESPACE_BYTES + 1),
+                operation: "read".into(),
+            },
+        ] {
+            assert!(lower_container_grants(&BTreeSet::from([requirement])).is_err());
+        }
     }
 
     #[test]

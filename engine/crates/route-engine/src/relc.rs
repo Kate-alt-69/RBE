@@ -23,8 +23,9 @@ use crate::modules::binding_name;
 use crate::parser::{ParseError, Parser};
 use crate::runtime_env::{RuntimeEnv, RuntimeEnvError};
 use crate::runtime_image::{
-    stable_image_hash, stable_source_hash, RuntimeCapabilityRequirement, RuntimeExecutable,
-    RuntimeImage, RuntimeSourceManifest,
+    stable_image_hash, stable_source_hash, storage_capability_operation_allowed,
+    storage_capability_owner_allowed, RuntimeCapabilityRequirement, RuntimeExecutable, RuntimeImage,
+    RuntimeSourceManifest, STORAGE_CAPABILITY_OPERATIONS,
 };
 use crate::server_policy::{ServerPolicy, ServerPolicyError};
 use crate::server_rel::{compile_server_source, ServerCompileError, ServerProgram};
@@ -327,6 +328,19 @@ pub fn compile_runtime_image(
                 route_wasm_artifacts.insert(id.clone(), artifact);
             }
             RouteWasmCompilation::InterpreterFallback { reason } => {
+                let requires_storage = capabilities.get(id).is_some_and(|requirements| {
+                    requirements.iter().any(|requirement| {
+                        matches!(requirement, RuntimeCapabilityRequirement::Storage { .. })
+                    })
+                });
+                if requires_storage {
+                    return Err(RelcError::Capability {
+                        source: id.clone(),
+                        message: format!(
+                            "Environment Storage authority requires native Container execution; Route-WASM v7 could not lower this Route: {reason}"
+                        ),
+                    });
+                }
                 route_wasm_fallbacks.insert(id.clone(), reason);
             }
         }
@@ -498,6 +512,36 @@ fn validate_capabilities(
                     source: source.clone(),
                     message: "quickDB is a Service REL process-local capability".into(),
                 });
+            }
+            if name == "storage" {
+                if kind != RelSourceKind::Module {
+                    return Err(RelcError::Capability {
+                        source: source.clone(),
+                        message: "Environment Storage authority is Module-owned; import an exported Module function instead of using Storage directly"
+                            .into(),
+                    });
+                }
+                match base {
+                    ImportTarget::Builtin(_) => {
+                        return Err(RelcError::Capability {
+                            source: source.clone(),
+                            message: "Storage namespace imports are forbidden; import one exact operation such as `storage.read`"
+                                .into(),
+                        });
+                    }
+                    ImportTarget::BuiltinFunction { function, .. }
+                        if !storage_capability_operation_allowed(function) =>
+                    {
+                        return Err(RelcError::Capability {
+                            source: source.clone(),
+                            message: format!(
+                                "unsupported Environment Storage operation {function:?}; expected one of {:?}",
+                                STORAGE_CAPABILITY_OPERATIONS
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
         if matches!(
@@ -810,18 +854,30 @@ fn builtin_host_requirements(
     source: &SourceId,
     module: &str,
     function: Option<&str>,
-    video_owner: Option<&str>,
+    module_owner: Option<&str>,
 ) -> Result<BTreeSet<RuntimeCapabilityRequirement>, RelcError> {
-    let operations = match module {
+    let operations: &[&str] = match module {
         "http" => HTTP_HOST_OPERATIONS,
+        "storage" => &STORAGE_CAPABILITY_OPERATIONS,
         "vm" | "video-manager" => VIDEO_LANGUAGE_OPERATIONS,
         _ => return Ok(BTreeSet::new()),
     };
-    let video_owner = if matches!(module, "vm" | "video-manager") {
-        Some(video_owner.ok_or_else(|| RelcError::Capability {
+    let module_owner = if matches!(module, "storage" | "vm" | "video-manager") {
+        let owner = module_owner.ok_or_else(|| RelcError::Capability {
             source: source.clone(),
-            message: "Video Manager authority is module-owned; direct Video capability requirements must originate from Module REL".into(),
-        })?)
+            message: format!(
+                "{module} authority is Module-owned; direct capability requirements must originate from Module REL"
+            ),
+        })?;
+        if module == "storage" && !storage_capability_owner_allowed(owner) {
+            return Err(RelcError::Capability {
+                source: source.clone(),
+                message: format!(
+                    "Module capability principal {owner:?} cannot be used as an Environment Storage namespace"
+                ),
+            });
+        }
+        Some(owner)
     } else {
         None
     };
@@ -833,10 +889,12 @@ fn builtin_host_requirements(
             "http" => RuntimeCapabilityRequirement::PublicHttp {
                 operation: operation.to_string(),
             },
+            "storage" => RuntimeCapabilityRequirement::Storage {
+                owner: module_owner.expect("Storage owner validated above").to_string(),
+                operation: operation.to_string(),
+            },
             _ => RuntimeCapabilityRequirement::Video {
-                owner: video_owner
-                    .expect("Video owner validated above")
-                    .to_string(),
+                owner: module_owner.expect("Video owner validated above").to_string(),
                 operation: operation.to_string(),
             },
         })
@@ -852,7 +910,7 @@ fn direct_capability_requirements(
     let source_record = registry
         .get(source)
         .ok_or_else(|| RelcError::Link(format!("compiled source {source} is not registered")))?;
-    let video_owner = (source_record.kind() == RelSourceKind::Module)
+    let module_owner = (source_record.kind() == RelSourceKind::Module)
         .then(|| module_owner_from_logical_name(source_record.logical_name()));
     let mut out = BTreeSet::new();
     for import in imports {
@@ -862,7 +920,7 @@ fn direct_capability_requirements(
                     source,
                     module,
                     None,
-                    video_owner.as_deref(),
+                    module_owner.as_deref(),
                 )?);
             }
             ImportTarget::BuiltinFunction { module, function } => {
@@ -870,7 +928,7 @@ fn direct_capability_requirements(
                     source,
                     module,
                     Some(function),
-                    video_owner.as_deref(),
+                    module_owner.as_deref(),
                 )?);
             }
             ImportTarget::Service(service) => {
@@ -958,6 +1016,26 @@ fn capability_requirements(
             break;
         }
     }
+
+    for (source, source_requirements) in &requirements {
+        if !source_requirements
+            .iter()
+            .any(|requirement| matches!(requirement, RuntimeCapabilityRequirement::Storage { .. }))
+        {
+            continue;
+        }
+        let source_record = registry
+            .get(source)
+            .ok_or_else(|| RelcError::Link(format!("compiled source {source} is not registered")))?;
+        if !matches!(source_record.kind(), RelSourceKind::Module | RelSourceKind::Route) {
+            return Err(RelcError::Capability {
+                source: source.clone(),
+                message: "Environment Storage authority may propagate through Module REL only into a Route that executes inside Container"
+                    .into(),
+            });
+        }
+    }
+
     Ok(requirements)
 }
 
@@ -1366,6 +1444,98 @@ mod tests {
         assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Service);
         assert_eq!(grants[0].target, "service:uac");
         assert_eq!(grants[0].operations, vec!["get_user"]);
+    }
+
+    #[test]
+    fn linked_storage_module_wrapper_compiles_native_with_exact_storage_grant() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "accounts/cache",
+                "module/accounts/cache.module",
+                r#":import[storage.read as readEntry]
+                   export function load(path) { return readEntry(path); }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "account-cache",
+                "api/account-cache.route",
+                r#":import["./module/accounts/cache".load]
+                   class Route { get(req) { return load("users/kate.json"); } }"#,
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        let route = image.routes.first().unwrap();
+        assert!(image.route_wasm_artifact(route).is_some());
+        assert!(image.route_wasm_fallback(route).is_none());
+        let expected = RuntimeCapabilityRequirement::Storage {
+            owner: "accounts.cache".into(),
+            operation: "read".into(),
+        };
+        assert!(image
+            .capability_requirements(route)
+            .unwrap()
+            .contains(&expected));
+        let grants = image.container_capability_grants(route).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Storage);
+        assert_eq!(grants[0].target, "storage:accounts.cache");
+        assert_eq!(grants[0].operations, vec!["read"]);
+    }
+
+    #[test]
+    fn storage_direct_route_import_is_a_capability_error() {
+        let sources = vec![PhysicalRelSource::new(
+            RelSourceKind::Route,
+            "bad-storage",
+            "api/bad-storage.route",
+            r#":import[storage.read]
+               class Route { get(req) { return read("users/kate.json"); } }"#,
+        )];
+        assert!(matches!(
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})),
+            Err(RelcError::Capability { .. })
+        ));
+    }
+
+    #[test]
+    fn storage_namespace_import_is_rejected() {
+        let sources = vec![PhysicalRelSource::new(
+            RelSourceKind::Module,
+            "cache",
+            "module/cache.module",
+            r#":import[storage]
+               export function listAll() { return storage.list(); }"#,
+        )];
+        let error = compile_runtime_image("server Main {}", sources, &serde_json::json!({}))
+            .expect_err("Storage namespace import must fail closed");
+        assert!(error.to_string().contains("exact operation"));
+    }
+
+    #[test]
+    fn storage_backed_route_cannot_fall_back_to_in_process_interpreter() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "cache",
+                "module/cache.module",
+                r#":import[storage.read as readEntry]
+                   export function load(path) { return readEntry(path); }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "dynamic-storage",
+                "api/dynamic-storage.route",
+                r#":import["./module/cache".load]
+                   class Route { post(req) { return load(req.body); } }"#,
+            ),
+        ];
+        let error = compile_runtime_image("server Main {}", sources, &serde_json::json!({}))
+            .expect_err("Storage authority must never escape to interpreter fallback");
+        let message = error.to_string();
+        assert!(message.contains("Storage authority requires native Container execution"));
+        assert!(message.contains("static JSON arguments"));
     }
 
     #[test]
