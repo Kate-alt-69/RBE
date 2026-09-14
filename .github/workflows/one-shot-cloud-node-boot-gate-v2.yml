@@ -1,0 +1,240 @@
+name: One-shot Cloud Node boot recovery gate v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-boot-gate-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Patch, validate, and land
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def patch(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: patch anchor {old[:80]!r} count={count}")
+              p.write_text(text.replace(old, new, 1))
+
+          cfg = "engine/crates/cloud-node/src/config.rs"
+          patch(cfg,
+              '#[derive(Debug, Clone, Serialize, Deserialize, Default)]\n#[serde(rename_all = "camelCase")]\npub struct ReplicationSettings {\n    #[serde(default)]\n    pub targets: Vec<ReplicationTarget>,\n}\n',
+              '#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(rename_all = "camelCase")]\npub struct ReplicationSettings {\n    #[serde(default)]\n    pub require_boot_recovery: bool,\n    #[serde(default = "default_boot_recovery_timeout_ms")]\n    pub boot_recovery_timeout_ms: u64,\n    #[serde(default)]\n    pub targets: Vec<ReplicationTarget>,\n}\n\nimpl Default for ReplicationSettings {\n    fn default() -> Self {\n        Self {\n            require_boot_recovery: false,\n            boot_recovery_timeout_ms: default_boot_recovery_timeout_ms(),\n            targets: Vec::new(),\n        }\n    }\n}\n')
+          patch(cfg,
+              '        for target in &self.replication.targets {\n',
+              '        if !(1_000..=3_600_000).contains(&self.replication.boot_recovery_timeout_ms) {\n            anyhow::bail!("Cloud Node bootRecoveryTimeoutMs must be between 1000 and 3600000");\n        }\n        if self.replication.require_boot_recovery && self.replication.targets.is_empty() {\n            anyhow::bail!("Cloud Node requireBootRecovery needs at least one trusted replication target");\n        }\n        for target in &self.replication.targets {\n')
+          patch(cfg,
+              'const fn default_reconnect_delay_ms() -> u64 {\n    2_000\n}\n',
+              'const fn default_reconnect_delay_ms() -> u64 {\n    2_000\n}\nconst fn default_boot_recovery_timeout_ms() -> u64 {\n    60_000\n}\n')
+          patch(cfg,
+              '        assert!(settings.node.preserve_original);\n        settings.validate().unwrap();\n',
+              '        assert!(settings.node.preserve_original);\n        assert!(!settings.replication.require_boot_recovery);\n        assert_eq!(settings.replication.boot_recovery_timeout_ms, 60_000);\n        settings.validate().unwrap();\n')
+
+          m = "engine/crates/backend/src/maintenance_notice.rs"
+          patch(m, 'use std::io::Read as _;\n', 'use std::io::{Read as _, Write as _};\n')
+          patch(m, 'use std::sync::{Arc, Mutex};\n', 'use std::sync::atomic::{AtomicBool, Ordering};\nuse std::sync::{Arc, Mutex};\n')
+          patch(m,
+              'use tokio::io::{AsyncReadExt, AsyncWriteExt};\nuse tokio::net::{TcpListener, TcpStream};\nuse tokio::process::{Child, ChildStdin, Command};\n',
+              'use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};\nuse tokio::net::{TcpListener, TcpStream};\nuse tokio::process::{Child, ChildStdin, ChildStdout, Command};\n')
+          patch(m,
+              'const MAX_TRANSFER_REQUEST_BYTES: usize = MAX_FRAME_BYTES + 32;\n',
+              'const MAX_TRANSFER_REQUEST_BYTES: usize = MAX_FRAME_BYTES + 32;\nconst CONTROL_PREFIX: &str = "RBE-CN-CONTROL/1";\nconst CONTROL_COMPLETE_PREFIX: &str = "RBE-CN-CONTROL/1 complete ";\nconst CONTROL_POLICY_TIMEOUT: Duration = Duration::from_secs(5);\n')
+          patch(m,
+              'pub struct MaintenanceNoticeProcess {\n',
+              '#[derive(Debug, Clone, Copy)]\nenum BootRecoveryAdmission {\n    Disabled,\n    Optional,\n    Required { timeout: Duration },\n}\n\npub struct MaintenanceNoticeProcess {\n')
+          patch(m,
+              '    lease: Option<ChildStdin>,\n    host: String,\n',
+              '    lease: Option<ChildStdin>,\n    control: BufReader<ChildStdout>,\n    recovery_admission: BootRecoveryAdmission,\n    host: String,\n')
+          patch(m,
+              '    recoveries: Mutex<HashMap<[u8; 16], RecoveryState>>,\n}\n\n#[derive(Clone)]\n',
+              '    recoveries: Mutex<HashMap<[u8; 16], RecoveryState>>,\n    recovery_admission: BootRecoveryAdmission,\n    recovery_complete: AtomicBool,\n}\n\n#[derive(Clone)]\n')
+          patch(m,
+              '            .stdin(Stdio::piped())\n            .kill_on_drop(true)\n',
+              '            .stdin(Stdio::piped())\n            .stdout(Stdio::piped())\n            .kill_on_drop(true)\n')
+          patch(m,
+              '        })?;\n\n        let mut process = Self {\n            child,\n            lease: Some(lease),\n',
+              '        })?;\n        let control = child.stdout.take().ok_or_else(|| {\n            anyhow::anyhow!("maintenance responder stdout control pipe was not created")\n        })?;\n\n        let mut process = Self {\n            child,\n            lease: Some(lease),\n            control: BufReader::new(control),\n            recovery_admission: BootRecoveryAdmission::Disabled,\n')
+          patch(m,
+              '        };\n        process.wait_until_ready().await?;\n',
+              '        };\n        process.recovery_admission = process.read_admission_policy().await?;\n        process.wait_until_ready().await?;\n')
+          patch(m,
+              '    /// Close the lifetime pipe first so the helper can release the listener\n',
+              '''    pub async fn wait_for_required_cloud_node_recovery(&mut self) -> anyhow::Result<()> {
+        let timeout = match self.recovery_admission {
+            BootRecoveryAdmission::Disabled | BootRecoveryAdmission::Optional => return Ok(()),
+            BootRecoveryAdmission::Required { timeout } => timeout,
+        };
+        tracing::info!(
+            timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            "waiting for required Cloud Node boot recovery before runtime admission"
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("required Cloud Node boot recovery timed out");
+            }
+            let line = self.read_control_line(remaining).await?;
+            if let Some(root) = line.strip_prefix(CONTROL_COMPLETE_PREFIX) {
+                if root.len() != 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    anyhow::bail!("maintenance responder returned an invalid Cloud Node recovery root");
+                }
+                tracing::info!(root = %root, "required Cloud Node boot recovery completed");
+                return Ok(());
+            }
+            anyhow::bail!("maintenance responder returned unexpected control message {line:?}");
+        }
+    }
+
+    async fn read_admission_policy(&mut self) -> anyhow::Result<BootRecoveryAdmission> {
+        let line = self.read_control_line(CONTROL_POLICY_TIMEOUT).await?;
+        if line == format!("{CONTROL_PREFIX} disabled") {
+            return Ok(BootRecoveryAdmission::Disabled);
+        }
+        if line == format!("{CONTROL_PREFIX} optional") {
+            return Ok(BootRecoveryAdmission::Optional);
+        }
+        if let Some(value) = line.strip_prefix(&format!("{CONTROL_PREFIX} required ")) {
+            let timeout_ms = value.parse::<u64>().map_err(|_| {
+                anyhow::anyhow!("maintenance responder returned an invalid recovery timeout")
+            })?;
+            return Ok(BootRecoveryAdmission::Required {
+                timeout: Duration::from_millis(timeout_ms),
+            });
+        }
+        anyhow::bail!("maintenance responder returned invalid control policy {line:?}")
+    }
+
+    async fn read_control_line(&mut self, timeout: Duration) -> anyhow::Result<String> {
+        let mut line = String::new();
+        let read = tokio::time::timeout(timeout, self.control.read_line(&mut line))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for maintenance responder control message"))??;
+        if read == 0 {
+            if let Some(status) = self.child.try_wait()? {
+                anyhow::bail!("maintenance responder exited while waiting for Cloud Node control message: {status}");
+            }
+            anyhow::bail!("maintenance responder closed its Cloud Node control pipe");
+        }
+        Ok(line.trim().to_owned())
+    }
+
+    /// Close the lifetime pipe first so the helper can release the listener
+''')
+          patch(m,
+              'pub async fn run(host: String, port: u16) -> anyhow::Result<()> {\n    let cloud_node = load_cloud_node_runtime()?;\n',
+              'pub async fn run(host: String, port: u16) -> anyhow::Result<()> {\n    let cloud_node = load_cloud_node_runtime()?;\n    emit_boot_recovery_policy(cloud_node.as_deref())?;\n')
+          patch(m,
+              '    if remote_header != local_header {\n',
+              '    if remote_header == local_header {\n        if let Err(error) = signal_boot_recovery_complete(runtime, local_header) {\n            tracing::error!(error = %error, "Cloud Node could not signal completed boot recovery");\n            return StatusCode::SERVICE_UNAVAILABLE.into_response();\n        }\n    }\n\n    if remote_header != local_header {\n')
+          patch(m,
+              '            if let Ok(mut recoveries) = runtime.recoveries.lock() {\n',
+              '            if let Err(error) = signal_boot_recovery_complete(runtime, actual) {\n                tracing::error!(error = %error, "Cloud Node could not signal activated boot recovery");\n                return StatusCode::SERVICE_UNAVAILABLE.into_response();\n            }\n            if let Ok(mut recoveries) = runtime.recoveries.lock() {\n')
+          patch(m,
+              'fn encode_cloud_node_response(frame: Frame, operation: &str) -> Response {\n',
+              '''fn emit_boot_recovery_policy(runtime: Option<&CloudNodeRuntime>) -> anyhow::Result<()> {
+    let line = match runtime.map(|runtime| runtime.recovery_admission) {
+        None | Some(BootRecoveryAdmission::Disabled) => format!("{CONTROL_PREFIX} disabled"),
+        Some(BootRecoveryAdmission::Optional) => format!("{CONTROL_PREFIX} optional"),
+        Some(BootRecoveryAdmission::Required { timeout }) => format!(
+            "{CONTROL_PREFIX} required {}",
+            timeout.as_millis().min(u128::from(u64::MAX)) as u64
+        ),
+    };
+    write_control_line(&line)
+}
+
+fn signal_boot_recovery_complete(
+    runtime: &CloudNodeRuntime,
+    header: SyncPlanHeader,
+) -> anyhow::Result<()> {
+    if !matches!(runtime.recovery_admission, BootRecoveryAdmission::Required { .. }) {
+        return Ok(());
+    }
+    if runtime
+        .recovery_complete
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(());
+    }
+    let result = write_control_line(&format!(
+        "{CONTROL_COMPLETE_PREFIX}{}",
+        hex::encode(header.root_sha256)
+    ));
+    if result.is_err() {
+        runtime.recovery_complete.store(false, Ordering::Release);
+    }
+    result
+}
+
+fn write_control_line(line: &str) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    writeln!(stdout, "{line}")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn encode_cloud_node_response(frame: Frame, operation: &str) -> Response {
+''')
+          patch(m,
+              '    let authenticator = CloudNodeAuthenticator::from_env(&settings)?;\n',
+              '    let recovery_admission = if settings.replication.require_boot_recovery {\n        BootRecoveryAdmission::Required {\n            timeout: Duration::from_millis(settings.replication.boot_recovery_timeout_ms),\n        }\n    } else {\n        BootRecoveryAdmission::Optional\n    };\n    let authenticator = CloudNodeAuthenticator::from_env(&settings)?;\n')
+          patch(m,
+              '        recoveries: Mutex::new(HashMap::new()),\n    })))\n',
+              '        recoveries: Mutex::new(HashMap::new()),\n        recovery_admission,\n        recovery_complete: AtomicBool::new(false),\n    })))\n')
+
+          main = "engine/crates/backend/src/main.rs"
+          patch(main, '    let maintenance_notice =\n', '    let mut maintenance_notice =\n')
+          patch(main,
+              '    boot_trace("temporary API maintenance responder ready");\n    lifecycle.set(BackendState::ServicesStarting);\n',
+              '    boot_trace("temporary API maintenance responder ready");\n    maintenance_notice\n        .wait_for_required_cloud_node_recovery()\n        .await?;\n    boot_trace("Cloud Node boot recovery admission satisfied");\n    lifecycle.set(BackendState::ServicesStarting);\n')
+          PY
+
+          cd engine
+          cargo generate-lockfile
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          cd ..
+
+          rm -f .github/workflows/one-shot-cloud-node-boot-gate.yml
+          rm -f .github/workflows/one-shot-cloud-node-boot-gate-v2.yml
+          git add engine/Cargo.lock \
+                  engine/crates/cloud-node/src/config.rs \
+                  engine/crates/backend/src/maintenance_notice.rs \
+                  engine/crates/backend/src/main.rs \
+                  .github/workflows/one-shot-cloud-node-boot-gate.yml \
+                  .github/workflows/one-shot-cloud-node-boot-gate-v2.yml
+          git diff --cached --check
+          git commit -m 'feat: gate runtime admission on required Cloud Node recovery'
+          git pull --rebase origin main
+          git push origin HEAD:main
