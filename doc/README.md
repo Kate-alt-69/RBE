@@ -9,6 +9,7 @@ This directory is the authoritative user-facing documentation for the current RB
 - [`runtime-image.md`](runtime-image.md) — the Runtime Image data contract, cryptographic identity, capability binding, and atomic activation model.
 - [`rel.md`](rel.md) — REL (Runtime Engine Language), shared grammar, capabilities, ENV, embedded sources, and recursion rules.
 - [`relc.md`](relc.md) — the implemented RELC compilation/link pipeline and Runtime Image format.
+- [`error-codes/`](error-codes/) — RBE Error Code Book: stable diagnostic namespaces, long-form explanations, repair guidance, and machine-readable lookup catalog.
 - [`source-security.md`](source-security.md) — source integrity, Runtime ENV hardening, process/capability boundaries, and sealed deployment.
 - [`compatibility.md`](compatibility.md) — current cross-file capability/runtime matrix.
 - [`quickdb.md`](quickdb.md) — Service-only probabilistic membership/indexing through `quickDB`.
@@ -55,6 +56,7 @@ The current `sourceHash` and `imageId` are deterministic SHA-256 identities. `im
 5. **Runtime behavior wins over old design text.** If implementation and an old document disagree, update this tree to match implementation.
 6. **The old `docs/` tree is legacy while migration continues.** New REL/RELC/runtime work should update this `doc/` tree first; legacy pages do not override this reference.
 7. **Security boundaries must describe authority, not vibes.** Document who owns a capability, how it is authenticated, and what happens on failure/restart.
+8. **Stable error codes are part of the public diagnostic contract.** Add/update the Error Code Book in the same change that introduces a new code; released codes are never recycled for a different meaning.
 
 ## Naming
 
