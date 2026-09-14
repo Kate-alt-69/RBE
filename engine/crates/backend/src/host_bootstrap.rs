@@ -6,6 +6,8 @@ use rand::RngCore;
 #[cfg(target_os = "linux")]
 use tokio::io::AsyncWriteExt;
 
+const FALLBACK_MASTER_KEY_ENV: &str = "RBE_VAULT_FALLBACK_MASTER_KEY";
+
 #[derive(Debug)]
 pub struct HostBootstrapReady {
     secure_credentials: bool,
@@ -87,10 +89,21 @@ async fn evaluate_linux(args: &[String]) -> anyhow::Result<HostBootstrapReady> {
     const INSTALL: &str = include_str!("../scripts/bootstrap/linux/install-secret-service.sh");
 
     let verbose = verbose_debug(args);
+    let fallback_ready = configured_fallback_master_key()?;
     let first = run_embedded_shell("probe-secret-service.sh", PROBE, verbose).await?;
     apply_exports(&first.stdout);
 
     if first.status != 0 {
+        if fallback_ready {
+            if verbose {
+                eprintln!(
+                    "[HostBootstrap] Secret Service unavailable; using configured encrypted-file Vault fallback"
+                );
+            }
+            return Ok(HostBootstrapReady {
+                secure_credentials: true,
+            });
+        }
         if first.status != 10 {
             anyhow::bail!("Linux credential host evaluation failed during Secret Service probe");
         }
@@ -107,10 +120,46 @@ async fn evaluate_linux(args: &[String]) -> anyhow::Result<HostBootstrapReady> {
         }
     }
 
-    verify_secret_service(verbose)?;
+    if let Err(error) = verify_secret_service(verbose) {
+        if fallback_ready {
+            if verbose {
+                eprintln!(
+                    "[HostBootstrap] Secret Service verification failed ({error}); using configured encrypted-file Vault fallback"
+                );
+            }
+            return Ok(HostBootstrapReady {
+                secure_credentials: true,
+            });
+        }
+        return Err(error);
+    }
+
     Ok(HostBootstrapReady {
         secure_credentials: true,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn configured_fallback_master_key() -> anyhow::Result<bool> {
+    match std::env::var(FALLBACK_MASTER_KEY_ENV) {
+        Ok(value) => {
+            validate_fallback_master_key(&value)?;
+            Ok(true)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "{FALLBACK_MASTER_KEY_ENV} must be a UTF-8 32-byte hexadecimal value"
+        ),
+    }
+}
+
+fn validate_fallback_master_key(value: &str) -> anyhow::Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "{FALLBACK_MASTER_KEY_ENV} must contain exactly 64 hexadecimal characters (32 bytes)"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -230,5 +279,14 @@ mod tests {
         std::env::set_var("RBE_ENV", "production");
         assert!(!verbose_debug(&["-debug".into()]));
         std::env::remove_var("RBE_ENV");
+    }
+
+    #[test]
+    fn fallback_master_key_requires_exactly_32_hex_bytes() {
+        assert!(validate_fallback_master_key(&"a5".repeat(32)).is_ok());
+        assert!(validate_fallback_master_key(&"A5".repeat(32)).is_ok());
+        assert!(validate_fallback_master_key(&"a5".repeat(31)).is_err());
+        assert!(validate_fallback_master_key(&"a5".repeat(33)).is_err());
+        assert!(validate_fallback_master_key(&format!("{}zz", "a5".repeat(31))).is_err());
     }
 }
