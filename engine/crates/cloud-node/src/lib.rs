@@ -9,6 +9,7 @@ mod config;
 mod crypto;
 mod format;
 mod protocol;
+mod server;
 mod store;
 mod sync;
 
@@ -26,5 +27,9 @@ pub use format::{
     BlobKind, BlobManifest, ByteRangeChange, ChunkRef, FolderEntry, BLOB_FORMAT_VERSION,
 };
 pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
+pub use server::{
+    AcceptedKnock, AuthenticatedSession, CloudNodeAuthenticator, DEFAULT_SESSION_TTL_MS,
+    MAX_AUTH_PROOF_BYTES,
+};
 pub use store::{CloudNodeStore, StoreSummary, StoredObject};
 pub use sync::{SyncObject, SyncPlan, SyncPlanHeader};

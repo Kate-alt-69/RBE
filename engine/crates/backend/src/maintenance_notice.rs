@@ -2,26 +2,37 @@
 //!
 //! The normal backend process spawns this same executable in
 //! `--maintenance-notice` mode after reclaiming any stale listener. The helper
-//! owns the public API port until bootstrap is complete and answers every
-//! request with HTTP 503. Its stdin is a parent-owned lifetime pipe: if the
-//! parent exits or intentionally closes the pipe, the helper shuts down and
-//! releases the port.
+//! owns the public API port until bootstrap is complete and answers ordinary
+//! requests with HTTP 503. When Cloud Node is configured for inbound
+//! replication, the same short-lived listener also exposes the deliberately
+//! hidden mutual-authentication knock endpoint used during recovery. Its stdin
+//! is a parent-owned lifetime pipe: if the parent exits or intentionally closes
+//! the pipe, the helper shuts down and releases the port.
 
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
+use axum::Router;
+use cloud_node::{
+    CloudNodeAuthenticator, CloudNodeSettings, KNOCK_PATH, MAX_AUTH_PROOF_BYTES,
+    SETTINGS_FILE_NAME,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, ChildStdin, Command};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(500);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
-const ACCEPT_FAILURE_LIMIT: u32 = 8;
 const MAX_HELPER_LIFETIME: Duration = Duration::from_secs(60 * 60);
-const MAINTENANCE_MARKER: &str = "X-RBE-Maintenance: 1";
+const MAINTENANCE_MARKER: &str = "X-RBE-Maintenance";
 const BODY: &str =
     r#"{"ok":false,"status":"maintenance","message":"NOT AVAILABLE TRY AGAIN LATER"}"#;
 
@@ -30,6 +41,11 @@ pub struct MaintenanceNoticeProcess {
     lease: Option<ChildStdin>,
     host: String,
     port: u16,
+}
+
+#[derive(Clone)]
+struct MaintenanceState {
+    cloud_node: Option<Arc<CloudNodeAuthenticator>>,
 }
 
 impl MaintenanceNoticeProcess {
@@ -117,13 +133,26 @@ impl MaintenanceNoticeProcess {
 
 /// Entry point for `backend(.exe) --maintenance-notice`.
 pub async fn run(host: String, port: u16) -> anyhow::Result<()> {
+    let cloud_node = load_cloud_node_authenticator()?;
+    if let Some(authenticator) = &cloud_node {
+        eprintln!(
+            "backend maintenance responder enabled Cloud Node boot authentication for {} trusted peer(s)",
+            authenticator.trusted_peer_count()
+        );
+    }
+    let state = Arc::new(MaintenanceState { cloud_node });
+    let app = Router::new()
+        .route(KNOCK_PATH, any(cloud_node_knock))
+        .fallback(maintenance_response)
+        .with_state(state);
+
     let listener = TcpListener::bind((host.as_str(), port))
         .await
         .map_err(|err| {
             anyhow::anyhow!("maintenance responder failed to bind {host}:{port}: {err}")
         })?;
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     std::thread::Builder::new()
         .name("rbe-maintenance-parent-watch".into())
         .spawn(move || {
@@ -147,70 +176,158 @@ pub async fn run(host: String, port: u16) -> anyhow::Result<()> {
         std::process::id()
     );
 
-    let lifetime = tokio::time::sleep(MAX_HELPER_LIFETIME);
-    tokio::pin!(lifetime);
-    let mut accept_failures = 0u32;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await
+        .map_err(|error| anyhow::anyhow!("maintenance responder server failed: {error}"))
+}
 
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = match accepted {
-                    Ok(accepted) => {
-                        accept_failures = 0;
-                        accepted
-                    }
-                    Err(error) => {
-                        accept_failures = accept_failures.saturating_add(1);
-                        if accept_failures >= ACCEPT_FAILURE_LIMIT {
-                            return Err(anyhow::anyhow!(
-                                "maintenance responder listener failed {accept_failures} consecutive accepts: {error}"
-                            ));
-                        }
-                        tracing::warn!(
-                            error = %error,
-                            accept_failures,
-                            retry_ms = ACCEPT_RETRY_DELAY.as_millis() as u64,
-                            "maintenance responder accept failed; retrying"
-                        );
-                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    if let Err(err) = serve_maintenance_response(stream).await {
-                        tracing::debug!(error = %err, "maintenance response connection ended with error");
-                    }
-                });
+async fn cloud_node_knock(
+    State(state): State<Arc<MaintenanceState>>,
+    request: Request,
+) -> Response {
+    if request.method() != Method::POST {
+        return hidden_not_found();
+    }
+    let Some(authenticator) = &state.cloud_node else {
+        return hidden_not_found();
+    };
+    let content_type_ok = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/octet-stream"));
+    if !content_type_ok {
+        return hidden_not_found();
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_AUTH_PROOF_BYTES)
+    {
+        return hidden_not_found();
+    }
+
+    let body = match axum::body::to_bytes(request.into_body(), MAX_AUTH_PROOF_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return hidden_not_found(),
+    };
+    let now_ms = match now_ms() {
+        Ok(now_ms) => now_ms,
+        Err(_) => return hidden_not_found(),
+    };
+    let accepted = match authenticator.accept_knock(&body, now_ms) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            tracing::debug!(error = %error, "rejected hidden Cloud Node boot authentication");
+            return hidden_not_found();
+        }
+    };
+
+    let mut response = Response::new(Body::from(accepted.response));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn maintenance_response() -> Response {
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, BODY).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+    response
+        .headers_mut()
+        .insert(MAINTENANCE_MARKER, HeaderValue::from_static("1"));
+    response.headers_mut().insert(
+        "x-rbe-backend-state",
+        HeaderValue::from_static("starting"),
+    );
+    response
+}
+
+fn hidden_not_found() -> Response {
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn load_cloud_node_authenticator() -> anyhow::Result<Option<Arc<CloudNodeAuthenticator>>> {
+    let (path, explicit) = cloud_node_settings_path()?;
+    if !path.is_file() {
+        if explicit {
+            anyhow::bail!(
+                "RBE_CN_SETTINGS points to a missing Cloud Node settings file: {}",
+                path.display()
+            );
+        }
+        return Ok(None);
+    }
+
+    let settings = CloudNodeSettings::load(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to load Cloud Node settings {}: {error}",
+            path.display()
+        )
+    })?;
+    if settings.replication.targets.is_empty() {
+        return Ok(None);
+    }
+    let authenticator = CloudNodeAuthenticator::from_env(&settings)?;
+    Ok(Some(Arc::new(authenticator)))
+}
+
+fn cloud_node_settings_path() -> anyhow::Result<(PathBuf, bool)> {
+    if let Some(path) = std::env::var_os("RBE_CN_SETTINGS") {
+        return Ok((PathBuf::from(path), true));
+    }
+    let exe = std::env::current_exe().map_err(|error| {
+        anyhow::anyhow!("could not resolve backend executable for Cloud Node settings: {error}")
+    })?;
+    let parent = exe.parent().ok_or_else(|| {
+        anyhow::anyhow!("backend executable has no parent directory for Cloud Node settings")
+    })?;
+    Ok((parent.join(SETTINGS_FILE_NAME), false))
+}
+
+async fn shutdown_signal(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    let parent_shutdown = async {
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
             }
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || *shutdown_rx.borrow() {
-                    break;
-                }
-            }
-            _ = &mut lifetime => {
-                tracing::warn!("maintenance responder reached maximum lifetime and is shutting down");
+            if shutdown_rx.changed().await.is_err() {
                 break;
             }
         }
+    };
+    tokio::select! {
+        _ = parent_shutdown => {}
+        _ = tokio::time::sleep(MAX_HELPER_LIFETIME) => {
+            eprintln!("maintenance responder reached maximum lifetime and is shutting down");
+        }
     }
-
-    Ok(())
 }
 
-async fn serve_maintenance_response(mut stream: TcpStream) -> std::io::Result<()> {
-    // Read enough to let normal HTTP clients finish sending their request line
-    // and headers, but never let a slow client hold a temporary responder task.
-    let mut request = [0u8; 2048];
-    let _ = tokio::time::timeout(REQUEST_READ_TIMEOUT, stream.read(&mut request)).await;
-
-    let response = format!(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nRetry-After: 2\r\n{}\r\nX-RBE-Backend-State: starting\r\nConnection: close\r\n\r\n{}",
-        BODY.len(),
-        MAINTENANCE_MARKER,
-        BODY
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await
+fn now_ms() -> anyhow::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("system clock predates Unix epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("system clock exceeds Cloud Node timestamp range"))
 }
 
 async fn probe(host: &str, port: u16) -> anyhow::Result<bool> {
@@ -233,5 +350,5 @@ async fn probe(host: &str, port: u16) -> anyhow::Result<bool> {
     let read = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut response))
         .await
         .map_err(|_| anyhow::anyhow!("maintenance readiness response timed out"))??;
-    Ok(String::from_utf8_lossy(&response[..read]).contains(MAINTENANCE_MARKER))
+    Ok(String::from_utf8_lossy(&response[..read]).contains("X-RBE-Maintenance: 1"))
 }
