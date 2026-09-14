@@ -607,13 +607,17 @@ mod tests {
     #[test]
     fn secure_profile_is_never_recorded_even_in_debug() {
         let payment = task(EnvironmentId::Payment, 1, b"secret".to_vec());
-        assert!(DebugReplayRecorder::start(true, EnvironmentId::Payment, &payment)
-            .unwrap()
-            .is_none());
+        assert!(
+            DebugReplayRecorder::start(true, EnvironmentId::Payment, &payment)
+                .unwrap()
+                .is_none()
+        );
         let general = task(EnvironmentId::General1, 2, Vec::new());
-        assert!(DebugReplayRecorder::start(false, EnvironmentId::General1, &general)
-            .unwrap()
-            .is_none());
+        assert!(
+            DebugReplayRecorder::start(false, EnvironmentId::General1, &general)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -693,7 +697,10 @@ mod tests {
             "DEBUG_REPLAY_RESULT_LIMIT"
         );
         assert_eq!(
-            recorder.finish_success(b"ignored", &store).unwrap_err().code,
+            recorder
+                .finish_success(b"ignored", &store)
+                .unwrap_err()
+                .code,
             "DEBUG_REPLAY_RESULT_LIMIT"
         );
         assert!(!root.exists() || trace_file_count(&root) == 0);
