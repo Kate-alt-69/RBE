@@ -1,0 +1,85 @@
+name: One-shot Cloud Node foundation
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-foundation.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Apply, validate and land Cloud Node foundation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The previous BUG-IPC-LNX-001 one-shot found one missed test call-site.
+          # Repair the patch in-place, apply it first, then clean its staging files.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/patches/ipc-lnx-diagnostics.py')
+          text = p.read_text()
+          old = 'handle_connection(stream, server_manager, server_token, shutdown_tx)'
+          new = 'handle_connection(stream, peer, server_manager, server_token, shutdown_tx)'
+          if old not in text:
+              raise SystemExit('BUG-IPC-LNX-001 test-call anchor was not found')
+          p.write_text(text.replace(old, new, 1))
+          PY
+          python3 .github/patches/ipc-lnx-diagnostics.py
+
+          python3 .github/patches/cloud-node-foundation.py
+
+          rm -f .github/patches/ipc-lnx-diagnostics.py
+          rm -f .github/workflows/one-shot-ipc-lnx-diagnostics.yml
+          rm -f .github/patches/cloud-node-foundation.py
+          rm -f .github/workflows/one-shot-cloud-node-foundation.yml
+
+          cd engine
+          cargo fmt --all
+          cargo check -p backend -p service-runtime -p cloud-node --all-targets
+          cargo test -p service-runtime malformed_ipc_classifier
+          cargo test -p cloud-node
+          cargo clippy -p backend -p service-runtime -p cloud-node --all-targets -- -D warnings
+          cd ..
+
+          bash -n build.sh
+          bash -n build-core.sh
+          pwsh -NoProfile -Command '$tokens=$null; $errors=$null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "build.ps1"), [ref]$tokens, [ref]$errors) > $null; if ($errors.Count) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }'
+
+          grep -q 'rejected malformed Host Capability frame' engine/crates/backend/src/host_capability.rs
+          grep -q 'rejected malformed Service Mother IPC' engine/crates/service-runtime/src/mother.rs
+          grep -q 'malformed service IPC HTTP-like preview' engine/crates/service-runtime/src/lib.rs
+          grep -q 'crates/cloud-node' engine/Cargo.toml
+          grep -q -- '--cloud-node-only' build-core.sh
+          grep -q -- '--cloud-node-only' build.ps1
+          grep -q 'file.blob.cn' engine/crates/cloud-node/src/format.rs
+          grep -q 'video.blob.cn' engine/crates/cloud-node/src/format.rs
+          grep -q 'folder.blob.cn' engine/crates/cloud-node/src/format.rs
+
+          git add engine/crates/backend/src/host_capability.rs engine/crates/service-runtime/src/mother.rs engine/crates/service-runtime/src/lib.rs
+          git diff --cached --check
+          git commit -m 'FIX | BUG-IPC-LNX-001 instrument malformed local IPC'
+
+          git add -A
+          git diff --cached --check
+          git commit -m 'feat: add Cloud Node storage foundation'
+
+          git pull --rebase origin main
+          git push origin HEAD:main
