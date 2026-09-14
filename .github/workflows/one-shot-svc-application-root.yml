@@ -8,7 +8,7 @@ permissions:
 jobs:
   repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0}
@@ -16,32 +16,92 @@ jobs:
         with: {components: 'rustfmt,clippy'}
       - uses: Swatinem/rust-cache@v2
         with: {workspaces: engine}
-      - name: Apply and land
+      - name: Apply, validate and land Service fixes
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # SVC-001: bind Service and Module paths to the application root.
           python3 - <<'PY'
           from pathlib import Path
-          p=Path('.github/patches/svc-application-root.py'); s=p.read_text()
-          helper='''def replace_many(path: str, old: str, new: str) -> None:\n    p=Path(path); text=p.read_text(); count=text.count(old)\n    if count < 1: raise SystemExit(f"{path}: expected replacement")\n    p.write_text(text.replace(old,new))\n\n'''
-          s=s.replace('# backend service_boot.rs\n',helper+'# backend service_boot.rs\n',1)
-          h,sep,t=s.partition('# service-runtime manager.rs\n')
-          if not sep: raise SystemExit('manager marker missing')
-          p.write_text(h+sep+t.replace('replace_once(path,','replace_many(path,'))
+          p = Path('.github/patches/svc-application-root.py')
+          s = p.read_text()
+          helper = '''def replace_many(path: str, old: str, new: str) -> None:\n    p = Path(path)\n    text = p.read_text()\n    count = text.count(old)\n    if count < 1:\n        raise SystemExit(f"{path}: expected at least one replacement")\n    p.write_text(text.replace(old, new))\n\n'''
+          marker = '# backend service_boot.rs\n'
+          if marker not in s:
+              raise SystemExit('service_boot patch marker missing')
+          s = s.replace(marker, helper + marker, 1)
+          manager_marker = '# service-runtime manager.rs\n'
+          head, sep, tail = s.partition(manager_marker)
+          if not sep:
+              raise SystemExit('Service manager patch marker missing')
+          p.write_text(head + sep + tail.replace('replace_once(path,', 'replace_many(path,'))
           PY
           python3 .github/patches/svc-application-root.py
+
+          cd engine
+          cargo fmt --all
+          cargo check -p backend -p service-runtime -p route-engine --all-targets --locked
+          cargo test -p backend explicit_application_root_owns_relative_service_paths --locked
+          cd ..
+          grep -q 'arg("--application-root")' engine/crates/backend/src/service_mother.rs
+          grep -q 'compile_from_root' engine/crates/backend/src/service_mother.rs
+          grep -q 'prepare_all_for_mother' engine/crates/service-runtime/src/manager.rs
+          git add engine/crates/backend/src/service_boot.rs \
+                  engine/crates/backend/src/service_mother.rs \
+                  engine/crates/service-runtime/src/manager.rs
+          git commit -m 'FIX | BUG-SVC-001 bind Service paths to application root'
+
+          # SVC-002: versioned compatibility handshake and actionable FATAL UX.
           python3 .github/patches/svc-diagnostics-contract.py
           python3 .github/patches/svc-diagnostics-mother.py
+
+          # service_main and backend main both include generated Service identity;
+          # allow the service binary's copy to be unused in non-probe compilation paths.
           python3 - <<'PY'
           from pathlib import Path
-          p=Path('engine/crates/backend/src/service_main.rs'); s=p.read_text()
-          old='mod service_integrity {\n    include!(concat!(env!("OUT_DIR"), "/service_integrity.rs"));\n}'
-          if s.count(old) != 1: raise SystemExit('service identity module anchor missing')
-          p.write_text(s.replace(old, '#[allow(dead_code)]\n'+old, 1))
+          p = Path('engine/crates/backend/src/service_main.rs')
+          s = p.read_text()
+          old = 'mod service_integrity {\n    include!(concat!(env!("OUT_DIR"), "/service_integrity.rs"));\n}'
+          if s.count(old) != 1:
+              raise SystemExit('service identity module anchor missing')
+          p.write_text(s.replace(old, '#[allow(dead_code)]\n' + old, 1))
           PY
-          rm -f .github/workflows/one-shot-svc-application-root.yml .github/patches/svc-application-root.py .github/patches/svc-diagnostics-contract.py .github/patches/svc-diagnostics-mother.py .ci-service-repair-guard
+
+          # Promote every code introduced by this validated runtime change from
+          # Assigned to Emitted in the same fix commit.
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+
+          page = Path('doc/error-codes/service.md')
+          text = page.read_text()
+          text = text.replace('**Status:** Assigned to the current Service compatibility work.', '**Status:** Emitted.')
+          text = text.replace('**Status:** Assigned.', '**Status:** Emitted.')
+          page.write_text(text)
+
+          catalog = Path('doc/error-codes/catalog.json')
+          data = json.loads(catalog.read_text())
+          emitted = {'SVC5001','SVC5002','SVC5003','SVC5099','SVC5100','SVC5101','SVC5102','SVC5199'}
+          seen = set()
+          for entry in data['entries']:
+              if entry['code'] in emitted:
+                  entry['status'] = 'emitted'
+                  seen.add(entry['code'])
+          missing = emitted - seen
+          if missing:
+              raise SystemExit(f'Error Code Book is missing Service codes: {sorted(missing)}')
+          catalog.write_text(json.dumps(data, indent=2) + '\n')
+          PY
+
+          rm -f .github/workflows/one-shot-svc-application-root.yml \
+                .github/patches/svc-application-root.py \
+                .github/patches/svc-diagnostics-contract.py \
+                .github/patches/svc-diagnostics-mother.py \
+                .ci-service-repair-guard
+
           cd engine
           cargo fmt --all
           cargo check -p backend -p service-runtime -p route-engine --all-targets --locked
@@ -49,15 +109,19 @@ jobs:
           cargo test -p backend --locked
           cargo clippy -p backend -p service-runtime -p route-engine --all-targets --locked -- -D warnings
           cargo build -p backend --bin service --locked
-          target/debug/service --service-compat-probe | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["protocol"]=="RBE-SERVICE-COMPAT/1" and p["serviceRuntimeAbi"]==1 and p["catalogFingerprintAbi"]==1'
+          target/debug/service --service-compat-probe | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["protocol"]=="RBE-SERVICE-COMPAT/1" and p["serviceRuntimeAbi"]==1 and p["catalogFingerprintAbi"]==1 and p["buildId"] and p["target"]'
           cd ..
-          grep -q 'arg("--application-root")' engine/crates/backend/src/service_mother.rs
-          grep -q 'compile_from_root' engine/crates/backend/src/service_mother.rs
-          grep -q 'prepare_all_for_mother' engine/crates/service-runtime/src/manager.rs
+
           grep -q 'SVC5001' engine/crates/backend/src/service_mother.rs
           grep -q 'SVC5002' engine/crates/backend/src/service_mother.rs
           grep -q 'SVC5003' engine/crates/backend/src/service_mother.rs
+          grep -q 'Logger::new("SERVICE")' engine/crates/backend/src/service_main.rs
+          grep -q 'SERVICE_COMPAT_PROTOCOL' engine/crates/service-runtime/src/lib.rs
+          python3 -m json.tool doc/error-codes/catalog.json >/dev/null
+
           git add -A
-          git commit -m 'FIX | BUG-SVC-001 bind Service runtime to application root and compatibility identity'
+          git commit -m 'FIX | BUG-SVC-002 improve Service compatibility diagnostics'
+
+          # Preserve concurrent non-overlapping main work; never force-push.
           git pull --rebase origin main
           git push origin HEAD:main
