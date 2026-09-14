@@ -153,12 +153,15 @@ function Initialize-AdminPasswordVerifier {
 }
 
 try {
-    if (-not ($args -contains '--help' -or $args -contains '-h' -or $args -contains '-?')) {
+    $CloudNodeOnlyRequested = $args -contains '--cloud-node-only' -or $args -contains '--build-cloud-node' -or $args -contains '-CloudNodeOnly'
+    $HelpRequested = $args -contains '--help' -or $args -contains '-h' -or $args -contains '-?'
+    if (-not $HelpRequested -and -not $CloudNodeOnlyRequested) {
         Initialize-AdminPasswordVerifier
+        Initialize-ContainerSigningKey
     }
-    Initialize-ContainerSigningKey
 
     $BuildWin = $false; $BuildLinux = $false; $BuildMacos = $false; $BuildAll = $false
+    $CloudNodeOnly = $false
     $Musl = $false; $NoEmbed = $false; $DevContent = $false; $Release = $true
     $ArchX64 = $false; $ArchX86 = $false; $ArchArm64 = $false; $ArchArmv7 = $false
     $CustomTarget = $null; $ShowHelp = $false
@@ -170,6 +173,7 @@ try {
             '^--build-linux$' { $BuildLinux = $true; continue }
             '^--build-macos$' { $BuildMacos = $true; continue }
             '^--build-all$' { $BuildAll = $true; continue }
+            '^(--cloud-node-only|--build-cloud-node|-CloudNodeOnly)$' { $CloudNodeOnly = $true; continue }
             '^--musl$' { $Musl = $true; continue }
             '^--no-embed$' { $NoEmbed = $true; continue }
             '^--dev-content$' { $DevContent = $true; continue }
@@ -249,6 +253,18 @@ try {
         Write-Host ""; Write-Host "=== Building for $target ===" -ForegroundColor Green
         if ($target -notmatch '^[A-Za-z0-9._-]+$' -or $target -eq '.' -or $target -eq '..') { throw "Unsafe build target name: $target" }
         $outDir = Join-Path $DistRoot $target; $depDir = Join-Path $outDir 'dep'
+        if ($CloudNodeOnly) {
+            New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+            Write-Host "-- cloud_node ($target) --" -ForegroundColor Cyan
+            Push-Location $EngineDir
+            try { Invoke-Build 'cloud-node' $target $Release 'cloud_node'; $cloudNodePath = Get-BinaryPath $EngineDir 'cloud_node' $target $Release }
+            finally { Pop-Location }
+            if (-not (Test-Path $cloudNodePath)) { throw "Cloud Node binary was not produced: $cloudNodePath" }
+            $cloudNodeName = if ((Get-TargetOs $target) -eq 'windows') { 'cloud_node.exe' } else { 'cloud_node' }
+            Copy-Item $cloudNodePath (Join-Path $outDir $cloudNodeName) -Force
+            Write-Host "  -> $(Join-Path $outDir $cloudNodeName)" -ForegroundColor Green
+            continue
+        }
         if (Test-Path -LiteralPath $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force }
         New-Item -ItemType Directory -Force -Path $depDir | Out-Null
 
@@ -270,6 +286,12 @@ try {
         finally { Pop-Location }
         if (-not (Test-Path $servicePath)) { throw "service runtime was not produced: $servicePath" }
 
+        Write-Host "-- cloud_node ($target) --" -ForegroundColor Cyan
+        Push-Location $EngineDir
+        try { Invoke-Build 'cloud-node' $target $Release 'cloud_node'; $cloudNodePath = Get-BinaryPath $EngineDir 'cloud_node' $target $Release }
+        finally { Pop-Location }
+        if (-not (Test-Path $cloudNodePath)) { throw "Cloud Node binary was not produced: $cloudNodePath" }
+
         Write-Host "-- backend ($target) --" -ForegroundColor Cyan
         $env:RBE_CONTAINER_BIN_PATH = $containerPath
         $env:RBE_SERVICE_BIN_PATH = $servicePath
@@ -284,6 +306,8 @@ try {
         Copy-Item $backendPath $outDir -Force
         $serviceName = if ((Get-TargetOs $target) -eq 'windows') { 'service.exe' } else { 'service' }
         Copy-Item $servicePath (Join-Path $depDir $serviceName) -Force
+        $cloudNodeName = if ((Get-TargetOs $target) -eq 'windows') { 'cloud_node.exe' } else { 'cloud_node' }
+        Copy-Item $cloudNodePath (Join-Path $outDir $cloudNodeName) -Force
 
         $settings = Join-Path $EngineDir 'settings.json'; if (Test-Path $settings) { Copy-Item $settings $outDir -Force }
         if ($DevContent) { Copy-Item (Join-Path $RepoRoot 'api') $outDir -Recurse -Force -ErrorAction SilentlyContinue; Copy-Item (Join-Path $RepoRoot 'module') $outDir -Recurse -Force -ErrorAction SilentlyContinue }

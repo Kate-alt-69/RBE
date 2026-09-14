@@ -11,6 +11,7 @@ members = [
     "crates/route-engine",
     "crates/service-runtime",
     "crates/video-manager",
+    "crates/cloud-node",
 ]
 # `vault` used to be a workspace member here; it's now a standalone
 # shared crate at ../vault (project root), depended on via relative

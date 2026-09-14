@@ -10,6 +10,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_WIN=false; BUILD_LINUX=false; BUILD_MACOS=false; BUILD_ALL=false; MUSL=false
 NO_EMBED=false; DEV_CONTENT=false; RELEASE=true; ARCH_X64=false; ARCH_X86=false
 ARCH_ARM64=false; ARCH_ARMV7=false; CUSTOM_TARGET=""; SHOW_HELP=false
+CLOUD_NODE_ONLY=false
 CACHE_REMOVE=false; CACHE_REMOVE_WIN=false; CACHE_REMOVE_LINUX=false; CACHE_REMOVE_ALL=false; DISTRO=""
 
 for arg in "$@"; do
@@ -18,6 +19,7 @@ for arg in "$@"; do
         --build-linux) BUILD_LINUX=true ;;
         --build-macos) BUILD_MACOS=true ;;
         --build-all) BUILD_ALL=true ;;
+        --cloud-node-only|--build-cloud-node) CLOUD_NODE_ONLY=true ;;
         --musl) MUSL=true ;;
         --no-embed) NO_EMBED=true ;;
         --dev-content) DEV_CONTENT=true ;;
@@ -87,24 +89,38 @@ invoke_cargo_build() {
 }
 get_built_binary_path() { local workspace="$1" bin="$2" target="$3" release="$4"; local profile=debug; [ "$release" = true ] && profile=release; local file="$bin"; [ "$(get_target_os "$target")" = windows ] && file="$bin.exe"; [ -n "${CARGO_TARGET_DIR:-}" ] && echo "$CARGO_TARGET_DIR/$target/$profile/$file" || echo "$workspace/target/$target/$profile/$file"; }
 
-if [ -z "${RBE_CONTAINER_SIGNING_PRIVATE_KEY:-}" ]; then
-    echo "ERROR: RBE_CONTAINER_SIGNING_PRIVATE_KEY is required for packaged builds." >&2
-    echo 'For a temporary local key: export RBE_CONTAINER_SIGNING_PRIVATE_KEY="$(openssl rand -hex 32)"' >&2
-    exit 1
+if [ "$CLOUD_NODE_ONLY" = false ]; then
+    if [ -z "${RBE_CONTAINER_SIGNING_PRIVATE_KEY:-}" ]; then
+        echo "ERROR: RBE_CONTAINER_SIGNING_PRIVATE_KEY is required for packaged builds." >&2
+        echo 'For a temporary local key: export RBE_CONTAINER_SIGNING_PRIVATE_KEY="$(openssl rand -hex 32)"' >&2
+        exit 1
+    fi
+    if [ -z "${RBE_ADMIN_AUTH_ROUNDS:-}" ] || [ -z "${RBE_ADMIN_AUTH_SALT_HEX:-}" ] || [ -z "${RBE_ADMIN_AUTH_VERIFIER_HEX:-}" ]; then
+        echo "ERROR: a complete RBE_ADMIN_AUTH_* verifier is required for packaged builds. Use build.sh for interactive password entry." >&2
+        exit 1
+    fi
+    [[ "$RBE_ADMIN_AUTH_ROUNDS" =~ ^[0-9]+$ ]] && [ "$RBE_ADMIN_AUTH_ROUNDS" -ge 10000 ] || { echo "ERROR: invalid RBE_ADMIN_AUTH_ROUNDS." >&2; exit 1; }
+    [[ "$RBE_ADMIN_AUTH_SALT_HEX" =~ ^[0-9a-fA-F]{16}$ ]] || { echo "ERROR: invalid RBE_ADMIN_AUTH_SALT_HEX." >&2; exit 1; }
+    [[ "$RBE_ADMIN_AUTH_VERIFIER_HEX" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "ERROR: invalid RBE_ADMIN_AUTH_VERIFIER_HEX." >&2; exit 1; }
 fi
-if [ -z "${RBE_ADMIN_AUTH_ROUNDS:-}" ] || [ -z "${RBE_ADMIN_AUTH_SALT_HEX:-}" ] || [ -z "${RBE_ADMIN_AUTH_VERIFIER_HEX:-}" ]; then
-    echo "ERROR: a complete RBE_ADMIN_AUTH_* verifier is required for packaged builds. Use build.sh for interactive password entry." >&2
-    exit 1
-fi
-[[ "$RBE_ADMIN_AUTH_ROUNDS" =~ ^[0-9]+$ ]] && [ "$RBE_ADMIN_AUTH_ROUNDS" -ge 10000 ] || { echo "ERROR: invalid RBE_ADMIN_AUTH_ROUNDS." >&2; exit 1; }
-[[ "$RBE_ADMIN_AUTH_SALT_HEX" =~ ^[0-9a-fA-F]{16}$ ]] || { echo "ERROR: invalid RBE_ADMIN_AUTH_SALT_HEX." >&2; exit 1; }
-[[ "$RBE_ADMIN_AUTH_VERIFIER_HEX" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "ERROR: invalid RBE_ADMIN_AUTH_VERIFIER_HEX." >&2; exit 1; }
 
 DIST_ROOT="$REPO_ROOT/dist"; ENGINE_DIR="$REPO_ROOT/engine"; CONTAINER_DIR="$REPO_ROOT/container-runtime"
 for target in "${targets[@]}"; do
     echo ""; echo "=== Building for $target ===" >&2
     if [[ ! "$target" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$target" = "." ] || [ "$target" = ".." ]; then echo "ERROR: unsafe target name '$target'" >&2; exit 1; fi
-    out_dir="$DIST_ROOT/$target"; dep_dir="$out_dir/dep"; rm -rf -- "$out_dir"; mkdir -p "$dep_dir"
+    out_dir="$DIST_ROOT/$target"; dep_dir="$out_dir/dep"
+    if [ "$CLOUD_NODE_ONLY" = true ]; then
+        mkdir -p "$out_dir"
+        echo "-- cloud_node ($target) --" >&2
+        (cd "$ENGINE_DIR" && invoke_cargo_build cloud-node "$target" "$RELEASE" cloud_node)
+        cloud_node_path=$(get_built_binary_path "$ENGINE_DIR" cloud_node "$target" "$RELEASE")
+        [ -f "$cloud_node_path" ] || { echo "ERROR: Cloud Node binary missing: $cloud_node_path" >&2; exit 1; }
+        cloud_node_dest="$out_dir/cloud_node"; [ "$(get_target_os "$target")" = windows ] && cloud_node_dest="$cloud_node_dest.exe"
+        cp "$cloud_node_path" "$cloud_node_dest"
+        echo "  -> $cloud_node_dest" >&2
+        continue
+    fi
+    rm -rf -- "$out_dir"; mkdir -p "$dep_dir"
 
     echo "-- container-bin ($target) --" >&2
     (cd "$CONTAINER_DIR" && invoke_cargo_build container-bin "$target" "$RELEASE")
@@ -121,6 +137,11 @@ for target in "${targets[@]}"; do
     service_path=$(get_built_binary_path "$ENGINE_DIR" service "$target" "$RELEASE")
     [ -f "$service_path" ] || { echo "ERROR: service artifact missing: $service_path" >&2; exit 1; }
 
+    echo "-- cloud_node ($target) --" >&2
+    (cd "$ENGINE_DIR" && invoke_cargo_build cloud-node "$target" "$RELEASE" cloud_node)
+    cloud_node_path=$(get_built_binary_path "$ENGINE_DIR" cloud_node "$target" "$RELEASE")
+    [ -f "$cloud_node_path" ] || { echo "ERROR: Cloud Node binary missing: $cloud_node_path" >&2; exit 1; }
+
     echo "-- backend ($target) --" >&2
     export RBE_CONTAINER_BIN_PATH="$container_bin_path"
     export RBE_SERVICE_BIN_PATH="$service_path"
@@ -131,6 +152,8 @@ for target in "${targets[@]}"; do
     cp "$backend_path" "$out_dir/"
     service_dest="$dep_dir/service"; [ "$(get_target_os "$target")" = windows ] && service_dest="$service_dest.exe"
     cp "$service_path" "$service_dest"
+    cloud_node_dest="$out_dir/cloud_node"; [ "$(get_target_os "$target")" = windows ] && cloud_node_dest="$cloud_node_dest.exe"
+    cp "$cloud_node_path" "$cloud_node_dest"
 
     [ -f "$ENGINE_DIR/settings.json" ] && cp "$ENGINE_DIR/settings.json" "$out_dir/" 2>/dev/null || true
     if [ "$DEV_CONTENT" = true ]; then [ -d "$REPO_ROOT/api" ] && cp -r "$REPO_ROOT/api" "$out_dir/"; [ -d "$REPO_ROOT/module" ] && cp -r "$REPO_ROOT/module" "$out_dir/"; else mkdir -p "$out_dir/api" "$out_dir/module"; fi

@@ -122,11 +122,19 @@ ensure_container_signing_key() {
     echo "Generated ephemeral local RBE container signing key (not written to disk)." >&2
 }
 
+CLOUD_NODE_ONLY=false
+case " $* " in
+    *" --cloud-node-only "*|*" --build-cloud-node "*) CLOUD_NODE_ONLY=true ;;
+esac
 case " $* " in
     *" --help "*|*" -h "*|*" -? "*) ;;
-    *) ensure_admin_verifier ;;
+    *)
+        if [ "$CLOUD_NODE_ONLY" = false ]; then
+            ensure_admin_verifier
+            ensure_container_signing_key
+        fi
+        ;;
 esac
-ensure_container_signing_key
 
 if [[ "$(uname -s)" == Linux* ]]; then
     if [[ " ${*} " == *" --build-win "* || " ${*} " == *" --build-win10 "* || " ${*} " == *" --build-win11 "* || " ${*} " == *" --build-windows "* || " ${*} " == *" --build-all "* || " ${*} " == *"--target=x86_64-pc-windows-msvc"* || " ${*} " == *"--target=i686-pc-windows-msvc"* || " ${*} " == *"--target=aarch64-pc-windows-msvc"* || " ${*} " == *"--target=thumbv7-pc-windows-msvc"* ]]; then
