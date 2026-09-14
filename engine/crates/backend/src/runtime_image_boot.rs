@@ -29,6 +29,7 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
     let settings = effective_settings_json(config);
     let image = route_engine::compile_runtime_image(&server_source, physical, &settings)
         .map_err(|error| anyhow::anyhow!("Runtime Image compile failed: {error}"))?;
+    route_engine::validate_runtime_image_routes(&image)?;
     tracing::info!(
         image = %image.image_id,
         source_hash = %image.source_hash,

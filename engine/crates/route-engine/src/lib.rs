@@ -104,6 +104,12 @@ pub fn build_routes_from_image(
     discovery::build_routes_from_image(image, service_interfaces)
 }
 
+/// Validate the immutable Runtime Image against native API namespaces and
+/// route/method collisions before backend boot launches any child processes.
+pub fn validate_runtime_image_routes(image: &RuntimeImage) -> anyhow::Result<()> {
+    route_collision::validate_image(image)
+}
+
 pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
     let tokens = lexer::Lexer::new(source)
         .tokenize()
