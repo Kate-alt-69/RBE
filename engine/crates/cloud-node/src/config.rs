@@ -45,11 +45,14 @@ pub struct NodeSettings {
 #[serde(rename_all = "camelCase")]
 pub struct UpstreamSettings {
     pub url: String,
+    pub node_id: String,
     pub public_key: String,
     #[serde(default = "default_true")]
     pub auto_reconnect: bool,
     #[serde(default = "default_true")]
     pub sync_on_connect: bool,
+    #[serde(default = "default_reconnect_delay_ms")]
+    pub reconnect_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -98,7 +101,11 @@ impl CloudNodeSettings {
         }
         if let Some(upstream) = &self.upstream {
             validate_peer_url(&upstream.url)?;
+            validate_node_id(&upstream.node_id)?;
             validate_public_key(&upstream.public_key)?;
+            if upstream.reconnect_delay_ms < 250 || upstream.reconnect_delay_ms > 300_000 {
+                anyhow::bail!("Cloud Node reconnectDelayMs must be between 250 and 300000");
+            }
         }
         for target in &self.replication.targets {
             validate_node_id(&target.node_id)?;
@@ -151,6 +158,9 @@ const fn default_true() -> bool {
 }
 const fn default_video_chunk_bytes() -> usize {
     4 * 1024 * 1024
+}
+const fn default_reconnect_delay_ms() -> u64 {
+    2_000
 }
 
 #[cfg(test)]

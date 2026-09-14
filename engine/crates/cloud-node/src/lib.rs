@@ -3,6 +3,8 @@
 //! Cloud Node sits below REL/RELC. Language programs never receive node keys,
 //! tunnel identities, topology, storage roots, or direct access to this crate.
 
+mod auth;
+mod client;
 mod config;
 mod crypto;
 mod format;
@@ -10,6 +12,8 @@ mod protocol;
 mod store;
 mod sync;
 
+pub use auth::{random_session_and_nonce, NodeProof, NodeProofKind, DEFAULT_AUTH_SKEW_MS};
+pub use client::{probe_upstream, AuthenticatedPeer, KNOCK_PATH};
 pub use config::{
     CloudNodeSettings, NodeMode, NodeSettings, ReplicationSettings, ReplicationTarget,
     UpstreamSettings, SETTINGS_FILE_NAME,

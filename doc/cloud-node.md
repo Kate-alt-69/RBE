@@ -34,9 +34,11 @@ Cloud Node reads `setting.node.cn.json`. Private keys never belong in this file.
   },
   "upstream": {
     "url": "https://example-backend.invalid",
+    "nodeId": "render-main",
     "publicKey": "<64 hex Ed25519 public key>",
     "autoReconnect": true,
-    "syncOnConnect": true
+    "syncOnConnect": true,
+    "reconnectDelayMs": 2000
   },
   "replication": {
     "targets": []
@@ -88,5 +90,7 @@ That ordering is part of the Cloud Node recovery contract and is intended to run
 ## Authentication foundation
 
 Cloud Node uses domain-separated Ed25519 challenge signing. The private key is never sent in a ping, challenge, response, sync frame, or configuration file. The binary `RBE-CN/1` frame envelope already reserves distinct message types for Hello, challenge/response, sync negotiation, folder manifests, object requests/chunks, completion, and ping/pong.
+
+Cloud Node authentication additionally has a compact binary `RBECNAU1` proof. A node signs its node id, timestamp, fresh session id, and nonce. The accepting RBE node returns a separately signed proof bound to that exact session and client nonce. `cloud_node probe-upstream` performs one mutual-authentication probe; `cloud_node run` retries the probe according to `reconnectDelayMs`. Invalid peers are intentionally expected to receive a generic not-found response once the backend-side knock endpoint is enabled.
 
 The storage/format/identity foundation in the Cloud Node crate intentionally does not expose any REL capability. The authenticated remote tunnel and backend Evaluating-phase sync admission are the next transport layer built on this contract.

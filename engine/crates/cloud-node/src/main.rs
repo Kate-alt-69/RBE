@@ -1,18 +1,20 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cloud_node::{
-    load_signing_key_from_env, public_key_hex, CloudNodeSettings, CloudNodeStore,
+    load_signing_key_from_env, probe_upstream, public_key_hex, CloudNodeSettings, CloudNodeStore,
     SETTINGS_FILE_NAME,
 };
 
-fn main() {
-    if let Err(error) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
         eprintln!("cloud_node: {error:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let config_path = take_config_arg(&mut args)?.unwrap_or_else(default_config_path);
     let command = args.first().map(String::as_str).unwrap_or("evaluate");
@@ -40,8 +42,15 @@ fn run() -> anyhow::Result<()> {
             println!("syncObjects={}", plan.object_count());
             if let Some(upstream) = &settings.upstream {
                 println!("upstream={}", upstream.url);
+                println!("upstreamNode={}", upstream.node_id);
             }
         }
+        "probe-upstream" => {
+            let peer = probe_upstream(&settings).await?;
+            println!("authenticated={}", peer.node_id);
+            println!("session={}", hex::encode(peer.session));
+        }
+        "run" => run_daemon(&settings).await?,
         "sync-plan" => {
             let plan = store.sync_plan()?;
             println!("root={}", plan.root_hex());
@@ -82,6 +91,34 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_daemon(settings: &CloudNodeSettings) -> anyhow::Result<()> {
+    let upstream = settings
+        .upstream
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node run mode requires an upstream"))?;
+    loop {
+        match probe_upstream(settings).await {
+            Ok(peer) => {
+                println!(
+                    "Cloud Node authenticated upstream {} session={}",
+                    peer.node_id,
+                    hex::encode(peer.session)
+                );
+                if !upstream.auto_reconnect {
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                eprintln!("Cloud Node upstream unavailable: {error}");
+                if !upstream.auto_reconnect {
+                    return Err(error);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(upstream.reconnect_delay_ms)).await;
+    }
+}
+
 fn take_config_arg(args: &mut Vec<String>) -> anyhow::Result<Option<PathBuf>> {
     let mut found = None;
     let mut index = 0usize;
@@ -112,6 +149,6 @@ fn default_config_path() -> PathBuf {
 
 fn print_help() {
     println!(
-        "cloud_node [--config=<setting.node.cn.json>] [evaluate|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
+        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
     );
 }
