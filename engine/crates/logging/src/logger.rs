@@ -1,6 +1,6 @@
 //! Rust equivalent of the Node backend's `core/utilities/logger.ts`
 //! `Logger` class. Same call-site ergonomics (`Logger::new("account")`,
-//! `.info(...)`, `.warn(...)`, `.error(...)`, `.debug(...)`,
+//! `.info(...)`, `.warn(...)`, `.error(...)`, `.fatal(...)`, `.debug(...)`,
 //! `.child(...)`), backed by `tracing` instead of `console.log`.
 //!
 //! One deliberate design change (per "probably improve on the design"):
@@ -45,6 +45,13 @@ impl Logger {
 
     pub fn error(&self, message: impl std::fmt::Display) {
         tracing::error!(module = %self.module, "{message}");
+    }
+
+    /// Emit a fatal operator-facing error. Structured outputs retain the
+    /// standard ERROR severity while carrying `fatal=true`; the pretty
+    /// terminal formatter renders the same event as FATAL for humans.
+    pub fn fatal(&self, message: impl std::fmt::Display) {
+        tracing::error!(module = %self.module, fatal = true, "{message}");
     }
 
     /// Unlike the Node version (which checked `process.env.DEBUG ===

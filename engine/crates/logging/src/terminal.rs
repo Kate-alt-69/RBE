@@ -38,21 +38,28 @@ where
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ")
         )?;
 
+        let mut fields = EventFields::default();
+        event.record(&mut fields);
+        let fatal = fields.fatal && *event.metadata().level() == Level::ERROR;
+
         if self.ansi {
-            let level = match *event.metadata().level() {
-                Level::ERROR => "\x1b[91mERROR\x1b[0m",
-                Level::WARN => "\x1b[93mWARN\x1b[0m",
-                Level::INFO => "\x1b[92mINFO\x1b[0m",
-                Level::DEBUG => "\x1b[94mDEBUG\x1b[0m",
-                Level::TRACE => "\x1b[95mTRACE\x1b[0m",
+            let level = if fatal {
+                "\x1b[91mFATAL\x1b[0m"
+            } else {
+                match *event.metadata().level() {
+                    Level::ERROR => "\x1b[91mERROR\x1b[0m",
+                    Level::WARN => "\x1b[93mWARN\x1b[0m",
+                    Level::INFO => "\x1b[92mINFO\x1b[0m",
+                    Level::DEBUG => "\x1b[94mDEBUG\x1b[0m",
+                    Level::TRACE => "\x1b[95mTRACE\x1b[0m",
+                }
             };
             write!(writer, "  {level}")?;
+        } else if fatal {
+            write!(writer, "  FATAL")?;
         } else {
             write!(writer, "  {}", event.metadata().level())?;
         }
-
-        let mut fields = EventFields::default();
-        event.record(&mut fields);
 
         if let Some(module) = fields.module.as_deref() {
             if self.ansi {
@@ -80,6 +87,7 @@ where
 struct EventFields {
     module: Option<String>,
     message: String,
+    fatal: bool,
     fields: Vec<String>,
 }
 
@@ -88,6 +96,7 @@ impl EventFields {
         match field.name() {
             "message" => self.message = value,
             "module" => self.module = Some(value),
+            "fatal" => self.fatal = value == "true",
             _ => self.fields.push(format!("{}={}", field.name(), value)),
         }
     }
