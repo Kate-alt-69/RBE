@@ -22,8 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use cloud_node::{
-    CloudNodeAuthenticator, CloudNodeSettings, KNOCK_PATH, MAX_AUTH_PROOF_BYTES,
-    SETTINGS_FILE_NAME,
+    CloudNodeAuthenticator, CloudNodeSettings, KNOCK_PATH, MAX_AUTH_PROOF_BYTES, SETTINGS_FILE_NAME,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -253,10 +252,9 @@ async fn maintenance_response() -> Response {
     response
         .headers_mut()
         .insert(MAINTENANCE_MARKER, HeaderValue::from_static("1"));
-    response.headers_mut().insert(
-        "x-rbe-backend-state",
-        HeaderValue::from_static("starting"),
-    );
+    response
+        .headers_mut()
+        .insert("x-rbe-backend-state", HeaderValue::from_static("starting"));
     response
 }
 
