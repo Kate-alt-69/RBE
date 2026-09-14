@@ -147,9 +147,9 @@ fn configured_fallback_master_key() -> anyhow::Result<bool> {
             Ok(true)
         }
         Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
-            "{FALLBACK_MASTER_KEY_ENV} must be a UTF-8 32-byte hexadecimal value"
-        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{FALLBACK_MASTER_KEY_ENV} must be a UTF-8 32-byte hexadecimal value")
+        }
     }
 }
 
