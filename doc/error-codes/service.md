@@ -9,7 +9,8 @@ Service codes cover `.service` catalog parsing/validation, Service Mother/worker
 | `SVC1000-1099` | `.service` catalog/source declaration problems |
 | `SVC2000-2099` | executable REL validation/compilation |
 | `SVC4000-4099` | Service runtime/lifecycle/fabric operations |
-| `SVC5000-5099` | standalone Service binary/bootstrap/compatibility |
+| `SVC5000-5099` | standalone Service binary/Mother bootstrap/compatibility |
+| `SVC5100-5199` | Service control and worker bootstrap |
 | `SVC9000-9099` | Service runtime internal invariants |
 
 ## Emitted catalog/compiler codes
@@ -152,6 +153,9 @@ SVC5001 Service binary is not compatible with the current backend.
   action:
     Rebuild the complete RBE package and use the Service binary generated
     alongside this backend.
+
+  help:
+    doc/error-codes/service.md#svc5001
 ```
 
 **Do not** diagnose a catalog fingerprint mismatch as SVC5001 if the compatibility handshake already proved the executable is compatible.
@@ -179,3 +183,52 @@ The configured `service(.exe)` could not execute the bounded compatibility probe
 This is distinct from SVC5001: SVC5003 means Backend could not obtain a trustworthy compatibility statement at all.
 
 **Action:** replace the binary with one produced by the same RBE build and verify it can execute on the host platform.
+
+<a id="svc5099"></a>
+### SVC5099 — Service Mother startup failed with an unclassified error
+
+**Status:** Assigned.
+
+The Service Mother failed during startup, but the underlying error has not yet been migrated to a more specific `SVCxxxx` diagnostic.
+
+This is a fallback envelope, not a replacement for specific diagnostics. If the error chain already contains a specific Service code such as `SVC5001`, that code is reported instead.
+
+**Action:** follow the nested `reason`. If the failure is stable and has no more specific code, preserve the complete error chain so the diagnostic can be classified in a future release.
+
+<a id="svc5100"></a>
+### SVC5100 — invalid Service control command
+
+**Status:** Assigned.
+
+`service(.exe)` received a malformed/unsupported operator control command.
+
+**Action:** verify the restart/control command syntax. Internal Mother/worker command-line contracts are not public control commands.
+
+<a id="svc5101"></a>
+### SVC5101 — Service restart request could not be queued
+
+**Status:** Assigned.
+
+The control command was valid, but RBE could not persist/queue the restart request for the Service Mother.
+
+**Common causes:** runtime data directory is unavailable/read-only, atomic write failure, or a host filesystem problem.
+
+**Action:** verify the RBE runtime data directory is writable and retry. Preserve the underlying filesystem error if it persists.
+
+<a id="svc5102"></a>
+### SVC5102 — invalid internal Service executable mode
+
+**Status:** Assigned.
+
+`service(.exe)` was started without exactly one internal Mother/worker role.
+
+**Action:** launch the Service runtime through `backend(.exe)` rather than manually reproducing internal process arguments.
+
+<a id="svc5199"></a>
+### SVC5199 — Service worker startup failed with an unclassified error
+
+**Status:** Assigned.
+
+A Service worker failed during startup, but the underlying error has not yet been migrated to a more specific Service diagnostic.
+
+Like `SVC5099`, this is only a fallback envelope. The underlying error chain should be retained so a more precise code can be assigned later.
