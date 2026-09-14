@@ -7,6 +7,11 @@ publish.workspace = true
 [[bin]]
 name = "cloud_node"
 path = "src/main.rs"
+required-features = ["client"]
+
+[features]
+default = ["client"]
+client = ["dep:reqwest"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -17,4 +22,4 @@ hex = "0.4"
 ed25519-dalek = "2"
 rand = "0.8"
 tokio = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"], optional = true }

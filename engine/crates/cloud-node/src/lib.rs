@@ -4,6 +4,7 @@
 //! tunnel identities, topology, storage roots, or direct access to this crate.
 
 mod auth;
+#[cfg(feature = "client")]
 mod client;
 mod config;
 mod crypto;
@@ -14,10 +15,17 @@ mod store;
 mod sync;
 
 pub use auth::{random_session_and_nonce, NodeProof, NodeProofKind, DEFAULT_AUTH_SKEW_MS};
+#[cfg(feature = "client")]
 pub use client::{
     negotiate_sync, probe_upstream, AuthenticatedPeer, SyncNegotiation, KNOCK_PATH,
     SESSION_PROOF_HEADER, SYNC_PATH,
 };
+#[cfg(not(feature = "client"))]
+pub const KNOCK_PATH: &str = "/.rbe/cn/v1/knock";
+#[cfg(not(feature = "client"))]
+pub const SYNC_PATH: &str = "/.rbe/cn/v1/sync";
+#[cfg(not(feature = "client"))]
+pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 pub use config::{
     CloudNodeSettings, NodeMode, NodeSettings, ReplicationSettings, ReplicationTarget,
     UpstreamSettings, SETTINGS_FILE_NAME,
