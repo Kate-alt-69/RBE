@@ -1,4 +1,4 @@
-name: One-shot Service diagnostic help validation
+name: One-shot API body limit repair
 
 "on":
   push:
@@ -10,50 +10,41 @@ permissions:
   contents: write
 
 jobs:
-  validate-and-land:
+  repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt,clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: engine
-      - name: Apply, validate and land DIAG-002
+          components: rustfmt
+      - name: Apply and validate API body limits
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
 
-          python3 .github/patches/diag-service-help.py
-          python3 .github/patches/diag-service-help-tests.py
-
-          # Restore the unrelated API repair workflow exactly as DIAG-001 left it.
-          git show 1cd2f5967e7bc7037976efbe541999b643d11bd7:.github/workflows/one-shot-api-body-limits.yml > .github/workflows/one-shot-api-body-limits.yml
-          rm -f .github/patches/diag-service-help.py
-          rm -f .github/patches/diag-service-help-tests.py
+          python3 .github/patches/api-body-limits.py
 
           cd engine
           cargo fmt --all
-          cargo check -p backend --all-targets --locked
-          cargo test -p backend compatibility_probe_distinguishes_protocol_and_runtime_mismatches --locked
-          cargo test -p backend fallback_service_diagnostics_link_to_error_code_book --locked
-          cargo clippy -p backend --all-targets --locked -- -D warnings
+          cargo test -p config rejects_inconsistent_api_body_limits
+          cargo check -p api
           cd ..
 
-          for code in svc5001 svc5002 svc5003 svc5100 svc5101 svc5102; do
-            grep -q "doc/error-codes/service.md#$code" engine/crates/backend/src/service_*.rs
-          done
-          grep -q 'code.to_ascii_lowercase()' engine/crates/backend/src/service_main.rs
+          git rm .github/workflows/one-shot-api-body-limits.yml
+          git rm .github/patches/api-body-limits.py
+          git add engine/Cargo.toml engine/crates/api/src/lib.rs engine/crates/config/src/lib.rs engine/Cargo.lock
+          git commit -m "FIX | BUG-API-003 enforce generic and JSON body limits"
 
-          git add -A
-          git diff --cached --check
-          git commit -m 'FIX | BUG-DIAG-002 link Service diagnostics to Error Code Book'
-
-          git pull --rebase origin main
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
           git push origin HEAD:main

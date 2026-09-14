@@ -200,7 +200,7 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
                 None => crate::service_boot::resolve_runtime_path(&config.services.directory),
             };
             anyhow::bail!(
-                "SVC5002 Service Mother compiled a different Service catalog than the backend validated.\n\n  service_root:\n    {}\n\n  service_binary:\n    {}\n\n  expected_fingerprint:\n    {}\n\n  compiled_fingerprint:\n    {}\n\n  action:\n    Ensure .service files and Service settings are not changing during startup and restart RBE.\n\n    If the mismatch persists, rebuild RBE and replace the generated Service binary at:\n    {}",
+                "SVC5002 Service Mother compiled a different Service catalog than the backend validated.\n\n  service_root:\n    {}\n\n  service_binary:\n    {}\n\n  expected_fingerprint:\n    {}\n\n  compiled_fingerprint:\n    {}\n\n  action:\n    Ensure .service files and Service settings are not changing during startup and restart RBE.\n\n    If the mismatch persists, rebuild RBE and replace the generated Service binary at:\n    {}\n\n  help:\n    doc/error-codes/service.md#svc5002",
                 service_root.display(),
                 current_exe.display(),
                 expected,
@@ -370,7 +370,7 @@ fn incompatible_service_runtime_error(
     reason: impl std::fmt::Display,
 ) -> anyhow::Error {
     anyhow::anyhow!(
-        "SVC5001 Service binary is not compatible with the current backend.\n\n  expected_path:\n    {}\n\n  reason:\n    {}\n\n  action:\n    Rebuild RBE for this target and replace the generated Service binary at:\n    {}",
+        "SVC5001 Service binary is not compatible with the current backend.\n\n  expected_path:\n    {}\n\n  reason:\n    {}\n\n  action:\n    Rebuild RBE for this target and replace the generated Service binary at:\n    {}\n\n  help:\n    doc/error-codes/service.md#svc5001",
         path.display(),
         reason,
         path.display(),
@@ -379,7 +379,7 @@ fn incompatible_service_runtime_error(
 
 fn service_compat_protocol_error(path: &Path, reason: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!(
-        "SVC5003 Service binary does not support the required compatibility protocol.\n\n  expected_path:\n    {}\n\n  reason:\n    {}\n\n  action:\n    Rebuild RBE and replace the generated Service binary at:\n    {}",
+        "SVC5003 Service binary does not support the required compatibility protocol.\n\n  expected_path:\n    {}\n\n  reason:\n    {}\n\n  action:\n    Rebuild RBE and replace the generated Service binary at:\n    {}\n\n  help:\n    doc/error-codes/service.md#svc5003",
         path.display(),
         reason,
         path.display(),
@@ -1218,14 +1218,18 @@ mod tests {
         protocol.protocol = "RBE-SERVICE-COMPAT/999".into();
         let error = validate_service_compatibility(service, &protocol)
             .expect_err("protocol mismatch must fail closed");
-        assert!(error.to_string().contains("SVC5003"));
+        let rendered = error.to_string();
+        assert!(rendered.contains("SVC5003"));
+        assert!(rendered.contains("doc/error-codes/service.md#svc5003"));
 
         let mut runtime = probe;
         runtime.service_runtime_abi += 1;
         let error = validate_service_compatibility(service, &runtime)
             .expect_err("runtime ABI mismatch must fail closed");
-        assert!(error.to_string().contains("SVC5001"));
-        assert!(error.to_string().contains("runtime ABI"));
+        let rendered = error.to_string();
+        assert!(rendered.contains("SVC5001"));
+        assert!(rendered.contains("runtime ABI"));
+        assert!(rendered.contains("doc/error-codes/service.md#svc5001"));
     }
 
     #[tokio::test]
