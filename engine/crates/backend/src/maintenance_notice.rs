@@ -199,7 +199,8 @@ async fn cloud_node_knock(
     let Some(runtime) = &state.cloud_node else {
         return hidden_not_found();
     };
-    if !octet_stream_request(&request) || advertised_body_too_large(&request, MAX_AUTH_PROOF_BYTES) {
+    if !octet_stream_request(&request) || advertised_body_too_large(&request, MAX_AUTH_PROOF_BYTES)
+    {
         return hidden_not_found();
     }
 
@@ -222,17 +223,15 @@ async fn cloud_node_knock(
     octet_stream_response(accepted.response)
 }
 
-async fn cloud_node_sync(
-    State(state): State<Arc<MaintenanceState>>,
-    request: Request,
-) -> Response {
+async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Request) -> Response {
     if request.method() != Method::POST {
         return hidden_not_found();
     }
     let Some(runtime) = &state.cloud_node else {
         return hidden_not_found();
     };
-    if !octet_stream_request(&request) || advertised_body_too_large(&request, MAX_SYNC_HELLO_BYTES) {
+    if !octet_stream_request(&request) || advertised_body_too_large(&request, MAX_SYNC_HELLO_BYTES)
+    {
         return hidden_not_found();
     }
 
@@ -252,7 +251,10 @@ async fn cloud_node_sync(
         Ok(now_ms) => now_ms,
         Err(_) => return hidden_not_found(),
     };
-    let session = match runtime.authenticator.authorize_session_proof(&proof, now_ms) {
+    let session = match runtime
+        .authenticator
+        .authorize_session_proof(&proof, now_ms)
+    {
         Ok(session) => session,
         Err(error) => {
             tracing::debug!(error = %error, "rejected hidden Cloud Node sync session proof");

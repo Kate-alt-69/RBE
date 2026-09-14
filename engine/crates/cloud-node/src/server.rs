@@ -286,17 +286,11 @@ mod tests {
         assert_eq!(authorized.node_id, "nas-main");
         assert!(auth.authorize_session_proof(&follow_up, 50_400).is_err());
 
-        let wrong_binding = NodeProof::session(
-            &client,
-            "nas-main",
-            50_500,
-            session,
-            [8u8; 32],
-            [99u8; 32],
-        )
-        .unwrap()
-        .encode()
-        .unwrap();
+        let wrong_binding =
+            NodeProof::session(&client, "nas-main", 50_500, session, [8u8; 32], [99u8; 32])
+                .unwrap()
+                .encode()
+                .unwrap();
         assert!(auth
             .authorize_session_proof(&wrong_binding, 50_600)
             .is_err());
