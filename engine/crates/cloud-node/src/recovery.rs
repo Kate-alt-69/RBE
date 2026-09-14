@@ -371,9 +371,7 @@ impl CloudNodeRecoveryReceiver {
             .join("versions")
             .join(hex::encode(content_sha256))
             .join("payload");
-        if payload.is_file()
-            && verify_resource(&payload, content_sha256, manifest.logical_size)?
-        {
+        if payload.is_file() && verify_resource(&payload, content_sha256, manifest.logical_size)? {
             return Ok(true);
         }
         if let Some(parent) = payload.parent() {
@@ -587,7 +585,11 @@ fn verify_part_range(path: &Path, offset: u64, expected: &[u8]) -> anyhow::Resul
     Ok(())
 }
 
-fn verify_resource(path: &Path, expected_hash: [u8; 32], expected_size: u64) -> anyhow::Result<bool> {
+fn verify_resource(
+    path: &Path,
+    expected_hash: [u8; 32],
+    expected_size: u64,
+) -> anyhow::Result<bool> {
     let metadata = fs::metadata(path)?;
     if metadata.len() != expected_size {
         return Ok(false);
@@ -747,7 +749,9 @@ mod tests {
             logical_path: "db/a.db".into(),
             logical_size: 1,
             created_unix_ms: 1,
-            body: BlobBody::File { changes: Vec::new() },
+            body: BlobBody::File {
+                changes: Vec::new(),
+            },
         };
         let bytes = file_manifest.encode().unwrap();
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
@@ -772,7 +776,9 @@ mod tests {
             logical_path: "root".into(),
             logical_size: 0,
             created_unix_ms: 1,
-            body: BlobBody::Folder { entries: Vec::new() },
+            body: BlobBody::Folder {
+                entries: Vec::new(),
+            },
         };
         let bytes = folder_manifest.encode().unwrap();
         let hash: [u8; 32] = Sha256::digest(&bytes).into();

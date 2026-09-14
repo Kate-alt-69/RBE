@@ -62,7 +62,10 @@ impl TransferChunk {
     ) -> anyhow::Result<Self> {
         let data_sha256 = Sha256::digest(&data).into();
         let end = offset
-            .checked_add(u64::try_from(data.len()).map_err(|_| anyhow::anyhow!("transfer chunk size exceeds u64"))?)
+            .checked_add(
+                u64::try_from(data.len())
+                    .map_err(|_| anyhow::anyhow!("transfer chunk size exceeds u64"))?,
+            )
             .ok_or_else(|| anyhow::anyhow!("Cloud Node transfer range overflow"))?;
         let mut chunk = Self {
             kind,

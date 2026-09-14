@@ -297,7 +297,10 @@ async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Re
                     tracing::warn!(peer = %session.node_id, "Cloud Node recovery is already owned by another authenticated session");
                     return StatusCode::CONFLICT.into_response();
                 }
-                let receiver = match CloudNodeRecoveryReceiver::open(&runtime.store, session.session) {
+                let receiver = match CloudNodeRecoveryReceiver::open(
+                    &runtime.store,
+                    session.session,
+                ) {
                     Ok(receiver) => receiver,
                     Err(error) => {
                         tracing::error!(error = %error, "Cloud Node could not create recovery staging tree");
@@ -437,7 +440,10 @@ async fn cloud_node_transfer(
                     tracing::warn!(peer = %session.node_id, "Cloud Node completion root differs from negotiated root");
                     return StatusCode::CONFLICT.into_response();
                 }
-                match recovery.receiver.complete(&runtime.store, recovery.expected) {
+                match recovery
+                    .receiver
+                    .complete(&runtime.store, recovery.expected)
+                {
                     Ok(actual) => actual,
                     Err(error) => {
                         tracing::error!(
@@ -487,7 +493,10 @@ fn authorize_cloud_node_session(
         return None;
     }
     let now_ms = now_ms().ok()?;
-    match runtime.authenticator.authorize_session_proof(&proof, now_ms) {
+    match runtime
+        .authenticator
+        .authorize_session_proof(&proof, now_ms)
+    {
         Ok(session) => Some(session),
         Err(error) => {
             tracing::debug!(error = %error, operation, "rejected hidden Cloud Node session proof");
