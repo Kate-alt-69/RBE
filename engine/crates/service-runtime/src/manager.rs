@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -188,6 +187,7 @@ pub struct ServiceManager {
     fabric: Option<ServiceFabricEndpoint>,
     runtime_env: Option<Arc<Value>>,
     restart_authority: Option<Arc<dyn ServiceRestartAuthority>>,
+    application_root: Option<Arc<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,7 +273,7 @@ impl ServiceManager {
     }
 
     pub async fn spawn_all(catalog: &ServiceCatalog) -> anyhow::Result<Self> {
-        let manager = Self::prepare_all(catalog, None, None, None).await;
+        let manager = Self::prepare_all(catalog, None, None, None, None).await;
         manager.start_prepared(catalog).await?;
         Ok(manager)
     }
@@ -282,7 +282,7 @@ impl ServiceManager {
         catalog: &ServiceCatalog,
         fabric: ServiceFabricEndpoint,
     ) -> Self {
-        Self::prepare_all(catalog, Some(fabric), None, None).await
+        Self::prepare_all(catalog, Some(fabric), None, None, None).await
     }
 
     pub async fn prepare_all_with_fabric_and_runtime_env(
@@ -290,7 +290,7 @@ impl ServiceManager {
         fabric: ServiceFabricEndpoint,
         runtime_env: Arc<Value>,
     ) -> Self {
-        Self::prepare_all(catalog, Some(fabric), Some(runtime_env), None).await
+        Self::prepare_all(catalog, Some(fabric), Some(runtime_env), None, None).await
     }
 
     pub async fn prepare_all_with_fabric_runtime_env_and_restart_authority(
@@ -299,7 +299,31 @@ impl ServiceManager {
         runtime_env: Arc<Value>,
         restart_authority: Option<Arc<dyn ServiceRestartAuthority>>,
     ) -> Self {
-        Self::prepare_all(catalog, Some(fabric), Some(runtime_env), restart_authority).await
+        Self::prepare_all(
+            catalog,
+            Some(fabric),
+            Some(runtime_env),
+            restart_authority,
+            None,
+        )
+        .await
+    }
+
+    pub async fn prepare_all_for_mother(
+        catalog: &ServiceCatalog,
+        fabric: ServiceFabricEndpoint,
+        runtime_env: Arc<Value>,
+        restart_authority: Option<Arc<dyn ServiceRestartAuthority>>,
+        application_root: PathBuf,
+    ) -> Self {
+        Self::prepare_all(
+            catalog,
+            Some(fabric),
+            Some(runtime_env),
+            restart_authority,
+            Some(Arc::new(application_root)),
+        )
+        .await
     }
 
     async fn prepare_all(
@@ -307,11 +331,13 @@ impl ServiceManager {
         fabric: Option<ServiceFabricEndpoint>,
         runtime_env: Option<Arc<Value>>,
         restart_authority: Option<Arc<dyn ServiceRestartAuthority>>,
+        application_root: Option<Arc<PathBuf>>,
     ) -> Self {
         let manager = Self {
             fabric,
             runtime_env,
             restart_authority,
+            application_root,
             ..Self::default()
         };
         let mut services = manager.services.write().await;
@@ -333,15 +359,20 @@ impl ServiceManager {
             if file.mode == ServiceMode::OnDemand {
                 continue;
             }
-            let process =
-                match spawn_process(&file, self.fabric.as_ref(), self.runtime_env.as_deref()).await
-                {
-                    Ok(process) => process,
-                    Err(error) => {
-                        self.shutdown_all().await;
-                        return Err(error);
-                    }
-                };
+            let process = match spawn_process(
+                &file,
+                self.fabric.as_ref(),
+                self.runtime_env.as_deref(),
+                self.application_root.as_deref().map(PathBuf::as_path),
+            )
+            .await
+            {
+                Ok(process) => process,
+                Err(error) => {
+                    self.shutdown_all().await;
+                    return Err(error);
+                }
+            };
             let handle = self
                 .services
                 .read()
@@ -578,7 +609,14 @@ impl ServiceManager {
                 continue;
             }
 
-            match spawn_process(&file, self.fabric.as_ref(), self.runtime_env.as_deref()).await {
+            match spawn_process(
+                &file,
+                self.fabric.as_ref(),
+                self.runtime_env.as_deref(),
+                self.application_root.as_deref().map(PathBuf::as_path),
+            )
+            .await
+            {
                 Ok(replacement) => {
                     let new_pid = replacement.ready.pid;
                     service.process = Some(replacement);
@@ -695,7 +733,14 @@ impl ServiceManager {
                 return;
             }
             attempt = attempt.saturating_add(1);
-            match spawn_process(&file, self.fabric.as_ref(), self.runtime_env.as_deref()).await {
+            match spawn_process(
+                &file,
+                self.fabric.as_ref(),
+                self.runtime_env.as_deref(),
+                self.application_root.as_deref().map(PathBuf::as_path),
+            )
+            .await
+            {
                 Ok(mut replacement) => {
                     let pid = replacement.ready.pid;
                     let mut service = handle.lock().await;
@@ -866,7 +911,14 @@ impl ServiceManager {
 
         let file = service.file.clone();
         service.restarting = true;
-        match spawn_process(&file, self.fabric.as_ref(), self.runtime_env.as_deref()).await {
+        match spawn_process(
+            &file,
+            self.fabric.as_ref(),
+            self.runtime_env.as_deref(),
+            self.application_root.as_deref().map(PathBuf::as_path),
+        )
+        .await
+        {
             Ok(process) => {
                 let pid = process.ready.pid;
                 service.process = Some(process);
@@ -1405,6 +1457,7 @@ async fn spawn_process(
     file: &ServiceFile,
     fabric: Option<&ServiceFabricEndpoint>,
     runtime_env: Option<&Value>,
+    application_root: Option<&Path>,
 ) -> anyhow::Result<ServiceProcess> {
     let source = std::fs::read_to_string(&file.path).with_context(|| {
         format!(
@@ -1448,6 +1501,9 @@ async fn spawn_process(
         )
         .arg("--service-source-digest")
         .arg(file.source_digest_hex());
+    if let Some(application_root) = application_root {
+        command.arg("--application-root").arg(application_root);
+    }
     if let Some(fabric) = fabric {
         command
             .arg("--service-mother-address")

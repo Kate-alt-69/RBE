@@ -13,6 +13,14 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let service_file = value("--service-file")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("service --service-host requires --service-file <path>"))?;
+    let mother_managed = args.iter().any(|arg| arg == "--service-mother-address");
+    let application_root = value("--application-root").map(PathBuf::from);
+    if mother_managed && application_root.is_none() {
+        anyhow::bail!("Service Mother-managed worker requires --application-root");
+    }
+    let application_root = application_root
+        .map(|path| canonical_runtime_root(&path, "service host application root"))
+        .transpose()?;
     let token = service_runtime::read_parent_bootstrap_secret_if_configured("service host")?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -97,7 +105,11 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
             error.message
         )
     })?;
-    let modules = route_engine::ModuleProgram::load_default().map_err(|errors| {
+    let modules = match application_root.as_ref() {
+        Some(root) => route_engine::ModuleProgram::load(&root.join("module")),
+        None => route_engine::ModuleProgram::load_default(),
+    }
+    .map_err(|errors| {
         anyhow::anyhow!(
             "service host module compilation failed:
 {}",
@@ -120,6 +132,15 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         Arc::new(executor),
     )
     .await
+}
+
+fn canonical_runtime_root(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| anyhow::anyhow!("canonicalize {label} {}: {error}", path.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("{label} {} is not a directory", canonical.display());
+    }
+    Ok(canonical)
 }
 
 fn validate_executable_catalog(catalog: &ServiceCatalog) -> Result<(), String> {
@@ -170,12 +191,29 @@ pub fn compile(
     settings: &config::ServicesConfig,
     io: &atomic_io::AtomicIo,
 ) -> anyhow::Result<Option<ServiceCatalog>> {
+    let directory = resolve_runtime_path(&settings.directory);
+    compile_resolved(settings, io, &directory)
+}
+
+pub fn compile_from_root(
+    settings: &config::ServicesConfig,
+    io: &atomic_io::AtomicIo,
+    application_root: &Path,
+) -> anyhow::Result<Option<ServiceCatalog>> {
+    let directory = resolve_runtime_path_from(application_root, &settings.directory);
+    compile_resolved(settings, io, &directory)
+}
+
+fn compile_resolved(
+    settings: &config::ServicesConfig,
+    io: &atomic_io::AtomicIo,
+    directory: &Path,
+) -> anyhow::Result<Option<ServiceCatalog>> {
     if !settings.enabled {
         tracing::info!("user .service runtime disabled by configuration");
         return Ok(None);
     }
 
-    let directory = resolve_runtime_path(&settings.directory);
     let defaults = ServiceDefaults {
         memory_limit_mb: settings.default_memory_limit_mb,
         startup_timeout_ms: settings.startup_timeout_ms,
@@ -183,7 +221,7 @@ pub fn compile(
         monitor_interval_ms: settings.monitor_interval_ms,
         max_restart_backoff_ms: settings.max_restart_backoff_ms,
     };
-    match ServiceCatalog::compile_dir(&directory, defaults) {
+    match ServiceCatalog::compile_dir(directory, defaults) {
         Ok(catalog) => {
             if let Err(rendered) = validate_executable_catalog(&catalog) {
                 report_compile_failure(&rendered, io);
@@ -209,11 +247,15 @@ pub fn compile(
 }
 
 pub fn resolve_runtime_path(path: impl AsRef<Path>) -> PathBuf {
+    resolve_runtime_path_from(&runtime_paths::binary_dir(), path)
+}
+
+pub fn resolve_runtime_path_from(root: &Path, path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        runtime_paths::binary_dir().join(path)
+        root.join(path)
     }
 }
 
@@ -252,5 +294,17 @@ mod tests {
         assert!(rendered.contains("SVC2000"));
         assert!(rendered.contains("broken.service"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn explicit_application_root_owns_relative_service_paths() {
+        let root = temp_dir();
+        let expected = root.join("service");
+        assert_eq!(
+            resolve_runtime_path_from(&root, "service"),
+            expected,
+            "helper executable location must not redefine the application service root"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

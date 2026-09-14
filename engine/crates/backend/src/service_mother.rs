@@ -147,12 +147,37 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
     let config = config::Config::load(&settings_path).map_err(|error| {
         anyhow::anyhow!("Service Mother failed to load {settings_path}: {error}")
     })?;
+    let parent_supervised = std::env::var_os("RBE_PARENT_LIVENESS_PIPE").is_some();
+    let application_root = flag_value(args, "--application-root").map(PathBuf::from);
+    if parent_supervised && application_root.is_none() {
+        anyhow::bail!("Service Mother requires the parent application root");
+    }
+    let application_root = application_root
+        .map(|path| {
+            let canonical = std::fs::canonicalize(&path).with_context(|| {
+                format!(
+                    "canonicalize Service Mother application root {}",
+                    path.display()
+                )
+            })?;
+            if !canonical.is_dir() {
+                anyhow::bail!(
+                    "Service Mother application root {} is not a directory",
+                    canonical.display()
+                );
+            }
+            Ok::<PathBuf, anyhow::Error>(canonical)
+        })
+        .transpose()?;
     let runtime_env = Arc::new(match runtime_env_frame {
         Some(value) => value,
         None => serde_json::to_value(&config.runtime_env)?,
     });
     let io = atomic_io::AtomicIo::new();
-    let catalog = crate::service_boot::compile(&config.services, &io)?;
+    let catalog = match application_root.as_deref() {
+        Some(root) => crate::service_boot::compile_from_root(&config.services, &io, root)?,
+        None => crate::service_boot::compile(&config.services, &io)?,
+    };
     let actual_fingerprint = catalog
         .as_ref()
         .map(|catalog| catalog.fingerprint())
@@ -179,13 +204,27 @@ pub async fn run_child(args: &[String]) -> anyhow::Result<()> {
                 Arc::new(crate::er_recovery::ErRecoveryClient::new(key))
                     as Arc<dyn service_runtime::ServiceRestartAuthority>
             });
-            ServiceManager::prepare_all_with_fabric_runtime_env_and_restart_authority(
-                catalog,
-                server.fabric_endpoint(),
-                runtime_env.clone(),
-                restart_authority,
-            )
-            .await
+            match application_root.clone() {
+                Some(application_root) => {
+                    ServiceManager::prepare_all_for_mother(
+                        catalog,
+                        server.fabric_endpoint(),
+                        runtime_env.clone(),
+                        restart_authority,
+                        application_root,
+                    )
+                    .await
+                }
+                None => {
+                    ServiceManager::prepare_all_with_fabric_runtime_env_and_restart_authority(
+                        catalog,
+                        server.fabric_endpoint(),
+                        runtime_env.clone(),
+                        restart_authority,
+                    )
+                    .await
+                }
+            }
         }
         None => ServiceManager::default(),
     };
@@ -392,6 +431,8 @@ async fn spawn_process(
         .arg(file_sha256_hex(&service_exe)?)
         .arg("--settings")
         .arg(&settings_path)
+        .arg("--application-root")
+        .arg(parent)
         .arg("--runtime-env-frame")
         .current_dir(parent)
         .stdin(Stdio::piped())
@@ -532,6 +573,7 @@ async fn spawn_process(
         pid = ready.pid,
         address = %ready.address,
         settings = %settings_path.display(),
+        application_root = %parent.display(),
         "Service Mother process ready"
     );
     Ok(ServiceMotherProcess {
