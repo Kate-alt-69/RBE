@@ -70,6 +70,10 @@ fn main() -> anyhow::Result<()> {
         return run_worker(&args);
     }
 
+    if args.iter().any(|arg| arg == "--parent-liveness-stdin") {
+        spawn_parent_liveness_guard()?;
+    }
+
     let debug = args.iter().any(|arg| arg == "--debug");
     let listen = value_after(&args, "--listen");
     let dashboard_disabled = args.iter().any(|arg| arg == "--no-dashboard");
@@ -205,6 +209,29 @@ fn main() -> anyhow::Result<()> {
         println!("container: no control socket requested; exiting after initialization");
     }
     Ok(())
+}
+
+fn spawn_parent_liveness_guard() -> anyhow::Result<()> {
+    thread::Builder::new()
+        .name("container-parent-liveness".into())
+        .spawn(|| {
+            let mut stdin = std::io::stdin();
+            let mut buffer = [0u8; 64];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) | Err(_) => {
+                        emit_event(
+                            "parent_liveness_closed",
+                            "backend parent pipe closed; stopping Controller",
+                        );
+                        std::process::exit(0);
+                    }
+                    Ok(_) => {}
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("spawn Controller parent liveness watcher: {error}"))
 }
 
 fn spawn_monitor_supervisor() -> anyhow::Result<()> {

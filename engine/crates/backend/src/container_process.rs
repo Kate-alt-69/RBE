@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::time::{sleep, timeout};
 
 mod container_integrity {
@@ -19,6 +19,7 @@ mod container_integrity {
 
 pub struct ContainerProcess {
     child: Child,
+    _parent_liveness: ChildStdin,
     pub address: SocketAddr,
     token: String,
     pid: Option<u32>,
@@ -47,6 +48,7 @@ impl ContainerProcess {
                 // The browser dashboard belongs to backend.exe. The child keeps
                 // its old standalone dashboard code only for direct debug runs.
                 .arg("--no-dashboard")
+                .arg("--parent-liveness-stdin")
                 .arg("--general-environments")
                 .arg(settings.environments.to_string());
             if let Some(value) = settings.swamps_per_environment.fixed() {
@@ -64,18 +66,23 @@ impl ContainerProcess {
                     host_capability.address().to_string(),
                 )
                 .env("RBE_HOST_CAPABILITY_TOKEN", host_capability.token())
+                .stdin(std::process::Stdio::piped())
                 .kill_on_drop(true);
 
-            let child = command.spawn().map_err(|err| {
+            let mut child = command.spawn().map_err(|err| {
                 anyhow::anyhow!(
                     "failed to spawn verified container process {}: {err}",
                     binary.display()
                 )
             })?;
             let pid = child.id();
+            let parent_liveness = child.stdin.take().ok_or_else(|| {
+                anyhow::anyhow!("verified container parent liveness pipe was not created")
+            })?;
 
             let mut process = Self {
                 child,
+                _parent_liveness: parent_liveness,
                 address,
                 token,
                 pid,

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +35,7 @@ mod service_integrity {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
 
@@ -50,15 +51,15 @@ async fn main() {
             .unwrap_or(8080);
         if let Err(error) = maintenance_notice::run(host, port).await {
             eprintln!("fatal maintenance responder error: {error:#}");
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
-        return;
+        return ExitCode::SUCCESS;
     }
 
     if has("--er") {
         if !has("--launch") {
             eprintln!("backend.exe --er requires --launch as well");
-            std::process::exit(2);
+            return ExitCode::from(2);
         }
         let separate = has("--separate-process") || has("--saperate-process");
         let bootstrap = if has("--er-bootstrap-stdin") {
@@ -70,14 +71,14 @@ async fn main() {
             Ok(bootstrap) => bootstrap,
             Err(error) => {
                 eprintln!("fatal error-reporter bootstrap error: {error:#}");
-                std::process::exit(1);
+                return ExitCode::FAILURE;
             }
         };
         if let Err(error) = run_error_reporter_daemon(separate, bootstrap).await {
             eprintln!("fatal error-reporter-daemon error: {error:#}");
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
-        return;
+        return ExitCode::SUCCESS;
     }
 
     if has("--vault") {
@@ -87,11 +88,11 @@ async fn main() {
             } else {
                 eprintln!("RBE initialization failed.");
             }
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
         if !has("--separate-process") && !has("--saperate-process") {
             eprintln!("backend.exe --vault requires --separate-process");
-            std::process::exit(2);
+            return ExitCode::from(2);
         }
         let value = |flag: &str, default: &str| {
             args.windows(2)
@@ -107,9 +108,9 @@ async fn main() {
         let force_dbus = has("--dbus");
         if let Err(error) = vault_process::run_vault_daemon(service_name, data_dir, force_dbus) {
             eprintln!("fatal Vault daemon error: {error:#}");
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
-        return;
+        return ExitCode::SUCCESS;
     }
 
     println!("Evaluating..");
@@ -121,14 +122,15 @@ async fn main() {
             } else {
                 eprintln!("RBE initialization failed.");
             }
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
 
     if let Err(error) = boot_and_run(host_ready).await {
         eprintln!("fatal boot error: {error:#}");
-        std::process::exit(1);
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
 }
 
 async fn run_error_reporter_daemon(
@@ -213,9 +215,9 @@ fn spawn_error_reporter_daemon_process(
             let pid = child.id();
             let started_at = tokio::time::Instant::now();
 
-            if let Some(frame) = frame {
+            let _parent_liveness = if let Some(frame) = frame {
                 use tokio::io::AsyncWriteExt;
-                let encoded = match serde_json::to_vec(&frame) {
+                let mut encoded = match serde_json::to_vec(&frame) {
                     Ok(encoded) => encoded,
                     Err(error) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
@@ -245,6 +247,7 @@ fn spawn_error_reporter_daemon_process(
                         continue;
                     }
                 };
+                encoded.push(b'\n');
                 let Some(mut stdin) = child.stdin.take() else {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     let delay = er_restart_delay(consecutive_failures);
@@ -300,8 +303,10 @@ fn spawn_error_reporter_daemon_process(
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                drop(stdin);
-            }
+                Some(stdin)
+            } else {
+                None
+            };
 
             tracing::info!(
                 pid,

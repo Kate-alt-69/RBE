@@ -7,7 +7,7 @@
 //! making refresh idempotent even if queue compaction changed byte offsets.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -72,6 +72,7 @@ pub struct ErBootstrap {
     authority: ErAuthority,
     signing_key: String,
     control_key: Option<String>,
+    parent_liveness: bool,
 }
 
 impl ErBootstrap {
@@ -80,12 +81,18 @@ impl ErBootstrap {
             authority: ErAuthority::Basic,
             signing_key: random_key_hex(),
             control_key: None,
+            parent_liveness: false,
         }
     }
 
     pub fn from_parent_stdin() -> anyhow::Result<Self> {
+        let stdin = std::io::stdin();
+        let mut stdin = stdin.lock();
         let mut raw = String::new();
-        std::io::stdin().read_to_string(&mut raw)?;
+        let read = stdin.read_line(&mut raw)?;
+        if read == 0 {
+            anyhow::bail!("ER bootstrap pipe closed before a frame was received");
+        }
         if raw.len() > 4096 {
             anyhow::bail!("ER bootstrap frame exceeded 4 KiB");
         }
@@ -105,11 +112,16 @@ impl ErBootstrap {
             authority: frame.authority,
             signing_key: frame.signing_key_hex,
             control_key: frame.control_key_hex,
+            parent_liveness: true,
         })
     }
 
     pub fn authority(&self) -> ErAuthority {
         self.authority
+    }
+
+    pub fn has_parent_liveness(&self) -> bool {
+        self.parent_liveness
     }
 
     pub fn recovery_key(&self) -> anyhow::Result<Option<ErControlKey>> {
@@ -129,6 +141,28 @@ impl Drop for ErBootstrap {
             }
         }
     }
+}
+
+fn spawn_parent_liveness_guard() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("rbe-er-parent-liveness".into())
+        .spawn(|| {
+            let mut stdin = std::io::stdin();
+            let mut buffer = [0u8; 64];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) | Err(_) => {
+                        tracing::info!(
+                            "error-reporter parent liveness pipe closed; exiting with backend"
+                        );
+                        std::process::exit(0);
+                    }
+                    Ok(_) => {}
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("spawn ER parent liveness watcher: {error}"))
 }
 
 fn random_key_hex() -> String {
@@ -265,6 +299,9 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&admin_dir)?;
     let authority = bootstrap.authority();
+    if bootstrap.has_parent_liveness() {
+        spawn_parent_liveness_guard()?;
+    }
     let restart_control = authority.can_control_restarts();
     let recovery_key = bootstrap.recovery_key()?;
     let com_key_in_memory = recovery_key.is_some();
