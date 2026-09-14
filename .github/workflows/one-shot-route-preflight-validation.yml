@@ -1,0 +1,53 @@
+name: One-shot Runtime Image route preflight
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-route-preflight-validation.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Apply, validate and land BUG-ROUTE-003
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/patches/route-preflight-validation.py
+          git rm .github/patches/route-preflight-validation.py
+          git rm .github/workflows/one-shot-route-preflight-validation.yml
+
+          cd engine
+          cargo fmt --all
+          cargo check -p route-engine -p backend --all-targets --locked
+          cargo test -p route-engine --locked
+          cargo test -p backend --locked
+          cargo clippy -p route-engine -p backend --all-targets --locked -- -D warnings
+          cd ..
+
+          grep -q 'pub fn validate_runtime_image_routes' engine/crates/route-engine/src/lib.rs
+          grep -q 'validate_runtime_image_routes(&image)?' engine/crates/backend/src/runtime_image_boot.rs
+
+          git add -A
+          git diff --cached --check
+          git commit -m 'FIX | BUG-ROUTE-003 reject route collisions before process startup'
+
+          git pull --rebase origin main
+          git push origin HEAD:main
