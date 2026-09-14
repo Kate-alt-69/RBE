@@ -15,6 +15,7 @@ pub const DEFAULT_AUTH_SKEW_MS: u64 = 60_000;
 pub enum NodeProofKind {
     Knock = 1,
     Accept = 2,
+    Session = 3,
 }
 
 impl TryFrom<u8> for NodeProofKind {
@@ -24,6 +25,7 @@ impl TryFrom<u8> for NodeProofKind {
         Ok(match value {
             1 => Self::Knock,
             2 => Self::Accept,
+            3 => Self::Session,
             _ => anyhow::bail!("unknown Cloud Node proof kind {value}"),
         })
     }
@@ -70,6 +72,28 @@ impl NodeProof {
         Self::signed(
             signing,
             NodeProofKind::Accept,
+            node_id,
+            timestamp_ms,
+            session,
+            nonce,
+            peer_nonce,
+        )
+    }
+
+    /// Authenticates a follow-up request inside a previously established
+    /// mutual-authentication session. `peer_nonce` is the nonce issued by the
+    /// accepting peer and therefore binds this proof to that exact handshake.
+    pub fn session(
+        signing: &SigningKey,
+        node_id: &str,
+        timestamp_ms: u64,
+        session: [u8; 16],
+        nonce: [u8; 32],
+        peer_nonce: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        Self::signed(
+            signing,
+            NodeProofKind::Session,
             node_id,
             timestamp_ms,
             session,
@@ -300,5 +324,20 @@ mod tests {
         assert!(accept
             .verify_identity("attacker", &hex::encode(server.verifying_key().to_bytes()))
             .is_err());
+
+        let request = NodeProof::session(
+            &client,
+            "nas-main",
+            50_700,
+            session,
+            [13u8; 32],
+            accept.nonce,
+        )
+        .unwrap();
+        assert_eq!(request.kind, NodeProofKind::Session);
+        assert_eq!(request.peer_nonce, accept.nonce);
+        request
+            .verify_identity("nas-main", &hex::encode(client.verifying_key().to_bytes()))
+            .unwrap();
     }
 }

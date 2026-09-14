@@ -4,10 +4,10 @@
 //! `--maintenance-notice` mode after reclaiming any stale listener. The helper
 //! owns the public API port until bootstrap is complete and answers ordinary
 //! requests with HTTP 503. When Cloud Node is configured for inbound
-//! replication, the same short-lived listener also exposes the deliberately
-//! hidden mutual-authentication knock endpoint used during recovery. Its stdin
-//! is a parent-owned lifetime pipe: if the parent exits or intentionally closes
-//! the pipe, the helper shuts down and releases the port.
+//! replication, the same short-lived listener also exposes deliberately hidden
+//! mutual-authentication and sync-negotiation endpoints used during recovery.
+//! Its stdin is a parent-owned lifetime pipe: if the parent exits or
+//! intentionally closes the pipe, the helper shuts down and releases the port.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -22,7 +22,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use cloud_node::{
-    CloudNodeAuthenticator, CloudNodeSettings, KNOCK_PATH, MAX_AUTH_PROOF_BYTES, SETTINGS_FILE_NAME,
+    CloudNodeAuthenticator, CloudNodeSettings, CloudNodeStore, Frame, FrameKind, KNOCK_PATH,
+    MAX_AUTH_PROOF_BYTES, SESSION_PROOF_HEADER, SETTINGS_FILE_NAME, SYNC_PATH,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -31,6 +32,7 @@ use tokio::process::{Child, ChildStdin, Command};
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HELPER_LIFETIME: Duration = Duration::from_secs(60 * 60);
+const MAX_SYNC_HELLO_BYTES: usize = 4096;
 const MAINTENANCE_MARKER: &str = "x-rbe-maintenance";
 const BODY: &str =
     r#"{"ok":false,"status":"maintenance","message":"NOT AVAILABLE TRY AGAIN LATER"}"#;
@@ -42,9 +44,14 @@ pub struct MaintenanceNoticeProcess {
     port: u16,
 }
 
+struct CloudNodeRuntime {
+    authenticator: CloudNodeAuthenticator,
+    store: CloudNodeStore,
+}
+
 #[derive(Clone)]
 struct MaintenanceState {
-    cloud_node: Option<Arc<CloudNodeAuthenticator>>,
+    cloud_node: Option<Arc<CloudNodeRuntime>>,
 }
 
 impl MaintenanceNoticeProcess {
@@ -132,16 +139,17 @@ impl MaintenanceNoticeProcess {
 
 /// Entry point for `backend(.exe) --maintenance-notice`.
 pub async fn run(host: String, port: u16) -> anyhow::Result<()> {
-    let cloud_node = load_cloud_node_authenticator()?;
-    if let Some(authenticator) = &cloud_node {
+    let cloud_node = load_cloud_node_runtime()?;
+    if let Some(runtime) = &cloud_node {
         eprintln!(
-            "backend maintenance responder enabled Cloud Node boot authentication for {} trusted peer(s)",
-            authenticator.trusted_peer_count()
+            "backend maintenance responder enabled Cloud Node boot recovery for {} trusted peer(s)",
+            runtime.authenticator.trusted_peer_count()
         );
     }
     let state = Arc::new(MaintenanceState { cloud_node });
     let app = Router::new()
         .route(KNOCK_PATH, any(cloud_node_knock))
+        .route(SYNC_PATH, any(cloud_node_sync))
         .fallback(maintenance_response)
         .with_state(state);
 
@@ -188,24 +196,10 @@ async fn cloud_node_knock(
     if request.method() != Method::POST {
         return hidden_not_found();
     }
-    let Some(authenticator) = &state.cloud_node else {
+    let Some(runtime) = &state.cloud_node else {
         return hidden_not_found();
     };
-    let content_type_ok = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("application/octet-stream"));
-    if !content_type_ok {
-        return hidden_not_found();
-    }
-    if request
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_AUTH_PROOF_BYTES)
-    {
+    if !octet_stream_request(&request) || advertised_body_too_large(&request, MAX_AUTH_PROOF_BYTES) {
         return hidden_not_found();
     }
 
@@ -217,7 +211,7 @@ async fn cloud_node_knock(
         Ok(now_ms) => now_ms,
         Err(_) => return hidden_not_found(),
     };
-    let accepted = match authenticator.accept_knock(&body, now_ms) {
+    let accepted = match runtime.authenticator.accept_knock(&body, now_ms) {
         Ok(accepted) => accepted,
         Err(error) => {
             tracing::debug!(error = %error, "rejected hidden Cloud Node boot authentication");
@@ -225,16 +219,96 @@ async fn cloud_node_knock(
         }
     };
 
-    let mut response = Response::new(Body::from(accepted.response));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
+    octet_stream_response(accepted.response)
+}
+
+async fn cloud_node_sync(
+    State(state): State<Arc<MaintenanceState>>,
+    request: Request,
+) -> Response {
+    if request.method() != Method::POST {
+        return hidden_not_found();
+    }
+    let Some(runtime) = &state.cloud_node else {
+        return hidden_not_found();
+    };
+    if !octet_stream_request(&request) || advertised_body_too_large(&request, MAX_SYNC_HELLO_BYTES) {
+        return hidden_not_found();
+    }
+
+    let proof = match request
+        .headers()
+        .get(SESSION_PROOF_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) if value.len() <= MAX_AUTH_PROOF_BYTES.saturating_mul(2) => value,
+        _ => return hidden_not_found(),
+    };
+    let proof = match hex::decode(proof) {
+        Ok(proof) if proof.len() <= MAX_AUTH_PROOF_BYTES => proof,
+        _ => return hidden_not_found(),
+    };
+    let now_ms = match now_ms() {
+        Ok(now_ms) => now_ms,
+        Err(_) => return hidden_not_found(),
+    };
+    let session = match runtime.authenticator.authorize_session_proof(&proof, now_ms) {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::debug!(error = %error, "rejected hidden Cloud Node sync session proof");
+            return hidden_not_found();
+        }
+    };
+
+    let body = match axum::body::to_bytes(request.into_body(), MAX_SYNC_HELLO_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return hidden_not_found(),
+    };
+    let frame = match Frame::decode(&body) {
+        Ok(frame) => frame,
+        Err(error) => {
+            tracing::debug!(error = %error, "rejected malformed Cloud Node sync negotiation frame");
+            return hidden_not_found();
+        }
+    };
+    if frame.kind != FrameKind::SyncHello || frame.session != session.session {
+        return hidden_not_found();
+    }
+    let remote_header = match cloud_node::SyncPlanHeader::decode(&frame.payload) {
+        Ok(header) => header,
+        Err(error) => {
+            tracing::debug!(error = %error, "rejected malformed Cloud Node sync plan header");
+            return hidden_not_found();
+        }
+    };
+    let local_header = match runtime.store.sync_plan().and_then(|plan| plan.header()) {
+        Ok(header) => header,
+        Err(error) => {
+            tracing::error!(error = %error, "Cloud Node could not compute local recovery root");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+
+    tracing::info!(
+        peer = %session.node_id,
+        remote_root = %hex::encode(remote_header.root_sha256),
+        local_root = %hex::encode(local_header.root_sha256),
+        roots_match = remote_header.root_sha256 == local_header.root_sha256,
+        "authenticated Cloud Node sync negotiation completed"
     );
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
+
+    let response = Frame {
+        kind: FrameKind::SyncHello,
+        session: session.session,
+        payload: local_header.encode(),
+    };
+    match response.encode() {
+        Ok(encoded) => octet_stream_response(encoded),
+        Err(error) => {
+            tracing::error!(error = %error, "Cloud Node could not encode sync negotiation response");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
 }
 
 async fn maintenance_response() -> Response {
@@ -258,11 +332,41 @@ async fn maintenance_response() -> Response {
     response
 }
 
+fn octet_stream_response(body: Vec<u8>) -> Response {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn octet_stream_request(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/octet-stream"))
+}
+
+fn advertised_body_too_large(request: &Request, maximum: usize) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > maximum)
+}
+
 fn hidden_not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
-fn load_cloud_node_authenticator() -> anyhow::Result<Option<Arc<CloudNodeAuthenticator>>> {
+fn load_cloud_node_runtime() -> anyhow::Result<Option<Arc<CloudNodeRuntime>>> {
     let (path, explicit) = cloud_node_settings_path()?;
     if !path.is_file() {
         if explicit {
@@ -284,7 +388,11 @@ fn load_cloud_node_authenticator() -> anyhow::Result<Option<Arc<CloudNodeAuthent
         return Ok(None);
     }
     let authenticator = CloudNodeAuthenticator::from_env(&settings)?;
-    Ok(Some(Arc::new(authenticator)))
+    let store = CloudNodeStore::open(&settings)?;
+    Ok(Some(Arc::new(CloudNodeRuntime {
+        authenticator,
+        store,
+    })))
 }
 
 fn cloud_node_settings_path() -> anyhow::Result<(PathBuf, bool)> {

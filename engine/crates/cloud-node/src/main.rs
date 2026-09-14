@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cloud_node::{
-    load_signing_key_from_env, probe_upstream, public_key_hex, CloudNodeSettings, CloudNodeStore,
-    SETTINGS_FILE_NAME,
+    load_signing_key_from_env, negotiate_sync, probe_upstream, public_key_hex, CloudNodeSettings,
+    CloudNodeStore, SETTINGS_FILE_NAME,
 };
 
 #[tokio::main]
@@ -50,7 +50,15 @@ async fn run() -> anyhow::Result<()> {
             println!("authenticated={}", peer.node_id);
             println!("session={}", hex::encode(peer.session));
         }
-        "run" => run_daemon(&settings).await?,
+        "negotiate-sync" => {
+            let peer = probe_upstream(&settings).await?;
+            let negotiation = negotiate_sync(&settings, &store, &peer).await?;
+            println!("authenticated={}", peer.node_id);
+            println!("localRoot={}", hex::encode(negotiation.local.root_sha256));
+            println!("remoteRoot={}", hex::encode(negotiation.remote.root_sha256));
+            println!("rootsMatch={}", negotiation.roots_match());
+        }
+        "run" => run_daemon(&settings, &store).await?,
         "sync-plan" => {
             let plan = store.sync_plan()?;
             println!("root={}", plan.root_hex());
@@ -91,7 +99,7 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_daemon(settings: &CloudNodeSettings) -> anyhow::Result<()> {
+async fn run_daemon(settings: &CloudNodeSettings, store: &CloudNodeStore) -> anyhow::Result<()> {
     let upstream = settings
         .upstream
         .as_ref()
@@ -104,6 +112,27 @@ async fn run_daemon(settings: &CloudNodeSettings) -> anyhow::Result<()> {
                     peer.node_id,
                     hex::encode(peer.session)
                 );
+                if upstream.sync_on_connect {
+                    match negotiate_sync(settings, store, &peer).await {
+                        Ok(negotiation) => {
+                            println!(
+                                "Cloud Node sync roots local={} remote={} match={}",
+                                hex::encode(negotiation.local.root_sha256),
+                                hex::encode(negotiation.remote.root_sha256),
+                                negotiation.roots_match()
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("Cloud Node sync negotiation failed: {error}");
+                            if !upstream.auto_reconnect {
+                                return Err(error);
+                            }
+                            tokio::time::sleep(Duration::from_millis(upstream.reconnect_delay_ms))
+                                .await;
+                            continue;
+                        }
+                    }
+                }
                 if !upstream.auto_reconnect {
                     return Ok(());
                 }
@@ -149,6 +178,6 @@ fn default_config_path() -> PathBuf {
 
 fn print_help() {
     println!(
-        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
+        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
     );
 }

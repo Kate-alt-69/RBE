@@ -14,7 +14,10 @@ mod store;
 mod sync;
 
 pub use auth::{random_session_and_nonce, NodeProof, NodeProofKind, DEFAULT_AUTH_SKEW_MS};
-pub use client::{probe_upstream, AuthenticatedPeer, KNOCK_PATH};
+pub use client::{
+    negotiate_sync, probe_upstream, AuthenticatedPeer, SyncNegotiation, KNOCK_PATH,
+    SESSION_PROOF_HEADER, SYNC_PATH,
+};
 pub use config::{
     CloudNodeSettings, NodeMode, NodeSettings, ReplicationSettings, ReplicationTarget,
     UpstreamSettings, SETTINGS_FILE_NAME,
