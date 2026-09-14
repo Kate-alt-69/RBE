@@ -1,0 +1,50 @@
+name: One-shot Cloud Node boot auth lock
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-boot-auth-lock.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-cloud-node-boot-auth-lock
+  cancel-in-progress: false
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Generate lock, validate, and land
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          cd engine
+          cargo generate-lockfile
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          cd ..
+
+          rm -f .github/workflows/one-shot-cloud-node-boot-auth-lock.yml
+          git add engine/Cargo.lock .github/workflows/one-shot-cloud-node-boot-auth-lock.yml
+          git diff --cached --check
+          git commit -m 'chore: refresh lock for Cloud Node boot authentication'
+          git pull --rebase origin main
+          git push origin HEAD:main
