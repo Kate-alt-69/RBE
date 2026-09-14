@@ -27,7 +27,29 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           staging="$(git rev-parse HEAD)"
-          base="$(git rev-parse HEAD^1)"
+          base="babb2d260c266ce10f59cac3a1da21823fc7415f"
+
+          # The Service Manager has repeated call shapes that all need the
+          # same propagation change. Keep the strict single-replacement rule
+          # for boot/Mother code, but intentionally replace every matching
+          # Manager callsite.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/patches/svc-application-root.py')
+          text = path.read_text()
+          helper = '''def replace_many(path: str, old: str, new: str) -> None:\n    p = Path(path)\n    text = p.read_text()\n    count = text.count(old)\n    if count < 1:\n        raise SystemExit(f"{path}: expected at least one replacement, found {count}")\n    p.write_text(text.replace(old, new))\n\n'''
+          marker = '# backend service_boot.rs\n'
+          if marker not in text:
+              raise SystemExit('patch marker missing')
+          text = text.replace(marker, helper + marker, 1)
+          manager_marker = '# service-runtime manager.rs\n'
+          head, sep, tail = text.partition(manager_marker)
+          if not sep:
+              raise SystemExit('manager patch marker missing')
+          tail = tail.replace('replace_once(path,', 'replace_many(path,')
+          path.write_text(head + sep + tail)
+          PY
+
           python3 .github/patches/svc-application-root.py
 
           rm -f .github/workflows/one-shot-svc-application-root.yml
