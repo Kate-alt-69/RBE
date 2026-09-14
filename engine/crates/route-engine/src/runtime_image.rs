@@ -167,13 +167,12 @@ fn lower_container_grants(
         });
     }
     for (owner, operations) in storage_operations {
-        let target = storage_capability_target(&owner).ok_or_else(|| {
-            RuntimeCapabilityLoweringError {
+        let target =
+            storage_capability_target(&owner).ok_or_else(|| RuntimeCapabilityLoweringError {
                 message: format!(
                     "Storage capability principal {owner:?} cannot be lowered to an exact target"
                 ),
-            }
-        })?;
+            })?;
         grants.push(ContainerCapabilityGrant {
             kind: ContainerCapabilityKind::Storage,
             target,

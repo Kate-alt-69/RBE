@@ -13,67 +13,353 @@
     "VID": "Video Manager"
   },
   "entries": [
-    {"code":"SVC1000","status":"emitted","title":"Service directory scan failed","doc":"service.md#svc1000"},
-    {"code":"SVC1001","status":"emitted","title":"Service source could not be read","doc":"service.md#svc1001"},
-    {"code":"SVC1002","status":"emitted","title":"Missing :service declaration","doc":"service.md#svc1002"},
-    {"code":"SVC1003","status":"emitted","title":"Malformed Service declaration fields","doc":"service.md#svc1003"},
-    {"code":"SVC1004","status":"emitted","title":"Service name is required","doc":"service.md#svc1004"},
-    {"code":"SVC1005","status":"emitted","title":"Unsupported characters in service name","doc":"service.md#svc1005"},
-    {"code":"SVC1006","status":"emitted","title":"Duplicate service name","doc":"service.md#svc1006"},
-    {"code":"SVC1007","status":"emitted","title":"Invalid restart policy","doc":"service.md#svc1007"},
-    {"code":"SVC1008","status":"emitted","title":"Invalid numeric Service policy value","doc":"service.md#svc1008"},
-    {"code":"SVC1009","status":"emitted","title":"Unsupported Service instance count","doc":"service.md#svc1009"},
-    {"code":"SVC1010","status":"emitted","title":"Invalid Service mode","doc":"service.md#svc1010"},
-    {"code":"SVC1011","status":"emitted","title":"Invalid idle timeout for lazy Service mode","doc":"service.md#svc1011"},
-    {"code":"SVC2000","status":"emitted","title":"Executable Service REL validation failed","doc":"service.md#svc2000"},
-    {"code":"SVC5001","status":"assigned","title":"Service binary incompatible with backend","doc":"service.md#svc5001"},
-    {"code":"SVC5002","status":"assigned","title":"Service catalog changed after backend validation","doc":"service.md#svc5002"},
-    {"code":"SVC5003","status":"assigned","title":"Service compatibility probe failed","doc":"service.md#svc5003"},
-    {"code":"SVC5099","status":"assigned","title":"Unclassified Service Mother startup failure","doc":"service.md#svc5099"},
-    {"code":"SVC5100","status":"assigned","title":"Invalid Service control command","doc":"service.md#svc5100"},
-    {"code":"SVC5101","status":"assigned","title":"Service restart request could not be queued","doc":"service.md#svc5101"},
-    {"code":"SVC5102","status":"assigned","title":"Invalid internal Service executable mode","doc":"service.md#svc5102"},
-    {"code":"SVC5199","status":"assigned","title":"Unclassified Service worker startup failure","doc":"service.md#svc5199"},
-
-    {"code":"REL1001","status":"reserved","title":"Invalid token","doc":"rel.md#rel1001"},
-    {"code":"REL1002","status":"reserved","title":"Unterminated string or literal","doc":"rel.md#rel1002"},
-    {"code":"REL1101","status":"reserved","title":"Unexpected token","doc":"rel.md#rel1101"},
-    {"code":"REL1102","status":"reserved","title":"Missing delimiter or block terminator","doc":"rel.md#rel1102"},
-    {"code":"REL1201","status":"reserved","title":"Invalid REL directive","doc":"rel.md#rel1201"},
-    {"code":"REL2001","status":"reserved","title":"Unsupported language operation in source role","doc":"rel.md#rel2001"},
-    {"code":"REL3001","status":"reserved","title":"Unknown identifier at evaluation time","doc":"rel.md#rel3001"},
-    {"code":"REL3002","status":"reserved","title":"Function call argument mismatch","doc":"rel.md#rel3002"},
-    {"code":"REL9001","status":"reserved","title":"REL runtime invariant violated","doc":"rel.md#rel9001"},
-
-    {"code":"RELC1001","status":"reserved","title":"Duplicate source identity","doc":"relc.md#relc1001"},
-    {"code":"RELC1002","status":"reserved","title":"Unsupported or inconsistent source role","doc":"relc.md#relc1002"},
-    {"code":"RELC2001","status":"reserved","title":"Unresolved import or symbol","doc":"relc.md#relc2001"},
-    {"code":"RELC2002","status":"reserved","title":"Unsupported dependency cycle","doc":"relc.md#relc2002"},
-    {"code":"RELC2101","status":"reserved","title":"Capability not permitted for source role","doc":"relc.md#relc2101"},
-    {"code":"RELC2102","status":"reserved","title":"Invalid capability target or operation","doc":"relc.md#relc2102"},
-    {"code":"RELC3001","status":"reserved","title":"Native Container execution required but lowering failed","doc":"relc.md#relc3001"},
-    {"code":"RELC3101","status":"reserved","title":"Runtime Image identity could not be constructed","doc":"relc.md#relc3101"},
-    {"code":"RELC4001","status":"reserved","title":"Runtime Image activation rejected","doc":"relc.md#relc4001"},
-    {"code":"RELC9001","status":"reserved","title":"Compiler invariant violated","doc":"relc.md#relc9001"},
-    {"code":"RELC9002","status":"reserved","title":"Deterministic compiler output diverged","doc":"relc.md#relc9002"},
-
-    {"code":"CAP1001","status":"reserved","title":"Malformed capability manifest","doc":"container.md#cap1001"},
-    {"code":"CAP2001","status":"reserved","title":"Execution has no registered capability manifest","doc":"container.md#cap2001"},
-    {"code":"CAP2002","status":"reserved","title":"Capability execution provenance mismatch","doc":"container.md#cap2002"},
-    {"code":"CAP2003","status":"reserved","title":"Requested operation is not granted","doc":"container.md#cap2003"},
-    {"code":"CAP3001","status":"reserved","title":"Capability relay transport failed","doc":"container.md#cap3001"},
-    {"code":"CAP4001","status":"reserved","title":"Storage capability execution failed","doc":"container.md#cap4001"},
-    {"code":"CTR4001","status":"reserved","title":"Artifact quarantined after repeated crashes","doc":"container.md#ctr4001"},
-    {"code":"CTR9001","status":"reserved","title":"Controller ownership invariant violated","doc":"container.md#ctr9001"},
-    {"code":"CAP9001","status":"reserved","title":"Capability broker invariant violated","doc":"container.md#cap9001"},
-
-    {"code":"RBE5001","status":"reserved","title":"Required packaged dependency missing","doc":"runtime.md#rbe5001"},
-    {"code":"RBE9001","status":"reserved","title":"Backend control-plane invariant violated","doc":"runtime.md#rbe9001"},
-    {"code":"ER4001","status":"reserved","title":"Durable issue processing failed","doc":"runtime.md#er4001"},
-    {"code":"ER9001","status":"reserved","title":"Recovery-authority invariant violated","doc":"runtime.md#er9001"},
-    {"code":"VLT5001","status":"reserved","title":"No usable secret backend","doc":"runtime.md#vlt5001"},
-    {"code":"VLT9001","status":"reserved","title":"Vault authorization invariant violated","doc":"runtime.md#vlt9001"},
-    {"code":"VID5001","status":"reserved","title":"Required media tool/capability unavailable","doc":"runtime.md#vid5001"},
-    {"code":"VID9001","status":"reserved","title":"Video Manager state-machine invariant violated","doc":"runtime.md#vid9001"}
+    {
+      "code": "SVC1000",
+      "status": "emitted",
+      "title": "Service directory scan failed",
+      "doc": "service.md#svc1000"
+    },
+    {
+      "code": "SVC1001",
+      "status": "emitted",
+      "title": "Service source could not be read",
+      "doc": "service.md#svc1001"
+    },
+    {
+      "code": "SVC1002",
+      "status": "emitted",
+      "title": "Missing :service declaration",
+      "doc": "service.md#svc1002"
+    },
+    {
+      "code": "SVC1003",
+      "status": "emitted",
+      "title": "Malformed Service declaration fields",
+      "doc": "service.md#svc1003"
+    },
+    {
+      "code": "SVC1004",
+      "status": "emitted",
+      "title": "Service name is required",
+      "doc": "service.md#svc1004"
+    },
+    {
+      "code": "SVC1005",
+      "status": "emitted",
+      "title": "Unsupported characters in service name",
+      "doc": "service.md#svc1005"
+    },
+    {
+      "code": "SVC1006",
+      "status": "emitted",
+      "title": "Duplicate service name",
+      "doc": "service.md#svc1006"
+    },
+    {
+      "code": "SVC1007",
+      "status": "emitted",
+      "title": "Invalid restart policy",
+      "doc": "service.md#svc1007"
+    },
+    {
+      "code": "SVC1008",
+      "status": "emitted",
+      "title": "Invalid numeric Service policy value",
+      "doc": "service.md#svc1008"
+    },
+    {
+      "code": "SVC1009",
+      "status": "emitted",
+      "title": "Unsupported Service instance count",
+      "doc": "service.md#svc1009"
+    },
+    {
+      "code": "SVC1010",
+      "status": "emitted",
+      "title": "Invalid Service mode",
+      "doc": "service.md#svc1010"
+    },
+    {
+      "code": "SVC1011",
+      "status": "emitted",
+      "title": "Invalid idle timeout for lazy Service mode",
+      "doc": "service.md#svc1011"
+    },
+    {
+      "code": "SVC2000",
+      "status": "emitted",
+      "title": "Executable Service REL validation failed",
+      "doc": "service.md#svc2000"
+    },
+    {
+      "code": "SVC5001",
+      "status": "emitted",
+      "title": "Service binary incompatible with backend",
+      "doc": "service.md#svc5001"
+    },
+    {
+      "code": "SVC5002",
+      "status": "emitted",
+      "title": "Service catalog changed after backend validation",
+      "doc": "service.md#svc5002"
+    },
+    {
+      "code": "SVC5003",
+      "status": "emitted",
+      "title": "Service compatibility probe failed",
+      "doc": "service.md#svc5003"
+    },
+    {
+      "code": "SVC5099",
+      "status": "emitted",
+      "title": "Unclassified Service Mother startup failure",
+      "doc": "service.md#svc5099"
+    },
+    {
+      "code": "SVC5100",
+      "status": "emitted",
+      "title": "Invalid Service control command",
+      "doc": "service.md#svc5100"
+    },
+    {
+      "code": "SVC5101",
+      "status": "emitted",
+      "title": "Service restart request could not be queued",
+      "doc": "service.md#svc5101"
+    },
+    {
+      "code": "SVC5102",
+      "status": "emitted",
+      "title": "Invalid internal Service executable mode",
+      "doc": "service.md#svc5102"
+    },
+    {
+      "code": "SVC5199",
+      "status": "emitted",
+      "title": "Unclassified Service worker startup failure",
+      "doc": "service.md#svc5199"
+    },
+    {
+      "code": "REL1001",
+      "status": "reserved",
+      "title": "Invalid token",
+      "doc": "rel.md#rel1001"
+    },
+    {
+      "code": "REL1002",
+      "status": "reserved",
+      "title": "Unterminated string or literal",
+      "doc": "rel.md#rel1002"
+    },
+    {
+      "code": "REL1101",
+      "status": "reserved",
+      "title": "Unexpected token",
+      "doc": "rel.md#rel1101"
+    },
+    {
+      "code": "REL1102",
+      "status": "reserved",
+      "title": "Missing delimiter or block terminator",
+      "doc": "rel.md#rel1102"
+    },
+    {
+      "code": "REL1201",
+      "status": "reserved",
+      "title": "Invalid REL directive",
+      "doc": "rel.md#rel1201"
+    },
+    {
+      "code": "REL2001",
+      "status": "reserved",
+      "title": "Unsupported language operation in source role",
+      "doc": "rel.md#rel2001"
+    },
+    {
+      "code": "REL3001",
+      "status": "reserved",
+      "title": "Unknown identifier at evaluation time",
+      "doc": "rel.md#rel3001"
+    },
+    {
+      "code": "REL3002",
+      "status": "reserved",
+      "title": "Function call argument mismatch",
+      "doc": "rel.md#rel3002"
+    },
+    {
+      "code": "REL9001",
+      "status": "reserved",
+      "title": "REL runtime invariant violated",
+      "doc": "rel.md#rel9001"
+    },
+    {
+      "code": "RELC1001",
+      "status": "reserved",
+      "title": "Duplicate source identity",
+      "doc": "relc.md#relc1001"
+    },
+    {
+      "code": "RELC1002",
+      "status": "reserved",
+      "title": "Unsupported or inconsistent source role",
+      "doc": "relc.md#relc1002"
+    },
+    {
+      "code": "RELC2001",
+      "status": "reserved",
+      "title": "Unresolved import or symbol",
+      "doc": "relc.md#relc2001"
+    },
+    {
+      "code": "RELC2002",
+      "status": "reserved",
+      "title": "Unsupported dependency cycle",
+      "doc": "relc.md#relc2002"
+    },
+    {
+      "code": "RELC2101",
+      "status": "reserved",
+      "title": "Capability not permitted for source role",
+      "doc": "relc.md#relc2101"
+    },
+    {
+      "code": "RELC2102",
+      "status": "reserved",
+      "title": "Invalid capability target or operation",
+      "doc": "relc.md#relc2102"
+    },
+    {
+      "code": "RELC3001",
+      "status": "reserved",
+      "title": "Native Container execution required but lowering failed",
+      "doc": "relc.md#relc3001"
+    },
+    {
+      "code": "RELC3101",
+      "status": "reserved",
+      "title": "Runtime Image identity could not be constructed",
+      "doc": "relc.md#relc3101"
+    },
+    {
+      "code": "RELC4001",
+      "status": "reserved",
+      "title": "Runtime Image activation rejected",
+      "doc": "relc.md#relc4001"
+    },
+    {
+      "code": "RELC9001",
+      "status": "reserved",
+      "title": "Compiler invariant violated",
+      "doc": "relc.md#relc9001"
+    },
+    {
+      "code": "RELC9002",
+      "status": "reserved",
+      "title": "Deterministic compiler output diverged",
+      "doc": "relc.md#relc9002"
+    },
+    {
+      "code": "CAP1001",
+      "status": "reserved",
+      "title": "Malformed capability manifest",
+      "doc": "container.md#cap1001"
+    },
+    {
+      "code": "CAP2001",
+      "status": "reserved",
+      "title": "Execution has no registered capability manifest",
+      "doc": "container.md#cap2001"
+    },
+    {
+      "code": "CAP2002",
+      "status": "reserved",
+      "title": "Capability execution provenance mismatch",
+      "doc": "container.md#cap2002"
+    },
+    {
+      "code": "CAP2003",
+      "status": "reserved",
+      "title": "Requested operation is not granted",
+      "doc": "container.md#cap2003"
+    },
+    {
+      "code": "CAP3001",
+      "status": "reserved",
+      "title": "Capability relay transport failed",
+      "doc": "container.md#cap3001"
+    },
+    {
+      "code": "CAP4001",
+      "status": "reserved",
+      "title": "Storage capability execution failed",
+      "doc": "container.md#cap4001"
+    },
+    {
+      "code": "CTR4001",
+      "status": "reserved",
+      "title": "Artifact quarantined after repeated crashes",
+      "doc": "container.md#ctr4001"
+    },
+    {
+      "code": "CTR9001",
+      "status": "reserved",
+      "title": "Controller ownership invariant violated",
+      "doc": "container.md#ctr9001"
+    },
+    {
+      "code": "CAP9001",
+      "status": "reserved",
+      "title": "Capability broker invariant violated",
+      "doc": "container.md#cap9001"
+    },
+    {
+      "code": "RBE5001",
+      "status": "reserved",
+      "title": "Required packaged dependency missing",
+      "doc": "runtime.md#rbe5001"
+    },
+    {
+      "code": "RBE9001",
+      "status": "reserved",
+      "title": "Backend control-plane invariant violated",
+      "doc": "runtime.md#rbe9001"
+    },
+    {
+      "code": "ER4001",
+      "status": "reserved",
+      "title": "Durable issue processing failed",
+      "doc": "runtime.md#er4001"
+    },
+    {
+      "code": "ER9001",
+      "status": "reserved",
+      "title": "Recovery-authority invariant violated",
+      "doc": "runtime.md#er9001"
+    },
+    {
+      "code": "VLT5001",
+      "status": "reserved",
+      "title": "No usable secret backend",
+      "doc": "runtime.md#vlt5001"
+    },
+    {
+      "code": "VLT9001",
+      "status": "reserved",
+      "title": "Vault authorization invariant violated",
+      "doc": "runtime.md#vlt9001"
+    },
+    {
+      "code": "VID5001",
+      "status": "reserved",
+      "title": "Required media tool/capability unavailable",
+      "doc": "runtime.md#vid5001"
+    },
+    {
+      "code": "VID9001",
+      "status": "reserved",
+      "title": "Video Manager state-machine invariant violated",
+      "doc": "runtime.md#vid9001"
+    }
   ]
 }

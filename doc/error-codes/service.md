@@ -135,7 +135,7 @@ The diagnostic includes the file and source location from the underlying REL par
 <a id="svc5001"></a>
 ### SVC5001 — Service binary is incompatible with this backend
 
-**Status:** Assigned to the current Service compatibility work.
+**Status:** Emitted.
 
 The standalone Service binary is missing, fails its build-time integrity binding, or successfully answered the compatibility probe but proved it was built for a different runtime/build/target/ABI.
 
@@ -163,7 +163,7 @@ SVC5001 Service binary is not compatible with the current backend.
 <a id="svc5002"></a>
 ### SVC5002 — Service catalog changed after backend validation
 
-**Status:** Assigned to the current Service compatibility work.
+**Status:** Emitted.
 
 Backend and a compatible Service Mother compiled different deterministic Service catalog fingerprints.
 
@@ -176,7 +176,7 @@ The catalog fingerprint covers Service policy/defaults plus each Service's logic
 <a id="svc5003"></a>
 ### SVC5003 — Service compatibility probe failed
 
-**Status:** Assigned to the current Service compatibility work.
+**Status:** Emitted.
 
 The configured `service(.exe)` could not execute the bounded compatibility probe, timed out, returned malformed/oversized output, or does not understand the protocol.
 
@@ -187,7 +187,7 @@ This is distinct from SVC5001: SVC5003 means Backend could not obtain a trustwor
 <a id="svc5099"></a>
 ### SVC5099 — Service Mother startup failed with an unclassified error
 
-**Status:** Assigned.
+**Status:** Emitted.
 
 The Service Mother failed during startup, but the underlying error has not yet been migrated to a more specific `SVCxxxx` diagnostic.
 
@@ -198,7 +198,7 @@ This is a fallback envelope, not a replacement for specific diagnostics. If the 
 <a id="svc5100"></a>
 ### SVC5100 — invalid Service control command
 
-**Status:** Assigned.
+**Status:** Emitted.
 
 `service(.exe)` received a malformed/unsupported operator control command.
 
@@ -207,7 +207,7 @@ This is a fallback envelope, not a replacement for specific diagnostics. If the 
 <a id="svc5101"></a>
 ### SVC5101 — Service restart request could not be queued
 
-**Status:** Assigned.
+**Status:** Emitted.
 
 The control command was valid, but RBE could not persist/queue the restart request for the Service Mother.
 
@@ -218,7 +218,7 @@ The control command was valid, but RBE could not persist/queue the restart reque
 <a id="svc5102"></a>
 ### SVC5102 — invalid internal Service executable mode
 
-**Status:** Assigned.
+**Status:** Emitted.
 
 `service(.exe)` was started without exactly one internal Mother/worker role.
 
@@ -227,7 +227,7 @@ The control command was valid, but RBE could not persist/queue the restart reque
 <a id="svc5199"></a>
 ### SVC5199 — Service worker startup failed with an unclassified error
 
-**Status:** Assigned.
+**Status:** Emitted.
 
 A Service worker failed during startup, but the underlying error has not yet been migrated to a more specific Service diagnostic.
 

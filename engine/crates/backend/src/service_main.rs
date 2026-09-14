@@ -12,6 +12,11 @@ mod service_control;
 #[allow(dead_code, clippy::too_many_arguments)]
 mod service_mother;
 
+#[allow(dead_code)]
+mod service_integrity {
+    include!(concat!(env!("OUT_DIR"), "/service_integrity.rs"));
+}
+
 // er_recovery is shared source with backend for now, but service.exe only needs
 // the already-issued in-memory CONTROL key type. Keeping this tiny shim here
 // prevents Linux HostBootstrap/keyring/package-manager code from entering the
@@ -59,6 +64,60 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
+fn emit_service_compat_probe() -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let probe = service_runtime::ServiceCompatibilityProbe {
+        protocol: service_runtime::SERVICE_COMPAT_PROTOCOL.to_string(),
+        service_runtime_abi: service_runtime::SERVICE_RUNTIME_ABI_VERSION,
+        catalog_fingerprint_abi: service_runtime::SERVICE_CATALOG_FINGERPRINT_ABI_VERSION,
+        package_version: env!("CARGO_PKG_VERSION").to_string(),
+        build_id: service_integrity::SERVICE_BUILD_ID.to_string(),
+        target: service_integrity::SERVICE_TARGET.to_string(),
+    };
+    let payload = serde_json::to_vec(&probe)?;
+    if payload.len() > service_runtime::SERVICE_COMPAT_PROBE_MAX_BYTES {
+        anyhow::bail!("Service compatibility probe exceeded its protocol bound");
+    }
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&payload)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn init_service_logging(args: &[String]) {
+    let settings_path = flag_value(args, "--settings").or_else(|| {
+        std::env::var_os("RBE_TRUSTED_SETTINGS_PATH")
+            .map(|value| value.to_string_lossy().into_owned())
+    });
+    let logging_config = settings_path
+        .as_deref()
+        .and_then(|path| config::Config::load(path).ok())
+        .map(|config| config.logging)
+        .unwrap_or_default();
+    if let Err(error) = logging::terminal::init(&logging_config) {
+        eprintln!("failed to initialize Service logging: {error:#}");
+    }
+}
+
+fn known_service_diagnostic(error: &anyhow::Error) -> bool {
+    format!("{error:#}")
+        .lines()
+        .any(|line| line.trim_start().starts_with("SVC"))
+}
+
+fn render_fatal(code: &str, headline: &str, error: &anyhow::Error) -> String {
+    let details = format!("{error:#}");
+    if known_service_diagnostic(error) {
+        details
+    } else {
+        format!(
+            "{code} {headline}\n\n  reason:\n    {details}\n\n  action:\n    Review the reason above. If generated runtime files are stale, rebuild the complete RBE package."
+        )
+    }
+}
+
 fn process_label(args: &[String]) -> String {
     if args.iter().any(|arg| arg == "--service-mother") {
         return "service - mother".into();
@@ -83,12 +142,24 @@ fn process_label(args: &[String]) -> String {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    if args.iter().any(|arg| arg == "--service-compat-probe") {
+        if let Err(error) = emit_service_compat_probe() {
+            eprintln!("service compatibility probe failed: {error:#}");
+            std::process::exit(3);
+        }
+        return;
+    }
+
+    init_service_logging(&args);
+
     match service_control::command_from_args(&args) {
         Ok(Some(command)) => {
             match service_control::submit(&command) {
                 Ok(path) => println!("Service restart request queued: {}", path.display()),
                 Err(error) => {
-                    eprintln!("failed to queue Service restart request: {error:#}");
+                    logging::Logger::new("SERVICE").child("CONTROL").fatal(format!(
+                        "SVC5101 Service restart request could not be queued.\n\n  reason:\n    {error:#}\n\n  action:\n    Verify the runtime data directory is writable and retry the request."
+                    ));
                     std::process::exit(1);
                 }
             }
@@ -96,7 +167,9 @@ async fn main() {
         }
         Ok(None) => {}
         Err(error) => {
-            eprintln!("invalid Service restart command: {error:#}");
+            logging::Logger::new("SERVICE").child("CONTROL").fatal(format!(
+                "SVC5100 Invalid Service control command.\n\n  reason:\n    {error:#}\n\n  action:\n    Check the command syntax and retry."
+            ));
             std::process::exit(2);
         }
     }
@@ -104,7 +177,9 @@ async fn main() {
     let mother = args.iter().any(|arg| arg == "--service-mother");
     let worker = args.iter().any(|arg| arg == "--service-host");
     if mother == worker {
-        eprintln!("service executable requires exactly one internal Mother or worker mode");
+        logging::Logger::new("SERVICE").fatal(
+            "SVC5102 Service executable requires exactly one internal Mother or worker mode.\n\n  action:\n    Launch service.exe through backend.exe; these modes are internal runtime contracts.",
+        );
         std::process::exit(2);
     }
 
@@ -116,9 +191,21 @@ async fn main() {
     };
     if let Err(error) = result {
         if mother {
-            eprintln!("fatal Service Mother error: {error:#}");
+            logging::Logger::new("SERVICE")
+                .child("MOTHER")
+                .fatal(render_fatal(
+                    "SVC5099",
+                    "Service Mother failed to start.",
+                    &error,
+                ));
         } else {
-            eprintln!("fatal service worker error: {error:#}");
+            logging::Logger::new("SERVICE")
+                .child("WORKER")
+                .fatal(render_fatal(
+                    "SVC5199",
+                    "Service worker failed to start.",
+                    &error,
+                ));
         }
         std::process::exit(1);
     }

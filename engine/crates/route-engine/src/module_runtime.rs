@@ -467,7 +467,10 @@ fn module_owner(module_dir: &Path, path: &Path) -> String {
 /// RELC uses this exact function so propagated host authority has the same
 /// owner identity that ModuleExecutor supplies to VideoLanguage at runtime.
 pub(crate) fn module_owner_from_logical_name(logical_name: &str) -> String {
-    let parts = logical_name.split('/').map(encode_owner_segment).collect::<Vec<_>>();
+    let parts = logical_name
+        .split('/')
+        .map(encode_owner_segment)
+        .collect::<Vec<_>>();
     canonical_module_owner_parts(parts)
 }
 

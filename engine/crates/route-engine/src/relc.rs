@@ -24,8 +24,8 @@ use crate::parser::{ParseError, Parser};
 use crate::runtime_env::{RuntimeEnv, RuntimeEnvError};
 use crate::runtime_image::{
     stable_image_hash, stable_source_hash, storage_capability_operation_allowed,
-    storage_capability_owner_allowed, RuntimeCapabilityRequirement, RuntimeExecutable, RuntimeImage,
-    RuntimeSourceManifest, STORAGE_CAPABILITY_OPERATIONS,
+    storage_capability_owner_allowed, RuntimeCapabilityRequirement, RuntimeExecutable,
+    RuntimeImage, RuntimeSourceManifest, STORAGE_CAPABILITY_OPERATIONS,
 };
 use crate::server_policy::{ServerPolicy, ServerPolicyError};
 use crate::server_rel::{compile_server_source, ServerCompileError, ServerProgram};
@@ -890,11 +890,15 @@ fn builtin_host_requirements(
                 operation: operation.to_string(),
             },
             "storage" => RuntimeCapabilityRequirement::Storage {
-                owner: module_owner.expect("Storage owner validated above").to_string(),
+                owner: module_owner
+                    .expect("Storage owner validated above")
+                    .to_string(),
                 operation: operation.to_string(),
             },
             _ => RuntimeCapabilityRequirement::Video {
-                owner: module_owner.expect("Video owner validated above").to_string(),
+                owner: module_owner
+                    .expect("Video owner validated above")
+                    .to_string(),
                 operation: operation.to_string(),
             },
         })
@@ -1024,10 +1028,13 @@ fn capability_requirements(
         {
             continue;
         }
-        let source_record = registry
-            .get(source)
-            .ok_or_else(|| RelcError::Link(format!("compiled source {source} is not registered")))?;
-        if !matches!(source_record.kind(), RelSourceKind::Module | RelSourceKind::Route) {
+        let source_record = registry.get(source).ok_or_else(|| {
+            RelcError::Link(format!("compiled source {source} is not registered"))
+        })?;
+        if !matches!(
+            source_record.kind(),
+            RelSourceKind::Module | RelSourceKind::Route
+        ) {
             return Err(RelcError::Capability {
                 source: source.clone(),
                 message: "Environment Storage authority may propagate through Module REL only into a Route that executes inside Container"

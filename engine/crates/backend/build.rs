@@ -21,6 +21,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_BIN_PATH");
     println!("cargo:rerun-if-env-changed=RBE_SERVICE_BIN_PATH");
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_SIGNING_PRIVATE_KEY");
+    println!("cargo:rerun-if-env-changed=RBE_BUILD_ID");
     println!("cargo:rerun-if-env-changed=RBE_BUILD_TRACE");
 
     let out_dir =
@@ -35,6 +36,9 @@ fn main() {
         .map(PathBuf::from);
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
     let build_id = build_id();
+    if build_id.chars().any(char::is_control) {
+        panic!("backend/build.rs: RBE build ID contains control characters");
+    }
 
     let (expected_hash, public_key, signature) = match source {
         Some(path) if path.is_file() => {
@@ -105,8 +109,11 @@ fn main() {
         }
         None => String::new(),
     };
-    let service_literal =
-        format!("pub const EXPECTED_SERVICE_SHA256: &str = \"{expected_service_hash}\";\n");
+    let service_literal = format!(
+        "pub const EXPECTED_SERVICE_SHA256: &str = {expected_service_hash:?};\n\
+         pub const SERVICE_BUILD_ID: &str = {build_id:?};\n\
+         pub const SERVICE_TARGET: &str = {target:?};\n"
+    );
     fs::write(&service_integrity_dest, service_literal).unwrap_or_else(|err| {
         panic!("backend/build.rs: failed to write generated service integrity source: {err}")
     });

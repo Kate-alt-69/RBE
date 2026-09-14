@@ -22,6 +22,24 @@ pub(crate) const SERVICE_IPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SERVICE_IPC_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const SERVICE_IPC_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// Parent/service compatibility protocol. This is deliberately separate from
+/// REL syntax versions: it describes process ABI and catalog identity only.
+pub const SERVICE_COMPAT_PROTOCOL: &str = "RBE-SERVICE-COMPAT/1";
+pub const SERVICE_RUNTIME_ABI_VERSION: u32 = 1;
+pub const SERVICE_CATALOG_FINGERPRINT_ABI_VERSION: u32 = 1;
+pub const SERVICE_COMPAT_PROBE_MAX_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceCompatibilityProbe {
+    pub protocol: String,
+    pub service_runtime_abi: u32,
+    pub catalog_fingerprint_abi: u32,
+    pub package_version: String,
+    pub build_id: String,
+    pub target: String,
+}
+
 /// Container-visible Service targets are logical catalog names only. The
 /// prefix makes them unambiguous from every other capability kind/namespace.
 pub const SERVICE_CAPABILITY_TARGET_PREFIX: &str = "service:";
