@@ -13,6 +13,7 @@
 
 mod cache;
 mod control_plane;
+mod debug_replay;
 mod environment;
 mod execution;
 mod runtime;
@@ -23,6 +24,13 @@ mod worker;
 
 pub use cache::{artifact_sha256_matches, ArtifactCache, ExecutionProfile};
 pub use control_plane::{AuthorizedCapability, CapabilityBroker, CapabilityCall, CapabilityError};
+pub use debug_replay::{
+    DebugReplayCapabilityEvent, DebugReplayCapabilityResult, DebugReplayError, DebugReplayRecorder,
+    DebugReplayStore, DebugReplayTerminal, DebugReplayTrace, DEBUG_REPLAY_TRACE_VERSION,
+    MAX_DEBUG_REPLAY_ERROR_BYTES, MAX_DEBUG_REPLAY_EVENTS, MAX_DEBUG_REPLAY_FILES,
+    MAX_DEBUG_REPLAY_INPUT_BYTES, MAX_DEBUG_REPLAY_RESULT_BYTES,
+    MAX_DEBUG_REPLAY_TOTAL_RESULT_BYTES, MAX_DEBUG_REPLAY_TRACE_BYTES,
+};
 pub use environment::EnvironmentSnapshot;
 pub use execution::{
     ExecutionId, ExecutionOutcome, ExecutionProvenance, ExecutionRecord, ExecutionState,
