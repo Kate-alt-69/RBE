@@ -31,7 +31,7 @@ use tokio::process::{Child, ChildStdin, Command};
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HELPER_LIFETIME: Duration = Duration::from_secs(60 * 60);
-const MAINTENANCE_MARKER: &str = "X-RBE-Maintenance";
+const MAINTENANCE_MARKER: &str = "x-rbe-maintenance";
 const BODY: &str =
     r#"{"ok":false,"status":"maintenance","message":"NOT AVAILABLE TRY AGAIN LATER"}"#;
 
@@ -348,5 +348,7 @@ async fn probe(host: &str, port: u16) -> anyhow::Result<bool> {
     let read = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut response))
         .await
         .map_err(|_| anyhow::anyhow!("maintenance readiness response timed out"))??;
-    Ok(String::from_utf8_lossy(&response[..read]).contains("X-RBE-Maintenance: 1"))
+    Ok(String::from_utf8_lossy(&response[..read])
+        .to_ascii_lowercase()
+        .contains("x-rbe-maintenance: 1"))
 }
