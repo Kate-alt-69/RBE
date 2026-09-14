@@ -31,10 +31,50 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Fix the Clippy-only blocker found by the previous validation pass,
-          # then apply the already-staged boot admission patch.
           sed -i 's/let mut chunk = Self {/let chunk = Self {/' engine/crates/cloud-node/src/transfer.rs
           python3 .github/patches/cloud-node-boot-gate.py
+
+          # The required gate expects exactly one completion control message;
+          # make that explicit instead of presenting it as a never-looping loop.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('engine/crates/backend/src/maintenance_notice.rs')
+          text = p.read_text()
+          old = '''        let deadline = tokio::time::Instant::now() + timeout;
+                  loop {
+                      let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                      if remaining.is_zero() {
+                          anyhow::bail!("required Cloud Node boot recovery timed out");
+                      }
+                      let line = self.read_control_line(remaining).await?;
+                      if let Some(root) = line.strip_prefix(CONTROL_COMPLETE_PREFIX) {
+                          if root.len() != 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                              anyhow::bail!(
+                                  "maintenance responder returned an invalid Cloud Node recovery root"
+                              );
+                          }
+                          tracing::info!(root = %root, "required Cloud Node boot recovery completed");
+                          return Ok(());
+                      }
+                      anyhow::bail!("maintenance responder returned unexpected control message {line:?}");
+                  }
+          '''
+          new = '''        let line = self.read_control_line(timeout).await?;
+                  let Some(root) = line.strip_prefix(CONTROL_COMPLETE_PREFIX) else {
+                      anyhow::bail!("maintenance responder returned unexpected control message {line:?}");
+                  };
+                  if root.len() != 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                      anyhow::bail!(
+                          "maintenance responder returned an invalid Cloud Node recovery root"
+                      );
+                  }
+                  tracing::info!(root = %root, "required Cloud Node boot recovery completed");
+                  Ok(())
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('boot recovery wait block anchor changed')
+          p.write_text(text.replace(old, new, 1))
+          PY
 
           cd engine
           cargo generate-lockfile
