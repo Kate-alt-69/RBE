@@ -59,6 +59,7 @@ For a configured storage root `<ROOT>` Cloud Node owns:
     └── <same-object-sha256>/
         ├── original/                         # first exact object, preserved
         ├── latest/                           # latest exact object
+        ├── versions/<content-sha256>/...     # actual rolling revision payloads
         └── history.blob.cn                   # binary rolling history, default 5
 ```
 
