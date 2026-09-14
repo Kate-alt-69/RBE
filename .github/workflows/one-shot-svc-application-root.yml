@@ -27,7 +27,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           staging="$(git rev-parse HEAD)"
-          base="babb2d260c266ce10f59cac3a1da21823fc7415f"
+          base="11e729b2acc49a25247055d15da47c37bd44f5a8"
 
           python3 - <<'PY'
           from pathlib import Path
@@ -268,6 +268,7 @@ jobs:
 
           rm -f .github/workflows/one-shot-svc-application-root.yml
           rm -f .github/patches/svc-application-root.py
+          rm -f .ci-service-repair-guard
 
           cd engine
           cargo fmt --all
