@@ -97,7 +97,7 @@ impl ProviderClient {
                     .await?
             }
             ProviderKind::Supabase => {
-                let url = self.supabase_url(&key)?;
+                let url = self.supabase_url(&key, true)?;
                 self.apply_supabase_auth(self.client.get(url))?
                     .send()
                     .await?
@@ -140,7 +140,7 @@ impl ProviderClient {
                     .await?
             }
             ProviderKind::Supabase => {
-                let url = self.supabase_url(&key)?;
+                let url = self.supabase_url(&key, false)?;
                 self.apply_supabase_auth(
                     self.client
                         .put(url)
@@ -314,16 +314,21 @@ impl ProviderClient {
         add_header(request, header_name, &value)
     }
 
-    fn supabase_url(&self, key: &str) -> anyhow::Result<Url> {
+    fn supabase_url(&self, key: &str, authenticated_read: bool) -> anyhow::Result<Url> {
         let endpoint = self
             .settings
             .endpoint
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("supabase provider endpoint is missing"))?;
+        let route = if authenticated_read {
+            "storage/v1/object/authenticated"
+        } else {
+            "storage/v1/object"
+        };
         object_url(
             endpoint,
             &format!(
-                "storage/v1/object/{}/{}",
+                "{route}/{}/{}",
                 encode_path_segment(&self.settings.bucket),
                 encode_object_key(key)
             ),
@@ -679,6 +684,32 @@ mod tests {
         assert_eq!(
             client.object_key("history/head.json").unwrap(),
             "tenant-a/rbe-cn/production/history/head.json"
+        );
+    }
+
+    #[test]
+    fn supabase_uses_authenticated_read_route() {
+        let settings: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"supabase",
+            "namespace":"production",
+            "bucket":"private-backups",
+            "endpoint":"https://example.supabase.co"
+        }))
+        .unwrap();
+        let client = ProviderClient::new(&settings).unwrap();
+        assert_eq!(
+            client
+                .supabase_url("history/HEAD.json", true)
+                .unwrap()
+                .path(),
+            "/storage/v1/object/authenticated/private-backups/history/HEAD.json"
+        );
+        assert_eq!(
+            client
+                .supabase_url("history/HEAD.json", false)
+                .unwrap()
+                .path(),
+            "/storage/v1/object/private-backups/history/HEAD.json"
         );
     }
 

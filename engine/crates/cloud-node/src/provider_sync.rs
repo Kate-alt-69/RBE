@@ -258,9 +258,27 @@ pub async fn provider_status(
     let plan = store.sync_plan()?;
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
+    let remote = remote_head(&client).await?;
+    if history.head()?.is_none() {
+        if let Some(remote_head) = remote.as_ref() {
+            let relation = if remote_head.snapshot_root == local_root {
+                ProviderSyncRelation::InSync
+            } else if plan.object_count() == 0 {
+                ProviderSyncRelation::RemoteAhead
+            } else {
+                ProviderSyncRelation::Diverged
+            };
+            return Ok(ProviderSyncStatus {
+                relation,
+                local_head: "<untracked>".to_owned(),
+                remote_head: Some(remote_head.id.clone()),
+                local_root,
+                remote_root: Some(remote_head.snapshot_root.clone()),
+            });
+        }
+    }
     let local_head = history.ensure_snapshot_commit(&settings.node.id, &local_root)?;
-    let remote_head = remote_head(&client).await?;
-    status_from_heads(&history, &client, local_head, remote_head, local_root).await
+    status_from_heads(&history, &client, local_head, remote, local_root).await
 }
 
 pub async fn synchronize_provider(
@@ -275,8 +293,46 @@ pub async fn synchronize_provider(
     let plan = store.sync_plan()?;
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
-    let local_head = history.ensure_snapshot_commit(&settings.node.id, &local_root)?;
     let remote = remote_head(&client).await?;
+
+    if history.head()?.is_none() {
+        if let Some(remote_head) = remote.as_ref() {
+            if remote_head.snapshot_root == local_root {
+                import_remote_history(&history, &client, remote_head).await?;
+                let before = ProviderSyncStatus {
+                    relation: ProviderSyncRelation::InSync,
+                    local_head: remote_head.id.clone(),
+                    remote_head: Some(remote_head.id.clone()),
+                    local_root: local_root.clone(),
+                    remote_root: Some(remote_head.snapshot_root.clone()),
+                };
+                return Ok(ProviderSyncResult {
+                    action: ProviderSyncAction::None,
+                    final_root: local_root,
+                    final_head: remote_head.id.clone(),
+                    before,
+                });
+            }
+            if plan.object_count() == 0 {
+                let before = ProviderSyncStatus {
+                    relation: ProviderSyncRelation::RemoteAhead,
+                    local_head: "<untracked>".to_owned(),
+                    remote_head: Some(remote_head.id.clone()),
+                    local_root,
+                    remote_root: Some(remote_head.snapshot_root.clone()),
+                };
+                pull_provider_state(&client, &history, store, remote_head).await?;
+                return Ok(ProviderSyncResult {
+                    action: ProviderSyncAction::Pull,
+                    final_root: remote_head.snapshot_root.clone(),
+                    final_head: remote_head.id.clone(),
+                    before,
+                });
+            }
+        }
+    }
+
+    let local_head = history.ensure_snapshot_commit(&settings.node.id, &local_root)?;
     let before = status_from_heads(
         &history,
         &client,
@@ -397,13 +453,20 @@ async fn pull_provider_state(
     store: &CloudNodeStore,
     remote_head: &HistoryCommit,
 ) -> anyhow::Result<()> {
-    let missing = remote_chain_until_local(history, client, remote_head).await?;
     restore_snapshot(client, store, &remote_head.snapshot_root).await?;
+    import_remote_history(history, client, remote_head).await
+}
+
+async fn import_remote_history(
+    history: &LocalHistory,
+    client: &ProviderClient,
+    remote_head: &HistoryCommit,
+) -> anyhow::Result<()> {
+    let missing = remote_chain_until_local(history, client, remote_head).await?;
     for commit in missing.iter().rev() {
         history.write_commit(commit)?;
     }
-    history.set_head(remote_head)?;
-    Ok(())
+    history.set_head(remote_head)
 }
 
 async fn remote_chain_until_local(
