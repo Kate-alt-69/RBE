@@ -498,6 +498,7 @@ fn route_wasm_link_context(
             module_owner_from_logical_name(source.logical_name()),
             function_def.clone(),
             module.imports.clone(),
+            module.functions.clone(),
         );
     }
     context
@@ -1608,6 +1609,39 @@ mod tests {
         assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Service);
         assert_eq!(grants[0].target, "service:uac");
         assert_eq!(grants[0].operations, vec!["get_user"]);
+    }
+
+    #[test]
+    fn linked_storage_module_helpers_compile_native_with_exact_storage_grant() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "accounts/cache",
+                "module/accounts/cache.module",
+                r#":import[storage.read as readEntry]
+                   :import[storage.list as listEntries]
+                   function prefix() { return "users/"; }
+                   function buildPath(name) { return prefix() + name + ".json"; }
+                   export function load(name) { return readEntry(buildPath(name)); }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "account-cache-helper",
+                "api/account-cache-helper.route",
+                r#":import["./module/accounts/cache".load]
+                   class Route { get(req) { return load("kate"); } }"#,
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        let route = image.routes.first().unwrap();
+        assert!(image.route_wasm_artifact(route, "get").is_some());
+        assert!(image.route_wasm_fallback(route, "get").is_none());
+        let grants = image.container_capability_grants(route).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Storage);
+        assert_eq!(grants[0].target, "storage:accounts.cache");
+        assert_eq!(grants[0].operations, vec!["list", "read"]);
     }
 
     #[test]

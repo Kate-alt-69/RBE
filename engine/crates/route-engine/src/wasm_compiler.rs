@@ -27,10 +27,11 @@ use crate::modules::binding_name;
 use crate::runtime_image::{storage_capability_operation_allowed, storage_capability_target};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-/// Generation 13 compiles each HTTP method independently so one `.route`
-/// can pin distinct native artifacts and explicit fallbacks per verb. Exact
-/// import binding, capability authority, and ABI v3 remain unchanged.
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 13;
+/// Generation 14 lowers linked Module wrappers with multiple exact host
+/// imports and pure local Module helpers. The returned host binding is selected
+/// exactly; helper evaluation remains bounded and host-call free. ABI v3 stays
+/// unchanged.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 14;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STATIC_HELPER_CALL_DEPTH: usize = 32;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
@@ -77,6 +78,7 @@ struct LinkedModuleFunction {
     owner: String,
     function: FunctionDef,
     imports: Vec<ImportTarget>,
+    functions: Vec<FunctionDef>,
 }
 
 impl RouteWasmLinkContext {
@@ -86,6 +88,7 @@ impl RouteWasmLinkContext {
         owner: String,
         function: FunctionDef,
         imports: Vec<ImportTarget>,
+        functions: Vec<FunctionDef>,
     ) {
         self.module_functions.insert(
             route_binding,
@@ -93,6 +96,7 @@ impl RouteWasmLinkContext {
                 owner,
                 function,
                 imports,
+                functions,
             },
         );
     }
@@ -101,11 +105,12 @@ impl RouteWasmLinkContext {
 /// Compile the currently supported native route subset.
 ///
 /// Native lowering remains intentionally strict per HTTP method. Compiler
-/// generation v13 keeps ABI v3 and lets RELC compile every method in a Route
-/// independently while retaining generation 12's exact import binding,
-/// generation 11's static capability arguments, and generation 10's bounded
-/// helper folding. Namespace imports, ambiguous bindings, dynamic transforms,
-/// wider Module bodies, and nested host-call chains remain interpreter-only.
+/// generation v14 keeps ABI v3 and extends immutable linked Module lowering
+/// to multiple exact host imports plus pure local Module helpers. It retains
+/// generation 13's per-method artifacts, generation 12's exact Route import
+/// binding, and bounded helper folding. Namespace host calls, ambiguous bindings,
+/// dynamic transforms, wider host-call control flow, and nested host-call chains
+/// remain interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let links = RouteWasmLinkContext::default();
     compile_route_with_links(file, &links)
@@ -413,22 +418,33 @@ fn lower_linked_module_capability_call(
             "native linked Module function must contain exactly one return statement".into(),
         );
     };
-    let [module_import] = linked.imports.as_slice() else {
+    let Expr::Call(target, host_args) = module_expr else {
+        return Err("native linked Module return must directly call one exact host import".into());
+    };
+    let Expr::Ident(host_binding) = target.as_ref() else {
         return Err(
-            "native linked Module function requires exactly one direct host capability import"
+            "native linked Module host call must use an exact imported function binding; namespace host calls remain interpreter-only"
                 .into(),
         );
     };
-    let host = direct_linked_capability_import(module_import, &linked.owner).ok_or_else(|| {
-        "native linked Module import must be one exact HTTP, Video, Service, or Storage function"
-            .to_string()
-    })?;
-    let Expr::Call(target, host_args) = module_expr else {
-        return Err("native linked Module return must directly call its host import".into());
-    };
-    if !matches!(target.as_ref(), Expr::Ident(name) if name == &host.binding) {
-        return Err("native linked Module return must call the imported host binding".into());
+
+    let mut host_imports = BTreeMap::<String, DirectCapabilityImport>::new();
+    for import in &linked.imports {
+        let Some(host) = direct_linked_capability_import(import, &linked.owner) else {
+            continue;
+        };
+        let binding = host.binding.clone();
+        if host_imports.insert(binding.clone(), host).is_some() {
+            return Err(format!(
+                "native linked Module has ambiguous host import binding {binding:?}"
+            ));
+        }
     }
+    let host = host_imports.get(host_binding).cloned().ok_or_else(|| {
+        format!(
+            "native linked Module return target {host_binding:?} is not one exact HTTP, Video, Service, or Storage import"
+        )
+    })?;
 
     let route_function_map = static_function_map(route_functions).ok_or_else(|| {
         "native capability lowering requires unique local Route helper names".to_string()
@@ -453,14 +469,16 @@ fn lower_linked_module_capability_call(
             .cloned()
             .zip(route_args)
             .collect::<BTreeMap<_, _>>();
-        let no_module_helpers = BTreeMap::<String, FunctionDef>::new();
+        let module_function_map = static_function_map(&linked.functions).ok_or_else(|| {
+            "native linked Module helper lowering requires unique Module function names".to_string()
+        })?;
         let args = host_args
             .iter()
             .map(|argument| {
                 static_eval_expr(
                     argument,
                     &bindings,
-                    &no_module_helpers,
+                    &module_function_map,
                     MAX_STATIC_HELPER_CALL_DEPTH,
                 )
                 .map(|value| static_value_to_json(&value))
@@ -1123,6 +1141,7 @@ mod tests {
             owner.to_string(),
             function,
             module.imports.clone(),
+            module.functions.clone(),
         );
         links
     }
@@ -1488,6 +1507,103 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("WASM ABI violation"));
         assert!(message.contains("CAPABILITY_DENIED"));
+    }
+
+    #[test]
+    fn linked_module_multiple_exact_host_imports_select_returned_binding() {
+        let module = parse_module(
+            r#":import[storage.read as readEntry]
+               :import[storage.list as listEntries]
+               export function load(path) { return readEntry(path); }"#,
+        );
+        let links = link_module_function("load", "accounts.cache", &module, "load");
+        let route = parse(
+            r#":import["./module/accounts/cache".load]
+               class Route { get(req) { return load("users/kate.json"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("linked Module should select the exact returned host import");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Storage);
+            assert_eq!(request.target, "storage:accounts.cache");
+            assert_eq!(request.operation, "read");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["users/kate.json"])
+            );
+            Ok(br#"{"found":true}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"found":true}"#);
+    }
+
+    #[test]
+    fn linked_module_pure_helpers_build_static_host_arguments() {
+        let module = parse_module(
+            r#":import[storage.read as readEntry]
+               function prefix() { return "users/"; }
+               function buildPath(name) { return prefix() + name + ".json"; }
+               export function load(name) { return readEntry(buildPath(name)); }"#,
+        );
+        let links = link_module_function("load", "accounts.cache", &module, "load");
+        let route = parse(
+            r#":import["./module/accounts/cache".load]
+               class Route { get(req) { return load("kate"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("pure Module helpers should fold into the exact host payload");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Storage);
+            assert_eq!(request.target, "storage:accounts.cache");
+            assert_eq!(request.operation, "read");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["users/kate.json"])
+            );
+            Ok(br#"{"found":true}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"found":true}"#);
+    }
+
+    #[test]
+    fn linked_module_dynamic_helper_transform_stays_interpreter_fallback() {
+        let module = parse_module(
+            r#":import[storage.read as readEntry]
+               function buildPath(name) { return "users/" + name + ".json"; }
+               export function load(name) { return readEntry(buildPath(name)); }"#,
+        );
+        let links = link_module_function("load", "accounts.cache", &module, "load");
+        let route = parse(
+            r#":import["./module/accounts/cache".load]
+               class Route { post(req) { return load(req.body); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { reason } =
+            compile_route_with_links(&route, &links)
+        else {
+            panic!("request-derived Module helper transforms must remain dynamic");
+        };
+        assert!(reason.contains("exactly one req.body value passed unchanged"));
     }
 
     #[test]
