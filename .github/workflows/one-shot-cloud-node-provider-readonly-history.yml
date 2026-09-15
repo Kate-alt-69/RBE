@@ -1,0 +1,70 @@
+name: One-shot Cloud Node provider read-only history inspection
+
+on:
+  push:
+    branches:
+      - work/cloud-node-provider-hardening
+
+permissions:
+  contents: write
+
+jobs:
+  provider-readonly-history:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Keep provider status filesystem read-only
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('engine/crates/cloud-node/src/provider_sync.rs')
+          text = path.read_text()
+          old = '''    fn open(store: &CloudNodeStore, namespace: &str) -> anyhow::Result<Self> {\n        let root = store\n            .summary()\n            .root\n            .join("provider-history")\n            .join(namespace);\n        let commits = root.join("commits");\n        fs::create_dir_all(&commits)?;\n        Ok(Self {\n            head: root.join("HEAD.json"),\n            commits,\n        })\n    }\n'''
+          new = '''    fn open(store: &CloudNodeStore, namespace: &str) -> anyhow::Result<Self> {\n        let root = store\n            .summary()\n            .root\n            .join("provider-history")\n            .join(namespace);\n        Ok(Self {\n            head: root.join("HEAD.json"),\n            commits: root.join("commits"),\n        })\n    }\n'''
+          if 'fs::create_dir_all(&commits)?;' in text:
+              if text.count(old) != 1:
+                  raise SystemExit('LocalHistory::open anchor not found exactly once')
+              text = text.replace(old, new, 1)
+
+          write_anchor = '''    fn write_commit(&self, commit: &HistoryCommit) -> anyhow::Result<()> {\n        validate_commit(commit)?;\n        let path = self.commits.join(format!("{}.json", commit.id));\n'''
+          write_new = '''    fn write_commit(&self, commit: &HistoryCommit) -> anyhow::Result<()> {\n        validate_commit(commit)?;\n        fs::create_dir_all(&self.commits)?;\n        let path = self.commits.join(format!("{}.json", commit.id));\n'''
+          if 'fs::create_dir_all(&self.commits)?;' not in text:
+              if text.count(write_anchor) != 1:
+                  raise SystemExit('LocalHistory::write_commit anchor not found exactly once')
+              text = text.replace(write_anchor, write_new, 1)
+
+          test_anchor = '''    #[test]\n    fn provider_history_rejects_invalid_remote_node_identity() {\n'''
+          test = '''    #[test]\n    fn opening_provider_history_for_status_does_not_create_directories() {\n        let root = test_root();\n        fs::create_dir_all(&root).unwrap();\n        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({\n            "node":{"id":"node-a","storageRoot":root},\n            "provider":{\n                "kind":"google-cloud-storage",\n                "namespace":"prod",\n                "bucket":"rbe"\n            }\n        }))\n        .unwrap();\n        let store = CloudNodeStore::open(&settings).unwrap();\n        let history_root = store\n            .summary()\n            .root\n            .join("provider-history")\n            .join("prod");\n        assert!(!history_root.exists());\n        let history = LocalHistory::open(&store, "prod").unwrap();\n        assert!(history.head().unwrap().is_none());\n        assert!(!history_root.exists());\n        drop(history);\n        fs::remove_dir_all(root).unwrap();\n    }\n\n'''
+          if 'fn opening_provider_history_for_status_does_not_create_directories()' not in text:
+              if text.count(test_anchor) != 1:
+                  raise SystemExit('provider history test anchor not found exactly once')
+              text = text.replace(test_anchor, test + test_anchor, 1)
+          path.write_text(text)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
+      - name: Commit BUG-CN-PROV-021
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-readonly-history.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-021 keep provider status filesystem read-only"
+          git push origin HEAD:work/cloud-node-provider-hardening
