@@ -8,3 +8,12 @@ count = text.count(old)
 if count != 1:
     raise SystemExit(f"BUG-WASM-013 dynamic body test input expected once, found {count}")
 path.write_text(text.replace(old, new, 1))
+
+path = Path("engine/crates/route-engine/src/relc.rs")
+text = path.read_text()
+old = "crate::wasm_compiler::RouteWasmInput::JsonBodyCapabilityArgument"
+new = "crate::wasm_compiler::RouteWasmInput::JsonBodyCapabilityValue"
+count = text.count(old)
+if count != 1:
+    raise SystemExit(f"BUG-WASM-013 stale RELC input variant expected once, found {count}")
+path.write_text(text.replace(old, new, 1))
