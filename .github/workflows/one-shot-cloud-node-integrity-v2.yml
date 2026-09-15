@@ -1,0 +1,364 @@
+name: One-shot Cloud Node integrity hardening v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-integrity-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Patch, validate, and land
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one anchor, found {count}")
+              print(f"patched: {label}")
+              return text.replace(old, new, 1)
+
+          store_path = Path('engine/crates/cloud-node/src/store.rs')
+          store = store_path.read_text()
+          verify_pattern = re.compile(
+              r'(?ms)^    pub fn verify\(&self\) -> anyhow::Result<usize> \{.*?^    fn store_video_chunks\('
+          )
+          verify_body = textwrap.indent(textwrap.dedent('''
+          pub fn verify(&self) -> anyhow::Result<usize> {
+              let mut verified = 0usize;
+              for entry in fs::read_dir(&self.storage)? {
+                  let entry = entry?;
+                  if !entry.file_type()?.is_dir() {
+                      continue;
+                  }
+                  let object_hex = entry.file_name().to_string_lossy().to_string();
+                  if object_hex.len() != 64 || !object_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                      anyhow::bail!("invalid Cloud Node storage object directory {object_hex:?}");
+                  }
+
+                  let mut current = None;
+                  for kind in [BlobKind::Folder, BlobKind::Video, BlobKind::File] {
+                      let path = entry.path().join(kind.manifest_name());
+                      if !path.is_file() {
+                          continue;
+                      }
+                      if current.is_some() {
+                          anyhow::bail!(
+                              "Cloud Node object {} contains multiple current manifests",
+                              entry.path().display()
+                          );
+                      }
+                      current = Some((kind, path));
+                  }
+                  let Some((kind, path)) = current else {
+                      anyhow::bail!(
+                          "Cloud Node object {} contains no current manifest",
+                          entry.path().display()
+                      );
+                  };
+
+                  let manifest = BlobManifest::decode(&fs::read(&path)?)?;
+                  if manifest.kind != kind || hex::encode(manifest.object_key) != object_hex {
+                      anyhow::bail!(
+                          "Cloud Node manifest identity mismatch at {}",
+                          path.display()
+                      );
+                  }
+                  let normalized = normalize_logical_path(&manifest.logical_path)?;
+                  if normalized != manifest.logical_path
+                      || object_key(kind, &manifest.logical_path) != manifest.object_key
+                  {
+                      anyhow::bail!(
+                          "Cloud Node manifest path identity is not canonical at {}",
+                          path.display()
+                      );
+                  }
+
+                  match &manifest.body {
+                      BlobBody::File { changes } => {
+                          for change in changes {
+                              change.offset.checked_add(change.old_len).ok_or_else(|| {
+                                  anyhow::anyhow!("Cloud Node file change range overflow")
+                              })?;
+                          }
+                          let payload = entry
+                              .path()
+                              .join("versions")
+                              .join(hex::encode(manifest.content_sha256))
+                              .join("payload");
+                          let metadata = fs::metadata(&payload)?;
+                          if metadata.len() != manifest.logical_size
+                              || sha256_file(&payload)? != manifest.content_sha256
+                          {
+                              anyhow::bail!(
+                                  "Cloud Node file payload integrity mismatch at {}",
+                                  payload.display()
+                              );
+                          }
+                      }
+                      BlobBody::Video { chunk_bytes, chunks } => {
+                          if *chunk_bytes == 0 && !chunks.is_empty() {
+                              anyhow::bail!("Cloud Node video manifest uses zero-sized chunks");
+                          }
+                          let mut expected_offset = 0u64;
+                          for chunk in chunks {
+                              if chunk.offset != expected_offset || chunk.len == 0 || chunk.len > *chunk_bytes {
+                                  anyhow::bail!("Cloud Node video manifest chunk layout is invalid");
+                              }
+                              let chunk_path = entry
+                                  .path()
+                                  .join("chunks")
+                                  .join(format!("{}.chunk", hex::encode(chunk.sha256)));
+                              let metadata = fs::metadata(&chunk_path)?;
+                              if metadata.len() != u64::from(chunk.len)
+                                  || sha256_file(&chunk_path)? != chunk.sha256
+                              {
+                                  anyhow::bail!(
+                                      "Cloud Node video chunk integrity mismatch at {}",
+                                      chunk_path.display()
+                                  );
+                              }
+                              expected_offset = expected_offset
+                                  .checked_add(u64::from(chunk.len))
+                                  .ok_or_else(|| anyhow::anyhow!("Cloud Node video chunk range overflow"))?;
+                          }
+                          if expected_offset != manifest.logical_size {
+                              anyhow::bail!("Cloud Node video manifest size does not match its chunk layout");
+                          }
+                          let payload = entry
+                              .path()
+                              .join("versions")
+                              .join(hex::encode(manifest.content_sha256))
+                              .join("payload");
+                          let metadata = fs::metadata(&payload)?;
+                          if metadata.len() != manifest.logical_size
+                              || sha256_file(&payload)? != manifest.content_sha256
+                          {
+                              anyhow::bail!(
+                                  "Cloud Node video payload integrity mismatch at {}",
+                                  payload.display()
+                              );
+                          }
+                      }
+                      BlobBody::Folder { entries } => {
+                          let mut previous: Option<&str> = None;
+                          let mut logical_size = 0u64;
+                          for folder_entry in entries {
+                              let normalized = normalize_logical_path(&folder_entry.path)?;
+                              if normalized != folder_entry.path
+                                  || object_key(folder_entry.kind, &folder_entry.path) != folder_entry.object_key
+                              {
+                                  anyhow::bail!("Cloud Node folder entry identity is not canonical");
+                              }
+                              if folder_entry.kind == BlobKind::Folder
+                                  && (folder_entry.content_sha256 != [0u8; 32] || folder_entry.size != 0)
+                              {
+                                  anyhow::bail!("Cloud Node folder entry directory metadata is invalid");
+                              }
+                              if previous.is_some_and(|value| value >= folder_entry.path.as_str()) {
+                                  anyhow::bail!("Cloud Node folder manifest entries are not strictly ordered");
+                              }
+                              previous = Some(&folder_entry.path);
+                              logical_size = logical_size
+                                  .checked_add(folder_entry.size)
+                                  .ok_or_else(|| anyhow::anyhow!("Cloud Node folder logical size overflow"))?;
+                          }
+                          if logical_size != manifest.logical_size {
+                              anyhow::bail!("Cloud Node folder logical size does not match its entries");
+                          }
+                          if folder_digest(entries) != manifest.content_sha256 {
+                              anyhow::bail!("Cloud Node folder manifest content hash mismatch");
+                          }
+                      }
+                  }
+                  verified = verified.saturating_add(1);
+              }
+              Ok(verified)
+          }
+          ''').lstrip(), '    ')
+          store, count = verify_pattern.subn(verify_body + '\n    fn store_video_chunks(', store, count=1)
+          if count != 1:
+              raise SystemExit(f'complete storage verification: expected one function block, found {count}')
+          print('patched: complete storage verification')
+
+          tests = textwrap.indent(textwrap.dedent('''
+          #[test]
+          fn verify_rejects_corrupted_video_chunk_even_with_intact_payload() {
+              let root = test_root("video-corruption");
+              fs::create_dir_all(&root).unwrap();
+              let source = root.join("clip.mp4");
+              fs::write(&source, vec![7u8; 1024 * 1024 + 31]).unwrap();
+              let store = CloudNodeStore::open(&settings(&root)).unwrap();
+              let stored = store.store_video(&source, "video/clip.mp4").unwrap();
+              let manifest = BlobManifest::decode(&fs::read(&stored.manifest).unwrap()).unwrap();
+              let BlobBody::Video { chunks, .. } = manifest.body else {
+                  panic!("expected video blob");
+              };
+              let first = chunks.first().expect("video should have chunks");
+              let chunk_path = store
+                  .summary()
+                  .storage
+                  .join(&stored.object_key)
+                  .join("chunks")
+                  .join(format!("{}.chunk", hex::encode(first.sha256)));
+              let mut bytes = fs::read(&chunk_path).unwrap();
+              bytes[0] ^= 0xff;
+              fs::write(&chunk_path, bytes).unwrap();
+              assert!(store.verify().is_err());
+              fs::remove_dir_all(root).unwrap();
+          }
+
+          #[test]
+          fn verify_rejects_inconsistent_folder_manifest_metadata() {
+              let root = test_root("folder-corruption");
+              fs::create_dir_all(&root).unwrap();
+              let tree = root.join("tree");
+              fs::create_dir_all(&tree).unwrap();
+              fs::write(tree.join("a.txt"), b"folder bytes").unwrap();
+              let store = CloudNodeStore::open(&settings(&root)).unwrap();
+              let stored = store.snapshot_folder(&tree, "root").unwrap();
+              let mut manifest = BlobManifest::decode(&fs::read(&stored.manifest).unwrap()).unwrap();
+              let BlobBody::Folder { entries } = &mut manifest.body else {
+                  panic!("expected folder blob");
+              };
+              entries[0].size = entries[0].size.saturating_add(1);
+              manifest.logical_size = manifest.logical_size.saturating_add(1);
+              fs::write(&stored.manifest, manifest.encode().unwrap()).unwrap();
+              assert!(store.verify().is_err());
+              fs::remove_dir_all(root).unwrap();
+          }
+          ''').strip(), '    ')
+          module_end = store.rfind('\n}')
+          if module_end < 0 or '#[cfg(test)]' not in store[module_end - 9000:module_end]:
+              raise SystemExit('store test module end anchor changed')
+          store = store[:module_end] + '\n\n' + tests + store[module_end:]
+          store_path.write_text(store)
+          print('patched: storage corruption tests')
+
+          recovery_path = Path('engine/crates/cloud-node/src/recovery.rs')
+          recovery = recovery_path.read_text()
+          old_folder = """        BlobBody::Folder { entries } => {\n            let mut previous: Option<&str> = None;\n            for entry in entries {\n                validate_folder_entry(entry)?;\n                if previous.is_some_and(|path| path >= entry.path.as_str()) {\n                    anyhow::bail!(\"Cloud Node folder manifest entries are not strictly ordered\");\n                }\n                previous = Some(&entry.path);\n            }\n            if folder_digest(entries) != manifest.content_sha256 {\n                anyhow::bail!(\"Cloud Node folder manifest content hash mismatch\");\n            }\n        }\n"""
+          new_folder = """        BlobBody::Folder { entries } => {\n            let mut previous: Option<&str> = None;\n            let mut logical_size = 0u64;\n            for entry in entries {\n                validate_folder_entry(entry)?;\n                if previous.is_some_and(|path| path >= entry.path.as_str()) {\n                    anyhow::bail!(\"Cloud Node folder manifest entries are not strictly ordered\");\n                }\n                previous = Some(&entry.path);\n                logical_size = logical_size\n                    .checked_add(entry.size)\n                    .ok_or_else(|| anyhow::anyhow!(\"Cloud Node folder logical size overflow\"))?;\n            }\n            if logical_size != manifest.logical_size {\n                anyhow::bail!(\"Cloud Node folder logical size does not match its entries\");\n            }\n            if folder_digest(entries) != manifest.content_sha256 {\n                anyhow::bail!(\"Cloud Node folder manifest content hash mismatch\");\n            }\n        }\n"""
+          recovery = replace_once(recovery, old_folder, new_folder, 'recovery folder logical size validation')
+          recovery_path.write_text(recovery)
+
+          maintenance_path = Path('engine/crates/backend/src/maintenance_notice.rs')
+          maintenance = maintenance_path.read_text()
+          admission_pattern = re.compile(
+              r'(?ms)^    let local_header = match runtime\.store\.sync_plan\(\)\.and_then\(\|plan\| plan\.header\(\)\) \{.*?^    if remote_header != local_header \{'
+          )
+          admission = textwrap.indent(textwrap.dedent('''
+          let local_header = match runtime.store.sync_plan().and_then(|plan| plan.header()) {
+              Ok(header) => header,
+              Err(error) => {
+                  tracing::error!(error = %error, "Cloud Node could not compute local recovery root");
+                  return StatusCode::SERVICE_UNAVAILABLE.into_response();
+              }
+          };
+          let mut advertised_header = local_header;
+          let local_integrity_ok = if remote_header == local_header {
+              match runtime.store.verify() {
+                  Ok(objects) => {
+                      tracing::debug!(objects, "Cloud Node equal-root snapshot passed integrity verification");
+                      true
+                  }
+                  Err(error) => {
+                      advertised_header.root_sha256[0] ^= 0x80;
+                      tracing::warn!(
+                          peer = %session.node_id,
+                          error = %error,
+                          "Cloud Node local snapshot failed integrity verification; forcing full recovery"
+                      );
+                      false
+                  }
+              }
+          } else {
+              true
+          };
+          let roots_match = remote_header == local_header && local_integrity_ok;
+
+          if roots_match {
+              if let Err(error) = signal_boot_recovery_complete(runtime, local_header) {
+                  tracing::error!(error = %error, "Cloud Node could not signal completed boot recovery");
+                  return StatusCode::SERVICE_UNAVAILABLE.into_response();
+              }
+          }
+
+          if !roots_match {
+          ''').lstrip(), '    ')
+          maintenance, count = admission_pattern.subn(admission, maintenance, count=1)
+          if count != 1:
+              raise SystemExit(f'verified equal-root boot admission: expected one block, found {count}')
+          print('patched: verified equal-root boot admission')
+
+          response_pattern = re.compile(
+              r'(?ms)^    tracing::info!\(\n        peer = %session\.node_id,\n        remote_root = %hex::encode\(remote_header\.root_sha256\),\n        local_root = %hex::encode\(local_header\.root_sha256\),\n        roots_match = remote_header\.root_sha256 == local_header\.root_sha256,\n        "authenticated Cloud Node sync negotiation completed"\n    \);\n\n    let response = Frame \{\n        kind: FrameKind::SyncHello,\n        session: session\.session,\n        payload: local_header\.encode\(\),\n    \};'
+          )
+          response = textwrap.indent(textwrap.dedent('''
+          tracing::info!(
+              peer = %session.node_id,
+              remote_root = %hex::encode(remote_header.root_sha256),
+              local_root = %hex::encode(local_header.root_sha256),
+              advertised_root = %hex::encode(advertised_header.root_sha256),
+              local_integrity_ok,
+              roots_match,
+              "authenticated Cloud Node sync negotiation completed"
+          );
+
+          let response = Frame {
+              kind: FrameKind::SyncHello,
+              session: session.session,
+              payload: advertised_header.encode(),
+          };
+          ''').strip(), '    ')
+          maintenance, count = response_pattern.subn(response, maintenance, count=1)
+          if count != 1:
+              raise SystemExit(f'force-recovery sync response: expected one block, found {count}')
+          print('patched: force-recovery sync response')
+          maintenance_path.write_text(maintenance)
+          PY
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test -p cloud-node --locked
+          cargo test -p backend --locked
+          cd ..
+
+          rm -f .github/workflows/one-shot-cloud-node-integrity.yml
+          rm -f .github/workflows/one-shot-cloud-node-integrity-v2.yml
+          git add -A .github/workflows/one-shot-cloud-node-integrity.yml \
+            .github/workflows/one-shot-cloud-node-integrity-v2.yml \
+            engine/crates/cloud-node/src/store.rs \
+            engine/crates/cloud-node/src/recovery.rs \
+            engine/crates/backend/src/maintenance_notice.rs
+          git diff --cached --check
+          git commit -m 'FIX | BUG-CN-001 verify storage before Cloud Node boot admission'
+          git pull --rebase origin main
+          git push origin HEAD:main
