@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use atomic_io::AtomicIo;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -97,6 +98,46 @@ struct ProviderResource {
     resource_sha256: String,
     size: u64,
     key: String,
+}
+
+struct ProviderSyncLock {
+    file: fs::File,
+}
+
+impl ProviderSyncLock {
+    fn acquire(store: &CloudNodeStore, namespace: &str) -> anyhow::Result<Self> {
+        let root = store
+            .summary()
+            .root
+            .join("provider-history")
+            .join(namespace);
+        fs::create_dir_all(&root)?;
+        let path = root.join(".sync.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to open Cloud Node provider sync lock {}: {error}",
+                    path.display()
+                )
+            })?;
+        file.try_lock_exclusive().map_err(|error| {
+            anyhow::anyhow!(
+                "Cloud Node provider sync is already active for namespace {namespace:?}, or its lock is unavailable: {error}"
+            )
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ProviderSyncLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 struct LocalHistory {
@@ -323,6 +364,7 @@ pub async fn synchronize_provider(
         .provider
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
+    let _sync_lock = ProviderSyncLock::acquire(store, &provider.namespace)?;
     let client = ProviderClient::new(provider)?;
     let recovery_owner = provider_recovery_owner(&provider.namespace);
     let plan = store.sync_plan()?;
@@ -1215,6 +1257,29 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn provider_sync_lock_serializes_same_namespace() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"node-a","storageRoot":root},
+            "provider":{
+                "kind":"google-cloud-storage",
+                "namespace":"prod",
+                "bucket":"rbe"
+            }
+        }))
+        .unwrap();
+        let store = CloudNodeStore::open(&settings).unwrap();
+
+        let first = ProviderSyncLock::acquire(&store, "prod").unwrap();
+        assert!(ProviderSyncLock::acquire(&store, "prod").is_err());
+        drop(first);
+        let second = ProviderSyncLock::acquire(&store, "prod").unwrap();
+        drop(second);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

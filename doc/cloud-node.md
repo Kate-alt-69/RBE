@@ -225,6 +225,8 @@ Before replacing the mutable provider HEAD, Cloud Node re-reads it and verifies 
 
 Provider pulls reuse the same crash-resumable recovery machinery as authenticated peer recovery. Their staging identity is stable for the provider namespace and expected snapshot root. After process restart, already committed resources are detected and partial resources return their durable `next_offset`, allowing the provider downloader to continue from verified bytes instead of restarting the complete snapshot.
 
+Only one local `sync-provider` operation may mutate a provider namespace at a time. Cloud Node holds an OS-backed exclusive lock at `provider-history/<namespace>/.sync.lock` for the complete synchronization transaction. A second local process fails fast instead of racing history/cache state, and the operating system releases the lock automatically if the owning process exits or crashes.
+
 Provider mode removes the requirement for a second `cloud_node.exe` for remote object persistence, snapshot synchronization, and Cloud Node history. Object storage itself is not an arbitrary reverse network tunnel or relay. Provider-managed ingress/relay products can be integrated separately without conflating network tunneling with the persistence provider interface.
 
 Useful provider commands are:
