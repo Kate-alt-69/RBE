@@ -3,6 +3,18 @@ from pathlib import Path
 path = Path('.github/patches/storage-project-root.py')
 text = path.read_text(encoding='utf-8')
 
+# The module registry contains the same Storage mapping in the namespace-import
+# and exact-function-import branches. Keep replace_once strict everywhere else,
+# but allow these two intentional sequential replacements.
+old_helper = '''    count = text.count(old)\n    if count != 1:\n        raise SystemExit(f'{path}: expected exactly one anchor, found {count}: {old[:120]!r}')\n    file.write_text(text.replace(old, new, 1), encoding='utf-8')'''
+new_helper = '''    count = text.count(old)\n    duplicate_storage_registry = (\n        path == 'engine/crates/route-engine/src/modules.rs'\n        and '"storage" | "Storage" => ModuleKind::Builtin(BuiltinModule::Storage)' in old\n    )\n    if count != 1 and not (duplicate_storage_registry and count >= 1):\n        raise SystemExit(f'{path}: expected exactly one anchor, found {count}: {old[:120]!r}')\n    file.write_text(text.replace(old, new, 1), encoding='utf-8')'''
+if text.count(old_helper) != 1:
+    raise SystemExit(f'expected replace_once helper once, found {text.count(old_helper)}')
+text = text.replace(old_helper, new_helper, 1)
+
+# project_relative() intentionally parses the $$ marker into a safe *relative*
+# path. The trusted Controller is the only layer that joins it to the canonical
+# backend startup project root.
 old = '''        let (relative, target) = project_relative(raw_path, false)?;\n        let parent = relative'''
 new = '''        let (relative, _) = project_relative(raw_path, false)?;\n        let target = self.root.join(&relative);\n        let parent = relative'''
 if text.count(old) != 1:
@@ -14,12 +26,6 @@ new = '''        let (relative, _) = project_relative(raw_path, allow_directory)
 if text.count(old) != 1:
     raise SystemExit(f'expected resolve_existing anchor once, found {text.count(old)}')
 text = text.replace(old, new, 1)
-
-block = '''replace_once(\n    'engine/crates/route-engine/src/modules.rs',\n    '                        \\"storage\\" | \\"Storage\\" => ModuleKind::Builtin(BuiltinModule::Storage),',\n    '                        \\"storage\\" | \\"Storage\\" | \\"envStorage\\" => ModuleKind::Builtin(BuiltinModule::Storage),',\n)\nreplace_once(\n    'engine/crates/route-engine/src/modules.rs',\n    '                        \\"storage\\" | \\"Storage\\" => ModuleKind::Builtin(BuiltinModule::Storage),',\n    '                        \\"storage\\" | \\"Storage\\" | \\"envStorage\\" => ModuleKind::Builtin(BuiltinModule::Storage),',\n)'''
-replacement = '''modules_path = ROOT / 'engine/crates/route-engine/src/modules.rs'\nmodules_text = modules_path.read_text(encoding='utf-8')\nmodules_old = '                        \\"storage\\" | \\"Storage\\" => ModuleKind::Builtin(BuiltinModule::Storage),'\nmodules_new = '                        \\"storage\\" | \\"Storage\\" | \\"envStorage\\" => ModuleKind::Builtin(BuiltinModule::Storage),'\nif modules_text.count(modules_old) != 2:\n    raise SystemExit(f'modules.rs: expected 2 Storage registry anchors, found {modules_text.count(modules_old)}')\nmodules_path.write_text(modules_text.replace(modules_old, modules_new), encoding='utf-8')'''
-if text.count(block) != 1:
-    raise SystemExit(f'expected duplicate modules patch block once, found {text.count(block)}')
-text = text.replace(block, replacement, 1)
 
 path.write_text(text, encoding='utf-8')
 print('storage project-root staging preflight fixed')
