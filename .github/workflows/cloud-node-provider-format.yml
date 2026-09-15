@@ -1,0 +1,42 @@
+name: Cloud Node Provider Format
+
+on:
+  push:
+    branches:
+      - work/cloud-node-providers
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cloud-node-provider-format
+  cancel-in-progress: true
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: work/cloud-node-providers
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format Rust workspace
+        run: cargo fmt --all
+      - name: Commit formatting
+        working-directory: .
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine
+          git commit -m "style: format Cloud Node provider work"
+          git push origin HEAD:work/cloud-node-providers
