@@ -250,7 +250,7 @@ pub async fn synchronize_upstream(
     Ok(SyncNegotiation { local, remote })
 }
 
-async fn prepare_outbound_cache(
+pub(crate) async fn prepare_outbound_cache(
     store: &CloudNodeStore,
     peer_node_id: &str,
     plan: &SyncPlan,
@@ -326,7 +326,7 @@ fn outbound_peer_cache_root(store: &CloudNodeStore, peer_node_id: &str) -> PathB
         .join(peer_node_id)
 }
 
-fn cached_resource_path(
+pub(crate) fn cached_resource_path(
     cache_root: &Path,
     object: &SyncObject,
     resource: TransferResource,
@@ -444,7 +444,10 @@ async fn prune_outbound_cache_snapshots(
     Ok(())
 }
 
-async fn cleanup_outbound_cache(store: &CloudNodeStore, peer_node_id: &str) -> anyhow::Result<()> {
+pub(crate) async fn cleanup_outbound_cache(
+    store: &CloudNodeStore,
+    peer_node_id: &str,
+) -> anyhow::Result<()> {
     let root = outbound_peer_cache_root(store, peer_node_id);
     match tokio::fs::remove_dir_all(root).await {
         Ok(()) => Ok(()),

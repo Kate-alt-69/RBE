@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
+use crate::client::{cached_resource_path, cleanup_outbound_cache, prepare_outbound_cache};
 use crate::config::{CloudNodeSettings, ProviderConflictPolicy};
 use crate::format::BlobKind;
 use crate::provider::ProviderClient;
@@ -366,7 +368,15 @@ pub async fn synchronize_provider(
             before,
         }),
         ProviderSyncRelation::EmptyRemote | ProviderSyncRelation::LocalAhead => {
-            push_provider_state(&client, &history, &plan, &local_head, remote.as_ref()).await?;
+            push_provider_state(
+                &client,
+                &history,
+                store,
+                &plan,
+                &local_head,
+                remote.as_ref(),
+            )
+            .await?;
             Ok(ProviderSyncResult {
                 action: ProviderSyncAction::Push,
                 final_root: local_head.snapshot_root.clone(),
@@ -391,7 +401,15 @@ pub async fn synchronize_provider(
                 before.remote_head.as_deref().unwrap_or("<none>")
             ),
             ProviderConflictPolicy::PreferLocal => {
-                push_provider_state(&client, &history, &plan, &local_head, remote.as_ref()).await?;
+                push_provider_state(
+                &client,
+                &history,
+                store,
+                &plan,
+                &local_head,
+                remote.as_ref(),
+            )
+            .await?;
                 Ok(ProviderSyncResult {
                     action: ProviderSyncAction::ForcedPush,
                     final_root: local_head.snapshot_root.clone(),
@@ -411,6 +429,13 @@ pub async fn synchronize_provider(
             }
         },
     }
+}
+
+fn provider_cache_owner(namespace: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"RBE-CN-PROVIDER-CACHE/1\0");
+    digest.update(namespace.as_bytes());
+    format!("provider-{}", hex::encode(digest.finalize()))
 }
 
 fn provider_recovery_owner(namespace: &str) -> String {
@@ -465,11 +490,13 @@ async fn status_from_heads(
 async fn push_provider_state(
     client: &ProviderClient,
     history: &LocalHistory,
+    store: &CloudNodeStore,
     plan: &SyncPlan,
     local_head: &HistoryCommit,
     expected_remote: Option<&HistoryCommit>,
 ) -> anyhow::Result<()> {
-    upload_snapshot(client, plan).await?;
+    let cache_owner = provider_cache_owner(client.namespace());
+    upload_snapshot(client, store, plan, &cache_owner).await?;
     let commits = history.chain_to_ancestor(
         &local_head.id,
         expected_remote.map(|commit| commit.id.as_str()),
@@ -488,7 +515,8 @@ async fn push_provider_state(
             current_id.unwrap_or("<empty>")
         );
     }
-    upload_head(client, local_head).await
+    upload_head(client, local_head).await?;
+    cleanup_outbound_cache(store, &cache_owner).await
 }
 
 async fn pull_provider_state(
@@ -626,7 +654,12 @@ async fn upload_head(client: &ProviderClient, commit: &HistoryCommit) -> anyhow:
         .await
 }
 
-async fn upload_snapshot(client: &ProviderClient, plan: &SyncPlan) -> anyhow::Result<()> {
+async fn upload_snapshot(
+    client: &ProviderClient,
+    store: &CloudNodeStore,
+    plan: &SyncPlan,
+    cache_owner: &str,
+) -> anyhow::Result<()> {
     let root = plan.root_hex();
     let index_key = format!("snapshots/{root}/index.json");
     if let Some(existing) = client.get(&index_key).await? {
@@ -638,6 +671,7 @@ async fn upload_snapshot(client: &ProviderClient, plan: &SyncPlan) -> anyhow::Re
         anyhow::bail!("Cloud Node provider snapshot index collision for root {root}");
     }
 
+    let cache_root = prepare_outbound_cache(store, cache_owner, plan).await?;
     let header = plan.header()?;
     let mut resources = Vec::new();
     for object in plan.ordered() {
@@ -645,11 +679,21 @@ async fn upload_snapshot(client: &ProviderClient, plan: &SyncPlan) -> anyhow::Re
         let content_hex = hex::encode(object.content_sha256);
         let base = format!("snapshots/{root}/objects/{object_hex}/{content_hex}");
 
-        let manifest = fs::read(&object.manifest_path)?;
-        let manifest_sha: [u8; 32] = Sha256::digest(&manifest).into();
+        let manifest_path = cached_resource_path(
+            &cache_root,
+            object,
+            TransferResource::Manifest,
+            &object.manifest_path,
+        )?;
+        let (manifest_sha, manifest_size) = hash_and_size(&manifest_path).await?;
         let manifest_key = format!("{base}/{}", object.kind.manifest_name());
         client
-            .put(&manifest_key, manifest.clone(), "application/octet-stream")
+            .put_file(
+                &manifest_key,
+                &manifest_path,
+                "application/octet-stream",
+                manifest_sha,
+            )
             .await?;
         resources.push(resource_record(
             object.kind,
@@ -657,7 +701,7 @@ async fn upload_snapshot(client: &ProviderClient, plan: &SyncPlan) -> anyhow::Re
             object.object_key,
             object.content_sha256,
             manifest_sha,
-            manifest.len(),
+            manifest_size,
             manifest_key,
         )?);
 
@@ -668,33 +712,50 @@ async fn upload_snapshot(client: &ProviderClient, plan: &SyncPlan) -> anyhow::Re
                     .payload_path
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Cloud Node file sync object has no payload"))?;
-                let payload = fs::read(payload_path)?;
-                let payload_sha: [u8; 32] = Sha256::digest(&payload).into();
-                if payload_sha != object.content_sha256 {
-                    anyhow::bail!("Cloud Node file payload changed while provider snapshot was being uploaded");
-                }
+                let cached_payload = cached_resource_path(
+                    &cache_root,
+                    object,
+                    TransferResource::FilePayload,
+                    payload_path,
+                )?;
+                let payload_size = tokio::fs::metadata(&cached_payload).await?.len();
                 let payload_key = format!("{base}/payload");
                 client
-                    .put(&payload_key, payload.clone(), "application/octet-stream")
+                    .put_file(
+                        &payload_key,
+                        &cached_payload,
+                        "application/octet-stream",
+                        object.content_sha256,
+                    )
                     .await?;
                 resources.push(resource_record(
                     object.kind,
                     TransferResource::FilePayload,
                     object.object_key,
                     object.content_sha256,
-                    payload_sha,
-                    payload.len(),
+                    object.content_sha256,
+                    payload_size,
                     payload_key,
                 )?);
             }
             BlobKind::Video => {
                 for chunk_path in &object.chunk_paths {
-                    let chunk = fs::read(chunk_path)?;
-                    let chunk_sha: [u8; 32] = Sha256::digest(&chunk).into();
+                    let cached_chunk = cached_resource_path(
+                        &cache_root,
+                        object,
+                        TransferResource::VideoChunk,
+                        chunk_path,
+                    )?;
+                    let (chunk_sha, chunk_size) = hash_and_size(&cached_chunk).await?;
                     let chunk_hex = hex::encode(chunk_sha);
                     let chunk_key = format!("{base}/chunks/{chunk_hex}.chunk");
                     client
-                        .put(&chunk_key, chunk.clone(), "application/octet-stream")
+                        .put_file(
+                            &chunk_key,
+                            &cached_chunk,
+                            "application/octet-stream",
+                            chunk_sha,
+                        )
                         .await?;
                     resources.push(resource_record(
                         object.kind,
@@ -702,7 +763,7 @@ async fn upload_snapshot(client: &ProviderClient, plan: &SyncPlan) -> anyhow::Re
                         object.object_key,
                         object.content_sha256,
                         chunk_sha,
-                        chunk.len(),
+                        chunk_size,
                         chunk_key,
                     )?);
                 }
@@ -726,6 +787,27 @@ async fn upload_snapshot(client: &ProviderClient, plan: &SyncPlan) -> anyhow::Re
             "application/json",
         )
         .await
+}
+
+async fn hash_and_size(path: &Path) -> anyhow::Result<([u8; 32], u64)> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut digest = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        size = size
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| anyhow::anyhow!("provider upload read size exceeds u64"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("provider upload size overflow"))?;
+    }
+    Ok((digest.finalize().into(), size))
 }
 
 async fn restore_snapshot(
@@ -918,7 +1000,7 @@ fn resource_record(
     object_key: [u8; 32],
     content_sha256: [u8; 32],
     resource_sha256: [u8; 32],
-    size: usize,
+    size: u64,
     key: String,
 ) -> anyhow::Result<ProviderResource> {
     Ok(ProviderResource {
@@ -927,8 +1009,7 @@ fn resource_record(
         object_key: hex::encode(object_key),
         content_sha256: hex::encode(content_sha256),
         resource_sha256: hex::encode(resource_sha256),
-        size: u64::try_from(size)
-            .map_err(|_| anyhow::anyhow!("Cloud Node provider resource size exceeds u64"))?,
+        size,
         key,
     })
 }
@@ -1120,6 +1201,19 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn provider_cache_owner_is_stable_and_path_safe() {
+        let first = provider_cache_owner("prod-primary");
+        let second = provider_cache_owner("prod-primary");
+        let other = provider_cache_owner("prod-secondary");
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert!(first.starts_with("provider-"));
+        assert!(!first.contains('/'));
+        assert!(!first.contains('\\'));
+        assert!(!first.contains(".."));
     }
 
     #[test]

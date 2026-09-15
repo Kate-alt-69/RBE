@@ -1,10 +1,13 @@
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{
-    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, HOST, RANGE,
+    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST,
+    RANGE,
 };
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use sha2::{Digest, Sha256};
+use tokio_util::io::ReaderStream;
 
 use crate::config::{ProviderAuthMode, ProviderKind, ProviderSettings};
 
@@ -254,6 +257,93 @@ impl ProviderClient {
         Ok(())
     }
 
+    pub(crate) async fn put_file(
+        &self,
+        relative: &str,
+        path: &Path,
+        content_type: &str,
+        expected_sha256: [u8; 32],
+    ) -> anyhow::Result<u64> {
+        let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+            anyhow::anyhow!(
+                "failed to stat Cloud Node provider upload source {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "Cloud Node provider upload source is not a file: {}",
+                path.display()
+            );
+        }
+        let size = metadata.len();
+        let key = self.object_key(relative)?;
+        let response = match self.settings.kind {
+            ProviderKind::AmazonS3 => {
+                self.aws_file_request(&key, path, content_type, expected_sha256, size)
+                    .await?
+            }
+            ProviderKind::Supabase => {
+                let url = self.supabase_url(&key, false)?;
+                self.apply_supabase_auth(
+                    self.client
+                        .put(url)
+                        .header("x-upsert", "true")
+                        .header(CONTENT_TYPE, content_type)
+                        .header(CONTENT_LENGTH, size)
+                        .body(file_body(path).await?),
+                )?
+                .send()
+                .await?
+            }
+            ProviderKind::AzureBlob => {
+                let url = self.azure_url(&key)?;
+                self.client
+                    .put(url)
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header(CONTENT_TYPE, content_type)
+                    .header(CONTENT_LENGTH, size)
+                    .body(file_body(path).await?)
+                    .send()
+                    .await?
+            }
+            ProviderKind::GoogleCloudStorage => {
+                let url = self.gcs_url(&key)?;
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .oauth_token_env
+                        .as_deref()
+                        .or(self.settings.auth.bearer_token_env.as_deref())
+                        .or(self.settings.credential_env.as_deref()),
+                    GOOGLE_OAUTH_TOKEN_ENV,
+                )?;
+                self.client
+                    .put(url)
+                    .bearer_auth(token)
+                    .header(CONTENT_TYPE, content_type)
+                    .header(CONTENT_LENGTH, size)
+                    .body(file_body(path).await?)
+                    .send()
+                    .await?
+            }
+            ProviderKind::Http => {
+                let url = self.http_url(&key)?;
+                self.apply_http_auth(
+                    self.client
+                        .put(url)
+                        .header(CONTENT_TYPE, content_type)
+                        .header(CONTENT_LENGTH, size)
+                        .body(file_body(path).await?),
+                )?
+                .send()
+                .await?
+            }
+        };
+        response_bytes(response, "upload", false).await?;
+        Ok(size)
+    }
+
     pub async fn probe(&self) -> anyhow::Result<()> {
         let probe_key = "provider/probe.json";
         let payload = format!(
@@ -468,6 +558,63 @@ impl ProviderClient {
         content_type: Option<&str>,
         range: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
+        let payload_sha256: [u8; 32] = Sha256::digest(&body).into();
+        let content_length = if body.is_empty() {
+            None
+        } else {
+            Some(
+                u64::try_from(body.len())
+                    .map_err(|_| anyhow::anyhow!("Cloud Node S3 request body exceeds u64"))?,
+            )
+        };
+        let body = if body.is_empty() {
+            None
+        } else {
+            Some(reqwest::Body::from(body))
+        };
+        self.aws_signed_request(
+            method,
+            key,
+            body,
+            payload_sha256,
+            content_type,
+            range,
+            content_length,
+        )
+        .await
+    }
+
+    async fn aws_file_request(
+        &self,
+        key: &str,
+        path: &Path,
+        content_type: &str,
+        payload_sha256: [u8; 32],
+        content_length: u64,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.aws_signed_request(
+            Method::PUT,
+            key,
+            Some(file_body(path).await?),
+            payload_sha256,
+            Some(content_type),
+            None,
+            Some(content_length),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn aws_signed_request(
+        &self,
+        method: Method,
+        key: &str,
+        body: Option<reqwest::Body>,
+        payload_sha256: [u8; 32],
+        content_type: Option<&str>,
+        range: Option<&str>,
+        content_length: Option<u64>,
+    ) -> anyhow::Result<reqwest::Response> {
         let region = self
             .settings
             .region
@@ -508,7 +655,7 @@ impl ProviderClient {
             AMAZON_SESSION_TOKEN_ENV,
         )?;
         let (short_date, amz_date) = aws_timestamp(SystemTime::now())?;
-        let payload_hash = hex::encode(Sha256::digest(&body));
+        let payload_hash = hex::encode(payload_sha256);
         let host = host_header(&url)?;
         let canonical_uri = if url.path().is_empty() {
             "/"
@@ -561,10 +708,13 @@ impl ProviderClient {
         if let Some(content_type) = content_type {
             request = request.header(CONTENT_TYPE, content_type);
         }
+        if let Some(content_length) = content_length {
+            request = request.header(CONTENT_LENGTH, content_length);
+        }
         if let Some(range) = range {
             request = request.header(RANGE, range);
         }
-        if !body.is_empty() {
+        if let Some(body) = body {
             request = request.body(body);
         }
         request
@@ -572,6 +722,16 @@ impl ProviderClient {
             .await
             .map_err(|error| anyhow::anyhow!("Cloud Node amazon-s3 request failed: {error}"))
     }
+}
+
+async fn file_body(path: &Path) -> anyhow::Result<reqwest::Body> {
+    let file = tokio::fs::File::open(path).await.map_err(|error| {
+        anyhow::anyhow!(
+            "failed to open Cloud Node provider upload source {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(reqwest::Body::wrap_stream(ReaderStream::new(file)))
 }
 
 async fn checked_download_response(

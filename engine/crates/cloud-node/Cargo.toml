@@ -11,7 +11,7 @@ required-features = ["client"]
 
 [features]
 default = ["client"]
-client = ["dep:reqwest"]
+client = ["dep:reqwest", "dep:tokio-util"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -22,5 +22,6 @@ hex = "0.4"
 ed25519-dalek = "2"
 rand = "0.8"
 tokio = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"], optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
 url = "2"
