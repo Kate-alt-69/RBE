@@ -147,6 +147,16 @@ impl EnvironmentStorageManager {
         Ok(Some(bytes))
     }
 
+    pub fn exists(&self, namespace: &str, path: &str) -> Result<bool> {
+        validate_namespace(namespace)?;
+        let path = normalize_relative_path(path)?;
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("storage commit lock poisoned");
+        Ok(self.load_manifest(namespace)?.files.contains_key(&path))
+    }
+
     pub fn list(&self, namespace: &str) -> Result<Vec<String>> {
         validate_namespace(namespace)?;
         let _guard = self

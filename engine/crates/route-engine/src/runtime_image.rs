@@ -24,11 +24,46 @@ use crate::wasm_compiler::{
 };
 
 pub(crate) const STORAGE_CAPABILITY_TARGET_PREFIX: &str = "storage:";
-pub(crate) const STORAGE_CAPABILITY_OPERATIONS: [&str; 4] = ["read", "list", "snapshot", "commit"];
+pub(crate) const STORAGE_RAW_CAPABILITY_OPERATIONS: [&str; 4] =
+    ["read", "list", "snapshot", "commit"];
+pub(crate) const STORAGE_LIBRARY_OPERATIONS: [&str; 10] = [
+    "readBytes",
+    "writeBytes",
+    "readText",
+    "writeText",
+    "readJson",
+    "writeJson",
+    "exists",
+    "remove",
+    "list",
+    "snapshot",
+];
+pub(crate) const STORAGE_CAPABILITY_OPERATIONS: [&str; 12] = [
+    "read",
+    "list",
+    "snapshot",
+    "commit",
+    "readBytes",
+    "writeBytes",
+    "readText",
+    "writeText",
+    "readJson",
+    "writeJson",
+    "exists",
+    "remove",
+];
 pub(crate) const MAX_STORAGE_NAMESPACE_BYTES: usize = 64;
 
 pub(crate) fn storage_capability_operation_allowed(operation: &str) -> bool {
     STORAGE_CAPABILITY_OPERATIONS.contains(&operation)
+}
+
+pub(crate) fn storage_raw_operation_allowed(operation: &str) -> bool {
+    STORAGE_RAW_CAPABILITY_OPERATIONS.contains(&operation)
+}
+
+pub(crate) fn storage_library_operation_allowed(operation: &str) -> bool {
+    STORAGE_LIBRARY_OPERATIONS.contains(&operation)
 }
 
 pub(crate) fn storage_capability_owner_allowed(owner: &str) -> bool {

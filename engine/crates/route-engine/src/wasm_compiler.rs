@@ -325,7 +325,8 @@ fn direct_linked_capability_import(
             )
         }
         ImportTarget::BuiltinFunction { module, function }
-            if module == "storage" && storage_capability_operation_allowed(function) =>
+            if matches!(module.as_str(), "storage" | "Storage")
+                && storage_capability_operation_allowed(function) =>
         {
             (
                 ContainerCapabilityKind::Storage,
@@ -1849,6 +1850,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.output, br#"{"id":"kate"}"#);
+    }
+
+    #[test]
+    fn linked_storage_library_json_read_uses_exact_module_namespace() {
+        let module = parse_module(
+            r#":import[Storage.readJson as readProfile]
+               export function load(path) { return readProfile(path); }"#,
+        );
+        let links = link_module_function("load", "accounts.profile", &module, "load");
+        let route = parse(
+            r#":import["./module/accounts/profile".load]
+               class Route { get(req) { return load("users/kate.json"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("Storage.readJson wrapper should compile natively");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Storage);
+            assert_eq!(request.target, "storage:accounts.profile");
+            assert_eq!(request.operation, "readJson");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["users/kate.json"])
+            );
+            Ok(br#"{"found":true,"value":{"name":"Kate"}}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"found":true,"value":{"name":"Kate"}}"#);
     }
 
     #[test]

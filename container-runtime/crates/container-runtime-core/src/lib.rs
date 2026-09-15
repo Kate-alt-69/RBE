@@ -20,6 +20,7 @@ mod execution;
 mod runtime;
 mod storage;
 mod storage_capability;
+mod storage_library;
 mod swamp;
 mod worker;
 
@@ -43,6 +44,10 @@ pub use storage::{EnvironmentStorageManager, StorageCommit, StorageSnapshot, Sto
 pub use storage_capability::{
     dispatch_storage_capability, storage_capability_operation_allowed, storage_capability_target,
     StorageCapabilityError, STORAGE_CAPABILITY_OPERATIONS, STORAGE_CAPABILITY_TARGET_PREFIX,
+};
+pub use storage_library::{
+    dispatch_storage_library, storage_library_operation_allowed, StorageLibraryError,
+    STORAGE_LIBRARY_OPERATIONS,
 };
 pub use swamp::SwampSnapshot;
 pub use worker::{Canceller, Runner, WorkerSnapshot, WorkerState};

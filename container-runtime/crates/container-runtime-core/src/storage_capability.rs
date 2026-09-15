@@ -4,10 +4,26 @@ use ipc_protocol::MAX_CAPABILITY_PAYLOAD_BYTES;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::storage_library::{
+    dispatch_storage_library, storage_library_operation_allowed, StorageLibraryError,
+};
 use crate::EnvironmentStorageManager;
 
 pub const STORAGE_CAPABILITY_TARGET_PREFIX: &str = "storage:";
-pub const STORAGE_CAPABILITY_OPERATIONS: [&str; 4] = ["read", "list", "snapshot", "commit"];
+pub const STORAGE_CAPABILITY_OPERATIONS: [&str; 12] = [
+    "read",
+    "list",
+    "snapshot",
+    "commit",
+    "readBytes",
+    "writeBytes",
+    "readText",
+    "writeText",
+    "readJson",
+    "writeJson",
+    "exists",
+    "remove",
+];
 const MAX_STORAGE_NAMESPACE_BYTES: usize = 64;
 const MAX_COMMIT_MUTATIONS: usize = 256;
 
@@ -155,6 +171,10 @@ pub fn dispatch_storage_capability(
                 "changedPaths": commit.changed_paths,
             })
         }
+        operation if storage_library_operation_allowed(operation) => {
+            dispatch_storage_library(storage, namespace, operation, &args)
+                .map_err(storage_library_error)?
+        }
         _ => unreachable!("operation allowlist checked above"),
     };
 
@@ -221,6 +241,13 @@ fn encode_response(
         ));
     }
     Ok(payload)
+}
+
+fn storage_library_error(error: StorageLibraryError) -> StorageCapabilityError {
+    StorageCapabilityError {
+        code: error.code,
+        message: error.message,
+    }
 }
 
 fn invalid_args(message: &str) -> StorageCapabilityError {

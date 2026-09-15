@@ -23,9 +23,10 @@ use crate::modules::binding_name;
 use crate::parser::{ParseError, Parser};
 use crate::runtime_env::{RuntimeEnv, RuntimeEnvError};
 use crate::runtime_image::{
-    stable_image_hash, stable_source_hash, storage_capability_operation_allowed,
-    storage_capability_owner_allowed, RuntimeCapabilityRequirement, RuntimeExecutable,
-    RuntimeImage, RuntimeSourceManifest, STORAGE_CAPABILITY_OPERATIONS,
+    stable_image_hash, stable_source_hash, storage_capability_owner_allowed,
+    storage_library_operation_allowed, storage_raw_operation_allowed, RuntimeCapabilityRequirement,
+    RuntimeExecutable, RuntimeImage, RuntimeSourceManifest, STORAGE_LIBRARY_OPERATIONS,
+    STORAGE_RAW_CAPABILITY_OPERATIONS,
 };
 use crate::server_policy::{ServerPolicy, ServerPolicyError};
 use crate::server_rel::{compile_server_source, ServerCompileError, ServerProgram};
@@ -583,7 +584,7 @@ fn validate_capabilities(
                     message: "quickDB is a Service REL process-local capability".into(),
                 });
             }
-            if name == "storage" {
+            if matches!(name.as_str(), "storage" | "Storage") {
                 if kind != RelSourceKind::Module {
                     return Err(RelcError::Capability {
                         code: "RELC2101",
@@ -597,19 +598,36 @@ fn validate_capabilities(
                         return Err(RelcError::Capability {
                             code: "RELC2102",
                             source: source.clone(),
-                            message: "Storage namespace imports are forbidden; import one exact operation such as `storage.read`"
-                                .into(),
+                            message: if name == "Storage" {
+                                "Storage namespace imports are forbidden; import one exact function such as `Storage.readJson`"
+                                    .into()
+                            } else {
+                                "Storage namespace imports are forbidden; import one exact operation such as `storage.read`"
+                                    .into()
+                            },
                         });
                     }
                     ImportTarget::BuiltinFunction { function, .. }
-                        if !storage_capability_operation_allowed(function) =>
+                        if name == "storage" && !storage_raw_operation_allowed(function) =>
                     {
                         return Err(RelcError::Capability {
                             code: "RELC2102",
                             source: source.clone(),
                             message: format!(
-                                "unsupported Environment Storage operation {function:?}; expected one of {:?}",
-                                STORAGE_CAPABILITY_OPERATIONS
+                                "unsupported low-level Environment Storage operation {function:?}; expected one of {:?}",
+                                STORAGE_RAW_CAPABILITY_OPERATIONS
+                            ),
+                        });
+                    }
+                    ImportTarget::BuiltinFunction { function, .. }
+                        if name == "Storage" && !storage_library_operation_allowed(function) =>
+                    {
+                        return Err(RelcError::Capability {
+                            code: "RELC2102",
+                            source: source.clone(),
+                            message: format!(
+                                "unsupported Storage library function {function:?}; expected one of {:?}",
+                                STORAGE_LIBRARY_OPERATIONS
                             ),
                         });
                     }
@@ -932,11 +950,12 @@ fn builtin_host_requirements(
 ) -> Result<BTreeSet<RuntimeCapabilityRequirement>, RelcError> {
     let operations: &[&str] = match module {
         "http" => HTTP_HOST_OPERATIONS,
-        "storage" => &STORAGE_CAPABILITY_OPERATIONS,
+        "storage" => &STORAGE_RAW_CAPABILITY_OPERATIONS,
+        "Storage" => &STORAGE_LIBRARY_OPERATIONS,
         "vm" | "video-manager" => VIDEO_LANGUAGE_OPERATIONS,
         _ => return Ok(BTreeSet::new()),
     };
-    let module_owner = if matches!(module, "storage" | "vm" | "video-manager") {
+    let module_owner = if matches!(module, "storage" | "Storage" | "vm" | "video-manager") {
         let owner = module_owner.ok_or_else(|| RelcError::Capability {
             code: "RELC2101",
             source: source.clone(),
@@ -944,7 +963,7 @@ fn builtin_host_requirements(
                 "{module} authority is Module-owned; direct capability requirements must originate from Module REL"
             ),
         })?;
-        if module == "storage" && !storage_capability_owner_allowed(owner) {
+        if matches!(module, "storage" | "Storage") && !storage_capability_owner_allowed(owner) {
             return Err(RelcError::Capability {
                 code: "RELC2102",
                 source: source.clone(),
@@ -965,7 +984,7 @@ fn builtin_host_requirements(
             "http" => RuntimeCapabilityRequirement::PublicHttp {
                 operation: operation.to_string(),
             },
-            "storage" => RuntimeCapabilityRequirement::Storage {
+            "storage" | "Storage" => RuntimeCapabilityRequirement::Storage {
                 owner: module_owner
                     .expect("Storage owner validated above")
                     .to_string(),

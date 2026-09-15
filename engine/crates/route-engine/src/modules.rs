@@ -41,6 +41,7 @@ enum BuiltinModule {
     Request,
     Security,
     Response,
+    Storage,
     VideoManager,
 }
 
@@ -122,6 +123,20 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
                 | "clearCookie"
                 | "clear_cookie"
         ),
+        "storage" => matches!(function, "read" | "list" | "snapshot" | "commit"),
+        "Storage" => matches!(
+            function,
+            "readBytes"
+                | "writeBytes"
+                | "readText"
+                | "writeText"
+                | "readJson"
+                | "writeJson"
+                | "exists"
+                | "remove"
+                | "list"
+                | "snapshot"
+        ),
         "vm" | "video-manager" => matches!(
             function,
             "status"
@@ -187,6 +202,7 @@ impl ModuleRegistry {
                         "request" => ModuleKind::Builtin(BuiltinModule::Request),
                         "security" => ModuleKind::Builtin(BuiltinModule::Security),
                         "response" => ModuleKind::Builtin(BuiltinModule::Response),
+                        "storage" | "Storage" => ModuleKind::Builtin(BuiltinModule::Storage),
                         "vm" | "video-manager" => ModuleKind::Builtin(BuiltinModule::VideoManager),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{name}"),
@@ -208,6 +224,7 @@ impl ModuleRegistry {
                         "request" => ModuleKind::Builtin(BuiltinModule::Request),
                         "security" => ModuleKind::Builtin(BuiltinModule::Security),
                         "response" => ModuleKind::Builtin(BuiltinModule::Response),
+                        "storage" | "Storage" => ModuleKind::Builtin(BuiltinModule::Storage),
                         "vm" | "video-manager" => ModuleKind::Builtin(BuiltinModule::VideoManager),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{module}"),
@@ -303,6 +320,11 @@ impl ModuleRegistry {
             ModuleKind::Builtin(BuiltinModule::Request) => call_request(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Security) => call_security(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Response) => call_response(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Storage) => Err(ModuleError {
+                message: format!(
+                    "{module_name}.{function_name}() requires the Container-owned Storage capability"
+                ),
+            }),
             ModuleKind::Builtin(BuiltinModule::VideoManager) => Err(ModuleError {
                 message: format!(
             "{module_name}.{function_name}() requires the privileged module Video Manager host capability"
