@@ -27,36 +27,27 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
+          import re
 
           provider = Path('engine/crates/cloud-node/src/provider.rs')
           text = provider.read_text()
-          text = text.replace(
-              'let url = self.supabase_url(&key)?;\n                self.apply_supabase_auth(self.client.get(url))?',
-              'let url = self.supabase_url(&key, true)?;\n                self.apply_supabase_auth(self.client.get(url))?',
-              1,
+          text, count = re.subn(
+              r'let url = self\.supabase_url\(&key\)\?;\n(\s+)self\.apply_supabase_auth\(self\.client\.get\(url\)\)\?',
+              r'let url = self.supabase_url(&key, true)?;\n\1self.apply_supabase_auth(self.client.get(url))?',
+              text,
+              count=1,
           )
-          text = text.replace(
-              'let url = self.supabase_url(&key)?;\n                self.apply_supabase_auth(\n                    self.client',
-              'let url = self.supabase_url(&key, false)?;\n                self.apply_supabase_auth(\n                    self.client',
-              1,
+          if count != 1:
+              raise SystemExit('Supabase GET call not found')
+          text, count = re.subn(
+              r'let url = self\.supabase_url\(&key\)\?;\n(\s+)self\.apply_supabase_auth\(\n',
+              r'let url = self.supabase_url(&key, false)?;\n\1self.apply_supabase_auth(\n',
+              text,
+              count=1,
           )
-          old = '''    fn supabase_url(&self, key: &str) -> anyhow::Result<Url> {
-              let endpoint = self
-                  .settings
-                  .endpoint
-                  .as_deref()
-                  .ok_or_else(|| anyhow::anyhow!("supabase provider endpoint is missing"))?;
-              object_url(
-                  endpoint,
-                  &format!(
-                      "storage/v1/object/{}/{}",
-                      encode_path_segment(&self.settings.bucket),
-                      encode_object_key(key)
-                  ),
-              )
-          }
-          '''
-          new = '''    fn supabase_url(&self, key: &str, authenticated_read: bool) -> anyhow::Result<Url> {
+          if count != 1:
+              raise SystemExit('Supabase PUT call not found')
+          replacement = '''    fn supabase_url(&self, key: &str, authenticated_read: bool) -> anyhow::Result<Url> {
               let endpoint = self
                   .settings
                   .endpoint
@@ -76,13 +67,18 @@ jobs:
                   ),
               )
           }
+
           '''
-          if old not in text:
-              raise SystemExit('supabase_url block not found')
-          text = text.replace(old, new, 1)
-          marker = '''    #[test]
-              fn aws_epoch_timestamp_is_stable() {
-          '''
+          text, count = re.subn(
+              r'    fn supabase_url\(&self, key: &str\) -> anyhow::Result<Url> \{.*?\n    \}\n\n(?=    fn azure_url)',
+              replacement,
+              text,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit('supabase_url function not found')
+          marker = '    #[test]\n    fn aws_epoch_timestamp_is_stable() {'
           test = '''    #[test]
               fn supabase_uses_authenticated_read_route() {
                   let settings: ProviderSettings = serde_json::from_value(serde_json::json!({
@@ -95,8 +91,7 @@ jobs:
                   let client = ProviderClient::new(&settings).unwrap();
                   assert_eq!(
                       client.supabase_url("history/HEAD.json", true).unwrap().path(),
-                      "/storage/v1/object/authenticated/private-backups/tenant-a"
-                          .replace("tenant-a", "history/HEAD.json")
+                      "/storage/v1/object/authenticated/private-backups/history/HEAD.json"
                   );
                   assert_eq!(
                       client.supabase_url("history/HEAD.json", false).unwrap().path(),
@@ -105,22 +100,25 @@ jobs:
               }
 
               #[test]
-              fn aws_epoch_timestamp_is_stable() {
-          '''
+              fn aws_epoch_timestamp_is_stable() {'''
           if marker not in text:
-              raise SystemExit('provider test insertion marker not found')
+              raise SystemExit('provider test marker not found')
           text = text.replace(marker, test, 1)
           provider.write_text(text)
 
           sync = Path('engine/crates/cloud-node/src/provider_sync.rs')
           text = sync.read_text()
-          old = '''    let local_root = plan.root_hex();
-              let history = LocalHistory::open(store, &provider.namespace)?;
-              let local_head = history.ensure_snapshot_commit(&settings.node.id, &local_root)?;
-              let remote_head = remote_head(&client).await?;
-              status_from_heads(&history, &client, local_head, remote_head, local_root).await
-          '''
-          new = '''    let local_root = plan.root_hex();
+          provider_status = '''pub async fn provider_status(
+              settings: &CloudNodeSettings,
+              store: &CloudNodeStore,
+          ) -> anyhow::Result<ProviderSyncStatus> {
+              let provider = settings
+                  .provider
+                  .as_ref()
+                  .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
+              let client = ProviderClient::new(provider)?;
+              let plan = store.sync_plan()?;
+              let local_root = plan.root_hex();
               let history = LocalHistory::open(store, &provider.namespace)?;
               let remote = remote_head(&client).await?;
               if history.head()?.is_none() {
@@ -143,25 +141,30 @@ jobs:
               }
               let local_head = history.ensure_snapshot_commit(&settings.node.id, &local_root)?;
               status_from_heads(&history, &client, local_head, remote, local_root).await
-          '''
-          if old not in text:
-              raise SystemExit('provider_status block not found')
-          text = text.replace(old, new, 1)
+          }
 
-          old = '''    let local_root = plan.root_hex();
-              let history = LocalHistory::open(store, &provider.namespace)?;
-              let local_head = history.ensure_snapshot_commit(&settings.node.id, &local_root)?;
-              let remote = remote_head(&client).await?;
-              let before = status_from_heads(
-                  &history,
-                  &client,
-                  local_head.clone(),
-                  remote.clone(),
-                  local_root,
-              )
-              .await?;
           '''
-          new = '''    let local_root = plan.root_hex();
+          text, count = re.subn(
+              r'pub async fn provider_status\(.*?\n\}\n\n(?=pub async fn synchronize_provider)',
+              provider_status,
+              text,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit('provider_status function not found')
+
+          synchronize = '''pub async fn synchronize_provider(
+              settings: &CloudNodeSettings,
+              store: &CloudNodeStore,
+          ) -> anyhow::Result<ProviderSyncResult> {
+              let provider = settings
+                  .provider
+                  .as_ref()
+                  .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
+              let client = ProviderClient::new(provider)?;
+              let plan = store.sync_plan()?;
+              let local_root = plan.root_hex();
               let history = LocalHistory::open(store, &provider.namespace)?;
               let remote = remote_head(&client).await?;
 
@@ -211,21 +214,80 @@ jobs:
                   local_root,
               )
               .await?;
-          '''
-          if old not in text:
-              raise SystemExit('synchronize_provider block not found')
-          text = text.replace(old, new, 1)
 
-          old = '''    let missing = remote_chain_until_local(history, client, remote_head).await?;
-              restore_snapshot(client, store, &remote_head.snapshot_root).await?;
-              for commit in missing.iter().rev() {
-                  history.write_commit(commit)?;
+              match before.relation {
+                  ProviderSyncRelation::InSync => Ok(ProviderSyncResult {
+                      action: ProviderSyncAction::None,
+                      final_root: before.local_root.clone(),
+                      final_head: before.local_head.clone(),
+                      before,
+                  }),
+                  ProviderSyncRelation::EmptyRemote | ProviderSyncRelation::LocalAhead => {
+                      push_provider_state(&client, &history, &plan, &local_head, remote.as_ref()).await?;
+                      Ok(ProviderSyncResult {
+                          action: ProviderSyncAction::Push,
+                          final_root: local_head.snapshot_root.clone(),
+                          final_head: local_head.id.clone(),
+                          before,
+                      })
+                  }
+                  ProviderSyncRelation::RemoteAhead => {
+                      let remote = remote.ok_or_else(|| anyhow::anyhow!("Cloud Node provider remote head disappeared"))?;
+                      pull_provider_state(&client, &history, store, &remote).await?;
+                      Ok(ProviderSyncResult {
+                          action: ProviderSyncAction::Pull,
+                          final_root: remote.snapshot_root.clone(),
+                          final_head: remote.id.clone(),
+                          before,
+                      })
+                  }
+                  ProviderSyncRelation::Diverged => match provider.conflict_policy {
+                      ProviderConflictPolicy::Fail => anyhow::bail!(
+                          "Cloud Node provider history diverged: local={} remote={}; set conflictPolicy explicitly only if one side should win",
+                          before.local_head,
+                          before.remote_head.as_deref().unwrap_or("<none>")
+                      ),
+                      ProviderConflictPolicy::PreferLocal => {
+                          push_provider_state(&client, &history, &plan, &local_head, None).await?;
+                          Ok(ProviderSyncResult {
+                              action: ProviderSyncAction::ForcedPush,
+                              final_root: local_head.snapshot_root.clone(),
+                              final_head: local_head.id.clone(),
+                              before,
+                          })
+                      }
+                      ProviderConflictPolicy::PreferRemote => {
+                          let remote = remote.ok_or_else(|| anyhow::anyhow!("Cloud Node provider remote head disappeared"))?;
+                          pull_provider_state(&client, &history, store, &remote).await?;
+                          Ok(ProviderSyncResult {
+                              action: ProviderSyncAction::ForcedPull,
+                              final_root: remote.snapshot_root.clone(),
+                              final_head: remote.id.clone(),
+                              before,
+                          })
+                      }
+                  },
               }
-              history.set_head(remote_head)?;
-              Ok(())
           }
+
           '''
-          new = '''    restore_snapshot(client, store, &remote_head.snapshot_root).await?;
+          text, count = re.subn(
+              r'pub async fn synchronize_provider\(.*?\n\}\n\n(?=async fn status_from_heads)',
+              synchronize,
+              text,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit('synchronize_provider function not found')
+
+          replacement = '''async fn pull_provider_state(
+              client: &ProviderClient,
+              history: &LocalHistory,
+              store: &CloudNodeStore,
+              remote_head: &HistoryCommit,
+          ) -> anyhow::Result<()> {
+              restore_snapshot(client, store, &remote_head.snapshot_root).await?;
               import_remote_history(history, client, remote_head).await
           }
 
@@ -240,10 +302,17 @@ jobs:
               }
               history.set_head(remote_head)
           }
+
           '''
-          if old not in text:
-              raise SystemExit('pull_provider_state block not found')
-          text = text.replace(old, new, 1)
+          text, count = re.subn(
+              r'async fn pull_provider_state\(.*?\n\}\n\n(?=async fn remote_chain_until_local)',
+              replacement,
+              text,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit('pull_provider_state function not found')
           sync.write_text(text)
       - name: Format Rust workspace
         working-directory: engine
