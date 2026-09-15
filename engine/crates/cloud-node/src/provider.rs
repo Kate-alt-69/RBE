@@ -204,7 +204,7 @@ impl ProviderClient {
                 let url = self.supabase_url(&key, false)?;
                 self.apply_supabase_auth(
                     self.client
-                        .put(url)
+                        .request(Self::supabase_upload_method(), url)
                         .header("x-upsert", "true")
                         .header(CONTENT_TYPE, content_type)
                         .body(bytes),
@@ -287,7 +287,7 @@ impl ProviderClient {
                 let url = self.supabase_url(&key, false)?;
                 self.apply_supabase_auth(
                     self.client
-                        .put(url)
+                        .request(Self::supabase_upload_method(), url)
                         .header("x-upsert", "true")
                         .header(CONTENT_TYPE, content_type)
                         .header(CONTENT_LENGTH, size)
@@ -359,6 +359,10 @@ impl ProviderClient {
             anyhow::bail!("Cloud Node provider probe returned an empty object");
         }
         Ok(())
+    }
+
+    fn supabase_upload_method() -> Method {
+        Method::POST
     }
 
     fn apply_supabase_auth(&self, request: RequestBuilder) -> anyhow::Result<RequestBuilder> {
@@ -1011,6 +1015,11 @@ mod tests {
             url.as_str(),
             "https://objects.example.invalid/rbe-bucket/rbe-cn/production/history/HEAD.json"
         );
+    }
+
+    #[test]
+    fn supabase_upserts_use_upload_method() {
+        assert_eq!(ProviderClient::supabase_upload_method(), Method::POST);
     }
 
     #[test]
