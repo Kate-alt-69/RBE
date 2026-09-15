@@ -23,3 +23,4 @@ ed25519-dalek = "2"
 rand = "0.8"
 tokio = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"], optional = true }
+url = "2"
