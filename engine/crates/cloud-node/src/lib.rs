@@ -51,8 +51,8 @@ pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
 pub use provider::ProviderClient;
 #[cfg(feature = "client")]
 pub use provider_sync::{
-    inspect_provider_sync, synchronize_provider, ProviderSyncAction, ProviderSyncInspection,
-    ProviderSyncRelation, ProviderSyncResult,
+    provider_status, synchronize_provider, ProviderSyncAction, ProviderSyncRelation,
+    ProviderSyncResult, ProviderSyncStatus,
 };
 pub use recovery::{CloudNodeRecoveryReceiver, RecoveryReceipt};
 pub use server::{
