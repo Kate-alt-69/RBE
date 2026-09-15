@@ -174,6 +174,11 @@ jobs:
           PY
 
           cd engine
+          # The new direct url dependency is already in the transitive graph,
+          # but Cargo still needs one unlocked pass to refresh cloud-node's
+          # package dependency list in Cargo.lock. Everything after this is
+          # deliberately locked again.
+          cargo check -p cloud-node --all-targets
           cargo fmt --all
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
