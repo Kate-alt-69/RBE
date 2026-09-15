@@ -1612,6 +1612,43 @@ mod tests {
     }
 
     #[test]
+    fn linked_storage_module_static_prefix_compiles_into_native_image() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "accounts/prefix-cache",
+                "module/accounts/prefix-cache.module",
+                r#":import[storage.read as readEntry]
+                   function suffix() { return ".json"; }
+                   export function load(name) {
+                       const path = "users/" + name + suffix();
+                       return readEntry(path);
+                   }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "account-prefix-cache",
+                "api/account-prefix-cache.route",
+                r#":import["./module/accounts/prefix-cache".load]
+                   class Route { get(req) { return load("kate"); } }"#,
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        let route = image.routes.first().unwrap();
+        let artifact = image
+            .route_wasm_artifact(route, "get")
+            .expect("static Module prefix should produce Route-WASM");
+        assert_eq!(artifact.verb, "get");
+        assert!(image.route_wasm_fallback(route, "get").is_none());
+        let grants = image.container_capability_grants(route).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Storage);
+        assert_eq!(grants[0].target, "storage:accounts.prefix-cache");
+        assert_eq!(grants[0].operations, vec!["read"]);
+    }
+
+    #[test]
     fn linked_storage_module_helpers_compile_native_with_exact_storage_grant() {
         let sources = vec![
             PhysicalRelSource::new(
