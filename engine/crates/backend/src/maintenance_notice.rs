@@ -70,13 +70,13 @@ struct RecoveryState {
 fn open_recovery_state(
     runtime: &CloudNodeRuntime,
     owner_node_id: &str,
-    session: [u8; 16],
+    _session: [u8; 16],
     expected: SyncPlanHeader,
 ) -> anyhow::Result<RecoveryState> {
     Ok(RecoveryState {
         owner_node_id: owner_node_id.to_owned(),
         expected,
-        receiver: CloudNodeRecoveryReceiver::open(&runtime.store, session)?,
+        receiver: CloudNodeRecoveryReceiver::open(&runtime.store, owner_node_id, expected)?,
     })
 }
 

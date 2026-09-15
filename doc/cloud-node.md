@@ -68,9 +68,10 @@ For a configured storage root `<ROOT>` Cloud Node owns:
 │       ├── versions/<content-sha256>/...     # actual rolling revision payloads
 │       └── history.blob.cn                   # binary rolling history, default 5
 ├── .cache/
-│   └── outbound/<peer-id>/<sync-root>/       # LOCAL durable transfer spool
+│   └── outbound/<peer-id>/<sync-root>/        # frozen LOCAL upload spool; retained on failure
 └── recovery-staging/
-    └── <authenticated-session>/              # REMOTE private recovery staging
+    └── <peer-sha256>/<plan-sha256>/           # private REMOTE crash-resumable staging
+        └── storage/.../*.transfer.part        # fsynced partial resource bytes
 ```
 
 The directory SHA is a stable object identity derived from blob kind + normalized logical path. Every exact content revision has its own SHA-256 inside that object. This gives backup and active storage the same stable lookup key while still keeping immutable content generations.
@@ -105,7 +106,9 @@ A sync begins by exchanging a `SyncPlanHeader` containing the canonical snapshot
 
 Transfers read from that immutable LOCAL cache rather than from live storage. A network or protocol failure deliberately leaves the cache in place. After reauthentication, the same trusted node and same snapshot root can reclaim its REMOTE staging state. Resume acknowledgements report the next verified byte offset, allowing the sender to skip already committed resources or jump over a verified partial prefix instead of retransmitting the entire blob. The acknowledgement extension is opt-in and remains compatible with older peers that return an empty acknowledgement payload.
 
-Recovery is intentionally full-snapshot rather than merge-based. Stale objects on the REMOTE side must disappear. The receiver writes incoming resources to `.part` state inside `recovery-staging/<session>/storage`, verifies hashes and the completed staged tree against the exact root negotiated with the authenticated sender, then swaps that storage tree into the live Cloud Node store. If post-swap verification fails, the previous live storage tree is restored. Content-addressed LOCAL writes likewise use verified `.part` files before final rename, so neither side treats a partially written blob as committed data.
+Recovery is intentionally full-snapshot rather than merge-based. Stale objects on the REMOTE side must disappear. The receiver writes into a staging tree keyed by the authenticated peer plus negotiated plan rather than by the temporary authentication session. Resource bytes are first written to stable `.transfer.part` files and fsynced. If the backend process restarts, the same authenticated peer negotiating the same plan reopens that staging tree, derives the already committed recovery phase, validates replayed prefix bytes, and continues from the durable partial offset instead of deleting the recovery. A changed plan for the same peer prunes the obsolete private staging tree. The completed staged tree is verified against the exact negotiated root and only then swapped into the live Cloud Node store. If post-swap verification fails, the previous live storage tree is restored.
+
+On the LOCAL sender, `.cache/outbound/<peer>/<sync-root>/` freezes the exact snapshot before transfer. The cache is assembled through `.part` files, survives network failure, and is removed only after the REMOTE proves that exact root was activated. Large blobs stay disk-backed rather than being buffered as whole objects in memory.
 
 ## Evaluating-phase boot admission
 
