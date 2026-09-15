@@ -25,11 +25,11 @@ use crate::modules::binding_name;
 use crate::runtime_image::{storage_capability_operation_allowed, storage_capability_target};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-/// Generation 11 lets request-independent REL expressions and local helpers
-/// feed exact host-capability arguments while preserving the same Controller
-/// authority boundary. Dynamic request-derived transformations remain outside
-/// the native subset. Capability ABI v3 remains stable.
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 11;
+/// Generation 12 resolves multiple exact Route imports by the binding the
+/// method actually calls. This removes the former one-import compiler limit
+/// without turning namespace imports or ambiguous bindings into wider authority.
+/// Capability ABI v3 remains stable.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 12;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STATIC_HELPER_CALL_DEPTH: usize = 32;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
@@ -100,11 +100,11 @@ impl RouteWasmLinkContext {
 /// Compile the currently supported native route subset.
 ///
 /// Native lowering remains intentionally strict: one HTTP method. Compiler
-/// generation v11 keeps ABI v3, allows request-independent expressions and
-/// local helpers to construct exact capability arguments, and retains generation
-/// 10's bounded helper folding plus generation 8's immutable linked Module
-/// authority path. Dynamic transformations, host-dependent helpers, wider
-/// Module bodies, namespace imports, and nested host-call chains remain
+/// generation v12 keeps ABI v3 and resolves any number of exact direct or
+/// linked-function imports by the binding actually returned by the method. It
+/// retains generation 11's static capability arguments and generation 10's
+/// bounded helper folding. Namespace imports, ambiguous bindings, dynamic
+/// transformations, wider Module bodies, and nested host-call chains remain
 /// interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let links = RouteWasmLinkContext::default();
@@ -115,39 +115,56 @@ pub(crate) fn compile_route_with_links(
     file: &RouteFile,
     links: &RouteWasmLinkContext,
 ) -> RouteWasmCompilation {
-    let mut host_import = None;
-    let mut linked_import = None;
-    match file.imports.as_slice() {
-        [] => {}
-        [import] => {
-            if let Some(found) = direct_capability_import(import) {
-                host_import = Some(found);
-            } else if matches!(base_import(import), ImportTarget::CustomFunction { .. }) {
-                let binding = binding_name(import);
-                let Some(linked) = links.module_functions.get(&binding) else {
-                    return fallback(
-                        "native linked Module function has no immutable RELC link context",
-                    );
-                };
-                linked_import = Some((binding, linked));
-            } else {
-                return fallback(
-                    "native Route-WASM v10 only supports one direct http.get/post/request import or one linked Module function import",
-                );
+    let mut host_imports = BTreeMap::<String, DirectCapabilityImport>::new();
+    let mut linked_imports = BTreeMap::<String, &LinkedModuleFunction>::new();
+    for import in &file.imports {
+        if let Some(found) = direct_capability_import(import) {
+            let binding = found.binding.clone();
+            if linked_imports.contains_key(&binding)
+                || host_imports.insert(binding.clone(), found).is_some()
+            {
+                return fallback(format!(
+                    "native Route-WASM v12 found ambiguous import binding {binding:?}"
+                ));
             }
+            continue;
         }
-        _ => {
-            return fallback(
-                "native Route-WASM v10 supports at most one direct or linked host-call import",
-            )
+
+        if matches!(base_import(import), ImportTarget::CustomFunction { .. }) {
+            let binding = binding_name(import);
+            let Some(linked) = links.module_functions.get(&binding) else {
+                return fallback(
+                    "native linked Module function has no immutable RELC link context",
+                );
+            };
+            if host_imports.contains_key(&binding)
+                || linked_imports.insert(binding.clone(), linked).is_some()
+            {
+                return fallback(format!(
+                    "native Route-WASM v12 found ambiguous import binding {binding:?}"
+                ));
+            }
+            continue;
         }
+
+        return fallback(
+            "native Route-WASM v12 supports only exact direct http.get/post/request imports or exact linked Module function imports; namespace imports remain interpreter-only",
+        );
     }
     if file.methods.len() != 1 {
         return fallback("native route compilation currently requires exactly one HTTP method");
     }
 
     let method = &file.methods[0];
-    let (bytes, input) = if let Some(import) = host_import.as_ref() {
+    let returned_binding = returned_call_binding(&method.body);
+    let host_import = returned_binding.and_then(|binding| host_imports.get(binding));
+    let linked_import = returned_binding.and_then(|binding| {
+        linked_imports
+            .get(binding)
+            .map(|linked| (binding.to_string(), *linked))
+    });
+
+    let (bytes, input) = if let Some(import) = host_import {
         let [Statement::Return(expr)] = method.body.as_slice() else {
             return fallback(
                 "native host capability route body currently requires one return statement",
@@ -225,6 +242,16 @@ pub(crate) fn compile_route_with_links(
         sha256,
         input,
     })
+}
+
+fn returned_call_binding(body: &[Statement]) -> Option<&str> {
+    let [Statement::Return(Expr::Call(target, _))] = body else {
+        return None;
+    };
+    let Expr::Ident(binding) = target.as_ref() else {
+        return None;
+    };
+    Some(binding.as_str())
 }
 
 fn fallback(reason: impl Into<String>) -> RouteWasmCompilation {
@@ -1210,6 +1237,91 @@ mod tests {
     }
 
     #[test]
+    fn multiple_exact_direct_imports_select_the_called_binding() {
+        let route = parse(
+            r#":import[http.get as fetch]
+               :import[http.post as send]
+               class Route {
+                   get(req) { return send("https://example.com/data", { ok: true }); }
+               }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("multiple exact direct imports should select the returned binding");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Network);
+            assert_eq!(request.target, PUBLIC_HTTP_TARGET);
+            assert_eq!(request.operation, "post");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["https://example.com/data", { "ok": true }])
+            );
+            Ok(br#"{"ok":true}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn mixed_exact_direct_and_linked_imports_select_the_linked_binding() {
+        let module = parse_module(
+            r#":import[storage.read as readEntry]
+               export function load(path) { return readEntry(path); }"#,
+        );
+        let links = link_module_function("load", "accounts.cache", &module, "load");
+        let route = parse(
+            r#":import[http.get as fetch]
+               :import["./module/accounts/cache".load]
+               class Route { get(req) { return load("users/kate.json"); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("mixed exact imports should select the linked binding");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Storage);
+            assert_eq!(request.target, "storage:accounts.cache");
+            assert_eq!(request.operation, "read");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["users/kate.json"])
+            );
+            Ok(br#"{"found":true}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"found":true}"#);
+    }
+
+    #[test]
+    fn namespace_import_among_exact_imports_still_fails_closed() {
+        let route = parse(
+            r#":import[http]
+               :import[http.get as fetch]
+               class Route { get(req) { return fetch("https://example.com/data"); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
+            panic!("namespace import must not gain native authority implicitly");
+        };
+        assert!(reason.contains("namespace imports remain interpreter-only"));
+    }
+
+    #[test]
     fn direct_static_http_get_is_native_v3_capability_call() {
         let route = parse(
             r#":import[http.get]
@@ -1623,9 +1735,7 @@ mod tests {
         let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
             panic!("namespace import must not widen native Network authority");
         };
-        assert!(reason.contains(
-            "one direct http.get/post/request import or one linked Module function import"
-        ));
+        assert!(reason.contains("namespace imports remain interpreter-only"));
     }
 
     #[test]
