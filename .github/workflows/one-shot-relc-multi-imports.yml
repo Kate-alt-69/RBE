@@ -32,18 +32,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           python3 .github/patches/bug-wasm-009.py
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('engine/crates/route-engine/src/wasm_compiler.rs')
-          text = path.read_text()
-          old = '''        assert!(reason.contains(
-            "one direct http.get/post/request import or one linked Module function import"
-        ));'''
-          new = '''        assert!(reason.contains("namespace imports remain interpreter-only"));'''
-          if text.count(old) != 1:
-              raise SystemExit(f'BUG-WASM-009 stale namespace assertion expected once, found {text.count(old)}')
-          path.write_text(text.replace(old, new, 1))
-          PY
+          python3 -c 'from pathlib import Path; p=Path("engine/crates/route-engine/src/wasm_compiler.rs"); t=p.read_text(); old="assert!(reason.contains(\n            \"one direct http.get/post/request import or one linked Module function import\"\n        ));"; new="assert!(reason.contains(\"namespace imports remain interpreter-only\"));"; assert t.count(old)==1, t.count(old); p.write_text(t.replace(old,new,1))'
 
           cd engine
           cargo fmt --all
