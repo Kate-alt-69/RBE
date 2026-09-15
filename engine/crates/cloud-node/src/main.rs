@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cloud_node::{
-    load_signing_key_from_env, negotiate_sync, probe_upstream, public_key_hex,
-    synchronize_upstream, CloudNodeSettings, CloudNodeStore, SETTINGS_FILE_NAME,
+    load_signing_key_from_env, negotiate_sync, probe_upstream, provider_status, public_key_hex,
+    synchronize_provider, synchronize_upstream, CloudNodeSettings, CloudNodeStore, ProviderClient,
+    SETTINGS_FILE_NAME,
 };
 
 #[tokio::main]
@@ -41,8 +42,16 @@ async fn run() -> anyhow::Result<()> {
             println!("syncRoot={}", plan.root_hex());
             println!("syncObjects={}", plan.object_count());
             if let Some(upstream) = &settings.upstream {
+                println!("transport=peer");
                 println!("upstream={}", upstream.url);
                 println!("upstreamNode={}", upstream.node_id);
+            }
+            if let Some(provider) = &settings.provider {
+                let client = ProviderClient::new(provider)?;
+                println!("transport=provider");
+                println!("provider={:?}", provider.kind);
+                println!("providerTarget={}", client.target_description());
+                println!("providerConflictPolicy={:?}", provider.conflict_policy);
             }
         }
         "probe-upstream" => {
@@ -65,6 +74,38 @@ async fn run() -> anyhow::Result<()> {
             println!("localRoot={}", hex::encode(negotiation.local.root_sha256));
             println!("remoteRoot={}", hex::encode(negotiation.remote.root_sha256));
             println!("rootsMatch={}", negotiation.roots_match());
+        }
+        "probe-provider" => {
+            let provider = settings
+                .provider
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
+            let client = ProviderClient::new(provider)?;
+            client.probe().await?;
+            println!("provider={:?}", provider.kind);
+            println!("target={}", client.target_description());
+            println!("reachable=true");
+        }
+        "provider-status" => {
+            let status = provider_status(&settings, &store).await?;
+            println!("relation={:?}", status.relation);
+            println!("localHead={}", status.local_head);
+            println!("localRoot={}", status.local_root);
+            println!(
+                "remoteHead={}",
+                status.remote_head.as_deref().unwrap_or("<empty>")
+            );
+            println!(
+                "remoteRoot={}",
+                status.remote_root.as_deref().unwrap_or("<empty>")
+            );
+        }
+        "sync-provider" => {
+            let result = synchronize_provider(&settings, &store).await?;
+            println!("before={:?}", result.before.relation);
+            println!("action={:?}", result.action);
+            println!("head={}", result.final_head);
+            println!("root={}", result.final_root);
         }
         "run" => run_daemon(&settings, &store).await?,
         "sync-plan" => {
@@ -108,10 +149,17 @@ async fn run() -> anyhow::Result<()> {
 }
 
 async fn run_daemon(settings: &CloudNodeSettings, store: &CloudNodeStore) -> anyhow::Result<()> {
+    if settings.provider.is_some() {
+        return run_provider_daemon(settings, store).await;
+    }
+    run_peer_daemon(settings, store).await
+}
+
+async fn run_peer_daemon(settings: &CloudNodeSettings, store: &CloudNodeStore) -> anyhow::Result<()> {
     let upstream = settings
         .upstream
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Cloud Node run mode requires an upstream"))?;
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node run mode requires an upstream or provider"))?;
     loop {
         match probe_upstream(settings).await {
             Ok(peer) => {
@@ -156,6 +204,50 @@ async fn run_daemon(settings: &CloudNodeSettings, store: &CloudNodeStore) -> any
     }
 }
 
+async fn run_provider_daemon(
+    settings: &CloudNodeSettings,
+    store: &CloudNodeStore,
+) -> anyhow::Result<()> {
+    let provider = settings
+        .provider
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
+    let client = ProviderClient::new(provider)?;
+    loop {
+        let result = if provider.sync_on_connect {
+            synchronize_provider(settings, store)
+                .await
+                .map(|sync| {
+                    println!(
+                        "Cloud Node provider sync target={} before={:?} action={:?} head={} root={}",
+                        client.target_description(),
+                        sync.before.relation,
+                        sync.action,
+                        sync.final_head,
+                        sync.final_root
+                    );
+                })
+        } else {
+            client.probe().await.map(|()| {
+                println!(
+                    "Cloud Node provider reachable target={}",
+                    client.target_description()
+                );
+            })
+        };
+
+        if let Err(error) = result {
+            eprintln!("Cloud Node provider synchronization failed: {error}");
+            if !provider.auto_reconnect {
+                return Err(error);
+            }
+        } else if !provider.auto_reconnect {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(provider.reconnect_delay_ms)).await;
+    }
+}
+
 fn take_config_arg(args: &mut Vec<String>) -> anyhow::Result<Option<PathBuf>> {
     let mut found = None;
     let mut index = 0usize;
@@ -186,6 +278,6 @@ fn default_config_path() -> PathBuf {
 
 fn print_help() {
     println!(
-        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
+        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
     );
 }
