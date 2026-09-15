@@ -37,6 +37,8 @@ jobs:
           python3 .github/patches/storage-library-v1-fix.py
 
           # RBE intentionally has separate Engine and Container Cargo workspaces.
+          # The post-patch fix also keeps UTF-16 pair decoding clean under
+          # Rust 1.98's fixed-size as_chunks Clippy rule.
           cargo fmt --manifest-path container-runtime/Cargo.toml --all
           cargo fmt --manifest-path container-runtime/Cargo.toml --all -- --check
           cargo test --manifest-path container-runtime/Cargo.toml -p container-runtime-core storage_library --locked
