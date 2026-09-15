@@ -1,0 +1,46 @@
+name: One-shot Cloud Node provider stream upload
+
+on:
+  push:
+    branches:
+      - work/cloud-node-providers-latest
+
+permissions:
+  contents: write
+
+jobs:
+  provider-upload:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Apply immutable streamed upload patch
+        run: python3 .github/patches/provider-stream-upload.py
+      - name: Resolve dependency lock
+        working-directory: engine
+        run: cargo check -p cloud-node --all-features
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all -- --check
+      - name: Validate Cloud Node
+        working-directory: engine
+        run: |
+          cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+          cargo test -p cloud-node --all-features --locked
+      - name: Commit immutable streamed uploads
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-stream-upload.yml
+          rm -f .github/patches/provider-stream-upload.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-009 freeze and stream provider uploads"
+          git push origin HEAD:work/cloud-node-providers-latest
