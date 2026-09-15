@@ -1,0 +1,70 @@
+name: one-shot project Storage root
+
+on:
+  push:
+    branches:
+      - work/relc-wasm-runtime
+    paths:
+      - .github/patches/storage-project-root.py
+      - .github/workflows/one-shot-storage-project-root.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: work/relc-wasm-runtime
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            container-runtime -> target
+            engine -> target
+
+      - name: Apply project-root Storage architecture
+        run: python .github/patches/storage-project-root.py
+
+      - name: Format both Rust workspaces
+        run: |
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+          cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Validate Container project Storage
+        run: |
+          cargo test --manifest-path container-runtime/Cargo.toml -p container-runtime-core --locked
+          cargo clippy --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Validate RELC and backend integration
+        run: |
+          cargo test --manifest-path engine/Cargo.toml -p route-engine --locked
+          cargo clippy --manifest-path engine/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Land validated Storage change
+        shell: bash
+        run: |
+          rm -f .github/patches/storage-project-root.py
+          rm -f .github/workflows/one-shot-storage-project-root.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FEAT | STORAGE-002 bind storage.write to backend project root"
+          for attempt in 1 2 3 4; do
+            if git push origin HEAD:work/relc-wasm-runtime; then
+              exit 0
+            fi
+            echo "push attempt $attempt failed; retrying"
+            sleep $((attempt * 3))
+            git fetch origin work/relc-wasm-runtime
+          done
+          exit 1
