@@ -1,0 +1,83 @@
+name: One-shot resumable Cloud Node recovery v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-resume-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Reuse patch, validate, and land resumable recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          # v1 reached the final source anchor before failing. Normalize only that
+          # pristine acknowledgement block to the indentation its staged patch
+          # expected, then reuse the already-reviewed patch body verbatim.
+          backend = Path('engine/crates/backend/src/maintenance_notice.rs')
+          text = backend.read_text()
+          actual = '''                    payload: Vec::new(),
+                          },
+                          "object transfer acknowledgement",
+          '''
+          expected = '''                    payload: Vec::new(),
+                  },
+                  "object transfer acknowledgement",
+          '''
+          if text.count(actual) != 1:
+              raise SystemExit(f'ObjectChunk acknowledgement retry anchor changed: {text.count(actual)}')
+          backend.write_text(text.replace(actual, expected, 1))
+
+          workflow = Path('.github/workflows/one-shot-cloud-node-resume.yml').read_text()
+          start_token = "          python3 - <<'PY'\n"
+          end_token = "\n          PY\n\n          cd engine"
+          start = workflow.index(start_token) + len(start_token)
+          end = workflow.index(end_token, start)
+          script = textwrap.dedent(workflow[start:end])
+          exec(compile(script, 'one-shot-cloud-node-resume.py', 'exec'))
+          PY
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test -p cloud-node --locked
+          cargo test -p backend --locked
+          cd ..
+
+          rm -f .github/workflows/one-shot-cloud-node-resume.yml
+          rm -f .github/workflows/one-shot-cloud-node-resume-v2.yml
+          git add -A .github/workflows \
+            engine/crates/cloud-node/src/transfer.rs \
+            engine/crates/cloud-node/src/lib.rs \
+            engine/crates/cloud-node/src/recovery.rs \
+            engine/crates/cloud-node/src/client.rs \
+            engine/crates/backend/src/maintenance_notice.rs
+          git diff --cached --check
+          git commit -m 'FIX | BUG-CN-004 resume Cloud Node recovery after reconnect'
+          git pull --rebase origin main
+          git push origin HEAD:main
