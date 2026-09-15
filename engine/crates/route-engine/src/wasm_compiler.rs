@@ -25,11 +25,13 @@ use crate::modules::binding_name;
 use crate::runtime_image::{storage_capability_operation_allowed, storage_capability_target};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-/// Generation 9 folds request-independent REL statements and expressions into
-/// deterministic native WASM results while preserving generation 8's strict
-/// linked `req.body` capability path. Capability ABI v3 remains stable.
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 9;
+/// Generation 10 folds request-independent local Route helpers in addition to
+/// generation 9's static statements and expressions. Dynamic request data and
+/// host-dependent helper calls remain outside the native subset. Capability ABI
+/// v3 remains stable.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 10;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STATIC_HELPER_CALL_DEPTH: usize = 32;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,12 +99,12 @@ impl RouteWasmLinkContext {
 
 /// Compile the currently supported native route subset.
 ///
-/// Native lowering remains intentionally strict: one HTTP method and no Route
-/// helper functions. Compiler generation v9 keeps ABI v3, adds deterministic
-/// folding of request-independent `const`, expression, `if`, and `return`
-/// statements, and retains generation 8's immutable linked Module capability
-/// path. Dynamic transformations, wider Module bodies, namespace imports, and
-/// nested host-call chains remain interpreter-only.
+/// Native lowering remains intentionally strict: one HTTP method. Compiler
+/// generation v10 keeps ABI v3, adds bounded deterministic folding of pure
+/// request-independent local Route helpers, and retains generation 9's static
+/// statements plus generation 8's immutable linked Module capability path.
+/// Dynamic transformations, host-dependent helpers, wider Module bodies,
+/// namespace imports, and nested host-call chains remain interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let links = RouteWasmLinkContext::default();
     compile_route_with_links(file, &links)
@@ -129,18 +131,15 @@ pub(crate) fn compile_route_with_links(
                 linked_import = Some((binding, linked));
             } else {
                 return fallback(
-                    "native Route-WASM v8 only supports one direct http.get/post/request import or one linked Module function import",
+                    "native Route-WASM v10 only supports one direct http.get/post/request import or one linked Module function import",
                 );
             }
         }
         _ => {
             return fallback(
-                "native Route-WASM v8 supports at most one direct or linked host-call import",
+                "native Route-WASM v10 supports at most one direct or linked host-call import",
             )
         }
-    }
-    if !file.functions.is_empty() {
-        return fallback("route helper functions are not WASM-native yet");
     }
     if file.methods.len() != 1 {
         return fallback("native route compilation currently requires exactly one HTTP method");
@@ -194,7 +193,7 @@ pub(crate) fn compile_route_with_links(
                 RouteWasmInput::JsonBodyCapabilityArgument,
             ),
         }
-    } else if let Some(value) = static_route_result(&method.body) {
+    } else if let Some(value) = static_route_result(&method.body, &file.functions) {
         let output = match serde_json::to_vec(&value) {
             Ok(output) => output,
             Err(error) => {
@@ -492,9 +491,24 @@ enum StaticFlow {
     Return(Value),
 }
 
-fn static_route_result(body: &[Statement]) -> Option<serde_json::Value> {
+fn static_route_result(body: &[Statement], functions: &[FunctionDef]) -> Option<serde_json::Value> {
+    let mut function_map = BTreeMap::<String, FunctionDef>::new();
+    for function in functions {
+        if function_map
+            .insert(function.name.clone(), function.clone())
+            .is_some()
+        {
+            return None;
+        }
+    }
+
     let mut scope = BTreeMap::<String, Value>::new();
-    let value = match static_exec_block(body, &mut scope)? {
+    let value = match static_exec_block(
+        body,
+        &mut scope,
+        &function_map,
+        MAX_STATIC_HELPER_CALL_DEPTH,
+    )? {
         StaticFlow::Continue => Value::Null,
         StaticFlow::Return(value) => value,
     };
@@ -504,31 +518,39 @@ fn static_route_result(body: &[Statement]) -> Option<serde_json::Value> {
 fn static_exec_block(
     body: &[Statement],
     scope: &mut BTreeMap<String, Value>,
+    functions: &BTreeMap<String, FunctionDef>,
+    remaining_helper_depth: usize,
 ) -> Option<StaticFlow> {
     for statement in body {
         match statement {
             Statement::Const { name, value } => {
-                let value = static_eval_expr(value, scope)?;
+                let value = static_eval_expr(value, scope, functions, remaining_helper_depth)?;
                 scope.insert(name.clone(), value);
             }
             Statement::Return(expr) => {
-                return Some(StaticFlow::Return(static_eval_expr(expr, scope)?));
+                return Some(StaticFlow::Return(static_eval_expr(
+                    expr,
+                    scope,
+                    functions,
+                    remaining_helper_depth,
+                )?));
             }
             Statement::Expr(expr) => {
-                static_eval_expr(expr, scope)?;
+                static_eval_expr(expr, scope, functions, remaining_helper_depth)?;
             }
             Statement::If {
                 condition,
                 then_body,
                 else_body,
             } => {
-                let condition = static_eval_expr(condition, scope)?;
+                let condition =
+                    static_eval_expr(condition, scope, functions, remaining_helper_depth)?;
                 let branch = if condition.truthy() {
                     then_body
                 } else {
                     else_body
                 };
-                match static_exec_block(branch, scope)? {
+                match static_exec_block(branch, scope, functions, remaining_helper_depth)? {
                     StaticFlow::Continue => {}
                     flow @ StaticFlow::Return(_) => return Some(flow),
                 }
@@ -538,7 +560,12 @@ fn static_exec_block(
     Some(StaticFlow::Continue)
 }
 
-fn static_eval_expr(expr: &Expr, scope: &BTreeMap<String, Value>) -> Option<Value> {
+fn static_eval_expr(
+    expr: &Expr,
+    scope: &BTreeMap<String, Value>,
+    functions: &BTreeMap<String, FunctionDef>,
+    remaining_helper_depth: usize,
+) -> Option<Value> {
     match expr {
         Expr::String(value) => Some(Value::String(value.clone())),
         Expr::Number(value) => Some(Value::Number(*value)),
@@ -546,46 +573,87 @@ fn static_eval_expr(expr: &Expr, scope: &BTreeMap<String, Value>) -> Option<Valu
         Expr::Null => Some(Value::Null),
         Expr::Ident(name) => scope.get(name).cloned(),
         Expr::Member(base, field) => {
-            let base = static_eval_expr(base, scope)?;
+            let base = static_eval_expr(base, scope, functions, remaining_helper_depth)?;
             crate::transpiled_support::member_get(&base, field).ok()
         }
-        Expr::Call(_, _) => None,
+        Expr::Call(target, args) => {
+            if remaining_helper_depth == 0 {
+                return None;
+            }
+            let Expr::Ident(name) = target.as_ref() else {
+                return None;
+            };
+            let function = functions.get(name)?;
+            if function.params.len() != args.len() {
+                return None;
+            }
+
+            let values = args
+                .iter()
+                .map(|arg| static_eval_expr(arg, scope, functions, remaining_helper_depth))
+                .collect::<Option<Vec<_>>>()?;
+            let mut child_scope = function
+                .params
+                .iter()
+                .cloned()
+                .zip(values)
+                .collect::<BTreeMap<_, _>>();
+            match static_exec_block(
+                &function.body,
+                &mut child_scope,
+                functions,
+                remaining_helper_depth - 1,
+            )? {
+                StaticFlow::Continue => Some(Value::Null),
+                StaticFlow::Return(value) => Some(value),
+            }
+        }
         Expr::Object(fields) => {
             let mut values = std::collections::HashMap::with_capacity(fields.len());
             for (name, value) in fields {
-                values.insert(name.clone(), static_eval_expr(value, scope)?);
+                values.insert(
+                    name.clone(),
+                    static_eval_expr(value, scope, functions, remaining_helper_depth)?,
+                );
             }
             Some(Value::Object(values))
         }
         Expr::Array(items) => items
             .iter()
-            .map(|item| static_eval_expr(item, scope))
+            .map(|item| static_eval_expr(item, scope, functions, remaining_helper_depth))
             .collect::<Option<Vec<_>>>()
             .map(Value::Array),
         Expr::UnaryNot(value) => Some(crate::transpiled_support::unary_not(static_eval_expr(
-            value, scope,
+            value,
+            scope,
+            functions,
+            remaining_helper_depth,
         )?)),
         Expr::Binary { left, op, right } => match op {
             BinaryOp::And => {
-                let left = static_eval_expr(left, scope)?;
+                let left = static_eval_expr(left, scope, functions, remaining_helper_depth)?;
                 if !left.truthy() {
                     Some(Value::Bool(false))
                 } else {
-                    Some(Value::Bool(static_eval_expr(right, scope)?.truthy()))
+                    Some(Value::Bool(
+                        static_eval_expr(right, scope, functions, remaining_helper_depth)?.truthy(),
+                    ))
                 }
             }
             BinaryOp::Or => {
-                let left = static_eval_expr(left, scope)?;
+                let left = static_eval_expr(left, scope, functions, remaining_helper_depth)?;
                 if left.truthy() {
                     Some(Value::Bool(true))
                 } else {
-                    Some(Value::Bool(static_eval_expr(right, scope)?.truthy()))
+                    Some(Value::Bool(
+                        static_eval_expr(right, scope, functions, remaining_helper_depth)?.truthy(),
+                    ))
                 }
             }
             _ => crate::transpiled_support::binary(
                 *op,
-                static_eval_expr(left, scope)?,
-                static_eval_expr(right, scope)?,
+                static_eval_expr(left, scope, functions, remaining_helper_depth)?,
+                static_eval_expr(right, scope, functions, remaining_helper_depth)?,
             )
             .ok(),
         },
@@ -1080,6 +1148,60 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&result.output).unwrap(),
             serde_json::json!({ "ok": true, "value": 42.0 })
         );
+    }
+
+    #[test]
+    fn request_independent_local_helpers_fold_into_native_wasm() {
+        let route = parse(
+            r#"function double(value) { return value * 2; }
+               function build(value) {
+                   if (value === 42) {
+                       return { ok: true, value: double(value) };
+                   }
+                   return { ok: false, value: 0 };
+               }
+               class Route {
+                   get(req) {
+                       const answer = 21 * 2;
+                       return build(answer);
+                   }
+               }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("pure request-independent helpers should compile natively");
+        };
+        assert_eq!(artifact.input, RouteWasmInput::None);
+        wasmparser::validate(&artifact.bytes).unwrap();
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute(&artifact.bytes, ExecutionLimits::default())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&result.output).unwrap(),
+            serde_json::json!({ "ok": true, "value": 84.0 })
+        );
+    }
+
+    #[test]
+    fn request_dependent_local_helper_stays_interpreter_fallback() {
+        let route = parse(
+            r#"function echo(value) { return value; }
+               class Route { post(req) { return echo(req.body); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { .. } = compile_route(&route) else {
+            panic!("request-dependent helper arguments must remain dynamic");
+        };
+    }
+
+    #[test]
+    fn recursive_static_helper_fails_closed_at_compiler_depth_limit() {
+        let route = parse(
+            r#"function loop(value) { return loop(value); }
+               class Route { get(req) { return loop(1); } }"#,
+        );
+        let RouteWasmCompilation::InterpreterFallback { .. } = compile_route(&route) else {
+            panic!("unbounded helper recursion must not execute during compilation");
+        };
     }
 
     #[test]
