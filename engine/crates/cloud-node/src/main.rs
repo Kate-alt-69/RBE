@@ -155,7 +155,10 @@ async fn run_daemon(settings: &CloudNodeSettings, store: &CloudNodeStore) -> any
     run_peer_daemon(settings, store).await
 }
 
-async fn run_peer_daemon(settings: &CloudNodeSettings, store: &CloudNodeStore) -> anyhow::Result<()> {
+async fn run_peer_daemon(
+    settings: &CloudNodeSettings,
+    store: &CloudNodeStore,
+) -> anyhow::Result<()> {
     let upstream = settings
         .upstream
         .as_ref()
@@ -215,18 +218,16 @@ async fn run_provider_daemon(
     let client = ProviderClient::new(provider)?;
     loop {
         let result = if provider.sync_on_connect {
-            synchronize_provider(settings, store)
-                .await
-                .map(|sync| {
-                    println!(
-                        "Cloud Node provider sync target={} before={:?} action={:?} head={} root={}",
-                        client.target_description(),
-                        sync.before.relation,
-                        sync.action,
-                        sync.final_head,
-                        sync.final_root
-                    );
-                })
+            synchronize_provider(settings, store).await.map(|sync| {
+                println!(
+                    "Cloud Node provider sync target={} before={:?} action={:?} head={} root={}",
+                    client.target_description(),
+                    sync.before.relation,
+                    sync.action,
+                    sync.final_head,
+                    sync.final_root
+                );
+            })
         } else {
             client.probe().await.map(|()| {
                 println!(
