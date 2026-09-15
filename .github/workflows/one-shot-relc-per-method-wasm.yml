@@ -1,0 +1,61 @@
+name: One-shot RELC per-method Route-WASM
+
+"on":
+  push:
+    branches:
+      - work/relc-wasm-runtime
+    paths:
+      - '.github/workflows/one-shot-relc-per-method-wasm.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Compile and bind native Route-WASM per HTTP method
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/patches/bug-wasm-010.py
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test -p route-engine multi_method_route_compiles_each_method_independently --locked
+          cargo test -p route-engine multi_method_route_can_mix_native_and_explicit_fallback --locked
+          cargo test -p route-engine runtime_image_pins_native_artifacts_and_fallbacks_per_method --locked
+          cargo test -p route-engine storage_multi_method_route_fails_closed_if_any_method_falls_back --locked
+          cargo test -p route-engine --locked
+          cargo clippy -p route-engine --all-targets --locked -- -D warnings
+          cargo check --workspace --all-targets --locked
+          cd ..
+
+          rm -f .github/patches/bug-wasm-010.py
+          rm -f .github/workflows/one-shot-relc-per-method-wasm.yml
+          git add -A
+          git diff --cached --check
+          git commit -m 'FIX | BUG-WASM-010 compile Route-WASM per HTTP method'
+          git pull --rebase origin work/relc-wasm-runtime
+          for attempt in 1 2 3; do
+            if git push origin HEAD:work/relc-wasm-runtime; then
+              exit 0
+            fi
+            echo "push attempt ${attempt} failed; retrying..."
+            sleep $((attempt * 5))
+          done
+          exit 1
