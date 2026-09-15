@@ -32,6 +32,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           python3 .github/patches/bug-wasm-011.py
+          python3 .github/patches/bug-wasm-011-fix.py
 
           cd engine
           cargo fmt --all
@@ -46,6 +47,7 @@ jobs:
           cd ..
 
           rm -f .github/patches/bug-wasm-011.py
+          rm -f .github/patches/bug-wasm-011-fix.py
           rm -f .github/workflows/one-shot-relc-linked-module-helpers.yml
           git add -A
           git diff --cached --check
