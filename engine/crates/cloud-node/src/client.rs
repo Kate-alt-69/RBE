@@ -1,8 +1,9 @@
+use std::io::SeekFrom;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::auth::{random_session_and_nonce, NodeProof, DEFAULT_AUTH_SKEW_MS};
 use crate::config::CloudNodeSettings;
@@ -11,7 +12,9 @@ use crate::format::BlobKind;
 use crate::protocol::{Frame, FrameKind};
 use crate::store::CloudNodeStore;
 use crate::sync::{SyncObject, SyncPlanHeader};
-use crate::transfer::{TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES};
+use crate::transfer::{
+    TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES, RESUME_ACK_HEADER,
+};
 
 pub const KNOCK_PATH: &str = "/.rbe/cn/v1/knock";
 pub const SYNC_PATH: &str = "/.rbe/cn/v1/sync";
@@ -102,6 +105,7 @@ pub async fn negotiate_sync(
         SYNC_PATH,
         request,
         MAX_SYNC_RESPONSE_BYTES,
+        false,
     )
     .await?;
     if response.kind != FrameKind::SyncHello {
@@ -195,6 +199,7 @@ pub async fn synchronize_upstream(
         TRANSFER_PATH,
         complete,
         MAX_TRANSFER_RESPONSE_BYTES,
+        false,
     )
     .await?;
     if response.kind != FrameKind::SyncComplete {
@@ -235,12 +240,16 @@ async fn send_resource(
             0,
             Vec::new(),
         )?;
-        send_chunk(client, settings, peer, &chunk).await?;
+        let next_offset = send_chunk(client, settings, peer, &chunk).await?;
+        if next_offset != 0 {
+            anyhow::bail!("Cloud Node empty resource acknowledgement has invalid offset");
+        }
         return Ok(());
     }
 
     let mut buffer = vec![0u8; MAX_TRANSFER_DATA_BYTES];
     while offset < total_size {
+        file.seek(SeekFrom::Start(offset)).await?;
         let remaining = total_size - offset;
         let wanted = usize::try_from(remaining.min(MAX_TRANSFER_DATA_BYTES as u64))
             .map_err(|_| anyhow::anyhow!("Cloud Node transfer size does not fit usize"))?;
@@ -259,10 +268,7 @@ async fn send_resource(
             total_size,
             data,
         )?;
-        send_chunk(client, settings, peer, &chunk).await?;
-        offset = offset
-            .checked_add(read as u64)
-            .ok_or_else(|| anyhow::anyhow!("Cloud Node transfer offset overflow"))?;
+        offset = send_chunk(client, settings, peer, &chunk).await?;
     }
     Ok(())
 }
@@ -272,7 +278,7 @@ async fn send_chunk(
     settings: &CloudNodeSettings,
     peer: &AuthenticatedPeer,
     chunk: &TransferChunk,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     let response = post_authenticated_frame(
         client,
         settings,
@@ -280,12 +286,33 @@ async fn send_chunk(
         TRANSFER_PATH,
         chunk.into_frame(peer.session)?,
         MAX_TRANSFER_RESPONSE_BYTES,
+        true,
     )
     .await?;
-    if response.kind != FrameKind::ObjectChunk || !response.payload.is_empty() {
+    if response.kind != FrameKind::ObjectChunk {
         anyhow::bail!("Cloud Node upstream returned an invalid object-transfer acknowledgement");
     }
-    Ok(())
+    decode_resume_ack(&response.payload, chunk)
+}
+
+fn decode_resume_ack(payload: &[u8], chunk: &TransferChunk) -> anyhow::Result<u64> {
+    let chunk_end = chunk
+        .offset
+        .checked_add(u64::try_from(chunk.data.len())?)
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node transfer acknowledgement range overflow"))?;
+    let next_offset = if payload.is_empty() {
+        // Compatibility with a pre-resume server: it acknowledged only
+        // the chunk that was just sent.
+        chunk_end
+    } else if payload.len() == 8 {
+        u64::from_be_bytes(payload.try_into()?)
+    } else {
+        anyhow::bail!("Cloud Node upstream returned malformed resume acknowledgement");
+    };
+    if next_offset < chunk_end || next_offset > chunk.total_size {
+        anyhow::bail!("Cloud Node upstream returned an invalid resume offset");
+    }
+    Ok(next_offset)
 }
 
 async fn post_authenticated_frame(
@@ -295,6 +322,7 @@ async fn post_authenticated_frame(
     path: &str,
     frame: Frame,
     maximum_response_bytes: usize,
+    request_resume_ack: bool,
 ) -> anyhow::Result<Frame> {
     ensure_expected_peer(settings, peer)?;
     if frame.session != peer.session {
@@ -316,13 +344,14 @@ async fn post_authenticated_frame(
     )?;
 
     let endpoint = format!("{}{}", upstream.url.trim_end_matches('/'), path);
-    let response = client
+    let mut request = client
         .post(endpoint)
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-        .header(SESSION_PROOF_HEADER, hex::encode(proof.encode()?))
-        .body(frame.encode()?)
-        .send()
-        .await?;
+        .header(SESSION_PROOF_HEADER, hex::encode(proof.encode()?));
+    if request_resume_ack {
+        request = request.header(RESUME_ACK_HEADER, "1");
+    }
+    let response = request.body(frame.encode()?).send().await?;
     if response.status() != reqwest::StatusCode::OK {
         anyhow::bail!(
             "Cloud Node upstream rejected authenticated request with status {}",
@@ -385,4 +414,28 @@ fn now_ms() -> anyhow::Result<u64> {
         .as_millis()
         .try_into()
         .map_err(|_| anyhow::anyhow!("system clock exceeds Cloud Node timestamp range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_ack_accepts_old_server_and_forward_progress() {
+        let chunk = TransferChunk::new(
+            BlobKind::File,
+            TransferResource::FilePayload,
+            [1u8; 32],
+            [2u8; 32],
+            [2u8; 32],
+            0,
+            32,
+            vec![7u8; 8],
+        )
+        .unwrap();
+        assert_eq!(decode_resume_ack(&[], &chunk).unwrap(), 8);
+        assert_eq!(decode_resume_ack(&24u64.to_be_bytes(), &chunk).unwrap(), 24);
+        assert!(decode_resume_ack(&4u64.to_be_bytes(), &chunk).is_err());
+        assert!(decode_resume_ack(&33u64.to_be_bytes(), &chunk).is_err());
+    }
 }

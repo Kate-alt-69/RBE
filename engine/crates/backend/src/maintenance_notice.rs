@@ -26,8 +26,8 @@ use axum::Router;
 use cloud_node::{
     AuthenticatedSession, CloudNodeAuthenticator, CloudNodeRecoveryReceiver, CloudNodeSettings,
     CloudNodeStore, Frame, FrameKind, SyncPlanHeader, TransferChunk, KNOCK_PATH,
-    MAX_AUTH_PROOF_BYTES, MAX_FRAME_BYTES, SESSION_PROOF_HEADER, SETTINGS_FILE_NAME, SYNC_PATH,
-    TRANSFER_PATH,
+    MAX_AUTH_PROOF_BYTES, MAX_FRAME_BYTES, RESUME_ACK_HEADER, SESSION_PROOF_HEADER,
+    SETTINGS_FILE_NAME, SYNC_PATH, TRANSFER_PATH,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -62,8 +62,22 @@ pub struct MaintenanceNoticeProcess {
 }
 
 struct RecoveryState {
+    owner_node_id: String,
     expected: SyncPlanHeader,
     receiver: CloudNodeRecoveryReceiver,
+}
+
+fn open_recovery_state(
+    runtime: &CloudNodeRuntime,
+    owner_node_id: &str,
+    session: [u8; 16],
+    expected: SyncPlanHeader,
+) -> anyhow::Result<RecoveryState> {
+    Ok(RecoveryState {
+        owner_node_id: owner_node_id.to_owned(),
+        expected,
+        receiver: CloudNodeRecoveryReceiver::open(&runtime.store, session)?,
+    })
 }
 
 struct CloudNodeRuntime {
@@ -397,33 +411,93 @@ async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Re
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
         };
-        match recoveries.get(&session.session) {
-            Some(existing) if existing.expected != remote_header => {
-                tracing::warn!(peer = %session.node_id, "Cloud Node peer changed its negotiated recovery root");
+
+        if let Some(existing) = recoveries.get(&session.session) {
+            if existing.owner_node_id != session.node_id {
                 return StatusCode::CONFLICT.into_response();
             }
-            Some(_) => {}
-            None => {
-                if !recoveries.is_empty() {
-                    tracing::warn!(peer = %session.node_id, "Cloud Node recovery is already owned by another authenticated session");
-                    return StatusCode::CONFLICT.into_response();
+            if existing.expected != remote_header {
+                let stale = recoveries
+                    .remove(&session.session)
+                    .expect("recovery state existed above");
+                if let Err(error) = stale.receiver.discard() {
+                    tracing::error!(error = %error, "Cloud Node could not discard obsolete recovery staging");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
-                let receiver = match CloudNodeRecoveryReceiver::open(
-                    &runtime.store,
+                let replacement = match open_recovery_state(
+                    runtime,
+                    &session.node_id,
                     session.session,
+                    remote_header,
                 ) {
-                    Ok(receiver) => receiver,
+                    Ok(state) => state,
                     Err(error) => {
-                        tracing::error!(error = %error, "Cloud Node could not create recovery staging tree");
+                        tracing::error!(error = %error, "Cloud Node could not create replacement recovery staging tree");
                         return StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
                 };
-                recoveries.insert(
+                recoveries.insert(session.session, replacement);
+            }
+        } else if recoveries.is_empty() {
+            let recovery = match open_recovery_state(
+                runtime,
+                &session.node_id,
+                session.session,
+                remote_header,
+            ) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::error!(error = %error, "Cloud Node could not create recovery staging tree");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+            };
+            recoveries.insert(session.session, recovery);
+        } else {
+            if recoveries.len() != 1 {
+                tracing::error!("Cloud Node recovery table contains multiple active owners");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            let (&old_session, existing) = recoveries
+                .iter()
+                .next()
+                .expect("non-empty recovery table checked above");
+            let owner = existing.owner_node_id.clone();
+            let expected = existing.expected;
+            if owner != session.node_id {
+                tracing::warn!(peer = %session.node_id, "Cloud Node recovery is already owned by another authenticated peer");
+                return StatusCode::CONFLICT.into_response();
+            }
+
+            let stale = recoveries
+                .remove(&old_session)
+                .expect("recovery state existed above");
+            if expected == remote_header {
+                recoveries.insert(session.session, stale);
+                tracing::info!(
+                    peer = %session.node_id,
+                    "Cloud Node resumed staged recovery after peer reauthentication"
+                );
+            } else {
+                if let Err(error) = stale.receiver.discard() {
+                    tracing::error!(error = %error, "Cloud Node could not discard obsolete reauthenticated recovery staging");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                let replacement = match open_recovery_state(
+                    runtime,
+                    &session.node_id,
                     session.session,
-                    RecoveryState {
-                        expected: remote_header,
-                        receiver,
-                    },
+                    remote_header,
+                ) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        tracing::error!(error = %error, "Cloud Node could not restart changed recovery snapshot");
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                };
+                recoveries.insert(session.session, replacement);
+                tracing::info!(
+                    peer = %session.node_id,
+                    "Cloud Node discarded obsolete staged recovery after snapshot root changed"
                 );
             }
         }
@@ -466,6 +540,11 @@ async fn cloud_node_transfer(
         return hidden_not_found();
     };
 
+    let resume_ack_requested = request
+        .headers()
+        .get(RESUME_ACK_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1");
     let body = match axum::body::to_bytes(request.into_body(), MAX_TRANSFER_REQUEST_BYTES).await {
         Ok(body) => body,
         Err(_) => return hidden_not_found(),
@@ -525,7 +604,11 @@ async fn cloud_node_transfer(
                 Frame {
                     kind: FrameKind::ObjectChunk,
                     session: session.session,
-                    payload: Vec::new(),
+                    payload: if resume_ack_requested {
+                        receipt.next_offset.to_be_bytes().to_vec()
+                    } else {
+                        Vec::new()
+                    },
                 },
                 "object transfer acknowledgement",
             )

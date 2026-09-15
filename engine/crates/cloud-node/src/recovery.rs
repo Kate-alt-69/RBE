@@ -16,6 +16,9 @@ pub struct RecoveryReceipt {
     pub committed: bool,
     pub duplicate: bool,
     pub video_reconstructed: bool,
+    /// First byte the sender still needs to transmit for this resource.
+    /// A completed resource reports `total_size` so a reconnect can skip it.
+    pub next_offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,14 +88,24 @@ impl CloudNodeRecoveryReceiver {
         })
     }
 
+    /// Removes an obsolete private staging tree. This is used only after
+    /// the same authenticated peer negotiates a different snapshot root.
+    pub fn discard(self) -> anyhow::Result<()> {
+        if self.session_root.exists() {
+            fs::remove_dir_all(&self.session_root)?;
+        }
+        Ok(())
+    }
+
     pub fn accept_chunk(&mut self, chunk: &TransferChunk) -> anyhow::Result<RecoveryReceipt> {
         if self.completed {
             anyhow::bail!("Cloud Node recovery session is already complete");
         }
         chunk.validate()?;
-        self.enforce_recovery_order(chunk)?;
-        self.enforce_resource_dependency(chunk)?;
 
+        // A reauthenticated sender starts its ordered walk at the beginning.
+        // Recognize already-committed staged resources before enforcing the
+        // current phase so reconnects can cheaply replay/skip earlier objects.
         let target = self.resource_target(chunk);
         if target.is_file() && verify_resource(&target, chunk.resource_sha256, chunk.total_size)? {
             let video_reconstructed = self.after_resource_committed(chunk, &target)?;
@@ -100,9 +113,12 @@ impl CloudNodeRecoveryReceiver {
                 committed: true,
                 duplicate: true,
                 video_reconstructed,
+                next_offset: chunk.total_size,
             });
         }
 
+        self.enforce_recovery_order(chunk)?;
+        self.enforce_resource_dependency(chunk)?;
         let identity = ResourceIdentity::from(chunk);
         if self.active.is_none() {
             if chunk.offset != 0 {
@@ -157,6 +173,7 @@ impl CloudNodeRecoveryReceiver {
                 committed: false,
                 duplicate,
                 video_reconstructed: false,
+                next_offset: active.written,
             });
         }
         if active.written != chunk.total_size {
@@ -189,6 +206,7 @@ impl CloudNodeRecoveryReceiver {
             committed: true,
             duplicate,
             video_reconstructed,
+            next_offset: chunk.total_size,
         })
     }
 
@@ -784,6 +802,74 @@ mod tests {
 
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    #[test]
+    fn recovery_allows_completed_earlier_resource_replay() {
+        let root = test_root("resume-replay");
+        fs::create_dir_all(&root).unwrap();
+        let store = CloudNodeStore::open(&settings(&root, "resume-replay")).unwrap();
+        let mut receiver = CloudNodeRecoveryReceiver::open(&store, [6u8; 16]).unwrap();
+
+        let folder_manifest = BlobManifest {
+            kind: BlobKind::Folder,
+            object_key: object_key(BlobKind::Folder, "root"),
+            content_sha256: folder_digest(&[]),
+            parent_content_sha256: None,
+            logical_path: "root".into(),
+            logical_size: 0,
+            created_unix_ms: 1,
+            body: BlobBody::Folder {
+                entries: Vec::new(),
+            },
+        };
+        let folder_bytes = folder_manifest.encode().unwrap();
+        let folder_hash: [u8; 32] = Sha256::digest(&folder_bytes).into();
+        let folder_chunk = TransferChunk::new(
+            BlobKind::Folder,
+            TransferResource::Manifest,
+            folder_manifest.object_key,
+            folder_manifest.content_sha256,
+            folder_hash,
+            0,
+            folder_bytes.len() as u64,
+            folder_bytes,
+        )
+        .unwrap();
+        receiver.accept_chunk(&folder_chunk).unwrap();
+
+        let file_manifest = BlobManifest {
+            kind: BlobKind::File,
+            object_key: object_key(BlobKind::File, "db/a.db"),
+            content_sha256: Sha256::digest(b"a").into(),
+            parent_content_sha256: None,
+            logical_path: "db/a.db".into(),
+            logical_size: 1,
+            created_unix_ms: 1,
+            body: BlobBody::File {
+                changes: Vec::new(),
+            },
+        };
+        let file_bytes = file_manifest.encode().unwrap();
+        let file_hash: [u8; 32] = Sha256::digest(&file_bytes).into();
+        let file_chunk = TransferChunk::new(
+            BlobKind::File,
+            TransferResource::Manifest,
+            file_manifest.object_key,
+            file_manifest.content_sha256,
+            file_hash,
+            0,
+            file_bytes.len() as u64,
+            file_bytes,
+        )
+        .unwrap();
+        receiver.accept_chunk(&file_chunk).unwrap();
+
+        let replay = receiver.accept_chunk(&folder_chunk).unwrap();
+        assert!(replay.committed);
+        assert!(replay.duplicate);
+        assert_eq!(replay.next_offset, folder_chunk.total_size);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

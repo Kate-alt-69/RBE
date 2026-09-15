@@ -9,6 +9,7 @@ const TRANSFER_MAGIC: &[u8; 8] = b"RBECNXF1";
 const TRANSFER_VERSION: u16 = 1;
 const TRANSFER_HEADER_BYTES: usize = 162;
 pub const MAX_TRANSFER_DATA_BYTES: usize = 8 * 1024 * 1024;
+pub const RESUME_ACK_HEADER: &str = "x-rbe-cn-resume-ack";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]

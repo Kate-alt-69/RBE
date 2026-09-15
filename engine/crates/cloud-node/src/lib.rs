@@ -49,4 +49,4 @@ pub use server::{
 };
 pub use store::{CloudNodeStore, StoreSummary, StoredObject};
 pub use sync::{SyncObject, SyncPlan, SyncPlanHeader};
-pub use transfer::{TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES};
+pub use transfer::{TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES, RESUME_ACK_HEADER};
