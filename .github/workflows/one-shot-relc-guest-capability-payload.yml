@@ -32,7 +32,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           # BUG-WASM-013: normalize staging, apply guest payload lowering, then
-          # refresh raw-body/RELC assertions and the byte-slice clippy fix.
+          # refresh raw-body/RELC assertions. The clippy byte-slice correction
+          # is token-based so it is independent of rustfmt's later layout.
           python3 .github/patches/bug-wasm-013-stage-fix.py
           python3 .github/patches/bug-wasm-013.py
           python3 .github/patches/bug-wasm-013-source-fix.py
