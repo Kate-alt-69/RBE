@@ -1,0 +1,163 @@
+name: One-shot Cloud Node power-loss durability v4
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-power-loss-v4.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Harden Cloud Node power-loss commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          template = Path('.github/workflows/one-shot-cloud-node-power-loss-v3.yml').read_text()
+          start = "          cat > engine/crates/cloud-node/src/durable.rs <<'RS'\n"
+          end = "\n          RS\n"
+          if start not in template or end not in template:
+              raise SystemExit('v3 durable helper template is unavailable')
+          durable = template.split(start, 1)[1].split(end, 1)[0]
+          durable = textwrap.dedent(durable)
+
+          replacements = {
+              'pub(crate) fn create_dir_all(path: &Path) -> io::Result<()> {\n    let missing = missing_directories(path)?;':
+                  'pub(crate) fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {\n    let path = path.as_ref();\n    let missing = missing_directories(path)?;',
+              'pub(crate) fn rename(source: &Path, target: &Path) -> io::Result<()> {\n    let source_parent = parent_path(source);':
+                  'pub(crate) fn rename(source: impl AsRef<Path>, target: impl AsRef<Path>) -> io::Result<()> {\n    let source = source.as_ref();\n    let target = target.as_ref();\n    let source_parent = parent_path(source);',
+              'pub(crate) fn remove_file(path: &Path) -> io::Result<()> {\n    let parent = parent_path(path);':
+                  'pub(crate) fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {\n    let path = path.as_ref();\n    let parent = parent_path(path);',
+              'pub(crate) fn remove_dir_all(path: &Path) -> io::Result<()> {\n    let parent = parent_path(path);':
+                  'pub(crate) fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {\n    let path = path.as_ref();\n    let parent = parent_path(path);',
+              'pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {\n    sync_directory(&parent_path(path))':
+                  'pub(crate) fn sync_parent(path: impl AsRef<Path>) -> io::Result<()> {\n    sync_directory(&parent_path(path.as_ref()))',
+              'pub(crate) async fn create_dir_all_async(path: &Path) -> io::Result<()> {\n    let missing = missing_directories_async(path).await?;':
+                  'pub(crate) async fn create_dir_all_async(path: impl AsRef<Path>) -> io::Result<()> {\n    let path = path.as_ref();\n    let missing = missing_directories_async(path).await?;',
+              'pub(crate) async fn rename_async(source: &Path, target: &Path) -> io::Result<()> {\n    let source_parent = parent_path(source);':
+                  'pub(crate) async fn rename_async(source: impl AsRef<Path>, target: impl AsRef<Path>) -> io::Result<()> {\n    let source = source.as_ref();\n    let target = target.as_ref();\n    let source_parent = parent_path(source);',
+              'pub(crate) async fn remove_file_async(path: &Path) -> io::Result<()> {\n    let parent = parent_path(path);':
+                  'pub(crate) async fn remove_file_async(path: impl AsRef<Path>) -> io::Result<()> {\n    let path = path.as_ref();\n    let parent = parent_path(path);',
+              'pub(crate) async fn remove_dir_all_async(path: &Path) -> io::Result<()> {\n    let parent = parent_path(path);':
+                  'pub(crate) async fn remove_dir_all_async(path: impl AsRef<Path>) -> io::Result<()> {\n    let path = path.as_ref();\n    let parent = parent_path(path);',
+          }
+          for old, new in replacements.items():
+              if old not in durable:
+                  raise SystemExit(f'durable helper signature anchor missing: {old.splitlines()[0]}')
+              durable = durable.replace(old, new, 1)
+          Path('engine/crates/cloud-node/src/durable.rs').write_text(durable)
+
+          def insert_first(text, marker, addition, label):
+              if marker not in text:
+                  raise SystemExit(f'{label} marker missing')
+              return text.replace(marker, marker + addition, 1)
+
+          marker = '\n#[cfg(test)]'
+
+          lib = Path('engine/crates/cloud-node/src/lib.rs')
+          text = lib.read_text()
+          text = insert_first(text, 'mod crypto;', '\nmod durable;', 'cloud-node lib')
+          lib.write_text(text)
+
+          store = Path('engine/crates/cloud-node/src/store.rs')
+          text = store.read_text()
+          text = insert_first(text, 'use crate::config::CloudNodeSettings;', '\nuse crate::durable;', 'store import')
+          if marker not in text:
+              raise SystemExit('store test boundary missing')
+          production, tests = text.split(marker, 1)
+          production = production.replace('fs::create_dir_all(', 'durable::create_dir_all(')
+          production = production.replace('fs::rename(', 'durable::rename(')
+          production = production.replace('fs::remove_file(', 'durable::remove_file(')
+          production = production.replace('fs::remove_dir_all(', 'durable::remove_dir_all(')
+          store.write_text(production + marker + tests)
+
+          recovery = Path('engine/crates/cloud-node/src/recovery.rs')
+          text = recovery.read_text()
+          text = insert_first(text, 'use sha2::{Digest, Sha256};', '\n\nuse crate::durable;', 'recovery import')
+          if marker not in text:
+              raise SystemExit('recovery test boundary missing')
+          production, tests = text.split(marker, 1)
+          production = production.replace('fs::create_dir_all(', 'durable::create_dir_all(')
+          production = production.replace('fs::rename(', 'durable::rename(')
+          production = production.replace('fs::remove_file(', 'durable::remove_file(')
+          production = production.replace('fs::remove_dir_all(', 'durable::remove_dir_all(')
+          part_anchor = 'file.sync_all()?;\n                    0'
+          if production.count(part_anchor) != 2:
+              raise SystemExit(f'recovery part sync anchor count={production.count(part_anchor)}')
+          production = production.replace(
+              part_anchor,
+              'file.sync_all()?;\n                    durable::sync_parent(&part)?;\n                    0',
+          )
+          recovery.write_text(production + marker + tests)
+
+          client = Path('engine/crates/cloud-node/src/client.rs')
+          text = client.read_text()
+          text = insert_first(text, 'use crate::crypto::load_signing_key_from_env;', '\nuse crate::durable;', 'client import')
+          if marker not in text:
+              raise SystemExit('client test boundary missing')
+          production, tests = text.split(marker, 1)
+          production = production.replace('tokio::fs::create_dir_all(', 'durable::create_dir_all_async(')
+          production = production.replace('tokio::fs::rename(', 'durable::rename_async(')
+          production = production.replace('tokio::fs::remove_file(', 'durable::remove_file_async(')
+          production = production.replace('tokio::fs::remove_dir_all(', 'durable::remove_dir_all_async(')
+          client.write_text(production + marker + tests)
+
+          doc = Path('doc/cloud-node.md')
+          text = doc.read_text()
+          old = 'Resource bytes are first written to stable `.transfer.part` files and fsynced.'
+          new = old + ' On Unix-like hosts, Cloud Node also fsyncs containing directories after durable directory creation, rename, and removal operations so a successful commit covers the filesystem namespace update rather than only file contents.'
+          if old not in text:
+              raise SystemExit('cloud-node durability documentation anchor missing')
+          doc.write_text(text.replace(old, new, 1))
+          PY
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test -p cloud-node --locked
+          cargo test -p backend --locked
+          cd ..
+
+          rm -f \
+            .github/workflows/one-shot-cloud-node-power-loss.yml \
+            .github/workflows/one-shot-cloud-node-power-loss-v2.yml \
+            .github/workflows/one-shot-cloud-node-power-loss-v3.yml \
+            .github/workflows/one-shot-cloud-node-power-loss-v4.yml
+          git add -A \
+            .github/workflows/one-shot-cloud-node-power-loss.yml \
+            .github/workflows/one-shot-cloud-node-power-loss-v2.yml \
+            .github/workflows/one-shot-cloud-node-power-loss-v3.yml \
+            .github/workflows/one-shot-cloud-node-power-loss-v4.yml \
+            engine/crates/cloud-node/src/durable.rs \
+            engine/crates/cloud-node/src/lib.rs \
+            engine/crates/cloud-node/src/store.rs \
+            engine/crates/cloud-node/src/recovery.rs \
+            engine/crates/cloud-node/src/client.rs \
+            doc/cloud-node.md
+          git diff --cached --check
+          git commit -m 'FIX | BUG-CN-008 persist Cloud Node filesystem commits across power loss'
+          git pull --rebase origin main
+          git push origin HEAD:main
