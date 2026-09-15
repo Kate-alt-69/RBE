@@ -43,11 +43,6 @@ jobs:
 
           path = Path('engine/crates/cloud-node/src/config.rs')
           text = path.read_text()
-          text = text.replace(
-              'use std::path::{Path, PathBuf};\n',
-              'use std::net::IpAddr;\nuse std::path::{Path, PathBuf};\n',
-              1,
-          )
 
           old_node = '''fn validate_node_id(value: &str) -> anyhow::Result<()> {
               if value.is_empty()
@@ -96,7 +91,7 @@ jobs:
               let parsed = url::Url::parse(value)
                   .map_err(|error| anyhow::anyhow!("invalid Cloud Node peer URL: {error}"))?;
               let host = parsed
-                  .host_str()
+                  .host()
                   .ok_or_else(|| anyhow::anyhow!("Cloud Node peer URL must include a host"))?;
 
               if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -109,10 +104,11 @@ jobs:
               match parsed.scheme() {
                   "https" => Ok(()),
                   "http" => {
-                      let loopback = host.eq_ignore_ascii_case("localhost")
-                          || host
-                              .parse::<IpAddr>()
-                              .is_ok_and(|address| address.is_loopback());
+                      let loopback = match host {
+                          url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+                          url::Host::Ipv4(address) => address.is_loopback(),
+                          url::Host::Ipv6(address) => address.is_loopback(),
+                      };
                       if !loopback {
                           anyhow::bail!(
                               "Cloud Node peer URL must use HTTPS outside exact loopback development hosts"
@@ -174,10 +170,6 @@ jobs:
           PY
 
           cd engine
-          # The new direct url dependency is already in the transitive graph,
-          # but Cargo still needs one unlocked pass to refresh cloud-node's
-          # package dependency list in Cargo.lock. Everything after this is
-          # deliberately locked again.
           cargo check -p cloud-node --all-targets
           cargo fmt --all
           cargo fmt --all -- --check
