@@ -171,11 +171,14 @@ impl CloudNodeRecoveryReceiver {
             fs::create_dir_all(parent)?;
         }
         if target.exists() {
-            if !verify_resource(&target, chunk.resource_sha256, chunk.total_size)? {
-                anyhow::bail!("Cloud Node recovery target already exists with different bytes");
+            if verify_resource(&target, chunk.resource_sha256, chunk.total_size)? {
+                fs::remove_file(&active.path)?;
+                duplicate = true;
+            } else {
+                fs::remove_file(&target)?;
+                fs::rename(&active.path, &target)?;
+                duplicate = false;
             }
-            fs::remove_file(&active.path)?;
-            duplicate = true;
         } else {
             fs::rename(&active.path, &target)?;
         }
@@ -331,7 +334,7 @@ impl CloudNodeRecoveryReceiver {
                 fs::create_dir_all(parent)?;
             }
             if !version.exists() {
-                fs::copy(target, &version)?;
+                copy_file_via_part(target, &version)?;
             }
         }
 
@@ -389,7 +392,7 @@ impl CloudNodeRecoveryReceiver {
         if let Some(parent) = payload.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temp = payload.with_extension(format!("recovery.tmp.{}", std::process::id()));
+        let temp = part_path(&payload)?;
         if temp.exists() {
             fs::remove_file(&temp)?;
         }
@@ -429,6 +432,36 @@ impl CloudNodeRecoveryReceiver {
         result?;
         Ok(true)
     }
+}
+
+fn part_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node recovery target has no file name: {}",
+                path.display()
+            )
+        })?
+        .to_string_lossy();
+    Ok(path.with_file_name(format!("{name}.part.{}", std::process::id())))
+}
+
+fn copy_file_via_part(source: &Path, target: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let part = part_path(target)?;
+    if part.exists() {
+        fs::remove_file(&part)?;
+    }
+    fs::copy(source, &part)?;
+    File::open(&part)?.sync_all()?;
+    if target.exists() {
+        fs::remove_file(target)?;
+    }
+    fs::rename(part, target)?;
+    Ok(())
 }
 
 fn validate_staged_resource(

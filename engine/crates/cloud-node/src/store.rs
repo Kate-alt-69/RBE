@@ -146,10 +146,16 @@ impl CloudNodeStore {
         let version_dir = object_dir.join("versions").join(&content_hex);
         fs::create_dir_all(&version_dir)?;
         let payload_path = version_dir.join("payload");
-        if !payload_path.exists() {
-            copy_exact(source, &payload_path)?;
-        }
         let logical_size = fs::metadata(source)?.len();
+        if !file_matches(&payload_path, content_sha256, logical_size)? {
+            copy_exact(source, &payload_path)?;
+            if !file_matches(&payload_path, content_sha256, logical_size)? {
+                anyhow::bail!(
+                    "Cloud Node content-addressed payload verification failed after repair: {}",
+                    payload_path.display()
+                );
+            }
+        }
         let body = match kind {
             BlobKind::File => {
                 let changes = if let Some(previous) = &previous {
@@ -157,7 +163,7 @@ impl CloudNodeStore {
                         .join("versions")
                         .join(hex::encode(previous.content_sha256))
                         .join("payload");
-                    if old.is_file() {
+                    if file_matches(&old, previous.content_sha256, previous.logical_size)? {
                         exact_byte_changes(&old, source)?
                     } else {
                         vec![ByteRangeChange {
@@ -443,8 +449,14 @@ impl CloudNodeStore {
             }
             let hash: [u8; 32] = Sha256::digest(&buffer[..used]).into();
             let chunk_path = chunks_dir.join(format!("{}.chunk", hex::encode(hash)));
-            if !chunk_path.exists() {
+            if !file_matches(&chunk_path, hash, used as u64)? {
                 atomic_write(&chunk_path, &buffer[..used])?;
+                if !file_matches(&chunk_path, hash, used as u64)? {
+                    anyhow::bail!(
+                        "Cloud Node content-addressed video chunk verification failed after repair: {}",
+                        chunk_path.display()
+                    );
+                }
             }
             chunks.push(ChunkRef {
                 offset,
@@ -717,35 +729,70 @@ fn prune_backup_versions(
     Ok(())
 }
 
+fn file_matches(path: &Path, expected_hash: [u8; 32], expected_size: u64) -> anyhow::Result<bool> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.len() != expected_size {
+        return Ok(false);
+    }
+    Ok(sha256_file(path)? == expected_hash)
+}
+
+fn part_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node target has no file name: {}", path.display()))?
+        .to_string_lossy();
+    Ok(path.with_file_name(format!("{name}.part.{}", std::process::id())))
+}
+
+fn commit_part(part: &Path, target: &Path) -> anyhow::Result<()> {
+    if target.exists() {
+        #[cfg(unix)]
+        {
+            fs::rename(part, target)?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            fs::remove_file(target)?;
+        }
+    }
+    fs::rename(part, target)?;
+    Ok(())
+}
+
 fn copy_exact(source: &Path, target: &Path) -> anyhow::Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = target.with_extension(format!("cn.tmp.{}", std::process::id()));
-    fs::copy(source, &temp)?;
-    if target.exists() {
-        fs::remove_file(target)?;
+    let part = part_path(target)?;
+    if part.exists() {
+        fs::remove_file(&part)?;
     }
-    fs::rename(temp, target)?;
-    Ok(())
+    fs::copy(source, &part)?;
+    File::open(&part)?.sync_all()?;
+    commit_part(&part, target)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension(format!("cn.tmp.{}", std::process::id()));
+    let part = part_path(path)?;
+    if part.exists() {
+        fs::remove_file(&part)?;
+    }
     {
-        let mut writer = BufWriter::new(File::create(&temp)?);
+        let mut writer = BufWriter::new(File::create(&part)?);
         writer.write_all(bytes)?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
     }
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temp, path)?;
-    Ok(())
+    commit_part(&part, path)
 }
 
 fn now_ms() -> anyhow::Result<u64> {
@@ -929,6 +976,55 @@ mod tests {
             panic!("expected video blob");
         };
         assert_eq!(chunks.len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storing_same_file_repairs_corrupted_content_addressed_payload() {
+        let root = test_root("repair-payload");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("users.db");
+        fs::write(&source, b"authoritative bytes").unwrap();
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+        let stored = store.store_file(&source, "db/users.db").unwrap();
+        let payload = store
+            .summary()
+            .storage
+            .join(&stored.object_key)
+            .join("versions")
+            .join(&stored.content_sha256)
+            .join("payload");
+        fs::write(&payload, b"corrupt").unwrap();
+        assert!(store.verify().is_err());
+        store.store_file(&source, "db/users.db").unwrap();
+        assert_eq!(fs::read(&payload).unwrap(), b"authoritative bytes");
+        store.verify().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storing_same_video_repairs_corrupted_content_addressed_chunk() {
+        let root = test_root("repair-video-chunk");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("clip.mp4");
+        fs::write(&source, vec![5u8; 1024 * 1024 + 17]).unwrap();
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+        let stored = store.store_video(&source, "video/clip.mp4").unwrap();
+        let manifest = BlobManifest::decode(&fs::read(&stored.manifest).unwrap()).unwrap();
+        let BlobBody::Video { chunks, .. } = manifest.body else {
+            panic!("expected video blob");
+        };
+        let first = chunks.first().unwrap();
+        let chunk_path = store
+            .summary()
+            .storage
+            .join(&stored.object_key)
+            .join("chunks")
+            .join(format!("{}.chunk", hex::encode(first.sha256)));
+        fs::write(&chunk_path, b"corrupt").unwrap();
+        assert!(store.verify().is_err());
+        store.store_video(&source, "video/clip.mp4").unwrap();
+        store.verify().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
