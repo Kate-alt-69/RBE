@@ -20,16 +20,17 @@ use wasm_encoder::{
     FunctionSection, ImportSection, MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
-use crate::ast::{BinaryOp, Expr, FunctionDef, ImportTarget, RouteFile, Statement, Value};
+use crate::ast::{
+    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, RouteFile, Statement, Value,
+};
 use crate::modules::binding_name;
 use crate::runtime_image::{storage_capability_operation_allowed, storage_capability_target};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-/// Generation 12 resolves multiple exact Route imports by the binding the
-/// method actually calls. This removes the former one-import compiler limit
-/// without turning namespace imports or ambiguous bindings into wider authority.
-/// Capability ABI v3 remains stable.
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 12;
+/// Generation 13 compiles each HTTP method independently so one `.route`
+/// can pin distinct native artifacts and explicit fallbacks per verb. Exact
+/// import binding, capability authority, and ABI v3 remain unchanged.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 13;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STATIC_HELPER_CALL_DEPTH: usize = 32;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
@@ -99,13 +100,12 @@ impl RouteWasmLinkContext {
 
 /// Compile the currently supported native route subset.
 ///
-/// Native lowering remains intentionally strict: one HTTP method. Compiler
-/// generation v12 keeps ABI v3 and resolves any number of exact direct or
-/// linked-function imports by the binding actually returned by the method. It
-/// retains generation 11's static capability arguments and generation 10's
-/// bounded helper folding. Namespace imports, ambiguous bindings, dynamic
-/// transformations, wider Module bodies, and nested host-call chains remain
-/// interpreter-only.
+/// Native lowering remains intentionally strict per HTTP method. Compiler
+/// generation v13 keeps ABI v3 and lets RELC compile every method in a Route
+/// independently while retaining generation 12's exact import binding,
+/// generation 11's static capability arguments, and generation 10's bounded
+/// helper folding. Namespace imports, ambiguous bindings, dynamic transforms,
+/// wider Module bodies, and nested host-call chains remain interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let links = RouteWasmLinkContext::default();
     compile_route_with_links(file, &links)
@@ -114,6 +114,19 @@ pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
 pub(crate) fn compile_route_with_links(
     file: &RouteFile,
     links: &RouteWasmLinkContext,
+) -> RouteWasmCompilation {
+    if file.methods.len() != 1 {
+        return fallback(
+            "whole-route native compilation requires exactly one HTTP method; RELC must compile multi-method Routes per verb",
+        );
+    }
+    compile_route_method_with_links(file, links, &file.methods[0])
+}
+
+pub(crate) fn compile_route_method_with_links(
+    file: &RouteFile,
+    links: &RouteWasmLinkContext,
+    method: &MethodDef,
 ) -> RouteWasmCompilation {
     let mut host_imports = BTreeMap::<String, DirectCapabilityImport>::new();
     let mut linked_imports = BTreeMap::<String, &LinkedModuleFunction>::new();
@@ -124,7 +137,7 @@ pub(crate) fn compile_route_with_links(
                 || host_imports.insert(binding.clone(), found).is_some()
             {
                 return fallback(format!(
-                    "native Route-WASM v12 found ambiguous import binding {binding:?}"
+                    "native Route-WASM v13 found ambiguous import binding {binding:?}"
                 ));
             }
             continue;
@@ -141,21 +154,16 @@ pub(crate) fn compile_route_with_links(
                 || linked_imports.insert(binding.clone(), linked).is_some()
             {
                 return fallback(format!(
-                    "native Route-WASM v12 found ambiguous import binding {binding:?}"
+                    "native Route-WASM v13 found ambiguous import binding {binding:?}"
                 ));
             }
             continue;
         }
 
         return fallback(
-            "native Route-WASM v12 supports only exact direct http.get/post/request imports or exact linked Module function imports; namespace imports remain interpreter-only",
+            "native Route-WASM v13 supports only exact direct http.get/post/request imports or exact linked Module function imports; namespace imports remain interpreter-only",
         );
     }
-    if file.methods.len() != 1 {
-        return fallback("native route compilation currently requires exactly one HTTP method");
-    }
-
-    let method = &file.methods[0];
     let returned_binding = returned_call_binding(&method.body);
     let host_import = returned_binding.and_then(|binding| host_imports.get(binding));
     let linked_import = returned_binding.and_then(|binding| {
@@ -1765,6 +1773,65 @@ mod tests {
         let route = parse("class Route { post(req) { return req.query; } }");
         let RouteWasmCompilation::InterpreterFallback { reason } = compile_route(&route) else {
             panic!("unsupported dynamic route must remain interpreter fallback");
+        };
+        assert!(reason.contains("outside the native Route-WASM v3 subset"));
+    }
+
+    #[test]
+    fn multi_method_route_compiles_each_method_independently() {
+        let route = parse(
+            r#"class Route {
+                get(req) { return { ok: true, method: "get" }; }
+                post(req) { return req.body; }
+            }"#,
+        );
+        assert_eq!(route.methods.len(), 2);
+        let links = RouteWasmLinkContext::default();
+
+        let RouteWasmCompilation::Native(get) =
+            compile_route_method_with_links(&route, &links, &route.methods[0])
+        else {
+            panic!("GET should compile independently");
+        };
+        assert_eq!(get.verb, "get");
+        assert_eq!(get.input, RouteWasmInput::None);
+        let get_result = WasmExecutor::new()
+            .unwrap()
+            .execute(&get.bytes, ExecutionLimits::default())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&get_result.output).unwrap(),
+            serde_json::json!({ "ok": true, "method": "get" })
+        );
+
+        let RouteWasmCompilation::Native(post) =
+            compile_route_method_with_links(&route, &links, &route.methods[1])
+        else {
+            panic!("POST should compile independently");
+        };
+        assert_eq!(post.verb, "post");
+        assert_eq!(post.input, RouteWasmInput::JsonBody);
+        let post_result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input(&post.bytes, br#"{"value":42}"#, ExecutionLimits::default())
+            .unwrap();
+        assert_eq!(post_result.output, br#"{"value":42}"#);
+    }
+
+    #[test]
+    fn multi_method_route_can_mix_native_and_explicit_fallback() {
+        let route = parse(
+            r#"class Route {
+                get(req) { return true; }
+                post(req) { return req.query; }
+            }"#,
+        );
+        let links = RouteWasmLinkContext::default();
+        assert!(compile_route_method_with_links(&route, &links, &route.methods[0]).is_native());
+        let RouteWasmCompilation::InterpreterFallback { reason } =
+            compile_route_method_with_links(&route, &links, &route.methods[1])
+        else {
+            panic!("unsupported POST should remain an explicit method fallback");
         };
         assert!(reason.contains("outside the native Route-WASM v3 subset"));
     }

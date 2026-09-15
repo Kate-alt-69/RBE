@@ -757,10 +757,14 @@ async fn execute(
 fn build_method_router(
     file: &RouteFile,
     module_program: Arc<ModuleProgram>,
-    native_plan: Option<Arc<NativeRoutePlan>>,
+    native_plans: Option<Arc<HashMap<String, Arc<NativeRoutePlan>>>>,
 ) -> MethodRouter<AppState> {
     let mut router = MethodRouter::<AppState>::new();
     for method_def in &file.methods {
+        let native_plan = native_plans
+            .as_ref()
+            .and_then(|plans| plans.get(&method_def.verb))
+            .cloned();
         let mut functions = file.functions.clone();
         functions.push(FunctionDef {
             name: INLINE_ROUTE_HANDLER.to_string(),
@@ -1265,16 +1269,31 @@ pub fn build_routes_from_image(
             methods = ?route_file.methods.iter().map(|method| &method.verb).collect::<Vec<_>>(),
             "registered Runtime Image Route REL"
         );
-        let native_plan = image.route_wasm_artifact(id).map(|artifact| {
-            Arc::new(NativeRoutePlan {
-                runtime_image: image.image_id.clone(),
-                source_id: id.clone(),
-                artifact: artifact.clone(),
-            })
-        });
+        let mut native_plans = HashMap::new();
+        for method in &route_file.methods {
+            let Some(artifact) = image.route_wasm_artifact(id, &method.verb) else {
+                continue;
+            };
+            if artifact.verb != method.verb {
+                anyhow::bail!(
+                    "Runtime Image route {id} method {:?} points at mismatched native artifact {:?}",
+                    method.verb,
+                    artifact.verb
+                );
+            }
+            native_plans.insert(
+                method.verb.clone(),
+                Arc::new(NativeRoutePlan {
+                    runtime_image: image.image_id.clone(),
+                    source_id: id.clone(),
+                    artifact: artifact.clone(),
+                }),
+            );
+        }
+        let native_plans = (!native_plans.is_empty()).then(|| Arc::new(native_plans));
         router = router.route(
             &url_path,
-            build_method_router(route_file.as_ref(), module_program.clone(), native_plan),
+            build_method_router(route_file.as_ref(), module_program.clone(), native_plans),
         );
     }
     Ok(router)

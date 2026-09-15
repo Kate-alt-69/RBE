@@ -302,11 +302,13 @@ pub struct RuntimeImage {
     pub middleware_plan: MiddlewarePlan,
     pub service_assignments: BTreeMap<String, String>,
     pub capabilities: BTreeMap<SourceId, BTreeSet<RuntimeCapabilityRequirement>>,
-    /// Exact native route artifacts pinned at image-link time. These bytes
-    /// are the only route WASM payloads eligible for Container registration.
-    pub route_wasm_artifacts: BTreeMap<SourceId, RouteWasmArtifact>,
-    /// Routes outside the current native compiler subset remain explicit.
-    pub route_wasm_fallbacks: BTreeMap<SourceId, String>,
+    /// Exact native route artifacts pinned at image-link time, grouped by
+    /// source and HTTP verb. These bytes are the only Route-WASM payloads
+    /// eligible for Container registration.
+    pub route_wasm_artifacts: BTreeMap<SourceId, BTreeMap<String, RouteWasmArtifact>>,
+    /// Method-level compiler fallbacks remain explicit instead of collapsing an
+    /// entire multi-method Route back to the evaluator.
+    pub route_wasm_fallbacks: BTreeMap<SourceId, BTreeMap<String, String>>,
     pub executables: BTreeMap<SourceId, RuntimeExecutable>,
 }
 
@@ -343,12 +345,15 @@ impl RuntimeImage {
         }
     }
 
-    pub fn route_wasm_artifact(&self, id: &SourceId) -> Option<&RouteWasmArtifact> {
-        self.route_wasm_artifacts.get(id)
+    pub fn route_wasm_artifact(&self, id: &SourceId, verb: &str) -> Option<&RouteWasmArtifact> {
+        self.route_wasm_artifacts.get(id)?.get(verb)
     }
 
-    pub fn route_wasm_fallback(&self, id: &SourceId) -> Option<&str> {
-        self.route_wasm_fallbacks.get(id).map(String::as_str)
+    pub fn route_wasm_fallback(&self, id: &SourceId, verb: &str) -> Option<&str> {
+        self.route_wasm_fallbacks
+            .get(id)?
+            .get(verb)
+            .map(String::as_str)
     }
 
     pub fn route_file(&self, id: &SourceId) -> Option<Arc<RouteFile>> {

@@ -30,7 +30,9 @@ use crate::runtime_image::{
 use crate::server_policy::{ServerPolicy, ServerPolicyError};
 use crate::server_rel::{compile_server_source, ServerCompileError, ServerProgram};
 use crate::source_registry::{RelSourceKind, RelSourceRegistry, SourceId, SourceRegistryError};
-use crate::wasm_compiler::{compile_route_with_links, RouteWasmCompilation, RouteWasmLinkContext};
+use crate::wasm_compiler::{
+    compile_route_method_with_links, RouteWasmCompilation, RouteWasmLinkContext,
+};
 
 #[derive(Debug, Clone)]
 pub struct PhysicalRelSource {
@@ -337,9 +339,10 @@ pub fn compile_runtime_image(
     let server_policy = ServerPolicy::resolve(&server, settings_json)?;
     let middleware_plan = MiddlewarePlan::lower(&server)?;
 
-    // PASS 7/8/9 are metadata/lowering boundaries in v1. The current evaluator
-    // remains the executable representation while the image owns validated
-    // policy, identities and graph information.
+    // PASS 7/8/9 lower validated REL into executable Runtime Image state.
+    // Route methods inside the native subset become immutable WASM artifacts;
+    // unsupported methods retain an explicit evaluator fallback. The image owns
+    // the exact policy, identities, graph, and executable representation.
     let mut sources = Vec::new();
     let mut routes = Vec::new();
     let mut modules = Vec::new();
@@ -358,27 +361,52 @@ pub fn compile_runtime_image(
             continue;
         };
         let link_context = route_wasm_link_context(&registry, &compiled, file);
-        match compile_route_with_links(file, &link_context) {
-            RouteWasmCompilation::Native(artifact) => {
-                route_wasm_artifacts.insert(id.clone(), artifact);
+        let requires_storage = capabilities.get(id).is_some_and(|requirements| {
+            requirements.iter().any(|requirement| {
+                matches!(requirement, RuntimeCapabilityRequirement::Storage { .. })
+            })
+        });
+        let mut method_artifacts = BTreeMap::new();
+        let mut method_fallbacks = BTreeMap::new();
+        let mut seen_verbs = BTreeSet::new();
+
+        for method in &file.methods {
+            if !seen_verbs.insert(method.verb.clone()) {
+                return Err(RelcError::Link(format!(
+                    "{id} declares duplicate Route method {:?}",
+                    method.verb
+                )));
             }
-            RouteWasmCompilation::InterpreterFallback { reason } => {
-                let requires_storage = capabilities.get(id).is_some_and(|requirements| {
-                    requirements.iter().any(|requirement| {
-                        matches!(requirement, RuntimeCapabilityRequirement::Storage { .. })
-                    })
-                });
-                if requires_storage {
-                    return Err(RelcError::Capability {
-                        code: "RELC3001",
-                        source: id.clone(),
-                        message: format!(
-                            "Environment Storage authority requires native Container execution; Route-WASM v7 could not lower this Route: {reason}"
-                        ),
-                    });
+            match compile_route_method_with_links(file, &link_context, method) {
+                RouteWasmCompilation::Native(artifact) => {
+                    debug_assert_eq!(artifact.verb, method.verb);
+                    method_artifacts.insert(method.verb.clone(), artifact);
                 }
-                route_wasm_fallbacks.insert(id.clone(), reason);
+                RouteWasmCompilation::InterpreterFallback { reason } => {
+                    // Storage authority is currently lowered at SourceId scope.
+                    // Until grants become method-scoped, allowing any method of
+                    // a Storage-capable Route to escape native execution would
+                    // blur the capability boundary. Fail the image instead.
+                    if requires_storage {
+                        return Err(RelcError::Capability {
+                            code: "RELC3001",
+                            source: id.clone(),
+                            message: format!(
+                                "Environment Storage authority requires native Container execution; Route-WASM v13 could not lower method {:?}: {reason}",
+                                method.verb
+                            ),
+                        });
+                    }
+                    method_fallbacks.insert(method.verb.clone(), reason);
+                }
             }
+        }
+
+        if !method_artifacts.is_empty() {
+            route_wasm_artifacts.insert(id.clone(), method_artifacts);
+        }
+        if !method_fallbacks.is_empty() {
+            route_wasm_fallbacks.insert(id.clone(), method_fallbacks);
         }
     }
 
@@ -1310,16 +1338,72 @@ mod tests {
             })
             .unwrap();
 
-        let artifact = image.route_wasm_artifact(static_id).unwrap();
+        let artifact = image.route_wasm_artifact(static_id, "get").unwrap();
         assert_eq!(artifact.verb, "get");
         assert_eq!(artifact.sha256.len(), 64);
         assert_eq!(&artifact.bytes[..4], b"\0asm");
-        assert!(image.route_wasm_fallback(static_id).is_none());
-        assert!(image.route_wasm_artifact(dynamic_id).is_none());
+        assert!(image.route_wasm_fallback(static_id, "get").is_none());
+        assert!(image.route_wasm_artifact(dynamic_id, "post").is_none());
         assert!(image
-            .route_wasm_fallback(dynamic_id)
+            .route_wasm_fallback(dynamic_id, "post")
             .unwrap()
             .contains("outside the native Route-WASM v3 subset"));
+    }
+
+    #[test]
+    fn runtime_image_pins_native_artifacts_and_fallbacks_per_method() {
+        let routes = vec![PhysicalRelSource::new(
+            RelSourceKind::Route,
+            "mixed-methods",
+            "api/mixed-methods.route",
+            r#"class Route {
+                get(req) { return { ok: true }; }
+                post(req) { return req.query; }
+            }"#,
+        )];
+        let image =
+            compile_runtime_image("server Main {}", routes, &serde_json::json!({})).unwrap();
+        let route = image.routes.first().unwrap();
+
+        let get = image
+            .route_wasm_artifact(route, "get")
+            .expect("GET should have a native artifact");
+        assert_eq!(get.verb, "get");
+        assert!(image.route_wasm_fallback(route, "get").is_none());
+
+        assert!(image.route_wasm_artifact(route, "post").is_none());
+        assert!(image
+            .route_wasm_fallback(route, "post")
+            .is_some_and(|reason| reason.contains("outside the native Route-WASM v3 subset")));
+    }
+
+    #[test]
+    fn storage_multi_method_route_fails_closed_if_any_method_falls_back() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Module,
+                "cache",
+                "module/cache.module",
+                r#":import[storage.read as readEntry]
+                   export function load(path) { return readEntry(path); }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "storage-mixed",
+                "api/storage-mixed.route",
+                r#":import["./module/cache".load]
+                   class Route {
+                       get(req) { return load("users/kate.json"); }
+                       post(req) { return req.query; }
+                   }"#,
+            ),
+        ];
+        let error = compile_runtime_image("server Main {}", sources, &serde_json::json!({}))
+            .expect_err("Storage-capable Route must not mix native and evaluator execution");
+        assert_eq!(error.code(), "RELC3001");
+        let rendered = error.to_string();
+        assert!(rendered.contains("Route-WASM v13"));
+        assert!(rendered.contains("post"));
     }
 
     #[test]
@@ -1334,7 +1418,7 @@ mod tests {
         let image =
             compile_runtime_image("server Main {}", routes, &serde_json::json!({})).unwrap();
         let route = image.routes.first().unwrap();
-        assert!(image.route_wasm_artifact(route).is_some());
+        assert!(image.route_wasm_artifact(route, "get").is_some());
         let requirements = image.capability_requirements(route).unwrap();
         assert_eq!(
             requirements,
@@ -1480,8 +1564,8 @@ mod tests {
         let image =
             compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
         let route = image.routes.first().unwrap();
-        assert!(image.route_wasm_artifact(route).is_some());
-        assert!(image.route_wasm_fallback(route).is_none());
+        assert!(image.route_wasm_artifact(route, "get").is_some());
+        assert!(image.route_wasm_fallback(route, "get").is_none());
         let grants = image.container_capability_grants(route).unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Video);
@@ -1517,8 +1601,8 @@ mod tests {
         let image =
             compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
         let route = image.routes.first().unwrap();
-        assert!(image.route_wasm_artifact(route).is_some());
-        assert!(image.route_wasm_fallback(route).is_none());
+        assert!(image.route_wasm_artifact(route, "get").is_some());
+        assert!(image.route_wasm_fallback(route, "get").is_none());
         let grants = image.container_capability_grants(route).unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Service);
@@ -1547,8 +1631,8 @@ mod tests {
         let image =
             compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
         let route = image.routes.first().unwrap();
-        assert!(image.route_wasm_artifact(route).is_some());
-        assert!(image.route_wasm_fallback(route).is_none());
+        assert!(image.route_wasm_artifact(route, "get").is_some());
+        assert!(image.route_wasm_fallback(route, "get").is_none());
         let expected = RuntimeCapabilityRequirement::Storage {
             owner: "accounts.cache".into(),
             operation: "read".into(),
@@ -1618,13 +1702,13 @@ mod tests {
             compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
         let route = image.routes.first().unwrap();
         let artifact = image
-            .route_wasm_artifact(route)
+            .route_wasm_artifact(route, "post")
             .expect("dynamic Storage route must compile to native WASM");
         assert_eq!(
             artifact.input,
             crate::wasm_compiler::RouteWasmInput::JsonBodyCapabilityArgument
         );
-        assert!(image.route_wasm_fallback(route).is_none());
+        assert!(image.route_wasm_fallback(route, "get").is_none());
         let grants = image.container_capability_grants(route).unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Storage);
