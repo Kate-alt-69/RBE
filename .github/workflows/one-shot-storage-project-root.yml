@@ -6,6 +6,7 @@ on:
       - work/relc-wasm-runtime
     paths:
       - .github/patches/storage-project-root.py
+      - .github/patches/storage-project-root-preflight.py
       - .github/workflows/one-shot-storage-project-root.yml
 
 permissions:
@@ -31,6 +32,9 @@ jobs:
             container-runtime -> target
             engine -> target
 
+      - name: Fix staging patch anchors
+        run: python .github/patches/storage-project-root-preflight.py
+
       - name: Apply project-root Storage architecture
         run: python .github/patches/storage-project-root.py
 
@@ -53,6 +57,7 @@ jobs:
         shell: bash
         run: |
           rm -f .github/patches/storage-project-root.py
+          rm -f .github/patches/storage-project-root-preflight.py
           rm -f .github/workflows/one-shot-storage-project-root.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
