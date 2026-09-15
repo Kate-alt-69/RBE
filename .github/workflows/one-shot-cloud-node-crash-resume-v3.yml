@@ -1,0 +1,198 @@
+name: One-shot Cloud Node crash-resumable recovery v3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-crash-resume-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Apply, validate, and land crash-resumable recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('doc/cloud-node.md')
+          text = p.read_text()
+          text = text.replace(
+              '    └── <authenticated-session>/              # REMOTE private recovery staging',
+              '    └── <authenticated-session>/              # private full-snapshot recovery staging',
+              1,
+          )
+          current = '''Recovery is intentionally full-snapshot rather than merge-based. Stale objects on the REMOTE side must disappear. The receiver writes incoming resources to `.part` state inside `recovery-staging/<session>/storage`, verifies hashes and the completed staged tree against the exact root negotiated with the authenticated sender, then swaps that storage tree into the live Cloud Node store. If post-swap verification fails, the previous live storage tree is restored. Content-addressed LOCAL writes likewise use verified `.part` files before final rename, so neither side treats a partially written blob as committed data.\n'''
+          expected = '''Recovery is intentionally full-snapshot rather than merge-based. Stale objects on the REMOTE side must disappear. The receiver writes into `recovery-staging/<session>/storage`, verifies the completed staged tree against the exact root negotiated with the authenticated sender, then swaps that storage tree into the live Cloud Node store. If post-swap verification fails, the previous live storage tree is restored.\n'''
+          if current not in text:
+              raise SystemExit('Cloud Node recovery documentation pre-anchor changed')
+          p.write_text(text.replace(current, expected, 1))
+          PY
+
+          python3 .github/patches/cloud-node-crash-resume.py
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('engine/crates/cloud-node/src/recovery.rs')
+          text = p.read_text()
+          old = '''        if !chunk.final_chunk {
+              return Ok(RecoveryReceipt {
+                  committed: false,
+                  duplicate,
+                  video_reconstructed: false,
+                  next_offset: active.written,
+              });
+          }
+          '''
+          new = '''        // A process may have crashed after the entire durable .part file was
+          // fsynced but before it was verified/renamed. In that case the first
+          // replayed chunk is not itself final, but the receiver already has the
+          // complete resource and must finish committing it before advertising
+          // total_size as the next offset.
+          if active.written < chunk.total_size {
+              return Ok(RecoveryReceipt {
+                  committed: false,
+                  duplicate,
+                  video_reconstructed: false,
+                  next_offset: active.written,
+              });
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'full-part commit guard anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          marker = '''    #[test]
+          fn recovery_rejects_phase_regression() {
+          '''
+          test = '''    #[test]
+          fn recovery_commits_fully_durable_part_after_restart_probe() {
+              let root = test_root("full-part-restart");
+              fs::create_dir_all(&root).unwrap();
+              let store = CloudNodeStore::open(&settings(&root, "full-part-restart")).unwrap();
+              let expected = SyncPlanHeader {
+                  root_sha256: [9u8; 32],
+                  folder_count: 0,
+                  video_count: 0,
+                  file_count: 1,
+              };
+              let payload = vec![3u8; 32];
+              let content_sha256: [u8; 32] = Sha256::digest(&payload).into();
+              let manifest = BlobManifest {
+                  kind: BlobKind::File,
+                  object_key: object_key(BlobKind::File, "db/full.db"),
+                  content_sha256,
+                  parent_content_sha256: None,
+                  logical_path: "db/full.db".into(),
+                  logical_size: payload.len() as u64,
+                  created_unix_ms: 1,
+                  body: BlobBody::File { changes: Vec::new() },
+              };
+              let manifest_bytes = manifest.encode().unwrap();
+              let manifest_hash: [u8; 32] = Sha256::digest(&manifest_bytes).into();
+              let manifest_chunk = TransferChunk::new(
+                  BlobKind::File,
+                  TransferResource::Manifest,
+                  manifest.object_key,
+                  manifest.content_sha256,
+                  manifest_hash,
+                  0,
+                  manifest_bytes.len() as u64,
+                  manifest_bytes,
+              )
+              .unwrap();
+
+              let mut receiver =
+                  CloudNodeRecoveryReceiver::open(&store, "full-part-peer", expected).unwrap();
+              receiver.accept_chunk(&manifest_chunk).unwrap();
+              let whole = TransferChunk::new(
+                  BlobKind::File,
+                  TransferResource::FilePayload,
+                  manifest.object_key,
+                  manifest.content_sha256,
+                  content_sha256,
+                  0,
+                  payload.len() as u64,
+                  payload.clone(),
+              )
+              .unwrap();
+
+              let target = receiver.resource_target(&whole);
+              let part = transfer_part_path(&target).unwrap();
+              fs::create_dir_all(part.parent().unwrap()).unwrap();
+              fs::write(&part, &payload).unwrap();
+              File::open(&part).unwrap().sync_all().unwrap();
+              drop(receiver);
+
+              let mut receiver =
+                  CloudNodeRecoveryReceiver::open(&store, "full-part-peer", expected).unwrap();
+              let probe = TransferChunk::new(
+                  BlobKind::File,
+                  TransferResource::FilePayload,
+                  manifest.object_key,
+                  manifest.content_sha256,
+                  content_sha256,
+                  0,
+                  payload.len() as u64,
+                  payload[..8].to_vec(),
+              )
+              .unwrap();
+              let receipt = receiver.accept_chunk(&probe).unwrap();
+              assert!(receipt.committed);
+              assert_eq!(receipt.next_offset, payload.len() as u64);
+              assert_eq!(fs::read(target).unwrap(), payload);
+              assert!(!part.exists());
+              fs::remove_dir_all(root).unwrap();
+          }
+
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit(f'full-part regression test marker count={text.count(marker)}')
+          p.write_text(text.replace(marker, test + marker, 1))
+          PY
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test -p cloud-node --locked
+          cargo test -p backend --locked
+          cd ..
+
+          rm -f \
+            .github/workflows/one-shot-cloud-node-crash-resume.yml \
+            .github/workflows/one-shot-cloud-node-crash-resume-v2.yml \
+            .github/workflows/one-shot-cloud-node-crash-resume-v3.yml \
+            .github/patches/cloud-node-crash-resume.py
+
+          git add -A \
+            .github/workflows/one-shot-cloud-node-crash-resume.yml \
+            .github/workflows/one-shot-cloud-node-crash-resume-v2.yml \
+            .github/workflows/one-shot-cloud-node-crash-resume-v3.yml \
+            .github/patches/cloud-node-crash-resume.py \
+            engine/crates/cloud-node/src/recovery.rs \
+            engine/crates/backend/src/maintenance_notice.rs \
+            doc/cloud-node.md
+          git diff --cached --check
+          git commit -m 'FIX | BUG-CN-006 resume Cloud Node recovery after process restart'
+          git pull --rebase origin main
+          git push origin HEAD:main
