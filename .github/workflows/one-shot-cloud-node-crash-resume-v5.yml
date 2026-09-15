@@ -60,6 +60,15 @@ jobs:
           p = Path('engine/crates/cloud-node/src/recovery.rs')
           text = p.read_text()
 
+          duplicate_binding = '        let duplicate = write_or_replay_recovery_chunk(active, chunk)?;\n'
+          if text.count(duplicate_binding) != 1:
+              raise SystemExit(f'duplicate binding count={text.count(duplicate_binding)}')
+          text = text.replace(
+              duplicate_binding,
+              '        let mut duplicate = write_or_replay_recovery_chunk(active, chunk)?;\n',
+              1,
+          )
+
           needle = '        if !chunk.final_chunk {\n'
           if text.count(needle) != 1:
               raise SystemExit(f'partial receipt guard count={text.count(needle)}')
