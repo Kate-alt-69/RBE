@@ -42,11 +42,15 @@ pub struct SyncPlanHeader {
 impl SyncPlan {
     pub fn scan(store: &CloudNodeStore) -> anyhow::Result<Self> {
         let storage = store.summary().storage;
+        Self::scan_storage(&storage)
+    }
+
+    pub(crate) fn scan_storage(storage: &Path) -> anyhow::Result<Self> {
         let mut folders = Vec::new();
         let mut videos = Vec::new();
         let mut files = Vec::new();
 
-        for entry in fs::read_dir(&storage)? {
+        for entry in fs::read_dir(storage)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;

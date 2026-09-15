@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::format::{BlobBody, BlobKind, BlobManifest, FolderEntry};
 use crate::store::CloudNodeStore;
-use crate::sync::SyncPlanHeader;
+use crate::sync::{SyncPlan, SyncPlanHeader};
 use crate::transfer::{TransferChunk, TransferResource};
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
@@ -204,11 +204,23 @@ impl CloudNodeRecoveryReceiver {
             anyhow::bail!("Cloud Node recovery cannot complete with a partial resource");
         }
 
+        CloudNodeStore::verify_storage_path(&self.staging_storage)?;
+        let staged = SyncPlan::scan_storage(&self.staging_storage)?.header()?;
+        if staged != expected {
+            anyhow::bail!(
+                "Cloud Node staged recovery root mismatch: expected {}, got {}",
+                hex::encode(expected.root_sha256),
+                hex::encode(staged.root_sha256)
+            );
+        }
+
         let summary = store.summary();
         let live = summary.storage;
-        let old = self.session_root.join("previous-storage");
+        let old = summary.root.join("recovery-previous-storage");
         if old.exists() {
-            fs::remove_dir_all(&old)?;
+            anyhow::bail!(
+                "Cloud Node cannot start a storage swap while previous recovery storage exists"
+            );
         }
 
         let had_live = live.exists();
@@ -222,7 +234,7 @@ impl CloudNodeRecoveryReceiver {
             return Err(error.into());
         }
 
-        let actual = match store.sync_plan().and_then(|plan| plan.header()) {
+        let actual = match store.verify().and_then(|_| store.sync_plan()?.header()) {
             Ok(actual) => actual,
             Err(error) => {
                 self.rollback_swap(&live, &old, had_live);
@@ -232,7 +244,7 @@ impl CloudNodeRecoveryReceiver {
         if actual != expected {
             self.rollback_swap(&live, &old, had_live);
             anyhow::bail!(
-                "Cloud Node recovered snapshot root mismatch: expected {}, got {}",
+                "Cloud Node activated recovery root mismatch: expected {}, got {}",
                 hex::encode(expected.root_sha256),
                 hex::encode(actual.root_sha256)
             );

@@ -41,18 +41,71 @@ impl CloudNodeStore {
     pub fn open(settings: &CloudNodeSettings) -> anyhow::Result<Self> {
         settings.validate()?;
         let root = settings.node.storage_root.join("rbe");
+        fs::create_dir_all(&root)?;
         let storage = root.join("storage");
         let backup = root.join("backup");
+        let previous = root.join("recovery-previous-storage");
+
+        let restored_previous = !storage.exists() && previous.exists();
+        if restored_previous {
+            fs::rename(&previous, &storage)?;
+        }
         fs::create_dir_all(&storage)?;
         fs::create_dir_all(&backup)?;
-        Ok(Self {
+
+        let store = Self {
             root,
             storage,
             backup,
             backup_versions: settings.node.backup_versions,
             preserve_original: settings.node.preserve_original,
             video_chunk_bytes: settings.node.video_chunk_bytes,
-        })
+        };
+
+        if restored_previous {
+            store.verify().map_err(|error| {
+                anyhow::anyhow!(
+                    "Cloud Node restored interrupted previous storage but verification failed: {error}"
+                )
+            })?;
+        } else if previous.exists() {
+            store.reconcile_interrupted_swap(&previous)?;
+        }
+        Ok(store)
+    }
+
+    fn reconcile_interrupted_swap(&self, previous: &Path) -> anyhow::Result<()> {
+        let live_error = match self.verify() {
+            Ok(_) => {
+                fs::remove_dir_all(previous)?;
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+
+        let failed = self.root.join("recovery-failed-storage");
+        if failed.exists() {
+            anyhow::bail!(
+                "Cloud Node has an unresolved failed recovery tree at {}",
+                failed.display()
+            );
+        }
+        fs::rename(&self.storage, &failed)?;
+        if let Err(error) = fs::rename(previous, &self.storage) {
+            let _ = fs::rename(&failed, &self.storage);
+            return Err(error.into());
+        }
+
+        match self.verify() {
+            Ok(_) => {
+                fs::remove_dir_all(&failed)?;
+                Ok(())
+            }
+            Err(previous_error) => anyhow::bail!(
+                "Cloud Node interrupted recovery contains two invalid trees: active={live_error}; previous={previous_error}; failed tree preserved at {}",
+                failed.display()
+            ),
+        }
     }
 
     pub fn summary(&self) -> StoreSummary {
@@ -196,8 +249,12 @@ impl CloudNodeStore {
     }
 
     pub fn verify(&self) -> anyhow::Result<usize> {
+        Self::verify_storage_path(&self.storage)
+    }
+
+    pub(crate) fn verify_storage_path(storage: &Path) -> anyhow::Result<usize> {
         let mut verified = 0usize;
-        for entry in fs::read_dir(&self.storage)? {
+        for entry in fs::read_dir(storage)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -918,6 +975,89 @@ mod tests {
         manifest.logical_size = manifest.logical_size.saturating_add(1);
         fs::write(&stored.manifest, manifest.encode().unwrap()).unwrap();
         assert!(store.verify().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_restores_previous_storage_when_live_tree_is_missing() {
+        let root = test_root("interrupted-missing-live");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("users.db");
+        fs::write(&source, b"old bytes").unwrap();
+        let settings = settings(&root);
+        let store = CloudNodeStore::open(&settings).unwrap();
+        store.store_file(&source, "db/users.db").unwrap();
+        let expected = store.sync_plan().unwrap().header().unwrap();
+        let summary = store.summary();
+        let previous = summary.root.join("recovery-previous-storage");
+        fs::rename(&summary.storage, &previous).unwrap();
+        drop(store);
+
+        let reopened = CloudNodeStore::open(&settings).unwrap();
+        assert_eq!(reopened.sync_plan().unwrap().header().unwrap(), expected);
+        assert!(!previous.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_keeps_verified_new_tree_after_interrupted_swap() {
+        let root = test_root("interrupted-good-live");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("users.db");
+        fs::write(&source, b"old bytes").unwrap();
+        let settings = settings(&root);
+        let store = CloudNodeStore::open(&settings).unwrap();
+        store.store_file(&source, "db/users.db").unwrap();
+        let summary = store.summary();
+        let previous = summary.root.join("recovery-previous-storage");
+        fs::rename(&summary.storage, &previous).unwrap();
+
+        fs::write(&source, b"new bytes").unwrap();
+        store.store_file(&source, "db/users.db").unwrap();
+        let expected_new = store.sync_plan().unwrap().header().unwrap();
+        drop(store);
+
+        let reopened = CloudNodeStore::open(&settings).unwrap();
+        assert_eq!(
+            reopened.sync_plan().unwrap().header().unwrap(),
+            expected_new
+        );
+        assert!(!previous.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_rolls_back_corrupt_new_tree_to_verified_previous_tree() {
+        let root = test_root("interrupted-bad-live");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("users.db");
+        fs::write(&source, b"old bytes").unwrap();
+        let settings = settings(&root);
+        let store = CloudNodeStore::open(&settings).unwrap();
+        store.store_file(&source, "db/users.db").unwrap();
+        let expected_old = store.sync_plan().unwrap().header().unwrap();
+        let summary = store.summary();
+        let previous = summary.root.join("recovery-previous-storage");
+        fs::rename(&summary.storage, &previous).unwrap();
+
+        fs::write(&source, b"new bytes").unwrap();
+        store.store_file(&source, "db/users.db").unwrap();
+        let plan = store.sync_plan().unwrap();
+        let payload = plan.files[0].payload_path.as_ref().unwrap();
+        fs::write(payload, b"corrupt").unwrap();
+        drop(store);
+
+        let reopened = CloudNodeStore::open(&settings).unwrap();
+        assert_eq!(
+            reopened.sync_plan().unwrap().header().unwrap(),
+            expected_old
+        );
+        assert!(!previous.exists());
+        assert!(!reopened
+            .summary()
+            .root
+            .join("recovery-failed-storage")
+            .exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
