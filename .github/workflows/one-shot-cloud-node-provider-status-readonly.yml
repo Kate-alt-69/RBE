@@ -1,0 +1,130 @@
+name: One-shot Cloud Node provider status readonly
+
+on:
+  push:
+    branches:
+      - work/cloud-node-providers-latest
+
+permissions:
+  contents: write
+
+jobs:
+  provider-status:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Make provider-status read-only
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('engine/crates/cloud-node/src/provider_sync.rs')
+          text = path.read_text()
+          start = text.index('pub async fn provider_status(')
+          end = text.index('pub async fn synchronize_provider(', start)
+          replacement = r'''fn working_snapshot_relation(
+              history: &LocalHistory,
+              local_head: &HistoryCommit,
+              remote: Option<&HistoryCommit>,
+              local_root: &str,
+          ) -> anyhow::Result<ProviderSyncRelation> {
+              let Some(remote) = remote else {
+                  return Ok(ProviderSyncRelation::EmptyRemote);
+              };
+              if remote.snapshot_root == local_root {
+                  return Ok(ProviderSyncRelation::InSync);
+              }
+              if remote.id == local_head.id || history.is_ancestor(&remote.id, &local_head.id)? {
+                  return Ok(ProviderSyncRelation::LocalAhead);
+              }
+              Ok(ProviderSyncRelation::Diverged)
+          }
+
+          pub async fn provider_status(
+              settings: &CloudNodeSettings,
+              store: &CloudNodeStore,
+          ) -> anyhow::Result<ProviderSyncStatus> {
+              let provider = settings
+                  .provider
+                  .as_ref()
+                  .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
+              let client = ProviderClient::new(provider)?;
+              let plan = store.sync_plan()?;
+              let local_root = plan.root_hex();
+              let history = LocalHistory::open(store, &provider.namespace)?;
+              let remote = remote_head(&client).await?;
+              let existing_head = history.head()?;
+
+              let Some(local_head) = existing_head else {
+                  let relation = match remote.as_ref() {
+                      None => ProviderSyncRelation::EmptyRemote,
+                      Some(remote_head) if remote_head.snapshot_root == local_root => {
+                          ProviderSyncRelation::InSync
+                      }
+                      Some(_) if plan.object_count() == 0 => ProviderSyncRelation::RemoteAhead,
+                      Some(_) => ProviderSyncRelation::Diverged,
+                  };
+                  return Ok(ProviderSyncStatus {
+                      relation,
+                      local_head: "<untracked>".to_owned(),
+                      remote_head: remote.as_ref().map(|head| head.id.clone()),
+                      local_root,
+                      remote_root: remote.as_ref().map(|head| head.snapshot_root.clone()),
+                  });
+              };
+
+              if local_head.snapshot_root != local_root {
+                  let relation = working_snapshot_relation(
+                      &history,
+                      &local_head,
+                      remote.as_ref(),
+                      &local_root,
+                  )?;
+                  return Ok(ProviderSyncStatus {
+                      relation,
+                      local_head: local_head.id,
+                      remote_head: remote.as_ref().map(|head| head.id.clone()),
+                      local_root,
+                      remote_root: remote.as_ref().map(|head| head.snapshot_root.clone()),
+                  });
+              }
+
+              status_from_heads(&history, &client, local_head, remote, local_root).await
+          }
+
+          '''
+          text = text[:start] + replacement + text[end:]
+
+          anchor = '''    #[test]\n    fn local_history_tracks_snapshot_ancestry() {\n'''
+          test = '''    #[test]\n    fn working_snapshot_status_does_not_advance_local_history() {\n        let root = test_root();\n        fs::create_dir_all(&root).unwrap();\n        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({\n            "node":{"id":"node-a","storageRoot":root},\n            "provider":{\n                "kind":"google-cloud-storage",\n                "namespace":"prod",\n                "bucket":"rbe"\n            }\n        }))\n        .unwrap();\n        let store = CloudNodeStore::open(&settings).unwrap();\n        let history = LocalHistory::open(&store, "prod").unwrap();\n        let remote = history\n            .ensure_snapshot_commit("node-a", &"11".repeat(32))\n            .unwrap();\n        let local = history\n            .ensure_snapshot_commit("node-a", &"22".repeat(32))\n            .unwrap();\n        let head_before = fs::read(&history.head).unwrap();\n\n        let relation = working_snapshot_relation(\n            &history,\n            &local,\n            Some(&remote),\n            &"33".repeat(32),\n        )\n        .unwrap();\n\n        assert_eq!(relation, ProviderSyncRelation::LocalAhead);\n        assert_eq!(fs::read(&history.head).unwrap(), head_before);\n        fs::remove_dir_all(root).unwrap();\n    }\n\n'''
+          if anchor not in text:
+              raise SystemExit('provider status test anchor not found')
+          text = text.replace(anchor, test + anchor, 1)
+          path.write_text(text)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
+      - name: Commit BUG-CN-PROV-011
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-status-readonly.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-011 keep provider status read-only"
+          git push origin HEAD:work/cloud-node-providers-latest
