@@ -6,6 +6,7 @@ use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
     ETAG, HOST, IF_MATCH, IF_NONE_MATCH, RANGE,
 };
+use reqwest::redirect::Policy;
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
@@ -50,6 +51,7 @@ impl ProviderClient {
     pub fn new(settings: &ProviderSettings) -> anyhow::Result<Self> {
         let client = Client::builder()
             .https_only(false)
+            .redirect(Policy::none())
             .connect_timeout(Duration::from_millis(settings.connect_timeout_ms))
             .read_timeout(Duration::from_millis(settings.read_timeout_ms))
             .build()
