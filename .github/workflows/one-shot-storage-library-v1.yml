@@ -1,0 +1,63 @@
+name: One-shot Container Storage library
+
+"on":
+  push:
+    branches:
+      - work/relc-wasm-runtime
+    paths:
+      - '.github/workflows/one-shot-storage-library-v1.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Add Container-owned typed Storage library
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/patches/storage-library-v1.py
+          python3 .github/patches/storage-library-v1-fix.py
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test -p container-runtime-core storage_library --locked
+          cargo test -p container-runtime-core storage_capability --locked
+          cargo test -p container-runtime-core --locked
+          cargo test -p route-engine linked_storage_library_json_read_uses_exact_module_namespace --locked
+          cargo test -p route-engine --locked
+          cargo clippy -p container-runtime-core -p route-engine --all-targets --locked -- -D warnings
+          cargo check --workspace --all-targets --locked
+          cd ..
+
+          rm -f .github/patches/storage-library-v1.py
+          rm -f .github/patches/storage-library-v1-fix.py
+          rm -f .github/workflows/one-shot-storage-library-v1.yml
+          git add -A
+          git diff --cached --check
+          git commit -m 'FEAT | STORAGE-001 add Container-owned typed Storage library'
+          git pull --rebase origin work/relc-wasm-runtime
+          for attempt in 1 2 3; do
+            if git push origin HEAD:work/relc-wasm-runtime; then
+              exit 0
+            fi
+            echo "push attempt ${attempt} failed; retrying..."
+            sleep $((attempt * 5))
+          done
+          exit 1
