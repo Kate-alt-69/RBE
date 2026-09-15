@@ -157,11 +157,9 @@ impl LocalHistory {
             .root
             .join("provider-history")
             .join(namespace);
-        let commits = root.join("commits");
-        fs::create_dir_all(&commits)?;
         Ok(Self {
             head: root.join("HEAD.json"),
-            commits,
+            commits: root.join("commits"),
         })
     }
 
@@ -201,6 +199,7 @@ impl LocalHistory {
 
     fn write_commit(&self, commit: &HistoryCommit) -> anyhow::Result<()> {
         validate_commit(commit)?;
+        fs::create_dir_all(&self.commits)?;
         let path = self.commits.join(format!("{}.json", commit.id));
         if path.is_file() {
             let existing = self.read_commit(&commit.id)?;
@@ -1310,6 +1309,29 @@ mod tests {
         drop(first);
         let second = ProviderSyncLock::acquire(&store, "prod").unwrap();
         drop(second);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_provider_history_for_status_does_not_create_directories() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"node-a","storageRoot":root},
+            "provider":{
+                "kind":"google-cloud-storage",
+                "namespace":"prod",
+                "bucket":"rbe"
+            }
+        }))
+        .unwrap();
+        let store = CloudNodeStore::open(&settings).unwrap();
+        let history_root = store.summary().root.join("provider-history").join("prod");
+        assert!(!history_root.exists());
+        let history = LocalHistory::open(&store, "prod").unwrap();
+        assert!(history.head().unwrap().is_none());
+        assert!(!history_root.exists());
+        drop(history);
         fs::remove_dir_all(root).unwrap();
     }
 
