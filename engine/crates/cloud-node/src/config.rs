@@ -459,7 +459,7 @@ fn validate_provider_timeout(label: &str, value: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_node_id(value: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_node_id(value: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || value.len() > 128
         || matches!(value, "." | "..")

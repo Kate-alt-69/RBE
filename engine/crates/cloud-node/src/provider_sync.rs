@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 use crate::client::{cached_resource_path, cleanup_outbound_cache, prepare_outbound_cache};
-use crate::config::{CloudNodeSettings, ProviderConflictPolicy};
+use crate::config::{validate_node_id, CloudNodeSettings, ProviderConflictPolicy};
 use crate::format::BlobKind;
 use crate::provider::{ProviderClient, ProviderObjectVersion};
 use crate::recovery::CloudNodeRecoveryReceiver;
@@ -1208,6 +1208,7 @@ fn validate_commit(commit: &HistoryCommit) -> anyhow::Result<()> {
     }
     validate_hash(&commit.id, "history commit id")?;
     validate_hash(&commit.snapshot_root, "snapshot root")?;
+    validate_node_id(&commit.node_id)?;
     if let Some(parent) = &commit.parent {
         validate_hash(parent, "history parent id")?;
         if parent == &commit.id {
@@ -1310,6 +1311,22 @@ mod tests {
         let second = ProviderSyncLock::acquire(&store, "prod").unwrap();
         drop(second);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_history_rejects_invalid_remote_node_identity() {
+        let node_id = "../remote";
+        let snapshot_root = "11".repeat(32);
+        let created_unix_ms = 7;
+        let commit = HistoryCommit {
+            format_version: HISTORY_VERSION,
+            id: commit_id(node_id, None, &snapshot_root, created_unix_ms),
+            parent: None,
+            snapshot_root,
+            node_id: node_id.to_owned(),
+            created_unix_ms,
+        };
+        assert!(validate_commit(&commit).is_err());
     }
 
     #[test]
