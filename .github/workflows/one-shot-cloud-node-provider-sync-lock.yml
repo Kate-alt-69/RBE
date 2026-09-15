@@ -1,0 +1,101 @@
+name: One-shot Cloud Node provider sync lock
+
+on:
+  push:
+    branches:
+      - work/cloud-node-provider-hardening
+
+permissions:
+  contents: write
+
+jobs:
+  provider-sync-lock:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Serialize local provider sync processes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cargo = Path('engine/crates/cloud-node/Cargo.toml')
+          text = cargo.read_text()
+          text = text.replace(
+              'client = ["dep:reqwest", "dep:tokio-util"]',
+              'client = ["dep:reqwest", "dep:tokio-util", "dep:fs2"]',
+              1,
+          )
+          if 'fs2 = { version = "0.4", optional = true }' not in text:
+              anchor = 'hex = "0.4"\n'
+              if anchor not in text:
+                  raise SystemExit('cloud-node dependency anchor not found')
+              text = text.replace(anchor, anchor + 'fs2 = { version = "0.4", optional = true }\n', 1)
+          cargo.write_text(text)
+
+          path = Path('engine/crates/cloud-node/src/provider_sync.rs')
+          text = path.read_text()
+          if 'use fs2::FileExt;' not in text:
+              text = text.replace('use atomic_io::AtomicIo;\n', 'use atomic_io::AtomicIo;\nuse fs2::FileExt;\n', 1)
+
+          struct_anchor = '''struct LocalHistory {\n    commits: PathBuf,\n    head: PathBuf,\n}\n\n'''
+          lock_struct = '''struct ProviderSyncLock {\n    file: fs::File,\n}\n\nimpl ProviderSyncLock {\n    fn acquire(store: &CloudNodeStore, namespace: &str) -> anyhow::Result<Self> {\n        let root = store\n            .summary()\n            .root\n            .join("provider-history")\n            .join(namespace);\n        fs::create_dir_all(&root)?;\n        let path = root.join(".sync.lock");\n        let file = fs::OpenOptions::new()\n            .create(true)\n            .read(true)\n            .write(true)\n            .open(&path)\n            .map_err(|error| {\n                anyhow::anyhow!(\n                    "failed to open Cloud Node provider sync lock {}: {error}",\n                    path.display()\n                )\n            })?;\n        file.try_lock_exclusive().map_err(|error| {\n            anyhow::anyhow!(\n                "Cloud Node provider sync is already active for namespace {namespace:?}, or its lock is unavailable: {error}"\n            )\n        })?;\n        Ok(Self { file })\n    }\n}\n\nimpl Drop for ProviderSyncLock {\n    fn drop(&mut self) {\n        let _ = FileExt::unlock(&self.file);\n    }\n}\n\n'''
+          if 'struct ProviderSyncLock {' not in text:
+              if struct_anchor not in text:
+                  raise SystemExit('LocalHistory anchor not found')
+              text = text.replace(struct_anchor, lock_struct + struct_anchor, 1)
+
+          sync_anchor = '''    let provider = settings\n        .provider\n        .as_ref()\n        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;\n    let client = ProviderClient::new(provider)?;\n    let recovery_owner = provider_recovery_owner(&provider.namespace);\n'''
+          sync_replacement = '''    let provider = settings\n        .provider\n        .as_ref()\n        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;\n    let _sync_lock = ProviderSyncLock::acquire(store, &provider.namespace)?;\n    let client = ProviderClient::new(provider)?;\n    let recovery_owner = provider_recovery_owner(&provider.namespace);\n'''
+          # There are two provider extraction blocks in this file; target the sync-specific one by recovery_owner context.
+          if 'let _sync_lock = ProviderSyncLock::acquire' not in text:
+              if sync_anchor not in text:
+                  raise SystemExit('synchronize_provider anchor not found')
+              text = text.replace(sync_anchor, sync_replacement, 1)
+
+          test_anchor = '''    #[test]\n    fn provider_cache_owner_is_stable_and_path_safe() {\n'''
+          test = '''    #[test]\n    fn provider_sync_lock_serializes_same_namespace() {\n        let root = test_root();\n        fs::create_dir_all(&root).unwrap();\n        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({\n            "node":{"id":"node-a","storageRoot":root},\n            "provider":{\n                "kind":"google-cloud-storage",\n                "namespace":"prod",\n                "bucket":"rbe"\n            }\n        }))\n        .unwrap();\n        let store = CloudNodeStore::open(&settings).unwrap();\n\n        let first = ProviderSyncLock::acquire(&store, "prod").unwrap();\n        assert!(ProviderSyncLock::acquire(&store, "prod").is_err());\n        drop(first);\n        let second = ProviderSyncLock::acquire(&store, "prod").unwrap();\n        drop(second);\n        fs::remove_dir_all(root).unwrap();\n    }\n\n'''
+          if 'fn provider_sync_lock_serializes_same_namespace()' not in text:
+              if test_anchor not in text:
+                  raise SystemExit('provider sync lock test anchor not found')
+              text = text.replace(test_anchor, test + test_anchor, 1)
+          path.write_text(text)
+
+          doc = Path('doc/cloud-node.md')
+          docs = doc.read_text()
+          marker = '''Provider pulls reuse the same crash-resumable recovery machinery as authenticated peer recovery. Their staging identity is stable for the provider namespace and expected snapshot root. After process restart, already committed resources are detected and partial resources return their durable `next_offset`, allowing the provider downloader to continue from verified bytes instead of restarting the complete snapshot.\n'''
+          addition = marker + '''\nOnly one local `sync-provider` operation may mutate a provider namespace at a time. Cloud Node holds an OS-backed exclusive lock at `provider-history/<namespace>/.sync.lock` for the complete synchronization transaction. A second local process fails fast instead of racing history/cache state, and the operating system releases the lock automatically if the owning process exits or crashes.\n'''
+          if 'Only one local `sync-provider` operation' not in docs:
+              if marker not in docs:
+                  raise SystemExit('provider sync lock docs anchor not found')
+              docs = docs.replace(marker, addition, 1)
+              doc.write_text(docs)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Refresh dependency lock
+        working-directory: engine
+        run: cargo check -p cloud-node --all-features
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
+      - name: Commit BUG-CN-PROV-017
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-sync-lock.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-017 serialize local provider sync"
+          git push origin HEAD:work/cloud-node-provider-hardening
