@@ -1,0 +1,98 @@
+name: One-shot atomic I/O durability
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-atomic-io-durability.yml'
+      - '.github/patches/atomic-io-durability.py'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine
+            container-runtime
+            atomic-io
+      - name: Validate Linux durability
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/patches/atomic-io-durability.py
+          cargo check --manifest-path atomic-io/Cargo.toml
+          cargo fmt --manifest-path atomic-io/Cargo.toml
+          cargo fmt --manifest-path atomic-io/Cargo.toml -- --check
+          cargo clippy --manifest-path atomic-io/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path atomic-io/Cargo.toml --locked
+          cd engine
+          cargo check -p backend
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cd ../container-runtime
+          cargo check -p container-bin
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  validate-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Validate Windows replace-existing behavior
+        shell: pwsh
+        run: |
+          python .github/patches/atomic-io-durability.py
+          cargo check --manifest-path atomic-io/Cargo.toml
+          cargo fmt --manifest-path atomic-io/Cargo.toml
+          cargo fmt --manifest-path atomic-io/Cargo.toml -- --check
+          cargo clippy --manifest-path atomic-io/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path atomic-io/Cargo.toml --locked
+
+  land:
+    needs: [validate-linux, validate-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Land BUG-IO-001
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 .github/patches/atomic-io-durability.py
+          cargo check --manifest-path atomic-io/Cargo.toml
+          (cd engine && cargo check -p backend)
+          (cd container-runtime && cargo check -p container-bin)
+          rm -f \
+            .github/workflows/one-shot-atomic-io-durability.yml \
+            .github/patches/atomic-io-durability.py
+          git add -A \
+            .github/workflows/one-shot-atomic-io-durability.yml \
+            .github/patches/atomic-io-durability.py \
+            atomic-io/Cargo.toml \
+            atomic-io/Cargo.lock \
+            atomic-io/src/lib.rs \
+            atomic-io/README.md \
+            engine/Cargo.lock \
+            container-runtime/Cargo.lock
+          git diff --cached --check
+          git commit -m 'FIX | BUG-IO-001 harden atomic file replacement durability'
+          git pull --rebase origin main
+          git push origin HEAD:main
