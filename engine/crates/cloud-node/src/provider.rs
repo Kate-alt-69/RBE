@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +25,7 @@ const HTTP_USERNAME_ENV: &str = "RBE_CN_PROV_HTTP_USERNAME";
 const HTTP_PASSWORD_ENV: &str = "RBE_CN_PROV_HTTP_PASSWORD";
 const HTTP_HEADER_VALUE_ENV: &str = "RBE_CN_PROV_HTTP_HEADER_VALUE";
 const MAX_PROVIDER_ERROR_BYTES: usize = 1024;
+const MAX_PROVIDER_SECRET_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone)]
 pub struct ProviderClient {
@@ -855,21 +857,69 @@ fn required_env(configured: Option<&str>, default_name: &str) -> anyhow::Result<
     let value = std::env::var(name).map_err(|_| {
         anyhow::anyhow!("Cloud Node provider credential environment {name} is not set")
     })?;
-    if value.trim().is_empty() {
-        anyhow::bail!("Cloud Node provider credential environment {name} is empty");
-    }
-    Ok(value)
+    resolve_secret_value(name, &value)?.ok_or_else(|| {
+        anyhow::anyhow!("Cloud Node provider credential environment {name} is empty")
+    })
 }
 
 fn optional_env(configured: Option<&str>, default_name: &str) -> anyhow::Result<Option<String>> {
     let name = configured.unwrap_or(default_name);
     match std::env::var(name) {
-        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(value) => resolve_secret_value(name, &value),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(anyhow::anyhow!(
             "failed to read Cloud Node provider credential environment {name}: {error}"
         )),
     }
+}
+
+fn resolve_secret_value(name: &str, value: &str) -> anyhow::Result<Option<String>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(file_name) = value.strip_prefix("file:") else {
+        return Ok(Some(value.to_owned()));
+    };
+    if file_name.is_empty() {
+        anyhow::bail!("Cloud Node provider credential environment {name} has an empty file: path");
+    }
+    let path = Path::new(file_name);
+    if !path.is_absolute() {
+        anyhow::bail!("Cloud Node provider credential file from {name} must use an absolute path");
+    }
+    let file = std::fs::File::open(path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to open Cloud Node provider credential file {} from {name}: {error}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROVIDER_SECRET_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to read Cloud Node provider credential file {} from {name}: {error}",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_PROVIDER_SECRET_FILE_BYTES {
+        anyhow::bail!(
+            "Cloud Node provider credential file {} exceeds {} bytes",
+            path.display(),
+            MAX_PROVIDER_SECRET_FILE_BYTES
+        );
+    }
+    let value = String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "Cloud Node provider credential file {} from {name} is not UTF-8",
+            path.display()
+        )
+    })?;
+    let value = value.trim_end_matches(&['\r', '\n'][..]);
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn object_url(endpoint: &str, path: &str) -> anyhow::Result<Url> {
@@ -1062,6 +1112,39 @@ mod tests {
                 .path(),
             "/storage/v1/object/private-backups/history/HEAD.json"
         );
+    }
+
+    #[test]
+    fn credential_file_values_are_reloaded_and_keep_inner_whitespace() {
+        let path = std::env::temp_dir().join(format!(
+            "rbe-provider-secret-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"first secret\r\n").unwrap();
+        let reference = format!("file:{}", path.display());
+        assert_eq!(
+            resolve_secret_value("RBE_TEST_SECRET", &reference)
+                .unwrap()
+                .as_deref(),
+            Some("first secret")
+        );
+        std::fs::write(&path, b"second secret\n").unwrap();
+        assert_eq!(
+            resolve_secret_value("RBE_TEST_SECRET", &reference)
+                .unwrap()
+                .as_deref(),
+            Some("second secret")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn credential_file_reference_requires_absolute_path() {
+        assert!(resolve_secret_value("RBE_TEST_SECRET", "file:relative/token").is_err());
     }
 
     #[test]

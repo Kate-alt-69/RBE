@@ -79,6 +79,14 @@ The built-in credential defaults use the RBE-owned `RBE_CN_PROV_*` namespace:
 
 Supported auth modes are `auto`, `none`, `api-key`, `bearer`, `oauth-bearer`, `basic`, `header`, `aws-sig-v4`, and `azure-sas`. Not every mode is valid for every provider. For example, S3 uses SigV4 rather than pretending an AWS access key is a single generic API key.
 
+For credentials that rotate while `cloud_node run` stays online, any provider credential environment value may point at an absolute UTF-8 secret file using the `file:` prefix instead of containing the secret directly. Cloud Node re-opens the file for every provider request, so a sidecar or platform credential agent can atomically replace the token without restarting Cloud Node. Secret files are capped at 64 KiB and trailing CR/LF is ignored. For example:
+
+```text
+RBE_CN_PROV_GOOGLE_OAUTH_TOKEN=file:/run/secrets/gcs-oauth-token
+```
+
+On Windows the same mechanism accepts an absolute Windows path, for example `file:C:\\ProgramData\\RBE\\gcs-oauth-token.txt`.
+
 The environment variable names can be overridden without putting their values in JSON. For example, a custom provider that expects a proprietary header can use:
 
 ```json
