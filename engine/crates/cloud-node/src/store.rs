@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::config::CloudNodeSettings;
+use crate::durable;
 use crate::format::{BlobBody, BlobKind, BlobManifest, ByteRangeChange, ChunkRef, FolderEntry};
 
 const HISTORY_MAGIC: &[u8; 8] = b"RBECNHI1";
@@ -41,17 +42,17 @@ impl CloudNodeStore {
     pub fn open(settings: &CloudNodeSettings) -> anyhow::Result<Self> {
         settings.validate()?;
         let root = settings.node.storage_root.join("rbe");
-        fs::create_dir_all(&root)?;
+        durable::create_dir_all(&root)?;
         let storage = root.join("storage");
         let backup = root.join("backup");
         let previous = root.join("recovery-previous-storage");
 
         let restored_previous = !storage.exists() && previous.exists();
         if restored_previous {
-            fs::rename(&previous, &storage)?;
+            durable::rename(&previous, &storage)?;
         }
-        fs::create_dir_all(&storage)?;
-        fs::create_dir_all(&backup)?;
+        durable::create_dir_all(&storage)?;
+        durable::create_dir_all(&backup)?;
 
         let store = Self {
             root,
@@ -77,7 +78,7 @@ impl CloudNodeStore {
     fn reconcile_interrupted_swap(&self, previous: &Path) -> anyhow::Result<()> {
         let live_error = match self.verify() {
             Ok(_) => {
-                fs::remove_dir_all(previous)?;
+                durable::remove_dir_all(previous)?;
                 return Ok(());
             }
             Err(error) => error,
@@ -90,15 +91,15 @@ impl CloudNodeStore {
                 failed.display()
             );
         }
-        fs::rename(&self.storage, &failed)?;
-        if let Err(error) = fs::rename(previous, &self.storage) {
-            let _ = fs::rename(&failed, &self.storage);
+        durable::rename(&self.storage, &failed)?;
+        if let Err(error) = durable::rename(previous, &self.storage) {
+            let _ = durable::rename(&failed, &self.storage);
             return Err(error.into());
         }
 
         match self.verify() {
             Ok(_) => {
-                fs::remove_dir_all(&failed)?;
+                durable::remove_dir_all(&failed)?;
                 Ok(())
             }
             Err(previous_error) => anyhow::bail!(
@@ -137,14 +138,14 @@ impl CloudNodeStore {
         let object_key = object_key(kind, &logical_path);
         let object_hex = hex::encode(object_key);
         let object_dir = self.storage.join(&object_hex);
-        fs::create_dir_all(&object_dir)?;
+        durable::create_dir_all(&object_dir)?;
         let manifest_path = object_dir.join(kind.manifest_name());
         let previous = read_manifest_if_present(&manifest_path)?;
         let parent = previous.as_ref().map(|manifest| manifest.content_sha256);
         let content_sha256 = sha256_file(source)?;
         let content_hex = hex::encode(content_sha256);
         let version_dir = object_dir.join("versions").join(&content_hex);
-        fs::create_dir_all(&version_dir)?;
+        durable::create_dir_all(&version_dir)?;
         let payload_path = version_dir.join("payload");
         let logical_size = fs::metadata(source)?.len();
         if !file_matches(&payload_path, content_sha256, logical_size)? {
@@ -222,7 +223,7 @@ impl CloudNodeStore {
         let object_key = object_key(BlobKind::Folder, &logical_path);
         let object_hex = hex::encode(object_key);
         let object_dir = self.storage.join(&object_hex);
-        fs::create_dir_all(&object_dir)?;
+        durable::create_dir_all(&object_dir)?;
         let manifest_path = object_dir.join(BlobKind::Folder.manifest_name());
         let previous = read_manifest_if_present(&manifest_path)?;
         let mut entries = Vec::new();
@@ -243,7 +244,7 @@ impl CloudNodeStore {
         let version_dir = object_dir
             .join("versions")
             .join(hex::encode(content_sha256));
-        fs::create_dir_all(&version_dir)?;
+        durable::create_dir_all(&version_dir)?;
         atomic_write(&version_dir.join("folder.blob.cn"), &encoded)?;
         atomic_write(&manifest_path, &encoded)?;
         self.update_folder_backup(&object_hex, &encoded, content_sha256)?;
@@ -430,7 +431,7 @@ impl CloudNodeStore {
         object_dir: &Path,
     ) -> anyhow::Result<Vec<ChunkRef>> {
         let chunks_dir = object_dir.join("chunks");
-        fs::create_dir_all(&chunks_dir)?;
+        durable::create_dir_all(&chunks_dir)?;
         let mut reader = BufReader::new(File::open(source)?);
         let mut buffer = vec![0u8; self.video_chunk_bytes];
         let mut offset = 0u64;
@@ -482,9 +483,9 @@ impl CloudNodeStore {
         let original = root.join("original");
         let latest = root.join("latest");
         let versions = root.join("versions");
-        fs::create_dir_all(&original)?;
-        fs::create_dir_all(&latest)?;
-        fs::create_dir_all(&versions)?;
+        durable::create_dir_all(&original)?;
+        durable::create_dir_all(&latest)?;
+        durable::create_dir_all(&versions)?;
         let name = safe_leaf_name(logical_path);
         let original_path = original.join(&name);
         if self.preserve_original && !original_path.exists() {
@@ -515,9 +516,9 @@ impl CloudNodeStore {
         let original = root.join("original");
         let latest = root.join("latest");
         let versions = root.join("versions");
-        fs::create_dir_all(&original)?;
-        fs::create_dir_all(&latest)?;
-        fs::create_dir_all(&versions)?;
+        durable::create_dir_all(&original)?;
+        durable::create_dir_all(&latest)?;
+        durable::create_dir_all(&versions)?;
         let original_path = original.join("folder.blob.cn");
         if self.preserve_original && !original_path.exists() {
             atomic_write(&original_path, encoded)?;
@@ -723,7 +724,7 @@ fn prune_backup_versions(
             continue;
         }
         if !retained.contains(&name.to_ascii_lowercase()) {
-            fs::remove_dir_all(entry.path())?;
+            durable::remove_dir_all(entry.path())?;
         }
     }
     Ok(())
@@ -753,25 +754,25 @@ fn commit_part(part: &Path, target: &Path) -> anyhow::Result<()> {
     if target.exists() {
         #[cfg(unix)]
         {
-            fs::rename(part, target)?;
+            durable::rename(part, target)?;
             return Ok(());
         }
         #[cfg(not(unix))]
         {
-            fs::remove_file(target)?;
+            durable::remove_file(target)?;
         }
     }
-    fs::rename(part, target)?;
+    durable::rename(part, target)?;
     Ok(())
 }
 
 fn copy_exact(source: &Path, target: &Path) -> anyhow::Result<()> {
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        durable::create_dir_all(parent)?;
     }
     let part = part_path(target)?;
     if part.exists() {
-        fs::remove_file(&part)?;
+        durable::remove_file(&part)?;
     }
     fs::copy(source, &part)?;
     File::open(&part)?.sync_all()?;
@@ -780,11 +781,11 @@ fn copy_exact(source: &Path, target: &Path) -> anyhow::Result<()> {
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        durable::create_dir_all(parent)?;
     }
     let part = part_path(path)?;
     if part.exists() {
-        fs::remove_file(&part)?;
+        durable::remove_file(&part)?;
     }
     {
         let mut writer = BufWriter::new(File::create(&part)?);

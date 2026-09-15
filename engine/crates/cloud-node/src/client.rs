@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::auth::{random_session_and_nonce, NodeProof, DEFAULT_AUTH_SKEW_MS};
 use crate::config::CloudNodeSettings;
 use crate::crypto::load_signing_key_from_env;
+use crate::durable;
 use crate::format::BlobKind;
 use crate::protocol::{Frame, FrameKind};
 use crate::store::CloudNodeStore;
@@ -257,11 +258,11 @@ async fn prepare_outbound_cache(
 ) -> anyhow::Result<PathBuf> {
     let header = plan.header()?;
     let peer_root = outbound_peer_cache_root(store, peer_node_id);
-    tokio::fs::create_dir_all(&peer_root).await?;
+    durable::create_dir_all_async(&peer_root).await?;
     let snapshot_name = hex::encode(header.root_sha256);
     prune_outbound_cache_snapshots(&peer_root, &snapshot_name).await?;
     let cache_root = peer_root.join(&snapshot_name);
-    tokio::fs::create_dir_all(&cache_root).await?;
+    durable::create_dir_all_async(&cache_root).await?;
 
     for object in plan.ordered() {
         let manifest_hash = sha256_path(&object.manifest_path).await?;
@@ -358,26 +359,26 @@ async fn materialize_cached_resource(
         return Ok(());
     }
     if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        durable::create_dir_all_async(parent).await?;
     }
     if target.exists() {
-        tokio::fs::remove_file(target).await?;
+        durable::remove_file_async(target).await?;
     }
 
     let part = cache_part_path(target)?;
     if part.exists() {
-        tokio::fs::remove_file(&part).await?;
+        durable::remove_file_async(&part).await?;
     }
     tokio::fs::copy(source, &part).await?;
     tokio::fs::File::open(&part).await?.sync_all().await?;
     if !cached_file_matches(&part, expected_sha256, source_size).await? {
-        let _ = tokio::fs::remove_file(&part).await;
+        let _ = durable::remove_file_async(&part).await;
         anyhow::bail!(
             "Cloud Node outbound cache copy failed integrity verification: {}",
             source.display()
         );
     }
-    tokio::fs::rename(&part, target).await?;
+    durable::rename_async(&part, target).await?;
     Ok(())
 }
 
@@ -414,14 +415,14 @@ async fn write_cache_ready_marker(cache_root: &Path, header: SyncPlanHeader) -> 
     let target = cache_root.join(".ready");
     let part = cache_part_path(&target)?;
     if part.exists() {
-        tokio::fs::remove_file(&part).await?;
+        durable::remove_file_async(&part).await?;
     }
     tokio::fs::write(&part, header.encode()).await?;
     tokio::fs::File::open(&part).await?.sync_all().await?;
     if target.exists() {
-        tokio::fs::remove_file(&target).await?;
+        durable::remove_file_async(&target).await?;
     }
-    tokio::fs::rename(part, target).await?;
+    durable::rename_async(part, target).await?;
     Ok(())
 }
 
@@ -436,9 +437,9 @@ async fn prune_outbound_cache_snapshots(
         }
         let file_type = entry.file_type().await?;
         if file_type.is_dir() {
-            tokio::fs::remove_dir_all(entry.path()).await?;
+            durable::remove_dir_all_async(entry.path()).await?;
         } else {
-            tokio::fs::remove_file(entry.path()).await?;
+            durable::remove_file_async(entry.path()).await?;
         }
     }
     Ok(())
@@ -446,7 +447,7 @@ async fn prune_outbound_cache_snapshots(
 
 async fn cleanup_outbound_cache(store: &CloudNodeStore, peer_node_id: &str) -> anyhow::Result<()> {
     let root = outbound_peer_cache_root(store, peer_node_id);
-    match tokio::fs::remove_dir_all(root).await {
+    match durable::remove_dir_all_async(root).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
