@@ -1,0 +1,68 @@
+name: One-shot Cloud Node bounded provider metadata
+
+on:
+  push:
+    branches:
+      - work/cloud-node-providers-latest
+
+permissions:
+  contents: write
+
+jobs:
+  provider-metadata:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Bound provider metadata downloads
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('engine/crates/cloud-node/src/provider.rs')
+          text = path.read_text()
+          if 'const MAX_PROVIDER_METADATA_BYTES' not in text:
+              text = text.replace(
+                  'const MAX_PROVIDER_ERROR_BYTES: usize = 1024;\n',
+                  'const MAX_PROVIDER_ERROR_BYTES: usize = 1024;\nconst MAX_PROVIDER_METADATA_BYTES: usize = 64 * 1024 * 1024;\n',
+                  1,
+              )
+
+          old = '''async fn response_bytes(\n    response: reqwest::Response,\n    operation: &str,\n    allow_not_found: bool,\n) -> anyhow::Result<Option<Vec<u8>>> {\n    let status = response.status();\n    if allow_not_found && status == StatusCode::NOT_FOUND {\n        return Ok(None);\n    }\n    if !status.is_success() {\n        return Err(provider_http_error(response, operation).await);\n    }\n    if operation == "download" {\n        Ok(Some(response.bytes().await?.to_vec()))\n    } else {\n        Ok(None)\n    }\n}\n'''
+          new = '''async fn response_bytes(\n    mut response: reqwest::Response,\n    operation: &str,\n    allow_not_found: bool,\n) -> anyhow::Result<Option<Vec<u8>>> {\n    let status = response.status();\n    if allow_not_found && status == StatusCode::NOT_FOUND {\n        return Ok(None);\n    }\n    if !status.is_success() {\n        return Err(provider_http_error(response, operation).await);\n    }\n    if operation != "download" {\n        return Ok(None);\n    }\n    if response\n        .content_length()\n        .is_some_and(|length| length > MAX_PROVIDER_METADATA_BYTES as u64)\n    {\n        anyhow::bail!(\n            "Cloud Node provider metadata exceeds {} bytes",\n            MAX_PROVIDER_METADATA_BYTES\n        );\n    }\n    let capacity = response\n        .content_length()\n        .and_then(|length| usize::try_from(length).ok())\n        .unwrap_or(0)\n        .min(MAX_PROVIDER_METADATA_BYTES);\n    let mut bytes = Vec::with_capacity(capacity);\n    while let Some(chunk) = response.chunk().await? {\n        append_bounded_bytes(\n            &mut bytes,\n            &chunk,\n            MAX_PROVIDER_METADATA_BYTES,\n            "provider metadata",\n        )?;\n    }\n    Ok(Some(bytes))\n}\n\nfn append_bounded_bytes(\n    target: &mut Vec<u8>,\n    chunk: &[u8],\n    limit: usize,\n    label: &str,\n) -> anyhow::Result<()> {\n    let next = target\n        .len()\n        .checked_add(chunk.len())\n        .ok_or_else(|| anyhow::anyhow!("Cloud Node {label} size overflow"))?;\n    if next > limit {\n        anyhow::bail!("Cloud Node {label} exceeds {limit} bytes");\n    }\n    target.extend_from_slice(chunk);\n    Ok(())\n}\n'''
+          if old not in text:
+              raise SystemExit('response_bytes anchor not found')
+          text = text.replace(old, new, 1)
+
+          test_anchor = '''    #[test]\n    fn aws_epoch_timestamp_is_stable() {\n'''
+          tests = '''    #[test]\n    fn bounded_provider_metadata_rejects_oversize_chunks() {\n        let mut bytes = Vec::new();\n        append_bounded_bytes(&mut bytes, b"1234", 5, "test metadata").unwrap();\n        assert_eq!(bytes, b"1234");\n        assert!(append_bounded_bytes(&mut bytes, b"56", 5, "test metadata").is_err());\n        assert_eq!(bytes, b"1234");\n    }\n\n'''
+          if test_anchor not in text:
+              raise SystemExit('provider test anchor not found')
+          text = text.replace(test_anchor, tests + test_anchor, 1)
+          path.write_text(text)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
+      - name: Commit BUG-CN-PROV-015
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-metadata-bound.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-015 bound provider metadata downloads"
+          git push origin HEAD:work/cloud-node-providers-latest
