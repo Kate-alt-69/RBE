@@ -39,7 +39,7 @@ jobs:
           cargo test -p route-engine direct_capability_arguments_can_use_pure_route_helpers --locked
           cargo test -p route-engine linked_module_capability_arguments_fold_pure_rel_expressions --locked
           cargo test -p route-engine request_dependent_local_helper_stays_interpreter_fallback --locked
-          cargo test -p route-engine transformed_dynamic_linked_argument_stays_interpreter_fallback --locked
+          cargo test -p route-engine linked_module_transformed_dynamic_route_argument_stays_interpreter_fallback --locked
           cargo test -p route-engine wasm_compiler --locked
           cargo clippy -p route-engine --all-targets --locked -- -D warnings
           cd ..
@@ -50,4 +50,11 @@ jobs:
           git diff --cached --check
           git commit -m 'FIX | BUG-WASM-008 fold pure REL capability arguments into native WASM'
           git pull --rebase origin work/relc-wasm-runtime
-          git push origin HEAD:work/relc-wasm-runtime
+          for attempt in 1 2 3; do
+            if git push origin HEAD:work/relc-wasm-runtime; then
+              exit 0
+            fi
+            echo "push attempt ${attempt} failed; retrying..."
+            sleep $((attempt * 5))
+          done
+          exit 1
