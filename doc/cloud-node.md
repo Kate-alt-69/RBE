@@ -107,6 +107,8 @@ The environment variable names can be overridden without putting their values in
 
 Provider endpoints must use HTTPS outside exact loopback development hosts. Embedded URL credentials, query strings, and fragments are rejected. Provider namespaces are also validated as safe local history components and cannot be `.` or `..`.
 
+Provider HTTP connections are also stall-bounded. `connectTimeoutMs` defaults to `10000` and bounds only connection establishment. `readTimeoutMs` defaults to `60000` and resets after each successful response read, so long streaming transfers can continue indefinitely while a provider that stops producing response data is eventually disconnected. Both values accept 250 through 300000 milliseconds. Cloud Node intentionally does not apply a total request deadline to provider uploads/downloads because that would incorrectly kill valid large transfers.
+
 ### Amazon S3
 
 ```json

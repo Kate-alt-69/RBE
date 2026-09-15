@@ -158,6 +158,10 @@ pub struct ProviderSettings {
     pub sync_on_connect: bool,
     #[serde(default = "default_reconnect_delay_ms")]
     pub reconnect_delay_ms: u64,
+    #[serde(default = "default_provider_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    #[serde(default = "default_provider_read_timeout_ms")]
+    pub read_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +258,8 @@ fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
     validate_bucket(&provider.bucket)?;
     validate_prefix(&provider.prefix)?;
     validate_reconnect_delay(provider.reconnect_delay_ms)?;
+    validate_provider_timeout("connectTimeoutMs", provider.connect_timeout_ms)?;
+    validate_provider_timeout("readTimeoutMs", provider.read_timeout_ms)?;
 
     if let Some(endpoint) = &provider.endpoint {
         validate_provider_endpoint(endpoint)?;
@@ -446,6 +452,13 @@ fn validate_reconnect_delay(value: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_provider_timeout(label: &str, value: u64) -> anyhow::Result<()> {
+    if !(250..=300_000).contains(&value) {
+        anyhow::bail!("Cloud Node provider {label} must be between 250 and 300000");
+    }
+    Ok(())
+}
+
 fn validate_node_id(value: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || value.len() > 128
@@ -556,6 +569,12 @@ const fn default_video_chunk_bytes() -> usize {
 const fn default_reconnect_delay_ms() -> u64 {
     2_000
 }
+const fn default_provider_connect_timeout_ms() -> u64 {
+    10_000
+}
+const fn default_provider_read_timeout_ms() -> u64 {
+    60_000
+}
 const fn default_boot_recovery_timeout_ms() -> u64 {
     60_000
 }
@@ -595,6 +614,27 @@ mod tests {
         assert!(validate_peer_url("https://user:pass@cloud.example.test").is_err());
         assert!(validate_peer_url("https://cloud.example.test?token=nope").is_err());
         assert!(validate_peer_url("https://cloud.example.test/#fragment").is_err());
+    }
+
+    #[test]
+    fn provider_network_timeouts_have_safe_defaults_and_bounds() {
+        let provider: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"http",
+            "namespace":"prod",
+            "bucket":"rbe",
+            "endpoint":"https://storage.example.test"
+        }))
+        .unwrap();
+        assert_eq!(provider.connect_timeout_ms, 10_000);
+        assert_eq!(provider.read_timeout_ms, 60_000);
+        validate_provider(&provider).unwrap();
+
+        let mut invalid = provider.clone();
+        invalid.connect_timeout_ms = 249;
+        assert!(validate_provider(&invalid).is_err());
+        invalid = provider.clone();
+        invalid.read_timeout_ms = 300_001;
+        assert!(validate_provider(&invalid).is_err());
     }
 
     #[test]

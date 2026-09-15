@@ -1,6 +1,6 @@
 use std::io::Read;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{
     HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST,
@@ -38,6 +38,8 @@ impl ProviderClient {
     pub fn new(settings: &ProviderSettings) -> anyhow::Result<Self> {
         let client = Client::builder()
             .https_only(false)
+            .connect_timeout(Duration::from_millis(settings.connect_timeout_ms))
+            .read_timeout(Duration::from_millis(settings.read_timeout_ms))
             .build()
             .map_err(|error| {
                 anyhow::anyhow!("failed to build Cloud Node provider client: {error}")
