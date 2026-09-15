@@ -91,6 +91,9 @@ jobs:
       - name: Format merged tree
         working-directory: engine
         run: cargo fmt --all
+      - name: Refresh dependency lock
+        working-directory: engine
+        run: cargo check -p cloud-node --all-features
       - name: Cloud Node Clippy
         working-directory: engine
         run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
