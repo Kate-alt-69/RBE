@@ -380,12 +380,13 @@ fn validate_auth_mode(
 fn validate_namespace(value: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || value.len() > 128
+        || matches!(value, "." | "..")
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         anyhow::bail!(
-            "Cloud Node provider namespace must use 1..=128 ASCII [A-Za-z0-9_.-] characters"
+            "Cloud Node provider namespace must use 1..=128 ASCII [A-Za-z0-9_.-] characters and cannot be . or .."
         );
     }
     Ok(())
@@ -448,34 +449,89 @@ fn validate_reconnect_delay(value: u64) -> anyhow::Result<()> {
 fn validate_node_id(value: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || value.len() > 128
+        || matches!(value, "." | "..")
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
-        anyhow::bail!("Cloud Node id must use 1..=128 ASCII [A-Za-z0-9_.-] characters");
+        anyhow::bail!(
+            "Cloud Node id must use 1..=128 ASCII [A-Za-z0-9_.-] characters and cannot be . or .."
+        );
     }
     Ok(())
 }
 
 fn validate_peer_url(value: &str) -> anyhow::Result<()> {
-    let secure = value.starts_with("https://") || value.starts_with("wss://");
-    let local_dev = value.starts_with("http://127.0.0.1")
-        || value.starts_with("http://localhost")
-        || value.starts_with("ws://127.0.0.1")
-        || value.starts_with("ws://localhost");
-    if !secure && !local_dev {
-        anyhow::bail!("Cloud Node peer URL must use TLS outside localhost development");
+    let parsed = url::Url::parse(value)
+        .map_err(|error| anyhow::anyhow!("invalid Cloud Node peer URL: {error}"))?;
+    let host = parsed
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node peer URL must include a host"))?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("Cloud Node peer URL cannot embed credentials");
     }
-    Ok(())
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("Cloud Node peer URL cannot include a query or fragment");
+    }
+
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let loopback = match host {
+                url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+                url::Host::Ipv4(address) => address.is_loopback(),
+                url::Host::Ipv6(address) => address.is_loopback(),
+            };
+            if !loopback {
+                anyhow::bail!(
+                    "Cloud Node peer URL must use HTTPS outside exact loopback development hosts"
+                );
+            }
+            Ok(())
+        }
+        "ws" | "wss" => anyhow::bail!(
+            "Cloud Node RBE-CN/1 currently uses HTTP POST transport; ws/wss peer URLs are not supported"
+        ),
+        scheme => anyhow::bail!(
+            "Cloud Node peer URL uses unsupported scheme {scheme:?}; expected https or loopback http"
+        ),
+    }
 }
 
 fn validate_provider_endpoint(value: &str) -> anyhow::Result<()> {
-    let secure = value.starts_with("https://");
-    let local_dev = value.starts_with("http://127.0.0.1") || value.starts_with("http://localhost");
-    if !secure && !local_dev {
-        anyhow::bail!("Cloud Node provider endpoint must use HTTPS outside localhost development");
+    let parsed = url::Url::parse(value)
+        .map_err(|error| anyhow::anyhow!("invalid Cloud Node provider endpoint: {error}"))?;
+    let host = parsed
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider endpoint must include a host"))?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("Cloud Node provider endpoint cannot embed credentials");
     }
-    Ok(())
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("Cloud Node provider endpoint cannot include a query or fragment");
+    }
+
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let loopback = match host {
+                url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+                url::Host::Ipv4(address) => address.is_loopback(),
+                url::Host::Ipv6(address) => address.is_loopback(),
+            };
+            if !loopback {
+                anyhow::bail!(
+                    "Cloud Node provider endpoint must use HTTPS outside exact loopback development hosts"
+                );
+            }
+            Ok(())
+        }
+        scheme => anyhow::bail!(
+            "Cloud Node provider endpoint uses unsupported scheme {scheme:?}; expected https or loopback http"
+        ),
+    }
 }
 
 fn validate_public_key(value: &str) -> anyhow::Result<()> {
@@ -507,6 +563,52 @@ const fn default_boot_recovery_timeout_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_ids_and_provider_namespaces_reject_filesystem_aliases() {
+        assert!(validate_node_id(".").is_err());
+        assert!(validate_node_id("..").is_err());
+        assert!(validate_namespace(".").is_err());
+        assert!(validate_namespace("..").is_err());
+        validate_node_id("nas.main-1").unwrap();
+        validate_namespace("prod.main-1").unwrap();
+    }
+
+    #[test]
+    fn peer_url_plaintext_requires_an_exact_loopback_host() {
+        validate_peer_url("http://localhost:8080/base").unwrap();
+        validate_peer_url("http://127.0.0.1:8080").unwrap();
+        validate_peer_url("http://127.12.34.56:8080").unwrap();
+        validate_peer_url("http://[::1]:8080").unwrap();
+        validate_peer_url("https://cloud.example.test").unwrap();
+
+        assert!(validate_peer_url("http://localhost.evil.example").is_err());
+        assert!(validate_peer_url("http://127.0.0.1.evil.example").is_err());
+        assert!(validate_peer_url("http://192.168.1.10:8080").is_err());
+    }
+
+    #[test]
+    fn peer_url_matches_the_implemented_http_transport() {
+        assert!(validate_peer_url("ws://localhost:8080").is_err());
+        assert!(validate_peer_url("wss://cloud.example.test").is_err());
+        assert!(validate_peer_url("ftp://cloud.example.test").is_err());
+        assert!(validate_peer_url("https://user:pass@cloud.example.test").is_err());
+        assert!(validate_peer_url("https://cloud.example.test?token=nope").is_err());
+        assert!(validate_peer_url("https://cloud.example.test/#fragment").is_err());
+    }
+
+    #[test]
+    fn provider_endpoint_uses_parsed_exact_loopback_rules() {
+        validate_provider_endpoint("http://localhost:9000/api").unwrap();
+        validate_provider_endpoint("http://127.0.0.1:9000").unwrap();
+        validate_provider_endpoint("http://[::1]:9000").unwrap();
+        validate_provider_endpoint("https://storage.example.test/base").unwrap();
+
+        assert!(validate_provider_endpoint("http://localhost.evil.example").is_err());
+        assert!(validate_provider_endpoint("http://192.168.1.10:9000").is_err());
+        assert!(validate_provider_endpoint("https://user:pass@storage.example.test").is_err());
+        assert!(validate_provider_endpoint("https://storage.example.test?token=nope").is_err());
+    }
 
     #[test]
     fn defaults_backup_history_to_five() {

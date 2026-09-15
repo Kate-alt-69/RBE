@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 use crate::config::{CloudNodeSettings, ProviderConflictPolicy};
 use crate::format::BlobKind;
 use crate::provider::ProviderClient;
-use crate::random_session_and_nonce;
 use crate::recovery::CloudNodeRecoveryReceiver;
 use crate::store::CloudNodeStore;
 use crate::sync::{SyncPlan, SyncPlanHeader};
@@ -19,6 +18,7 @@ const HISTORY_VERSION: u16 = 1;
 const SNAPSHOT_VERSION: u16 = 1;
 const COMMIT_DOMAIN: &[u8] = b"RBE-CN-PROVIDER-COMMIT/1\0";
 const MAX_HISTORY_DEPTH: usize = 100_000;
+const PROVIDER_RECOVERY_OWNER_PREFIX: &str = "provider.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderSyncRelation {
@@ -290,6 +290,7 @@ pub async fn synchronize_provider(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
     let client = ProviderClient::new(provider)?;
+    let recovery_owner = provider_recovery_owner(&provider.namespace);
     let plan = store.sync_plan()?;
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
@@ -321,7 +322,7 @@ pub async fn synchronize_provider(
                     local_root,
                     remote_root: Some(remote_head.snapshot_root.clone()),
                 };
-                pull_provider_state(&client, &history, store, remote_head).await?;
+                pull_provider_state(&client, &history, store, remote_head, &recovery_owner).await?;
                 return Ok(ProviderSyncResult {
                     action: ProviderSyncAction::Pull,
                     final_root: remote_head.snapshot_root.clone(),
@@ -360,7 +361,7 @@ pub async fn synchronize_provider(
         }
         ProviderSyncRelation::RemoteAhead => {
             let remote = remote.ok_or_else(|| anyhow::anyhow!("Cloud Node provider remote head disappeared"))?;
-            pull_provider_state(&client, &history, store, &remote).await?;
+            pull_provider_state(&client, &history, store, &remote, &recovery_owner).await?;
             Ok(ProviderSyncResult {
                 action: ProviderSyncAction::Pull,
                 final_root: remote.snapshot_root.clone(),
@@ -375,7 +376,7 @@ pub async fn synchronize_provider(
                 before.remote_head.as_deref().unwrap_or("<none>")
             ),
             ProviderConflictPolicy::PreferLocal => {
-                push_provider_state(&client, &history, &plan, &local_head, None).await?;
+                push_provider_state(&client, &history, &plan, &local_head, remote.as_ref()).await?;
                 Ok(ProviderSyncResult {
                     action: ProviderSyncAction::ForcedPush,
                     final_root: local_head.snapshot_root.clone(),
@@ -385,7 +386,7 @@ pub async fn synchronize_provider(
             }
             ProviderConflictPolicy::PreferRemote => {
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("Cloud Node provider remote head disappeared"))?;
-                pull_provider_state(&client, &history, store, &remote).await?;
+                pull_provider_state(&client, &history, store, &remote, &recovery_owner).await?;
                 Ok(ProviderSyncResult {
                     action: ProviderSyncAction::ForcedPull,
                     final_root: remote.snapshot_root.clone(),
@@ -395,6 +396,10 @@ pub async fn synchronize_provider(
             }
         },
     }
+}
+
+fn provider_recovery_owner(namespace: &str) -> String {
+    format!("{PROVIDER_RECOVERY_OWNER_PREFIX}{namespace}")
 }
 
 async fn status_from_heads(
@@ -436,13 +441,26 @@ async fn push_provider_state(
     history: &LocalHistory,
     plan: &SyncPlan,
     local_head: &HistoryCommit,
-    remote_head: Option<&HistoryCommit>,
+    expected_remote: Option<&HistoryCommit>,
 ) -> anyhow::Result<()> {
     upload_snapshot(client, plan).await?;
-    let commits =
-        history.chain_to_ancestor(&local_head.id, remote_head.map(|commit| commit.id.as_str()))?;
+    let commits = history.chain_to_ancestor(
+        &local_head.id,
+        expected_remote.map(|commit| commit.id.as_str()),
+    )?;
     for commit in commits {
         upload_commit(client, &commit).await?;
+    }
+
+    let current_remote = remote_head(client).await?;
+    let expected_id = expected_remote.map(|commit| commit.id.as_str());
+    let current_id = current_remote.as_ref().map(|commit| commit.id.as_str());
+    if current_id != expected_id {
+        anyhow::bail!(
+            "Cloud Node provider HEAD changed during push: expected {} but found {}; retry synchronization",
+            expected_id.unwrap_or("<empty>"),
+            current_id.unwrap_or("<empty>")
+        );
     }
     upload_head(client, local_head).await
 }
@@ -452,8 +470,9 @@ async fn pull_provider_state(
     history: &LocalHistory,
     store: &CloudNodeStore,
     remote_head: &HistoryCommit,
+    recovery_owner: &str,
 ) -> anyhow::Result<()> {
-    restore_snapshot(client, store, &remote_head.snapshot_root).await?;
+    restore_snapshot(client, store, &remote_head.snapshot_root, recovery_owner).await?;
     import_remote_history(history, client, remote_head).await
 }
 
@@ -687,6 +706,7 @@ async fn restore_snapshot(
     client: &ProviderClient,
     store: &CloudNodeStore,
     root: &str,
+    recovery_owner: &str,
 ) -> anyhow::Result<()> {
     validate_hash(root, "snapshot root")?;
     let index_key = format!("snapshots/{root}/index.json");
@@ -706,8 +726,7 @@ async fn restore_snapshot(
         video_count: snapshot.video_count,
         file_count: snapshot.file_count,
     };
-    let (session, _) = random_session_and_nonce();
-    let mut receiver = CloudNodeRecoveryReceiver::open(store, session)?;
+    let mut receiver = CloudNodeRecoveryReceiver::open(store, recovery_owner, expected)?;
     for resource in &snapshot.resources {
         restore_resource(client, &mut receiver, resource).await?;
     }
@@ -779,8 +798,17 @@ async fn restore_resource(
             total_size,
             bytes[offset..end].to_vec(),
         )?;
-        receiver.accept_chunk(&chunk)?;
-        offset = end;
+        let receipt = receiver.accept_chunk(&chunk)?;
+        let next = usize::try_from(receipt.next_offset)
+            .map_err(|_| anyhow::anyhow!("provider recovery offset exceeds platform range"))?;
+        if next <= offset || next > bytes.len() {
+            anyhow::bail!(
+                "Cloud Node provider recovery returned invalid resume offset {} for resource size {}",
+                next,
+                bytes.len()
+            );
+        }
+        offset = next;
     }
     Ok(())
 }
