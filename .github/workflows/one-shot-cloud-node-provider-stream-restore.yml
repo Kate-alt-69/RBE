@@ -26,39 +26,40 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import re
 
-          def replace_once(text, old, new, label):
-              count = text.count(old)
+          def sub_once(pattern: str, replacement: str, text: str, label: str, flags=0) -> str:
+              updated, count = re.subn(pattern, replacement, text, count=1, flags=flags)
               if count != 1:
                   raise SystemExit(f"{label}: expected one match, found {count}")
-              return text.replace(old, new, 1)
+              return updated
 
           provider_path = Path("engine/crates/cloud-node/src/provider.rs")
           p = provider_path.read_text()
-          p = replace_once(
-              p,
-              'use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, HOST};',
-              'use reqwest::header::{\n    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, HOST, RANGE,\n};',
-              "provider header imports",
+          p = p.replace(
+              "use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, HOST};",
+              "use reqwest::header::{\n    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, HOST, RANGE,\n};",
+              1,
           )
-          p = replace_once(
-              p,
+          p = p.replace(
               'const HTTP_HEADER_VALUE_ENV: &str = "RBE_CN_PROV_HTTP_HEADER_VALUE";\n',
               'const HTTP_HEADER_VALUE_ENV: &str = "RBE_CN_PROV_HTTP_HEADER_VALUE";\nconst MAX_PROVIDER_ERROR_BYTES: usize = 1024;\n',
-              "provider error cap",
+              1,
           )
-          p = p.replace(
-              'self.aws_request(Method::GET, &key, Vec::new(), None)\n                    .await?',
-              'self.aws_request(Method::GET, &key, Vec::new(), None, None)\n                    .await?',
+          p = sub_once(
+              r"self\.aws_request\(Method::GET,\s*&key,\s*Vec::new\(\),\s*None\)",
+              "self.aws_request(Method::GET, &key, Vec::new(), None, None)",
+              p,
+              "AWS GET call",
           )
-          p = p.replace(
-              'self.aws_request(Method::PUT, &key, bytes, Some(content_type))\n                    .await?',
-              'self.aws_request(Method::PUT, &key, bytes, Some(content_type), None)\n                    .await?',
+          p = sub_once(
+              r"self\.aws_request\(Method::PUT,\s*&key,\s*bytes,\s*Some\(content_type\)\)",
+              "self.aws_request(Method::PUT, &key, bytes, Some(content_type), None)",
+              p,
+              "AWS PUT call",
           )
 
-          get_anchor = '''    pub async fn put(
-          '''
-          open_download = '''    pub(crate) async fn open_download(
+          open_download = r'''    pub(crate) async fn open_download(
               &self,
               relative: &str,
               start: u64,
@@ -67,14 +68,8 @@ jobs:
               let range = (start > 0).then(|| format!("bytes={start}-"));
               let response = match self.settings.kind {
                   ProviderKind::AmazonS3 => {
-                      self.aws_request(
-                          Method::GET,
-                          &key,
-                          Vec::new(),
-                          None,
-                          range.as_deref(),
-                      )
-                      .await?
+                      self.aws_request(Method::GET, &key, Vec::new(), None, range.as_deref())
+                          .await?
                   }
                   ProviderKind::Supabase => {
                       let url = self.supabase_url(&key, true)?;
@@ -116,68 +111,27 @@ jobs:
               checked_download_response(response, start).await
           }
 
-          '''
-          p = replace_once(p, get_anchor, open_download + get_anchor, "open provider download")
+'''
+          p = sub_once(
+              r"(?m)^    pub async fn put\(",
+              open_download + "    pub async fn put(",
+              p,
+              "open download insertion",
+          )
+          p = sub_once(
+              r"(?s)(    async fn aws_request\(\s*&self,\s*method: Method,\s*key: &str,\s*body: Vec<u8>,\s*content_type: Option<&str>,)(\s*\) -> anyhow::Result<reqwest::Response> \{)",
+              r"\1\n        range: Option<&str>,\2",
+              p,
+              "AWS range signature",
+          )
+          p = sub_once(
+              r"(?s)(        if let Some\(content_type\) = content_type \{\s*request = request\.header\(CONTENT_TYPE, content_type\);\s*\}\s*)(        if !body\.is_empty\(\) \{)",
+              r"\1        if let Some(range) = range {\n            request = request.header(RANGE, range);\n        }\n\2",
+              p,
+              "AWS range request header",
+          )
 
-          old_aws_sig = '''    async fn aws_request(
-              &self,
-              method: Method,
-              key: &str,
-              body: Vec<u8>,
-              content_type: Option<&str>,
-          ) -> anyhow::Result<reqwest::Response> {
-          '''
-          new_aws_sig = '''    async fn aws_request(
-              &self,
-              method: Method,
-              key: &str,
-              body: Vec<u8>,
-              content_type: Option<&str>,
-              range: Option<&str>,
-          ) -> anyhow::Result<reqwest::Response> {
-          '''
-          p = replace_once(p, old_aws_sig, new_aws_sig, "AWS request range signature")
-          old_send = '''        if let Some(content_type) = content_type {
-                  request = request.header(CONTENT_TYPE, content_type);
-              }
-              if !body.is_empty() {
-                  request = request.body(body);
-              }
-          '''
-          new_send = '''        if let Some(content_type) = content_type {
-                  request = request.header(CONTENT_TYPE, content_type);
-              }
-              if let Some(range) = range {
-                  request = request.header(RANGE, range);
-              }
-              if !body.is_empty() {
-                  request = request.body(body);
-              }
-          '''
-          p = replace_once(p, old_send, new_send, "AWS range header")
-
-          old_response = '''async fn response_bytes(
-              response: reqwest::Response,
-              operation: &str,
-              allow_not_found: bool,
-          ) -> anyhow::Result<Option<Vec<u8>>> {
-              let status = response.status();
-              if allow_not_found && status == StatusCode::NOT_FOUND {
-                  return Ok(None);
-              }
-              if !status.is_success() {
-                  let detail = response.text().await.unwrap_or_default();
-                  let detail = detail.chars().take(1024).collect::<String>();
-                  anyhow::bail!("Cloud Node provider {operation} failed with HTTP {status}: {detail}");
-              }
-              if operation == "download" {
-                  Ok(Some(response.bytes().await?.to_vec()))
-              } else {
-                  Ok(None)
-              }
-          }
-          '''
-          new_response = '''async fn checked_download_response(
+          response_helpers = r'''async fn checked_download_response(
               response: reqwest::Response,
               start: u64,
           ) -> anyhow::Result<Option<reqwest::Response>> {
@@ -273,106 +227,20 @@ jobs:
               let (start, _) = range.split_once('-')?;
               start.parse().ok()
           }
-          '''
-          p = replace_once(p, old_response, new_response, "bounded provider error and ranged response")
 
-          test_anchor = '''    #[test]
-              fn provider_object_keys_are_namespaced() {
-          '''
-          range_test = '''    #[test]
-              fn content_range_parser_requires_a_byte_start() {
-                  assert_eq!(content_range_start("bytes 4194304-8388607/10000000"), Some(4_194_304));
-                  assert_eq!(content_range_start("bytes 0-0/1"), Some(0));
-                  assert_eq!(content_range_start("items 0-1/2"), None);
-                  assert_eq!(content_range_start("bytes */10"), None);
-              }
-
-          '''
-          p = replace_once(p, test_anchor, range_test + test_anchor, "range parser tests")
+'''
+          p = sub_once(
+              r"(?s)^async fn response_bytes\(.*?^fn add_header\(",
+              response_helpers + "fn add_header(",
+              p,
+              "provider response helpers",
+              re.MULTILINE,
+          )
           provider_path.write_text(p)
 
           sync_path = Path("engine/crates/cloud-node/src/provider_sync.rs")
           s = sync_path.read_text()
-          old_restore = '''async fn restore_resource(
-              client: &ProviderClient,
-              receiver: &mut CloudNodeRecoveryReceiver,
-              resource: &ProviderResource,
-          ) -> anyhow::Result<()> {
-              let bytes = client.get(&resource.key).await?.ok_or_else(|| {
-                  anyhow::anyhow!(
-                      "Cloud Node provider snapshot resource {} is missing",
-                      resource.key
-                  )
-              })?;
-              let expected_size = usize::try_from(resource.size)
-                  .map_err(|_| anyhow::anyhow!("Cloud Node provider resource size exceeds platform range"))?;
-              if bytes.len() != expected_size {
-                  anyhow::bail!(
-                      "Cloud Node provider resource size mismatch for {}",
-                      resource.key
-                  );
-              }
-              let resource_sha = decode_hash(&resource.resource_sha256, "provider resource hash")?;
-              let actual: [u8; 32] = Sha256::digest(&bytes).into();
-              if actual != resource_sha {
-                  anyhow::bail!(
-                      "Cloud Node provider resource hash mismatch for {}",
-                      resource.key
-                  );
-              }
-              let kind = BlobKind::try_from(resource.kind)?;
-              let transfer_resource = TransferResource::try_from(resource.resource)?;
-              let object_key = decode_hash(&resource.object_key, "provider object key")?;
-              let content_sha = decode_hash(&resource.content_sha256, "provider content hash")?;
-              let total_size = resource.size;
-
-              if bytes.is_empty() {
-                  let chunk = TransferChunk::new(
-                      kind,
-                      transfer_resource,
-                      object_key,
-                      content_sha,
-                      resource_sha,
-                      0,
-                      0,
-                      Vec::new(),
-                  )?;
-                  receiver.accept_chunk(&chunk)?;
-                  return Ok(());
-              }
-
-              let mut offset = 0usize;
-              while offset < bytes.len() {
-                  let end = offset
-                      .saturating_add(MAX_TRANSFER_DATA_BYTES)
-                      .min(bytes.len());
-                  let chunk = TransferChunk::new(
-                      kind,
-                      transfer_resource,
-                      object_key,
-                      content_sha,
-                      resource_sha,
-                      u64::try_from(offset)
-                          .map_err(|_| anyhow::anyhow!("provider resource offset exceeds u64"))?,
-                      total_size,
-                      bytes[offset..end].to_vec(),
-                  )?;
-                  let receipt = receiver.accept_chunk(&chunk)?;
-                  let next = usize::try_from(receipt.next_offset)
-                      .map_err(|_| anyhow::anyhow!("provider recovery offset exceeds platform range"))?;
-                  if next <= offset || next > bytes.len() {
-                      anyhow::bail!(
-                          "Cloud Node provider recovery returned invalid resume offset {} for resource size {}",
-                          next,
-                          bytes.len()
-                      );
-                  }
-                  offset = next;
-              }
-              Ok(())
-          }
-          '''
-          new_restore = '''async fn restore_resource(
+          restore = r'''async fn restore_resource(
               client: &ProviderClient,
               receiver: &mut CloudNodeRecoveryReceiver,
               resource: &ProviderResource,
@@ -411,6 +279,9 @@ jobs:
                   return Ok(());
               }
 
+              // A zero-length non-final chunk lets recovery report the durable prefix
+              // before we start the network request. This is the provider equivalent
+              // of the peer resume acknowledgement path.
               let probe = TransferChunk::new(
                   kind,
                   transfer_resource,
@@ -470,8 +341,8 @@ jobs:
                               resource.key
                           );
                       }
-                      let resource_remaining = usize::try_from(total_size - offset)
-                          .unwrap_or(usize::MAX);
+                      let remaining_u64 = total_size - offset;
+                      let resource_remaining = usize::try_from(remaining_u64).unwrap_or(usize::MAX);
                       let take = remaining
                           .len()
                           .min(MAX_TRANSFER_DATA_BYTES)
@@ -482,7 +353,6 @@ jobs:
                               resource.key
                           );
                       }
-                      let data = remaining[..take].to_vec();
                       let sent_end = offset
                           .checked_add(u64::try_from(take).map_err(|_| {
                               anyhow::anyhow!("provider transfer chunk exceeds u64")
@@ -496,7 +366,7 @@ jobs:
                           resource_sha,
                           offset,
                           total_size,
-                          data,
+                          remaining[..take].to_vec(),
                       )?;
                       let receipt = receiver.accept_chunk(&chunk)?;
                       if receipt.next_offset != sent_end {
@@ -519,8 +389,15 @@ jobs:
               }
               Ok(())
           }
-          '''
-          s = replace_once(s, old_restore, new_restore, "streamed provider restore")
+
+'''
+          s = sub_once(
+              r"(?s)^async fn restore_resource\(.*?^fn resource_record\(",
+              restore + "fn resource_record(",
+              s,
+              "streamed provider restore",
+              re.MULTILINE,
+          )
           sync_path.write_text(s)
           PY
       - name: Format
