@@ -1,0 +1,71 @@
+name: One-shot Cloud Node provider redirect hardening
+
+on:
+  push:
+    branches:
+      - work/cloud-node-provider-hardening
+
+permissions:
+  contents: write
+
+jobs:
+  provider-no-redirects:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Disable automatic provider redirects
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('engine/crates/cloud-node/src/provider.rs')
+          text = path.read_text()
+          if 'use reqwest::redirect::Policy;' not in text:
+              anchor = 'use reqwest::header::{\n'
+              if anchor not in text:
+                  raise SystemExit('reqwest header import anchor not found')
+              text = text.replace(anchor, 'use reqwest::redirect::Policy;\n' + anchor, 1)
+          builder = '''        let client = Client::builder()\n            .https_only(false)\n            .connect_timeout(Duration::from_millis(settings.connect_timeout_ms))\n'''
+          hardened = '''        let client = Client::builder()\n            .https_only(false)\n            .redirect(Policy::none())\n            .connect_timeout(Duration::from_millis(settings.connect_timeout_ms))\n'''
+          if '.redirect(Policy::none())' not in text:
+              if builder not in text:
+                  raise SystemExit('provider ClientBuilder anchor not found')
+              text = text.replace(builder, hardened, 1)
+          path.write_text(text)
+
+          doc = Path('doc/cloud-node.md')
+          docs = doc.read_text()
+          marker = '''Provider mode removes the requirement for a second `cloud_node.exe` for remote object persistence, snapshot synchronization, and Cloud Node history. Object storage itself is not an arbitrary reverse network tunnel or relay. Provider-managed ingress/relay products can be integrated separately without conflating network tunneling with the persistence provider interface.\n'''
+          addition = '''Provider HTTP clients do not automatically follow redirects. A 3xx response is treated as a provider error so API keys, Supabase `apikey` headers, custom authorization headers, signed S3 requests, and other provider credentials cannot be replayed to an unexpected redirect target. Configure the canonical storage endpoint directly.\n\n''' + marker
+          if 'Provider HTTP clients do not automatically follow redirects.' not in docs:
+              if marker not in docs:
+                  raise SystemExit('Cloud Node provider redirect docs anchor not found')
+              docs = docs.replace(marker, addition, 1)
+              doc.write_text(docs)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
+      - name: Commit BUG-CN-PROV-019
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-no-redirects.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-019 reject provider redirects"
+          git push origin HEAD:work/cloud-node-provider-hardening
