@@ -224,9 +224,7 @@ impl ProviderClient {
                         .or(self.settings.credential_env.as_deref()),
                     SUPABASE_API_KEY_ENV,
                 )?;
-                Ok(request
-                    .header("apikey", token.as_str())
-                    .bearer_auth(token))
+                Ok(request.header("apikey", token.as_str()).bearer_auth(token))
             }
             ProviderAuthMode::Bearer => {
                 let token = required_env(
@@ -262,10 +260,8 @@ impl ProviderClient {
             }
             ProviderAuthMode::None => Ok(request),
             ProviderAuthMode::ApiKey => {
-                let token = required_env(
-                    self.settings.auth.api_key_env.as_deref(),
-                    HTTP_API_KEY_ENV,
-                )?;
+                let token =
+                    required_env(self.settings.auth.api_key_env.as_deref(), HTTP_API_KEY_ENV)?;
                 let header_name = self
                     .settings
                     .auth
@@ -276,11 +272,11 @@ impl ProviderClient {
             }
             ProviderAuthMode::Bearer | ProviderAuthMode::OAuthBearer => {
                 let token = required_env(
-                    self.settings
+                    self.settings.auth.bearer_token_env.as_deref().or(self
+                        .settings
                         .auth
-                        .bearer_token_env
-                        .as_deref()
-                        .or(self.settings.auth.oauth_token_env.as_deref()),
+                        .oauth_token_env
+                        .as_deref()),
                     HTTP_BEARER_TOKEN_ENV,
                 )?;
                 Ok(request.bearer_auth(token))
@@ -304,12 +300,9 @@ impl ProviderClient {
     }
 
     fn apply_custom_header(&self, request: RequestBuilder) -> anyhow::Result<RequestBuilder> {
-        let header_name = self
-            .settings
-            .auth
-            .header_name
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Cloud Node provider header auth requires headerName"))?;
+        let header_name = self.settings.auth.header_name.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Cloud Node provider header auth requires headerName")
+        })?;
         let value = required_env(
             self.settings
                 .auth
@@ -536,10 +529,12 @@ async fn response_bytes(
 }
 
 fn add_header(request: RequestBuilder, name: &str, value: &str) -> anyhow::Result<RequestBuilder> {
-    let name = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|error| anyhow::anyhow!("invalid Cloud Node provider auth header name: {error}"))?;
-    let value = HeaderValue::from_str(value)
-        .map_err(|error| anyhow::anyhow!("invalid Cloud Node provider auth header value: {error}"))?;
+    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+        anyhow::anyhow!("invalid Cloud Node provider auth header name: {error}")
+    })?;
+    let value = HeaderValue::from_str(value).map_err(|error| {
+        anyhow::anyhow!("invalid Cloud Node provider auth header value: {error}")
+    })?;
     Ok(request.header(name, value))
 }
 

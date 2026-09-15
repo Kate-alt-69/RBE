@@ -9,11 +9,11 @@ use sha2::{Digest, Sha256};
 use crate::config::{CloudNodeSettings, ProviderConflictPolicy};
 use crate::format::BlobKind;
 use crate::provider::ProviderClient;
+use crate::random_session_and_nonce;
 use crate::recovery::CloudNodeRecoveryReceiver;
 use crate::store::CloudNodeStore;
 use crate::sync::{SyncPlan, SyncPlanHeader};
 use crate::transfer::{TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES};
-use crate::random_session_and_nonce;
 
 const HISTORY_VERSION: u16 = 1;
 const SNAPSHOT_VERSION: u16 = 1;
@@ -130,11 +130,12 @@ impl LocalHistory {
     fn read_commit(&self, id: &str) -> anyhow::Result<HistoryCommit> {
         validate_hash(id, "history commit id")?;
         let path = self.commits.join(format!("{id}.json"));
-        let commit: HistoryCommit = serde_json::from_slice(
-            &fs::read(&path).map_err(|error| {
-                anyhow::anyhow!("failed to read Cloud Node local history commit {}: {error}", path.display())
-            })?,
-        )?;
+        let commit: HistoryCommit = serde_json::from_slice(&fs::read(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to read Cloud Node local history commit {}: {error}",
+                path.display()
+            )
+        })?)?;
         validate_commit(&commit)?;
         if commit.id != id {
             anyhow::bail!("Cloud Node local history commit filename/id mismatch");
@@ -384,10 +385,8 @@ async fn push_provider_state(
     remote_head: Option<&HistoryCommit>,
 ) -> anyhow::Result<()> {
     upload_snapshot(client, plan).await?;
-    let commits = history.chain_to_ancestor(
-        &local_head.id,
-        remote_head.map(|commit| commit.id.as_str()),
-    )?;
+    let commits =
+        history.chain_to_ancestor(&local_head.id, remote_head.map(|commit| commit.id.as_str()))?;
     for commit in commits {
         upload_commit(client, &commit).await?;
     }
@@ -428,9 +427,9 @@ async fn remote_chain_until_local(
         let Some(parent) = &current.parent else {
             return Ok(out);
         };
-        current = fetch_remote_commit(client, parent)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Cloud Node provider history is missing commit {parent}"))?;
+        current = fetch_remote_commit(client, parent).await?.ok_or_else(|| {
+            anyhow::anyhow!("Cloud Node provider history is missing commit {parent}")
+        })?;
     }
     anyhow::bail!("Cloud Node remote provider history exceeded maximum depth")
 }
@@ -472,7 +471,12 @@ async fn remote_head(client: &ProviderClient) -> anyhow::Result<Option<HistoryCo
     fetch_remote_commit(client, &pointer.commit)
         .await?
         .map(Some)
-        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider HEAD references missing commit {}", pointer.commit))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node provider HEAD references missing commit {}",
+                pointer.commit
+            )
+        })
 }
 
 async fn fetch_remote_commit(
@@ -610,7 +614,11 @@ async fn upload_snapshot(client: &ProviderClient, plan: &SyncPlan) -> anyhow::Re
     };
     validate_snapshot(&snapshot)?;
     client
-        .put(&index_key, serde_json::to_vec(&snapshot)?, "application/json")
+        .put(
+            &index_key,
+            serde_json::to_vec(&snapshot)?,
+            "application/json",
+        )
         .await
 }
 
@@ -651,19 +659,27 @@ async fn restore_resource(
     receiver: &mut CloudNodeRecoveryReceiver,
     resource: &ProviderResource,
 ) -> anyhow::Result<()> {
-    let bytes = client
-        .get(&resource.key)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider snapshot resource {} is missing", resource.key))?;
+    let bytes = client.get(&resource.key).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cloud Node provider snapshot resource {} is missing",
+            resource.key
+        )
+    })?;
     let expected_size = usize::try_from(resource.size)
         .map_err(|_| anyhow::anyhow!("Cloud Node provider resource size exceeds platform range"))?;
     if bytes.len() != expected_size {
-        anyhow::bail!("Cloud Node provider resource size mismatch for {}", resource.key);
+        anyhow::bail!(
+            "Cloud Node provider resource size mismatch for {}",
+            resource.key
+        );
     }
     let resource_sha = decode_hash(&resource.resource_sha256, "provider resource hash")?;
     let actual: [u8; 32] = Sha256::digest(&bytes).into();
     if actual != resource_sha {
-        anyhow::bail!("Cloud Node provider resource hash mismatch for {}", resource.key);
+        anyhow::bail!(
+            "Cloud Node provider resource hash mismatch for {}",
+            resource.key
+        );
     }
     let kind = BlobKind::try_from(resource.kind)?;
     let transfer_resource = TransferResource::try_from(resource.resource)?;
@@ -688,14 +704,17 @@ async fn restore_resource(
 
     let mut offset = 0usize;
     while offset < bytes.len() {
-        let end = offset.saturating_add(MAX_TRANSFER_DATA_BYTES).min(bytes.len());
+        let end = offset
+            .saturating_add(MAX_TRANSFER_DATA_BYTES)
+            .min(bytes.len());
         let chunk = TransferChunk::new(
             kind,
             transfer_resource,
             object_key,
             content_sha,
             resource_sha,
-            u64::try_from(offset).map_err(|_| anyhow::anyhow!("provider resource offset exceeds u64"))?,
+            u64::try_from(offset)
+                .map_err(|_| anyhow::anyhow!("provider resource offset exceeds u64"))?,
             total_size,
             bytes[offset..end].to_vec(),
         )?;
@@ -728,7 +747,10 @@ fn resource_record(
 
 fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
     if snapshot.format_version != SNAPSHOT_VERSION {
-        anyhow::bail!("unsupported Cloud Node provider snapshot version {}", snapshot.format_version);
+        anyhow::bail!(
+            "unsupported Cloud Node provider snapshot version {}",
+            snapshot.format_version
+        );
     }
     validate_hash(&snapshot.root_sha256, "snapshot root")?;
     let mut phase = 0u8;
@@ -767,7 +789,9 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
             },
             TransferResource::FilePayload if kind == BlobKind::File => {}
             TransferResource::VideoChunk if kind == BlobKind::Video => {}
-            _ => anyhow::bail!("Cloud Node provider snapshot contains invalid resource kind pairing"),
+            _ => {
+                anyhow::bail!("Cloud Node provider snapshot contains invalid resource kind pairing")
+            }
         }
     }
     if usize::try_from(snapshot.folder_count).ok() != Some(folders.len())
@@ -815,7 +839,10 @@ fn commit_id(node_id: &str, parent: Option<&str>, root: &str, created_unix_ms: u
 
 fn validate_commit(commit: &HistoryCommit) -> anyhow::Result<()> {
     if commit.format_version != HISTORY_VERSION {
-        anyhow::bail!("unsupported Cloud Node provider history version {}", commit.format_version);
+        anyhow::bail!(
+            "unsupported Cloud Node provider history version {}",
+            commit.format_version
+        );
     }
     validate_hash(&commit.id, "history commit id")?;
     validate_hash(&commit.snapshot_root, "snapshot root")?;
@@ -839,7 +866,10 @@ fn validate_commit(commit: &HistoryCommit) -> anyhow::Result<()> {
 
 fn validate_head_pointer(pointer: &HeadPointer) -> anyhow::Result<()> {
     if pointer.format_version != HISTORY_VERSION {
-        anyhow::bail!("unsupported Cloud Node provider HEAD version {}", pointer.format_version);
+        anyhow::bail!(
+            "unsupported Cloud Node provider HEAD version {}",
+            pointer.format_version
+        );
     }
     validate_hash(&pointer.commit, "history HEAD commit")
 }
@@ -866,7 +896,9 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
     fs::create_dir_all(parent)?;
     let temp = parent.join(format!(
         ".{}.{}.tmp",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("history"),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("history"),
         std::process::id()
     ));
     fs::write(&temp, serde_json::to_vec(value)?)?;
@@ -917,8 +949,12 @@ mod tests {
         .unwrap();
         let store = CloudNodeStore::open(&settings).unwrap();
         let history = LocalHistory::open(&store, "prod").unwrap();
-        let first = history.ensure_snapshot_commit("node-a", &"11".repeat(32)).unwrap();
-        let second = history.ensure_snapshot_commit("node-a", &"22".repeat(32)).unwrap();
+        let first = history
+            .ensure_snapshot_commit("node-a", &"11".repeat(32))
+            .unwrap();
+        let second = history
+            .ensure_snapshot_commit("node-a", &"22".repeat(32))
+            .unwrap();
         assert_ne!(first.id, second.id);
         assert!(history.is_ancestor(&first.id, &second.id).unwrap());
         assert!(!history.is_ancestor(&second.id, &first.id).unwrap());

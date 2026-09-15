@@ -36,8 +36,8 @@ pub const TRANSFER_PATH: &str = "/.rbe/cn/v1/transfer";
 pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 pub use config::{
     CloudNodeSettings, NodeMode, NodeSettings, ProviderAuthMode, ProviderAuthSettings,
-    ProviderConflictPolicy, ProviderKind, ProviderSettings, ReplicationSettings,
-    ReplicationTarget, UpstreamSettings, SETTINGS_FILE_NAME,
+    ProviderConflictPolicy, ProviderKind, ProviderSettings, ReplicationSettings, ReplicationTarget,
+    UpstreamSettings, SETTINGS_FILE_NAME,
 };
 pub use crypto::{
     load_signing_key_from_env, public_key_hex, sign_challenge, verify_challenge,

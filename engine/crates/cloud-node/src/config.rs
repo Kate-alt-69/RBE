@@ -350,7 +350,12 @@ fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
             }
         }
         ProviderAuthMode::Header => {
-            if provider.auth.header_name.as_deref().is_none_or(str::is_empty) {
+            if provider
+                .auth
+                .header_name
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
                 anyhow::bail!("Cloud Node header provider auth requires headerName");
             }
         }
@@ -425,9 +430,9 @@ fn validate_env_name(value: &str) -> anyhow::Result<()> {
 fn validate_header_name(value: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || value.len() > 128
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-        })
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         anyhow::bail!("Cloud Node provider auth headerName contains invalid characters");
     }
