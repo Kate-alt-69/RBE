@@ -14,6 +14,73 @@ pub enum NodeMode {
     Archive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderKind {
+    #[serde(rename = "amazon-s3", alias = "aws-s3", alias = "s3")]
+    AmazonS3,
+    #[serde(rename = "supabase")]
+    Supabase,
+    #[serde(rename = "azure-blob", alias = "azure")]
+    AzureBlob,
+    #[serde(rename = "google-cloud-storage", alias = "gcs", alias = "google-cloud")]
+    GoogleCloudStorage,
+    #[serde(rename = "http")]
+    Http,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderConflictPolicy {
+    #[default]
+    Fail,
+    PreferLocal,
+    PreferRemote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderAuthMode {
+    #[default]
+    Auto,
+    None,
+    ApiKey,
+    Bearer,
+    Basic,
+    Header,
+    AwsSigV4,
+    AzureSas,
+    OAuthBearer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAuthSettings {
+    #[serde(default)]
+    pub mode: ProviderAuthMode,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+    #[serde(default)]
+    pub username_env: Option<String>,
+    #[serde(default)]
+    pub password_env: Option<String>,
+    #[serde(default)]
+    pub header_name: Option<String>,
+    #[serde(default)]
+    pub header_value_env: Option<String>,
+    #[serde(default)]
+    pub access_key_env: Option<String>,
+    #[serde(default)]
+    pub secret_key_env: Option<String>,
+    #[serde(default)]
+    pub session_token_env: Option<String>,
+    #[serde(default)]
+    pub sas_token_env: Option<String>,
+    #[serde(default)]
+    pub oauth_token_env: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudNodeSettings {
@@ -22,6 +89,8 @@ pub struct CloudNodeSettings {
     pub node: NodeSettings,
     #[serde(default)]
     pub upstream: Option<UpstreamSettings>,
+    #[serde(default)]
+    pub provider: Option<ProviderSettings>,
     #[serde(default)]
     pub replication: ReplicationSettings,
 }
@@ -47,6 +116,42 @@ pub struct UpstreamSettings {
     pub url: String,
     pub node_id: String,
     pub public_key: String,
+    #[serde(default = "default_true")]
+    pub auto_reconnect: bool,
+    #[serde(default = "default_true")]
+    pub sync_on_connect: bool,
+    #[serde(default = "default_reconnect_delay_ms")]
+    pub reconnect_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSettings {
+    pub kind: ProviderKind,
+    pub namespace: String,
+    pub bucket: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub auth: ProviderAuthSettings,
+    // Compatibility fields for the first provider prototype. New configs should
+    // use provider.auth.*Env instead.
+    #[serde(default)]
+    pub credential_env: Option<String>,
+    #[serde(default)]
+    pub access_key_env: Option<String>,
+    #[serde(default)]
+    pub secret_key_env: Option<String>,
+    #[serde(default)]
+    pub session_token_env: Option<String>,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub conflict_policy: ProviderConflictPolicy,
     #[serde(default = "default_true")]
     pub auto_reconnect: bool,
     #[serde(default = "default_true")]
@@ -113,13 +218,19 @@ impl CloudNodeSettings {
         if !(1024 * 1024..=64 * 1024 * 1024).contains(&self.node.video_chunk_bytes) {
             anyhow::bail!("Cloud Node videoChunkBytes must be between 1 MiB and 64 MiB");
         }
+        if self.upstream.is_some() && self.provider.is_some() {
+            anyhow::bail!(
+                "Cloud Node settings must choose either upstream peer mode or provider mode, not both"
+            );
+        }
         if let Some(upstream) = &self.upstream {
             validate_peer_url(&upstream.url)?;
             validate_node_id(&upstream.node_id)?;
             validate_public_key(&upstream.public_key)?;
-            if upstream.reconnect_delay_ms < 250 || upstream.reconnect_delay_ms > 300_000 {
-                anyhow::bail!("Cloud Node reconnectDelayMs must be between 250 and 300000");
-            }
+            validate_reconnect_delay(upstream.reconnect_delay_ms)?;
+        }
+        if let Some(provider) = &self.provider {
+            validate_provider(provider)?;
         }
         if !(1_000..=3_600_000).contains(&self.replication.boot_recovery_timeout_ms) {
             anyhow::bail!("Cloud Node bootRecoveryTimeoutMs must be between 1000 and 3600000");
@@ -136,6 +247,202 @@ impl CloudNodeSettings {
         }
         Ok(())
     }
+}
+
+fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
+    validate_namespace(&provider.namespace)?;
+    validate_bucket(&provider.bucket)?;
+    validate_prefix(&provider.prefix)?;
+    validate_reconnect_delay(provider.reconnect_delay_ms)?;
+
+    if let Some(endpoint) = &provider.endpoint {
+        validate_provider_endpoint(endpoint)?;
+    }
+    match provider.kind {
+        ProviderKind::AmazonS3 => {
+            if provider.region.as_deref().is_none_or(str::is_empty) {
+                anyhow::bail!("Cloud Node amazon-s3 provider requires region");
+            }
+            validate_auth_mode(
+                provider,
+                &[ProviderAuthMode::Auto, ProviderAuthMode::AwsSigV4],
+            )?;
+        }
+        ProviderKind::Supabase => {
+            if provider.endpoint.as_deref().is_none_or(str::is_empty) {
+                anyhow::bail!("Cloud Node supabase provider requires endpoint");
+            }
+            validate_auth_mode(
+                provider,
+                &[
+                    ProviderAuthMode::Auto,
+                    ProviderAuthMode::ApiKey,
+                    ProviderAuthMode::Bearer,
+                    ProviderAuthMode::Header,
+                ],
+            )?;
+        }
+        ProviderKind::AzureBlob => {
+            let has_endpoint = provider
+                .endpoint
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            let has_account = provider
+                .account
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            if !has_endpoint && !has_account {
+                anyhow::bail!("Cloud Node azure-blob provider requires account or endpoint");
+            }
+            validate_auth_mode(
+                provider,
+                &[ProviderAuthMode::Auto, ProviderAuthMode::AzureSas],
+            )?;
+        }
+        ProviderKind::GoogleCloudStorage => {
+            validate_auth_mode(
+                provider,
+                &[
+                    ProviderAuthMode::Auto,
+                    ProviderAuthMode::OAuthBearer,
+                    ProviderAuthMode::Bearer,
+                ],
+            )?;
+        }
+        ProviderKind::Http => {
+            if provider.endpoint.as_deref().is_none_or(str::is_empty) {
+                anyhow::bail!("Cloud Node http provider requires endpoint");
+            }
+        }
+    }
+
+    for env_name in [
+        provider.credential_env.as_deref(),
+        provider.access_key_env.as_deref(),
+        provider.secret_key_env.as_deref(),
+        provider.session_token_env.as_deref(),
+        provider.auth.api_key_env.as_deref(),
+        provider.auth.bearer_token_env.as_deref(),
+        provider.auth.username_env.as_deref(),
+        provider.auth.password_env.as_deref(),
+        provider.auth.header_value_env.as_deref(),
+        provider.auth.access_key_env.as_deref(),
+        provider.auth.secret_key_env.as_deref(),
+        provider.auth.session_token_env.as_deref(),
+        provider.auth.sas_token_env.as_deref(),
+        provider.auth.oauth_token_env.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_env_name(env_name)?;
+    }
+
+    if let Some(header_name) = &provider.auth.header_name {
+        validate_header_name(header_name)?;
+    }
+    match provider.auth.mode {
+        ProviderAuthMode::Basic => {
+            if provider.auth.username_env.is_some() ^ provider.auth.password_env.is_some() {
+                anyhow::bail!(
+                    "Cloud Node basic provider auth must configure both usernameEnv and passwordEnv or neither"
+                );
+            }
+        }
+        ProviderAuthMode::Header
+            if provider
+                .auth
+                .header_name
+                .as_deref()
+                .is_none_or(str::is_empty) =>
+        {
+            anyhow::bail!("Cloud Node header provider auth requires headerName");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_auth_mode(
+    provider: &ProviderSettings,
+    allowed: &[ProviderAuthMode],
+) -> anyhow::Result<()> {
+    if !allowed.contains(&provider.auth.mode) {
+        anyhow::bail!(
+            "Cloud Node {:?} provider does not support {:?} authentication",
+            provider.kind,
+            provider.auth.mode
+        );
+    }
+    Ok(())
+}
+
+fn validate_namespace(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        anyhow::bail!(
+            "Cloud Node provider namespace must use 1..=128 ASCII [A-Za-z0-9_.-] characters"
+        );
+    }
+    Ok(())
+}
+
+fn validate_bucket(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > 255
+        || value.bytes().any(|byte| byte <= b' ' || byte == b'/')
+    {
+        anyhow::bail!(
+            "Cloud Node provider bucket/container must be a non-empty name without spaces or slashes"
+        );
+    }
+    Ok(())
+}
+
+fn validate_prefix(value: &str) -> anyhow::Result<()> {
+    if value.len() > 512 || value.starts_with('/') || value.contains("..") || value.contains('\\') {
+        anyhow::bail!(
+            "Cloud Node provider prefix must be relative, <=512 bytes, and cannot contain '..' or backslashes"
+        );
+    }
+    Ok(())
+}
+
+fn validate_env_name(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        anyhow::bail!(
+            "Cloud Node provider credential environment names must use ASCII [A-Za-z0-9_] characters"
+        );
+    }
+    Ok(())
+}
+
+fn validate_header_name(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        anyhow::bail!("Cloud Node provider auth headerName contains invalid characters");
+    }
+    Ok(())
+}
+
+fn validate_reconnect_delay(value: u64) -> anyhow::Result<()> {
+    if !(250..=300_000).contains(&value) {
+        anyhow::bail!("Cloud Node reconnectDelayMs must be between 250 and 300000");
+    }
+    Ok(())
 }
 
 fn validate_node_id(value: &str) -> anyhow::Result<()> {
@@ -158,6 +465,15 @@ fn validate_peer_url(value: &str) -> anyhow::Result<()> {
         || value.starts_with("ws://localhost");
     if !secure && !local_dev {
         anyhow::bail!("Cloud Node peer URL must use TLS outside localhost development");
+    }
+    Ok(())
+}
+
+fn validate_provider_endpoint(value: &str) -> anyhow::Result<()> {
+    let secure = value.starts_with("https://");
+    let local_dev = value.starts_with("http://127.0.0.1") || value.starts_with("http://localhost");
+    if !secure && !local_dev {
+        anyhow::bail!("Cloud Node provider endpoint must use HTTPS outside localhost development");
     }
     Ok(())
 }
@@ -201,5 +517,61 @@ mod tests {
         assert!(!settings.replication.require_boot_recovery);
         assert_eq!(settings.replication.boot_recovery_timeout_ms, 60_000);
         settings.validate().unwrap();
+    }
+
+    #[test]
+    fn provider_mode_rejects_peer_upstream_at_the_same_time() {
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node": {"id":"nas-main","storageRoot":"/srv/nas"},
+            "upstream": {
+                "url":"https://peer.example",
+                "nodeId":"peer",
+                "publicKey":"0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "provider": {
+                "kind":"google-cloud-storage",
+                "namespace":"prod",
+                "bucket":"rbe-backups"
+            }
+        }))
+        .unwrap();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn provider_aliases_and_defaults_are_stable() {
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node": {"id":"nas-main","storageRoot":"/srv/nas"},
+            "provider": {
+                "kind":"s3",
+                "namespace":"prod",
+                "bucket":"rbe-backups",
+                "region":"ap-south-1"
+            }
+        }))
+        .unwrap();
+        settings.validate().unwrap();
+        let provider = settings.provider.unwrap();
+        assert_eq!(provider.kind, ProviderKind::AmazonS3);
+        assert_eq!(provider.auth.mode, ProviderAuthMode::Auto);
+        assert_eq!(provider.conflict_policy, ProviderConflictPolicy::Fail);
+        assert!(provider.auto_reconnect);
+        assert!(provider.sync_on_connect);
+    }
+
+    #[test]
+    fn provider_rejects_invalid_fixed_auth_mode() {
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node": {"id":"nas-main","storageRoot":"/srv/nas"},
+            "provider": {
+                "kind":"amazon-s3",
+                "namespace":"prod",
+                "bucket":"rbe-backups",
+                "region":"ap-south-1",
+                "auth":{"mode":"basic"}
+            }
+        }))
+        .unwrap();
+        assert!(settings.validate().is_err());
     }
 }

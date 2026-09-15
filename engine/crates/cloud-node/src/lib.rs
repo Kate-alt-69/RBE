@@ -10,6 +10,10 @@ mod config;
 mod crypto;
 mod format;
 mod protocol;
+#[cfg(feature = "client")]
+mod provider;
+#[cfg(feature = "client")]
+mod provider_sync;
 mod recovery;
 mod server;
 mod store;
@@ -31,7 +35,8 @@ pub const TRANSFER_PATH: &str = "/.rbe/cn/v1/transfer";
 #[cfg(not(feature = "client"))]
 pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 pub use config::{
-    CloudNodeSettings, NodeMode, NodeSettings, ReplicationSettings, ReplicationTarget,
+    CloudNodeSettings, NodeMode, NodeSettings, ProviderAuthMode, ProviderAuthSettings,
+    ProviderConflictPolicy, ProviderKind, ProviderSettings, ReplicationSettings, ReplicationTarget,
     UpstreamSettings, SETTINGS_FILE_NAME,
 };
 pub use crypto::{
@@ -42,6 +47,13 @@ pub use format::{
     BlobKind, BlobManifest, ByteRangeChange, ChunkRef, FolderEntry, BLOB_FORMAT_VERSION,
 };
 pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
+#[cfg(feature = "client")]
+pub use provider::ProviderClient;
+#[cfg(feature = "client")]
+pub use provider_sync::{
+    provider_status, synchronize_provider, ProviderSyncAction, ProviderSyncRelation,
+    ProviderSyncResult, ProviderSyncStatus,
+};
 pub use recovery::{CloudNodeRecoveryReceiver, RecoveryReceipt};
 pub use server::{
     AcceptedKnock, AuthenticatedSession, CloudNodeAuthenticator, DEFAULT_SESSION_TTL_MS,
@@ -49,4 +61,4 @@ pub use server::{
 };
 pub use store::{CloudNodeStore, StoreSummary, StoredObject};
 pub use sync::{SyncObject, SyncPlan, SyncPlanHeader};
-pub use transfer::{TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES, RESUME_ACK_HEADER};
+pub use transfer::{TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES};
