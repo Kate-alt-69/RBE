@@ -1,0 +1,321 @@
+name: One-shot Cloud Node crash recovery hardening
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-crash-recovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Patch, validate, and land
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          store_path = Path('engine/crates/cloud-node/src/store.rs')
+          store = store_path.read_text()
+
+          open_pattern = re.compile(r'(?ms)^    pub fn open\(settings: &CloudNodeSettings\) -> anyhow::Result<Self> \{.*?^    pub fn summary\(&self\) -> StoreSummary \{')
+          open_block = textwrap.indent(textwrap.dedent('''
+          pub fn open(settings: &CloudNodeSettings) -> anyhow::Result<Self> {
+              settings.validate()?;
+              let root = settings.node.storage_root.join("rbe");
+              fs::create_dir_all(&root)?;
+              let storage = root.join("storage");
+              let backup = root.join("backup");
+              let previous = root.join("recovery-previous-storage");
+
+              let restored_previous = !storage.exists() && previous.exists();
+              if restored_previous {
+                  fs::rename(&previous, &storage)?;
+              }
+              fs::create_dir_all(&storage)?;
+              fs::create_dir_all(&backup)?;
+
+              let store = Self {
+                  root,
+                  storage,
+                  backup,
+                  backup_versions: settings.node.backup_versions,
+                  preserve_original: settings.node.preserve_original,
+                  video_chunk_bytes: settings.node.video_chunk_bytes,
+              };
+
+              if restored_previous {
+                  store.verify().map_err(|error| {
+                      anyhow::anyhow!(
+                          "Cloud Node restored interrupted previous storage but verification failed: {error}"
+                      )
+                  })?;
+              } else if previous.exists() {
+                  store.reconcile_interrupted_swap(&previous)?;
+              }
+              Ok(store)
+          }
+
+          fn reconcile_interrupted_swap(&self, previous: &Path) -> anyhow::Result<()> {
+              let live_error = match self.verify() {
+                  Ok(_) => {
+                      fs::remove_dir_all(previous)?;
+                      return Ok(());
+                  }
+                  Err(error) => error,
+              };
+
+              let failed = self.root.join("recovery-failed-storage");
+              if failed.exists() {
+                  anyhow::bail!(
+                      "Cloud Node has an unresolved failed recovery tree at {}",
+                      failed.display()
+                  );
+              }
+              fs::rename(&self.storage, &failed)?;
+              if let Err(error) = fs::rename(previous, &self.storage) {
+                  let _ = fs::rename(&failed, &self.storage);
+                  return Err(error.into());
+              }
+
+              match self.verify() {
+                  Ok(_) => {
+                      fs::remove_dir_all(&failed)?;
+                      Ok(())
+                  }
+                  Err(previous_error) => anyhow::bail!(
+                      "Cloud Node interrupted recovery contains two invalid trees: active={live_error}; previous={previous_error}; failed tree preserved at {}",
+                      failed.display()
+                  ),
+              }
+          }
+
+          pub fn summary(&self) -> StoreSummary {
+          ''').lstrip(), '    ')
+          store, count = open_pattern.subn(open_block, store, count=1)
+          if count != 1:
+              raise SystemExit(f'store open reconciliation: expected one block, found {count}')
+          print('patched: store open reconciliation')
+
+          old_verify_start = """    pub fn verify(&self) -> anyhow::Result<usize> {\n        let mut verified = 0usize;\n        for entry in fs::read_dir(&self.storage)? {\n"""
+          new_verify_start = """    pub fn verify(&self) -> anyhow::Result<usize> {\n        Self::verify_storage_path(&self.storage)\n    }\n\n    pub(crate) fn verify_storage_path(storage: &Path) -> anyhow::Result<usize> {\n        let mut verified = 0usize;\n        for entry in fs::read_dir(storage)? {\n"""
+          if store.count(old_verify_start) != 1:
+              raise SystemExit('verify-storage helper anchor changed')
+          store = store.replace(old_verify_start, new_verify_start, 1)
+          print('patched: reusable storage verifier')
+
+          tests = textwrap.indent(textwrap.dedent('''
+          #[test]
+          fn open_restores_previous_storage_when_live_tree_is_missing() {
+              let root = test_root("interrupted-missing-live");
+              fs::create_dir_all(&root).unwrap();
+              let source = root.join("users.db");
+              fs::write(&source, b"old bytes").unwrap();
+              let settings = settings(&root);
+              let store = CloudNodeStore::open(&settings).unwrap();
+              store.store_file(&source, "db/users.db").unwrap();
+              let expected = store.sync_plan().unwrap().header().unwrap();
+              let summary = store.summary();
+              let previous = summary.root.join("recovery-previous-storage");
+              fs::rename(&summary.storage, &previous).unwrap();
+              drop(store);
+
+              let reopened = CloudNodeStore::open(&settings).unwrap();
+              assert_eq!(reopened.sync_plan().unwrap().header().unwrap(), expected);
+              assert!(!previous.exists());
+              fs::remove_dir_all(root).unwrap();
+          }
+
+          #[test]
+          fn open_keeps_verified_new_tree_after_interrupted_swap() {
+              let root = test_root("interrupted-good-live");
+              fs::create_dir_all(&root).unwrap();
+              let source = root.join("users.db");
+              fs::write(&source, b"old bytes").unwrap();
+              let settings = settings(&root);
+              let store = CloudNodeStore::open(&settings).unwrap();
+              store.store_file(&source, "db/users.db").unwrap();
+              let summary = store.summary();
+              let previous = summary.root.join("recovery-previous-storage");
+              fs::rename(&summary.storage, &previous).unwrap();
+
+              fs::write(&source, b"new bytes").unwrap();
+              store.store_file(&source, "db/users.db").unwrap();
+              let expected_new = store.sync_plan().unwrap().header().unwrap();
+              drop(store);
+
+              let reopened = CloudNodeStore::open(&settings).unwrap();
+              assert_eq!(reopened.sync_plan().unwrap().header().unwrap(), expected_new);
+              assert!(!previous.exists());
+              fs::remove_dir_all(root).unwrap();
+          }
+
+          #[test]
+          fn open_rolls_back_corrupt_new_tree_to_verified_previous_tree() {
+              let root = test_root("interrupted-bad-live");
+              fs::create_dir_all(&root).unwrap();
+              let source = root.join("users.db");
+              fs::write(&source, b"old bytes").unwrap();
+              let settings = settings(&root);
+              let store = CloudNodeStore::open(&settings).unwrap();
+              store.store_file(&source, "db/users.db").unwrap();
+              let expected_old = store.sync_plan().unwrap().header().unwrap();
+              let summary = store.summary();
+              let previous = summary.root.join("recovery-previous-storage");
+              fs::rename(&summary.storage, &previous).unwrap();
+
+              fs::write(&source, b"new bytes").unwrap();
+              store.store_file(&source, "db/users.db").unwrap();
+              let plan = store.sync_plan().unwrap();
+              let payload = plan.files[0].payload_path.as_ref().unwrap();
+              fs::write(payload, b"corrupt").unwrap();
+              drop(store);
+
+              let reopened = CloudNodeStore::open(&settings).unwrap();
+              assert_eq!(reopened.sync_plan().unwrap().header().unwrap(), expected_old);
+              assert!(!previous.exists());
+              assert!(!reopened.summary().root.join("recovery-failed-storage").exists());
+              fs::remove_dir_all(root).unwrap();
+          }
+          ''').strip(), '    ')
+          module_end = store.rfind('\n}')
+          if module_end < 0 or '#[cfg(test)]' not in store[module_end - 14000:module_end]:
+              raise SystemExit('store test module end anchor changed')
+          store = store[:module_end] + '\n\n' + tests + store[module_end:]
+          store_path.write_text(store)
+          print('patched: interrupted swap tests')
+
+          sync_path = Path('engine/crates/cloud-node/src/sync.rs')
+          sync = sync_path.read_text()
+          old_scan = """impl SyncPlan {\n    pub fn scan(store: &CloudNodeStore) -> anyhow::Result<Self> {\n        let storage = store.summary().storage;\n        let mut folders = Vec::new();\n"""
+          new_scan = """impl SyncPlan {\n    pub fn scan(store: &CloudNodeStore) -> anyhow::Result<Self> {\n        let storage = store.summary().storage;\n        Self::scan_storage(&storage)\n    }\n\n    pub(crate) fn scan_storage(storage: &Path) -> anyhow::Result<Self> {\n        let mut folders = Vec::new();\n"""
+          if sync.count(old_scan) != 1:
+              raise SystemExit('sync storage scanner anchor changed')
+          sync = sync.replace(old_scan, new_scan, 1)
+          sync = sync.replace('for entry in fs::read_dir(&storage)? {', 'for entry in fs::read_dir(storage)? {', 1)
+          sync_path.write_text(sync)
+          print('patched: staged storage sync scanner')
+
+          recovery_path = Path('engine/crates/cloud-node/src/recovery.rs')
+          recovery = recovery_path.read_text()
+          recovery = recovery.replace(
+              'use crate::sync::SyncPlanHeader;',
+              'use crate::sync::{SyncPlan, SyncPlanHeader};',
+              1,
+          )
+          complete_pattern = re.compile(r'(?ms)^    pub fn complete\(\n.*?^    fn rollback_swap\(')
+          complete_block = textwrap.indent(textwrap.dedent('''
+          pub fn complete(
+              &mut self,
+              store: &CloudNodeStore,
+              expected: SyncPlanHeader,
+          ) -> anyhow::Result<SyncPlanHeader> {
+              if self.completed {
+                  anyhow::bail!("Cloud Node recovery session is already complete");
+              }
+              if self.active.is_some() {
+                  anyhow::bail!("Cloud Node recovery cannot complete with a partial resource");
+              }
+
+              CloudNodeStore::verify_storage_path(&self.staging_storage)?;
+              let staged = SyncPlan::scan_storage(&self.staging_storage)?.header()?;
+              if staged != expected {
+                  anyhow::bail!(
+                      "Cloud Node staged recovery root mismatch: expected {}, got {}",
+                      hex::encode(expected.root_sha256),
+                      hex::encode(staged.root_sha256)
+                  );
+              }
+
+              let summary = store.summary();
+              let live = summary.storage;
+              let old = summary.root.join("recovery-previous-storage");
+              if old.exists() {
+                  anyhow::bail!(
+                      "Cloud Node cannot start a storage swap while previous recovery storage exists"
+                  );
+              }
+
+              let had_live = live.exists();
+              if had_live {
+                  fs::rename(&live, &old)?;
+              }
+              if let Err(error) = fs::rename(&self.staging_storage, &live) {
+                  if had_live && old.exists() {
+                      let _ = fs::rename(&old, &live);
+                  }
+                  return Err(error.into());
+              }
+
+              let actual = match store.verify().and_then(|_| store.sync_plan()?.header()) {
+                  Ok(actual) => actual,
+                  Err(error) => {
+                      self.rollback_swap(&live, &old, had_live);
+                      return Err(error);
+                  }
+              };
+              if actual != expected {
+                  self.rollback_swap(&live, &old, had_live);
+                  anyhow::bail!(
+                      "Cloud Node activated recovery root mismatch: expected {}, got {}",
+                      hex::encode(expected.root_sha256),
+                      hex::encode(actual.root_sha256)
+                  );
+              }
+
+              if old.exists() {
+                  fs::remove_dir_all(&old)?;
+              }
+              self.completed = true;
+              if self.session_root.exists() {
+                  fs::remove_dir_all(&self.session_root)?;
+              }
+              Ok(actual)
+          }
+
+          fn rollback_swap(
+          ''').lstrip(), '    ')
+          recovery, count = complete_pattern.subn(complete_block, recovery, count=1)
+          if count != 1:
+              raise SystemExit(f'recovery swap block: expected one block, found {count}')
+          recovery_path.write_text(recovery)
+          print('patched: preverified crash-recoverable storage swap')
+          PY
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test -p cloud-node --locked
+          cd ..
+
+          rm -f .github/workflows/one-shot-cloud-node-crash-recovery.yml
+          git add -A .github/workflows/one-shot-cloud-node-crash-recovery.yml \
+            engine/crates/cloud-node/src/store.rs \
+            engine/crates/cloud-node/src/sync.rs \
+            engine/crates/cloud-node/src/recovery.rs
+          git diff --cached --check
+          git commit -m 'FIX | BUG-CN-002 recover interrupted Cloud Node storage swaps'
+          git pull --rebase origin main
+          git push origin HEAD:main
