@@ -1,0 +1,60 @@
+name: One-shot Cloud Node crash-resumable recovery v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cloud-node-crash-resume-v2.yml'
+      - '.github/patches/cloud-node-crash-resume.py'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Apply, validate, and land crash-resumable recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/patches/cloud-node-crash-resume.py
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test -p cloud-node --locked
+          cargo test -p backend --locked
+          cd ..
+
+          rm -f \
+            .github/workflows/one-shot-cloud-node-crash-resume.yml \
+            .github/workflows/one-shot-cloud-node-crash-resume-v2.yml \
+            .github/patches/cloud-node-crash-resume.py
+
+          git add -A \
+            .github/workflows/one-shot-cloud-node-crash-resume.yml \
+            .github/workflows/one-shot-cloud-node-crash-resume-v2.yml \
+            .github/patches/cloud-node-crash-resume.py \
+            engine/crates/cloud-node/src/recovery.rs \
+            engine/crates/backend/src/maintenance_notice.rs \
+            doc/cloud-node.md
+          git diff --cached --check
+          git commit -m 'FIX | BUG-CN-006 resume Cloud Node recovery after process restart'
+          git pull --rebase origin main
+          git push origin HEAD:main
