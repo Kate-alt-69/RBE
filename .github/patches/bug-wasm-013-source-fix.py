@@ -9,11 +9,13 @@ if count != 1:
     raise SystemExit(f"BUG-WASM-013 dynamic body test input expected once, found {count}")
 text = text.replace(old, new, 1)
 
-old = "data.active(0, &ConstExpr::i32_const(payload_offset as i32), [b'[']);"
-new = 'data.active(0, &ConstExpr::i32_const(payload_offset as i32), *b"[");'
+# The generation-16 encoder is still multiline before rustfmt runs, so patch
+# the byte slice itself rather than depending on rustfmt's compact rendering.
+old = "[b'['],"
+new = '*b"[",'
 count = text.count(old)
 if count != 1:
-    raise SystemExit(f"BUG-WASM-013 byte-slice clippy anchor expected once, found {count}")
+    raise SystemExit(f"BUG-WASM-013 byte-slice clippy token expected once, found {count}")
 path.write_text(text.replace(old, new, 1))
 
 path = Path("engine/crates/route-engine/src/relc.rs")
