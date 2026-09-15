@@ -12,6 +12,8 @@ mod format;
 mod protocol;
 #[cfg(feature = "client")]
 mod provider;
+#[cfg(feature = "client")]
+mod provider_sync;
 mod recovery;
 mod server;
 mod store;
@@ -46,6 +48,11 @@ pub use format::{
 pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
 #[cfg(feature = "client")]
 pub use provider::ProviderClient;
+#[cfg(feature = "client")]
+pub use provider_sync::{
+    provider_status, synchronize_provider, ProviderSyncAction, ProviderSyncRelation,
+    ProviderSyncResult, ProviderSyncStatus,
+};
 pub use recovery::{CloudNodeRecoveryReceiver, RecoveryReceipt};
 pub use server::{
     AcceptedKnock, AuthenticatedSession, CloudNodeAuthenticator, DEFAULT_SESSION_TTL_MS,
