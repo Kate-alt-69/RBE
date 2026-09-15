@@ -1777,7 +1777,7 @@ mod tests {
             .expect("dynamic Storage route must compile to native WASM");
         assert_eq!(
             artifact.input,
-            crate::wasm_compiler::RouteWasmInput::JsonBodyCapabilityArgument
+            crate::wasm_compiler::RouteWasmInput::JsonBodyCapabilityValue
         );
         assert!(image.route_wasm_fallback(route, "get").is_none());
         let grants = image.container_capability_grants(route).unwrap();

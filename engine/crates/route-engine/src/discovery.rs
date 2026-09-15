@@ -697,7 +697,7 @@ async fn execute(
                 }
                 input
             }
-            RouteWasmInput::JsonBodyCapabilityArgument => {
+            RouteWasmInput::JsonBodyCapabilityValue => {
                 let body = args
                     .first()
                     .and_then(|request| match request {
@@ -705,13 +705,13 @@ async fn execute(
                         _ => None,
                     })
                     .unwrap_or(&Value::Null);
-                let input = match serde_json::to_vec(&vec![value_to_json(body)]) {
+                let input = match serde_json::to_vec(&value_to_json(body)) {
                     Ok(input) => input,
                     Err(error) => {
                         tracing::error!(
                             error = %error,
                             path = %path,
-                            "encode native req.body capability argument"
+                            "encode raw native req.body capability input"
                         );
                         return request_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -719,12 +719,13 @@ async fn execute(
                         );
                     }
                 };
-                let limit =
-                    CONTAINER_MAX_EXECUTION_INPUT_BYTES.min(CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES);
+                // Guest adds '[' and ']' around raw JSON before capability_call.
+                let limit = CONTAINER_MAX_EXECUTION_INPUT_BYTES
+                    .min(CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES.saturating_sub(2));
                 if input.len() > limit {
                     return request_error(
                         StatusCode::PAYLOAD_TOO_LARGE,
-                        "native route capability argument exceeds the Container capability input limit",
+                        "native route capability value exceeds the Container capability input limit",
                     );
                 }
                 input

@@ -17,7 +17,8 @@ use service_runtime::{service_capability_name_allowed, SERVICE_CAPABILITY_TARGET
 use sha2::{Digest, Sha256};
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
-    FunctionSection, ImportSection, MemorySection, MemoryType, Module, TypeSection, ValType,
+    FunctionSection, ImportSection, MemArg, MemorySection, MemoryType, Module, TypeSection,
+    ValType,
 };
 
 use crate::ast::{
@@ -27,11 +28,10 @@ use crate::modules::binding_name;
 use crate::runtime_image::{storage_capability_operation_allowed, storage_capability_target};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-/// Generation 15 lowers request-independent `const`/`if` control flow in
-/// linked Module wrappers before one exact terminal host call. Static execution
-/// stays host-call free and bounded; the selected capability still executes in
-/// the generated WASM guest. ABI v3 stays unchanged.
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 15;
+/// Generation 16 moves dynamic one-value capability payload construction
+/// into the WASM guest. The host supplies raw JSON `req.body`; guest code wraps
+/// it as `[req.body]` before the exact capability call. ABI v3 stays unchanged.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 16;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STATIC_HELPER_CALL_DEPTH: usize = 32;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
@@ -42,10 +42,10 @@ pub enum RouteWasmInput {
     /// Invocation input is the JSON encoding of the evaluator-visible `req.body`
     /// value. This keeps strings/null/objects/arrays semantically identical.
     JsonBody,
-    /// Invocation input is a JSON argument array containing exactly one
-    /// evaluator-visible `req.body` value. The guest forwards these bytes to an
-    /// already-authorized host capability without parsing or widening them.
-    JsonBodyCapabilityArgument,
+    /// Invocation input is the raw JSON encoding of evaluator-visible
+    /// `req.body`. The guest constructs the single-argument JSON array around
+    /// these bytes before crossing the capability ABI.
+    JsonBodyCapabilityValue,
 }
 
 #[derive(Debug, Clone)]
@@ -105,12 +105,11 @@ impl RouteWasmLinkContext {
 /// Compile the currently supported native route subset.
 ///
 /// Native lowering remains intentionally strict per HTTP method. Compiler
-/// generation v15 keeps ABI v3 and extends immutable linked Module lowering
-/// through request-independent `const`, pure expression, and `if` prefixes that
-/// resolve to one exact terminal host call. It retains generation 14's multiple
-/// host imports/helpers and generation 13's per-method artifacts. Dynamic control
-/// flow, namespace host calls, ambiguous bindings, and nested host-call chains
-/// remain interpreter-only.
+/// generation v16 keeps ABI v3 and moves dynamic single-body capability
+/// argument construction into the guest. It retains generation 15's static
+/// Module control flow and generation 13's per-method artifacts. Dynamic value
+/// transforms, namespace host calls, ambiguous bindings, and nested host-call
+/// chains remain interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let links = RouteWasmLinkContext::default();
     compile_route_with_links(file, &links)
@@ -142,7 +141,7 @@ pub(crate) fn compile_route_method_with_links(
                 || host_imports.insert(binding.clone(), found).is_some()
             {
                 return fallback(format!(
-                    "native Route-WASM v13 found ambiguous import binding {binding:?}"
+                    "native Route-WASM v16 found ambiguous import binding {binding:?}"
                 ));
             }
             continue;
@@ -159,14 +158,14 @@ pub(crate) fn compile_route_method_with_links(
                 || linked_imports.insert(binding.clone(), linked).is_some()
             {
                 return fallback(format!(
-                    "native Route-WASM v13 found ambiguous import binding {binding:?}"
+                    "native Route-WASM v16 found ambiguous import binding {binding:?}"
                 ));
             }
             continue;
         }
 
         return fallback(
-            "native Route-WASM v13 supports only exact direct http.get/post/request imports or exact linked Module function imports; namespace imports remain interpreter-only",
+            "native Route-WASM v16 supports only exact direct http.get/post/request imports or exact linked Module function imports; namespace imports remain interpreter-only",
         );
     }
     let returned_binding = returned_call_binding(&method.body);
@@ -222,7 +221,7 @@ pub(crate) fn compile_route_method_with_links(
             ),
             LoweredCapabilityPayload::JsonBodySingleArgument => (
                 encode_input_capability_call_module(call.kind, &call.target, &call.operation),
-                RouteWasmInput::JsonBodyCapabilityArgument,
+                RouteWasmInput::JsonBodyCapabilityValue,
             ),
         }
     } else if let Some(value) = static_route_result(&method.body, &file.functions) {
@@ -964,14 +963,15 @@ fn encode_input_capability_call_module(
     target: &str,
     operation: &str,
 ) -> Vec<u8> {
-    // Invocation input is already the exact JSON argument array `[req.body]`.
-    // Keeping JSON encoding at the HTTP boundary means the guest never needs a
-    // JSON parser and cannot reinterpret or widen the capability request.
+    // Invocation input is raw JSON for req.body. The guest owns capability
+    // payload composition: it writes '[' + input + ']' and crosses the host ABI
+    // only after constructing the exact one-argument JSON envelope itself.
     let target = target.as_bytes();
     let operation = operation.as_bytes();
     let target_offset = 0usize;
     let operation_offset = target_offset + target.len();
     let payload_offset = (operation_offset + operation.len() + 15) & !15usize;
+    let input_offset = payload_offset + 1;
     let response_offset = (payload_offset + CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES + 15) & !15usize;
     let memory_bytes = response_offset + CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES;
 
@@ -1022,10 +1022,20 @@ fn encode_input_capability_call_module(
     run.instructions()
         .call(0)
         .local_set(0)
-        .i32_const(payload_offset as i32)
+        .i32_const(input_offset as i32)
         .local_get(0)
         .call(1)
         .drop()
+        // Store the closing ']' immediately after the dynamic input bytes.
+        .i32_const(input_offset as i32)
+        .local_get(0)
+        .i32_add()
+        .i32_const(b']' as i32)
+        .i32_store8(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        })
         .i32_const(kind.abi_code())
         .i32_const(target_offset as i32)
         .i32_const(target.len() as i32)
@@ -1033,6 +1043,8 @@ fn encode_input_capability_call_module(
         .i32_const(operation.len() as i32)
         .i32_const(payload_offset as i32)
         .local_get(0)
+        .i32_const(2)
+        .i32_add()
         .call(2)
         .drop()
         .call(3)
@@ -1061,6 +1073,7 @@ fn encode_input_capability_call_module(
         &ConstExpr::i32_const(operation_offset as i32),
         operation.iter().copied(),
     );
+    data.active(0, &ConstExpr::i32_const(payload_offset as i32), *b"[");
 
     let mut module = Module::new();
     module
@@ -1890,7 +1903,7 @@ mod tests {
         else {
             panic!("dynamic req.body Storage wrapper should compile natively");
         };
-        assert_eq!(artifact.input, RouteWasmInput::JsonBodyCapabilityArgument);
+        assert_eq!(artifact.input, RouteWasmInput::JsonBodyCapabilityValue);
         wasmparser::validate(&artifact.bytes).unwrap();
 
         let host: CapabilityHost = Box::new(|request| {
@@ -1907,12 +1920,50 @@ mod tests {
             .unwrap()
             .execute_with_input_and_capabilities(
                 &artifact.bytes,
-                br#"["users/kate.json"]"#,
+                br#""users/kate.json""#,
                 ExecutionLimits::default(),
                 Some(host),
             )
             .unwrap();
         assert_eq!(result.output, br#"{"found":true,"dataHex":"6f6b"}"#);
+    }
+
+    #[test]
+    fn dynamic_object_body_is_wrapped_into_capability_payload_inside_guest() {
+        let module = parse_module(
+            r#":import[storage.commit as commitEntry]
+               export function save(value) { return commitEntry(value); }"#,
+        );
+        let links = link_module_function("save", "accounts.cache", &module, "save");
+        let route = parse(
+            r#":import["./module/accounts/cache".save]
+               class Route { post(req) { return save(req.body); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("raw dynamic body should compile through guest payload construction");
+        };
+        assert_eq!(artifact.input, RouteWasmInput::JsonBodyCapabilityValue);
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Storage);
+            assert_eq!(request.target, "storage:accounts.cache");
+            assert_eq!(request.operation, "commit");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!([{ "id": "kate", "active": true }])
+            );
+            Ok(br#"{"ok":true}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                br#"{"id":"kate","active":true}"#,
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"ok":true}"#);
     }
 
     #[test]
