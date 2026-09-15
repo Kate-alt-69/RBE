@@ -97,7 +97,6 @@ struct ProviderResource {
 }
 
 struct LocalHistory {
-    root: PathBuf,
     commits: PathBuf,
     head: PathBuf,
 }
@@ -113,7 +112,6 @@ impl LocalHistory {
         fs::create_dir_all(&commits)?;
         Ok(Self {
             head: root.join("HEAD.json"),
-            root,
             commits,
         })
     }
@@ -910,12 +908,12 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
 }
 
 fn now_ms() -> anyhow::Result<u64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| anyhow::anyhow!("system clock is before UNIX epoch"))?
         .as_millis()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("system clock exceeds Cloud Node timestamp range"))?)
+        .map_err(|_| anyhow::anyhow!("system clock exceeds Cloud Node timestamp range"))
 }
 
 #[cfg(test)]
