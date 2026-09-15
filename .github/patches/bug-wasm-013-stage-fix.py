@@ -2,19 +2,15 @@ from pathlib import Path
 
 path = Path(".github/patches/bug-wasm-013.py")
 text = path.read_text()
-old = '''text = replace_once(
-    text,
-    '                br#"[\\\\"users/kate.json\\\\"]"#,.decode()' if False else '                br#"[\\\\"users/kate.json\\\\"]"#,',
-    '                br#"\\\\"users/kate.json\\\\""#,',
-    "dynamic capability raw body executor input",
-)'''
-new = '''text = replace_once(
-    text,
-    r''' + "'''" + '''                br#"["users/kate.json"]"#,''' + "'''" + ''',
-    r''' + "'''" + '''                br#""users/kate.json""#,''' + "'''" + ''',
-    "dynamic capability raw body executor input",
-)'''
-count = text.count(old)
-if count != 1:
-    raise SystemExit(f"BUG-WASM-013 raw-string staging anchor expected once, found {count}")
-path.write_text(text.replace(old, new, 1))
+label = '    "dynamic capability raw body executor input",'
+pos = text.find(label)
+if pos < 0:
+    raise SystemExit("BUG-WASM-013 raw-body staging label missing")
+start = text.rfind("text = replace_once(", 0, pos)
+if start < 0:
+    raise SystemExit("BUG-WASM-013 raw-body replace block start missing")
+end = text.find("\n)\n", pos)
+if end < 0:
+    raise SystemExit("BUG-WASM-013 raw-body replace block end missing")
+end += len("\n)\n")
+path.write_text(text[:start] + text[end:])
