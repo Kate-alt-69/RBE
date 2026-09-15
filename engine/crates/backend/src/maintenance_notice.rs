@@ -357,15 +357,39 @@ async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Re
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    let mut advertised_header = local_header;
+    let local_integrity_ok = if remote_header == local_header {
+        match runtime.store.verify() {
+            Ok(objects) => {
+                tracing::debug!(
+                    objects,
+                    "Cloud Node equal-root snapshot passed integrity verification"
+                );
+                true
+            }
+            Err(error) => {
+                advertised_header.root_sha256[0] ^= 0x80;
+                tracing::warn!(
+                    peer = %session.node_id,
+                    error = %error,
+                    "Cloud Node local snapshot failed integrity verification; forcing full recovery"
+                );
+                false
+            }
+        }
+    } else {
+        true
+    };
+    let roots_match = remote_header == local_header && local_integrity_ok;
 
-    if remote_header == local_header {
+    if roots_match {
         if let Err(error) = signal_boot_recovery_complete(runtime, local_header) {
             tracing::error!(error = %error, "Cloud Node could not signal completed boot recovery");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     }
 
-    if remote_header != local_header {
+    if !roots_match {
         let mut recoveries = match runtime.recoveries.lock() {
             Ok(recoveries) => recoveries,
             Err(_) => {
@@ -409,14 +433,16 @@ async fn cloud_node_sync(State(state): State<Arc<MaintenanceState>>, request: Re
         peer = %session.node_id,
         remote_root = %hex::encode(remote_header.root_sha256),
         local_root = %hex::encode(local_header.root_sha256),
-        roots_match = remote_header.root_sha256 == local_header.root_sha256,
+        advertised_root = %hex::encode(advertised_header.root_sha256),
+        local_integrity_ok,
+        roots_match,
         "authenticated Cloud Node sync negotiation completed"
     );
 
     let response = Frame {
         kind: FrameKind::SyncHello,
         session: session.session,
-        payload: local_header.encode(),
+        payload: advertised_header.encode(),
     };
     encode_cloud_node_response(response, "sync negotiation")
 }

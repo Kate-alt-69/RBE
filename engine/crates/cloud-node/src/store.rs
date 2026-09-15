@@ -206,30 +206,157 @@ impl CloudNodeStore {
             if object_hex.len() != 64 || !object_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 anyhow::bail!("invalid Cloud Node storage object directory {object_hex:?}");
             }
+
+            let mut current = None;
             for kind in [BlobKind::Folder, BlobKind::Video, BlobKind::File] {
                 let path = entry.path().join(kind.manifest_name());
                 if !path.is_file() {
                     continue;
                 }
-                let manifest = BlobManifest::decode(&fs::read(&path)?)?;
-                if manifest.kind != kind || hex::encode(manifest.object_key) != object_hex {
+                if current.is_some() {
                     anyhow::bail!(
-                        "Cloud Node manifest identity mismatch at {}",
-                        path.display()
+                        "Cloud Node object {} contains multiple current manifests",
+                        entry.path().display()
                     );
                 }
-                if kind != BlobKind::Folder {
+                current = Some((kind, path));
+            }
+            let Some((kind, path)) = current else {
+                anyhow::bail!(
+                    "Cloud Node object {} contains no current manifest",
+                    entry.path().display()
+                );
+            };
+
+            let manifest = BlobManifest::decode(&fs::read(&path)?)?;
+            if manifest.kind != kind || hex::encode(manifest.object_key) != object_hex {
+                anyhow::bail!(
+                    "Cloud Node manifest identity mismatch at {}",
+                    path.display()
+                );
+            }
+            let normalized = normalize_logical_path(&manifest.logical_path)?;
+            if normalized != manifest.logical_path
+                || object_key(kind, &manifest.logical_path) != manifest.object_key
+            {
+                anyhow::bail!(
+                    "Cloud Node manifest path identity is not canonical at {}",
+                    path.display()
+                );
+            }
+
+            match &manifest.body {
+                BlobBody::File { changes } => {
+                    for change in changes {
+                        change.offset.checked_add(change.old_len).ok_or_else(|| {
+                            anyhow::anyhow!("Cloud Node file change range overflow")
+                        })?;
+                    }
                     let payload = entry
                         .path()
                         .join("versions")
                         .join(hex::encode(manifest.content_sha256))
                         .join("payload");
-                    if sha256_file(&payload)? != manifest.content_sha256 {
-                        anyhow::bail!("Cloud Node payload hash mismatch at {}", payload.display());
+                    let metadata = fs::metadata(&payload)?;
+                    if metadata.len() != manifest.logical_size
+                        || sha256_file(&payload)? != manifest.content_sha256
+                    {
+                        anyhow::bail!(
+                            "Cloud Node file payload integrity mismatch at {}",
+                            payload.display()
+                        );
                     }
                 }
-                verified = verified.saturating_add(1);
+                BlobBody::Video {
+                    chunk_bytes,
+                    chunks,
+                } => {
+                    if *chunk_bytes == 0 && !chunks.is_empty() {
+                        anyhow::bail!("Cloud Node video manifest uses zero-sized chunks");
+                    }
+                    let mut expected_offset = 0u64;
+                    for chunk in chunks {
+                        if chunk.offset != expected_offset
+                            || chunk.len == 0
+                            || chunk.len > *chunk_bytes
+                        {
+                            anyhow::bail!("Cloud Node video manifest chunk layout is invalid");
+                        }
+                        let chunk_path = entry
+                            .path()
+                            .join("chunks")
+                            .join(format!("{}.chunk", hex::encode(chunk.sha256)));
+                        let metadata = fs::metadata(&chunk_path)?;
+                        if metadata.len() != u64::from(chunk.len)
+                            || sha256_file(&chunk_path)? != chunk.sha256
+                        {
+                            anyhow::bail!(
+                                "Cloud Node video chunk integrity mismatch at {}",
+                                chunk_path.display()
+                            );
+                        }
+                        expected_offset = expected_offset
+                            .checked_add(u64::from(chunk.len))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Cloud Node video chunk range overflow")
+                            })?;
+                    }
+                    if expected_offset != manifest.logical_size {
+                        anyhow::bail!(
+                            "Cloud Node video manifest size does not match its chunk layout"
+                        );
+                    }
+                    let payload = entry
+                        .path()
+                        .join("versions")
+                        .join(hex::encode(manifest.content_sha256))
+                        .join("payload");
+                    let metadata = fs::metadata(&payload)?;
+                    if metadata.len() != manifest.logical_size
+                        || sha256_file(&payload)? != manifest.content_sha256
+                    {
+                        anyhow::bail!(
+                            "Cloud Node video payload integrity mismatch at {}",
+                            payload.display()
+                        );
+                    }
+                }
+                BlobBody::Folder { entries } => {
+                    let mut previous: Option<&str> = None;
+                    let mut logical_size = 0u64;
+                    for folder_entry in entries {
+                        let normalized = normalize_logical_path(&folder_entry.path)?;
+                        if normalized != folder_entry.path
+                            || object_key(folder_entry.kind, &folder_entry.path)
+                                != folder_entry.object_key
+                        {
+                            anyhow::bail!("Cloud Node folder entry identity is not canonical");
+                        }
+                        if folder_entry.kind == BlobKind::Folder
+                            && (folder_entry.content_sha256 != [0u8; 32] || folder_entry.size != 0)
+                        {
+                            anyhow::bail!("Cloud Node folder entry directory metadata is invalid");
+                        }
+                        if previous.is_some_and(|value| value >= folder_entry.path.as_str()) {
+                            anyhow::bail!(
+                                "Cloud Node folder manifest entries are not strictly ordered"
+                            );
+                        }
+                        previous = Some(&folder_entry.path);
+                        logical_size =
+                            logical_size.checked_add(folder_entry.size).ok_or_else(|| {
+                                anyhow::anyhow!("Cloud Node folder logical size overflow")
+                            })?;
+                    }
+                    if logical_size != manifest.logical_size {
+                        anyhow::bail!("Cloud Node folder logical size does not match its entries");
+                    }
+                    if folder_digest(entries) != manifest.content_sha256 {
+                        anyhow::bail!("Cloud Node folder manifest content hash mismatch");
+                    }
+                }
             }
+            verified = verified.saturating_add(1);
         }
         Ok(verified)
     }
@@ -745,6 +872,52 @@ mod tests {
             panic!("expected video blob");
         };
         assert_eq!(chunks.len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_corrupted_video_chunk_even_with_intact_payload() {
+        let root = test_root("video-corruption");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("clip.mp4");
+        fs::write(&source, vec![7u8; 1024 * 1024 + 31]).unwrap();
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+        let stored = store.store_video(&source, "video/clip.mp4").unwrap();
+        let manifest = BlobManifest::decode(&fs::read(&stored.manifest).unwrap()).unwrap();
+        let BlobBody::Video { chunks, .. } = manifest.body else {
+            panic!("expected video blob");
+        };
+        let first = chunks.first().expect("video should have chunks");
+        let chunk_path = store
+            .summary()
+            .storage
+            .join(&stored.object_key)
+            .join("chunks")
+            .join(format!("{}.chunk", hex::encode(first.sha256)));
+        let mut bytes = fs::read(&chunk_path).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(&chunk_path, bytes).unwrap();
+        assert!(store.verify().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_inconsistent_folder_manifest_metadata() {
+        let root = test_root("folder-corruption");
+        fs::create_dir_all(&root).unwrap();
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("a.txt"), b"folder bytes").unwrap();
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+        let stored = store.snapshot_folder(&tree, "root").unwrap();
+        let mut manifest = BlobManifest::decode(&fs::read(&stored.manifest).unwrap()).unwrap();
+        let BlobBody::Folder { entries } = &mut manifest.body else {
+            panic!("expected folder blob");
+        };
+        entries[0].size = entries[0].size.saturating_add(1);
+        manifest.logical_size = manifest.logical_size.saturating_add(1);
+        fs::write(&stored.manifest, manifest.encode().unwrap()).unwrap();
+        assert!(store.verify().is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

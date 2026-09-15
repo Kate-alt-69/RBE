@@ -511,12 +511,19 @@ fn validate_manifest(manifest: &BlobManifest) -> anyhow::Result<()> {
         }
         BlobBody::Folder { entries } => {
             let mut previous: Option<&str> = None;
+            let mut logical_size = 0u64;
             for entry in entries {
                 validate_folder_entry(entry)?;
                 if previous.is_some_and(|path| path >= entry.path.as_str()) {
                     anyhow::bail!("Cloud Node folder manifest entries are not strictly ordered");
                 }
                 previous = Some(&entry.path);
+                logical_size = logical_size
+                    .checked_add(entry.size)
+                    .ok_or_else(|| anyhow::anyhow!("Cloud Node folder logical size overflow"))?;
+            }
+            if logical_size != manifest.logical_size {
+                anyhow::bail!("Cloud Node folder logical size does not match its entries");
             }
             if folder_digest(entries) != manifest.content_sha256 {
                 anyhow::bail!("Cloud Node folder manifest content hash mismatch");
