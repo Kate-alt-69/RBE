@@ -1,0 +1,472 @@
+name: One-shot Cloud Node provider reconcile
+
+on:
+  push:
+    branches:
+      - work/cloud-node-providers-latest
+
+permissions:
+  contents: write
+
+jobs:
+  reconcile:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Reconcile provider code
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
+
+          config_path = Path("engine/crates/cloud-node/src/config.rs")
+          config = config_path.read_text()
+
+          old_namespace = '''fn validate_namespace(value: &str) -> anyhow::Result<()> {
+              if value.is_empty()
+                  || value.len() > 128
+                  || !value
+                      .bytes()
+                      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+              {
+                  anyhow::bail!(
+                      "Cloud Node provider namespace must use 1..=128 ASCII [A-Za-z0-9_.-] characters"
+                  );
+              }
+              Ok(())
+          }
+          '''
+          new_namespace = '''fn validate_namespace(value: &str) -> anyhow::Result<()> {
+              if value.is_empty()
+                  || value.len() > 128
+                  || matches!(value, "." | "..")
+                  || !value
+                      .bytes()
+                      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+              {
+                  anyhow::bail!(
+                      "Cloud Node provider namespace must use 1..=128 ASCII [A-Za-z0-9_.-] characters and cannot be . or .."
+                  );
+              }
+              Ok(())
+          }
+          '''
+          config = replace_once(config, old_namespace, new_namespace, "provider namespace hardening")
+
+          old_node = '''fn validate_node_id(value: &str) -> anyhow::Result<()> {
+              if value.is_empty()
+                  || value.len() > 128
+                  || !value
+                      .bytes()
+                      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+              {
+                  anyhow::bail!("Cloud Node id must use 1..=128 ASCII [A-Za-z0-9_.-] characters");
+              }
+              Ok(())
+          }
+          '''
+          new_node = '''fn validate_node_id(value: &str) -> anyhow::Result<()> {
+              if value.is_empty()
+                  || value.len() > 128
+                  || matches!(value, "." | "..")
+                  || !value
+                      .bytes()
+                      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+              {
+                  anyhow::bail!(
+                      "Cloud Node id must use 1..=128 ASCII [A-Za-z0-9_.-] characters and cannot be . or .."
+                  );
+              }
+              Ok(())
+          }
+          '''
+          config = replace_once(config, old_node, new_node, "node id hardening")
+
+          old_peer = '''fn validate_peer_url(value: &str) -> anyhow::Result<()> {
+              let secure = value.starts_with("https://") || value.starts_with("wss://");
+              let local_dev = value.starts_with("http://127.0.0.1")
+                  || value.starts_with("http://localhost")
+                  || value.starts_with("ws://127.0.0.1")
+                  || value.starts_with("ws://localhost");
+              if !secure && !local_dev {
+                  anyhow::bail!("Cloud Node peer URL must use TLS outside localhost development");
+              }
+              Ok(())
+          }
+          '''
+          new_peer = '''fn validate_peer_url(value: &str) -> anyhow::Result<()> {
+              let parsed = url::Url::parse(value)
+                  .map_err(|error| anyhow::anyhow!("invalid Cloud Node peer URL: {error}"))?;
+              let host = parsed
+                  .host()
+                  .ok_or_else(|| anyhow::anyhow!("Cloud Node peer URL must include a host"))?;
+
+              if !parsed.username().is_empty() || parsed.password().is_some() {
+                  anyhow::bail!("Cloud Node peer URL cannot embed credentials");
+              }
+              if parsed.query().is_some() || parsed.fragment().is_some() {
+                  anyhow::bail!("Cloud Node peer URL cannot include a query or fragment");
+              }
+
+              match parsed.scheme() {
+                  "https" => Ok(()),
+                  "http" => {
+                      let loopback = match host {
+                          url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+                          url::Host::Ipv4(address) => address.is_loopback(),
+                          url::Host::Ipv6(address) => address.is_loopback(),
+                      };
+                      if !loopback {
+                          anyhow::bail!(
+                              "Cloud Node peer URL must use HTTPS outside exact loopback development hosts"
+                          );
+                      }
+                      Ok(())
+                  }
+                  "ws" | "wss" => anyhow::bail!(
+                      "Cloud Node RBE-CN/1 currently uses HTTP POST transport; ws/wss peer URLs are not supported"
+                  ),
+                  scheme => anyhow::bail!(
+                      "Cloud Node peer URL uses unsupported scheme {scheme:?}; expected https or loopback http"
+                  ),
+              }
+          }
+          '''
+          config = replace_once(config, old_peer, new_peer, "peer URL hardening")
+
+          old_endpoint = '''fn validate_provider_endpoint(value: &str) -> anyhow::Result<()> {
+              let secure = value.starts_with("https://");
+              let local_dev = value.starts_with("http://127.0.0.1") || value.starts_with("http://localhost");
+              if !secure && !local_dev {
+                  anyhow::bail!("Cloud Node provider endpoint must use HTTPS outside localhost development");
+              }
+              Ok(())
+          }
+          '''
+          new_endpoint = '''fn validate_provider_endpoint(value: &str) -> anyhow::Result<()> {
+              let parsed = url::Url::parse(value)
+                  .map_err(|error| anyhow::anyhow!("invalid Cloud Node provider endpoint: {error}"))?;
+              let host = parsed
+                  .host()
+                  .ok_or_else(|| anyhow::anyhow!("Cloud Node provider endpoint must include a host"))?;
+
+              if !parsed.username().is_empty() || parsed.password().is_some() {
+                  anyhow::bail!("Cloud Node provider endpoint cannot embed credentials");
+              }
+              if parsed.query().is_some() || parsed.fragment().is_some() {
+                  anyhow::bail!("Cloud Node provider endpoint cannot include a query or fragment");
+              }
+
+              match parsed.scheme() {
+                  "https" => Ok(()),
+                  "http" => {
+                      let loopback = match host {
+                          url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+                          url::Host::Ipv4(address) => address.is_loopback(),
+                          url::Host::Ipv6(address) => address.is_loopback(),
+                      };
+                      if !loopback {
+                          anyhow::bail!(
+                              "Cloud Node provider endpoint must use HTTPS outside exact loopback development hosts"
+                          );
+                      }
+                      Ok(())
+                  }
+                  scheme => anyhow::bail!(
+                      "Cloud Node provider endpoint uses unsupported scheme {scheme:?}; expected https or loopback http"
+                  ),
+              }
+          }
+          '''
+          config = replace_once(config, old_endpoint, new_endpoint, "provider endpoint hardening")
+
+          test_anchor = '''    #[test]
+              fn defaults_backup_history_to_five() {
+          '''
+          extra_tests = '''    #[test]
+              fn node_ids_and_provider_namespaces_reject_filesystem_aliases() {
+                  assert!(validate_node_id(".").is_err());
+                  assert!(validate_node_id("..").is_err());
+                  assert!(validate_namespace(".").is_err());
+                  assert!(validate_namespace("..").is_err());
+                  validate_node_id("nas.main-1").unwrap();
+                  validate_namespace("prod.main-1").unwrap();
+              }
+
+              #[test]
+              fn peer_url_plaintext_requires_an_exact_loopback_host() {
+                  validate_peer_url("http://localhost:8080/base").unwrap();
+                  validate_peer_url("http://127.0.0.1:8080").unwrap();
+                  validate_peer_url("http://127.12.34.56:8080").unwrap();
+                  validate_peer_url("http://[::1]:8080").unwrap();
+                  validate_peer_url("https://cloud.example.test").unwrap();
+
+                  assert!(validate_peer_url("http://localhost.evil.example").is_err());
+                  assert!(validate_peer_url("http://127.0.0.1.evil.example").is_err());
+                  assert!(validate_peer_url("http://192.168.1.10:8080").is_err());
+              }
+
+              #[test]
+              fn peer_url_matches_the_implemented_http_transport() {
+                  assert!(validate_peer_url("ws://localhost:8080").is_err());
+                  assert!(validate_peer_url("wss://cloud.example.test").is_err());
+                  assert!(validate_peer_url("ftp://cloud.example.test").is_err());
+                  assert!(validate_peer_url("https://user:pass@cloud.example.test").is_err());
+                  assert!(validate_peer_url("https://cloud.example.test?token=nope").is_err());
+                  assert!(validate_peer_url("https://cloud.example.test/#fragment").is_err());
+              }
+
+              #[test]
+              fn provider_endpoint_uses_parsed_exact_loopback_rules() {
+                  validate_provider_endpoint("http://localhost:9000/api").unwrap();
+                  validate_provider_endpoint("http://127.0.0.1:9000").unwrap();
+                  validate_provider_endpoint("http://[::1]:9000").unwrap();
+                  validate_provider_endpoint("https://storage.example.test/base").unwrap();
+
+                  assert!(validate_provider_endpoint("http://localhost.evil.example").is_err());
+                  assert!(validate_provider_endpoint("http://192.168.1.10:9000").is_err());
+                  assert!(validate_provider_endpoint("https://user:pass@storage.example.test").is_err());
+                  assert!(validate_provider_endpoint("https://storage.example.test?token=nope").is_err());
+              }
+
+          '''
+          config = replace_once(config, test_anchor, extra_tests + test_anchor, "config hardening tests")
+          config_path.write_text(config)
+
+          sync_path = Path("engine/crates/cloud-node/src/provider_sync.rs")
+          sync = sync_path.read_text()
+          sync = replace_once(sync, "use crate::random_session_and_nonce;\n", "", "remove obsolete random recovery session")
+          sync = replace_once(
+              sync,
+              "const MAX_HISTORY_DEPTH: usize = 100_000;\n",
+              "const MAX_HISTORY_DEPTH: usize = 100_000;\nconst PROVIDER_RECOVERY_OWNER_PREFIX: &str = \"provider.\";\n",
+              "provider recovery owner constant",
+          )
+
+          marker = "pub async fn synchronize_provider("
+          pos = sync.index(marker)
+          head, tail = sync[:pos], sync[pos:]
+          tail = replace_once(
+              tail,
+              "    let client = ProviderClient::new(provider)?;\n    let plan = store.sync_plan()?;\n",
+              "    let client = ProviderClient::new(provider)?;\n    let recovery_owner = provider_recovery_owner(&provider.namespace);\n    let plan = store.sync_plan()?;\n",
+              "stable provider recovery owner",
+          )
+          sync = head + tail
+
+          sync = sync.replace(
+              "pull_provider_state(&client, &history, store, remote_head).await?;",
+              "pull_provider_state(&client, &history, store, remote_head, &recovery_owner).await?;",
+          )
+          sync = sync.replace(
+              "pull_provider_state(&client, &history, store, &remote).await?;",
+              "pull_provider_state(&client, &history, store, &remote, &recovery_owner).await?;",
+          )
+          sync = replace_once(
+              sync,
+              "push_provider_state(&client, &history, &plan, &local_head, None).await?;",
+              "push_provider_state(&client, &history, &plan, &local_head, remote.as_ref()).await?;",
+              "forced push expected remote head",
+          )
+
+          sync = replace_once(
+              sync,
+              '''async fn push_provider_state(
+              client: &ProviderClient,
+              history: &LocalHistory,
+              plan: &SyncPlan,
+              local_head: &HistoryCommit,
+              remote_head: Option<&HistoryCommit>,
+          ) -> anyhow::Result<()> {
+              upload_snapshot(client, plan).await?;
+              let commits =
+                  history.chain_to_ancestor(&local_head.id, remote_head.map(|commit| commit.id.as_str()))?;
+              for commit in commits {
+                  upload_commit(client, &commit).await?;
+              }
+              upload_head(client, local_head).await
+          }
+          ''',
+              '''async fn push_provider_state(
+              client: &ProviderClient,
+              history: &LocalHistory,
+              plan: &SyncPlan,
+              local_head: &HistoryCommit,
+              expected_remote: Option<&HistoryCommit>,
+          ) -> anyhow::Result<()> {
+              upload_snapshot(client, plan).await?;
+              let commits = history.chain_to_ancestor(
+                  &local_head.id,
+                  expected_remote.map(|commit| commit.id.as_str()),
+              )?;
+              for commit in commits {
+                  upload_commit(client, &commit).await?;
+              }
+
+              let current_remote = remote_head(client).await?;
+              let expected_id = expected_remote.map(|commit| commit.id.as_str());
+              let current_id = current_remote.as_ref().map(|commit| commit.id.as_str());
+              if current_id != expected_id {
+                  anyhow::bail!(
+                      "Cloud Node provider HEAD changed during push: expected {} but found {}; retry synchronization",
+                      expected_id.unwrap_or("<empty>"),
+                      current_id.unwrap_or("<empty>")
+                  );
+              }
+              upload_head(client, local_head).await
+          }
+          ''',
+              "provider HEAD race guard",
+          )
+
+          sync = replace_once(
+              sync,
+              '''async fn pull_provider_state(
+              client: &ProviderClient,
+              history: &LocalHistory,
+              store: &CloudNodeStore,
+              remote_head: &HistoryCommit,
+          ) -> anyhow::Result<()> {
+              restore_snapshot(client, store, &remote_head.snapshot_root).await?;
+              import_remote_history(history, client, remote_head).await
+          }
+          ''',
+              '''async fn pull_provider_state(
+              client: &ProviderClient,
+              history: &LocalHistory,
+              store: &CloudNodeStore,
+              remote_head: &HistoryCommit,
+              recovery_owner: &str,
+          ) -> anyhow::Result<()> {
+              restore_snapshot(client, store, &remote_head.snapshot_root, recovery_owner).await?;
+              import_remote_history(history, client, remote_head).await
+          }
+          ''',
+              "provider pull recovery owner",
+          )
+
+          sync = replace_once(
+              sync,
+              '''async fn restore_snapshot(
+              client: &ProviderClient,
+              store: &CloudNodeStore,
+              root: &str,
+          ) -> anyhow::Result<()> {
+          ''',
+              '''async fn restore_snapshot(
+              client: &ProviderClient,
+              store: &CloudNodeStore,
+              root: &str,
+              recovery_owner: &str,
+          ) -> anyhow::Result<()> {
+          ''',
+              "restore snapshot recovery owner parameter",
+          )
+          sync = replace_once(
+              sync,
+              '''    let (session, _) = random_session_and_nonce();
+              let mut receiver = CloudNodeRecoveryReceiver::open(store, session)?;
+          ''',
+              '''    let mut receiver = CloudNodeRecoveryReceiver::open(store, recovery_owner, expected)?;
+          ''',
+              "crash-resumable provider receiver open",
+          )
+
+          old_loop = '''    let mut offset = 0usize;
+              while offset < bytes.len() {
+                  let end = offset
+                      .saturating_add(MAX_TRANSFER_DATA_BYTES)
+                      .min(bytes.len());
+                  let chunk = TransferChunk::new(
+                      kind,
+                      transfer_resource,
+                      object_key,
+                      content_sha,
+                      resource_sha,
+                      u64::try_from(offset)
+                          .map_err(|_| anyhow::anyhow!("provider resource offset exceeds u64"))?,
+                      total_size,
+                      bytes[offset..end].to_vec(),
+                  )?;
+                  receiver.accept_chunk(&chunk)?;
+                  offset = end;
+              }
+          '''
+          new_loop = '''    let mut offset = 0usize;
+              while offset < bytes.len() {
+                  let end = offset
+                      .saturating_add(MAX_TRANSFER_DATA_BYTES)
+                      .min(bytes.len());
+                  let chunk = TransferChunk::new(
+                      kind,
+                      transfer_resource,
+                      object_key,
+                      content_sha,
+                      resource_sha,
+                      u64::try_from(offset)
+                          .map_err(|_| anyhow::anyhow!("provider resource offset exceeds u64"))?,
+                      total_size,
+                      bytes[offset..end].to_vec(),
+                  )?;
+                  let receipt = receiver.accept_chunk(&chunk)?;
+                  let next = usize::try_from(receipt.next_offset).map_err(|_| {
+                      anyhow::anyhow!("provider recovery offset exceeds platform range")
+                  })?;
+                  if next <= offset || next > bytes.len() {
+                      anyhow::bail!(
+                          "Cloud Node provider recovery returned invalid resume offset {} for resource size {}",
+                          next,
+                          bytes.len()
+                      );
+                  }
+                  offset = next;
+              }
+          '''
+          sync = replace_once(sync, old_loop, new_loop, "provider resume offsets")
+
+          status_anchor = "async fn status_from_heads(\n"
+          owner_helper = '''fn provider_recovery_owner(namespace: &str) -> String {
+              format!("{PROVIDER_RECOVERY_OWNER_PREFIX}{namespace}")
+          }
+
+          '''
+          sync = replace_once(sync, status_anchor, owner_helper + status_anchor, "provider recovery owner helper")
+          sync_path.write_text(sync)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Check format
+        working-directory: engine
+        run: cargo fmt --all -- --check
+      - name: Cloud Node clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --locked -- -D warnings
+      - name: Cloud Node tests
+        working-directory: engine
+        run: cargo test -p cloud-node --locked
+      - name: Commit reconciled provider fixes
+        shell: bash
+        run: |
+          rm .github/workflows/one-shot-cloud-node-provider-reconcile.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "FIX | BUG-CN-PROV-006 resume provider recovery and harden provider config"
+          git push origin HEAD:work/cloud-node-providers-latest
