@@ -31,9 +31,9 @@ jobs:
           git merge --no-commit --no-ff origin/main
       - name: Remove one-shot helper
         run: rm -f .github/workflows/one-shot-cloud-node-provider-main-reconcile.yml
-      - name: Format check
+      - name: Format merged tree
         working-directory: engine
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all
       - name: Workspace Clippy
         working-directory: engine
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
