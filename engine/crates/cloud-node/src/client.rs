@@ -1,5 +1,5 @@
 use std::io::SeekFrom;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use crate::crypto::load_signing_key_from_env;
 use crate::format::BlobKind;
 use crate::protocol::{Frame, FrameKind};
 use crate::store::CloudNodeStore;
-use crate::sync::{SyncObject, SyncPlanHeader};
+use crate::sync::{SyncObject, SyncPlan, SyncPlanHeader};
 use crate::transfer::{
     TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES, RESUME_ACK_HEADER,
 };
@@ -126,25 +126,43 @@ pub async fn synchronize_upstream(
 ) -> anyhow::Result<SyncNegotiation> {
     let negotiation = negotiate_sync(settings, store, peer).await?;
     if negotiation.roots_match() {
+        // A matching REMOTE snapshot means any older interrupted LOCAL
+        // transport spool for this peer is no longer useful.
+        let _ = cleanup_outbound_cache(store, &peer.node_id).await;
         return Ok(negotiation);
     }
 
+    // Never freeze or transmit a LOCAL snapshot whose underlying blobs
+    // already fail Cloud Node integrity verification.
+    store.verify()?;
     let plan = store.sync_plan()?;
     let local = plan.header()?;
     if local != negotiation.local {
         anyhow::bail!("Cloud Node local snapshot changed after sync negotiation; retry required");
     }
 
+    // Freeze the complete transfer set before the first object is sent.
+    // Large resources are copied through disk-backed .part files rather
+    // than accumulated in RAM. A failed upload leaves this root intact,
+    // so a later daemon reconnect can reuse it byte-for-byte.
+    let cache_root = prepare_outbound_cache(store, &peer.node_id, &plan).await?;
+
     let client = http_client()?;
     for object in plan.ordered() {
-        let manifest_hash = sha256_path(&object.manifest_path).await?;
+        let cached_manifest = cached_resource_path(
+            &cache_root,
+            object,
+            TransferResource::Manifest,
+            &object.manifest_path,
+        )?;
+        let manifest_hash = sha256_path(&cached_manifest).await?;
         send_resource(
             &client,
             settings,
             peer,
             object,
             TransferResource::Manifest,
-            &object.manifest_path,
+            &cached_manifest,
             manifest_hash,
         )
         .await?;
@@ -153,14 +171,20 @@ pub async fn synchronize_upstream(
             BlobKind::Folder => {}
             BlobKind::Video => {
                 for chunk_path in &object.chunk_paths {
-                    let chunk_hash = sha256_path(chunk_path).await?;
+                    let cached_chunk = cached_resource_path(
+                        &cache_root,
+                        object,
+                        TransferResource::VideoChunk,
+                        chunk_path,
+                    )?;
+                    let chunk_hash = sha256_path(&cached_chunk).await?;
                     send_resource(
                         &client,
                         settings,
                         peer,
                         object,
                         TransferResource::VideoChunk,
-                        chunk_path,
+                        &cached_chunk,
                         chunk_hash,
                     )
                     .await?;
@@ -173,13 +197,19 @@ pub async fn synchronize_upstream(
                         object.logical_path
                     )
                 })?;
+                let cached_payload = cached_resource_path(
+                    &cache_root,
+                    object,
+                    TransferResource::FilePayload,
+                    payload,
+                )?;
                 send_resource(
                     &client,
                     settings,
                     peer,
                     object,
                     TransferResource::FilePayload,
-                    payload,
+                    &cached_payload,
                     object.content_sha256,
                 )
                 .await?;
@@ -213,7 +243,214 @@ pub async fn synchronize_upstream(
             hex::encode(remote.root_sha256)
         );
     }
+
+    // Only remove the durable spool after REMOTE proves the exact root
+    // was committed. Network/protocol failures return earlier and keep it.
+    cleanup_outbound_cache(store, &peer.node_id).await?;
     Ok(SyncNegotiation { local, remote })
+}
+
+async fn prepare_outbound_cache(
+    store: &CloudNodeStore,
+    peer_node_id: &str,
+    plan: &SyncPlan,
+) -> anyhow::Result<PathBuf> {
+    let header = plan.header()?;
+    let peer_root = outbound_peer_cache_root(store, peer_node_id);
+    tokio::fs::create_dir_all(&peer_root).await?;
+    let snapshot_name = hex::encode(header.root_sha256);
+    prune_outbound_cache_snapshots(&peer_root, &snapshot_name).await?;
+    let cache_root = peer_root.join(&snapshot_name);
+    tokio::fs::create_dir_all(&cache_root).await?;
+
+    for object in plan.ordered() {
+        let manifest_hash = sha256_path(&object.manifest_path).await?;
+        let manifest_target = cached_resource_path(
+            &cache_root,
+            object,
+            TransferResource::Manifest,
+            &object.manifest_path,
+        )?;
+        materialize_cached_resource(&object.manifest_path, &manifest_target, manifest_hash).await?;
+
+        match object.kind {
+            BlobKind::Folder => {}
+            BlobKind::Video => {
+                for chunk_path in &object.chunk_paths {
+                    let chunk_hash = sha256_path(chunk_path).await?;
+                    let chunk_target = cached_resource_path(
+                        &cache_root,
+                        object,
+                        TransferResource::VideoChunk,
+                        chunk_path,
+                    )?;
+                    materialize_cached_resource(chunk_path, &chunk_target, chunk_hash).await?;
+                }
+            }
+            BlobKind::File => {
+                let payload = object.payload_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cloud Node file {} is missing its generation payload",
+                        object.logical_path
+                    )
+                })?;
+                let payload_target = cached_resource_path(
+                    &cache_root,
+                    object,
+                    TransferResource::FilePayload,
+                    payload,
+                )?;
+                materialize_cached_resource(payload, &payload_target, object.content_sha256)
+                    .await?;
+            }
+        }
+    }
+
+    // Detect a LOCAL write racing the cache freeze. Partial cache bytes stay
+    // durable, but they are never marked ready or uploaded as a mixed root.
+    if store.sync_plan()?.header()? != header {
+        anyhow::bail!(
+            "Cloud Node local snapshot changed while preparing outbound cache; retry required"
+        );
+    }
+    write_cache_ready_marker(&cache_root, header).await?;
+    Ok(cache_root)
+}
+
+fn outbound_peer_cache_root(store: &CloudNodeStore, peer_node_id: &str) -> PathBuf {
+    store
+        .summary()
+        .root
+        .join(".cache")
+        .join("outbound")
+        .join(peer_node_id)
+}
+
+fn cached_resource_path(
+    cache_root: &Path,
+    object: &SyncObject,
+    resource: TransferResource,
+    source: &Path,
+) -> anyhow::Result<PathBuf> {
+    let object_root = cache_root.join(hex::encode(object.object_key));
+    match resource {
+        TransferResource::Manifest => Ok(object_root.join("manifest.blob.cn")),
+        TransferResource::FilePayload => Ok(object_root.join("payload")),
+        TransferResource::VideoChunk => {
+            let name = source.file_name().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cloud Node video chunk has no cacheable file name: {}",
+                    source.display()
+                )
+            })?;
+            Ok(object_root.join("chunks").join(name))
+        }
+    }
+}
+
+async fn materialize_cached_resource(
+    source: &Path,
+    target: &Path,
+    expected_sha256: [u8; 32],
+) -> anyhow::Result<()> {
+    let source_size = tokio::fs::metadata(source).await?.len();
+    if cached_file_matches(target, expected_sha256, source_size).await? {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    if target.exists() {
+        tokio::fs::remove_file(target).await?;
+    }
+
+    let part = cache_part_path(target)?;
+    if part.exists() {
+        tokio::fs::remove_file(&part).await?;
+    }
+    tokio::fs::copy(source, &part).await?;
+    tokio::fs::File::open(&part).await?.sync_all().await?;
+    if !cached_file_matches(&part, expected_sha256, source_size).await? {
+        let _ = tokio::fs::remove_file(&part).await;
+        anyhow::bail!(
+            "Cloud Node outbound cache copy failed integrity verification: {}",
+            source.display()
+        );
+    }
+    tokio::fs::rename(&part, target).await?;
+    Ok(())
+}
+
+async fn cached_file_matches(
+    path: &Path,
+    expected_sha256: [u8; 32],
+    expected_size: u64,
+) -> anyhow::Result<bool> {
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.len() != expected_size {
+        return Ok(false);
+    }
+    Ok(sha256_path(path).await? == expected_sha256)
+}
+
+fn cache_part_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node cache target has no file name: {}",
+                path.display()
+            )
+        })?
+        .to_string_lossy();
+    Ok(path.with_file_name(format!("{name}.part.{}", std::process::id())))
+}
+
+async fn write_cache_ready_marker(cache_root: &Path, header: SyncPlanHeader) -> anyhow::Result<()> {
+    let target = cache_root.join(".ready");
+    let part = cache_part_path(&target)?;
+    if part.exists() {
+        tokio::fs::remove_file(&part).await?;
+    }
+    tokio::fs::write(&part, header.encode()).await?;
+    tokio::fs::File::open(&part).await?.sync_all().await?;
+    if target.exists() {
+        tokio::fs::remove_file(&target).await?;
+    }
+    tokio::fs::rename(part, target).await?;
+    Ok(())
+}
+
+async fn prune_outbound_cache_snapshots(
+    peer_root: &Path,
+    keep_snapshot: &str,
+) -> anyhow::Result<()> {
+    let mut entries = tokio::fs::read_dir(peer_root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_name().to_string_lossy() == keep_snapshot {
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        if file_type.is_dir() {
+            tokio::fs::remove_dir_all(entry.path()).await?;
+        } else {
+            tokio::fs::remove_file(entry.path()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_outbound_cache(store: &CloudNodeStore, peer_node_id: &str) -> anyhow::Result<()> {
+    let root = outbound_peer_cache_root(store, peer_node_id);
+    match tokio::fs::remove_dir_all(root).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn send_resource(
@@ -419,6 +656,74 @@ fn now_ms() -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rbe-cloud-node-client-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn cache_test_settings(root: &Path) -> CloudNodeSettings {
+        serde_json::from_value(serde_json::json!({
+            "node": {
+                "id": "local-test",
+                "storageRoot": root,
+                "backupVersions": 5,
+                "preserveOriginal": true,
+                "videoChunkBytes": 1048576
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn outbound_cache_freezes_snapshot_and_uses_part_commit() {
+        let root = cache_test_root("outbound-cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("users.db");
+        std::fs::write(&source, b"snapshot-one").unwrap();
+        let store = CloudNodeStore::open(&cache_test_settings(&root)).unwrap();
+        store.store_file(&source, "db/users.db").unwrap();
+        let plan = store.sync_plan().unwrap();
+        let cache_root = prepare_outbound_cache(&store, "remote-test", &plan)
+            .await
+            .unwrap();
+        assert!(cache_root.starts_with(store.summary().root.join(".cache/outbound")));
+        assert!(cache_root.join(".ready").is_file());
+
+        let object = plan.files.first().unwrap();
+        let live_payload = object.payload_path.as_deref().unwrap();
+        let cached_payload = cached_resource_path(
+            &cache_root,
+            object,
+            TransferResource::FilePayload,
+            live_payload,
+        )
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(&cached_payload).await.unwrap(),
+            b"snapshot-one"
+        );
+        assert!(!cache_part_path(&cached_payload).unwrap().exists());
+
+        // A later LOCAL revision must not mutate the frozen bytes that a
+        // reconnect is supposed to resume sending.
+        std::fs::write(&source, b"snapshot-two").unwrap();
+        store.store_file(&source, "db/users.db").unwrap();
+        assert_eq!(
+            tokio::fs::read(&cached_payload).await.unwrap(),
+            b"snapshot-one"
+        );
+
+        cleanup_outbound_cache(&store, "remote-test").await.unwrap();
+        assert!(!outbound_peer_cache_root(&store, "remote-test").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn resume_ack_accepts_old_server_and_forward_progress() {
