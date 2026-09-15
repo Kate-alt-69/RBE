@@ -249,6 +249,24 @@ impl LocalHistory {
     }
 }
 
+fn working_snapshot_relation(
+    history: &LocalHistory,
+    local_head: &HistoryCommit,
+    remote: Option<&HistoryCommit>,
+    local_root: &str,
+) -> anyhow::Result<ProviderSyncRelation> {
+    let Some(remote) = remote else {
+        return Ok(ProviderSyncRelation::EmptyRemote);
+    };
+    if remote.snapshot_root == local_root {
+        return Ok(ProviderSyncRelation::InSync);
+    }
+    if remote.id == local_head.id || history.is_ancestor(&remote.id, &local_head.id)? {
+        return Ok(ProviderSyncRelation::LocalAhead);
+    }
+    Ok(ProviderSyncRelation::Diverged)
+}
+
 pub async fn provider_status(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
@@ -263,35 +281,37 @@ pub async fn provider_status(
     let history = LocalHistory::open(store, &provider.namespace)?;
     let remote = remote_head(&client).await?;
     let existing_head = history.head()?;
-    if let Some(remote_head) = remote.as_ref() {
-        if should_adopt_matching_remote_history(existing_head.as_ref(), &local_root, remote_head) {
-            import_remote_history(&history, &client, remote_head).await?;
-            return Ok(ProviderSyncStatus {
-                relation: ProviderSyncRelation::InSync,
-                local_head: remote_head.id.clone(),
-                remote_head: Some(remote_head.id.clone()),
-                local_root,
-                remote_root: Some(remote_head.snapshot_root.clone()),
-            });
-        }
+
+    let Some(local_head) = existing_head else {
+        let relation = match remote.as_ref() {
+            None => ProviderSyncRelation::EmptyRemote,
+            Some(remote_head) if remote_head.snapshot_root == local_root => {
+                ProviderSyncRelation::InSync
+            }
+            Some(_) if plan.object_count() == 0 => ProviderSyncRelation::RemoteAhead,
+            Some(_) => ProviderSyncRelation::Diverged,
+        };
+        return Ok(ProviderSyncStatus {
+            relation,
+            local_head: "<untracked>".to_owned(),
+            remote_head: remote.as_ref().map(|head| head.id.clone()),
+            local_root,
+            remote_root: remote.as_ref().map(|head| head.snapshot_root.clone()),
+        });
+    };
+
+    if local_head.snapshot_root != local_root {
+        let relation =
+            working_snapshot_relation(&history, &local_head, remote.as_ref(), &local_root)?;
+        return Ok(ProviderSyncStatus {
+            relation,
+            local_head: local_head.id,
+            remote_head: remote.as_ref().map(|head| head.id.clone()),
+            local_root,
+            remote_root: remote.as_ref().map(|head| head.snapshot_root.clone()),
+        });
     }
-    if existing_head.is_none() {
-        if let Some(remote_head) = remote.as_ref() {
-            let relation = if plan.object_count() == 0 {
-                ProviderSyncRelation::RemoteAhead
-            } else {
-                ProviderSyncRelation::Diverged
-            };
-            return Ok(ProviderSyncStatus {
-                relation,
-                local_head: "<untracked>".to_owned(),
-                remote_head: Some(remote_head.id.clone()),
-                local_root,
-                remote_root: Some(remote_head.snapshot_root.clone()),
-            });
-        }
-    }
-    let local_head = history.ensure_snapshot_commit(&settings.node.id, &local_root)?;
+
     status_from_heads(&history, &client, local_head, remote, local_root).await
 }
 
@@ -1208,6 +1228,37 @@ mod tests {
         assert!(!first.contains('/'));
         assert!(!first.contains('\\'));
         assert!(!first.contains(".."));
+    }
+
+    #[test]
+    fn working_snapshot_status_does_not_advance_local_history() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"node-a","storageRoot":root},
+            "provider":{
+                "kind":"google-cloud-storage",
+                "namespace":"prod",
+                "bucket":"rbe"
+            }
+        }))
+        .unwrap();
+        let store = CloudNodeStore::open(&settings).unwrap();
+        let history = LocalHistory::open(&store, "prod").unwrap();
+        let remote = history
+            .ensure_snapshot_commit("node-a", &"11".repeat(32))
+            .unwrap();
+        let local = history
+            .ensure_snapshot_commit("node-a", &"22".repeat(32))
+            .unwrap();
+        let head_before = fs::read(&history.head).unwrap();
+
+        let relation =
+            working_snapshot_relation(&history, &local, Some(&remote), &"33".repeat(32)).unwrap();
+
+        assert_eq!(relation, ProviderSyncRelation::LocalAhead);
+        assert_eq!(fs::read(&history.head).unwrap(), head_before);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
