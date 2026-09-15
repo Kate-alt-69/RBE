@@ -35,8 +35,9 @@ pub const TRANSFER_PATH: &str = "/.rbe/cn/v1/transfer";
 #[cfg(not(feature = "client"))]
 pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 pub use config::{
-    CloudNodeSettings, NodeMode, NodeSettings, ProviderConflictPolicy, ProviderKind,
-    ProviderSettings, ReplicationSettings, ReplicationTarget, UpstreamSettings, SETTINGS_FILE_NAME,
+    CloudNodeSettings, NodeMode, NodeSettings, ProviderAuthMode, ProviderAuthSettings,
+    ProviderConflictPolicy, ProviderKind, ProviderSettings, ReplicationSettings,
+    ReplicationTarget, UpstreamSettings, SETTINGS_FILE_NAME,
 };
 pub use crypto::{
     load_signing_key_from_env, public_key_hex, sign_challenge, verify_challenge,
@@ -50,8 +51,8 @@ pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
 pub use provider::ProviderClient;
 #[cfg(feature = "client")]
 pub use provider_sync::{
-    provider_status, synchronize_provider, ProviderSyncAction, ProviderSyncRelation,
-    ProviderSyncResult, ProviderSyncStatus,
+    inspect_provider_sync, synchronize_provider, ProviderSyncAction, ProviderSyncInspection,
+    ProviderSyncRelation, ProviderSyncResult,
 };
 pub use recovery::{CloudNodeRecoveryReceiver, RecoveryReceipt};
 pub use server::{
