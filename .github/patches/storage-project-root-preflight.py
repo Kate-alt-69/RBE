@@ -27,6 +27,20 @@ if text.count(old) != 1:
     raise SystemExit(f'expected resolve_existing anchor once, found {text.count(old)}')
 text = text.replace(old, new, 1)
 
+# Rust compile findings: AtomicIo has no Debug implementation (nor does this
+# manager need one), and list() only needs the validated relative path.
+old = '''#[derive(Debug)]\npub struct ProjectStorageManager {'''
+new = '''pub struct ProjectStorageManager {'''
+if text.count(old) != 1:
+    raise SystemExit(f'expected ProjectStorageManager Debug derive once, found {text.count(old)}')
+text = text.replace(old, new, 1)
+
+old = '''        let (relative, target) = project_relative(raw_path, true)?;'''
+new = '''        let (relative, _) = project_relative(raw_path, true)?;'''
+if text.count(old) != 1:
+    raise SystemExit(f'expected storage.list relative-path binding once, found {text.count(old)}')
+text = text.replace(old, new, 1)
+
 # The two supervised Controller replacement call sites have different outer
 # indentation. Replace the brittle exact-block matcher in the staging patch
 # with a tiny regex that preserves each call site's own argument indentation.
