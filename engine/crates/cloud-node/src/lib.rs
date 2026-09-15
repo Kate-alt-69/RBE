@@ -10,6 +10,8 @@ mod config;
 mod crypto;
 mod format;
 mod protocol;
+#[cfg(feature = "client")]
+mod provider;
 mod recovery;
 mod server;
 mod store;
@@ -31,8 +33,8 @@ pub const TRANSFER_PATH: &str = "/.rbe/cn/v1/transfer";
 #[cfg(not(feature = "client"))]
 pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 pub use config::{
-    CloudNodeSettings, NodeMode, NodeSettings, ReplicationSettings, ReplicationTarget,
-    UpstreamSettings, SETTINGS_FILE_NAME,
+    CloudNodeSettings, NodeMode, NodeSettings, ProviderConflictPolicy, ProviderKind,
+    ProviderSettings, ReplicationSettings, ReplicationTarget, UpstreamSettings, SETTINGS_FILE_NAME,
 };
 pub use crypto::{
     load_signing_key_from_env, public_key_hex, sign_challenge, verify_challenge,
@@ -42,6 +44,8 @@ pub use format::{
     BlobKind, BlobManifest, ByteRangeChange, ChunkRef, FolderEntry, BLOB_FORMAT_VERSION,
 };
 pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
+#[cfg(feature = "client")]
+pub use provider::ProviderClient;
 pub use recovery::{CloudNodeRecoveryReceiver, RecoveryReceipt};
 pub use server::{
     AcceptedKnock, AuthenticatedSession, CloudNodeAuthenticator, DEFAULT_SESSION_TTL_MS,
