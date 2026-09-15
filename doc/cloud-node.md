@@ -38,7 +38,8 @@ Cloud Node reads `setting.node.cn.json`. Private keys never belong in this file.
     "publicKey": "<64 hex Ed25519 public key>",
     "autoReconnect": true,
     "syncOnConnect": true,
-    "reconnectDelayMs": 2000
+    "reconnectDelayMs": 2000,
+    "pollIntervalMs": 30000
   },
   "replication": {
     "requireBootRecovery": true,
@@ -108,6 +109,8 @@ The environment variable names can be overridden without putting their values in
 Provider endpoints must use HTTPS outside exact loopback development hosts. Embedded URL credentials, query strings, and fragments are rejected. Provider namespaces are also validated as safe local history components and cannot be `.` or `..`.
 
 Provider HTTP connections are also stall-bounded. `connectTimeoutMs` defaults to `10000` and bounds only connection establishment. `readTimeoutMs` defaults to `60000` and resets after each successful response read, so long streaming transfers can continue indefinitely while a provider that stops producing response data is eventually disconnected. Both values accept 250 through 300000 milliseconds. Cloud Node intentionally does not apply a total request deadline to provider uploads/downloads because that would incorrectly kill valid large transfers.
+
+Provider daemon success polling is intentionally separate from failure recovery. `reconnectDelayMs` remains the delay before retrying a failed provider operation, while `pollIntervalMs` controls the cadence after a successful sync/probe and defaults to `30000` milliseconds. It accepts 1000 through 3600000 milliseconds. This avoids turning the 2-second reconnect default into continuous healthy cloud API traffic.
 
 ### Amazon S3
 
