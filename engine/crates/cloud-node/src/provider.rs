@@ -1,11 +1,12 @@
 use std::io::Read;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{
-    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST,
-    RANGE,
+    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    ETAG, HOST, IF_MATCH, IF_NONE_MATCH, RANGE,
 };
+use reqwest::redirect::Policy;
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
@@ -34,10 +35,25 @@ pub struct ProviderClient {
     settings: ProviderSettings,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderObjectVersion {
+    Etag(String),
+    Generation(u64),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderMetadataObject {
+    pub bytes: Vec<u8>,
+    pub version: Option<ProviderObjectVersion>,
+}
+
 impl ProviderClient {
     pub fn new(settings: &ProviderSettings) -> anyhow::Result<Self> {
         let client = Client::builder()
             .https_only(false)
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_millis(settings.connect_timeout_ms))
+            .read_timeout(Duration::from_millis(settings.read_timeout_ms))
             .build()
             .map_err(|error| {
                 anyhow::anyhow!("failed to build Cloud Node provider client: {error}")
@@ -99,6 +115,16 @@ impl ProviderClient {
     }
 
     pub async fn get(&self, relative: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self
+            .get_versioned(relative)
+            .await?
+            .map(|object| object.bytes))
+    }
+
+    pub(crate) async fn get_versioned(
+        &self,
+        relative: &str,
+    ) -> anyhow::Result<Option<ProviderMetadataObject>> {
         let key = self.object_key(relative)?;
         let response = match self.settings.kind {
             ProviderKind::AmazonS3 => {
@@ -133,7 +159,11 @@ impl ProviderClient {
                 self.apply_http_auth(self.client.get(url))?.send().await?
             }
         };
-        response_bytes(response, "download", true).await
+        let version = provider_object_version(self.settings.kind, response.headers())?;
+        let Some(bytes) = response_bytes(response, "download", true).await? else {
+            return Ok(None);
+        };
+        Ok(Some(ProviderMetadataObject { bytes, version }))
     }
 
     pub(crate) async fn open_download(
@@ -258,6 +288,83 @@ impl ProviderClient {
         };
         response_bytes(response, "upload", false).await?;
         Ok(())
+    }
+
+    pub(crate) async fn put_if_unchanged(
+        &self,
+        relative: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+        expected_version: Option<&ProviderObjectVersion>,
+        expected_exists: bool,
+    ) -> anyhow::Result<bool> {
+        if !expected_exists && expected_version.is_some() {
+            anyhow::bail!("Cloud Node provider conditional write cannot expect a version for a missing object");
+        }
+        let key = self.object_key(relative)?;
+        let response = match self.settings.kind {
+            ProviderKind::AmazonS3 => {
+                if expected_exists
+                    && !matches!(expected_version, Some(ProviderObjectVersion::Etag(_)))
+                {
+                    anyhow::bail!("Cloud Node S3 provider omitted the ETag required for atomic HEAD publication");
+                }
+                let payload_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+                let content_length = u64::try_from(bytes.len())
+                    .map_err(|_| anyhow::anyhow!("Cloud Node S3 request body exceeds u64"))?;
+                self.aws_signed_request(
+                    Method::PUT,
+                    &key,
+                    Some(reqwest::Body::from(bytes)),
+                    payload_sha256,
+                    Some(content_type),
+                    None,
+                    Some(content_length),
+                    expected_version,
+                    !expected_exists,
+                )
+                .await?
+            }
+            ProviderKind::AzureBlob => {
+                let url = self.azure_url(&key)?;
+                let request = self
+                    .client
+                    .put(url)
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header(CONTENT_TYPE, content_type)
+                    .body(bytes);
+                apply_etag_precondition(request, expected_version, expected_exists)?
+                    .send()
+                    .await?
+            }
+            ProviderKind::GoogleCloudStorage => {
+                let url = self.gcs_url(&key)?;
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .oauth_token_env
+                        .as_deref()
+                        .or(self.settings.auth.bearer_token_env.as_deref())
+                        .or(self.settings.credential_env.as_deref()),
+                    GOOGLE_OAUTH_TOKEN_ENV,
+                )?;
+                let generation = gcs_generation_precondition(expected_version, expected_exists)?;
+                self.client
+                    .put(url)
+                    .bearer_auth(token)
+                    .header(CONTENT_TYPE, content_type)
+                    .header("x-goog-if-generation-match", generation)
+                    .body(bytes)
+                    .send()
+                    .await?
+            }
+            ProviderKind::Supabase | ProviderKind::Http => {
+                self.put(relative, bytes, content_type).await?;
+                return Ok(false);
+            }
+        };
+        conditional_write_response(response, expected_exists).await?;
+        Ok(true)
     }
 
     pub(crate) async fn put_file(
@@ -605,6 +712,8 @@ impl ProviderClient {
             content_type,
             range,
             content_length,
+            None,
+            false,
         )
         .await
     }
@@ -625,6 +734,8 @@ impl ProviderClient {
             Some(content_type),
             None,
             Some(content_length),
+            None,
+            false,
         )
         .await
     }
@@ -639,6 +750,8 @@ impl ProviderClient {
         content_type: Option<&str>,
         range: Option<&str>,
         content_length: Option<u64>,
+        expected_version: Option<&ProviderObjectVersion>,
+        require_absent: bool,
     ) -> anyhow::Result<reqwest::Response> {
         let region = self
             .settings
@@ -733,6 +846,19 @@ impl ProviderClient {
         if let Some(range) = range {
             request = request.header(RANGE, range);
         }
+        if require_absent {
+            if expected_version.is_some() {
+                anyhow::bail!(
+                    "Cloud Node S3 conditional write cannot require absent and match an ETag"
+                );
+            }
+            request = request.header(IF_NONE_MATCH, "*");
+        } else if let Some(version) = expected_version {
+            let ProviderObjectVersion::Etag(etag) = version else {
+                anyhow::bail!("Cloud Node S3 conditional write requires an ETag version");
+            };
+            request = request.header(IF_MATCH, etag);
+        }
         if let Some(body) = body {
             request = request.body(body);
         }
@@ -741,6 +867,97 @@ impl ProviderClient {
             .await
             .map_err(|error| anyhow::anyhow!("Cloud Node amazon-s3 request failed: {error}"))
     }
+}
+
+fn provider_object_version(
+    kind: ProviderKind,
+    headers: &HeaderMap,
+) -> anyhow::Result<Option<ProviderObjectVersion>> {
+    match kind {
+        ProviderKind::AmazonS3 | ProviderKind::AzureBlob => headers
+            .get(ETAG)
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(|value| ProviderObjectVersion::Etag(value.to_owned()))
+                    .map_err(|error| {
+                        anyhow::anyhow!("Cloud Node provider returned invalid ETag: {error}")
+                    })
+            })
+            .transpose(),
+        ProviderKind::GoogleCloudStorage => headers
+            .get("x-goog-generation")
+            .map(|value| {
+                let value = value.to_str().map_err(|error| {
+                    anyhow::anyhow!(
+                        "Cloud Node GCS provider returned invalid generation header: {error}"
+                    )
+                })?;
+                let generation = value.parse::<u64>().map_err(|error| {
+                    anyhow::anyhow!(
+                        "Cloud Node GCS provider returned invalid generation {value:?}: {error}"
+                    )
+                })?;
+                Ok(ProviderObjectVersion::Generation(generation))
+            })
+            .transpose(),
+        ProviderKind::Supabase | ProviderKind::Http => Ok(None),
+    }
+}
+
+fn apply_etag_precondition(
+    request: RequestBuilder,
+    expected_version: Option<&ProviderObjectVersion>,
+    expected_exists: bool,
+) -> anyhow::Result<RequestBuilder> {
+    match (expected_exists, expected_version) {
+        (false, None) => Ok(request.header(IF_NONE_MATCH, "*")),
+        (true, Some(ProviderObjectVersion::Etag(etag))) => Ok(request.header(IF_MATCH, etag)),
+        (true, None) => anyhow::bail!(
+            "Cloud Node provider omitted the ETag required for atomic HEAD publication"
+        ),
+        (_, Some(ProviderObjectVersion::Generation(_))) => {
+            anyhow::bail!("Cloud Node ETag conditional write received a generation version")
+        }
+        (false, Some(ProviderObjectVersion::Etag(_))) => anyhow::bail!(
+            "Cloud Node provider conditional write cannot match an ETag for a missing object"
+        ),
+    }
+}
+
+fn gcs_generation_precondition(
+    expected_version: Option<&ProviderObjectVersion>,
+    expected_exists: bool,
+) -> anyhow::Result<u64> {
+    match (expected_exists, expected_version) {
+        (false, None) => Ok(0),
+        (true, Some(ProviderObjectVersion::Generation(generation))) => Ok(*generation),
+        (true, None) => anyhow::bail!(
+            "Cloud Node GCS provider omitted the generation required for atomic HEAD publication"
+        ),
+        (_, Some(ProviderObjectVersion::Etag(_))) => {
+            anyhow::bail!("Cloud Node GCS conditional write received an ETag version")
+        }
+        (false, Some(ProviderObjectVersion::Generation(_))) => anyhow::bail!(
+            "Cloud Node GCS conditional write cannot match a generation for a missing object"
+        ),
+    }
+}
+
+async fn conditional_write_response(
+    response: reqwest::Response,
+    expected_exists: bool,
+) -> anyhow::Result<()> {
+    let status = response.status();
+    if status == StatusCode::PRECONDITION_FAILED
+        || status == StatusCode::CONFLICT
+        || (expected_exists && status == StatusCode::NOT_FOUND)
+    {
+        let error = provider_http_error(response, "conditional HEAD publish").await;
+        anyhow::bail!("Cloud Node provider HEAD changed during atomic publish; retry synchronization: {error}");
+    }
+    response_bytes(response, "conditional HEAD publish", false).await?;
+    Ok(())
 }
 
 async fn file_body(path: &Path) -> anyhow::Result<reqwest::Body> {
@@ -1185,6 +1402,52 @@ mod tests {
     #[test]
     fn credential_file_reference_requires_absolute_path() {
         assert!(resolve_secret_value("RBE_TEST_SECRET", "file:relative/token").is_err());
+    }
+
+    #[test]
+    fn provider_native_versions_parse_etags_and_gcs_generations() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ETAG, HeaderValue::from_static("\"etag-1\""));
+        assert_eq!(
+            provider_object_version(ProviderKind::AmazonS3, &headers).unwrap(),
+            Some(ProviderObjectVersion::Etag("\"etag-1\"".to_owned()))
+        );
+        headers.remove(ETAG);
+        headers.insert("x-goog-generation", HeaderValue::from_static("42"));
+        assert_eq!(
+            provider_object_version(ProviderKind::GoogleCloudStorage, &headers).unwrap(),
+            Some(ProviderObjectVersion::Generation(42))
+        );
+    }
+
+    #[test]
+    fn provider_native_preconditions_cover_create_and_replace() {
+        let request = apply_etag_precondition(
+            Client::new().put("https://example.invalid/object"),
+            None,
+            false,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(request.headers().get(IF_NONE_MATCH).unwrap(), "*");
+
+        let version = ProviderObjectVersion::Etag("\"etag-2\"".to_owned());
+        let request = apply_etag_precondition(
+            Client::new().put("https://example.invalid/object"),
+            Some(&version),
+            true,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(request.headers().get(IF_MATCH).unwrap(), "\"etag-2\"");
+        assert_eq!(gcs_generation_precondition(None, false).unwrap(), 0);
+        assert_eq!(
+            gcs_generation_precondition(Some(&ProviderObjectVersion::Generation(99)), true)
+                .unwrap(),
+            99
+        );
     }
 
     #[test]

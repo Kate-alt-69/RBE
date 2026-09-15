@@ -237,15 +237,22 @@ async fn run_provider_daemon(
             })
         };
 
-        if let Err(error) = result {
-            eprintln!("Cloud Node provider synchronization failed: {error}");
-            if !provider.auto_reconnect {
-                return Err(error);
+        let delay_ms = match result {
+            Err(error) => {
+                eprintln!("Cloud Node provider synchronization failed: {error}");
+                if !provider.auto_reconnect {
+                    return Err(error);
+                }
+                provider.reconnect_delay_ms
             }
-        } else if !provider.auto_reconnect {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(provider.reconnect_delay_ms)).await;
+            Ok(()) => {
+                if !provider.auto_reconnect {
+                    return Ok(());
+                }
+                provider.poll_interval_ms
+            }
+        };
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 

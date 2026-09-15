@@ -38,7 +38,8 @@ Cloud Node reads `setting.node.cn.json`. Private keys never belong in this file.
     "publicKey": "<64 hex Ed25519 public key>",
     "autoReconnect": true,
     "syncOnConnect": true,
-    "reconnectDelayMs": 2000
+    "reconnectDelayMs": 2000,
+    "pollIntervalMs": 30000
   },
   "replication": {
     "requireBootRecovery": true,
@@ -106,6 +107,10 @@ The environment variable names can be overridden without putting their values in
 ```
 
 Provider endpoints must use HTTPS outside exact loopback development hosts. Embedded URL credentials, query strings, and fragments are rejected. Provider namespaces are also validated as safe local history components and cannot be `.` or `..`.
+
+Provider HTTP connections are also stall-bounded. `connectTimeoutMs` defaults to `10000` and bounds only connection establishment. `readTimeoutMs` defaults to `60000` and resets after each successful response read, so long streaming transfers can continue indefinitely while a provider that stops producing response data is eventually disconnected. Both values accept 250 through 300000 milliseconds. Cloud Node intentionally does not apply a total request deadline to provider uploads/downloads because that would incorrectly kill valid large transfers.
+
+Provider daemon success polling is intentionally separate from failure recovery. `reconnectDelayMs` remains the delay before retrying a failed provider operation, while `pollIntervalMs` controls the cadence after a successful sync/probe and defaults to `30000` milliseconds. It accepts 1000 through 3600000 milliseconds. This avoids turning the 2-second reconnect default into continuous healthy cloud API traffic.
 
 ### Amazon S3
 
@@ -219,9 +224,13 @@ empty/untracked local + existing provider history -> adopt/pull provider history
 
 `conflictPolicy` defaults to `fail`. `prefer-local` explicitly permits a forced provider push and `prefer-remote` explicitly permits a forced provider pull. These policies are intentionally opt-in because silently selecting one side after divergence can destroy valid history.
 
-Before replacing the mutable provider HEAD, Cloud Node re-reads it and verifies that it still matches the remote head used when synchronization was planned. If another writer moved the head, the push fails and must be retried rather than blindly publishing stale history. This is an application-level race guard; it is not advertised as a provider-native atomic compare-and-swap primitive.
+Before replacing the mutable provider HEAD, Cloud Node re-reads it and verifies that it still matches the remote head used when synchronization was planned. Amazon S3 and Azure Blob then publish `HEAD.json` with ETag preconditions (`If-Match` for replacement and `If-None-Match: *` for first creation), while Google Cloud Storage uses the object's generation with `x-goog-if-generation-match` (generation `0` for first creation). Those providers therefore reject stale cross-machine writers atomically at the object store. Supabase Storage and the generic HTTP provider keep the application-level re-read guard because their configured object APIs do not expose a portable equivalent through this provider interface.
 
 Provider pulls reuse the same crash-resumable recovery machinery as authenticated peer recovery. Their staging identity is stable for the provider namespace and expected snapshot root. After process restart, already committed resources are detected and partial resources return their durable `next_offset`, allowing the provider downloader to continue from verified bytes instead of restarting the complete snapshot.
+
+Only one local `sync-provider` operation may mutate a provider namespace at a time. Cloud Node holds an OS-backed exclusive lock at `provider-history/<namespace>/.sync.lock` for the complete synchronization transaction. A second local process fails fast instead of racing history/cache state, and the operating system releases the lock automatically if the owning process exits or crashes.
+
+Provider HTTP clients do not automatically follow redirects. A 3xx response is treated as a provider error so API keys, Supabase `apikey` headers, custom authorization headers, signed S3 requests, and other provider credentials cannot be replayed to an unexpected redirect target. Configure the canonical storage endpoint directly.
 
 Provider mode removes the requirement for a second `cloud_node.exe` for remote object persistence, snapshot synchronization, and Cloud Node history. Object storage itself is not an arbitrary reverse network tunnel or relay. Provider-managed ingress/relay products can be integrated separately without conflating network tunneling with the persistence provider interface.
 
