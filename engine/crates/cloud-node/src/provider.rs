@@ -550,6 +550,24 @@ impl ProviderClient {
         )
     }
 
+    fn aws_url(&self, key: &str, region: &str) -> anyhow::Result<Url> {
+        if let Some(endpoint) = self.settings.endpoint.as_deref() {
+            return object_url(
+                endpoint,
+                &format!(
+                    "{}/{}",
+                    encode_path_segment(&self.settings.bucket),
+                    encode_object_key(key)
+                ),
+            );
+        }
+        let endpoint = format!(
+            "https://{}.s3.{}.amazonaws.com",
+            self.settings.bucket, region
+        );
+        object_url(&endpoint, &encode_object_key(key))
+    }
+
     async fn aws_request(
         &self,
         method: Method,
@@ -620,13 +638,7 @@ impl ProviderClient {
             .region
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("amazon-s3 provider region is missing"))?;
-        let endpoint = self.settings.endpoint.clone().unwrap_or_else(|| {
-            format!(
-                "https://{}.s3.{}.amazonaws.com",
-                self.settings.bucket, region
-            )
-        });
-        let url = object_url(&endpoint, &encode_object_key(key))?;
+        let url = self.aws_url(key, region)?;
         if url.query().is_some() {
             anyhow::bail!("Cloud Node amazon-s3 endpoint cannot contain a query string");
         }
@@ -961,6 +973,45 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_default_endpoint_uses_virtual_hosted_bucket() {
+        let settings: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"amazon-s3",
+            "namespace":"production",
+            "bucket":"rbe-bucket",
+            "region":"ap-south-1"
+        }))
+        .unwrap();
+        let client = ProviderClient::new(&settings).unwrap();
+        let url = client
+            .aws_url("rbe-cn/production/history/HEAD.json", "ap-south-1")
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://rbe-bucket.s3.ap-south-1.amazonaws.com/rbe-cn/production/history/HEAD.json"
+        );
+    }
+
+    #[test]
+    fn s3_custom_endpoint_uses_path_style_bucket() {
+        let settings: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"amazon-s3",
+            "namespace":"production",
+            "bucket":"rbe-bucket",
+            "region":"auto",
+            "endpoint":"https://objects.example.invalid"
+        }))
+        .unwrap();
+        let client = ProviderClient::new(&settings).unwrap();
+        let url = client
+            .aws_url("rbe-cn/production/history/HEAD.json", "auto")
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://objects.example.invalid/rbe-bucket/rbe-cn/production/history/HEAD.json"
+        );
+    }
 
     #[test]
     fn provider_object_keys_are_namespaced() {
