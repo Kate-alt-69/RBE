@@ -1,19 +1,23 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, HOST};
-use reqwest::{Client, Method, StatusCode, Url};
+use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use sha2::{Digest, Sha256};
 
-use crate::config::{ProviderKind, ProviderSettings};
+use crate::config::{ProviderAuthMode, ProviderKind, ProviderSettings};
 
 const AWS_SERVICE: &str = "s3";
-const AWS_ACCESS_KEY_ENV: &str = "AWS_ACCESS_KEY_ID";
-const AWS_SECRET_KEY_ENV: &str = "AWS_SECRET_ACCESS_KEY";
-const AWS_SESSION_TOKEN_ENV: &str = "AWS_SESSION_TOKEN";
-const SUPABASE_KEY_ENV: &str = "SUPABASE_SERVICE_ROLE_KEY";
-const AZURE_SAS_ENV: &str = "AZURE_STORAGE_SAS_TOKEN";
-const GCS_TOKEN_ENV: &str = "GOOGLE_OAUTH_ACCESS_TOKEN";
-const HTTP_BEARER_ENV: &str = "RBE_CN_PROVIDER_TOKEN";
+const AMAZON_ACCESS_KEY_ENV: &str = "RBE_CN_PROV_AMAZON_ACCESS_KEY";
+const AMAZON_SECRET_KEY_ENV: &str = "RBE_CN_PROV_AMAZON_SECRET_KEY";
+const AMAZON_SESSION_TOKEN_ENV: &str = "RBE_CN_PROV_AMAZON_SESSION_TOKEN";
+const SUPABASE_API_KEY_ENV: &str = "RBE_CN_PROV_SUPABASE_API_KEY";
+const AZURE_SAS_TOKEN_ENV: &str = "RBE_CN_PROV_AZURE_SAS_TOKEN";
+const GOOGLE_OAUTH_TOKEN_ENV: &str = "RBE_CN_PROV_GOOGLE_OAUTH_TOKEN";
+const HTTP_API_KEY_ENV: &str = "RBE_CN_PROV_HTTP_API_KEY";
+const HTTP_BEARER_TOKEN_ENV: &str = "RBE_CN_PROV_HTTP_BEARER_TOKEN";
+const HTTP_USERNAME_ENV: &str = "RBE_CN_PROV_HTTP_USERNAME";
+const HTTP_PASSWORD_ENV: &str = "RBE_CN_PROV_HTTP_PASSWORD";
+const HTTP_HEADER_VALUE_ENV: &str = "RBE_CN_PROV_HTTP_HEADER_VALUE";
 
 #[derive(Clone)]
 pub struct ProviderClient {
@@ -26,7 +30,9 @@ impl ProviderClient {
         let client = Client::builder()
             .https_only(false)
             .build()
-            .map_err(|error| anyhow::anyhow!("failed to build Cloud Node provider client: {error}"))?;
+            .map_err(|error| {
+                anyhow::anyhow!("failed to build Cloud Node provider client: {error}")
+            })?;
         Ok(Self {
             client,
             settings: settings.clone(),
@@ -62,30 +68,23 @@ impl ProviderClient {
 
     pub fn target_description(&self) -> String {
         match self.settings.kind {
-            ProviderKind::AmazonS3 => format!(
-                "s3://{}/{}",
-                self.settings.bucket,
-                self.settings.namespace
-            ),
+            ProviderKind::AmazonS3 => {
+                format!("s3://{}/{}", self.settings.bucket, self.settings.namespace)
+            }
             ProviderKind::Supabase => format!(
                 "supabase://{}/{}",
-                self.settings.bucket,
-                self.settings.namespace
+                self.settings.bucket, self.settings.namespace
             ),
             ProviderKind::AzureBlob => format!(
                 "azure://{}/{}",
-                self.settings.bucket,
-                self.settings.namespace
+                self.settings.bucket, self.settings.namespace
             ),
-            ProviderKind::GoogleCloudStorage => format!(
-                "gs://{}/{}",
-                self.settings.bucket,
-                self.settings.namespace
-            ),
+            ProviderKind::GoogleCloudStorage => {
+                format!("gs://{}/{}", self.settings.bucket, self.settings.namespace)
+            }
             ProviderKind::Http => format!(
                 "http-provider://{}/{}",
-                self.settings.bucket,
-                self.settings.namespace
+                self.settings.bucket, self.settings.namespace
             ),
         }
     }
@@ -93,14 +92,13 @@ impl ProviderClient {
     pub async fn get(&self, relative: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let key = self.object_key(relative)?;
         let response = match self.settings.kind {
-            ProviderKind::AmazonS3 => self.aws_request(Method::GET, &key, Vec::new(), None).await?,
+            ProviderKind::AmazonS3 => {
+                self.aws_request(Method::GET, &key, Vec::new(), None)
+                    .await?
+            }
             ProviderKind::Supabase => {
                 let url = self.supabase_url(&key)?;
-                let token = required_env(self.settings.credential_env.as_deref(), SUPABASE_KEY_ENV)?;
-                self.client
-                    .get(url)
-                    .header("apikey", token.as_str())
-                    .bearer_auth(token)
+                self.apply_supabase_auth(self.client.get(url))?
                     .send()
                     .await?
             }
@@ -110,16 +108,20 @@ impl ProviderClient {
             }
             ProviderKind::GoogleCloudStorage => {
                 let url = self.gcs_url(&key)?;
-                let token = required_env(self.settings.credential_env.as_deref(), GCS_TOKEN_ENV)?;
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .oauth_token_env
+                        .as_deref()
+                        .or(self.settings.auth.bearer_token_env.as_deref())
+                        .or(self.settings.credential_env.as_deref()),
+                    GOOGLE_OAUTH_TOKEN_ENV,
+                )?;
                 self.client.get(url).bearer_auth(token).send().await?
             }
             ProviderKind::Http => {
                 let url = self.http_url(&key)?;
-                let mut request = self.client.get(url);
-                if let Some(token) = optional_env(self.settings.credential_env.as_deref(), HTTP_BEARER_ENV)? {
-                    request = request.bearer_auth(token);
-                }
-                request.send().await?
+                self.apply_http_auth(self.client.get(url))?.send().await?
             }
         };
         response_bytes(response, "download", true).await
@@ -139,16 +141,15 @@ impl ProviderClient {
             }
             ProviderKind::Supabase => {
                 let url = self.supabase_url(&key)?;
-                let token = required_env(self.settings.credential_env.as_deref(), SUPABASE_KEY_ENV)?;
-                self.client
-                    .put(url)
-                    .header("apikey", token.as_str())
-                    .bearer_auth(token)
-                    .header("x-upsert", "true")
-                    .header(CONTENT_TYPE, content_type)
-                    .body(bytes)
-                    .send()
-                    .await?
+                self.apply_supabase_auth(
+                    self.client
+                        .put(url)
+                        .header("x-upsert", "true")
+                        .header(CONTENT_TYPE, content_type)
+                        .body(bytes),
+                )?
+                .send()
+                .await?
             }
             ProviderKind::AzureBlob => {
                 let url = self.azure_url(&key)?;
@@ -162,7 +163,15 @@ impl ProviderClient {
             }
             ProviderKind::GoogleCloudStorage => {
                 let url = self.gcs_url(&key)?;
-                let token = required_env(self.settings.credential_env.as_deref(), GCS_TOKEN_ENV)?;
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .oauth_token_env
+                        .as_deref()
+                        .or(self.settings.auth.bearer_token_env.as_deref())
+                        .or(self.settings.credential_env.as_deref()),
+                    GOOGLE_OAUTH_TOKEN_ENV,
+                )?;
                 self.client
                     .put(url)
                     .bearer_auth(token)
@@ -173,15 +182,14 @@ impl ProviderClient {
             }
             ProviderKind::Http => {
                 let url = self.http_url(&key)?;
-                let mut request = self
-                    .client
-                    .put(url)
-                    .header(CONTENT_TYPE, content_type)
-                    .body(bytes);
-                if let Some(token) = optional_env(self.settings.credential_env.as_deref(), HTTP_BEARER_ENV)? {
-                    request = request.bearer_auth(token);
-                }
-                request.send().await?
+                self.apply_http_auth(
+                    self.client
+                        .put(url)
+                        .header(CONTENT_TYPE, content_type)
+                        .body(bytes),
+                )?
+                .send()
+                .await?
             }
         };
         response_bytes(response, "upload", false).await?;
@@ -196,14 +204,121 @@ impl ProviderClient {
         );
         self.put(probe_key, payload.into_bytes(), "application/json")
             .await?;
-        let downloaded = self
-            .get(probe_key)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Cloud Node provider probe object disappeared after upload"))?;
+        let downloaded = self.get(probe_key).await?.ok_or_else(|| {
+            anyhow::anyhow!("Cloud Node provider probe object disappeared after upload")
+        })?;
         if downloaded.is_empty() {
             anyhow::bail!("Cloud Node provider probe returned an empty object");
         }
         Ok(())
+    }
+
+    fn apply_supabase_auth(&self, request: RequestBuilder) -> anyhow::Result<RequestBuilder> {
+        match self.settings.auth.mode {
+            ProviderAuthMode::Auto | ProviderAuthMode::ApiKey => {
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .api_key_env
+                        .as_deref()
+                        .or(self.settings.credential_env.as_deref()),
+                    SUPABASE_API_KEY_ENV,
+                )?;
+                Ok(request
+                    .header("apikey", token.as_str())
+                    .bearer_auth(token))
+            }
+            ProviderAuthMode::Bearer => {
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .bearer_token_env
+                        .as_deref()
+                        .or(self.settings.credential_env.as_deref()),
+                    SUPABASE_API_KEY_ENV,
+                )?;
+                Ok(request.bearer_auth(token))
+            }
+            ProviderAuthMode::Header => self.apply_custom_header(request),
+            other => anyhow::bail!("unsupported Supabase provider auth mode {other:?}"),
+        }
+    }
+
+    fn apply_http_auth(&self, request: RequestBuilder) -> anyhow::Result<RequestBuilder> {
+        match self.settings.auth.mode {
+            ProviderAuthMode::Auto => {
+                let token = optional_env(
+                    self.settings
+                        .auth
+                        .bearer_token_env
+                        .as_deref()
+                        .or(self.settings.credential_env.as_deref()),
+                    HTTP_BEARER_TOKEN_ENV,
+                )?;
+                Ok(match token {
+                    Some(token) => request.bearer_auth(token),
+                    None => request,
+                })
+            }
+            ProviderAuthMode::None => Ok(request),
+            ProviderAuthMode::ApiKey => {
+                let token = required_env(
+                    self.settings.auth.api_key_env.as_deref(),
+                    HTTP_API_KEY_ENV,
+                )?;
+                let header_name = self
+                    .settings
+                    .auth
+                    .header_name
+                    .as_deref()
+                    .unwrap_or("x-api-key");
+                add_header(request, header_name, &token)
+            }
+            ProviderAuthMode::Bearer | ProviderAuthMode::OAuthBearer => {
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .bearer_token_env
+                        .as_deref()
+                        .or(self.settings.auth.oauth_token_env.as_deref()),
+                    HTTP_BEARER_TOKEN_ENV,
+                )?;
+                Ok(request.bearer_auth(token))
+            }
+            ProviderAuthMode::Basic => {
+                let username = required_env(
+                    self.settings.auth.username_env.as_deref(),
+                    HTTP_USERNAME_ENV,
+                )?;
+                let password = required_env(
+                    self.settings.auth.password_env.as_deref(),
+                    HTTP_PASSWORD_ENV,
+                )?;
+                Ok(request.basic_auth(username, Some(password)))
+            }
+            ProviderAuthMode::Header => self.apply_custom_header(request),
+            ProviderAuthMode::AwsSigV4 | ProviderAuthMode::AzureSas => {
+                anyhow::bail!("generic HTTP provider cannot use cloud-specific auth mode")
+            }
+        }
+    }
+
+    fn apply_custom_header(&self, request: RequestBuilder) -> anyhow::Result<RequestBuilder> {
+        let header_name = self
+            .settings
+            .auth
+            .header_name
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Cloud Node provider header auth requires headerName"))?;
+        let value = required_env(
+            self.settings
+                .auth
+                .header_value_env
+                .as_deref()
+                .or(self.settings.credential_env.as_deref()),
+            HTTP_HEADER_VALUE_ENV,
+        )?;
+        add_header(request, header_name, &value)
     }
 
     fn supabase_url(&self, key: &str) -> anyhow::Result<Url> {
@@ -241,7 +356,14 @@ impl ProviderClient {
                 encode_object_key(key)
             ),
         )?;
-        let sas = required_env(self.settings.credential_env.as_deref(), AZURE_SAS_ENV)?;
+        let sas = required_env(
+            self.settings
+                .auth
+                .sas_token_env
+                .as_deref()
+                .or(self.settings.credential_env.as_deref()),
+            AZURE_SAS_TOKEN_ENV,
+        )?;
         let sas = sas.trim_start_matches('?');
         if sas.is_empty() {
             anyhow::bail!("Cloud Node Azure SAS token is empty");
@@ -304,20 +426,41 @@ impl ProviderClient {
         if url.query().is_some() {
             anyhow::bail!("Cloud Node amazon-s3 endpoint cannot contain a query string");
         }
-        let access_key = required_env(self.settings.access_key_env.as_deref(), AWS_ACCESS_KEY_ENV)?;
-        let secret_key = required_env(self.settings.secret_key_env.as_deref(), AWS_SECRET_KEY_ENV)?;
+        let access_key = required_env(
+            self.settings
+                .auth
+                .access_key_env
+                .as_deref()
+                .or(self.settings.access_key_env.as_deref()),
+            AMAZON_ACCESS_KEY_ENV,
+        )?;
+        let secret_key = required_env(
+            self.settings
+                .auth
+                .secret_key_env
+                .as_deref()
+                .or(self.settings.secret_key_env.as_deref()),
+            AMAZON_SECRET_KEY_ENV,
+        )?;
         let session_token = optional_env(
-            self.settings.session_token_env.as_deref(),
-            AWS_SESSION_TOKEN_ENV,
+            self.settings
+                .auth
+                .session_token_env
+                .as_deref()
+                .or(self.settings.session_token_env.as_deref()),
+            AMAZON_SESSION_TOKEN_ENV,
         )?;
         let (short_date, amz_date) = aws_timestamp(SystemTime::now())?;
         let payload_hash = hex::encode(Sha256::digest(&body));
         let host = host_header(&url)?;
-        let canonical_uri = if url.path().is_empty() { "/" } else { url.path() };
+        let canonical_uri = if url.path().is_empty() {
+            "/"
+        } else {
+            url.path()
+        };
 
-        let mut canonical_headers = format!(
-            "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-        );
+        let mut canonical_headers =
+            format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
         let mut signed_headers = "host;x-amz-content-sha256;x-amz-date".to_owned();
         if let Some(token) = &session_token {
             canonical_headers.push_str(&format!("x-amz-security-token:{}\n", token.trim()));
@@ -336,7 +479,10 @@ impl ProviderClient {
             "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
             hex::encode(Sha256::digest(canonical_request.as_bytes()))
         );
-        let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), short_date.as_bytes());
+        let k_date = hmac_sha256(
+            format!("AWS4{secret_key}").as_bytes(),
+            short_date.as_bytes(),
+        );
         let k_region = hmac_sha256(&k_date, region.as_bytes());
         let k_service = hmac_sha256(&k_region, AWS_SERVICE.as_bytes());
         let k_signing = hmac_sha256(&k_service, b"aws4_request");
@@ -389,10 +535,19 @@ async fn response_bytes(
     }
 }
 
+fn add_header(request: RequestBuilder, name: &str, value: &str) -> anyhow::Result<RequestBuilder> {
+    let name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|error| anyhow::anyhow!("invalid Cloud Node provider auth header name: {error}"))?;
+    let value = HeaderValue::from_str(value)
+        .map_err(|error| anyhow::anyhow!("invalid Cloud Node provider auth header value: {error}"))?;
+    Ok(request.header(name, value))
+}
+
 fn required_env(configured: Option<&str>, default_name: &str) -> anyhow::Result<String> {
     let name = configured.unwrap_or(default_name);
-    let value = std::env::var(name)
-        .map_err(|_| anyhow::anyhow!("Cloud Node provider credential environment {name} is not set"))?;
+    let value = std::env::var(name).map_err(|_| {
+        anyhow::anyhow!("Cloud Node provider credential environment {name} is not set")
+    })?;
     if value.trim().is_empty() {
         anyhow::bail!("Cloud Node provider credential environment {name} is empty");
     }
