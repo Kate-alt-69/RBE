@@ -1,0 +1,52 @@
+name: One-shot RELC static helper lowering
+
+"on":
+  push:
+    branches:
+      - work/relc-wasm-runtime
+    paths:
+      - '.github/workflows/one-shot-relc-static-helpers.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Compile pure local REL helpers into native WASM
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/patches/bug-wasm-007.py
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test -p route-engine request_independent_local_helpers_fold_into_native_wasm --locked
+          cargo test -p route-engine request_dependent_local_helper_stays_interpreter_fallback --locked
+          cargo test -p route-engine recursive_static_helper_fails_closed_at_compiler_depth_limit --locked
+          cargo test -p route-engine wasm_compiler --locked
+          cargo clippy -p route-engine --all-targets --locked -- -D warnings
+          cd ..
+
+          rm -f .github/patches/bug-wasm-007.py
+          rm -f .github/workflows/one-shot-relc-static-helpers.yml
+          git add -A
+          git diff --cached --check
+          git commit -m 'FIX | BUG-WASM-007 compile pure local REL helpers to native WASM'
+          git pull --rebase origin work/relc-wasm-runtime
+          git push origin HEAD:work/relc-wasm-runtime
