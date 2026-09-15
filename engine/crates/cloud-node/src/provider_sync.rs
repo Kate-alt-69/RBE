@@ -12,7 +12,7 @@ use tokio::io::AsyncReadExt;
 use crate::client::{cached_resource_path, cleanup_outbound_cache, prepare_outbound_cache};
 use crate::config::{CloudNodeSettings, ProviderConflictPolicy};
 use crate::format::BlobKind;
-use crate::provider::ProviderClient;
+use crate::provider::{ProviderClient, ProviderObjectVersion};
 use crate::recovery::CloudNodeRecoveryReceiver;
 use crate::store::CloudNodeStore;
 use crate::sync::{SyncPlan, SyncPlanHeader};
@@ -57,6 +57,11 @@ pub struct ProviderSyncResult {
     pub before: ProviderSyncStatus,
     pub final_root: String,
     pub final_head: String,
+}
+
+struct RemoteHeadState {
+    commit: HistoryCommit,
+    version: Option<ProviderObjectVersion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -568,9 +573,11 @@ async fn push_provider_state(
         upload_commit(client, &commit).await?;
     }
 
-    let current_remote = remote_head(client).await?;
+    let current_remote = remote_head_state(client).await?;
     let expected_id = expected_remote.map(|commit| commit.id.as_str());
-    let current_id = current_remote.as_ref().map(|commit| commit.id.as_str());
+    let current_id = current_remote
+        .as_ref()
+        .map(|state| state.commit.id.as_str());
     if current_id != expected_id {
         anyhow::bail!(
             "Cloud Node provider HEAD changed during push: expected {} but found {}; retry synchronization",
@@ -578,7 +585,15 @@ async fn push_provider_state(
             current_id.unwrap_or("<empty>")
         );
     }
-    upload_head(client, local_head).await?;
+    upload_head(
+        client,
+        local_head,
+        current_remote
+            .as_ref()
+            .and_then(|state| state.version.as_ref()),
+        current_remote.is_some(),
+    )
+    .await?;
     cleanup_outbound_cache(store, &cache_owner).await
 }
 
@@ -660,20 +675,27 @@ async fn remote_is_ancestor(
 }
 
 async fn remote_head(client: &ProviderClient) -> anyhow::Result<Option<HistoryCommit>> {
-    let Some(bytes) = client.get("history/HEAD.json").await? else {
+    Ok(remote_head_state(client).await?.map(|state| state.commit))
+}
+
+async fn remote_head_state(client: &ProviderClient) -> anyhow::Result<Option<RemoteHeadState>> {
+    let Some(object) = client.get_versioned("history/HEAD.json").await? else {
         return Ok(None);
     };
-    let pointer: HeadPointer = serde_json::from_slice(&bytes)?;
+    let pointer: HeadPointer = serde_json::from_slice(&object.bytes)?;
     validate_head_pointer(&pointer)?;
-    fetch_remote_commit(client, &pointer.commit)
+    let commit = fetch_remote_commit(client, &pointer.commit)
         .await?
-        .map(Some)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Cloud Node provider HEAD references missing commit {}",
                 pointer.commit
             )
-        })
+        })?;
+    Ok(Some(RemoteHeadState {
+        commit,
+        version: object.version,
+    }))
 }
 
 async fn fetch_remote_commit(
@@ -703,18 +725,26 @@ async fn upload_commit(client: &ProviderClient, commit: &HistoryCommit) -> anyho
         .await
 }
 
-async fn upload_head(client: &ProviderClient, commit: &HistoryCommit) -> anyhow::Result<()> {
+async fn upload_head(
+    client: &ProviderClient,
+    commit: &HistoryCommit,
+    expected_version: Option<&ProviderObjectVersion>,
+    expected_exists: bool,
+) -> anyhow::Result<()> {
     let pointer = HeadPointer {
         format_version: HISTORY_VERSION,
         commit: commit.id.clone(),
     };
     client
-        .put(
+        .put_if_unchanged(
             "history/HEAD.json",
             serde_json::to_vec(&pointer)?,
             "application/json",
+            expected_version,
+            expected_exists,
         )
         .await
+        .map(|_| ())
 }
 
 async fn upload_snapshot(
