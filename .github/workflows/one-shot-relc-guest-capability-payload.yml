@@ -1,0 +1,63 @@
+name: One-shot RELC guest capability payload
+
+"on":
+  push:
+    branches:
+      - work/relc-wasm-runtime
+    paths:
+      - '.github/workflows/one-shot-relc-guest-capability-payload.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-land:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Build dynamic capability payload inside Route-WASM
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/patches/bug-wasm-013-stage-fix.py
+          python3 .github/patches/bug-wasm-013.py
+          python3 .github/patches/bug-wasm-013-source-fix.py
+
+          cd engine
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test -p route-engine linked_module_storage_call_passes_dynamic_request_body_natively --locked
+          cargo test -p route-engine dynamic_object_body_is_wrapped_into_capability_payload_inside_guest --locked
+          cargo test -p route-engine --locked
+          cargo clippy -p route-engine --all-targets --locked -- -D warnings
+          cargo check --workspace --all-targets --locked
+          cd ..
+
+          rm -f .github/patches/bug-wasm-013.py
+          rm -f .github/patches/bug-wasm-013-stage-fix.py
+          rm -f .github/patches/bug-wasm-013-source-fix.py
+          rm -f .github/workflows/one-shot-relc-guest-capability-payload.yml
+          git add -A
+          git diff --cached --check
+          git commit -m 'FIX | BUG-WASM-013 build dynamic capability payloads inside Route-WASM'
+          git pull --rebase origin work/relc-wasm-runtime
+          for attempt in 1 2 3; do
+            if git push origin HEAD:work/relc-wasm-runtime; then
+              exit 0
+            fi
+            echo "push attempt ${attempt} failed; retrying..."
+            sleep $((attempt * 5))
+          done
+          exit 1
