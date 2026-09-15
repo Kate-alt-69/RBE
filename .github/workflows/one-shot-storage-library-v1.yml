@@ -23,7 +23,9 @@ jobs:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: engine
+          workspaces: |
+            engine
+            container-runtime
       - name: Add Container-owned typed Storage library
         shell: bash
         run: |
@@ -34,15 +36,21 @@ jobs:
           python3 .github/patches/storage-library-v1.py
           python3 .github/patches/storage-library-v1-fix.py
 
+          # RBE intentionally has separate Engine and Container Cargo workspaces.
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all
+          cargo fmt --manifest-path container-runtime/Cargo.toml --all -- --check
+          cargo test --manifest-path container-runtime/Cargo.toml -p container-runtime-core storage_library --locked
+          cargo test --manifest-path container-runtime/Cargo.toml -p container-runtime-core storage_capability --locked
+          cargo test --manifest-path container-runtime/Cargo.toml -p container-runtime-core --locked
+          cargo clippy --manifest-path container-runtime/Cargo.toml -p container-runtime-core --all-targets --locked -- -D warnings
+          cargo check --manifest-path container-runtime/Cargo.toml --workspace --all-targets --locked
+
           cd engine
           cargo fmt --all
           cargo fmt --all -- --check
-          cargo test -p container-runtime-core storage_library --locked
-          cargo test -p container-runtime-core storage_capability --locked
-          cargo test -p container-runtime-core --locked
           cargo test -p route-engine linked_storage_library_json_read_uses_exact_module_namespace --locked
           cargo test -p route-engine --locked
-          cargo clippy -p container-runtime-core -p route-engine --all-targets --locked -- -D warnings
+          cargo clippy -p route-engine --all-targets --locked -- -D warnings
           cargo check --workspace --all-targets --locked
           cd ..
 
