@@ -50,6 +50,185 @@ Cloud Node reads `setting.node.cn.json`. Private keys never belong in this file.
 
 `requireBootRecovery` defaults to `false`. When enabled, at least one trusted replication target must be configured. `bootRecoveryTimeoutMs` defaults to 60000 and accepts 1000 through 3600000 milliseconds.
 
+## Provider-backed mode
+
+A Cloud Node can use a supported cloud/object provider instead of an `upstream` Cloud Node for remote persistence, snapshot synchronization, and provider history. `upstream` and `provider` are mutually exclusive: a configuration must choose peer mode or provider mode, never both.
+
+Provider mode currently supports:
+
+- Amazon S3 (`amazon-s3`, with `aws-s3` and `s3` aliases)
+- Supabase Storage (`supabase`)
+- Azure Blob Storage (`azure-blob`, with `azure` alias)
+- Google Cloud Storage (`google-cloud-storage`, with `gcs` and `google-cloud` aliases)
+- generic HTTPS object endpoints (`http`)
+
+Provider credentials never belong directly in `setting.node.cn.json`. The JSON selects an authentication mode and may name environment variables; the secret value itself is read only from the process environment.
+
+The built-in credential defaults use the RBE-owned `RBE_CN_PROV_*` namespace:
+
+| Provider/auth | Default environment variable(s) |
+| --- | --- |
+| Amazon S3 SigV4 | `RBE_CN_PROV_AMAZON_ACCESS_KEY`, `RBE_CN_PROV_AMAZON_SECRET_KEY`, optional `RBE_CN_PROV_AMAZON_SESSION_TOKEN` |
+| Supabase | `RBE_CN_PROV_SUPABASE_API_KEY` |
+| Azure Blob SAS | `RBE_CN_PROV_AZURE_SAS_TOKEN` |
+| Google Cloud Storage OAuth | `RBE_CN_PROV_GOOGLE_OAUTH_TOKEN` |
+| Generic HTTP API key | `RBE_CN_PROV_HTTP_API_KEY` |
+| Generic HTTP Bearer | `RBE_CN_PROV_HTTP_BEARER_TOKEN` |
+| Generic HTTP Basic | `RBE_CN_PROV_HTTP_USERNAME`, `RBE_CN_PROV_HTTP_PASSWORD` |
+| Generic HTTP custom header | `RBE_CN_PROV_HTTP_HEADER_VALUE` |
+
+Supported auth modes are `auto`, `none`, `api-key`, `bearer`, `oauth-bearer`, `basic`, `header`, `aws-sig-v4`, and `azure-sas`. Not every mode is valid for every provider. For example, S3 uses SigV4 rather than pretending an AWS access key is a single generic API key.
+
+The environment variable names can be overridden without putting their values in JSON. For example, a custom provider that expects a proprietary header can use:
+
+```json
+{
+  "provider": {
+    "kind": "http",
+    "namespace": "production",
+    "bucket": "rbe-data",
+    "endpoint": "https://objects.example.invalid",
+    "auth": {
+      "mode": "header",
+      "headerName": "x-company-auth",
+      "headerValueEnv": "RBE_CN_PROV_COMPANY_AUTH"
+    }
+  }
+}
+```
+
+Provider endpoints must use HTTPS outside exact loopback development hosts. Embedded URL credentials, query strings, and fragments are rejected. Provider namespaces are also validated as safe local history components and cannot be `.` or `..`.
+
+### Amazon S3
+
+```json
+{
+  "formatVersion": 1,
+  "node": {
+    "id": "home-nas",
+    "storageRoot": "Z:/"
+  },
+  "provider": {
+    "kind": "amazon-s3",
+    "namespace": "production",
+    "bucket": "kastrick-rbe",
+    "region": "ap-south-1",
+    "auth": {
+      "mode": "aws-sig-v4"
+    },
+    "conflictPolicy": "fail",
+    "autoReconnect": true,
+    "syncOnConnect": true,
+    "reconnectDelayMs": 2000
+  }
+}
+```
+
+Set `RBE_CN_PROV_AMAZON_ACCESS_KEY` and `RBE_CN_PROV_AMAZON_SECRET_KEY`. Temporary AWS credentials may additionally set `RBE_CN_PROV_AMAZON_SESSION_TOKEN`.
+
+### Supabase Storage
+
+```json
+{
+  "formatVersion": 1,
+  "node": {
+    "id": "home-nas",
+    "storageRoot": "Z:/"
+  },
+  "provider": {
+    "kind": "supabase",
+    "namespace": "production",
+    "bucket": "rbe-cloud-node",
+    "endpoint": "https://PROJECT.supabase.co",
+    "auth": {
+      "mode": "api-key"
+    }
+  }
+}
+```
+
+Set `RBE_CN_PROV_SUPABASE_API_KEY`. Provider downloads use the authenticated object route so private buckets remain usable.
+
+### Azure Blob Storage
+
+```json
+{
+  "formatVersion": 1,
+  "node": {
+    "id": "home-nas",
+    "storageRoot": "Z:/"
+  },
+  "provider": {
+    "kind": "azure-blob",
+    "namespace": "production",
+    "bucket": "rbe-cloud-node",
+    "account": "myaccount",
+    "auth": {
+      "mode": "azure-sas"
+    }
+  }
+}
+```
+
+Set `RBE_CN_PROV_AZURE_SAS_TOKEN`. The SAS query is supplied from the environment at request time rather than being stored in the configured endpoint URL.
+
+### Google Cloud Storage
+
+```json
+{
+  "formatVersion": 1,
+  "node": {
+    "id": "home-nas",
+    "storageRoot": "Z:/"
+  },
+  "provider": {
+    "kind": "google-cloud-storage",
+    "namespace": "production",
+    "bucket": "kastrick-rbe",
+    "auth": {
+      "mode": "oauth-bearer"
+    }
+  }
+}
+```
+
+Set `RBE_CN_PROV_GOOGLE_OAUTH_TOKEN` to the OAuth Bearer token used for the configured bucket.
+
+### Provider history and synchronization
+
+Provider mode maintains a local commit chain under `provider-history/<namespace>/`. Each history commit identifies a complete Cloud Node snapshot root and its parent commit. The provider stores the immutable snapshot data and history commits plus a mutable `HEAD.json` pointer.
+
+The relation is deterministic:
+
+```text
+same head/root       -> no-op
+remote is ancestor   -> LOCAL ahead  -> push
+local is ancestor    -> REMOTE ahead -> pull
+different branches   -> diverged
+empty provider       -> push first local snapshot
+empty/untracked local + existing provider history -> adopt/pull provider history
+```
+
+`conflictPolicy` defaults to `fail`. `prefer-local` explicitly permits a forced provider push and `prefer-remote` explicitly permits a forced provider pull. These policies are intentionally opt-in because silently selecting one side after divergence can destroy valid history.
+
+Before replacing the mutable provider HEAD, Cloud Node re-reads it and verifies that it still matches the remote head used when synchronization was planned. If another writer moved the head, the push fails and must be retried rather than blindly publishing stale history. This is an application-level race guard; it is not advertised as a provider-native atomic compare-and-swap primitive.
+
+Provider pulls reuse the same crash-resumable recovery machinery as authenticated peer recovery. Their staging identity is stable for the provider namespace and expected snapshot root. After process restart, already committed resources are detected and partial resources return their durable `next_offset`, allowing the provider downloader to continue from verified bytes instead of restarting the complete snapshot.
+
+Provider mode removes the requirement for a second `cloud_node.exe` for remote object persistence, snapshot synchronization, and Cloud Node history. Object storage itself is not an arbitrary reverse network tunnel or relay. Provider-managed ingress/relay products can be integrated separately without conflating network tunneling with the persistence provider interface.
+
+Useful provider commands are:
+
+```text
+cloud_node evaluate
+cloud_node probe-provider
+cloud_node provider-status
+cloud_node sync-provider
+cloud_node run
+```
+
+`run` automatically selects the provider loop when `provider` is configured and the peer loop when `upstream` is configured.
+
 ## NAS layout
 
 For a configured storage root `<ROOT>` Cloud Node owns:
@@ -69,8 +248,12 @@ For a configured storage root `<ROOT>` Cloud Node owns:
 │       └── history.blob.cn                   # binary rolling history, default 5
 ├── .cache/
 │   └── outbound/<peer-id>/<sync-root>/        # frozen LOCAL upload spool; retained on failure
+├── provider-history/
+│   └── <namespace>/
+│       ├── HEAD.json                          # current local provider-history head
+│       └── commits/<commit-sha256>.json       # immutable local history commits
 └── recovery-staging/
-    └── <peer-sha256>/<plan-sha256>/           # private REMOTE crash-resumable staging
+    └── <peer-or-provider-sha256>/<plan-sha256>/
         └── storage/.../*.transfer.part        # fsynced partial resource bytes
 ```
 
