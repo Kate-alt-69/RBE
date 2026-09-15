@@ -349,15 +349,14 @@ fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
                 );
             }
         }
-        ProviderAuthMode::Header => {
+        ProviderAuthMode::Header
             if provider
                 .auth
                 .header_name
                 .as_deref()
-                .is_none_or(str::is_empty)
-            {
-                anyhow::bail!("Cloud Node header provider auth requires headerName");
-            }
+                .is_none_or(str::is_empty) =>
+        {
+            anyhow::bail!("Cloud Node header provider auth requires headerName");
         }
         _ => {}
     }
