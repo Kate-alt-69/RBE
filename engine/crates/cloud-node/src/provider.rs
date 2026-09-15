@@ -25,6 +25,7 @@ const HTTP_USERNAME_ENV: &str = "RBE_CN_PROV_HTTP_USERNAME";
 const HTTP_PASSWORD_ENV: &str = "RBE_CN_PROV_HTTP_PASSWORD";
 const HTTP_HEADER_VALUE_ENV: &str = "RBE_CN_PROV_HTTP_HEADER_VALUE";
 const MAX_PROVIDER_ERROR_BYTES: usize = 1024;
+const MAX_PROVIDER_METADATA_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROVIDER_SECRET_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone)]
@@ -791,7 +792,7 @@ async fn checked_download_response(
 }
 
 async fn response_bytes(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     operation: &str,
     allow_not_found: bool,
 ) -> anyhow::Result<Option<Vec<u8>>> {
@@ -802,11 +803,50 @@ async fn response_bytes(
     if !status.is_success() {
         return Err(provider_http_error(response, operation).await);
     }
-    if operation == "download" {
-        Ok(Some(response.bytes().await?.to_vec()))
-    } else {
-        Ok(None)
+    if operation != "download" {
+        return Ok(None);
     }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_METADATA_BYTES as u64)
+    {
+        anyhow::bail!(
+            "Cloud Node provider metadata exceeds {} bytes",
+            MAX_PROVIDER_METADATA_BYTES
+        );
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(MAX_PROVIDER_METADATA_BYTES);
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        append_bounded_bytes(
+            &mut bytes,
+            &chunk,
+            MAX_PROVIDER_METADATA_BYTES,
+            "provider metadata",
+        )?;
+    }
+    Ok(Some(bytes))
+}
+
+fn append_bounded_bytes(
+    target: &mut Vec<u8>,
+    chunk: &[u8],
+    limit: usize,
+    label: &str,
+) -> anyhow::Result<()> {
+    let next = target
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node {label} size overflow"))?;
+    if next > limit {
+        anyhow::bail!("Cloud Node {label} exceeds {limit} bytes");
+    }
+    target.extend_from_slice(chunk);
+    Ok(())
 }
 
 async fn provider_http_error(mut response: reqwest::Response, operation: &str) -> anyhow::Error {
@@ -1145,6 +1185,15 @@ mod tests {
     #[test]
     fn credential_file_reference_requires_absolute_path() {
         assert!(resolve_secret_value("RBE_TEST_SECRET", "file:relative/token").is_err());
+    }
+
+    #[test]
+    fn bounded_provider_metadata_rejects_oversize_chunks() {
+        let mut bytes = Vec::new();
+        append_bounded_bytes(&mut bytes, b"1234", 5, "test metadata").unwrap();
+        assert_eq!(bytes, b"1234");
+        assert!(append_bounded_bytes(&mut bytes, b"56", 5, "test metadata").is_err());
+        assert_eq!(bytes, b"1234");
     }
 
     #[test]
