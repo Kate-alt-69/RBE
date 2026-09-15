@@ -259,11 +259,22 @@ pub async fn provider_status(
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
     let remote = remote_head(&client).await?;
-    if history.head()?.is_none() {
+    let existing_head = history.head()?;
+    if let Some(remote_head) = remote.as_ref() {
+        if should_adopt_matching_remote_history(existing_head.as_ref(), &local_root, remote_head) {
+            import_remote_history(&history, &client, remote_head).await?;
+            return Ok(ProviderSyncStatus {
+                relation: ProviderSyncRelation::InSync,
+                local_head: remote_head.id.clone(),
+                remote_head: Some(remote_head.id.clone()),
+                local_root,
+                remote_root: Some(remote_head.snapshot_root.clone()),
+            });
+        }
+    }
+    if existing_head.is_none() {
         if let Some(remote_head) = remote.as_ref() {
-            let relation = if remote_head.snapshot_root == local_root {
-                ProviderSyncRelation::InSync
-            } else if plan.object_count() == 0 {
+            let relation = if plan.object_count() == 0 {
                 ProviderSyncRelation::RemoteAhead
             } else {
                 ProviderSyncRelation::Diverged
@@ -295,25 +306,29 @@ pub async fn synchronize_provider(
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
     let remote = remote_head(&client).await?;
+    let existing_head = history.head()?;
 
-    if history.head()?.is_none() {
+    if let Some(remote_head) = remote.as_ref() {
+        if should_adopt_matching_remote_history(existing_head.as_ref(), &local_root, remote_head) {
+            import_remote_history(&history, &client, remote_head).await?;
+            let before = ProviderSyncStatus {
+                relation: ProviderSyncRelation::InSync,
+                local_head: remote_head.id.clone(),
+                remote_head: Some(remote_head.id.clone()),
+                local_root: local_root.clone(),
+                remote_root: Some(remote_head.snapshot_root.clone()),
+            };
+            return Ok(ProviderSyncResult {
+                action: ProviderSyncAction::None,
+                final_root: local_root,
+                final_head: remote_head.id.clone(),
+                before,
+            });
+        }
+    }
+
+    if existing_head.is_none() {
         if let Some(remote_head) = remote.as_ref() {
-            if remote_head.snapshot_root == local_root {
-                import_remote_history(&history, &client, remote_head).await?;
-                let before = ProviderSyncStatus {
-                    relation: ProviderSyncRelation::InSync,
-                    local_head: remote_head.id.clone(),
-                    remote_head: Some(remote_head.id.clone()),
-                    local_root: local_root.clone(),
-                    remote_root: Some(remote_head.snapshot_root.clone()),
-                };
-                return Ok(ProviderSyncResult {
-                    action: ProviderSyncAction::None,
-                    final_root: local_root,
-                    final_head: remote_head.id.clone(),
-                    before,
-                });
-            }
             if plan.object_count() == 0 {
                 let before = ProviderSyncStatus {
                     relation: ProviderSyncRelation::RemoteAhead,
@@ -400,6 +415,17 @@ pub async fn synchronize_provider(
 
 fn provider_recovery_owner(namespace: &str) -> String {
     format!("{PROVIDER_RECOVERY_OWNER_PREFIX}{namespace}")
+}
+
+fn should_adopt_matching_remote_history(
+    local_head: Option<&HistoryCommit>,
+    local_root: &str,
+    remote_head: &HistoryCommit,
+) -> bool {
+    remote_head.snapshot_root == local_root
+        && local_head
+            .map(|head| head.snapshot_root.as_str() != local_root)
+            .unwrap_or(true)
 }
 
 async fn status_from_heads(
@@ -1048,6 +1074,58 @@ mod tests {
         assert!(history.is_ancestor(&first.id, &second.id).unwrap());
         assert!(!history.is_ancestor(&second.id, &first.id).unwrap());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matching_remote_root_repairs_only_stale_or_missing_history() {
+        let live_root = "11".repeat(32);
+        let remote = HistoryCommit {
+            format_version: HISTORY_VERSION,
+            id: "22".repeat(32),
+            parent: None,
+            snapshot_root: live_root.clone(),
+            node_id: "remote".into(),
+            created_unix_ms: 1,
+        };
+        let stale = HistoryCommit {
+            format_version: HISTORY_VERSION,
+            id: "33".repeat(32),
+            parent: None,
+            snapshot_root: "44".repeat(32),
+            node_id: "local".into(),
+            created_unix_ms: 2,
+        };
+        let same_content_other_history = HistoryCommit {
+            format_version: HISTORY_VERSION,
+            id: "55".repeat(32),
+            parent: None,
+            snapshot_root: live_root.clone(),
+            node_id: "local".into(),
+            created_unix_ms: 3,
+        };
+        let other_remote = HistoryCommit {
+            snapshot_root: "66".repeat(32),
+            ..remote.clone()
+        };
+
+        assert!(should_adopt_matching_remote_history(
+            None, &live_root, &remote
+        ));
+        assert!(should_adopt_matching_remote_history(
+            Some(&stale),
+            &live_root,
+            &remote
+        ));
+        assert!(!should_adopt_matching_remote_history(
+            Some(&same_content_other_history),
+            &live_root,
+            &remote
+        ));
+        assert!(!should_adopt_matching_remote_history(
+            Some(&stale),
+            &live_root,
+            &other_remote
+        ));
     }
 
     #[test]
