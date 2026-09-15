@@ -1597,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_backed_route_cannot_fall_back_to_in_process_interpreter() {
+    fn storage_backed_dynamic_body_route_stays_inside_native_container_execution() {
         let sources = vec![
             PhysicalRelSource::new(
                 RelSourceKind::Module,
@@ -1614,14 +1614,22 @@ mod tests {
                    class Route { post(req) { return load(req.body); } }"#,
             ),
         ];
-        let error = compile_runtime_image("server Main {}", sources, &serde_json::json!({}))
-            .expect_err("Storage authority must never escape to interpreter fallback");
-        assert_eq!(error.code(), "RELC3001");
-        let message = error.to_string();
-        assert!(message.starts_with("RELC3001 "));
-        assert!(message.contains("Storage authority requires native Container execution"));
-        assert!(message.contains("static JSON arguments"));
-        assert!(message.contains("help: doc/error-codes/relc.md#relc3001"));
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        let route = image.routes.first().unwrap();
+        let artifact = image
+            .route_wasm_artifact(route)
+            .expect("dynamic Storage route must compile to native WASM");
+        assert_eq!(
+            artifact.input,
+            crate::wasm_compiler::RouteWasmInput::JsonBodyCapabilityArgument
+        );
+        assert!(image.route_wasm_fallback(route).is_none());
+        let grants = image.container_capability_grants(route).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].kind, core_lib::ContainerCapabilityKind::Storage);
+        assert_eq!(grants[0].target, "storage:cache");
+        assert_eq!(grants[0].operations, vec!["read"]);
     }
 
     #[test]

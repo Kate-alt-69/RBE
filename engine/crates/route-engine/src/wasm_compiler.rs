@@ -25,10 +25,10 @@ use crate::modules::binding_name;
 use crate::runtime_image::{storage_capability_operation_allowed, storage_capability_target};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-/// Generation 7 adds exact Module-owned Environment Storage calls to the
-/// existing linked Module authority boundary. Direct Route-to-Storage remains
-/// unreachable and capability ABI v3 stays stable.
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 7;
+/// Generation 8 carries the evaluator-visible `req.body` through one strict
+/// linked Module parameter into an exact host-capability call. Direct
+/// Route-to-Storage remains unreachable and capability ABI v3 stays stable.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 8;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 
@@ -38,6 +38,10 @@ pub enum RouteWasmInput {
     /// Invocation input is the JSON encoding of the evaluator-visible `req.body`
     /// value. This keeps strings/null/objects/arrays semantically identical.
     JsonBody,
+    /// Invocation input is a JSON argument array containing exactly one
+    /// evaluator-visible `req.body` value. The guest forwards these bytes to an
+    /// already-authorized host capability without parsing or widening them.
+    JsonBodyCapabilityArgument,
 }
 
 #[derive(Debug, Clone)]
@@ -94,12 +98,13 @@ impl RouteWasmLinkContext {
 /// Compile the currently supported native route subset.
 ///
 /// Native lowering remains intentionally strict: one HTTP method, one return,
-/// no route helper functions. Compiler generation v7 keeps ABI v3 and permits
+/// no route helper functions. Compiler generation v8 keeps ABI v3 and permits
 /// one immutable linked Module function supplied by RELC. The linked function
 /// must itself be exactly one return of one direct HTTP, Video, Service, or
-/// Storage host call, and every Route/host argument must resolve to static JSON.
-/// Namespace imports, dynamic arguments, wider Module bodies, and nested chains
-/// remain interpreter-only.
+/// Storage host call. Arguments may be static JSON, or one Route `req.body`
+/// value may pass unchanged through one Module parameter into the host call.
+/// Namespace imports, transformed dynamic arguments, wider Module bodies, and
+/// nested chains remain interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let links = RouteWasmLinkContext::default();
     compile_route_with_links(file, &links)
@@ -126,13 +131,13 @@ pub(crate) fn compile_route_with_links(
                 linked_import = Some((binding, linked));
             } else {
                 return fallback(
-                    "native Route-WASM v7 only supports one direct http.get/post/request import or one linked Module function import",
+                    "native Route-WASM v8 only supports one direct http.get/post/request import or one linked Module function import",
                 );
             }
         }
         _ => {
             return fallback(
-                "native Route-WASM v7 supports at most one direct or linked host-call import",
+                "native Route-WASM v8 supports at most one direct or linked host-call import",
             )
         }
     }
@@ -165,15 +170,25 @@ pub(crate) fn compile_route_with_links(
             RouteWasmInput::None,
         )
     } else if let Some((binding, linked)) = linked_import.as_ref() {
-        let (kind, target, operation, payload) =
-            match lower_linked_module_capability_call(binding, linked, expr) {
-                Ok(call) => call,
-                Err(reason) => return fallback(reason),
-            };
-        (
-            encode_capability_call_module(kind, &target, &operation, &payload),
-            RouteWasmInput::None,
-        )
+        let call = match lower_linked_module_capability_call(
+            binding,
+            linked,
+            expr,
+            method.param_name.as_deref(),
+        ) {
+            Ok(call) => call,
+            Err(reason) => return fallback(reason),
+        };
+        match call.payload {
+            LoweredCapabilityPayload::Static(payload) => (
+                encode_capability_call_module(call.kind, &call.target, &call.operation, &payload),
+                RouteWasmInput::None,
+            ),
+            LoweredCapabilityPayload::JsonBodySingleArgument => (
+                encode_input_capability_call_module(call.kind, &call.target, &call.operation),
+                RouteWasmInput::JsonBodyCapabilityArgument,
+            ),
+        }
     } else if let Some(value) = static_json(expr) {
         let output = match serde_json::to_vec(&value) {
             Ok(output) => output,
@@ -309,14 +324,34 @@ fn valid_capability_operation(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
+#[derive(Debug, Clone)]
+enum LoweredCapabilityPayload {
+    Static(Vec<u8>),
+    JsonBodySingleArgument,
+}
+
+#[derive(Debug, Clone)]
+struct LoweredCapabilityCall {
+    kind: ContainerCapabilityKind,
+    target: String,
+    operation: String,
+    payload: LoweredCapabilityPayload,
+}
+
 fn lower_linked_module_capability_call(
     route_binding: &str,
     linked: &LinkedModuleFunction,
     route_expr: &Expr,
-) -> Result<(ContainerCapabilityKind, String, String, Vec<u8>), String> {
-    let route_args = static_direct_call(route_binding, route_expr).ok_or_else(|| {
-        "native linked Module calls require the imported function as the return value with static JSON arguments".to_string()
-    })?;
+    request_parameter: Option<&str>,
+) -> Result<LoweredCapabilityCall, String> {
+    let Expr::Call(route_target, route_args) = route_expr else {
+        return Err(
+            "native linked Module calls require the imported function as the return value".into(),
+        );
+    };
+    if !matches!(route_target.as_ref(), Expr::Ident(name) if name == route_binding) {
+        return Err("native linked Module return must call the imported Module binding".into());
+    }
     if route_args.len() != linked.function.params.len() {
         return Err(format!(
             "native linked Module call arity mismatch: Route supplied {}, Module function expects {}",
@@ -324,6 +359,7 @@ fn lower_linked_module_capability_call(
             linked.function.params.len()
         ));
     }
+
     let [Statement::Return(module_expr)] = linked.function.body.as_slice() else {
         return Err(
             "native linked Module function must contain exactly one return statement".into(),
@@ -346,26 +382,61 @@ fn lower_linked_module_capability_call(
         return Err("native linked Module return must call the imported host binding".into());
     }
 
-    let bindings = linked
-        .function
-        .params
+    if let Some(route_args) = route_args
         .iter()
-        .cloned()
-        .zip(route_args)
-        .collect::<BTreeMap<_, _>>();
-    let args = host_args
-        .iter()
-        .map(|argument| static_json_with_bindings(argument, &bindings))
+        .map(static_json)
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            "native linked Module host arguments must resolve to static JSON values".to_string()
-        })?;
-    let payload = serde_json::to_vec(&args)
-        .map_err(|error| format!("encode native linked Module arguments: {error}"))?;
-    if payload.len() > CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES {
-        return Err("native linked Module argument payload exceeds the capability envelope".into());
+    {
+        let bindings = linked
+            .function
+            .params
+            .iter()
+            .cloned()
+            .zip(route_args)
+            .collect::<BTreeMap<_, _>>();
+        let args = host_args
+            .iter()
+            .map(|argument| static_json_with_bindings(argument, &bindings))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                "native linked Module host arguments must resolve to static JSON values".to_string()
+            })?;
+        let payload = serde_json::to_vec(&args)
+            .map_err(|error| format!("encode native linked Module arguments: {error}"))?;
+        if payload.len() > CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES {
+            return Err(
+                "native linked Module argument payload exceeds the capability envelope".into(),
+            );
+        }
+        return Ok(LoweredCapabilityCall {
+            kind: host.kind,
+            target: host.target,
+            operation: host.operation,
+            payload: LoweredCapabilityPayload::Static(payload),
+        });
     }
-    Ok((host.kind, host.target, host.operation, payload))
+
+    let dynamic_body_passthrough = linked.function.params.len() == 1
+        && route_args.len() == 1
+        && host_args.len() == 1
+        && returns_request_body(request_parameter, &route_args[0])
+        && matches!(
+            &host_args[0],
+            Expr::Ident(name) if name == &linked.function.params[0]
+        );
+    if dynamic_body_passthrough {
+        return Ok(LoweredCapabilityCall {
+            kind: host.kind,
+            target: host.target,
+            operation: host.operation,
+            payload: LoweredCapabilityPayload::JsonBodySingleArgument,
+        });
+    }
+
+    Err(
+        "native linked Module dynamic arguments currently support exactly one req.body value passed unchanged through one Module parameter into the host call"
+            .into(),
+    )
 }
 
 fn static_direct_call(binding: &str, expr: &Expr) -> Option<Vec<serde_json::Value>> {
@@ -538,6 +609,121 @@ fn encode_capability_call_module(
         0,
         &ConstExpr::i32_const(payload_offset as i32),
         payload.iter().copied(),
+    );
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&imports)
+        .section(&functions)
+        .section(&memories)
+        .section(&exports)
+        .section(&code)
+        .section(&data);
+    module.finish()
+}
+
+fn encode_input_capability_call_module(
+    kind: ContainerCapabilityKind,
+    target: &str,
+    operation: &str,
+) -> Vec<u8> {
+    // Invocation input is already the exact JSON argument array `[req.body]`.
+    // Keeping JSON encoding at the HTTP boundary means the guest never needs a
+    // JSON parser and cannot reinterpret or widen the capability request.
+    let target = target.as_bytes();
+    let operation = operation.as_bytes();
+    let target_offset = 0usize;
+    let operation_offset = target_offset + target.len();
+    let payload_offset = (operation_offset + operation.len() + 15) & !15usize;
+    let response_offset = (payload_offset + CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES + 15) & !15usize;
+    let memory_bytes = response_offset + CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES;
+
+    let mut types = TypeSection::new();
+    types.ty().function([], [ValType::I32]);
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32], [ValType::I32]);
+    types.ty().function(
+        [
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+        ],
+        [ValType::I32],
+    );
+
+    let mut imports = ImportSection::new();
+    imports.import("rbe", "input_len", EntityType::Function(0));
+    imports.import("rbe", "input_read", EntityType::Function(1));
+    imports.import("rbe", "capability_call", EntityType::Function(2));
+    imports.import("rbe", "capability_response_len", EntityType::Function(0));
+    imports.import("rbe", "capability_response_read", EntityType::Function(1));
+    imports.import("rbe", "output_write", EntityType::Function(1));
+
+    let mut functions = FunctionSection::new();
+    functions.function(0);
+
+    let pages = memory_bytes.max(1).div_ceil(WASM_PAGE_BYTES) as u64;
+    let mut memories = MemorySection::new();
+    memories.memory(MemoryType {
+        minimum: pages,
+        maximum: Some(pages),
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+
+    let mut exports = ExportSection::new();
+    exports.export("memory", ExportKind::Memory, 0);
+    exports.export("run", ExportKind::Func, 6);
+
+    let mut run = Function::new([(2, ValType::I32)]);
+    run.instructions()
+        .call(0)
+        .local_set(0)
+        .i32_const(payload_offset as i32)
+        .local_get(0)
+        .call(1)
+        .drop()
+        .i32_const(kind.abi_code())
+        .i32_const(target_offset as i32)
+        .i32_const(target.len() as i32)
+        .i32_const(operation_offset as i32)
+        .i32_const(operation.len() as i32)
+        .i32_const(payload_offset as i32)
+        .local_get(0)
+        .call(2)
+        .drop()
+        .call(3)
+        .local_set(1)
+        .i32_const(response_offset as i32)
+        .local_get(1)
+        .call(4)
+        .drop()
+        .i32_const(response_offset as i32)
+        .local_get(1)
+        .call(5)
+        .drop()
+        .i32_const(0)
+        .end();
+    let mut code = CodeSection::new();
+    code.function(&run);
+
+    let mut data = DataSection::new();
+    data.active(
+        0,
+        &ConstExpr::i32_const(target_offset as i32),
+        target.iter().copied(),
+    );
+    data.active(
+        0,
+        &ConstExpr::i32_const(operation_offset as i32),
+        operation.iter().copied(),
     );
 
     let mut module = Module::new();
@@ -890,6 +1076,46 @@ mod tests {
     }
 
     #[test]
+    fn linked_module_storage_call_passes_dynamic_request_body_natively() {
+        let module = parse_module(
+            r#":import[storage.read as readEntry]
+               export function load(path) { return readEntry(path); }"#,
+        );
+        let links = link_module_function("load", "accounts.cache", &module, "load");
+        let route = parse(
+            r#":import["./module/accounts/cache".load]
+               class Route { post(req) { return load(req.body); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("dynamic req.body Storage wrapper should compile natively");
+        };
+        assert_eq!(artifact.input, RouteWasmInput::JsonBodyCapabilityArgument);
+        wasmparser::validate(&artifact.bytes).unwrap();
+
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Storage);
+            assert_eq!(request.target, "storage:accounts.cache");
+            assert_eq!(request.operation, "read");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!(["users/kate.json"])
+            );
+            Ok(br#"{"found":true,"dataHex":"6f6b"}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                br#"["users/kate.json"]"#,
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"found":true,"dataHex":"6f6b"}"#);
+    }
+
+    #[test]
     fn linked_module_video_call_uses_canonical_module_owner() {
         let module = parse_module(
             r#":import[video-manager.status as vmStatus]
@@ -924,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_module_dynamic_route_argument_stays_interpreter_fallback() {
+    fn linked_module_transformed_dynamic_route_argument_stays_interpreter_fallback() {
         let module = parse_module(
             r#":import[service:uac.get_user as getUser]
                export function lookup(id) { return getUser(id); }"#,
@@ -932,14 +1158,14 @@ mod tests {
         let links = link_module_function("lookup", "accounts", &module, "lookup");
         let route = parse(
             r#":import["./module/accounts".lookup]
-               class Route { post(req) { return lookup(req.body); } }"#,
+               class Route { post(req) { return lookup(req.body.id); } }"#,
         );
         let RouteWasmCompilation::InterpreterFallback { reason } =
             compile_route_with_links(&route, &links)
         else {
-            panic!("dynamic linked arguments must remain interpreter-only");
+            panic!("transformed dynamic linked arguments must remain interpreter-only");
         };
-        assert!(reason.contains("static JSON arguments"));
+        assert!(reason.contains("exactly one req.body value passed unchanged"));
     }
 
     #[test]

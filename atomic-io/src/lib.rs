@@ -123,7 +123,10 @@ impl AtomicIo {
         let path_lock = self.lock_for(path);
         let _guard = path_lock.lock().unwrap();
 
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             create_dir_all_durable(parent)?;
         }
 
