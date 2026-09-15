@@ -1,6 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, HOST};
+use reqwest::header::{
+    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, HOST, RANGE,
+};
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use sha2::{Digest, Sha256};
 
@@ -18,6 +20,7 @@ const HTTP_BEARER_TOKEN_ENV: &str = "RBE_CN_PROV_HTTP_BEARER_TOKEN";
 const HTTP_USERNAME_ENV: &str = "RBE_CN_PROV_HTTP_USERNAME";
 const HTTP_PASSWORD_ENV: &str = "RBE_CN_PROV_HTTP_PASSWORD";
 const HTTP_HEADER_VALUE_ENV: &str = "RBE_CN_PROV_HTTP_HEADER_VALUE";
+const MAX_PROVIDER_ERROR_BYTES: usize = 1024;
 
 #[derive(Clone)]
 pub struct ProviderClient {
@@ -93,7 +96,7 @@ impl ProviderClient {
         let key = self.object_key(relative)?;
         let response = match self.settings.kind {
             ProviderKind::AmazonS3 => {
-                self.aws_request(Method::GET, &key, Vec::new(), None)
+                self.aws_request(Method::GET, &key, Vec::new(), None, None)
                     .await?
             }
             ProviderKind::Supabase => {
@@ -127,6 +130,61 @@ impl ProviderClient {
         response_bytes(response, "download", true).await
     }
 
+    pub(crate) async fn open_download(
+        &self,
+        relative: &str,
+        start: u64,
+    ) -> anyhow::Result<Option<reqwest::Response>> {
+        let key = self.object_key(relative)?;
+        let range = (start > 0).then(|| format!("bytes={start}-"));
+        let response = match self.settings.kind {
+            ProviderKind::AmazonS3 => {
+                self.aws_request(Method::GET, &key, Vec::new(), None, range.as_deref())
+                    .await?
+            }
+            ProviderKind::Supabase => {
+                let url = self.supabase_url(&key, true)?;
+                apply_range(
+                    self.apply_supabase_auth(self.client.get(url))?,
+                    range.as_deref(),
+                )
+                .send()
+                .await?
+            }
+            ProviderKind::AzureBlob => {
+                let url = self.azure_url(&key)?;
+                apply_range(self.client.get(url), range.as_deref())
+                    .send()
+                    .await?
+            }
+            ProviderKind::GoogleCloudStorage => {
+                let url = self.gcs_url(&key)?;
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .oauth_token_env
+                        .as_deref()
+                        .or(self.settings.auth.bearer_token_env.as_deref())
+                        .or(self.settings.credential_env.as_deref()),
+                    GOOGLE_OAUTH_TOKEN_ENV,
+                )?;
+                apply_range(self.client.get(url).bearer_auth(token), range.as_deref())
+                    .send()
+                    .await?
+            }
+            ProviderKind::Http => {
+                let url = self.http_url(&key)?;
+                apply_range(
+                    self.apply_http_auth(self.client.get(url))?,
+                    range.as_deref(),
+                )
+                .send()
+                .await?
+            }
+        };
+        checked_download_response(response, start).await
+    }
+
     pub async fn put(
         &self,
         relative: &str,
@@ -136,7 +194,7 @@ impl ProviderClient {
         let key = self.object_key(relative)?;
         let response = match self.settings.kind {
             ProviderKind::AmazonS3 => {
-                self.aws_request(Method::PUT, &key, bytes, Some(content_type))
+                self.aws_request(Method::PUT, &key, bytes, Some(content_type), None)
                     .await?
             }
             ProviderKind::Supabase => {
@@ -408,6 +466,7 @@ impl ProviderClient {
         key: &str,
         body: Vec<u8>,
         content_type: Option<&str>,
+        range: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let region = self
             .settings
@@ -502,6 +561,9 @@ impl ProviderClient {
         if let Some(content_type) = content_type {
             request = request.header(CONTENT_TYPE, content_type);
         }
+        if let Some(range) = range {
+            request = request.header(RANGE, range);
+        }
         if !body.is_empty() {
             request = request.body(body);
         }
@@ -510,6 +572,44 @@ impl ProviderClient {
             .await
             .map_err(|error| anyhow::anyhow!("Cloud Node amazon-s3 request failed: {error}"))
     }
+}
+
+async fn checked_download_response(
+    response: reqwest::Response,
+    start: u64,
+) -> anyhow::Result<Option<reqwest::Response>> {
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(provider_http_error(response, "download").await);
+    }
+    if start > 0 && status == StatusCode::PARTIAL_CONTENT {
+        let content_range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cloud Node provider partial download omitted Content-Range")
+            })?
+            .to_str()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Cloud Node provider returned invalid Content-Range header: {error}"
+                )
+            })?;
+        let actual_start = content_range_start(content_range).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node provider returned malformed Content-Range {content_range:?}"
+            )
+        })?;
+        if actual_start != start {
+            anyhow::bail!(
+                "Cloud Node provider range started at {actual_start} instead of requested {start}"
+            );
+        }
+    }
+    Ok(Some(response))
 }
 
 async fn response_bytes(
@@ -522,15 +622,46 @@ async fn response_bytes(
         return Ok(None);
     }
     if !status.is_success() {
-        let detail = response.text().await.unwrap_or_default();
-        let detail = detail.chars().take(1024).collect::<String>();
-        anyhow::bail!("Cloud Node provider {operation} failed with HTTP {status}: {detail}");
+        return Err(provider_http_error(response, operation).await);
     }
     if operation == "download" {
         Ok(Some(response.bytes().await?.to_vec()))
     } else {
         Ok(None)
     }
+}
+
+async fn provider_http_error(mut response: reqwest::Response, operation: &str) -> anyhow::Error {
+    let status = response.status();
+    let mut detail = Vec::new();
+    while detail.len() < MAX_PROVIDER_ERROR_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = (MAX_PROVIDER_ERROR_BYTES - detail.len()).min(chunk.len());
+                detail.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let detail = String::from_utf8_lossy(&detail);
+    anyhow::anyhow!("Cloud Node provider {operation} failed with HTTP {status}: {detail}")
+}
+
+fn apply_range(request: RequestBuilder, range: Option<&str>) -> RequestBuilder {
+    match range {
+        Some(range) => request.header(RANGE, range),
+        None => request,
+    }
+}
+
+fn content_range_start(value: &str) -> Option<u64> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, _) = value.split_once('/')?;
+    let (start, _) = range.split_once('-')?;
+    start.parse().ok()
 }
 
 fn add_header(request: RequestBuilder, name: &str, value: &str) -> anyhow::Result<RequestBuilder> {

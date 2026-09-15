@@ -765,35 +765,29 @@ async fn restore_resource(
     receiver: &mut CloudNodeRecoveryReceiver,
     resource: &ProviderResource,
 ) -> anyhow::Result<()> {
-    let bytes = client.get(&resource.key).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Cloud Node provider snapshot resource {} is missing",
-            resource.key
-        )
-    })?;
-    let expected_size = usize::try_from(resource.size)
-        .map_err(|_| anyhow::anyhow!("Cloud Node provider resource size exceeds platform range"))?;
-    if bytes.len() != expected_size {
-        anyhow::bail!(
-            "Cloud Node provider resource size mismatch for {}",
-            resource.key
-        );
-    }
     let resource_sha = decode_hash(&resource.resource_sha256, "provider resource hash")?;
-    let actual: [u8; 32] = Sha256::digest(&bytes).into();
-    if actual != resource_sha {
-        anyhow::bail!(
-            "Cloud Node provider resource hash mismatch for {}",
-            resource.key
-        );
-    }
     let kind = BlobKind::try_from(resource.kind)?;
     let transfer_resource = TransferResource::try_from(resource.resource)?;
     let object_key = decode_hash(&resource.object_key, "provider object key")?;
     let content_sha = decode_hash(&resource.content_sha256, "provider content hash")?;
     let total_size = resource.size;
 
-    if bytes.is_empty() {
+    if total_size == 0 {
+        let mut response = client
+            .open_download(&resource.key, 0)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cloud Node provider snapshot resource {} is missing",
+                    resource.key
+                )
+            })?;
+        if response.chunk().await?.is_some() {
+            anyhow::bail!(
+                "Cloud Node provider resource size mismatch for {}",
+                resource.key
+            );
+        }
         let chunk = TransferChunk::new(
             kind,
             transfer_resource,
@@ -808,33 +802,112 @@ async fn restore_resource(
         return Ok(());
     }
 
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let end = offset
-            .saturating_add(MAX_TRANSFER_DATA_BYTES)
-            .min(bytes.len());
-        let chunk = TransferChunk::new(
-            kind,
-            transfer_resource,
-            object_key,
-            content_sha,
-            resource_sha,
-            u64::try_from(offset)
-                .map_err(|_| anyhow::anyhow!("provider resource offset exceeds u64"))?,
-            total_size,
-            bytes[offset..end].to_vec(),
-        )?;
-        let receipt = receiver.accept_chunk(&chunk)?;
-        let next = usize::try_from(receipt.next_offset)
-            .map_err(|_| anyhow::anyhow!("provider recovery offset exceeds platform range"))?;
-        if next <= offset || next > bytes.len() {
-            anyhow::bail!(
-                "Cloud Node provider recovery returned invalid resume offset {} for resource size {}",
-                next,
-                bytes.len()
-            );
+    // Ask recovery for the already durable prefix before opening the provider
+    // body. This mirrors the peer resume acknowledgement path.
+    let probe = TransferChunk::new(
+        kind,
+        transfer_resource,
+        object_key,
+        content_sha,
+        resource_sha,
+        0,
+        total_size,
+        Vec::new(),
+    )?;
+    let receipt = receiver.accept_chunk(&probe)?;
+    let mut offset = receipt.next_offset;
+    if offset > total_size {
+        anyhow::bail!(
+            "Cloud Node provider recovery returned invalid resume offset {offset} for resource size {total_size}"
+        );
+    }
+    if offset == total_size {
+        return Ok(());
+    }
+
+    let mut response = client
+        .open_download(&resource.key, offset)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node provider snapshot resource {} is missing",
+                resource.key
+            )
+        })?;
+    let ranged = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let mut source_offset = if ranged { offset } else { 0 };
+
+    while let Some(bytes) = response.chunk().await? {
+        let chunk_start = source_offset;
+        source_offset = source_offset
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| anyhow::anyhow!("provider response chunk size exceeds u64"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("provider response offset overflow"))?;
+
+        if source_offset <= offset {
+            continue;
         }
-        offset = next;
+        let begin = if chunk_start < offset {
+            usize::try_from(offset - chunk_start)
+                .map_err(|_| anyhow::anyhow!("provider resume prefix exceeds platform range"))?
+        } else {
+            0
+        };
+        let mut remaining = &bytes[begin..];
+        while !remaining.is_empty() {
+            if offset >= total_size {
+                anyhow::bail!(
+                    "Cloud Node provider resource exceeded declared size for {}",
+                    resource.key
+                );
+            }
+            let resource_remaining = usize::try_from(total_size - offset).unwrap_or(usize::MAX);
+            let take = remaining
+                .len()
+                .min(MAX_TRANSFER_DATA_BYTES)
+                .min(resource_remaining);
+            if take == 0 {
+                anyhow::bail!(
+                    "Cloud Node provider resource exceeded declared size for {}",
+                    resource.key
+                );
+            }
+            let sent_end = offset
+                .checked_add(
+                    u64::try_from(take)
+                        .map_err(|_| anyhow::anyhow!("provider transfer chunk exceeds u64"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("provider transfer offset overflow"))?;
+            let chunk = TransferChunk::new(
+                kind,
+                transfer_resource,
+                object_key,
+                content_sha,
+                resource_sha,
+                offset,
+                total_size,
+                remaining[..take].to_vec(),
+            )?;
+            let receipt = receiver.accept_chunk(&chunk)?;
+            if receipt.next_offset != sent_end {
+                anyhow::bail!(
+                    "Cloud Node provider recovery advanced to unexpected offset {} instead of {}",
+                    receipt.next_offset,
+                    sent_end
+                );
+            }
+            offset = receipt.next_offset;
+            remaining = &remaining[take..];
+        }
+    }
+
+    if offset != total_size {
+        anyhow::bail!(
+            "Cloud Node provider resource ended at offset {offset} instead of declared size {total_size} for {}",
+            resource.key
+        );
     }
     Ok(())
 }
