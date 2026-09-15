@@ -1,0 +1,547 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, HOST};
+use reqwest::{Client, Method, StatusCode, Url};
+use sha2::{Digest, Sha256};
+
+use crate::config::{ProviderKind, ProviderSettings};
+
+const AWS_SERVICE: &str = "s3";
+const AWS_ACCESS_KEY_ENV: &str = "AWS_ACCESS_KEY_ID";
+const AWS_SECRET_KEY_ENV: &str = "AWS_SECRET_ACCESS_KEY";
+const AWS_SESSION_TOKEN_ENV: &str = "AWS_SESSION_TOKEN";
+const SUPABASE_KEY_ENV: &str = "SUPABASE_SERVICE_ROLE_KEY";
+const AZURE_SAS_ENV: &str = "AZURE_STORAGE_SAS_TOKEN";
+const GCS_TOKEN_ENV: &str = "GOOGLE_OAUTH_ACCESS_TOKEN";
+const HTTP_BEARER_ENV: &str = "RBE_CN_PROVIDER_TOKEN";
+
+#[derive(Clone)]
+pub struct ProviderClient {
+    client: Client,
+    settings: ProviderSettings,
+}
+
+impl ProviderClient {
+    pub fn new(settings: &ProviderSettings) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .https_only(false)
+            .build()
+            .map_err(|error| anyhow::anyhow!("failed to build Cloud Node provider client: {error}"))?;
+        Ok(Self {
+            client,
+            settings: settings.clone(),
+        })
+    }
+
+    pub fn kind(&self) -> ProviderKind {
+        self.settings.kind
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.settings.namespace
+    }
+
+    pub fn object_key(&self, relative: &str) -> anyhow::Result<String> {
+        if relative.is_empty()
+            || relative.starts_with('/')
+            || relative.contains("..")
+            || relative.contains('\\')
+        {
+            anyhow::bail!("invalid Cloud Node provider object key {relative:?}");
+        }
+        let mut parts = Vec::new();
+        let prefix = self.settings.prefix.trim_matches('/');
+        if !prefix.is_empty() {
+            parts.push(prefix);
+        }
+        parts.push("rbe-cn");
+        parts.push(&self.settings.namespace);
+        parts.push(relative);
+        Ok(parts.join("/"))
+    }
+
+    pub fn target_description(&self) -> String {
+        match self.settings.kind {
+            ProviderKind::AmazonS3 => format!(
+                "s3://{}/{}",
+                self.settings.bucket,
+                self.settings.namespace
+            ),
+            ProviderKind::Supabase => format!(
+                "supabase://{}/{}",
+                self.settings.bucket,
+                self.settings.namespace
+            ),
+            ProviderKind::AzureBlob => format!(
+                "azure://{}/{}",
+                self.settings.bucket,
+                self.settings.namespace
+            ),
+            ProviderKind::GoogleCloudStorage => format!(
+                "gs://{}/{}",
+                self.settings.bucket,
+                self.settings.namespace
+            ),
+            ProviderKind::Http => format!(
+                "http-provider://{}/{}",
+                self.settings.bucket,
+                self.settings.namespace
+            ),
+        }
+    }
+
+    pub async fn get(&self, relative: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let key = self.object_key(relative)?;
+        let response = match self.settings.kind {
+            ProviderKind::AmazonS3 => self.aws_request(Method::GET, &key, Vec::new(), None).await?,
+            ProviderKind::Supabase => {
+                let url = self.supabase_url(&key)?;
+                let token = required_env(self.settings.credential_env.as_deref(), SUPABASE_KEY_ENV)?;
+                self.client
+                    .get(url)
+                    .header("apikey", token.as_str())
+                    .bearer_auth(token)
+                    .send()
+                    .await?
+            }
+            ProviderKind::AzureBlob => {
+                let url = self.azure_url(&key)?;
+                self.client.get(url).send().await?
+            }
+            ProviderKind::GoogleCloudStorage => {
+                let url = self.gcs_url(&key)?;
+                let token = required_env(self.settings.credential_env.as_deref(), GCS_TOKEN_ENV)?;
+                self.client.get(url).bearer_auth(token).send().await?
+            }
+            ProviderKind::Http => {
+                let url = self.http_url(&key)?;
+                let mut request = self.client.get(url);
+                if let Some(token) = optional_env(self.settings.credential_env.as_deref(), HTTP_BEARER_ENV)? {
+                    request = request.bearer_auth(token);
+                }
+                request.send().await?
+            }
+        };
+        response_bytes(response, "download", true).await
+    }
+
+    pub async fn put(
+        &self,
+        relative: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> anyhow::Result<()> {
+        let key = self.object_key(relative)?;
+        let response = match self.settings.kind {
+            ProviderKind::AmazonS3 => {
+                self.aws_request(Method::PUT, &key, bytes, Some(content_type))
+                    .await?
+            }
+            ProviderKind::Supabase => {
+                let url = self.supabase_url(&key)?;
+                let token = required_env(self.settings.credential_env.as_deref(), SUPABASE_KEY_ENV)?;
+                self.client
+                    .put(url)
+                    .header("apikey", token.as_str())
+                    .bearer_auth(token)
+                    .header("x-upsert", "true")
+                    .header(CONTENT_TYPE, content_type)
+                    .body(bytes)
+                    .send()
+                    .await?
+            }
+            ProviderKind::AzureBlob => {
+                let url = self.azure_url(&key)?;
+                self.client
+                    .put(url)
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header(CONTENT_TYPE, content_type)
+                    .body(bytes)
+                    .send()
+                    .await?
+            }
+            ProviderKind::GoogleCloudStorage => {
+                let url = self.gcs_url(&key)?;
+                let token = required_env(self.settings.credential_env.as_deref(), GCS_TOKEN_ENV)?;
+                self.client
+                    .put(url)
+                    .bearer_auth(token)
+                    .header(CONTENT_TYPE, content_type)
+                    .body(bytes)
+                    .send()
+                    .await?
+            }
+            ProviderKind::Http => {
+                let url = self.http_url(&key)?;
+                let mut request = self
+                    .client
+                    .put(url)
+                    .header(CONTENT_TYPE, content_type)
+                    .body(bytes);
+                if let Some(token) = optional_env(self.settings.credential_env.as_deref(), HTTP_BEARER_ENV)? {
+                    request = request.bearer_auth(token);
+                }
+                request.send().await?
+            }
+        };
+        response_bytes(response, "upload", false).await?;
+        Ok(())
+    }
+
+    pub async fn probe(&self) -> anyhow::Result<()> {
+        let probe_key = "provider/probe.json";
+        let payload = format!(
+            "{{\"formatVersion\":1,\"namespace\":{}}}",
+            serde_json::to_string(&self.settings.namespace)?
+        );
+        self.put(probe_key, payload.into_bytes(), "application/json")
+            .await?;
+        let downloaded = self
+            .get(probe_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Cloud Node provider probe object disappeared after upload"))?;
+        if downloaded.is_empty() {
+            anyhow::bail!("Cloud Node provider probe returned an empty object");
+        }
+        Ok(())
+    }
+
+    fn supabase_url(&self, key: &str) -> anyhow::Result<Url> {
+        let endpoint = self
+            .settings
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("supabase provider endpoint is missing"))?;
+        object_url(
+            endpoint,
+            &format!(
+                "storage/v1/object/{}/{}",
+                encode_path_segment(&self.settings.bucket),
+                encode_object_key(key)
+            ),
+        )
+    }
+
+    fn azure_url(&self, key: &str) -> anyhow::Result<Url> {
+        let endpoint = if let Some(value) = &self.settings.endpoint {
+            value.clone()
+        } else {
+            let account = self
+                .settings
+                .account
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("azure provider account is missing"))?;
+            format!("https://{account}.blob.core.windows.net")
+        };
+        let mut url = object_url(
+            &endpoint,
+            &format!(
+                "{}/{}",
+                encode_path_segment(&self.settings.bucket),
+                encode_object_key(key)
+            ),
+        )?;
+        let sas = required_env(self.settings.credential_env.as_deref(), AZURE_SAS_ENV)?;
+        let sas = sas.trim_start_matches('?');
+        if sas.is_empty() {
+            anyhow::bail!("Cloud Node Azure SAS token is empty");
+        }
+        url.set_query(Some(sas));
+        Ok(url)
+    }
+
+    fn gcs_url(&self, key: &str) -> anyhow::Result<Url> {
+        let endpoint = self
+            .settings
+            .endpoint
+            .as_deref()
+            .unwrap_or("https://storage.googleapis.com");
+        object_url(
+            endpoint,
+            &format!(
+                "{}/{}",
+                encode_path_segment(&self.settings.bucket),
+                encode_object_key(key)
+            ),
+        )
+    }
+
+    fn http_url(&self, key: &str) -> anyhow::Result<Url> {
+        let endpoint = self
+            .settings
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("http provider endpoint is missing"))?;
+        object_url(
+            endpoint,
+            &format!(
+                "{}/{}",
+                encode_path_segment(&self.settings.bucket),
+                encode_object_key(key)
+            ),
+        )
+    }
+
+    async fn aws_request(
+        &self,
+        method: Method,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let region = self
+            .settings
+            .region
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("amazon-s3 provider region is missing"))?;
+        let endpoint = self.settings.endpoint.clone().unwrap_or_else(|| {
+            format!(
+                "https://{}.s3.{}.amazonaws.com",
+                self.settings.bucket, region
+            )
+        });
+        let url = object_url(&endpoint, &encode_object_key(key))?;
+        if url.query().is_some() {
+            anyhow::bail!("Cloud Node amazon-s3 endpoint cannot contain a query string");
+        }
+        let access_key = required_env(self.settings.access_key_env.as_deref(), AWS_ACCESS_KEY_ENV)?;
+        let secret_key = required_env(self.settings.secret_key_env.as_deref(), AWS_SECRET_KEY_ENV)?;
+        let session_token = optional_env(
+            self.settings.session_token_env.as_deref(),
+            AWS_SESSION_TOKEN_ENV,
+        )?;
+        let (short_date, amz_date) = aws_timestamp(SystemTime::now())?;
+        let payload_hash = hex::encode(Sha256::digest(&body));
+        let host = host_header(&url)?;
+        let canonical_uri = if url.path().is_empty() { "/" } else { url.path() };
+
+        let mut canonical_headers = format!(
+            "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+        );
+        let mut signed_headers = "host;x-amz-content-sha256;x-amz-date".to_owned();
+        if let Some(token) = &session_token {
+            canonical_headers.push_str(&format!("x-amz-security-token:{}\n", token.trim()));
+            signed_headers.push_str(";x-amz-security-token");
+        }
+        let canonical_request = format!(
+            "{}\n{}\n\n{}\n{}\n{}",
+            method.as_str(),
+            canonical_uri,
+            canonical_headers,
+            signed_headers,
+            payload_hash
+        );
+        let scope = format!("{short_date}/{region}/{AWS_SERVICE}/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), short_date.as_bytes());
+        let k_region = hmac_sha256(&k_date, region.as_bytes());
+        let k_service = hmac_sha256(&k_region, AWS_SERVICE.as_bytes());
+        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+        );
+
+        let mut request = self
+            .client
+            .request(method, url)
+            .header(HOST, host)
+            .header("x-amz-content-sha256", payload_hash)
+            .header("x-amz-date", amz_date)
+            .header(AUTHORIZATION, authorization);
+        if let Some(token) = session_token {
+            request = request.header("x-amz-security-token", token);
+        }
+        if let Some(content_type) = content_type {
+            request = request.header(CONTENT_TYPE, content_type);
+        }
+        if !body.is_empty() {
+            request = request.body(body);
+        }
+        request
+            .send()
+            .await
+            .map_err(|error| anyhow::anyhow!("Cloud Node amazon-s3 request failed: {error}"))
+    }
+}
+
+async fn response_bytes(
+    response: reqwest::Response,
+    operation: &str,
+    allow_not_found: bool,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let status = response.status();
+    if allow_not_found && status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        let detail = detail.chars().take(1024).collect::<String>();
+        anyhow::bail!("Cloud Node provider {operation} failed with HTTP {status}: {detail}");
+    }
+    if operation == "download" {
+        Ok(Some(response.bytes().await?.to_vec()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn required_env(configured: Option<&str>, default_name: &str) -> anyhow::Result<String> {
+    let name = configured.unwrap_or(default_name);
+    let value = std::env::var(name)
+        .map_err(|_| anyhow::anyhow!("Cloud Node provider credential environment {name} is not set"))?;
+    if value.trim().is_empty() {
+        anyhow::bail!("Cloud Node provider credential environment {name} is empty");
+    }
+    Ok(value)
+}
+
+fn optional_env(configured: Option<&str>, default_name: &str) -> anyhow::Result<Option<String>> {
+    let name = configured.unwrap_or(default_name);
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "failed to read Cloud Node provider credential environment {name}: {error}"
+        )),
+    }
+}
+
+fn object_url(endpoint: &str, path: &str) -> anyhow::Result<Url> {
+    let base = endpoint.trim_end_matches('/');
+    Url::parse(&format!("{base}/{}", path.trim_start_matches('/')))
+        .map_err(|error| anyhow::anyhow!("invalid Cloud Node provider URL: {error}"))
+}
+
+fn encode_object_key(value: &str) -> String {
+    value
+        .split('/')
+        .map(encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(hex_digit(byte >> 4));
+            out.push(hex_digit(byte & 0x0f));
+        }
+    }
+    out
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        _ => (b'A' + (value - 10)) as char,
+    }
+}
+
+fn host_header(url: &Url) -> anyhow::Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider URL has no host"))?;
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut normalized = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let digest = Sha256::digest(key);
+        normalized[..32].copy_from_slice(&digest);
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; BLOCK];
+    let mut outer_pad = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(data);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+fn aws_timestamp(now: SystemTime) -> anyhow::Result<(String, String)> {
+    let seconds = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("system clock is before UNIX epoch"))?
+        .as_secs();
+    let days = i64::try_from(seconds / 86_400)
+        .map_err(|_| anyhow::anyhow!("system clock exceeds supported AWS timestamp range"))?;
+    let seconds_of_day = seconds % 86_400;
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    let (year, month, day) = civil_from_days(days);
+    let short = format!("{year:04}{month:02}{day:02}");
+    let full = format!("{short}T{hour:02}{minute:02}{second:02}Z");
+    Ok((short, full))
+}
+
+// Howard Hinnant's civil-from-days transform, with day zero at 1970-01-01.
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(m <= 2);
+    (year, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_object_keys_are_namespaced() {
+        let settings: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"google-cloud-storage",
+            "namespace":"production",
+            "bucket":"rbe",
+            "prefix":"tenant-a"
+        }))
+        .unwrap();
+        let client = ProviderClient::new(&settings).unwrap();
+        assert_eq!(
+            client.object_key("history/head.json").unwrap(),
+            "tenant-a/rbe-cn/production/history/head.json"
+        );
+    }
+
+    #[test]
+    fn aws_epoch_timestamp_is_stable() {
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
+        let (short, full) = aws_timestamp(now).unwrap();
+        assert_eq!(short, "20240101");
+        assert_eq!(full, "20240101T000000Z");
+    }
+
+    #[test]
+    fn path_encoding_preserves_object_hierarchy() {
+        assert_eq!(encode_object_key("a folder/x+y"), "a%20folder/x%2By");
+    }
+}
