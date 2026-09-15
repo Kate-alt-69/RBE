@@ -8,6 +8,7 @@ mod auth;
 mod client;
 mod config;
 mod crypto;
+mod durable;
 mod format;
 mod protocol;
 #[cfg(feature = "client")]

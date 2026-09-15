@@ -9,9 +9,11 @@ here, not one per process.
 
 Two real guarantees — full detail in `src/lib.rs`'s doc comment:
 
-- `write_atomic` — genuinely atomic full-file replace (temp file +
-  `sync_all` + `rename`). A reader never observes a partial write; a
-  crash mid-write leaves the old file intact.
+- `write_atomic` — genuinely atomic full-file replace. The temp file
+  is flushed before commit; Unix also fsyncs directory namespace
+  changes, while Windows uses a replace-existing, write-through move.
+  Rewriting an existing target therefore keeps the same atomic-replace
+  contract on both platforms.
 - `append_locked` / `read` — serialized via an in-process per-path
   lock. Safe against races between tasks in **this process**; not a
   claim of cross-process atomicity for appends (there's no OS

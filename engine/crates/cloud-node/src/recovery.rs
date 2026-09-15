@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::durable;
+
 use crate::format::{BlobBody, BlobKind, BlobManifest, FolderEntry};
 use crate::store::CloudNodeStore;
 use crate::sync::{SyncPlan, SyncPlanHeader};
@@ -78,12 +80,12 @@ impl CloudNodeRecoveryReceiver {
             .root
             .join("recovery-staging")
             .join(recovery_peer_key(owner_node_id));
-        fs::create_dir_all(&peer_root)?;
+        durable::create_dir_all(&peer_root)?;
         let recovery_name = recovery_plan_key(expected);
         prune_obsolete_peer_recoveries(&peer_root, &recovery_name)?;
         let session_root = peer_root.join(&recovery_name);
         let staging_storage = session_root.join("storage");
-        fs::create_dir_all(&staging_storage)?;
+        durable::create_dir_all(&staging_storage)?;
         let phase = infer_recovery_phase(&staging_storage)?;
         Ok(Self {
             session_root,
@@ -98,7 +100,7 @@ impl CloudNodeRecoveryReceiver {
     /// the same authenticated peer negotiates a different snapshot root.
     pub fn discard(self) -> anyhow::Result<()> {
         if self.session_root.exists() {
-            fs::remove_dir_all(&self.session_root)?;
+            durable::remove_dir_all(&self.session_root)?;
         }
         Ok(())
     }
@@ -116,7 +118,7 @@ impl CloudNodeRecoveryReceiver {
         if target.is_file() && verify_resource(&target, chunk.resource_sha256, chunk.total_size)? {
             let part = transfer_part_path(&target)?;
             if part.exists() {
-                fs::remove_file(part)?;
+                durable::remove_file(part)?;
             }
             let video_reconstructed = self.after_resource_committed(chunk, &target)?;
             return Ok(RecoveryReceipt {
@@ -135,7 +137,7 @@ impl CloudNodeRecoveryReceiver {
                 anyhow::bail!("Cloud Node recovery resource did not begin at offset zero");
             }
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
+                durable::create_dir_all(parent)?;
             }
             let part = transfer_part_path(&target)?;
             let written = match fs::metadata(&part) {
@@ -144,15 +146,17 @@ impl CloudNodeRecoveryReceiver {
                 }
                 Ok(_) => {
                     if part.exists() {
-                        fs::remove_file(&part)?;
+                        durable::remove_file(&part)?;
                     }
                     let file = File::create(&part)?;
                     file.sync_all()?;
+                    durable::sync_parent(&part)?;
                     0
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let file = File::create(&part)?;
                     file.sync_all()?;
+                    durable::sync_parent(&part)?;
                     0
                 }
                 Err(error) => return Err(error.into()),
@@ -195,19 +199,19 @@ impl CloudNodeRecoveryReceiver {
         validate_staged_resource(&active.path, chunk, &self.staging_storage)?;
 
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+            durable::create_dir_all(parent)?;
         }
         if target.exists() {
             if verify_resource(&target, chunk.resource_sha256, chunk.total_size)? {
-                fs::remove_file(&active.path)?;
+                durable::remove_file(&active.path)?;
                 duplicate = true;
             } else {
-                fs::remove_file(&target)?;
-                fs::rename(&active.path, &target)?;
+                durable::remove_file(&target)?;
+                durable::rename(&active.path, &target)?;
                 duplicate = false;
             }
         } else {
-            fs::rename(&active.path, &target)?;
+            durable::rename(&active.path, &target)?;
         }
         self.active = None;
 
@@ -256,11 +260,11 @@ impl CloudNodeRecoveryReceiver {
 
         let had_live = live.exists();
         if had_live {
-            fs::rename(&live, &old)?;
+            durable::rename(&live, &old)?;
         }
-        if let Err(error) = fs::rename(&self.staging_storage, &live) {
+        if let Err(error) = durable::rename(&self.staging_storage, &live) {
             if had_live && old.exists() {
-                let _ = fs::rename(&old, &live);
+                let _ = durable::rename(&old, &live);
             }
             return Err(error.into());
         }
@@ -282,21 +286,21 @@ impl CloudNodeRecoveryReceiver {
         }
 
         if old.exists() {
-            fs::remove_dir_all(&old)?;
+            durable::remove_dir_all(&old)?;
         }
         self.completed = true;
         if self.session_root.exists() {
-            fs::remove_dir_all(&self.session_root)?;
+            durable::remove_dir_all(&self.session_root)?;
         }
         Ok(actual)
     }
 
     fn rollback_swap(&mut self, live: &Path, old: &Path, had_live: bool) {
         if live.exists() {
-            let _ = fs::rename(live, &self.staging_storage);
+            let _ = durable::rename(live, &self.staging_storage);
         }
         if had_live && old.exists() {
-            let _ = fs::rename(old, live);
+            let _ = durable::rename(old, live);
         }
     }
 
@@ -359,7 +363,7 @@ impl CloudNodeRecoveryReceiver {
                 .join(hex::encode(chunk.content_sha256))
                 .join(BlobKind::Folder.manifest_name());
             if let Some(parent) = version.parent() {
-                fs::create_dir_all(parent)?;
+                durable::create_dir_all(parent)?;
             }
             if !version.exists() {
                 copy_file_via_part(target, &version)?;
@@ -418,11 +422,11 @@ impl CloudNodeRecoveryReceiver {
             return Ok(true);
         }
         if let Some(parent) = payload.parent() {
-            fs::create_dir_all(parent)?;
+            durable::create_dir_all(parent)?;
         }
         let temp = part_path(&payload)?;
         if temp.exists() {
-            fs::remove_file(&temp)?;
+            durable::remove_file(&temp)?;
         }
 
         let result = (|| -> anyhow::Result<()> {
@@ -451,11 +455,11 @@ impl CloudNodeRecoveryReceiver {
             if written != manifest.logical_size || actual != content_sha256 {
                 anyhow::bail!("Cloud Node reconstructed video payload hash mismatch");
             }
-            fs::rename(&temp, &payload)?;
+            durable::rename(&temp, &payload)?;
             Ok(())
         })();
         if result.is_err() && temp.exists() {
-            let _ = fs::remove_file(&temp);
+            let _ = durable::remove_file(&temp);
         }
         result?;
         Ok(true)
@@ -482,7 +486,7 @@ fn prune_obsolete_peer_recoveries(peer_root: &Path, keep: &str) -> anyhow::Resul
         if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy() == keep {
             continue;
         }
-        fs::remove_dir_all(entry.path())?;
+        durable::remove_dir_all(entry.path())?;
     }
     Ok(())
 }
@@ -623,18 +627,18 @@ fn part_path(path: &Path) -> anyhow::Result<PathBuf> {
 
 fn copy_file_via_part(source: &Path, target: &Path) -> anyhow::Result<()> {
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        durable::create_dir_all(parent)?;
     }
     let part = part_path(target)?;
     if part.exists() {
-        fs::remove_file(&part)?;
+        durable::remove_file(&part)?;
     }
     fs::copy(source, &part)?;
     File::open(&part)?.sync_all()?;
     if target.exists() {
-        fs::remove_file(target)?;
+        durable::remove_file(target)?;
     }
-    fs::rename(part, target)?;
+    durable::rename(part, target)?;
     Ok(())
 }
 

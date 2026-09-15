@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use atomic_io::AtomicIo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -1159,22 +1160,15 @@ fn decode_hash(value: &str, label: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cloud Node history path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("history"),
-        std::process::id()
-    ));
-    fs::write(&temp, serde_json::to_vec(value)?)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temp, path)?;
+    let bytes = serde_json::to_vec(value)?;
+    AtomicIo::new()
+        .write_atomic(path, &bytes)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to durably replace Cloud Node provider history {}: {error}",
+                path.display()
+            )
+        })?;
     Ok(())
 }
 

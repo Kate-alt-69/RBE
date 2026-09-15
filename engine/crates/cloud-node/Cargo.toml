@@ -14,6 +14,7 @@ default = ["client"]
 client = ["dep:reqwest", "dep:tokio-util"]
 
 [dependencies]
+atomic-io = { path = "../../../atomic-io" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
