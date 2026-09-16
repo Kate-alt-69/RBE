@@ -1,0 +1,69 @@
+name: One-shot Storage project-root write boundary
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .ci-storage-project-write-v1-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  storage-project-write:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            container-runtime
+            engine
+
+      - name: Apply trusted Storage project-root boundary
+        run: python3 .github/patches/storage-project-write-v1.py
+
+      - name: Format Container runtime
+        run: cargo fmt --manifest-path container-runtime/Cargo.toml --all
+
+      - name: Format Engine
+        run: cargo fmt --manifest-path engine/Cargo.toml --all
+
+      - name: Diff check
+        run: git diff --check
+
+      - name: Test Storage capability boundary
+        run: cargo test --manifest-path container-runtime/Cargo.toml -p container-runtime-core --locked storage_capability
+
+      - name: Test Environment Storage transport
+        run: cargo test --manifest-path container-runtime/Cargo.toml -p container-bin --locked storage
+
+      - name: Clippy Container Storage path
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml -p container-runtime-core -p container-bin --all-targets --locked -- -D warnings
+
+      - name: Check backend ProjectRoot propagation
+        run: cargo check --manifest-path engine/Cargo.toml -p backend --locked
+
+      - name: Clippy backend ProjectRoot propagation
+        run: cargo clippy --manifest-path engine/Cargo.toml -p backend --all-targets --locked -- -D warnings
+
+      - name: Commit BUG-STO-001
+        run: |
+          rm -f \
+            .ci-storage-project-write-v1-trigger \
+            .github/patches/storage-project-write-v1.py \
+            .github/workflows/storage-project-write-v1.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-STO-001 freeze project-root Storage write boundary"
+          git push origin HEAD:main
