@@ -321,10 +321,10 @@ pub async fn provider_status(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
     let client = ProviderClient::new(provider)?;
+    let remote = remote_head(&client).await?;
     let plan = store.sync_plan()?;
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
-    let remote = remote_head(&client).await?;
     let existing_head = history.head()?;
 
     let Some(local_head) = existing_head else {
@@ -370,11 +370,11 @@ pub async fn synchronize_provider(
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
     let _sync_lock = ProviderSyncLock::acquire(store, &provider.namespace)?;
     let client = ProviderClient::new(provider)?;
+    let remote = remote_head(&client).await?;
     let recovery_owner = provider_recovery_owner(&provider.namespace);
     let plan = store.sync_plan()?;
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
-    let remote = remote_head(&client).await?;
     let existing_head = history.head()?;
 
     if let Some(remote_head) = remote.as_ref() {
