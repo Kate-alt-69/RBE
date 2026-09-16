@@ -158,6 +158,8 @@ pub struct ProviderSettings {
     pub sync_on_connect: bool,
     #[serde(default = "default_reconnect_delay_ms")]
     pub reconnect_delay_ms: u64,
+    #[serde(default = "default_provider_max_reconnect_delay_ms")]
+    pub max_reconnect_delay_ms: u64,
     #[serde(default = "default_provider_poll_interval_ms")]
     pub poll_interval_ms: u64,
     #[serde(default = "default_provider_connect_timeout_ms")]
@@ -260,6 +262,10 @@ fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
     validate_bucket(&provider.bucket)?;
     validate_prefix(&provider.prefix)?;
     validate_reconnect_delay(provider.reconnect_delay_ms)?;
+    validate_provider_max_reconnect_delay(
+        provider.reconnect_delay_ms,
+        provider.max_reconnect_delay_ms,
+    )?;
     validate_provider_poll_interval(provider.poll_interval_ms)?;
     validate_provider_timeout("connectTimeoutMs", provider.connect_timeout_ms)?;
     validate_provider_timeout("readTimeoutMs", provider.read_timeout_ms)?;
@@ -455,6 +461,18 @@ fn validate_reconnect_delay(value: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_provider_max_reconnect_delay(initial: u64, maximum: u64) -> anyhow::Result<()> {
+    if !(250..=3_600_000).contains(&maximum) {
+        anyhow::bail!("Cloud Node provider maxReconnectDelayMs must be between 250 and 3600000");
+    }
+    if maximum < initial {
+        anyhow::bail!(
+            "Cloud Node provider maxReconnectDelayMs cannot be smaller than reconnectDelayMs"
+        );
+    }
+    Ok(())
+}
+
 fn validate_provider_poll_interval(value: u64) -> anyhow::Result<()> {
     if !(1_000..=3_600_000).contains(&value) {
         anyhow::bail!("Cloud Node provider pollIntervalMs must be between 1000 and 3600000");
@@ -579,6 +597,9 @@ const fn default_video_chunk_bytes() -> usize {
 const fn default_reconnect_delay_ms() -> u64 {
     2_000
 }
+const fn default_provider_max_reconnect_delay_ms() -> u64 {
+    60_000
+}
 const fn default_provider_poll_interval_ms() -> u64 {
     30_000
 }
@@ -638,6 +659,7 @@ mod tests {
             "endpoint":"https://storage.example.test"
         }))
         .unwrap();
+        assert_eq!(provider.max_reconnect_delay_ms, 60_000);
         assert_eq!(provider.poll_interval_ms, 30_000);
         assert_eq!(provider.connect_timeout_ms, 10_000);
         assert_eq!(provider.read_timeout_ms, 60_000);
@@ -651,6 +673,12 @@ mod tests {
         assert!(validate_provider(&invalid).is_err());
         invalid = provider.clone();
         invalid.poll_interval_ms = 999;
+        assert!(validate_provider(&invalid).is_err());
+        invalid = provider.clone();
+        invalid.max_reconnect_delay_ms = provider.reconnect_delay_ms - 1;
+        assert!(validate_provider(&invalid).is_err());
+        invalid = provider.clone();
+        invalid.max_reconnect_delay_ms = 3_600_001;
         assert!(validate_provider(&invalid).is_err());
     }
 

@@ -216,6 +216,7 @@ async fn run_provider_daemon(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
     let client = ProviderClient::new(provider)?;
+    let mut retry_delay_ms = provider.reconnect_delay_ms;
     loop {
         let result = if provider.sync_on_connect {
             synchronize_provider(settings, store).await.map(|sync| {
@@ -243,9 +244,14 @@ async fn run_provider_daemon(
                 if !provider.auto_reconnect {
                     return Err(error);
                 }
-                provider.reconnect_delay_ms
+                let delay = retry_delay_ms;
+                retry_delay_ms = retry_delay_ms
+                    .saturating_mul(2)
+                    .min(provider.max_reconnect_delay_ms);
+                delay
             }
             Ok(()) => {
+                retry_delay_ms = provider.reconnect_delay_ms;
                 if !provider.auto_reconnect {
                     return Ok(());
                 }

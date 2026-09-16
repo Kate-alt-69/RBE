@@ -112,7 +112,7 @@ Provider HTTP connections are also stall-bounded. `connectTimeoutMs` defaults to
 
 Provider transport errors deliberately discard the request URL before they reach logs. This is especially important for Azure Blob Storage because SAS credentials are carried in the request query string; status/error bodies are still reported, but connection/TLS failures cannot echo the SAS-bearing URL.
 
-Provider daemon success polling is intentionally separate from failure recovery. `reconnectDelayMs` remains the delay before retrying a failed provider operation, while `pollIntervalMs` controls the cadence after a successful sync/probe and defaults to `30000` milliseconds. It accepts 1000 through 3600000 milliseconds. This avoids turning the 2-second reconnect default into continuous healthy cloud API traffic.
+Provider daemon success polling is intentionally separate from failure recovery. `reconnectDelayMs` is the initial delay before retrying a failed provider operation, `maxReconnectDelayMs` caps exponential failure backoff and defaults to `60000` milliseconds, and `pollIntervalMs` controls the cadence after a successful sync/probe and defaults to `30000` milliseconds. `maxReconnectDelayMs` accepts 250 through 3600000 milliseconds and cannot be smaller than `reconnectDelayMs`; `pollIntervalMs` accepts 1000 through 3600000 milliseconds. Successful provider activity resets the retry delay back to `reconnectDelayMs`. This avoids both continuous healthy cloud API traffic and fixed 2-second hammering during prolonged outages.
 
 ### Amazon S3
 
