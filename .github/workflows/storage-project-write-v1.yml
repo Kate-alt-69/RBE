@@ -29,7 +29,9 @@ jobs:
             engine
 
       - name: Apply frozen ProjectRoot plumbing
-        run: python3 .github/patches/storage-project-root-plumbing.py
+        run: |
+          python3 .github/patches/storage-project-root-plumbing.py
+          python3 .github/patches/storage-project-root-fixups.py
 
       - name: Format Container runtime core
         run: cargo fmt --manifest-path container-runtime/Cargo.toml -p container-runtime-core
@@ -64,6 +66,7 @@ jobs:
             .ci-storage-project-write-v1-trigger \
             .github/patches/storage-project-write-v1.py \
             .github/patches/storage-project-root-plumbing.py \
+            .github/patches/storage-project-root-fixups.py \
             .github/workflows/storage-project-write-v1.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
