@@ -217,6 +217,7 @@ Set `RBE_CN_PROV_GOOGLE_OAUTH_TOKEN` to the OAuth Bearer token used for the conf
 Provider mode maintains a local commit chain under `provider-history/<namespace>/`. Each history commit identifies a complete Cloud Node snapshot root and its parent commit. The provider stores the immutable snapshot data and history commits plus a mutable `HEAD.json` pointer.
 
 Local provider-history JSON metadata is treated as untrusted disk input when read back. `HEAD.json` and individual commit files are bounded to 64 KiB before JSON decoding, preventing a corrupted or externally replaced history file from causing unbounded memory allocation during status or synchronization.
+Provider-history directories are created through Cloud Node's durable directory helper before commits or lock files are placed inside them, so newly created namespace/commit directory entries receive the same parent-directory sync treatment used by the recovery/store paths on platforms that support directory fsync.
 
 The relation is deterministic:
 

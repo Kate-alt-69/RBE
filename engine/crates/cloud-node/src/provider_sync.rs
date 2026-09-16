@@ -12,6 +12,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::client::{cached_resource_path, cleanup_outbound_cache, prepare_outbound_cache};
 use crate::config::{validate_node_id, CloudNodeSettings, ProviderConflictPolicy};
+use crate::durable;
 use crate::format::BlobKind;
 use crate::provider::{ProviderClient, ProviderObjectVersion};
 use crate::recovery::CloudNodeRecoveryReceiver;
@@ -120,7 +121,7 @@ impl ProviderSyncLock {
             .root
             .join("provider-history")
             .join(namespace);
-        fs::create_dir_all(&root)?;
+        durable::create_dir_all(&root)?;
         let path = root.join(".sync.lock");
         let file = fs::OpenOptions::new()
             .create(true)
@@ -205,7 +206,7 @@ impl LocalHistory {
 
     fn write_commit(&self, commit: &HistoryCommit) -> anyhow::Result<()> {
         validate_commit(commit)?;
-        fs::create_dir_all(&self.commits)?;
+        durable::create_dir_all(&self.commits)?;
         let path = self.commits.join(format!("{}.json", commit.id));
         if path.is_file() {
             let existing = self.read_commit(&commit.id)?;
