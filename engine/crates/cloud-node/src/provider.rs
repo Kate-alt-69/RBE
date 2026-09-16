@@ -135,11 +135,16 @@ impl ProviderClient {
                 let url = self.supabase_url(&key, true)?;
                 self.apply_supabase_auth(self.client.get(url))?
                     .send()
-                    .await?
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::AzureBlob => {
                 let url = self.azure_url(&key)?;
-                self.client.get(url).send().await?
+                self.client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::GoogleCloudStorage => {
                 let url = self.gcs_url(&key)?;
@@ -152,11 +157,19 @@ impl ProviderClient {
                         .or(self.settings.credential_env.as_deref()),
                     GOOGLE_OAUTH_TOKEN_ENV,
                 )?;
-                self.client.get(url).bearer_auth(token).send().await?
+                self.client
+                    .get(url)
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::Http => {
                 let url = self.http_url(&key)?;
-                self.apply_http_auth(self.client.get(url))?.send().await?
+                self.apply_http_auth(self.client.get(url))?
+                    .send()
+                    .await
+                    .map_err(provider_transport_error)?
             }
         };
         let version = provider_object_version(self.settings.kind, response.headers())?;
@@ -185,13 +198,15 @@ impl ProviderClient {
                     range.as_deref(),
                 )
                 .send()
-                .await?
+                .await
+                .map_err(provider_transport_error)?
             }
             ProviderKind::AzureBlob => {
                 let url = self.azure_url(&key)?;
                 apply_range(self.client.get(url), range.as_deref())
                     .send()
-                    .await?
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::GoogleCloudStorage => {
                 let url = self.gcs_url(&key)?;
@@ -206,7 +221,8 @@ impl ProviderClient {
                 )?;
                 apply_range(self.client.get(url).bearer_auth(token), range.as_deref())
                     .send()
-                    .await?
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::Http => {
                 let url = self.http_url(&key)?;
@@ -215,7 +231,8 @@ impl ProviderClient {
                     range.as_deref(),
                 )
                 .send()
-                .await?
+                .await
+                .map_err(provider_transport_error)?
             }
         };
         checked_download_response(response, start).await
@@ -243,7 +260,8 @@ impl ProviderClient {
                         .body(bytes),
                 )?
                 .send()
-                .await?
+                .await
+                .map_err(provider_transport_error)?
             }
             ProviderKind::AzureBlob => {
                 let url = self.azure_url(&key)?;
@@ -253,7 +271,8 @@ impl ProviderClient {
                     .header(CONTENT_TYPE, content_type)
                     .body(bytes)
                     .send()
-                    .await?
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::GoogleCloudStorage => {
                 let url = self.gcs_url(&key)?;
@@ -272,7 +291,8 @@ impl ProviderClient {
                     .header(CONTENT_TYPE, content_type)
                     .body(bytes)
                     .send()
-                    .await?
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::Http => {
                 let url = self.http_url(&key)?;
@@ -283,7 +303,8 @@ impl ProviderClient {
                         .body(bytes),
                 )?
                 .send()
-                .await?
+                .await
+                .map_err(provider_transport_error)?
             }
         };
         response_bytes(response, "upload", false).await?;
@@ -335,7 +356,8 @@ impl ProviderClient {
                     .body(bytes);
                 apply_etag_precondition(request, expected_version, expected_exists)?
                     .send()
-                    .await?
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::GoogleCloudStorage => {
                 let url = self.gcs_url(&key)?;
@@ -356,7 +378,8 @@ impl ProviderClient {
                     .header("x-goog-if-generation-match", generation)
                     .body(bytes)
                     .send()
-                    .await?
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::Supabase | ProviderKind::Http => {
                 self.put(relative, bytes, content_type).await?;
@@ -404,7 +427,8 @@ impl ProviderClient {
                         .body(file_body(path).await?),
                 )?
                 .send()
-                .await?
+                .await
+                .map_err(provider_transport_error)?
             }
             ProviderKind::AzureBlob => {
                 let url = self.azure_url(&key)?;
@@ -415,7 +439,8 @@ impl ProviderClient {
                     .header(CONTENT_LENGTH, size)
                     .body(file_body(path).await?)
                     .send()
-                    .await?
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::GoogleCloudStorage => {
                 let url = self.gcs_url(&key)?;
@@ -435,7 +460,8 @@ impl ProviderClient {
                     .header(CONTENT_LENGTH, size)
                     .body(file_body(path).await?)
                     .send()
-                    .await?
+                    .await
+                    .map_err(provider_transport_error)?
             }
             ProviderKind::Http => {
                 let url = self.http_url(&key)?;
@@ -447,7 +473,8 @@ impl ProviderClient {
                         .body(file_body(path).await?),
                 )?
                 .send()
-                .await?
+                .await
+                .map_err(provider_transport_error)?
             }
         };
         response_bytes(response, "upload", false).await?;
@@ -862,11 +889,15 @@ impl ProviderClient {
         if let Some(body) = body {
             request = request.body(body);
         }
-        request
-            .send()
-            .await
-            .map_err(|error| anyhow::anyhow!("Cloud Node amazon-s3 request failed: {error}"))
+        request.send().await.map_err(provider_transport_error)
     }
+}
+
+fn provider_transport_error(error: reqwest::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Cloud Node provider request failed: {}",
+        error.without_url()
+    )
 }
 
 fn provider_object_version(

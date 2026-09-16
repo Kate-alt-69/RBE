@@ -110,6 +110,8 @@ Provider endpoints must use HTTPS outside exact loopback development hosts. Embe
 
 Provider HTTP connections are also stall-bounded. `connectTimeoutMs` defaults to `10000` and bounds only connection establishment. `readTimeoutMs` defaults to `60000` and resets after each successful response read, so long streaming transfers can continue indefinitely while a provider that stops producing response data is eventually disconnected. Both values accept 250 through 300000 milliseconds. Cloud Node intentionally does not apply a total request deadline to provider uploads/downloads because that would incorrectly kill valid large transfers.
 
+Provider transport errors deliberately discard the request URL before they reach logs. This is especially important for Azure Blob Storage because SAS credentials are carried in the request query string; status/error bodies are still reported, but connection/TLS failures cannot echo the SAS-bearing URL.
+
 Provider daemon success polling is intentionally separate from failure recovery. `reconnectDelayMs` remains the delay before retrying a failed provider operation, while `pollIntervalMs` controls the cadence after a successful sync/probe and defaults to `30000` milliseconds. It accepts 1000 through 3600000 milliseconds. This avoids turning the 2-second reconnect default into continuous healthy cloud API traffic.
 
 ### Amazon S3
