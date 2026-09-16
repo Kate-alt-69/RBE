@@ -1,0 +1,91 @@
+name: One-shot Cloud Node provider error redaction
+
+on:
+  push:
+    branches:
+      - work/cloud-node-provider-hardening-2
+
+permissions:
+  contents: write
+
+jobs:
+  provider-error-redaction:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Redact provider request URLs from transport errors
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('engine/crates/cloud-node/src/provider.rs')
+          text = path.read_text()
+
+          helper_anchor = '''fn provider_object_version(\n    kind: ProviderKind,\n'''
+          helper = '''fn provider_transport_error(error: reqwest::Error) -> anyhow::Error {\n    anyhow::anyhow!(\n        "Cloud Node provider request failed: {}",\n        error.without_url()\n    )\n}\n\n'''
+          if 'fn provider_transport_error(' not in text:
+              if helper_anchor not in text:
+                  raise SystemExit('provider_object_version anchor not found')
+              text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+          # Sanitize every direct reqwest send path. Keep HTTP response bodies/statuses
+          # unchanged; only transport errors lose their potentially secret-bearing URL.
+          text = text.replace(
+              '.send().await?',
+              '.send().await.map_err(provider_transport_error)?',
+          )
+          text = re.sub(
+              r'\.send\(\)\n(?P<i>\s*)\.await\?',
+              lambda m: '.send()\n' + m.group('i') + '.await\n' + m.group('i') + '.map_err(provider_transport_error)?',
+              text,
+          )
+          text = text.replace(
+              '''request\n            .send()\n            .await\n            .map_err(|error| anyhow::anyhow!("Cloud Node amazon-s3 request failed: {error}"))''',
+              '''request\n            .send()\n            .await\n            .map_err(provider_transport_error)''',
+          )
+
+          if '.send().await?' in text:
+              raise SystemExit('unsanitized single-line provider send remains')
+          if re.search(r'\.send\(\)\n\s*\.await\?', text):
+              raise SystemExit('unsanitized multiline provider send remains')
+          if 'amazon-s3 request failed: {error}' in text:
+              raise SystemExit('unsanitized S3 transport error remains')
+          path.write_text(text)
+
+          doc = Path('doc/cloud-node.md')
+          docs = doc.read_text()
+          marker = '''Provider HTTP connections are also stall-bounded. `connectTimeoutMs` defaults to `10000` and bounds only connection establishment. `readTimeoutMs` defaults to `60000` and resets after each successful response read, so long streaming transfers can continue indefinitely while a provider that stops producing response data is eventually disconnected. Both values accept 250 through 300000 milliseconds. Cloud Node intentionally does not apply a total request deadline to provider uploads/downloads because that would incorrectly kill valid large transfers.\n'''
+          addition = marker + '''\nProvider transport errors deliberately discard the request URL before they reach logs. This is especially important for Azure Blob Storage because SAS credentials are carried in the request query string; status/error bodies are still reported, but connection/TLS failures cannot echo the SAS-bearing URL.\n'''
+          if 'Provider transport errors deliberately discard the request URL' not in docs:
+              if marker not in docs:
+                  raise SystemExit('provider timeout docs anchor not found')
+              docs = docs.replace(marker, addition, 1)
+              doc.write_text(docs)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
+      - name: Commit BUG-CN-PROV-024
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-error-redaction.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-024 redact provider request URLs from errors"
+          git push origin HEAD:work/cloud-node-provider-hardening-2
