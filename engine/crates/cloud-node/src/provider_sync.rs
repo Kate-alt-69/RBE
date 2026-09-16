@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +23,8 @@ const SNAPSHOT_VERSION: u16 = 1;
 const COMMIT_DOMAIN: &[u8] = b"RBE-CN-PROVIDER-COMMIT/1\0";
 const MAX_HISTORY_DEPTH: usize = 100_000;
 const PROVIDER_RECOVERY_OWNER_PREFIX: &str = "provider.";
+
+type RemoteCommitCache = HashMap<String, HistoryCommit>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderSyncRelation {
@@ -322,6 +324,10 @@ pub async fn provider_status(
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
     let client = ProviderClient::new(provider)?;
     let remote = remote_head(&client).await?;
+    let mut remote_cache = RemoteCommitCache::new();
+    if let Some(remote_head) = remote.as_ref() {
+        remote_cache.insert(remote_head.id.clone(), remote_head.clone());
+    }
     let plan = store.sync_plan()?;
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
@@ -357,7 +363,15 @@ pub async fn provider_status(
         });
     }
 
-    status_from_heads(&history, &client, local_head, remote, local_root).await
+    status_from_heads(
+        &history,
+        &client,
+        local_head,
+        remote,
+        local_root,
+        &mut remote_cache,
+    )
+    .await
 }
 
 pub async fn synchronize_provider(
@@ -371,6 +385,10 @@ pub async fn synchronize_provider(
     let _sync_lock = ProviderSyncLock::acquire(store, &provider.namespace)?;
     let client = ProviderClient::new(provider)?;
     let remote = remote_head(&client).await?;
+    let mut remote_cache = RemoteCommitCache::new();
+    if let Some(remote_head) = remote.as_ref() {
+        remote_cache.insert(remote_head.id.clone(), remote_head.clone());
+    }
     let recovery_owner = provider_recovery_owner(&provider.namespace);
     let plan = store.sync_plan()?;
     let local_root = plan.root_hex();
@@ -379,7 +397,7 @@ pub async fn synchronize_provider(
 
     if let Some(remote_head) = remote.as_ref() {
         if should_adopt_matching_remote_history(existing_head.as_ref(), &local_root, remote_head) {
-            import_remote_history(&history, &client, remote_head).await?;
+            import_remote_history(&history, &client, remote_head, &mut remote_cache).await?;
             let before = ProviderSyncStatus {
                 relation: ProviderSyncRelation::InSync,
                 local_head: remote_head.id.clone(),
@@ -406,7 +424,15 @@ pub async fn synchronize_provider(
                     local_root,
                     remote_root: Some(remote_head.snapshot_root.clone()),
                 };
-                pull_provider_state(&client, &history, store, remote_head, &recovery_owner).await?;
+                pull_provider_state(
+                    &client,
+                    &history,
+                    store,
+                    remote_head,
+                    &recovery_owner,
+                    &mut remote_cache,
+                )
+                .await?;
                 return Ok(ProviderSyncResult {
                     action: ProviderSyncAction::Pull,
                     final_root: remote_head.snapshot_root.clone(),
@@ -424,6 +450,7 @@ pub async fn synchronize_provider(
         local_head.clone(),
         remote.clone(),
         local_root,
+        &mut remote_cache,
     )
     .await?;
 
@@ -453,7 +480,15 @@ pub async fn synchronize_provider(
         }
         ProviderSyncRelation::RemoteAhead => {
             let remote = remote.ok_or_else(|| anyhow::anyhow!("Cloud Node provider remote head disappeared"))?;
-            pull_provider_state(&client, &history, store, &remote, &recovery_owner).await?;
+            pull_provider_state(
+                &client,
+                &history,
+                store,
+                &remote,
+                &recovery_owner,
+                &mut remote_cache,
+            )
+            .await?;
             Ok(ProviderSyncResult {
                 action: ProviderSyncAction::Pull,
                 final_root: remote.snapshot_root.clone(),
@@ -486,7 +521,15 @@ pub async fn synchronize_provider(
             }
             ProviderConflictPolicy::PreferRemote => {
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("Cloud Node provider remote head disappeared"))?;
-                pull_provider_state(&client, &history, store, &remote, &recovery_owner).await?;
+                pull_provider_state(
+                &client,
+                &history,
+                store,
+                &remote,
+                &recovery_owner,
+                &mut remote_cache,
+            )
+            .await?;
                 Ok(ProviderSyncResult {
                     action: ProviderSyncAction::ForcedPull,
                     final_root: remote.snapshot_root.clone(),
@@ -526,6 +569,7 @@ async fn status_from_heads(
     local: HistoryCommit,
     remote: Option<HistoryCommit>,
     local_root: String,
+    remote_cache: &mut RemoteCommitCache,
 ) -> anyhow::Result<ProviderSyncStatus> {
     let Some(remote) = remote else {
         return Ok(ProviderSyncStatus {
@@ -540,7 +584,7 @@ async fn status_from_heads(
         ProviderSyncRelation::InSync
     } else if history.is_ancestor(&remote.id, &local.id)? {
         ProviderSyncRelation::LocalAhead
-    } else if remote_is_ancestor(client, &local.id, &remote.id).await? {
+    } else if remote_is_ancestor(client, &local.id, &remote.id, remote_cache).await? {
         ProviderSyncRelation::RemoteAhead
     } else {
         ProviderSyncRelation::Diverged
@@ -602,17 +646,19 @@ async fn pull_provider_state(
     store: &CloudNodeStore,
     remote_head: &HistoryCommit,
     recovery_owner: &str,
+    remote_cache: &mut RemoteCommitCache,
 ) -> anyhow::Result<()> {
     restore_snapshot(client, store, &remote_head.snapshot_root, recovery_owner).await?;
-    import_remote_history(history, client, remote_head).await
+    import_remote_history(history, client, remote_head, remote_cache).await
 }
 
 async fn import_remote_history(
     history: &LocalHistory,
     client: &ProviderClient,
     remote_head: &HistoryCommit,
+    remote_cache: &mut RemoteCommitCache,
 ) -> anyhow::Result<()> {
-    let missing = remote_chain_until_local(history, client, remote_head).await?;
+    let missing = remote_chain_until_local(history, client, remote_head, remote_cache).await?;
     for commit in missing.iter().rev() {
         history.write_commit(commit)?;
     }
@@ -623,6 +669,7 @@ async fn remote_chain_until_local(
     history: &LocalHistory,
     client: &ProviderClient,
     start: &HistoryCommit,
+    remote_cache: &mut RemoteCommitCache,
 ) -> anyhow::Result<Vec<HistoryCommit>> {
     let mut out = Vec::new();
     let mut current = start.clone();
@@ -638,9 +685,11 @@ async fn remote_chain_until_local(
         let Some(parent) = &current.parent else {
             return Ok(out);
         };
-        current = fetch_remote_commit(client, parent).await?.ok_or_else(|| {
-            anyhow::anyhow!("Cloud Node provider history is missing commit {parent}")
-        })?;
+        current = fetch_remote_commit_cached(client, parent, remote_cache)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cloud Node provider history is missing commit {parent}")
+            })?;
     }
     anyhow::bail!("Cloud Node remote provider history exceeded maximum depth")
 }
@@ -649,6 +698,7 @@ async fn remote_is_ancestor(
     client: &ProviderClient,
     ancestor: &str,
     descendant: &str,
+    remote_cache: &mut RemoteCommitCache,
 ) -> anyhow::Result<bool> {
     if ancestor == descendant {
         return Ok(true);
@@ -659,7 +709,7 @@ async fn remote_is_ancestor(
         if !seen.insert(current.clone()) {
             anyhow::bail!("Cloud Node remote provider history contains a cycle");
         }
-        let Some(commit) = fetch_remote_commit(client, &current).await? else {
+        let Some(commit) = fetch_remote_commit_cached(client, &current, remote_cache).await? else {
             return Ok(false);
         };
         let Some(parent) = commit.parent else {
@@ -695,6 +745,21 @@ async fn remote_head_state(client: &ProviderClient) -> anyhow::Result<Option<Rem
         commit,
         version: object.version,
     }))
+}
+
+async fn fetch_remote_commit_cached(
+    client: &ProviderClient,
+    id: &str,
+    remote_cache: &mut RemoteCommitCache,
+) -> anyhow::Result<Option<HistoryCommit>> {
+    if let Some(commit) = remote_cache.get(id) {
+        return Ok(Some(commit.clone()));
+    }
+    let commit = fetch_remote_commit(client, id).await?;
+    if let Some(commit) = commit.as_ref() {
+        remote_cache.insert(commit.id.clone(), commit.clone());
+    }
+    Ok(commit)
 }
 
 async fn fetch_remote_commit(
@@ -1520,6 +1585,28 @@ mod tests {
         let mut missing = valid_file_provider_snapshot();
         missing.resources.pop();
         assert!(validate_snapshot(&missing).is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_commit_cache_serves_known_history_without_network() {
+        let settings: crate::config::ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"http",
+            "namespace":"prod",
+            "bucket":"rbe",
+            "endpoint":"http://127.0.0.1:9",
+            "auth":{"mode":"none"}
+        }))
+        .unwrap();
+        let client = ProviderClient::new(&settings).unwrap();
+        let commit = new_commit("remote-node", None, &"11".repeat(32)).unwrap();
+        let mut cache = RemoteCommitCache::new();
+        cache.insert(commit.id.clone(), commit.clone());
+
+        let fetched = fetch_remote_commit_cached(&client, &commit.id, &mut cache)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched, commit);
     }
 
     #[test]
