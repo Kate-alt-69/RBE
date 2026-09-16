@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,7 @@ const HISTORY_VERSION: u16 = 1;
 const SNAPSHOT_VERSION: u16 = 1;
 const COMMIT_DOMAIN: &[u8] = b"RBE-CN-PROVIDER-COMMIT/1\0";
 const MAX_HISTORY_DEPTH: usize = 100_000;
+const MAX_LOCAL_HISTORY_METADATA_BYTES: u64 = 64 * 1024;
 const PROVIDER_RECOVERY_OWNER_PREFIX: &str = "provider.";
 
 type RemoteCommitCache = HashMap<String, HistoryCommit>;
@@ -169,7 +171,8 @@ impl LocalHistory {
         if !self.head.is_file() {
             return Ok(None);
         }
-        let pointer: HeadPointer = serde_json::from_slice(&fs::read(&self.head)?)?;
+        let pointer: HeadPointer =
+            serde_json::from_slice(&read_local_history_metadata(&self.head)?)?;
         validate_head_pointer(&pointer)?;
         self.read_commit(&pointer.commit).map(Some)
     }
@@ -177,12 +180,13 @@ impl LocalHistory {
     fn read_commit(&self, id: &str) -> anyhow::Result<HistoryCommit> {
         validate_hash(id, "history commit id")?;
         let path = self.commits.join(format!("{id}.json"));
-        let commit: HistoryCommit = serde_json::from_slice(&fs::read(&path).map_err(|error| {
-            anyhow::anyhow!(
-                "failed to read Cloud Node local history commit {}: {error}",
-                path.display()
-            )
-        })?)?;
+        let commit: HistoryCommit =
+            serde_json::from_slice(&read_local_history_metadata(&path).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to read Cloud Node local history commit {}: {error}",
+                    path.display()
+                )
+            })?)?;
         validate_commit(&commit)?;
         if commit.id != id {
             anyhow::bail!("Cloud Node local history commit filename/id mismatch");
@@ -1436,6 +1440,33 @@ fn decode_hash(value: &str, label: &str) -> anyhow::Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("Cloud Node {label} has invalid decoded length"))
 }
 
+fn read_local_history_metadata(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let file = fs::File::open(path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to open Cloud Node local history metadata {}: {error}",
+            path.display()
+        )
+    })?;
+    if file.metadata()?.len() > MAX_LOCAL_HISTORY_METADATA_BYTES {
+        anyhow::bail!(
+            "Cloud Node local history metadata {} exceeds {} bytes",
+            path.display(),
+            MAX_LOCAL_HISTORY_METADATA_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(MAX_LOCAL_HISTORY_METADATA_BYTES as usize);
+    file.take(MAX_LOCAL_HISTORY_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_LOCAL_HISTORY_METADATA_BYTES {
+        anyhow::bail!(
+            "Cloud Node local history metadata {} exceeds {} bytes",
+            path.display(),
+            MAX_LOCAL_HISTORY_METADATA_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
 fn atomic_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec(value)?;
     AtomicIo::new()
@@ -1607,6 +1638,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fetched, commit);
+    }
+
+    #[test]
+    fn local_provider_history_metadata_reads_are_bounded() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let small = root.join("small.json");
+        fs::write(&small, b"{}").unwrap();
+        assert_eq!(read_local_history_metadata(&small).unwrap(), b"{}");
+
+        let oversized = root.join("oversized.json");
+        fs::write(
+            &oversized,
+            vec![b'x'; (MAX_LOCAL_HISTORY_METADATA_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert!(read_local_history_metadata(&oversized).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
