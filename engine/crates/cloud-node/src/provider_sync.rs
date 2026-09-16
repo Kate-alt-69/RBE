@@ -757,10 +757,15 @@ async fn upload_snapshot(
     if let Some(existing) = client.get(&index_key).await? {
         let snapshot: ProviderSnapshot = serde_json::from_slice(&existing)?;
         validate_snapshot(&snapshot)?;
-        if snapshot.root_sha256 == root {
-            return Ok(());
+        if snapshot.root_sha256 != root {
+            anyhow::bail!("Cloud Node provider snapshot index collision for root {root}");
         }
-        anyhow::bail!("Cloud Node provider snapshot index collision for root {root}");
+        if !snapshot_matches_plan(&snapshot, plan)? {
+            anyhow::bail!(
+                "Cloud Node provider snapshot index for root {root} does not match the local sync plan"
+            );
+        }
+        return Ok(());
     }
 
     let cache_root = prepare_outbound_cache(store, cache_owner, plan).await?;
@@ -1106,6 +1111,63 @@ fn resource_record(
     })
 }
 
+fn snapshot_matches_plan(snapshot: &ProviderSnapshot, plan: &SyncPlan) -> anyhow::Result<bool> {
+    let header = plan.header()?;
+    if snapshot.root_sha256 != plan.root_hex()
+        || snapshot.folder_count != header.folder_count
+        || snapshot.video_count != header.video_count
+        || snapshot.file_count != header.file_count
+    {
+        return Ok(false);
+    }
+    let expected = snapshot_resource_keys_for_plan(plan)?;
+    let actual = snapshot
+        .resources
+        .iter()
+        .map(|resource| resource.key.clone())
+        .collect::<HashSet<_>>();
+    Ok(actual == expected)
+}
+
+fn snapshot_resource_keys_for_plan(plan: &SyncPlan) -> anyhow::Result<HashSet<String>> {
+    let root = plan.root_hex();
+    let mut keys = HashSet::new();
+    for object in plan.ordered() {
+        let object_hex = hex::encode(object.object_key);
+        let content_hex = hex::encode(object.content_sha256);
+        let base = format!("snapshots/{root}/objects/{object_hex}/{content_hex}");
+        keys.insert(format!("{base}/{}", object.kind.manifest_name()));
+        match object.kind {
+            BlobKind::Folder => {}
+            BlobKind::File => {
+                keys.insert(format!("{base}/payload"));
+            }
+            BlobKind::Video => {
+                for chunk_path in &object.chunk_paths {
+                    let name = chunk_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Cloud Node video chunk path has no UTF-8 file name: {}",
+                                chunk_path.display()
+                            )
+                        })?;
+                    let chunk = name.strip_suffix(".chunk").ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Cloud Node video chunk path has invalid suffix: {}",
+                            chunk_path.display()
+                        )
+                    })?;
+                    validate_hash(chunk, "video chunk hash")?;
+                    keys.insert(format!("{base}/chunks/{chunk}.chunk"));
+                }
+            }
+        }
+    }
+    Ok(keys)
+}
+
 fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
     if snapshot.format_version != SNAPSHOT_VERSION {
         anyhow::bail!(
@@ -1185,6 +1247,11 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
                 }
             }
             TransferResource::FilePayload => {
+                if resource.resource_sha256 != resource.content_sha256 {
+                    anyhow::bail!(
+                        "Cloud Node provider file payload hash must match its content hash"
+                    );
+                }
                 if !manifests.contains(&identity) {
                     anyhow::bail!(
                         "Cloud Node provider file payload is missing its matching preceding manifest"
@@ -1376,6 +1443,60 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn matching_file_sync_plan() -> SyncPlan {
+        SyncPlan {
+            root_sha256: [0x11; 32],
+            folders: Vec::new(),
+            videos: Vec::new(),
+            files: vec![crate::sync::SyncObject {
+                kind: BlobKind::File,
+                object_key: [0x22; 32],
+                content_sha256: [0x33; 32],
+                logical_path: "db/users.db".into(),
+                logical_size: 0,
+                manifest_path: PathBuf::from("unused/file.blob.cn"),
+                payload_path: Some(PathBuf::from("unused/payload")),
+                chunk_paths: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn existing_provider_snapshot_must_match_sync_plan_resources() {
+        let plan = matching_file_sync_plan();
+        let snapshot = valid_file_provider_snapshot();
+        validate_snapshot(&snapshot).unwrap();
+        assert!(snapshot_matches_plan(&snapshot, &plan).unwrap());
+
+        let mut poisoned = snapshot.clone();
+        let object = "55".repeat(32);
+        let content = "33".repeat(32);
+        for resource in &mut poisoned.resources {
+            resource.object_key = object.clone();
+            resource.key = match TransferResource::try_from(resource.resource).unwrap() {
+                TransferResource::Manifest => format!(
+                    "snapshots/{}/objects/{object}/{content}/{}",
+                    poisoned.root_sha256,
+                    BlobKind::File.manifest_name()
+                ),
+                TransferResource::FilePayload => format!(
+                    "snapshots/{}/objects/{object}/{content}/payload",
+                    poisoned.root_sha256
+                ),
+                TransferResource::VideoChunk => unreachable!(),
+            };
+        }
+        validate_snapshot(&poisoned).unwrap();
+        assert!(!snapshot_matches_plan(&poisoned, &plan).unwrap());
+    }
+
+    #[test]
+    fn provider_snapshot_file_payload_hash_matches_content() {
+        let mut snapshot = valid_file_provider_snapshot();
+        snapshot.resources[1].resource_sha256 = "66".repeat(32);
+        assert!(validate_snapshot(&snapshot).is_err());
     }
 
     #[test]
