@@ -28,11 +28,12 @@ jobs:
 
           path = Path('engine/crates/cloud-node/src/provider_sync.rs')
           text = path.read_text()
-          text = text.replace(
-              'use std::collections::HashSet;\n',
-              'use std::collections::{HashMap, HashSet};\n',
-              1,
-          )
+
+          if 'use std::collections::{HashMap, HashSet};' not in text:
+              anchor = 'use std::collections::HashSet;\n'
+              if anchor not in text:
+                  raise SystemExit('collections import anchor not found')
+              text = text.replace(anchor, 'use std::collections::{HashMap, HashSet};\n', 1)
 
           const_anchor = 'const PROVIDER_RECOVERY_OWNER_PREFIX: &str = "provider.";\n\n'
           if 'type RemoteCommitCache =' not in text:
@@ -44,13 +45,24 @@ jobs:
                   1,
               )
 
-          status_remote = '''    let client = ProviderClient::new(provider)?;\n    let remote = remote_head(&client).await?;\n    let plan = store.sync_plan()?;\n'''
-          status_remote_new = '''    let client = ProviderClient::new(provider)?;\n    let remote = remote_head(&client).await?;\n    let mut remote_cache = RemoteCommitCache::new();\n    if let Some(remote_head) = remote.as_ref() {\n        remote_cache.insert(remote_head.id.clone(), remote_head.clone());\n    }\n    let plan = store.sync_plan()?;\n'''
-          # Occurs in provider_status and synchronize_provider; replace both.
-          if text.count('let mut remote_cache = RemoteCommitCache::new();') < 2:
-              if text.count(status_remote) != 2:
-                  raise SystemExit(f'expected two remote-head anchors, found {text.count(status_remote)}')
-              text = text.replace(status_remote, status_remote_new)
+          cache_block = '''    let mut remote_cache = RemoteCommitCache::new();\n    if let Some(remote_head) = remote.as_ref() {\n        remote_cache.insert(remote_head.id.clone(), remote_head.clone());\n    }\n'''
+
+          status_anchor = '''    let client = ProviderClient::new(provider)?;\n    let remote = remote_head(&client).await?;\n    let plan = store.sync_plan()?;\n'''
+          status_replacement = '''    let client = ProviderClient::new(provider)?;\n    let remote = remote_head(&client).await?;\n''' + cache_block + '''    let plan = store.sync_plan()?;\n'''
+          if text.count('let mut remote_cache = RemoteCommitCache::new();') == 0:
+              if status_anchor not in text:
+                  raise SystemExit('provider_status remote-head anchor not found')
+              text = text.replace(status_anchor, status_replacement, 1)
+
+          sync_anchor = '''    let client = ProviderClient::new(provider)?;\n    let remote = remote_head(&client).await?;\n    let recovery_owner = provider_recovery_owner(&provider.namespace);\n'''
+          sync_replacement = '''    let client = ProviderClient::new(provider)?;\n    let remote = remote_head(&client).await?;\n''' + cache_block + '''    let recovery_owner = provider_recovery_owner(&provider.namespace);\n'''
+          if text.count('let mut remote_cache = RemoteCommitCache::new();') == 1:
+              if sync_anchor not in text:
+                  raise SystemExit('synchronize_provider remote-head anchor not found')
+              text = text.replace(sync_anchor, sync_replacement, 1)
+
+          if text.count('let mut remote_cache = RemoteCommitCache::new();') != 2:
+              raise SystemExit('expected one remote history cache per status/sync transaction')
 
           old_status_call = '''    status_from_heads(&history, &client, local_head, remote, local_root).await\n'''
           new_status_call = '''    status_from_heads(\n        &history,\n        &client,\n        local_head,\n        remote,\n        local_root,\n        &mut remote_cache,\n    )\n    .await\n'''
@@ -62,27 +74,31 @@ jobs:
           if old_sync_status in text:
               text = text.replace(old_sync_status, new_sync_status, 1)
 
-          # Synchronize-provider-only history import / pull calls.
+          direct_import = 'import_remote_history(&history, &client, remote_head).await?;'
+          if direct_import in text:
+              text = text.replace(
+                  direct_import,
+                  'import_remote_history(&history, &client, remote_head, &mut remote_cache).await?;',
+                  1,
+              )
+
+          untracked_pull = 'pull_provider_state(&client, &history, store, remote_head, &recovery_owner).await?;'
+          if untracked_pull in text:
+              text = text.replace(
+                  untracked_pull,
+                  '''pull_provider_state(\n                    &client,\n                    &history,\n                    store,\n                    remote_head,\n                    &recovery_owner,\n                    &mut remote_cache,\n                )\n                .await?;''',
+                  1,
+              )
+
+          remote_pull = 'pull_provider_state(&client, &history, store, &remote, &recovery_owner).await?;'
           text = text.replace(
-              'import_remote_history(&history, &client, remote_head).await?;',
-              'import_remote_history(&history, &client, remote_head, &mut remote_cache).await?;',
-              1,
-          )
-          text = text.replace(
-              'pull_provider_state(&client, &history, store, remote_head, &recovery_owner).await?;',
-              'pull_provider_state(\n                    &client,\n                    &history,\n                    store,\n                    remote_head,\n                    &recovery_owner,\n                    &mut remote_cache,\n                )\n                .await?;',
-              1,
-          )
-          text = text.replace(
-              'pull_provider_state(&client, &history, store, &remote, &recovery_owner).await?;',
-              'pull_provider_state(\n                &client,\n                &history,\n                store,\n                &remote,\n                &recovery_owner,\n                &mut remote_cache,\n            )\n            .await?;',
+              remote_pull,
+              '''pull_provider_state(\n                &client,\n                &history,\n                store,\n                &remote,\n                &recovery_owner,\n                &mut remote_cache,\n            )\n            .await?;''',
           )
 
           status_sig = '''async fn status_from_heads(\n    history: &LocalHistory,\n    client: &ProviderClient,\n    local: HistoryCommit,\n    remote: Option<HistoryCommit>,\n    local_root: String,\n) -> anyhow::Result<ProviderSyncStatus> {\n'''
           status_sig_new = '''async fn status_from_heads(\n    history: &LocalHistory,\n    client: &ProviderClient,\n    local: HistoryCommit,\n    remote: Option<HistoryCommit>,\n    local_root: String,\n    remote_cache: &mut RemoteCommitCache,\n) -> anyhow::Result<ProviderSyncStatus> {\n'''
-          if 'remote_cache: &mut RemoteCommitCache' not in text:
-              if status_sig not in text:
-                  raise SystemExit('status_from_heads signature anchor not found')
+          if status_sig in text:
               text = text.replace(status_sig, status_sig_new, 1)
           text = text.replace(
               'remote_is_ancestor(client, &local.id, &remote.id).await?',
@@ -106,7 +122,7 @@ jobs:
               text = text.replace(chain_sig, chain_sig_new, 1)
           text = text.replace(
               'current = fetch_remote_commit(client, parent).await?.ok_or_else(|| {',
-              'current = fetch_remote_commit_cached(client, parent, remote_cache)\n            .await?\n            .ok_or_else(|| {',
+              '''current = fetch_remote_commit_cached(client, parent, remote_cache)\n            .await?\n            .ok_or_else(|| {''',
               1,
           )
 
@@ -133,6 +149,16 @@ jobs:
               if test_anchor not in text:
                   raise SystemExit('provider sync test anchor not found')
               text = text.replace(test_anchor, test + test_anchor, 1)
+
+          required = [
+              'type RemoteCommitCache =',
+              'fetch_remote_commit_cached(',
+              'remote_cache: &mut RemoteCommitCache',
+              'remote_commit_cache_serves_known_history_without_network',
+          ]
+          for marker in required:
+              if marker not in text:
+                  raise SystemExit(f'missing expected provider history cache marker: {marker}')
 
           path.write_text(text)
           PY
