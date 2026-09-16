@@ -28,8 +28,8 @@ jobs:
             container-runtime
             engine
 
-      - name: Apply trusted Storage project-root boundary
-        run: python3 .github/patches/storage-project-write-v1.py
+      - name: Apply frozen ProjectRoot plumbing
+        run: python3 .github/patches/storage-project-root-plumbing.py
 
       - name: Format Container runtime core
         run: cargo fmt --manifest-path container-runtime/Cargo.toml -p container-runtime-core
@@ -58,15 +58,16 @@ jobs:
       - name: Clippy backend ProjectRoot propagation
         run: cargo clippy --manifest-path engine/Cargo.toml -p backend --all-targets --locked -- -D warnings
 
-      - name: Commit BUG-STO-001
+      - name: Commit BUG-STO-002
         run: |
           rm -f \
             .ci-storage-project-write-v1-trigger \
             .github/patches/storage-project-write-v1.py \
+            .github/patches/storage-project-root-plumbing.py \
             .github/workflows/storage-project-write-v1.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --cached --check
-          git commit -m "FIX | BUG-STO-001 freeze project-root Storage write boundary"
+          git commit -m "FIX | BUG-STO-002 propagate frozen ProjectRoot to Storage"
           git push origin HEAD:main
