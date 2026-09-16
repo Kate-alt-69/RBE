@@ -51,7 +51,7 @@ jobs:
 
           default_anchor = '''const fn default_provider_poll_interval_ms() -> u64 {\n    30_000\n}\n'''
           default_replacement = '''const fn default_provider_max_reconnect_delay_ms() -> u64 {\n    60_000\n}\nconst fn default_provider_poll_interval_ms() -> u64 {\n    30_000\n}\n'''
-          if 'default_provider_max_reconnect_delay_ms' not in text.split('#[cfg(test)]')[0]:
+          if 'const fn default_provider_max_reconnect_delay_ms()' not in text:
               if default_anchor not in text:
                   raise SystemExit('provider poll default anchor not found')
               text = text.replace(default_anchor, default_replacement, 1)
