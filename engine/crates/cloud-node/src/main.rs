@@ -217,6 +217,7 @@ async fn run_provider_daemon(
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
     let client = ProviderClient::new(provider)?;
     let mut retry_delay_ms = provider.reconnect_delay_ms;
+    let mut write_probe_verified = false;
     loop {
         let result = if provider.sync_on_connect {
             synchronize_provider(settings, store).await.map(|sync| {
@@ -230,7 +231,15 @@ async fn run_provider_daemon(
                 );
             })
         } else {
-            client.probe().await.map(|()| {
+            let probe = if write_probe_verified {
+                client.probe_read_only().await
+            } else {
+                client.probe().await
+            };
+            if probe.is_ok() {
+                write_probe_verified = true;
+            }
+            probe.map(|()| {
                 println!(
                     "Cloud Node provider reachable target={}",
                     client.target_description()

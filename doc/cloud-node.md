@@ -114,6 +114,8 @@ Provider transport errors deliberately discard the request URL before they reach
 
 Provider daemon success polling is intentionally separate from failure recovery. `reconnectDelayMs` is the initial delay before retrying a failed provider operation, `maxReconnectDelayMs` caps exponential failure backoff and defaults to `60000` milliseconds, and `pollIntervalMs` controls the cadence after a successful sync/probe and defaults to `30000` milliseconds. `maxReconnectDelayMs` accepts 250 through 3600000 milliseconds and cannot be smaller than `reconnectDelayMs`; `pollIntervalMs` accepts 1000 through 3600000 milliseconds. Successful provider activity resets the retry delay back to `reconnectDelayMs`. This avoids both continuous healthy cloud API traffic and fixed 2-second hammering during prolonged outages.
 
+When `syncOnConnect` is disabled, `cloud_node run` performs one full write+read provider capability probe after process startup. After that succeeds, recurring daemon health checks only read the existing probe object instead of rewriting it on every `pollIntervalMs` cycle. The explicit `probe-provider` command always keeps the full write+read behavior when write capability needs to be tested on demand.
+
 ### Amazon S3
 
 ```json

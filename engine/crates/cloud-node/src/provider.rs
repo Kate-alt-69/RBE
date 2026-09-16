@@ -489,9 +489,14 @@ impl ProviderClient {
         );
         self.put(probe_key, payload.into_bytes(), "application/json")
             .await?;
-        let downloaded = self.get(probe_key).await?.ok_or_else(|| {
-            anyhow::anyhow!("Cloud Node provider probe object disappeared after upload")
-        })?;
+        self.probe_read_only().await
+    }
+
+    pub async fn probe_read_only(&self) -> anyhow::Result<()> {
+        let downloaded = self
+            .get("provider/probe.json")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Cloud Node provider probe object is missing"))?;
         if downloaded.is_empty() {
             anyhow::bail!("Cloud Node provider probe returned an empty object");
         }
