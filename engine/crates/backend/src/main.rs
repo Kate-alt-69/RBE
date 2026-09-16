@@ -511,18 +511,21 @@ fn resolve_settings_path() -> String {
 async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow::Result<()> {
     let er_control_key = host_ready.issue_er_control_key();
     boot_trace("start");
+    let project_root = std::env::current_dir()
+        .map_err(|error| {
+            anyhow::anyhow!("could not capture RBE project root at backend boot: {error}")
+        })?
+        .canonicalize()
+        .map_err(|error| {
+            anyhow::anyhow!("could not canonicalize RBE project root at backend boot: {error}")
+        })?;
     boot_trace(format!(
         "exe={}",
         std::env::current_exe()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|error| format!("<unavailable: {error}>"))
     ));
-    boot_trace(format!(
-        "cwd={}",
-        std::env::current_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|error| format!("<unavailable: {error}>"))
-    ));
+    boot_trace(format!("project_root={}", project_root.display()));
 
     let settings_path = resolve_settings_path();
     boot_trace(format!("settings path={settings_path}"));
@@ -677,6 +680,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         &container_path,
         &config.containers,
         &host_capability_endpoint,
+        &project_root,
     )
     .await?;
     let (address, token, pid) = initial_container.endpoint();
@@ -690,6 +694,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         config.containers.clone(),
         ContainerSupervisorContext {
             host_capability: host_capability_endpoint.clone(),
+            project_root: project_root.clone(),
             process: container_process.clone(),
             client: container_client.clone(),
             maintenance: maintenance.clone(),
@@ -940,6 +945,7 @@ async fn bind_backend_listener(addr: &str) -> anyhow::Result<tokio::net::TcpList
 
 struct ContainerSupervisorContext {
     host_capability: host_capability::HostCapabilityEndpoint,
+    project_root: PathBuf,
     process: Arc<tokio::sync::Mutex<container_process::ContainerProcess>>,
     client: ContainerClient,
     maintenance: Arc<MaintenanceMetrics>,
@@ -954,6 +960,7 @@ fn spawn_container_supervisor(
 ) -> tokio::task::JoinHandle<()> {
     let ContainerSupervisorContext {
         host_capability,
+        project_root,
         process,
         client,
         maintenance,
@@ -1034,6 +1041,7 @@ fn spawn_container_supervisor(
                             &binary,
                             &settings,
                             &host_capability,
+                            &project_root,
                         )
                         .await
                         {
@@ -1092,6 +1100,7 @@ fn spawn_container_supervisor(
                         &binary,
                         &settings,
                         &host_capability,
+                        &project_root,
                     )
                     .await
                     {

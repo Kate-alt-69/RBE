@@ -75,6 +75,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     let debug = args.iter().any(|arg| arg == "--debug");
+    let project_root = value_after(&args, "--application-root")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    let project_root = project_root
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("canonicalize Container application root: {error}"))?;
+    if !project_root.is_dir() {
+        anyhow::bail!(
+            "Container application root is not a directory: {}",
+            project_root.display()
+        );
+    }
     let listen = value_after(&args, "--listen");
     let dashboard_disabled = args.iter().any(|arg| arg == "--no-dashboard");
     let dashboard_address = value_after(&args, "--dashboard-listen")
@@ -145,6 +157,7 @@ fn main() -> anyhow::Result<()> {
         token.as_deref(),
         Arc::clone(&capability_broker),
         capability_dispatcher,
+        project_root,
     )?;
     let runtime = Runtime::new_with_runner(
         RuntimeConfig {

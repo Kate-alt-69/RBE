@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -10,9 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use container_runtime_core::{
-    dispatch_storage_capability, Canceller, CapabilityBroker, CapabilityCall, EnvironmentId,
-    EnvironmentProfile, EnvironmentStorageManager, ExecutionProvenance, ExecutionTask, Runner,
-    DEFAULT_ENVIRONMENT_STORAGE_BYTES,
+    dispatch_storage_capability_with_project_root, Canceller, CapabilityBroker, CapabilityCall,
+    EnvironmentId, EnvironmentProfile, EnvironmentStorageManager, ExecutionProvenance,
+    ExecutionTask, Runner, DEFAULT_ENVIRONMENT_STORAGE_BYTES,
 };
 use ipc_protocol::{
     read_frame, read_worker_output, write_frame, write_worker_capability_result,
@@ -25,7 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CHILD_PROTOCOL_VERSION: u16 = 4;
+const CHILD_PROTOCOL_VERSION: u16 = 5;
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_MAX_BYTES: usize = 128;
@@ -40,6 +41,7 @@ struct Bootstrap {
     environment: String,
     generation: u64,
     storage_limit_bytes: u64,
+    project_root: String,
     debug: bool,
     session: String,
 }
@@ -162,6 +164,7 @@ struct ActiveExecutionIdentity {
 
 struct EnvironmentChildState {
     storage: Arc<EnvironmentStorageManager>,
+    project_root: Arc<PathBuf>,
     active_executions: Mutex<HashMap<String, ActiveExecutionIdentity>>,
     cancelled: Mutex<HashMap<String, Instant>>,
 }
@@ -499,6 +502,7 @@ pub struct EnvironmentProcessSupervisor {
     cancelled: Mutex<HashMap<String, Instant>>,
     capability_broker: Arc<CapabilityBroker>,
     capability_dispatcher: CapabilityDispatcher,
+    project_root: Arc<PathBuf>,
     artifact_crash_circuit: ArtifactCrashCircuit,
 }
 
@@ -509,7 +513,17 @@ impl EnvironmentProcessSupervisor {
         controller_token: Option<&str>,
         capability_broker: Arc<CapabilityBroker>,
         capability_dispatcher: CapabilityDispatcher,
+        project_root: PathBuf,
     ) -> Result<Arc<Self>> {
+        let project_root = project_root
+            .canonicalize()
+            .context("canonicalize Environment supervisor ProjectRoot")?;
+        if !project_root.is_dir() {
+            bail!(
+                "Environment supervisor ProjectRoot is not a directory: {}",
+                project_root.display()
+            );
+        }
         let supervisor = Arc::new(Self {
             debug,
             session_root: make_session_root(controller_token),
@@ -519,6 +533,7 @@ impl EnvironmentProcessSupervisor {
             cancelled: Mutex::new(HashMap::new()),
             capability_broker,
             capability_dispatcher,
+            project_root: Arc::new(project_root),
             artifact_crash_circuit: ArtifactCrashCircuit::default(),
         });
         for id in active_environment_ids(general_environments) {
@@ -1076,6 +1091,11 @@ impl EnvironmentProcessSupervisor {
             environment: id.to_string(),
             generation,
             storage_limit_bytes: DEFAULT_ENVIRONMENT_STORAGE_BYTES,
+            project_root: self
+                .project_root
+                .to_str()
+                .ok_or_else(|| anyhow!("RBE ProjectRoot is not valid UTF-8"))?
+                .to_string(),
             debug: child_debug,
             session: session.clone(),
         });
@@ -1174,6 +1194,15 @@ pub fn run_environment_child() -> Result<()> {
     validate_bootstrap(&bootstrap)?;
     let environment = parse_environment(&bootstrap.environment)
         .ok_or_else(|| anyhow!("invalid Environment {}", bootstrap.environment))?;
+    let project_root = PathBuf::from(&bootstrap.project_root)
+        .canonicalize()
+        .context("canonicalize Environment ProjectRoot")?;
+    if !project_root.is_dir() {
+        bail!(
+            "Environment ProjectRoot is not a directory: {}",
+            project_root.display()
+        );
+    }
     let storage_root = runtime_paths::binary_dir()
         .join("data")
         .join("container-runtime")
@@ -1221,6 +1250,7 @@ pub fn run_environment_child() -> Result<()> {
     let bootstrap = Arc::new(bootstrap);
     let state = Arc::new(EnvironmentChildState {
         storage,
+        project_root: Arc::new(project_root),
         active_executions: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashMap::new()),
     });
@@ -1461,8 +1491,9 @@ fn handle_child_connection(
                         "Storage capability is not bound to the active execution provenance",
                     ),
                     Ok(true) => {
-                        let result = match dispatch_storage_capability(
+                        let result = match dispatch_storage_capability_with_project_root(
                             &state.storage,
+                            &state.project_root,
                             &call.target,
                             &call.operation,
                             &call.payload,
@@ -1934,6 +1965,9 @@ fn validate_bootstrap(bootstrap: &Bootstrap) -> Result<()> {
     if bootstrap.storage_limit_bytes == 0 {
         bail!("Environment storage limit must be non-zero");
     }
+    if bootstrap.project_root.is_empty() {
+        bail!("Environment ProjectRoot must be non-empty");
+    }
     if bootstrap.session.len() != 64
         || bootstrap.session.len() > SESSION_MAX_BYTES
         || !bootstrap
@@ -2084,9 +2118,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let storage = EnvironmentStorageManager::open(root.clone(), 4096).unwrap();
         (
-            root,
+            root.clone(),
             Arc::new(EnvironmentChildState {
                 storage,
+                project_root: Arc::new(root.clone()),
                 active_executions: Mutex::new(HashMap::new()),
                 cancelled: Mutex::new(HashMap::new()),
             }),
@@ -2139,6 +2174,7 @@ mod tests {
             environment: "general-1".into(),
             generation,
             storage_limit_bytes: 4096,
+            project_root: root.to_string_lossy().into_owned(),
             debug: false,
             session: "ab".repeat(32),
         });
@@ -2217,6 +2253,11 @@ mod tests {
             environment: "general-1".into(),
             generation: 0,
             storage_limit_bytes: DEFAULT_ENVIRONMENT_STORAGE_BYTES,
+            project_root: std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             debug: false,
             session: "ab".repeat(32),
         };

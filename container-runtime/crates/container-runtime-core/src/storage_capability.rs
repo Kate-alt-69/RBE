@@ -299,7 +299,10 @@ fn resolve_project_write_path(
                 }
                 segments.push(segment.to_os_string());
             }
-            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
                 return Err(error(
                     "CAPABILITY_STORAGE_PATH_INVALID",
                     "project write path may not contain root, dot, or parent components",
@@ -758,10 +761,7 @@ mod tests {
             }]),
         )
         .unwrap_err();
-        assert_eq!(
-            error.code,
-            "CAPABILITY_STORAGE_PROJECT_ROOT_UNAVAILABLE"
-        );
+        assert_eq!(error.code, "CAPABILITY_STORAGE_PROJECT_ROOT_UNAVAILABLE");
         assert!(!root.join("data/nope.txt").exists());
         let _ = std::fs::remove_dir_all(root);
     }

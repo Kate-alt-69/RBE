@@ -31,7 +31,14 @@ impl ContainerProcess {
         binary: &Path,
         settings: &config::ContainersConfig,
         host_capability: &crate::host_capability::HostCapabilityEndpoint,
+        project_root: &Path,
     ) -> anyhow::Result<Self> {
+        if !project_root.is_absolute() || !project_root.is_dir() {
+            anyhow::bail!(
+                "frozen RBE project root must be an existing absolute directory: {}",
+                project_root.display()
+            );
+        }
         verify_container(binary)?;
         const MAX_SPAWN_ATTEMPTS: u32 = 3;
         let mut last_err = None;
@@ -49,8 +56,11 @@ impl ContainerProcess {
                 // its old standalone dashboard code only for direct debug runs.
                 .arg("--no-dashboard")
                 .arg("--parent-liveness-stdin")
+                .arg("--application-root")
+                .arg(project_root)
                 .arg("--general-environments")
-                .arg(settings.environments.to_string());
+                .arg(settings.environments.to_string())
+                .current_dir(project_root);
             if let Some(value) = settings.swamps_per_environment.fixed() {
                 command
                     .arg("--swamps-per-environment")
