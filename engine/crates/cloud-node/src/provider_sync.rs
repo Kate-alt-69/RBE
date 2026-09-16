@@ -1118,13 +1118,13 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
     let mut folders = HashSet::new();
     let mut videos = HashSet::new();
     let mut files = HashSet::new();
+    let mut manifests = HashSet::new();
+    let mut file_payloads = HashSet::new();
+    let mut resource_paths = HashSet::new();
     for resource in &snapshot.resources {
         validate_hash(&resource.object_key, "provider object key")?;
         validate_hash(&resource.content_sha256, "provider content hash")?;
         validate_hash(&resource.resource_sha256, "provider resource hash")?;
-        if resource.key.is_empty() || resource.key.starts_with('/') || resource.key.contains("..") {
-            anyhow::bail!("Cloud Node provider snapshot contains invalid resource key");
-        }
         let kind = BlobKind::try_from(resource.kind)?;
         let transfer = TransferResource::try_from(resource.resource)?;
         let required_phase = match kind {
@@ -1136,22 +1136,70 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
             anyhow::bail!("Cloud Node provider snapshot resource order regressed");
         }
         phase = required_phase;
-        match transfer {
-            TransferResource::Manifest => match kind {
-                BlobKind::Folder => {
-                    folders.insert(resource.object_key.clone());
-                }
-                BlobKind::Video => {
-                    videos.insert(resource.object_key.clone());
-                }
-                BlobKind::File => {
-                    files.insert(resource.object_key.clone());
-                }
-            },
-            TransferResource::FilePayload if kind == BlobKind::File => {}
-            TransferResource::VideoChunk if kind == BlobKind::Video => {}
+
+        let identity = (
+            resource.kind,
+            resource.object_key.clone(),
+            resource.content_sha256.clone(),
+        );
+        let base = format!(
+            "snapshots/{}/objects/{}/{}",
+            snapshot.root_sha256, resource.object_key, resource.content_sha256
+        );
+        let expected_key = match transfer {
+            TransferResource::Manifest => format!("{base}/{}", kind.manifest_name()),
+            TransferResource::FilePayload if kind == BlobKind::File => {
+                format!("{base}/payload")
+            }
+            TransferResource::VideoChunk if kind == BlobKind::Video => {
+                format!("{base}/chunks/{}.chunk", resource.resource_sha256)
+            }
             _ => {
                 anyhow::bail!("Cloud Node provider snapshot contains invalid resource kind pairing")
+            }
+        };
+        if resource.key != expected_key {
+            anyhow::bail!(
+                "Cloud Node provider snapshot resource key is non-canonical: expected {expected_key:?}, got {:?}",
+                resource.key
+            );
+        }
+        if !resource_paths.insert(resource.key.clone()) {
+            anyhow::bail!("Cloud Node provider snapshot contains a duplicate resource path");
+        }
+
+        match transfer {
+            TransferResource::Manifest => {
+                if !manifests.insert(identity.clone()) {
+                    anyhow::bail!("Cloud Node provider snapshot contains a duplicate manifest");
+                }
+                let inserted = match kind {
+                    BlobKind::Folder => folders.insert(resource.object_key.clone()),
+                    BlobKind::Video => videos.insert(resource.object_key.clone()),
+                    BlobKind::File => files.insert(resource.object_key.clone()),
+                };
+                if !inserted {
+                    anyhow::bail!(
+                        "Cloud Node provider snapshot contains multiple manifests for one object"
+                    );
+                }
+            }
+            TransferResource::FilePayload => {
+                if !manifests.contains(&identity) {
+                    anyhow::bail!(
+                        "Cloud Node provider file payload is missing its matching preceding manifest"
+                    );
+                }
+                if !file_payloads.insert(resource.object_key.clone()) {
+                    anyhow::bail!("Cloud Node provider snapshot contains a duplicate file payload");
+                }
+            }
+            TransferResource::VideoChunk => {
+                if !manifests.contains(&identity) {
+                    anyhow::bail!(
+                        "Cloud Node provider video chunk is missing its matching preceding manifest"
+                    );
+                }
             }
         }
     }
@@ -1160,6 +1208,11 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
         || usize::try_from(snapshot.file_count).ok() != Some(files.len())
     {
         anyhow::bail!("Cloud Node provider snapshot object counts do not match manifest resources");
+    }
+    if file_payloads != files {
+        anyhow::bail!(
+            "Cloud Node provider snapshot file manifests and payload resources do not match"
+        );
     }
     Ok(())
 }
@@ -1287,6 +1340,65 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn valid_file_provider_snapshot() -> ProviderSnapshot {
+        let root = "11".repeat(32);
+        let object = "22".repeat(32);
+        let content = "33".repeat(32);
+        ProviderSnapshot {
+            format_version: SNAPSHOT_VERSION,
+            root_sha256: root.clone(),
+            folder_count: 0,
+            video_count: 0,
+            file_count: 1,
+            resources: vec![
+                ProviderResource {
+                    kind: BlobKind::File as u8,
+                    resource: TransferResource::Manifest as u8,
+                    object_key: object.clone(),
+                    content_sha256: content.clone(),
+                    resource_sha256: "44".repeat(32),
+                    size: 1,
+                    key: format!(
+                        "snapshots/{root}/objects/{object}/{content}/{}",
+                        BlobKind::File.manifest_name()
+                    ),
+                },
+                ProviderResource {
+                    kind: BlobKind::File as u8,
+                    resource: TransferResource::FilePayload as u8,
+                    object_key: object.clone(),
+                    content_sha256: content.clone(),
+                    resource_sha256: content.clone(),
+                    size: 0,
+                    key: format!("snapshots/{root}/objects/{object}/{content}/payload"),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn provider_snapshot_requires_canonical_resource_paths() {
+        let mut snapshot = valid_file_provider_snapshot();
+        validate_snapshot(&snapshot).unwrap();
+        snapshot.resources[1].key = format!("snapshots/{}/index.json", snapshot.root_sha256);
+        assert!(validate_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn provider_snapshot_rejects_duplicate_or_orphan_file_payloads() {
+        let mut duplicate = valid_file_provider_snapshot();
+        duplicate.resources.push(duplicate.resources[1].clone());
+        assert!(validate_snapshot(&duplicate).is_err());
+
+        let mut orphan = valid_file_provider_snapshot();
+        orphan.resources.swap(0, 1);
+        assert!(validate_snapshot(&orphan).is_err());
+
+        let mut missing = valid_file_provider_snapshot();
+        missing.resources.pop();
+        assert!(validate_snapshot(&missing).is_err());
     }
 
     #[test]
