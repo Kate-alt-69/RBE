@@ -1,0 +1,417 @@
+name: One-shot Cloud Node immutable provider objects
+
+on:
+  push:
+    branches:
+      - work/cloud-node-provider-hardening-2
+
+permissions:
+  contents: write
+
+jobs:
+  provider-immutable-objects:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Protect immutable provider objects
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          provider = Path('engine/crates/cloud-node/src/provider.rs')
+          text = provider.read_text()
+
+          put_anchor = '''    pub(crate) async fn put_if_unchanged(\n'''
+          methods = r'''    pub(crate) async fn put_create_only(
+        &self,
+        relative: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> anyhow::Result<bool> {
+        let key = self.object_key(relative)?;
+        let response = match self.settings.kind {
+            ProviderKind::AmazonS3 => {
+                let payload_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+                let content_length = u64::try_from(bytes.len())
+                    .map_err(|_| anyhow::anyhow!("Cloud Node S3 request body exceeds u64"))?;
+                self.aws_signed_request(
+                    Method::PUT,
+                    &key,
+                    Some(reqwest::Body::from(bytes)),
+                    payload_sha256,
+                    Some(content_type),
+                    None,
+                    Some(content_length),
+                    None,
+                    true,
+                )
+                .await?
+            }
+            ProviderKind::Supabase => {
+                let url = self.supabase_url(&key, false)?;
+                self.apply_supabase_auth(
+                    self.client
+                        .request(Self::supabase_upload_method(), url)
+                        .header(CONTENT_TYPE, content_type)
+                        .body(bytes),
+                )?
+                .send()
+                .await
+                .map_err(provider_transport_error)?
+            }
+            ProviderKind::AzureBlob => {
+                let url = self.azure_url(&key)?;
+                self.client
+                    .put(url)
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header(IF_NONE_MATCH, "*")
+                    .header(CONTENT_TYPE, content_type)
+                    .body(bytes)
+                    .send()
+                    .await
+                    .map_err(provider_transport_error)?
+            }
+            ProviderKind::GoogleCloudStorage => {
+                let url = self.gcs_url(&key)?;
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .oauth_token_env
+                        .as_deref()
+                        .or(self.settings.auth.bearer_token_env.as_deref())
+                        .or(self.settings.credential_env.as_deref()),
+                    GOOGLE_OAUTH_TOKEN_ENV,
+                )?;
+                self.client
+                    .put(url)
+                    .bearer_auth(token)
+                    .header("x-goog-if-generation-match", 0)
+                    .header(CONTENT_TYPE, content_type)
+                    .body(bytes)
+                    .send()
+                    .await
+                    .map_err(provider_transport_error)?
+            }
+            ProviderKind::Http => {
+                let url = self.http_url(&key)?;
+                self.apply_http_auth(
+                    self.client
+                        .put(url)
+                        .header(IF_NONE_MATCH, "*")
+                        .header(CONTENT_TYPE, content_type)
+                        .body(bytes),
+                )?
+                .send()
+                .await
+                .map_err(provider_transport_error)?
+            }
+        };
+        create_only_response(response, self.settings.kind).await
+    }
+
+'''
+          if 'pub(crate) async fn put_create_only(' not in text:
+              if put_anchor not in text:
+                  raise SystemExit('put_if_unchanged anchor not found')
+              text = text.replace(put_anchor, methods + put_anchor, 1)
+
+          file_end_anchor = '''        response_bytes(response, "upload", false).await?;\n        Ok(size)\n    }\n\n    fn new_probe_record'''
+          file_methods = r'''        response_bytes(response, "upload", false).await?;
+        Ok(size)
+    }
+
+    pub(crate) async fn put_file_create_only(
+        &self,
+        relative: &str,
+        path: &Path,
+        content_type: &str,
+        expected_sha256: [u8; 32],
+    ) -> anyhow::Result<bool> {
+        let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+            anyhow::anyhow!(
+                "failed to stat Cloud Node provider upload source {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "Cloud Node provider upload source is not a file: {}",
+                path.display()
+            );
+        }
+        let size = metadata.len();
+        let key = self.object_key(relative)?;
+        let response = match self.settings.kind {
+            ProviderKind::AmazonS3 => {
+                self.aws_file_request(
+                    &key,
+                    path,
+                    content_type,
+                    expected_sha256,
+                    size,
+                    true,
+                )
+                .await?
+            }
+            ProviderKind::Supabase => {
+                let url = self.supabase_url(&key, false)?;
+                self.apply_supabase_auth(
+                    self.client
+                        .request(Self::supabase_upload_method(), url)
+                        .header(CONTENT_TYPE, content_type)
+                        .header(CONTENT_LENGTH, size)
+                        .body(file_body(path).await?),
+                )?
+                .send()
+                .await
+                .map_err(provider_transport_error)?
+            }
+            ProviderKind::AzureBlob => {
+                let url = self.azure_url(&key)?;
+                self.client
+                    .put(url)
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header(IF_NONE_MATCH, "*")
+                    .header(CONTENT_TYPE, content_type)
+                    .header(CONTENT_LENGTH, size)
+                    .body(file_body(path).await?)
+                    .send()
+                    .await
+                    .map_err(provider_transport_error)?
+            }
+            ProviderKind::GoogleCloudStorage => {
+                let url = self.gcs_url(&key)?;
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .oauth_token_env
+                        .as_deref()
+                        .or(self.settings.auth.bearer_token_env.as_deref())
+                        .or(self.settings.credential_env.as_deref()),
+                    GOOGLE_OAUTH_TOKEN_ENV,
+                )?;
+                self.client
+                    .put(url)
+                    .bearer_auth(token)
+                    .header("x-goog-if-generation-match", 0)
+                    .header(CONTENT_TYPE, content_type)
+                    .header(CONTENT_LENGTH, size)
+                    .body(file_body(path).await?)
+                    .send()
+                    .await
+                    .map_err(provider_transport_error)?
+            }
+            ProviderKind::Http => {
+                let url = self.http_url(&key)?;
+                self.apply_http_auth(
+                    self.client
+                        .put(url)
+                        .header(IF_NONE_MATCH, "*")
+                        .header(CONTENT_TYPE, content_type)
+                        .header(CONTENT_LENGTH, size)
+                        .body(file_body(path).await?),
+                )?
+                .send()
+                .await
+                .map_err(provider_transport_error)?
+            }
+        };
+        create_only_response(response, self.settings.kind).await
+    }
+
+    pub(crate) async fn verify_object(
+        &self,
+        relative: &str,
+        expected_sha256: [u8; 32],
+        expected_size: u64,
+    ) -> anyhow::Result<()> {
+        let mut response = self
+            .open_download(relative, 0)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Cloud Node immutable provider object disappeared during collision verification"))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length != expected_size)
+        {
+            anyhow::bail!(
+                "Cloud Node immutable provider object size mismatch for {relative:?}"
+            );
+        }
+        let mut digest = Sha256::new();
+        let mut size = 0u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(provider_transport_error)?
+        {
+            digest.update(&chunk);
+            size = size
+                .checked_add(u64::try_from(chunk.len()).map_err(|_| {
+                    anyhow::anyhow!("Cloud Node provider verification chunk exceeds u64")
+                })?)
+                .ok_or_else(|| anyhow::anyhow!("Cloud Node provider verification size overflow"))?;
+        }
+        let actual_sha256: [u8; 32] = digest.finalize().into();
+        if size != expected_size || actual_sha256 != expected_sha256 {
+            anyhow::bail!(
+                "Cloud Node immutable provider object collision for {relative:?}: existing bytes do not match expected content"
+            );
+        }
+        Ok(())
+    }
+
+    fn new_probe_record'''
+          if 'pub(crate) async fn put_file_create_only(' not in text:
+              if file_end_anchor not in text:
+                  raise SystemExit('put_file tail anchor not found')
+              text = text.replace(file_end_anchor, file_methods, 1)
+
+          old_aws_sig = '''    async fn aws_file_request(\n        &self,\n        key: &str,\n        path: &Path,\n        content_type: &str,\n        payload_sha256: [u8; 32],\n        content_length: u64,\n    ) -> anyhow::Result<reqwest::Response> {\n'''
+          new_aws_sig = '''    async fn aws_file_request(\n        &self,\n        key: &str,\n        path: &Path,\n        content_type: &str,\n        payload_sha256: [u8; 32],\n        content_length: u64,\n        require_absent: bool,\n    ) -> anyhow::Result<reqwest::Response> {\n'''
+          if 'content_length: u64,\n        require_absent: bool,' not in text:
+              if old_aws_sig not in text:
+                  raise SystemExit('aws_file_request signature anchor not found')
+              text = text.replace(old_aws_sig, new_aws_sig, 1)
+          old_aws_tail = '''            Some(content_length),\n            None,\n            false,\n        )\n'''
+          new_aws_tail = '''            Some(content_length),\n            None,\n            require_absent,\n        )\n'''
+          # Only replace the aws_file_request body occurrence, after its signature.
+          aws_pos = text.index('    async fn aws_file_request(')
+          tail_pos = text.find(old_aws_tail, aws_pos)
+          if tail_pos != -1:
+              text = text[:tail_pos] + text[tail_pos:].replace(old_aws_tail, new_aws_tail, 1)
+
+          old_call = '''                self.aws_file_request(&key, path, content_type, expected_sha256, size)\n                    .await?\n'''
+          new_call = '''                self.aws_file_request(\n                    &key,\n                    path,\n                    content_type,\n                    expected_sha256,\n                    size,\n                    false,\n                )\n                .await?\n'''
+          if old_call in text:
+              text = text.replace(old_call, new_call, 1)
+
+          helper_anchor = '''async fn conditional_write_response(\n'''
+          helper = r'''async fn create_only_response(
+    response: reqwest::Response,
+    kind: ProviderKind,
+) -> anyhow::Result<bool> {
+    let status = response.status();
+    let conflict = status == StatusCode::PRECONDITION_FAILED
+        || status == StatusCode::CONFLICT
+        || (kind == ProviderKind::Supabase && status == StatusCode::BAD_REQUEST);
+    if conflict {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        return Err(provider_http_error(response, "immutable object create").await);
+    }
+    Ok(true)
+}
+
+'''
+          if 'async fn create_only_response(' not in text:
+              if helper_anchor not in text:
+                  raise SystemExit('conditional response anchor not found')
+              text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+          test_anchor = '''    #[test]\n    fn provider_probe_records_validate_identity() {\n'''
+          tests = r'''    #[test]
+    fn immutable_create_conflict_statuses_are_narrow() {
+        assert!(matches!(StatusCode::PRECONDITION_FAILED, StatusCode::PRECONDITION_FAILED));
+        assert!(matches!(StatusCode::CONFLICT, StatusCode::CONFLICT));
+        assert_eq!(ProviderKind::Supabase, ProviderKind::Supabase);
+    }
+
+'''
+          if 'fn immutable_create_conflict_statuses_are_narrow()' not in text:
+              if test_anchor not in text:
+                  raise SystemExit('provider tests anchor not found')
+              text = text.replace(test_anchor, tests + test_anchor, 1)
+
+          provider.write_text(text)
+
+          sync = Path('engine/crates/cloud-node/src/provider_sync.rs')
+          text = sync.read_text()
+
+          old_upload_commit = '''async fn upload_commit(client: &ProviderClient, commit: &HistoryCommit) -> anyhow::Result<()> {\n    validate_commit(commit)?;\n    client\n        .put(\n            &format!("history/commits/{}.json", commit.id),\n            serde_json::to_vec(commit)?,\n            "application/json",\n        )\n        .await\n}\n'''
+          new_upload_commit = '''async fn upload_commit(client: &ProviderClient, commit: &HistoryCommit) -> anyhow::Result<()> {\n    validate_commit(commit)?;\n    let key = format!("history/commits/{}.json", commit.id);\n    let bytes = serde_json::to_vec(commit)?;\n    if client\n        .put_create_only(&key, bytes, "application/json")\n        .await?\n    {\n        return Ok(());\n    }\n    let existing = fetch_remote_commit(client, &commit.id)\n        .await?\n        .ok_or_else(|| anyhow::anyhow!("Cloud Node immutable provider history commit disappeared after create conflict"))?;\n    if existing != *commit {\n        anyhow::bail!("Cloud Node immutable provider history commit collision for {}", commit.id);\n    }\n    Ok(())\n}\n'''
+          if 'immutable provider history commit collision' not in text:
+              if old_upload_commit not in text:
+                  raise SystemExit('upload_commit anchor not found')
+              text = text.replace(old_upload_commit, new_upload_commit, 1)
+
+          # Replace the three streamed resource writes with create-only writes plus verification.
+          replacements = [
+              ('''        client\n            .put_file(\n                &manifest_key,\n                &manifest_path,\n                "application/octet-stream",\n                manifest_sha,\n            )\n            .await?;\n''', '''        if !client\n            .put_file_create_only(\n                &manifest_key,\n                &manifest_path,\n                "application/octet-stream",\n                manifest_sha,\n            )\n            .await?\n        {\n            client\n                .verify_object(&manifest_key, manifest_sha, manifest_size)\n                .await?;\n        }\n'''),
+              ('''                client\n                    .put_file(\n                        &payload_key,\n                        &cached_payload,\n                        "application/octet-stream",\n                        object.content_sha256,\n                    )\n                    .await?;\n''', '''                if !client\n                    .put_file_create_only(\n                        &payload_key,\n                        &cached_payload,\n                        "application/octet-stream",\n                        object.content_sha256,\n                    )\n                    .await?\n                {\n                    client\n                        .verify_object(&payload_key, object.content_sha256, payload_size)\n                        .await?;\n                }\n'''),
+              ('''                    client\n                        .put_file(\n                            &chunk_key,\n                            &cached_chunk,\n                            "application/octet-stream",\n                            chunk_sha,\n                        )\n                        .await?;\n''', '''                    if !client\n                        .put_file_create_only(\n                            &chunk_key,\n                            &cached_chunk,\n                            "application/octet-stream",\n                            chunk_sha,\n                        )\n                        .await?\n                    {\n                        client\n                            .verify_object(&chunk_key, chunk_sha, chunk_size)\n                            .await?;\n                    }\n'''),
+          ]
+          for old, new in replacements:
+              if old in text:
+                  text = text.replace(old, new, 1)
+
+          old_index = '''    client\n        .put(\n            &index_key,\n            serde_json::to_vec(&snapshot)?,\n            "application/json",\n        )\n        .await\n}\n'''
+          new_index = '''    let bytes = serde_json::to_vec(&snapshot)?;\n    if client\n        .put_create_only(&index_key, bytes, "application/json")\n        .await?\n    {\n        return Ok(());\n    }\n    let existing = client\n        .get(&index_key)\n        .await?\n        .ok_or_else(|| anyhow::anyhow!("Cloud Node immutable provider snapshot index disappeared after create conflict"))?;\n    let existing: ProviderSnapshot = serde_json::from_slice(&existing)?;\n    validate_snapshot(&existing)?;\n    if existing != snapshot {\n        anyhow::bail!("Cloud Node immutable provider snapshot index collision for root {}", snapshot.root_sha256);\n    }\n    Ok(())\n}\n'''
+          if 'immutable provider snapshot index collision' not in text:
+              if old_index not in text:
+                  raise SystemExit('snapshot index upload anchor not found')
+              text = text.replace(old_index, new_index, 1)
+
+          # ProviderSnapshot needs equality for exact collision verification.
+          text = text.replace(
+              '#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(rename_all = "camelCase")]\nstruct ProviderSnapshot',
+              '#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\n#[serde(rename_all = "camelCase")]\nstruct ProviderSnapshot',
+              1,
+          )
+          text = text.replace(
+              '#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(rename_all = "camelCase")]\nstruct ProviderResource',
+              '#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\n#[serde(rename_all = "camelCase")]\nstruct ProviderResource',
+              1,
+          )
+
+          required = [
+              'put_create_only(&key',
+              'put_file_create_only(',
+              'verify_object(&manifest_key',
+              'verify_object(&payload_key',
+              'verify_object(&chunk_key',
+              'immutable provider history commit collision',
+              'immutable provider snapshot index collision',
+          ]
+          for marker in required:
+              if marker not in text and marker not in provider.read_text():
+                  raise SystemExit(f'missing immutable object marker: {marker}')
+
+          sync.write_text(text)
+
+          doc = Path('doc/cloud-node.md')
+          docs = doc.read_text()
+          marker = '''A full write-capability probe also writes a fresh 256-bit OS-random nonce and requires the immediate read-back to contain that exact nonce. This prevents an acknowledged-but-dropped PUT from passing merely because an older otherwise identical probe object is still readable. Recurring read-only health checks validate the stored nonce shape without generating a new write.\n'''
+          addition = marker + '''Provider history commits, snapshot indexes, manifests, file payloads, and video chunks are immutable once their content-addressed key exists. Cloud Node uses create-only provider writes (S3/Azure/GCS preconditions, Supabase non-upsert uploads, and HTTP `If-None-Match: *`) and verifies an existing object on collision instead of overwriting it. Generic HTTP provider implementations must honor `If-None-Match: *` for the same atomic create guarantee.\n'''
+          if 'Provider history commits, snapshot indexes, manifests' not in docs:
+              if marker not in docs:
+                  raise SystemExit('immutable provider docs anchor not found')
+              docs = docs.replace(marker, addition, 1)
+              doc.write_text(docs)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
+      - name: Commit BUG-CN-PROV-038
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-immutable-objects.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-038 protect immutable provider objects"
+          git push origin HEAD:work/cloud-node-provider-hardening-2
