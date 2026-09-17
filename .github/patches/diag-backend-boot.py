@@ -100,24 +100,22 @@ replace_once(
 ''',
 )
 
-# Add focused rendering tests to the existing backend test module.
+# Keep the tests independent from whatever test-module layout main.rs happens
+# to use. A uniquely named module avoids brittle anchor assumptions.
 p = Path(path)
 text = p.read_text()
-anchor = '''#[cfg(test)]
-mod tests {
-'''
-if text.count(anchor) != 1:
-    raise SystemExit("backend main.rs test module anchor drifted")
-text = text.replace(
-    anchor,
-    '''#[cfg(test)]
-mod tests {
+if "backend_boot_fatal_preserves_specific_rbe_codes" in text:
+    raise SystemExit("backend boot diagnostic tests already exist")
+text += r'''
+
+#[cfg(test)]
+mod backend_boot_diagnostic_tests {
     use super::{has_rbe_error_code, render_backend_boot_fatal};
 
     #[test]
     fn backend_boot_fatal_preserves_specific_rbe_codes() {
         let error = anyhow::anyhow!(
-            "RBE5001 Required packaged Container runtime is missing.\\nhelp: doc/error-codes/runtime.md#rbe5001"
+            "RBE5001 Required packaged Container runtime is missing.\nhelp: doc/error-codes/runtime.md#rbe5001"
         );
         let rendered = render_backend_boot_fatal(&error);
         assert!(rendered.starts_with("RBE5001 "));
@@ -133,10 +131,8 @@ mod tests {
         assert!(rendered.contains("synthetic backend startup failure"));
         assert!(rendered.contains("doc/error-codes/runtime.md#rbe5099"));
     }
-
-''',
-    1,
-)
+}
+'''
 p.write_text(text)
 
 # Error Code Book: RBE5001 is now emitted and RBE5099 becomes the generic
