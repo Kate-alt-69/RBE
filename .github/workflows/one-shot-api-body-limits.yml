@@ -57,3 +57,5 @@ jobs:
 
           git pull --rebase origin main
           git push origin HEAD:main
+
+          # retrigger: 2026-09-17
