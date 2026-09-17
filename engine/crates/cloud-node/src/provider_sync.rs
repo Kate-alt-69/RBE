@@ -1201,12 +1201,13 @@ fn snapshot_matches_plan(snapshot: &ProviderSnapshot, plan: &SyncPlan) -> anyhow
         return Ok(false);
     }
     let expected = snapshot_resource_keys_for_plan(plan)?;
-    let actual = snapshot
+    if snapshot.resources.len() != expected.len() {
+        return Ok(false);
+    }
+    Ok(snapshot
         .resources
         .iter()
-        .map(|resource| resource.key.clone())
-        .collect::<HashSet<_>>();
-    Ok(actual == expected)
+        .all(|resource| expected.contains(resource.key.as_str())))
 }
 
 fn snapshot_resource_keys_for_plan(plan: &SyncPlan) -> anyhow::Result<HashSet<String>> {
@@ -1281,8 +1282,8 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
 
         let identity = (
             resource.kind,
-            resource.object_key.clone(),
-            resource.content_sha256.clone(),
+            resource.object_key.as_str(),
+            resource.content_sha256.as_str(),
         );
         let base = format!(
             "snapshots/{}/objects/{}/{}",
@@ -1306,19 +1307,19 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
                 resource.key
             );
         }
-        if !resource_paths.insert(resource.key.clone()) {
+        if !resource_paths.insert(resource.key.as_str()) {
             anyhow::bail!("Cloud Node provider snapshot contains a duplicate resource path");
         }
 
         match transfer {
             TransferResource::Manifest => {
-                if !manifests.insert(identity.clone()) {
+                if !manifests.insert(identity) {
                     anyhow::bail!("Cloud Node provider snapshot contains a duplicate manifest");
                 }
                 let inserted = match kind {
-                    BlobKind::Folder => folders.insert(resource.object_key.clone()),
-                    BlobKind::Video => videos.insert(resource.object_key.clone()),
-                    BlobKind::File => files.insert(resource.object_key.clone()),
+                    BlobKind::Folder => folders.insert(resource.object_key.as_str()),
+                    BlobKind::Video => videos.insert(resource.object_key.as_str()),
+                    BlobKind::File => files.insert(resource.object_key.as_str()),
                 };
                 if !inserted {
                     anyhow::bail!(
@@ -1337,7 +1338,7 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
                         "Cloud Node provider file payload is missing its matching preceding manifest"
                     );
                 }
-                if !file_payloads.insert(resource.object_key.clone()) {
+                if !file_payloads.insert(resource.object_key.as_str()) {
                     anyhow::bail!("Cloud Node provider snapshot contains a duplicate file payload");
                 }
             }
