@@ -236,9 +236,10 @@ async fn run_provider_daemon(
             } else {
                 client.probe().await
             };
-            if probe.is_ok() {
-                write_probe_verified = true;
-            }
+            // A failed read-only health check must fall back to a full write+read
+            // capability probe on the next retry so a deleted probe object can
+            // self-heal instead of leaving the daemon permanently read-only.
+            write_probe_verified = probe.is_ok();
             probe.map(|()| {
                 println!(
                     "Cloud Node provider reachable target={}",

@@ -115,6 +115,7 @@ Provider transport errors deliberately discard the request URL before they reach
 Provider daemon success polling is intentionally separate from failure recovery. `reconnectDelayMs` is the initial delay before retrying a failed provider operation, `maxReconnectDelayMs` caps exponential failure backoff and defaults to `60000` milliseconds, and `pollIntervalMs` controls the cadence after a successful sync/probe and defaults to `30000` milliseconds. `maxReconnectDelayMs` accepts 250 through 3600000 milliseconds and cannot be smaller than `reconnectDelayMs`; `pollIntervalMs` accepts 1000 through 3600000 milliseconds. Successful provider activity resets the retry delay back to `reconnectDelayMs`. This avoids both continuous healthy cloud API traffic and fixed 2-second hammering during prolonged outages.
 
 When `syncOnConnect` is disabled, `cloud_node run` performs one full write+read provider capability probe after process startup. After that succeeds, recurring daemon health checks only read the existing probe object instead of rewriting it on every `pollIntervalMs` cycle. The explicit `probe-provider` command always keeps the full write+read behavior when write capability needs to be tested on demand.
+If a later read-only health check fails, the daemon drops that cached write-capability state and the next retry performs a full write+read probe again. This lets a deleted or lost `provider/probe.json` object self-heal instead of leaving the daemon stuck in permanent read-only probe failures.
 
 ### Amazon S3
 
@@ -214,6 +215,10 @@ Set `RBE_CN_PROV_GOOGLE_OAUTH_TOKEN` to the OAuth Bearer token used for the conf
 ### Provider history and synchronization
 
 Provider mode maintains a local commit chain under `provider-history/<namespace>/`. Each history commit identifies a complete Cloud Node snapshot root and its parent commit. The provider stores the immutable snapshot data and history commits plus a mutable `HEAD.json` pointer.
+
+Local provider-history JSON metadata is treated as untrusted disk input when read back. `HEAD.json` and individual commit files are bounded to 64 KiB before JSON decoding, preventing a corrupted or externally replaced history file from causing unbounded memory allocation during status or synchronization.
+Remote provider control metadata is bounded independently from snapshot indexes: `history/HEAD.json`, individual history commits, and the provider probe are capped at 64 KiB, while snapshot indexes retain the broader 64 MiB metadata allowance needed for large object graphs.
+Provider-history directories are created through Cloud Node's durable directory helper before commits or lock files are placed inside them, so newly created namespace/commit directory entries receive the same parent-directory sync treatment used by the recovery/store paths on platforms that support directory fsync.
 
 The relation is deterministic:
 

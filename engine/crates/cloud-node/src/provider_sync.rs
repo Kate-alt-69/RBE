@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::client::{cached_resource_path, cleanup_outbound_cache, prepare_outbound_cache};
 use crate::config::{validate_node_id, CloudNodeSettings, ProviderConflictPolicy};
+use crate::durable;
 use crate::format::BlobKind;
 use crate::provider::{ProviderClient, ProviderObjectVersion};
 use crate::recovery::CloudNodeRecoveryReceiver;
@@ -22,6 +24,8 @@ const HISTORY_VERSION: u16 = 1;
 const SNAPSHOT_VERSION: u16 = 1;
 const COMMIT_DOMAIN: &[u8] = b"RBE-CN-PROVIDER-COMMIT/1\0";
 const MAX_HISTORY_DEPTH: usize = 100_000;
+const MAX_LOCAL_HISTORY_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_REMOTE_HISTORY_METADATA_BYTES: usize = 64 * 1024;
 const PROVIDER_RECOVERY_OWNER_PREFIX: &str = "provider.";
 
 type RemoteCommitCache = HashMap<String, HistoryCommit>;
@@ -118,7 +122,7 @@ impl ProviderSyncLock {
             .root
             .join("provider-history")
             .join(namespace);
-        fs::create_dir_all(&root)?;
+        durable::create_dir_all(&root)?;
         let path = root.join(".sync.lock");
         let file = fs::OpenOptions::new()
             .create(true)
@@ -169,7 +173,8 @@ impl LocalHistory {
         if !self.head.is_file() {
             return Ok(None);
         }
-        let pointer: HeadPointer = serde_json::from_slice(&fs::read(&self.head)?)?;
+        let pointer: HeadPointer =
+            serde_json::from_slice(&read_local_history_metadata(&self.head)?)?;
         validate_head_pointer(&pointer)?;
         self.read_commit(&pointer.commit).map(Some)
     }
@@ -177,12 +182,13 @@ impl LocalHistory {
     fn read_commit(&self, id: &str) -> anyhow::Result<HistoryCommit> {
         validate_hash(id, "history commit id")?;
         let path = self.commits.join(format!("{id}.json"));
-        let commit: HistoryCommit = serde_json::from_slice(&fs::read(&path).map_err(|error| {
-            anyhow::anyhow!(
-                "failed to read Cloud Node local history commit {}: {error}",
-                path.display()
-            )
-        })?)?;
+        let commit: HistoryCommit =
+            serde_json::from_slice(&read_local_history_metadata(&path).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to read Cloud Node local history commit {}: {error}",
+                    path.display()
+                )
+            })?)?;
         validate_commit(&commit)?;
         if commit.id != id {
             anyhow::bail!("Cloud Node local history commit filename/id mismatch");
@@ -201,7 +207,7 @@ impl LocalHistory {
 
     fn write_commit(&self, commit: &HistoryCommit) -> anyhow::Result<()> {
         validate_commit(commit)?;
-        fs::create_dir_all(&self.commits)?;
+        durable::create_dir_all(&self.commits)?;
         let path = self.commits.join(format!("{}.json", commit.id));
         if path.is_file() {
             let existing = self.read_commit(&commit.id)?;
@@ -728,7 +734,10 @@ async fn remote_head(client: &ProviderClient) -> anyhow::Result<Option<HistoryCo
 }
 
 async fn remote_head_state(client: &ProviderClient) -> anyhow::Result<Option<RemoteHeadState>> {
-    let Some(object) = client.get_versioned("history/HEAD.json").await? else {
+    let Some(object) = client
+        .get_versioned_limited("history/HEAD.json", MAX_REMOTE_HISTORY_METADATA_BYTES)
+        .await?
+    else {
         return Ok(None);
     };
     let pointer: HeadPointer = serde_json::from_slice(&object.bytes)?;
@@ -767,7 +776,13 @@ async fn fetch_remote_commit(
     id: &str,
 ) -> anyhow::Result<Option<HistoryCommit>> {
     validate_hash(id, "history commit id")?;
-    let Some(bytes) = client.get(&format!("history/commits/{id}.json")).await? else {
+    let Some(bytes) = client
+        .get_limited(
+            &format!("history/commits/{id}.json"),
+            MAX_REMOTE_HISTORY_METADATA_BYTES,
+        )
+        .await?
+    else {
         return Ok(None);
     };
     let commit: HistoryCommit = serde_json::from_slice(&bytes)?;
@@ -1186,12 +1201,13 @@ fn snapshot_matches_plan(snapshot: &ProviderSnapshot, plan: &SyncPlan) -> anyhow
         return Ok(false);
     }
     let expected = snapshot_resource_keys_for_plan(plan)?;
-    let actual = snapshot
+    if snapshot.resources.len() != expected.len() {
+        return Ok(false);
+    }
+    Ok(snapshot
         .resources
         .iter()
-        .map(|resource| resource.key.clone())
-        .collect::<HashSet<_>>();
-    Ok(actual == expected)
+        .all(|resource| expected.contains(resource.key.as_str())))
 }
 
 fn snapshot_resource_keys_for_plan(plan: &SyncPlan) -> anyhow::Result<HashSet<String>> {
@@ -1266,8 +1282,8 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
 
         let identity = (
             resource.kind,
-            resource.object_key.clone(),
-            resource.content_sha256.clone(),
+            resource.object_key.as_str(),
+            resource.content_sha256.as_str(),
         );
         let base = format!(
             "snapshots/{}/objects/{}/{}",
@@ -1291,19 +1307,19 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
                 resource.key
             );
         }
-        if !resource_paths.insert(resource.key.clone()) {
+        if !resource_paths.insert(resource.key.as_str()) {
             anyhow::bail!("Cloud Node provider snapshot contains a duplicate resource path");
         }
 
         match transfer {
             TransferResource::Manifest => {
-                if !manifests.insert(identity.clone()) {
+                if !manifests.insert(identity) {
                     anyhow::bail!("Cloud Node provider snapshot contains a duplicate manifest");
                 }
                 let inserted = match kind {
-                    BlobKind::Folder => folders.insert(resource.object_key.clone()),
-                    BlobKind::Video => videos.insert(resource.object_key.clone()),
-                    BlobKind::File => files.insert(resource.object_key.clone()),
+                    BlobKind::Folder => folders.insert(resource.object_key.as_str()),
+                    BlobKind::Video => videos.insert(resource.object_key.as_str()),
+                    BlobKind::File => files.insert(resource.object_key.as_str()),
                 };
                 if !inserted {
                     anyhow::bail!(
@@ -1322,7 +1338,7 @@ fn validate_snapshot(snapshot: &ProviderSnapshot) -> anyhow::Result<()> {
                         "Cloud Node provider file payload is missing its matching preceding manifest"
                     );
                 }
-                if !file_payloads.insert(resource.object_key.clone()) {
+                if !file_payloads.insert(resource.object_key.as_str()) {
                     anyhow::bail!("Cloud Node provider snapshot contains a duplicate file payload");
                 }
             }
@@ -1434,6 +1450,33 @@ fn decode_hash(value: &str, label: &str) -> anyhow::Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("Cloud Node {label} has invalid decoded length"))
+}
+
+fn read_local_history_metadata(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let file = fs::File::open(path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to open Cloud Node local history metadata {}: {error}",
+            path.display()
+        )
+    })?;
+    if file.metadata()?.len() > MAX_LOCAL_HISTORY_METADATA_BYTES {
+        anyhow::bail!(
+            "Cloud Node local history metadata {} exceeds {} bytes",
+            path.display(),
+            MAX_LOCAL_HISTORY_METADATA_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(MAX_LOCAL_HISTORY_METADATA_BYTES as usize);
+    file.take(MAX_LOCAL_HISTORY_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_LOCAL_HISTORY_METADATA_BYTES {
+        anyhow::bail!(
+            "Cloud Node local history metadata {} exceeds {} bytes",
+            path.display(),
+            MAX_LOCAL_HISTORY_METADATA_BYTES
+        );
+    }
+    Ok(bytes)
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
@@ -1607,6 +1650,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fetched, commit);
+    }
+
+    #[test]
+    fn local_provider_history_metadata_reads_are_bounded() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let small = root.join("small.json");
+        fs::write(&small, b"{}").unwrap();
+        assert_eq!(read_local_history_metadata(&small).unwrap(), b"{}");
+
+        let oversized = root.join("oversized.json");
+        fs::write(
+            &oversized,
+            vec![b'x'; (MAX_LOCAL_HISTORY_METADATA_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert!(read_local_history_metadata(&oversized).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

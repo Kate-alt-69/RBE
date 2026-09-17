@@ -27,6 +27,7 @@ const HTTP_PASSWORD_ENV: &str = "RBE_CN_PROV_HTTP_PASSWORD";
 const HTTP_HEADER_VALUE_ENV: &str = "RBE_CN_PROV_HTTP_HEADER_VALUE";
 const MAX_PROVIDER_ERROR_BYTES: usize = 1024;
 const MAX_PROVIDER_METADATA_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PROVIDER_CONTROL_METADATA_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_SECRET_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone)]
@@ -115,15 +116,25 @@ impl ProviderClient {
     }
 
     pub async fn get(&self, relative: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.get_limited(relative, MAX_PROVIDER_METADATA_BYTES)
+            .await
+    }
+
+    pub(crate) async fn get_limited(
+        &self,
+        relative: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(self
-            .get_versioned(relative)
+            .get_versioned_limited(relative, max_bytes)
             .await?
             .map(|object| object.bytes))
     }
 
-    pub(crate) async fn get_versioned(
+    pub(crate) async fn get_versioned_limited(
         &self,
         relative: &str,
+        max_bytes: usize,
     ) -> anyhow::Result<Option<ProviderMetadataObject>> {
         let key = self.object_key(relative)?;
         let response = match self.settings.kind {
@@ -172,10 +183,19 @@ impl ProviderClient {
                     .map_err(provider_transport_error)?
             }
         };
-        let version = provider_object_version(self.settings.kind, response.headers())?;
-        let Some(bytes) = response_bytes(response, "download", true).await? else {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Ok(None);
-        };
+        }
+        if !status.is_success() {
+            return Err(provider_http_error(response, "download").await);
+        }
+        let version = provider_object_version(self.settings.kind, response.headers())?;
+        let bytes = response_bytes_limited(response, "download", false, max_bytes)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cloud Node provider successful metadata response disappeared")
+            })?;
         Ok(Some(ProviderMetadataObject { bytes, version }))
     }
 
@@ -494,7 +514,7 @@ impl ProviderClient {
 
     pub async fn probe_read_only(&self) -> anyhow::Result<()> {
         let downloaded = self
-            .get("provider/probe.json")
+            .get_limited("provider/probe.json", MAX_PROVIDER_CONTROL_METADATA_BYTES)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Cloud Node provider probe object is missing"))?;
         if downloaded.is_empty() {
@@ -1045,9 +1065,24 @@ async fn checked_download_response(
 }
 
 async fn response_bytes(
+    response: reqwest::Response,
+    operation: &str,
+    allow_not_found: bool,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    response_bytes_limited(
+        response,
+        operation,
+        allow_not_found,
+        MAX_PROVIDER_METADATA_BYTES,
+    )
+    .await
+}
+
+async fn response_bytes_limited(
     mut response: reqwest::Response,
     operation: &str,
     allow_not_found: bool,
+    max_metadata_bytes: usize,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let status = response.status();
     if allow_not_found && status == StatusCode::NOT_FOUND {
@@ -1061,26 +1096,21 @@ async fn response_bytes(
     }
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_PROVIDER_METADATA_BYTES as u64)
+        .is_some_and(|length| length > max_metadata_bytes as u64)
     {
         anyhow::bail!(
             "Cloud Node provider metadata exceeds {} bytes",
-            MAX_PROVIDER_METADATA_BYTES
+            max_metadata_bytes
         );
     }
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(0)
-        .min(MAX_PROVIDER_METADATA_BYTES);
+        .min(max_metadata_bytes);
     let mut bytes = Vec::with_capacity(capacity);
     while let Some(chunk) = response.chunk().await? {
-        append_bounded_bytes(
-            &mut bytes,
-            &chunk,
-            MAX_PROVIDER_METADATA_BYTES,
-            "provider metadata",
-        )?;
+        append_bounded_bytes(&mut bytes, &chunk, max_metadata_bytes, "provider metadata")?;
     }
     Ok(Some(bytes))
 }
