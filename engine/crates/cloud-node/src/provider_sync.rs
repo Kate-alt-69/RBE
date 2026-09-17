@@ -25,6 +25,7 @@ const SNAPSHOT_VERSION: u16 = 1;
 const COMMIT_DOMAIN: &[u8] = b"RBE-CN-PROVIDER-COMMIT/1\0";
 const MAX_HISTORY_DEPTH: usize = 100_000;
 const MAX_LOCAL_HISTORY_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_REMOTE_HISTORY_METADATA_BYTES: usize = 64 * 1024;
 const PROVIDER_RECOVERY_OWNER_PREFIX: &str = "provider.";
 
 type RemoteCommitCache = HashMap<String, HistoryCommit>;
@@ -733,7 +734,10 @@ async fn remote_head(client: &ProviderClient) -> anyhow::Result<Option<HistoryCo
 }
 
 async fn remote_head_state(client: &ProviderClient) -> anyhow::Result<Option<RemoteHeadState>> {
-    let Some(object) = client.get_versioned("history/HEAD.json").await? else {
+    let Some(object) = client
+        .get_versioned_limited("history/HEAD.json", MAX_REMOTE_HISTORY_METADATA_BYTES)
+        .await?
+    else {
         return Ok(None);
     };
     let pointer: HeadPointer = serde_json::from_slice(&object.bytes)?;
@@ -772,7 +776,13 @@ async fn fetch_remote_commit(
     id: &str,
 ) -> anyhow::Result<Option<HistoryCommit>> {
     validate_hash(id, "history commit id")?;
-    let Some(bytes) = client.get(&format!("history/commits/{id}.json")).await? else {
+    let Some(bytes) = client
+        .get_limited(
+            &format!("history/commits/{id}.json"),
+            MAX_REMOTE_HISTORY_METADATA_BYTES,
+        )
+        .await?
+    else {
         return Ok(None);
     };
     let commit: HistoryCommit = serde_json::from_slice(&bytes)?;
