@@ -183,11 +183,19 @@ impl ProviderClient {
                     .map_err(provider_transport_error)?
             }
         };
-        let version = provider_object_version(self.settings.kind, response.headers())?;
-        let Some(bytes) = response_bytes_limited(response, "download", true, max_bytes).await?
-        else {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Ok(None);
-        };
+        }
+        if !status.is_success() {
+            return Err(provider_http_error(response, "download").await);
+        }
+        let version = provider_object_version(self.settings.kind, response.headers())?;
+        let bytes = response_bytes_limited(response, "download", false, max_bytes)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cloud Node provider successful metadata response disappeared")
+            })?;
         Ok(Some(ProviderMetadataObject { bytes, version }))
     }
 
