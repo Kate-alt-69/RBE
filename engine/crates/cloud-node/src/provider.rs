@@ -8,6 +8,7 @@ use reqwest::header::{
 };
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 
@@ -29,6 +30,7 @@ const MAX_PROVIDER_ERROR_BYTES: usize = 1024;
 const MAX_PROVIDER_METADATA_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROVIDER_CONTROL_METADATA_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_SECRET_FILE_BYTES: u64 = 64 * 1024;
+const PROVIDER_PROBE_VERSION: u16 = 1;
 
 #[derive(Clone)]
 pub struct ProviderClient {
@@ -46,6 +48,13 @@ pub(crate) enum ProviderObjectVersion {
 pub(crate) struct ProviderMetadataObject {
     pub bytes: Vec<u8>,
     pub version: Option<ProviderObjectVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProviderProbe {
+    format_version: u16,
+    namespace: String,
 }
 
 impl ProviderClient {
@@ -501,14 +510,17 @@ impl ProviderClient {
         Ok(size)
     }
 
+    fn probe_record(&self) -> ProviderProbe {
+        ProviderProbe {
+            format_version: PROVIDER_PROBE_VERSION,
+            namespace: self.settings.namespace.clone(),
+        }
+    }
+
     pub async fn probe(&self) -> anyhow::Result<()> {
         let probe_key = "provider/probe.json";
-        let payload = format!(
-            "{{\"formatVersion\":1,\"namespace\":{}}}",
-            serde_json::to_string(&self.settings.namespace)?
-        );
-        self.put(probe_key, payload.into_bytes(), "application/json")
-            .await?;
+        let payload = serde_json::to_vec(&self.probe_record())?;
+        self.put(probe_key, payload, "application/json").await?;
         self.probe_read_only().await
     }
 
@@ -517,8 +529,18 @@ impl ProviderClient {
             .get_limited("provider/probe.json", MAX_PROVIDER_CONTROL_METADATA_BYTES)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Cloud Node provider probe object is missing"))?;
-        if downloaded.is_empty() {
-            anyhow::bail!("Cloud Node provider probe returned an empty object");
+        let actual: ProviderProbe = serde_json::from_slice(&downloaded).map_err(|error| {
+            anyhow::anyhow!("Cloud Node provider probe is invalid JSON: {error}")
+        })?;
+        let expected = self.probe_record();
+        if actual != expected {
+            anyhow::bail!(
+                "Cloud Node provider probe identity mismatch: expected namespace {:?} format {}, got namespace {:?} format {}",
+                expected.namespace,
+                expected.format_version,
+                actual.namespace,
+                actual.format_version
+            );
         }
         Ok(())
     }
@@ -1514,6 +1536,25 @@ mod tests {
                 .unwrap(),
             99
         );
+    }
+
+    #[test]
+    fn provider_probe_record_is_versioned_and_namespace_bound() {
+        let settings: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"http",
+            "namespace":"prod-a",
+            "bucket":"rbe",
+            "endpoint":"https://storage.example.invalid",
+            "auth":{"mode":"none"}
+        }))
+        .unwrap();
+        let client = ProviderClient::new(&settings).unwrap();
+        let probe = client.probe_record();
+        assert_eq!(probe.format_version, PROVIDER_PROBE_VERSION);
+        assert_eq!(probe.namespace, "prod-a");
+        let encoded = serde_json::to_vec(&probe).unwrap();
+        let decoded: ProviderProbe = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, probe);
     }
 
     #[test]
