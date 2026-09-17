@@ -1,5 +1,9 @@
 from pathlib import Path
 
+# Semantic guard: descriptor lowering must remain tied to the imported Storage
+# capability, never to a user helper merely named `write`. This file is also
+# intentionally modified while the first one-shot is running so that its final
+# delete/rebase cannot land the over-broad identifier-based rewrite.
 path = Path('.github/patches/storage-rel-write-v1.py')
 text = path.read_text(encoding='utf-8')
 for old, new in [
