@@ -24,13 +24,94 @@ const CONTAINER: &str = include_str!("../../../../doc/error-codes/container.md")
 const RUNTIME: &str = include_str!("../../../../doc/error-codes/runtime.md");
 
 pub fn requested(args: &[String]) -> Option<anyhow::Result<String>> {
-    let index = args.iter().position(|arg| arg == "--explain")?;
-    let Some(code) = args.get(index + 1) else {
-        return Some(Err(anyhow::anyhow!(
-            "--explain requires an error code, for example RELC3001"
-        )));
-    };
-    Some(explain(code))
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--explain" {
+            let Some(code) = args.get(index + 1) else {
+                return Some(Err(anyhow::anyhow!(
+                    "--explain requires an error code, for example RELC3001"
+                )));
+            };
+            return Some(explain(code));
+        }
+        if let Some(code) = arg.strip_prefix("--explain=") {
+            return Some(explain(code));
+        }
+        if arg == "--list-error-codes" {
+            let prefix = args
+                .get(index + 1)
+                .filter(|value| !value.starts_with('-'))
+                .map(String::as_str);
+            return Some(list_codes(prefix));
+        }
+    }
+    None
+}
+
+fn catalog() -> anyhow::Result<serde_json::Value> {
+    serde_json::from_str(CATALOG)
+        .map_err(|error| anyhow::anyhow!("embedded Error Code Book catalog is invalid: {error}"))
+}
+
+fn entries(catalog: &serde_json::Value) -> anyhow::Result<&Vec<serde_json::Value>> {
+    catalog
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("embedded Error Code Book catalog has no entries"))
+}
+
+fn code_prefix(code: &str) -> String {
+    code.chars()
+        .take_while(|character| character.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn render_known_codes(
+    entries: &[serde_json::Value],
+    prefix: Option<&str>,
+    limit: Option<usize>,
+) -> Vec<String> {
+    let normalized = prefix.map(|value| value.trim().to_ascii_uppercase());
+    let mut out = entries
+        .iter()
+        .filter_map(|entry| {
+            let code = entry.get("code")?.as_str()?;
+            if normalized
+                .as_deref()
+                .is_some_and(|prefix| !code.starts_with(prefix))
+            {
+                return None;
+            }
+            let status = entry
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let title = entry
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("RBE diagnostic");
+            Some(format!("{code:<10} [{status:<8}] {title}"))
+        })
+        .collect::<Vec<_>>();
+    out.sort();
+    if let Some(limit) = limit {
+        out.truncate(limit);
+    }
+    out
+}
+
+pub fn list_codes(prefix: Option<&str>) -> anyhow::Result<String> {
+    let catalog = catalog()?;
+    let entries = entries(&catalog)?;
+    let lines = render_known_codes(entries, prefix, None);
+    if lines.is_empty() {
+        let requested = prefix.unwrap_or("<all>").trim().to_ascii_uppercase();
+        anyhow::bail!("no RBE error codes are registered for prefix {requested}");
+    }
+    let heading = prefix
+        .map(|value| format!("RBE Error Code Book — {}", value.trim().to_ascii_uppercase()))
+        .unwrap_or_else(|| "RBE Error Code Book".to_string());
+    Ok(format!("{heading}\n\n{}", lines.join("\n")))
 }
 
 pub fn explain(code: &str) -> anyhow::Result<String> {
@@ -39,26 +120,39 @@ pub fn explain(code: &str) -> anyhow::Result<String> {
         anyhow::bail!("error code cannot be empty");
     }
 
-    let catalog: serde_json::Value = serde_json::from_str(CATALOG)
-        .map_err(|error| anyhow::anyhow!("embedded Error Code Book catalog is invalid: {error}"))?;
-    let entries = catalog
-        .get("entries")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("embedded Error Code Book catalog has no entries"))?;
-    let entry = entries
-        .iter()
-        .find(|entry| {
-            entry
-                .get("code")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| value.eq_ignore_ascii_case(&requested))
-        })
-        .ok_or_else(|| anyhow::anyhow!("unknown RBE error code {requested}"))?;
+    let catalog = catalog()?;
+    let entries = entries(&catalog)?;
+    let Some(entry) = entries.iter().find(|entry| {
+        entry
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(&requested))
+    }) else {
+        let prefix = code_prefix(&requested);
+        let suggestions = render_known_codes(
+            entries,
+            (!prefix.is_empty()).then_some(prefix.as_str()),
+            Some(8),
+        );
+        if suggestions.is_empty() {
+            anyhow::bail!(
+                "unknown RBE error code {requested}; use --list-error-codes to inspect registered codes"
+            );
+        }
+        anyhow::bail!(
+            "unknown RBE error code {requested}. Nearby registered codes:\n{}",
+            suggestions.join("\n")
+        );
+    };
 
     let title = entry
         .get("title")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("RBE diagnostic");
+    let status = entry
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
     let doc = entry
         .get("doc")
         .and_then(serde_json::Value::as_str)
@@ -82,9 +176,25 @@ pub fn explain(code: &str) -> anyhow::Result<String> {
     let tail = &page[start..];
     let end = tail.find("\n<a id=\"").unwrap_or(tail.len());
     let section = tail[..end].trim();
+    let body = section
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if index == 0 && line.starts_with("### ") {
+                None
+            } else if line.starts_with("**Status:**") {
+                None
+            } else {
+                Some(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
 
     Ok(format!(
-        "{requested} — {title}\n\n{section}\n\nReference: doc/error-codes/{doc}"
+        "{requested} — {title}\nStatus: {status}\n\n{body}\n\nReference: doc/error-codes/{doc}"
     ))
 }
 
@@ -98,6 +208,7 @@ mod tests {
         assert!(rendered.contains("RELC3001"));
         assert!(rendered.contains("native Container execution required"));
         assert!(rendered.contains("doc/error-codes/relc.md#relc3001"));
+        assert_eq!(rendered.matches("RELC3001").count(), 1);
     }
 
     #[test]
@@ -108,15 +219,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_error_code() {
-        let error = explain("NOPE9999").expect_err("unknown codes must be rejected");
-        assert!(error.to_string().contains("unknown RBE error code"));
+    fn unknown_code_suggests_same_prefix() {
+        let error = explain("RELC3999").expect_err("unknown codes must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("unknown RBE error code RELC3999"));
+        assert!(message.contains("RELC3001"));
+    }
+
+    #[test]
+    fn lists_codes_by_prefix() {
+        let rendered = list_codes(Some("REL")).expect("REL code list must exist");
+        assert!(rendered.contains("REL1000"));
+        assert!(!rendered.contains("RELC1000"));
+    }
+
+    #[test]
+    fn requested_accepts_equals_form() {
+        let args = vec!["--explain=svc5002".to_string()];
+        let rendered = requested(&args)
+            .expect("lookup should be detected")
+            .expect("lookup should succeed");
+        assert!(rendered.contains("SVC5002"));
     }
 }
 '''
 Path('engine/crates/backend/src/error_code_book.rs').write_text(module)
 
-# backend.exe handles --explain before HostBootstrap/settings/logging.
+# backend.exe handles Error Code Book requests before HostBootstrap/settings/logging.
 path = 'engine/crates/backend/src/main.rs'
 replace_once(
     path,
@@ -186,10 +315,12 @@ replace_once(
 
 ```text
 backend.exe --explain RELC3001
+backend.exe --explain=RELC3001
+backend.exe --list-error-codes RELC
 service.exe --explain SVC5002
 ```
 
-The lookup is compiled from this authoritative documentation tree, so it does not require network access or a mutable runtime docs directory.
+Unknown codes suggest nearby registered codes from the same prefix. The lookup is compiled from this authoritative documentation tree, so it does not require network access or a mutable runtime docs directory.
 
 For machine-readable tooling, see [`catalog.json`](catalog.json).
 ''',
