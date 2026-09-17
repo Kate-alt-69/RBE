@@ -116,6 +116,7 @@ Provider daemon success polling is intentionally separate from failure recovery.
 
 When `syncOnConnect` is disabled, `cloud_node run` performs one full write+read provider capability probe after process startup. After that succeeds, recurring daemon health checks only read the existing probe object instead of rewriting it on every `pollIntervalMs` cycle. The explicit `probe-provider` command always keeps the full write+read behavior when write capability needs to be tested on demand.
 Provider probe reads validate a versioned JSON record and require its namespace to match the active provider configuration; arbitrary non-empty bytes are not accepted as a healthy probe.
+A full write-capability probe also writes a fresh 256-bit OS-random nonce and requires the immediate read-back to contain that exact nonce. This prevents an acknowledged-but-dropped PUT from passing merely because an older otherwise identical probe object is still readable. Recurring read-only health checks validate the stored nonce shape without generating a new write.
 If a later read-only health check fails, the daemon drops that cached write-capability state and the next retry performs a full write+read probe again. This lets a deleted or lost `provider/probe.json` object self-heal instead of leaving the daemon stuck in permanent read-only probe failures.
 
 ### Amazon S3

@@ -2,6 +2,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rand::{rngs::OsRng, RngCore};
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
     ETAG, HOST, IF_MATCH, IF_NONE_MATCH, RANGE,
@@ -55,6 +56,7 @@ pub(crate) struct ProviderMetadataObject {
 struct ProviderProbe {
     format_version: u16,
     namespace: String,
+    write_nonce: String,
 }
 
 impl ProviderClient {
@@ -510,39 +512,70 @@ impl ProviderClient {
         Ok(size)
     }
 
-    fn probe_record(&self) -> ProviderProbe {
+    fn new_probe_record(&self) -> ProviderProbe {
+        let mut nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut nonce);
         ProviderProbe {
             format_version: PROVIDER_PROBE_VERSION,
             namespace: self.settings.namespace.clone(),
+            write_nonce: hex::encode(nonce),
         }
     }
 
-    pub async fn probe(&self) -> anyhow::Result<()> {
-        let probe_key = "provider/probe.json";
-        let payload = serde_json::to_vec(&self.probe_record())?;
-        self.put(probe_key, payload, "application/json").await?;
-        self.probe_read_only().await
+    fn validate_probe_record(&self, probe: &ProviderProbe) -> anyhow::Result<()> {
+        if probe.format_version != PROVIDER_PROBE_VERSION {
+            anyhow::bail!(
+                "Cloud Node provider probe format mismatch: expected {}, got {}",
+                PROVIDER_PROBE_VERSION,
+                probe.format_version
+            );
+        }
+        if probe.namespace != self.settings.namespace {
+            anyhow::bail!(
+                "Cloud Node provider probe namespace mismatch: expected {:?}, got {:?}",
+                self.settings.namespace,
+                probe.namespace
+            );
+        }
+        if probe.write_nonce.len() != 64
+            || !probe
+                .write_nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            anyhow::bail!("Cloud Node provider probe write nonce must be 32-byte hexadecimal");
+        }
+        Ok(())
     }
 
-    pub async fn probe_read_only(&self) -> anyhow::Result<()> {
+    async fn read_probe_record(&self) -> anyhow::Result<ProviderProbe> {
         let downloaded = self
             .get_limited("provider/probe.json", MAX_PROVIDER_CONTROL_METADATA_BYTES)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Cloud Node provider probe object is missing"))?;
-        let actual: ProviderProbe = serde_json::from_slice(&downloaded).map_err(|error| {
+        let probe: ProviderProbe = serde_json::from_slice(&downloaded).map_err(|error| {
             anyhow::anyhow!("Cloud Node provider probe is invalid JSON: {error}")
         })?;
-        let expected = self.probe_record();
+        self.validate_probe_record(&probe)?;
+        Ok(probe)
+    }
+
+    pub async fn probe(&self) -> anyhow::Result<()> {
+        let probe_key = "provider/probe.json";
+        let expected = self.new_probe_record();
+        let payload = serde_json::to_vec(&expected)?;
+        self.put(probe_key, payload, "application/json").await?;
+        let actual = self.read_probe_record().await?;
         if actual != expected {
             anyhow::bail!(
-                "Cloud Node provider probe identity mismatch: expected namespace {:?} format {}, got namespace {:?} format {}",
-                expected.namespace,
-                expected.format_version,
-                actual.namespace,
-                actual.format_version
+                "Cloud Node provider probe write was not observed; provider returned a stale probe record"
             );
         }
         Ok(())
+    }
+
+    pub async fn probe_read_only(&self) -> anyhow::Result<()> {
+        self.read_probe_record().await.map(|_| ())
     }
 
     fn supabase_upload_method() -> Method {
@@ -1549,12 +1582,28 @@ mod tests {
         }))
         .unwrap();
         let client = ProviderClient::new(&settings).unwrap();
-        let probe = client.probe_record();
-        assert_eq!(probe.format_version, PROVIDER_PROBE_VERSION);
-        assert_eq!(probe.namespace, "prod-a");
-        let encoded = serde_json::to_vec(&probe).unwrap();
+        let first = client.new_probe_record();
+        let second = client.new_probe_record();
+        assert_eq!(first.format_version, PROVIDER_PROBE_VERSION);
+        assert_eq!(first.namespace, "prod-a");
+        assert_eq!(first.write_nonce.len(), 64);
+        assert!(first
+            .write_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first.write_nonce, second.write_nonce);
+        client.validate_probe_record(&first).unwrap();
+
+        let encoded = serde_json::to_vec(&first).unwrap();
         let decoded: ProviderProbe = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded, probe);
+        assert_eq!(decoded, first);
+
+        let mut wrong_namespace = first.clone();
+        wrong_namespace.namespace = "prod-b".to_owned();
+        assert!(client.validate_probe_record(&wrong_namespace).is_err());
+        let mut bad_nonce = first;
+        bad_nonce.write_nonce = "not-a-nonce".to_owned();
+        assert!(client.validate_probe_record(&bad_nonce).is_err());
     }
 
     #[test]
