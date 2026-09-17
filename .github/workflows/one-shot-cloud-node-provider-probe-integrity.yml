@@ -1,0 +1,94 @@
+name: One-shot Cloud Node provider probe integrity
+
+on:
+  push:
+    branches:
+      - work/cloud-node-provider-hardening-2
+
+permissions:
+  contents: write
+
+jobs:
+  provider-probe-integrity:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Validate provider probe identity
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('engine/crates/cloud-node/src/provider.rs')
+          text = path.read_text()
+
+          import_anchor = 'use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};\n'
+          if 'use serde::{Deserialize, Serialize};' not in text:
+              if import_anchor not in text:
+                  raise SystemExit('serde import anchor not found')
+              text = text.replace(import_anchor, import_anchor + 'use serde::{Deserialize, Serialize};\n', 1)
+
+          const_anchor = 'const MAX_PROVIDER_SECRET_FILE_BYTES: u64 = 64 * 1024;\n'
+          if 'const PROVIDER_PROBE_VERSION: u16 = 1;' not in text:
+              if const_anchor not in text:
+                  raise SystemExit('provider probe constant anchor not found')
+              text = text.replace(const_anchor, const_anchor + 'const PROVIDER_PROBE_VERSION: u16 = 1;\n', 1)
+
+          struct_anchor = '''#[derive(Debug, Clone)]\npub(crate) struct ProviderMetadataObject {\n    pub bytes: Vec<u8>,\n    pub version: Option<ProviderObjectVersion>,\n}\n\n'''
+          probe_struct = '''#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\n#[serde(rename_all = "camelCase")]\nstruct ProviderProbe {\n    format_version: u16,\n    namespace: String,\n}\n\n'''
+          if 'struct ProviderProbe {' not in text:
+              if struct_anchor not in text:
+                  raise SystemExit('provider metadata struct anchor not found')
+              text = text.replace(struct_anchor, struct_anchor + probe_struct, 1)
+
+          old_probe = '''    pub async fn probe(&self) -> anyhow::Result<()> {\n        let probe_key = "provider/probe.json";\n        let payload = format!(\n            "{{\\\"formatVersion\\\":1,\\\"namespace\\\":{}}}",\n            serde_json::to_string(&self.settings.namespace)?\n        );\n        self.put(probe_key, payload.into_bytes(), "application/json")\n            .await?;\n        self.probe_read_only().await\n    }\n\n    pub async fn probe_read_only(&self) -> anyhow::Result<()> {\n        let downloaded = self\n            .get_limited("provider/probe.json", MAX_PROVIDER_CONTROL_METADATA_BYTES)\n            .await?\n            .ok_or_else(|| anyhow::anyhow!("Cloud Node provider probe object is missing"))?;\n        if downloaded.is_empty() {\n            anyhow::bail!("Cloud Node provider probe returned an empty object");\n        }\n        Ok(())\n    }\n'''
+          new_probe = '''    fn probe_record(&self) -> ProviderProbe {\n        ProviderProbe {\n            format_version: PROVIDER_PROBE_VERSION,\n            namespace: self.settings.namespace.clone(),\n        }\n    }\n\n    pub async fn probe(&self) -> anyhow::Result<()> {\n        let probe_key = "provider/probe.json";\n        let payload = serde_json::to_vec(&self.probe_record())?;\n        self.put(probe_key, payload, "application/json").await?;\n        self.probe_read_only().await\n    }\n\n    pub async fn probe_read_only(&self) -> anyhow::Result<()> {\n        let downloaded = self\n            .get_limited("provider/probe.json", MAX_PROVIDER_CONTROL_METADATA_BYTES)\n            .await?\n            .ok_or_else(|| anyhow::anyhow!("Cloud Node provider probe object is missing"))?;\n        let actual: ProviderProbe = serde_json::from_slice(&downloaded)\n            .map_err(|error| anyhow::anyhow!("Cloud Node provider probe is invalid JSON: {error}"))?;\n        let expected = self.probe_record();\n        if actual != expected {\n            anyhow::bail!(\n                "Cloud Node provider probe identity mismatch: expected namespace {:?} format {}, got namespace {:?} format {}",\n                expected.namespace,\n                expected.format_version,\n                actual.namespace,\n                actual.format_version\n            );\n        }\n        Ok(())\n    }\n'''
+          if 'provider probe identity mismatch' not in text:
+              if old_probe not in text:
+                  raise SystemExit('provider probe implementation anchor not found')
+              text = text.replace(old_probe, new_probe, 1)
+
+          test_anchor = '''    #[test]\n    fn bounded_provider_metadata_rejects_oversize_chunks() {\n'''
+          test = '''    #[test]\n    fn provider_probe_record_is_versioned_and_namespace_bound() {\n        let settings: ProviderSettings = serde_json::from_value(serde_json::json!({\n            "kind":"http",\n            "namespace":"prod-a",\n            "bucket":"rbe",\n            "endpoint":"https://storage.example.invalid",\n            "auth":{"mode":"none"}\n        }))\n        .unwrap();\n        let client = ProviderClient::new(&settings).unwrap();\n        let probe = client.probe_record();\n        assert_eq!(probe.format_version, PROVIDER_PROBE_VERSION);\n        assert_eq!(probe.namespace, "prod-a");\n        let encoded = serde_json::to_vec(&probe).unwrap();\n        let decoded: ProviderProbe = serde_json::from_slice(&encoded).unwrap();\n        assert_eq!(decoded, probe);\n    }\n\n'''
+          if 'fn provider_probe_record_is_versioned_and_namespace_bound()' not in text:
+              if test_anchor not in text:
+                  raise SystemExit('provider probe test anchor not found')
+              text = text.replace(test_anchor, test + test_anchor, 1)
+
+          path.write_text(text)
+
+          doc = Path('doc/cloud-node.md')
+          docs = doc.read_text()
+          marker = '''When `syncOnConnect` is disabled, `cloud_node run` performs one full write+read provider capability probe after process startup. After that succeeds, recurring daemon health checks only read the existing probe object instead of rewriting it on every `pollIntervalMs` cycle. The explicit `probe-provider` command always keeps the full write+read behavior when write capability needs to be tested on demand.\n'''
+          addition = marker + '''Provider probe reads validate a versioned JSON record and require its namespace to match the active provider configuration; arbitrary non-empty bytes are not accepted as a healthy probe.\n'''
+          if 'arbitrary non-empty bytes are not accepted as a healthy probe' not in docs:
+              if marker not in docs:
+                  raise SystemExit('provider probe docs anchor not found')
+              docs = docs.replace(marker, addition, 1)
+              doc.write_text(docs)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
+      - name: Commit BUG-CN-PROV-036
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-probe-integrity.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-036 validate provider probe identity"
+          git push origin HEAD:work/cloud-node-provider-hardening-2
