@@ -32,7 +32,7 @@ static BACKEND_LOGGING_READY: AtomicBool = AtomicBool::new(false);
 
 fn has_rbe_error_code(details: &str) -> bool {
     details.lines().any(|line| {
-        let Some(token) = line.trim_start().split_whitespace().next() else {
+        let Some(token) = line.split_whitespace().next() else {
             return false;
         };
         token.len() == 7
