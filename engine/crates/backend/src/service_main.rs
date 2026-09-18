@@ -114,7 +114,7 @@ fn render_fatal(code: &str, headline: &str, error: &anyhow::Error) -> String {
         details
     } else {
         format!(
-            "{code} {headline}\n\n  reason:\n    {details}\n\n  action:\n    Review the reason above. If generated runtime files are stale, rebuild the complete RBE package.\n\n  help:\n    doc/error-codes/service.md#{}",
+            "{code} {headline}\n\n  reason:\n    {details}\n\n  action:\n    Review the reason above. If generated runtime files are stale, rebuild the complete RBE package.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/service#{}",
             code.to_ascii_lowercase(),
         )
     }
@@ -171,7 +171,7 @@ async fn main() {
                 Ok(path) => println!("Service restart request queued: {}", path.display()),
                 Err(error) => {
                     logging::Logger::new("SERVICE").child("CONTROL").fatal(format!(
-                        "SVC5101 Service restart request could not be queued.\n\n  reason:\n    {error:#}\n\n  action:\n    Verify the runtime data directory is writable and retry the request.\n\n  help:\n    doc/error-codes/service.md#svc5101"
+                        "SVC5101 Service restart request could not be queued.\n\n  reason:\n    {error:#}\n\n  action:\n    Verify the runtime data directory is writable and retry the request.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5101"
                     ));
                     std::process::exit(1);
                 }
@@ -181,7 +181,7 @@ async fn main() {
         Ok(None) => {}
         Err(error) => {
             logging::Logger::new("SERVICE").child("CONTROL").fatal(format!(
-                "SVC5100 Invalid Service control command.\n\n  reason:\n    {error:#}\n\n  action:\n    Check the command syntax and retry.\n\n  help:\n    doc/error-codes/service.md#svc5100"
+                "SVC5100 Invalid Service control command.\n\n  reason:\n    {error:#}\n\n  action:\n    Check the command syntax and retry.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5100"
             ));
             std::process::exit(2);
         }
@@ -191,7 +191,7 @@ async fn main() {
     let worker = args.iter().any(|arg| arg == "--service-host");
     if mother == worker {
         logging::Logger::new("SERVICE").fatal(
-            "SVC5102 Service executable requires exactly one internal Mother or worker mode.\n\n  action:\n    Launch service.exe through backend.exe; these modes are internal runtime contracts.\n\n  help:\n    doc/error-codes/service.md#svc5102",
+            "SVC5102 Service executable requires exactly one internal Mother or worker mode.\n\n  action:\n    Launch service.exe through backend.exe; these modes are internal runtime contracts.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5102",
         );
         std::process::exit(2);
     }
@@ -233,9 +233,11 @@ mod diagnostic_tests {
         let error = anyhow::anyhow!("synthetic startup failure");
 
         let mother = render_fatal("SVC5099", "Service Mother failed to start.", &error);
-        assert!(mother.contains("doc/error-codes/service.md#svc5099"));
+        assert!(mother
+            .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5099"));
 
         let worker = render_fatal("SVC5199", "Service worker failed to start.", &error);
-        assert!(worker.contains("doc/error-codes/service.md#svc5199"));
+        assert!(worker
+            .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5199"));
     }
 }

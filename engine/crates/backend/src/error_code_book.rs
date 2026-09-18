@@ -10,6 +10,7 @@ const RELC: &str = include_str!("../../../../doc/error-codes/relc.md");
 const SERVICE: &str = include_str!("../../../../doc/error-codes/service.md");
 const CONTAINER: &str = include_str!("../../../../doc/error-codes/container.md");
 const RUNTIME: &str = include_str!("../../../../doc/error-codes/runtime.md");
+const PUBLIC_BASE_URL: &str = "https://kastrick.vercel.app/project/rbe/doc/error-codes";
 
 pub fn requested(args: &[String]) -> Option<anyhow::Result<String>> {
     for (index, arg) in args.iter().enumerate() {
@@ -234,8 +235,10 @@ pub fn explain(code: &str) -> anyhow::Result<String> {
         .trim()
         .to_string();
 
+    let online_page = page_name.strip_suffix(".md").unwrap_or(page_name);
+    let online = format!("{PUBLIC_BASE_URL}/{online_page}#{anchor}");
     Ok(format!(
-        "{requested} — {title}\nStatus: {status}\n\n{body}\n\nReference: doc/error-codes/{doc}"
+        "{requested} — {title}\nStatus: {status}\n\n{body}\n\nReference: doc/error-codes/{doc}\nOnline: {online}"
     ))
 }
 
@@ -249,6 +252,8 @@ mod tests {
         assert!(rendered.contains("RELC3001"));
         assert!(rendered.contains("Native Container execution required but lowering failed"));
         assert!(rendered.contains("doc/error-codes/relc.md#relc3001"));
+        assert!(rendered
+            .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/relc#relc3001"));
         assert_eq!(rendered.matches("RELC3001").count(), 1);
     }
 
@@ -257,6 +262,8 @@ mod tests {
         let rendered = explain("SVC5002").expect("SVC5002 must be explainable");
         assert!(rendered.contains("Service catalog changed"));
         assert!(rendered.contains("doc/error-codes/service.md#svc5002"));
+        assert!(rendered
+            .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5002"));
     }
 
     #[test]

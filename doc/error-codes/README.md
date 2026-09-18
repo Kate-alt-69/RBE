@@ -8,7 +8,7 @@ Example:
 
 ```text
 RELC3001 Route requires native Container execution but native lowering failed.
-help: doc/error-codes/relc.md#relc3001
+help: https://kastrick.vercel.app/project/rbe/doc/error-codes/relc#relc3001
 ```
 
 ## Code format
@@ -74,7 +74,7 @@ CODE concise summary
     ...
 
   help:
-    doc/error-codes/<book>.md#<lowercase-code>
+    https://kastrick.vercel.app/project/rbe/doc/error-codes/<book>#<lowercase-code>
 ```
 
 Machine-readable/JSON logging should keep `code`, `module`, severity, and structured context as separate fields rather than parsing the pretty string.
@@ -83,7 +83,7 @@ Machine-readable/JSON logging should keep `code`, `module`, severity, and struct
 
 A new stable error code should be added to this book in the same change that introduces it. Codes are never recycled after release, even if the implementation that emitted them is removed.
 
-The built backend package also supports offline long-form lookup before runtime bootstrap:
+Runtime diagnostics use the public documentation website as their canonical `help:` target. The built backend package also supports offline long-form lookup before runtime bootstrap, using the same book embedded at build time:
 
 ```text
 backend.exe --explain RELC3001

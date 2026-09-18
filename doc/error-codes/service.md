@@ -155,7 +155,7 @@ SVC5001 Service binary is not compatible with the current backend.
     alongside this backend.
 
   help:
-    doc/error-codes/service.md#svc5001
+    https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5001
 ```
 
 **Do not** diagnose a catalog fingerprint mismatch as SVC5001 if the compatibility handshake already proved the executable is compatible.

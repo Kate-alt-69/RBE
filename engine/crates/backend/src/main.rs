@@ -55,7 +55,7 @@ fn render_backend_boot_fatal(error: &anyhow::Error) -> String {
         details
     } else {
         format!(
-            "RBE5099 Backend failed to start with an unclassified boot error.\n\n  reason:\n    {details}\n\n  action:\n    Review the reason above and the preceding startup logs. If the failure persists with an unchanged configuration/build, preserve the logs and report it.\n\n  help:\n    doc/error-codes/runtime.md#rbe5099"
+            "RBE5099 Backend failed to start with an unclassified boot error.\n\n  reason:\n    {details}\n\n  action:\n    Review the reason above and the preceding startup logs. If the failure persists with an unchanged configuration/build, preserve the logs and report it.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5099"
         )
     }
 }
@@ -711,7 +711,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     ));
     if !container_path.is_file() {
         anyhow::bail!(
-            "RBE5001 Required packaged Container runtime is missing.\n\n  expected_path:\n    {}\n\n  action:\n    Rebuild the complete RBE package for this target and keep the generated Container binary beside the backend package layout.\n\n  help:\n    doc/error-codes/runtime.md#rbe5001",
+            "RBE5001 Required packaged Container runtime is missing.\n\n  expected_path:\n    {}\n\n  action:\n    Rebuild the complete RBE package for this target and keep the generated Container binary beside the backend package layout.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5001",
             container_path.display()
         );
     }
@@ -1485,7 +1485,7 @@ mod backend_boot_diagnostic_tests {
     #[test]
     fn backend_boot_fatal_preserves_specific_rbe_codes() {
         let error = anyhow::anyhow!(
-            "RBE5001 Required packaged Container runtime is missing.\nhelp: doc/error-codes/runtime.md#rbe5001"
+            "RBE5001 Required packaged Container runtime is missing.\nhelp: https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5001"
         );
         let rendered = render_backend_boot_fatal(&error);
         assert!(rendered.starts_with("RBE5001 "));
@@ -1499,6 +1499,7 @@ mod backend_boot_diagnostic_tests {
         let rendered = render_backend_boot_fatal(&error);
         assert!(rendered.starts_with("RBE5099 "));
         assert!(rendered.contains("synthetic backend startup failure"));
-        assert!(rendered.contains("doc/error-codes/runtime.md#rbe5099"));
+        assert!(rendered
+            .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5099"));
     }
 }

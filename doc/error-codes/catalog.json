@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
   "description": "Machine-readable index for the authoritative RBE Error Code Book. Markdown pages contain the full explanations.",
+  "publicBaseUrl": "https://kastrick.vercel.app/project/rbe/doc/error-codes",
   "prefixes": {
     "REL": "Runtime Engine Language",
     "RELC": "Runtime Engine Language Compiler",

@@ -170,15 +170,19 @@ impl RelcError {
         }
     }
 
-    /// Repository-relative long-form Error Code Book target.
-    pub fn help_path(&self) -> String {
+    /// Public long-form Error Code Book target. The compiler stays usable
+    /// offline because backend/service also embed the same book for `--explain`.
+    pub fn help_url(&self) -> String {
         let code = self.code();
         let book = if code.starts_with("RELC") {
-            "relc.md"
+            "relc"
         } else {
-            "rel.md"
+            "rel"
         };
-        format!("doc/error-codes/{book}#{}", code.to_ascii_lowercase())
+        format!(
+            "https://kastrick.vercel.app/project/rbe/doc/error-codes/{book}#{}",
+            code.to_ascii_lowercase()
+        )
     }
 }
 
@@ -202,7 +206,7 @@ impl fmt::Display for RelcError {
             } => write!(formatter, "RELC capability error in {source}: {message}"),
             Self::Link(message) => write!(formatter, "RELC link error: {message}"),
         }?;
-        write!(formatter, "\nhelp: {}", self.help_path())
+        write!(formatter, "\nhelp: {}", self.help_url())
     }
 }
 
@@ -1217,7 +1221,8 @@ mod tests {
         assert_eq!(error.code(), "REL1100");
         let rendered = error.to_string();
         assert!(rendered.starts_with("REL1100 "));
-        assert!(rendered.contains("help: doc/error-codes/rel.md#rel1100"));
+        assert!(rendered
+            .contains("help: https://kastrick.vercel.app/project/rbe/doc/error-codes/rel#rel1100"));
     }
 
     #[test]
@@ -1226,7 +1231,9 @@ mod tests {
         assert_eq!(error.code(), "RELC2000");
         let rendered = error.to_string();
         assert!(rendered.starts_with("RELC2000 "));
-        assert!(rendered.contains("help: doc/error-codes/relc.md#relc2000"));
+        assert!(rendered.contains(
+            "help: https://kastrick.vercel.app/project/rbe/doc/error-codes/relc#relc2000"
+        ));
     }
 
     #[test]
@@ -1593,7 +1600,9 @@ mod tests {
         assert_eq!(error.code(), "RELC2102");
         let rendered = error.to_string();
         assert!(rendered.contains("exact operation"));
-        assert!(rendered.contains("help: doc/error-codes/relc.md#relc2102"));
+        assert!(rendered.contains(
+            "help: https://kastrick.vercel.app/project/rbe/doc/error-codes/relc#relc2102"
+        ));
     }
 
     #[test]
@@ -1621,7 +1630,9 @@ mod tests {
         assert!(message.starts_with("RELC3001 "));
         assert!(message.contains("Storage authority requires native Container execution"));
         assert!(message.contains("static JSON arguments"));
-        assert!(message.contains("help: doc/error-codes/relc.md#relc3001"));
+        assert!(message.contains(
+            "help: https://kastrick.vercel.app/project/rbe/doc/error-codes/relc#relc3001"
+        ));
     }
 
     #[test]
@@ -1760,8 +1771,8 @@ mod tests {
         let error = compile_runtime_image(server, route, &serde_json::json!({}))
             .expect_err("Route Runtime ENV must fail capability validation");
         assert_eq!(error.code(), "RELC2101");
-        assert!(error
-            .to_string()
-            .contains("help: doc/error-codes/relc.md#relc2101"));
+        assert!(error.to_string().contains(
+            "help: https://kastrick.vercel.app/project/rbe/doc/error-codes/relc#relc2101"
+        ));
     }
 }

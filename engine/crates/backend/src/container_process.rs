@@ -170,14 +170,14 @@ impl ContainerProcess {
 
 fn container_dependency_missing(binary: &Path) -> anyhow::Error {
     anyhow::anyhow!(
-        "RBE5001 Required packaged Container runtime is missing.\n\n  expected_path:\n    {}\n\n  action:\n    Rebuild/reinstall the complete RBE package for this target. Do not mix a Container binary from another build into this package.\n\n  help:\n    doc/error-codes/runtime.md#rbe5001",
+        "RBE5001 Required packaged Container runtime is missing.\n\n  expected_path:\n    {}\n\n  action:\n    Rebuild/reinstall the complete RBE package for this target. Do not mix a Container binary from another build into this package.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5001",
         binary.display()
     )
 }
 
 fn container_binding_invalid(binary: &Path, reason: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!(
-        "RBE5002 Backend Container binding metadata is invalid.\n\n  container_path:\n    {}\n\n  reason:\n    {}\n\n  action:\n    Rebuild the complete RBE package for this target so backend and Container integrity metadata are generated together.\n\n  help:\n    doc/error-codes/runtime.md#rbe5002",
+        "RBE5002 Backend Container binding metadata is invalid.\n\n  container_path:\n    {}\n\n  reason:\n    {}\n\n  action:\n    Rebuild the complete RBE package for this target so backend and Container integrity metadata are generated together.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5002",
         binary.display(),
         reason
     )
@@ -185,7 +185,7 @@ fn container_binding_invalid(binary: &Path, reason: impl std::fmt::Display) -> a
 
 fn container_integrity_failed(binary: &Path, reason: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!(
-        "RBE5003 Packaged Container runtime failed backend integrity verification.\n\n  container_path:\n    {}\n\n  reason:\n    {}\n\n  action:\n    Replace the package with a complete RBE build produced for this target. Do not copy Container binaries between backend builds.\n\n  help:\n    doc/error-codes/runtime.md#rbe5003",
+        "RBE5003 Packaged Container runtime failed backend integrity verification.\n\n  container_path:\n    {}\n\n  reason:\n    {}\n\n  action:\n    Replace the package with a complete RBE build produced for this target. Do not copy Container binaries between backend builds.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5003",
         binary.display(),
         reason
     )
@@ -326,16 +326,19 @@ mod tests {
         let missing = container_dependency_missing(path).to_string();
         assert!(missing.starts_with("RBE5001 "));
         assert!(missing.contains("expected_path:"));
-        assert!(missing.contains("doc/error-codes/runtime.md#rbe5001"));
+        assert!(missing
+            .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5001"));
 
         let binding = container_binding_invalid(path, "synthetic binding failure").to_string();
         assert!(binding.starts_with("RBE5002 "));
         assert!(binding.contains("synthetic binding failure"));
-        assert!(binding.contains("doc/error-codes/runtime.md#rbe5002"));
+        assert!(binding
+            .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5002"));
 
         let integrity = container_integrity_failed(path, "synthetic integrity failure").to_string();
         assert!(integrity.starts_with("RBE5003 "));
         assert!(integrity.contains("synthetic integrity failure"));
-        assert!(integrity.contains("doc/error-codes/runtime.md#rbe5003"));
+        assert!(integrity
+            .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5003"));
     }
 }
