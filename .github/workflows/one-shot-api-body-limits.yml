@@ -97,4 +97,4 @@ jobs:
           git pull --rebase origin main
           git push origin HEAD:main
 
-          # retrigger: nearest-code-ranking
+          # retrigger: clippy-filter-merge
