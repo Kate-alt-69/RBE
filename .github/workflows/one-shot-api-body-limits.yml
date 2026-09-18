@@ -45,7 +45,7 @@ jobs:
 
           backend_explain="$(cargo run -q -p backend --bin backend -- --explain RELC3001)"
           grep -q 'RELC3001' <<<"$backend_explain"
-          grep -q 'native Container execution required' <<<"$backend_explain"
+          grep -q 'Native Container execution required' <<<"$backend_explain"
           grep -q 'Status: emitted' <<<"$backend_explain"
           grep -q 'doc/error-codes/relc.md#relc3001' <<<"$backend_explain"
 
@@ -96,3 +96,5 @@ jobs:
 
           git pull --rebase origin main
           git push origin HEAD:main
+
+          # retrigger: nearest-code-ranking
