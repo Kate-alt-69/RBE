@@ -66,20 +66,25 @@ fn code_prefix(code: &str) -> String {
         .to_ascii_uppercase()
 }
 
+fn code_matches_filter(code: &str, filter: &str) -> bool {
+    let normalized = filter.trim().to_ascii_uppercase();
+    if normalized.chars().all(|character| character.is_ascii_alphabetic()) {
+        code_prefix(code) == normalized
+    } else {
+        code.starts_with(&normalized)
+    }
+}
+
 fn render_known_codes(
     entries: &[serde_json::Value],
     prefix: Option<&str>,
     limit: Option<usize>,
 ) -> Vec<String> {
-    let normalized = prefix.map(|value| value.trim().to_ascii_uppercase());
     let mut out = entries
         .iter()
         .filter_map(|entry| {
             let code = entry.get("code")?.as_str()?;
-            if normalized
-                .as_deref()
-                .is_some_and(|prefix| !code.starts_with(prefix))
-            {
+            if prefix.is_some_and(|filter| !code_matches_filter(code, filter)) {
                 return None;
             }
             let status = entry
@@ -224,6 +229,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("unknown RBE error code RELC3999"));
         assert!(message.contains("RELC3001"));
+        assert!(!message.contains("REL1000"));
     }
 
     #[test]
@@ -231,6 +237,13 @@ mod tests {
         let rendered = list_codes(Some("REL")).expect("REL code list must exist");
         assert!(rendered.contains("REL1000"));
         assert!(!rendered.contains("RELC1000"));
+    }
+
+    #[test]
+    fn numeric_filter_can_narrow_a_family() {
+        let rendered = list_codes(Some("SVC5")).expect("SVC5 range must exist");
+        assert!(rendered.contains("SVC5001"));
+        assert!(!rendered.contains("SVC1000"));
     }
 
     #[test]
@@ -320,7 +333,7 @@ backend.exe --list-error-codes RELC
 service.exe --explain SVC5002
 ```
 
-Unknown codes suggest nearby registered codes from the same prefix. The lookup is compiled from this authoritative documentation tree, so it does not require network access or a mutable runtime docs directory.
+Unknown codes suggest nearby registered codes from the same subsystem. Alphabetic filters select one exact subsystem (`REL` does not include `RELC`); filters containing digits can narrow a range such as `SVC5`. The lookup is compiled from this authoritative documentation tree, so it does not require network access or a mutable runtime docs directory.
 
 For machine-readable tooling, see [`catalog.json`](catalog.json).
 ''',
