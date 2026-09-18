@@ -38,4 +38,18 @@ if text.count(old) != 1:
     raise SystemExit(f"dynamic instruction mutability fix anchor count={text.count(old)}")
 text = text.replace(old, new, 1)
 
+old = '''        return Err(
+            "dynamic linked Module capability arguments currently support only storage.write data[req.body]"
+                .into(),
+        );
+'''
+new = '''        return Err(
+            "native linked Module host arguments must resolve to static JSON arguments; dynamic arguments currently support only storage.write data[req.body]"
+                .into(),
+        );
+'''
+if text.count(old) != 1:
+    raise SystemExit(f"dynamic fallback diagnostic fix anchor count={text.count(old)}")
+text = text.replace(old, new, 1)
+
 path.write_text(text, encoding="utf-8")
