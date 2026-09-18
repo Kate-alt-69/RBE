@@ -27,7 +27,9 @@ jobs:
           workspaces: engine
 
       - name: Apply capability-bound REL Storage write lowering
-        run: python3 .github/patches/storage-rel-write-v2.py
+        run: |
+          python3 .github/patches/storage-rel-write-v2.py
+          python3 .github/patches/storage-rel-write-v2-fix.py
 
       - name: Format route-engine
         run: cargo fmt --manifest-path engine/Cargo.toml -p route-engine
@@ -58,6 +60,7 @@ jobs:
             .github/patches/storage-rel-write-v1.py \
             .github/patches/storage-rel-write-v1-fix.py \
             .github/patches/storage-rel-write-v2.py \
+            .github/patches/storage-rel-write-v2-fix.py \
             .github/workflows/storage-rel-write-v1.yml \
             .github/workflows/storage-rel-write-v2.yml
           git config user.name "github-actions[bot]"
