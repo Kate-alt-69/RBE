@@ -1,0 +1,71 @@
+name: One-shot Storage docs and generation diagnostics
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .ci-storage-docs-gen8-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  storage-docs-gen8:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply Storage docs and generation fixes
+        run: python3 .github/patches/storage-docs-gen8.py
+
+      - name: Format route-engine
+        run: cargo fmt --manifest-path engine/Cargo.toml -p route-engine
+
+      - name: Diff check
+        run: git diff --check
+
+      - name: Verify no stale Route-WASM v7 diagnostics
+        run: |
+          if grep -R --line-number --fixed-strings 'Route-WASM v7' engine/crates/route-engine/src; then
+            echo 'stale Route-WASM v7 diagnostic remains' >&2
+            exit 1
+          fi
+
+      - name: Test route-engine
+        run: cargo test --manifest-path engine/Cargo.toml -p route-engine --locked
+
+      - name: Clippy route-engine
+        run: cargo clippy --manifest-path engine/Cargo.toml -p route-engine --all-targets --locked -- -D warnings
+
+      - name: Verify Storage documentation links
+        run: |
+          test -s doc/storage.md
+          grep -Fq '[`storage.md`](storage.md)' doc/README.md
+          grep -Fq 'storage.write' doc/storage.md
+          grep -Fq '$$/' doc/storage.md
+          grep -Fq 'does **not yet** automatically ingest' doc/storage.md
+
+      - name: Commit BUG-STO-005
+        run: |
+          rm -f \
+            .ci-storage-docs-gen8-trigger \
+            .github/patches/storage-docs-gen8.py \
+            .github/workflows/storage-docs-gen8.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-STO-005 sync Storage generation diagnostics and docs"
+          git pull --rebase origin main
+          git push origin HEAD:main
