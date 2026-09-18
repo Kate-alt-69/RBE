@@ -1,0 +1,77 @@
+name: One-shot Cloud Node provider stream error sanitization
+
+on:
+  push:
+    branches:
+      - work/cloud-node-provider-hardening-2
+
+permissions:
+  contents: write
+
+jobs:
+  provider-stream-errors:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Sanitize streamed provider errors
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          provider = Path('engine/crates/cloud-node/src/provider.rs')
+          text = provider.read_text()
+          old = 'fn provider_transport_error(error: reqwest::Error) -> anyhow::Error {'
+          new = 'pub(crate) fn provider_transport_error(error: reqwest::Error) -> anyhow::Error {'
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('provider transport error anchor not found')
+              text = text.replace(old, new, 1)
+          provider.write_text(text)
+
+          sync = Path('engine/crates/cloud-node/src/provider_sync.rs')
+          text = sync.read_text()
+          old_import = 'use crate::provider::{ProviderClient, ProviderObjectVersion};'
+          new_import = 'use crate::provider::{provider_transport_error, ProviderClient, ProviderObjectVersion};'
+          if new_import not in text:
+              if old_import not in text:
+                  raise SystemExit('provider import anchor not found')
+              text = text.replace(old_import, new_import, 1)
+
+          raw = 'response.chunk().await?'
+          if raw in text:
+              count = text.count(raw)
+              if count != 2:
+                  raise SystemExit(f'expected exactly 2 raw response chunk reads, found {count}')
+              text = text.replace(raw, 'response.chunk().await.map_err(provider_transport_error)?')
+          if 'response.chunk().await?' in text:
+              raise SystemExit('raw provider stream error propagation remains')
+          if text.count('map_err(provider_transport_error)?') < 2:
+              raise SystemExit('provider stream sanitization markers missing')
+          sync.write_text(text)
+          PY
+      - name: Format
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
+      - name: Commit BUG-CN-PROV-039
+        run: |
+          rm -f .github/workflows/one-shot-cloud-node-provider-stream-errors.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-CN-PROV-039 sanitize provider stream errors"
+          git push origin HEAD:work/cloud-node-provider-hardening-2
