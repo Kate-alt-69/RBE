@@ -342,6 +342,93 @@ impl ProviderClient {
         Ok(())
     }
 
+    pub(crate) async fn put_create_only(
+        &self,
+        relative: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> anyhow::Result<bool> {
+        let key = self.object_key(relative)?;
+        let response = match self.settings.kind {
+            ProviderKind::AmazonS3 => {
+                let payload_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+                let content_length = u64::try_from(bytes.len())
+                    .map_err(|_| anyhow::anyhow!("Cloud Node S3 request body exceeds u64"))?;
+                self.aws_signed_request(
+                    Method::PUT,
+                    &key,
+                    Some(reqwest::Body::from(bytes)),
+                    payload_sha256,
+                    Some(content_type),
+                    None,
+                    Some(content_length),
+                    None,
+                    true,
+                )
+                .await?
+            }
+            ProviderKind::Supabase => {
+                let url = self.supabase_url(&key, false)?;
+                self.apply_supabase_auth(
+                    self.client
+                        .request(Self::supabase_upload_method(), url)
+                        .header(CONTENT_TYPE, content_type)
+                        .body(bytes),
+                )?
+                .send()
+                .await
+                .map_err(provider_transport_error)?
+            }
+            ProviderKind::AzureBlob => {
+                let url = self.azure_url(&key)?;
+                self.client
+                    .put(url)
+                    .header("x-ms-blob-type", "BlockBlob")
+                    .header(IF_NONE_MATCH, "*")
+                    .header(CONTENT_TYPE, content_type)
+                    .body(bytes)
+                    .send()
+                    .await
+                    .map_err(provider_transport_error)?
+            }
+            ProviderKind::GoogleCloudStorage => {
+                let url = self.gcs_url(&key)?;
+                let token = required_env(
+                    self.settings
+                        .auth
+                        .oauth_token_env
+                        .as_deref()
+                        .or(self.settings.auth.bearer_token_env.as_deref())
+                        .or(self.settings.credential_env.as_deref()),
+                    GOOGLE_OAUTH_TOKEN_ENV,
+                )?;
+                self.client
+                    .put(url)
+                    .bearer_auth(token)
+                    .header("x-goog-if-generation-match", 0)
+                    .header(CONTENT_TYPE, content_type)
+                    .body(bytes)
+                    .send()
+                    .await
+                    .map_err(provider_transport_error)?
+            }
+            ProviderKind::Http => {
+                let url = self.http_url(&key)?;
+                self.apply_http_auth(
+                    self.client
+                        .put(url)
+                        .header(IF_NONE_MATCH, "*")
+                        .header(CONTENT_TYPE, content_type)
+                        .body(bytes),
+                )?
+                .send()
+                .await
+                .map_err(provider_transport_error)?
+            }
+        };
+        create_only_response(response, self.settings.kind).await
+    }
+
     pub(crate) async fn put_if_unchanged(
         &self,
         relative: &str,
@@ -421,13 +508,13 @@ impl ProviderClient {
         Ok(true)
     }
 
-    pub(crate) async fn put_file(
+    pub(crate) async fn put_file_create_only(
         &self,
         relative: &str,
         path: &Path,
         content_type: &str,
         expected_sha256: [u8; 32],
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<bool> {
         let metadata = tokio::fs::metadata(path).await.map_err(|error| {
             anyhow::anyhow!(
                 "failed to stat Cloud Node provider upload source {}: {error}",
@@ -444,7 +531,7 @@ impl ProviderClient {
         let key = self.object_key(relative)?;
         let response = match self.settings.kind {
             ProviderKind::AmazonS3 => {
-                self.aws_file_request(&key, path, content_type, expected_sha256, size)
+                self.aws_file_request(&key, path, content_type, expected_sha256, size, true)
                     .await?
             }
             ProviderKind::Supabase => {
@@ -452,7 +539,6 @@ impl ProviderClient {
                 self.apply_supabase_auth(
                     self.client
                         .request(Self::supabase_upload_method(), url)
-                        .header("x-upsert", "true")
                         .header(CONTENT_TYPE, content_type)
                         .header(CONTENT_LENGTH, size)
                         .body(file_body(path).await?),
@@ -466,6 +552,7 @@ impl ProviderClient {
                 self.client
                     .put(url)
                     .header("x-ms-blob-type", "BlockBlob")
+                    .header(IF_NONE_MATCH, "*")
                     .header(CONTENT_TYPE, content_type)
                     .header(CONTENT_LENGTH, size)
                     .body(file_body(path).await?)
@@ -487,6 +574,7 @@ impl ProviderClient {
                 self.client
                     .put(url)
                     .bearer_auth(token)
+                    .header("x-goog-if-generation-match", 0)
                     .header(CONTENT_TYPE, content_type)
                     .header(CONTENT_LENGTH, size)
                     .body(file_body(path).await?)
@@ -499,6 +587,7 @@ impl ProviderClient {
                 self.apply_http_auth(
                     self.client
                         .put(url)
+                        .header(IF_NONE_MATCH, "*")
                         .header(CONTENT_TYPE, content_type)
                         .header(CONTENT_LENGTH, size)
                         .body(file_body(path).await?),
@@ -508,8 +597,43 @@ impl ProviderClient {
                 .map_err(provider_transport_error)?
             }
         };
-        response_bytes(response, "upload", false).await?;
-        Ok(size)
+        create_only_response(response, self.settings.kind).await
+    }
+
+    pub(crate) async fn verify_object(
+        &self,
+        relative: &str,
+        expected_sha256: [u8; 32],
+        expected_size: u64,
+    ) -> anyhow::Result<()> {
+        let mut response = self.open_download(relative, 0).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node immutable provider object disappeared during collision verification"
+            )
+        })?;
+        if response
+            .content_length()
+            .is_some_and(|length| length != expected_size)
+        {
+            anyhow::bail!("Cloud Node immutable provider object size mismatch for {relative:?}");
+        }
+        let mut digest = Sha256::new();
+        let mut size = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(provider_transport_error)? {
+            digest.update(&chunk);
+            size = size
+                .checked_add(u64::try_from(chunk.len()).map_err(|_| {
+                    anyhow::anyhow!("Cloud Node provider verification chunk exceeds u64")
+                })?)
+                .ok_or_else(|| anyhow::anyhow!("Cloud Node provider verification size overflow"))?;
+        }
+        let actual_sha256: [u8; 32] = digest.finalize().into();
+        if size != expected_size || actual_sha256 != expected_sha256 {
+            anyhow::bail!(
+                "Cloud Node immutable provider object collision for {relative:?}: existing bytes do not match expected content"
+            );
+        }
+        Ok(())
     }
 
     fn new_probe_record(&self) -> ProviderProbe {
@@ -832,6 +956,7 @@ impl ProviderClient {
         content_type: &str,
         payload_sha256: [u8; 32],
         content_length: u64,
+        require_absent: bool,
     ) -> anyhow::Result<reqwest::Response> {
         self.aws_signed_request(
             Method::PUT,
@@ -842,7 +967,7 @@ impl ProviderClient {
             None,
             Some(content_length),
             None,
-            false,
+            require_absent,
         )
         .await
     }
@@ -973,7 +1098,7 @@ impl ProviderClient {
     }
 }
 
-fn provider_transport_error(error: reqwest::Error) -> anyhow::Error {
+pub(crate) fn provider_transport_error(error: reqwest::Error) -> anyhow::Error {
     anyhow::anyhow!(
         "Cloud Node provider request failed: {}",
         error.without_url()
@@ -1053,6 +1178,33 @@ fn gcs_generation_precondition(
             "Cloud Node GCS conditional write cannot match a generation for a missing object"
         ),
     }
+}
+
+async fn create_only_response(
+    response: reqwest::Response,
+    kind: ProviderKind,
+) -> anyhow::Result<bool> {
+    let status = response.status();
+    if kind == ProviderKind::Supabase
+        && (status == StatusCode::BAD_REQUEST || status == StatusCode::CONFLICT)
+    {
+        let (status, detail) = provider_error_parts(response).await;
+        if supabase_duplicate_error(&detail) {
+            return Ok(false);
+        }
+        return Err(provider_http_error_from_parts(
+            status,
+            &detail,
+            "immutable object create",
+        ));
+    }
+    if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        return Err(provider_http_error(response, "immutable object create").await);
+    }
+    Ok(true)
 }
 
 async fn conditional_write_response(
@@ -1187,7 +1339,7 @@ fn append_bounded_bytes(
     Ok(())
 }
 
-async fn provider_http_error(mut response: reqwest::Response, operation: &str) -> anyhow::Error {
+async fn provider_error_parts(mut response: reqwest::Response) -> (StatusCode, Vec<u8>) {
     let status = response.status();
     let mut detail = Vec::new();
     while detail.len() < MAX_PROVIDER_ERROR_BYTES {
@@ -1202,8 +1354,30 @@ async fn provider_http_error(mut response: reqwest::Response, operation: &str) -
             Ok(None) | Err(_) => break,
         }
     }
-    let detail = String::from_utf8_lossy(&detail);
+    (status, detail)
+}
+
+fn provider_http_error_from_parts(
+    status: StatusCode,
+    detail: &[u8],
+    operation: &str,
+) -> anyhow::Error {
+    let detail = String::from_utf8_lossy(detail);
     anyhow::anyhow!("Cloud Node provider {operation} failed with HTTP {status}: {detail}")
+}
+
+async fn provider_http_error(response: reqwest::Response, operation: &str) -> anyhow::Error {
+    let (status, detail) = provider_error_parts(response).await;
+    provider_http_error_from_parts(status, &detail, operation)
+}
+
+fn supabase_duplicate_error(detail: &[u8]) -> bool {
+    let detail = String::from_utf8_lossy(detail).to_ascii_lowercase();
+    detail.contains("asset already exists")
+        || detail.contains("resourcealreadyexists")
+        || detail.contains("keyalreadyexists")
+        || detail.contains("already_exists")
+        || detail.contains("\"duplicate\"")
 }
 
 fn apply_range(request: RequestBuilder, range: Option<&str>) -> RequestBuilder {
@@ -1569,6 +1743,26 @@ mod tests {
                 .unwrap(),
             99
         );
+    }
+
+    #[test]
+    fn supabase_duplicate_errors_are_narrow() {
+        assert!(supabase_duplicate_error(
+            br#"{"error":"Duplicate","message":"Asset Already Exists"}"#
+        ));
+        assert!(supabase_duplicate_error(
+            br#"{"code":"ResourceAlreadyExists","message":"exists"}"#
+        ));
+        assert!(supabase_duplicate_error(
+            br#"{"code":"KeyAlreadyExists","message":"exists"}"#
+        ));
+        assert!(supabase_duplicate_error(br#"{"code":"already_exists"}"#));
+        assert!(!supabase_duplicate_error(
+            br#"{"code":"InvalidRequest","message":"bad request"}"#
+        ));
+        assert!(!supabase_duplicate_error(
+            br#"{"code":"InvalidKey","message":"bad key"}"#
+        ));
     }
 
     #[test]
