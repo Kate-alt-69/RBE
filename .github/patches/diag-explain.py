@@ -229,9 +229,7 @@ pub fn explain(code: &str) -> anyhow::Result<String> {
         .lines()
         .enumerate()
         .filter_map(|(index, line)| {
-            if index == 0 && line.starts_with("### ") {
-                None
-            } else if line.starts_with("**Status:**") {
+            if (index == 0 && line.starts_with("### ")) || line.starts_with("**Status:**") {
                 None
             } else {
                 Some(line)
