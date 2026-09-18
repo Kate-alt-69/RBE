@@ -35,7 +35,7 @@ publish = false
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors", "compression-full"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "compression-full", "limit"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

@@ -9,8 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{header::CONTENT_TYPE, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -18,6 +19,7 @@ use core_lib::AppState;
 use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 pub fn build_router(
@@ -60,8 +62,10 @@ pub fn build_router(
             state.clone(),
             security::api_rate_limit::<AppState>,
         ))
+        // Extractors may consume bodies up to the API-wide ceiling. JSON
+        // receives a second, stricter security ceiling below.
         .layer(axum::extract::DefaultBodyLimit::max(
-            state.config.security.max_json_payload_bytes,
+            state.config.api.max_body_size_bytes,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.config.clone(),
@@ -71,6 +75,10 @@ pub fn build_router(
         .layer(axum::middleware::from_fn_with_state(
             Duration::from_millis(state.config.api.request_timeout_ms),
             request_timeout,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.config.security.max_json_payload_bytes,
+            json_payload_limit,
         ));
 
     let mut router = Router::new()
@@ -97,7 +105,9 @@ pub fn build_router(
         .snapshot()
         .middleware_plan
         .contains("compression");
-    let router = router.layer(middleware);
+    let router = router.layer(middleware).layer(RequestBodyLimitLayer::new(
+        state.config.api.max_body_size_bytes,
+    ));
     let router = if compression_enabled {
         router.layer(CompressionLayer::new())
     } else {
@@ -204,6 +214,43 @@ fn is_control_plane_path(path: &str) -> bool {
         || path.starts_with("/api/admin/")
         || path == "/api/maintenance"
         || path.starts_with("/api/maintenance/")
+}
+
+async fn json_payload_limit(
+    State(max_bytes): State<usize>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !is_json_content_type(&request) {
+        return next.run(request).await;
+    }
+
+    let (parts, body) = request.into_parts();
+    let bytes = match to_bytes(body, max_bytes).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                max_bytes,
+                "rejected JSON request body above configured security limit"
+            );
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+    };
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+fn is_json_content_type(request: &Request) -> bool {
+    let Some(value) = request.headers().get(CONTENT_TYPE) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let media_type = value.split(';').next().unwrap_or_default().trim();
+    media_type.eq_ignore_ascii_case("application/json")
+        || media_type.to_ascii_lowercase().ends_with("+json")
 }
 
 async fn request_timeout(

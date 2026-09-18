@@ -520,6 +520,21 @@ impl Config {
                 "api.requestTimeoutMs must be greater than zero".into(),
             ));
         }
+        if self.api.max_body_size_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "api.maxBodySizeBytes must be greater than zero".into(),
+            ));
+        }
+        if self.security.max_json_payload_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "security.maxJsonPayloadBytes must be greater than zero".into(),
+            ));
+        }
+        if self.security.max_json_payload_bytes > self.api.max_body_size_bytes {
+            return Err(ConfigError::Invalid(
+                "security.maxJsonPayloadBytes must not exceed api.maxBodySizeBytes".into(),
+            ));
+        }
         if self.runtime.process_refresh_hours == 0 {
             return Err(ConfigError::Invalid(
                 "runtime.processRefreshHours must be greater than zero".into(),
@@ -621,6 +636,47 @@ mod tests {
         assert_eq!(config.video_manager.live_idle_secs, 7200);
         assert!(!config.video_manager.download_worker_enabled);
         assert_eq!(config.video_manager.worker_recovery_scan_secs, 30);
+    }
+
+    #[test]
+    fn rejects_inconsistent_api_body_limits() {
+        let zero_api: Config = serde_json::from_str(
+            r#"{
+                "api": { "host": "0.0.0.0", "port": 8080, "maxBodySizeBytes": 0 }
+            }"#,
+        )
+        .unwrap();
+        assert!(zero_api
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("api.maxBodySizeBytes"));
+
+        let zero_json: Config = serde_json::from_str(
+            r#"{
+                "api": { "host": "0.0.0.0", "port": 8080 },
+                "security": { "maxJsonPayloadBytes": 0 }
+            }"#,
+        )
+        .unwrap();
+        assert!(zero_json
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("security.maxJsonPayloadBytes"));
+
+        let inverted: Config = serde_json::from_str(
+            r#"{
+                "api": { "host": "0.0.0.0", "port": 8080, "maxBodySizeBytes": 1024 },
+                "security": { "maxJsonPayloadBytes": 2048 }
+            }"#,
+        )
+        .unwrap();
+        assert!(inverted
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must not exceed"));
     }
 
     #[test]
