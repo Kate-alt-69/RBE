@@ -1,4 +1,4 @@
-name: One-shot embedded Error Code Book validation
+name: One-shot Container package diagnostic validation
 
 "on":
   push:
@@ -23,72 +23,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: Apply, validate and land DIAG-004
+      - name: Apply, validate and land DIAG-005
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          python3 .github/patches/diag-explain.py
-          rm -f .github/patches/diag-explain.py
+          python3 .github/patches/diag-container-package-errors.py
+          rm -f .github/patches/diag-container-package-errors.py
 
           cd engine
           cargo fmt --all
           cargo check -p backend --all-targets --locked
-          cargo test -p backend error_code_book::tests --locked
+          cargo test -p backend container_package_diagnostics_are_stable_and_actionable --locked
           cargo clippy -p backend --all-targets --locked -- -D warnings
 
-          backend_explain="$(cargo run -q -p backend --bin backend -- --explain RELC3001)"
-          grep -q 'RELC3001' <<<"$backend_explain"
-          grep -q 'Native Container execution required' <<<"$backend_explain"
-          grep -q 'Status: emitted' <<<"$backend_explain"
-          grep -q 'doc/error-codes/relc.md#relc3001' <<<"$backend_explain"
+          missing="$(cargo run -q -p backend --bin backend -- --explain RBE5001)"
+          grep -q 'RBE5001' <<<"$missing"
+          grep -q 'Required packaged dependency missing' <<<"$missing"
 
-          backend_equals="$(cargo run -q -p backend --bin backend -- --explain=RELC3001)"
-          grep -q 'RELC3001' <<<"$backend_equals"
+          binding="$(cargo run -q -p backend --bin backend -- --explain RBE5002)"
+          grep -q 'RBE5002' <<<"$binding"
+          grep -q 'Container binding metadata' <<<"$binding"
+          grep -q 'doc/error-codes/runtime.md#rbe5002' <<<"$binding"
 
-          rel_list="$(cargo run -q -p backend --bin backend -- --list-error-codes REL)"
-          grep -q 'REL1000' <<<"$rel_list"
-          if grep -q 'RELC1000' <<<"$rel_list"; then
-            echo 'REL namespace listing leaked RELC codes' >&2
-            exit 1
-          fi
+          integrity="$(cargo run -q -p backend --bin backend -- --explain RBE5003)"
+          grep -q 'RBE5003' <<<"$integrity"
+          grep -q 'integrity verification' <<<"$integrity"
+          grep -q 'doc/error-codes/runtime.md#rbe5003' <<<"$integrity"
 
-          svc_list="$(cargo run -q -p backend --bin backend -- --list-error-codes SVC5)"
-          grep -q 'SVC5001' <<<"$svc_list"
-          if grep -q 'SVC1000' <<<"$svc_list"; then
-            echo 'SVC5 range listing leaked SVC1xxx codes' >&2
-            exit 1
-          fi
-
-          service_explain="$(cargo run -q -p backend --bin service -- --explain SVC5002)"
-          grep -q 'SVC5002' <<<"$service_explain"
-          grep -q 'doc/error-codes/service.md#svc5002' <<<"$service_explain"
-
-          set +e
-          unknown="$(cargo run -q -p backend --bin backend -- --explain RELC3999 2>&1)"
-          unknown_status=$?
-          set -e
-          if [ "$unknown_status" -ne 2 ]; then
-            echo "unknown error-code lookup returned $unknown_status instead of 2" >&2
-            exit 1
-          fi
-          grep -q 'unknown RBE error code RELC3999' <<<"$unknown"
-          grep -q 'RELC3001' <<<"$unknown"
-          if grep -q 'REL1000' <<<"$unknown"; then
-            echo 'RELC suggestion leaked REL namespace codes' >&2
-            exit 1
-          fi
+          rbe5="$(cargo run -q -p backend --bin backend -- --list-error-codes RBE5)"
+          grep -q 'RBE5001' <<<"$rbe5"
+          grep -q 'RBE5002' <<<"$rbe5"
+          grep -q 'RBE5003' <<<"$rbe5"
           cd ..
 
-          grep -q 'backend.exe --explain RELC3001' doc/error-codes/README.md
-          grep -q 'backend.exe --list-error-codes RELC' doc/error-codes/README.md
-          grep -q 'service.exe --explain SVC5002' doc/error-codes/README.md
+          python3 -m json.tool doc/error-codes/catalog.json >/dev/null
+          grep -q '### RBE5002' doc/error-codes/runtime.md
+          grep -q '### RBE5003' doc/error-codes/runtime.md
+          grep -q 'doc/error-codes/runtime.md#rbe5001' engine/crates/backend/src/container_process.rs
+          grep -q 'doc/error-codes/runtime.md#rbe5002' engine/crates/backend/src/container_process.rs
+          grep -q 'doc/error-codes/runtime.md#rbe5003' engine/crates/backend/src/container_process.rs
 
           git add -A
           git diff --cached --check
-          git commit -m 'FIX | BUG-DIAG-004 add offline Error Code Book lookup'
+          git commit -m 'FIX | BUG-DIAG-005 classify Container package failures'
 
           git pull --rebase origin main
           git push origin HEAD:main
