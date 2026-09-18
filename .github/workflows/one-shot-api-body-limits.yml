@@ -1,4 +1,4 @@
-name: One-shot API body limit repair
+name: One-shot embedded Error Code Book validation
 
 "on":
   push:
@@ -10,41 +10,89 @@ permissions:
   contents: write
 
 jobs:
-  repair:
+  validate-and-land:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      - name: Apply and validate API body limits
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Apply, validate and land DIAG-004
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git reset --hard origin/main
 
-          python3 .github/patches/api-body-limits.py
+          python3 .github/patches/diag-explain.py
+
+          # Restore the unrelated API repair workflow from this staging
+          # commit's parent. DIAG-004 must not consume that one-shot lane.
+          git show HEAD^:.github/workflows/one-shot-api-body-limits.yml > .github/workflows/one-shot-api-body-limits.yml
+          rm -f .github/patches/diag-explain.py
 
           cd engine
           cargo fmt --all
-          cargo test -p config rejects_inconsistent_api_body_limits
-          cargo check -p api
+          cargo check -p backend --all-targets --locked
+          cargo test -p backend error_code_book::tests --locked
+          cargo clippy -p backend --all-targets --locked -- -D warnings
+
+          backend_explain="$(cargo run -q -p backend --bin backend -- --explain RELC3001)"
+          grep -q 'RELC3001' <<<"$backend_explain"
+          grep -q 'native Container execution required' <<<"$backend_explain"
+          grep -q 'Status: emitted' <<<"$backend_explain"
+          grep -q 'doc/error-codes/relc.md#relc3001' <<<"$backend_explain"
+
+          backend_equals="$(cargo run -q -p backend --bin backend -- --explain=RELC3001)"
+          grep -q 'RELC3001' <<<"$backend_equals"
+
+          rel_list="$(cargo run -q -p backend --bin backend -- --list-error-codes REL)"
+          grep -q 'REL1000' <<<"$rel_list"
+          if grep -q 'RELC1000' <<<"$rel_list"; then
+            echo 'REL namespace listing leaked RELC codes' >&2
+            exit 1
+          fi
+
+          svc_list="$(cargo run -q -p backend --bin backend -- --list-error-codes SVC5)"
+          grep -q 'SVC5001' <<<"$svc_list"
+          if grep -q 'SVC1000' <<<"$svc_list"; then
+            echo 'SVC5 range listing leaked SVC1xxx codes' >&2
+            exit 1
+          fi
+
+          service_explain="$(cargo run -q -p backend --bin service -- --explain SVC5002)"
+          grep -q 'SVC5002' <<<"$service_explain"
+          grep -q 'doc/error-codes/service.md#svc5002' <<<"$service_explain"
+
+          set +e
+          unknown="$(cargo run -q -p backend --bin backend -- --explain RELC3999 2>&1)"
+          unknown_status=$?
+          set -e
+          if [ "$unknown_status" -ne 2 ]; then
+            echo "unknown error-code lookup returned $unknown_status instead of 2" >&2
+            exit 1
+          fi
+          grep -q 'unknown RBE error code RELC3999' <<<"$unknown"
+          grep -q 'RELC3001' <<<"$unknown"
+          if grep -q 'REL1000' <<<"$unknown"; then
+            echo 'RELC suggestion leaked REL namespace codes' >&2
+            exit 1
+          fi
           cd ..
 
-          git rm .github/workflows/one-shot-api-body-limits.yml
-          git rm .github/patches/api-body-limits.py
-          git add engine/Cargo.toml engine/crates/api/src/lib.rs engine/crates/config/src/lib.rs engine/Cargo.lock
-          git commit -m "FIX | BUG-API-003 enforce generic and JSON body limits"
+          grep -q 'backend.exe --explain RELC3001' doc/error-codes/README.md
+          grep -q 'backend.exe --list-error-codes RELC' doc/error-codes/README.md
+          grep -q 'service.exe --explain SVC5002' doc/error-codes/README.md
 
-          git fetch origin main
-          base="$(git rev-parse HEAD~1)"
-          current="$(git rev-parse origin/main)"
-          if [ "$current" != "$base" ]; then
-            git rebase origin/main
-          fi
+          git add -A
+          git diff --cached --check
+          git commit -m 'FIX | BUG-DIAG-004 add offline Error Code Book lookup'
+
+          git pull --rebase origin main
           git push origin HEAD:main
