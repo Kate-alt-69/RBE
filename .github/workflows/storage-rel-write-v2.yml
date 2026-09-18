@@ -28,8 +28,8 @@ jobs:
 
       - name: Apply capability-bound REL Storage write lowering
         run: |
-          python3 .github/patches/storage-rel-write-v2.py
           python3 .github/patches/storage-rel-write-v2-fix.py
+          python3 .github/patches/storage-rel-write-v2.py
 
       - name: Format route-engine
         run: cargo fmt --manifest-path engine/Cargo.toml -p route-engine
