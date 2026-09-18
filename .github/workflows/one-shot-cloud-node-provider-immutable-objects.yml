@@ -22,7 +22,9 @@ jobs:
         with:
           workspaces: engine
       - name: Protect immutable provider objects
-        run: python3 .github/apply_prov038.py
+        run: |
+          python3 .github/apply_prov038.py
+          python3 .github/cleanup_prov038.py
       - name: Format
         working-directory: engine
         run: cargo fmt --all
@@ -36,6 +38,7 @@ jobs:
         run: |
           rm -f .github/workflows/one-shot-cloud-node-provider-immutable-objects.yml
           rm -f .github/apply_prov038.py
+          rm -f .github/cleanup_prov038.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
