@@ -1,0 +1,31 @@
+name: One-shot Cloud Node merged-tree validation
+
+on:
+  push:
+    branches:
+      - work/cloud-node-provider-merge-validate
+
+permissions:
+  contents: read
+
+jobs:
+  cloud-node-merge-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Format check
+        working-directory: engine
+        run: cargo fmt --all --check
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy -p cloud-node --all-targets --all-features --locked -- -D warnings
+      - name: Test Cloud Node
+        working-directory: engine
+        run: cargo test -p cloud-node --all-features --locked
