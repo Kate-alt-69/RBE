@@ -11,7 +11,8 @@
     "RBE": "Backend/runtime",
     "ER": "Error Reporter",
     "VLT": "Vault",
-    "VID": "Video Manager"
+    "VID": "Video Manager",
+    "CRY": "REL cryptography/authentication primitives"
   },
   "entries": [
     {
@@ -397,6 +398,24 @@
       "status": "reserved",
       "title": "Vault authorization invariant violated",
       "doc": "runtime.md#vlt9001"
+    },
+    {
+      "code": "CRY1001",
+      "status": "emitted",
+      "title": "Invalid cryptography argument",
+      "doc": "runtime.md#cry1001"
+    },
+    {
+      "code": "CRY1002",
+      "status": "emitted",
+      "title": "Unknown cryptography operation",
+      "doc": "runtime.md#cry1002"
+    },
+    {
+      "code": "CRY3001",
+      "status": "emitted",
+      "title": "Secure random generation failed",
+      "doc": "runtime.md#cry3001"
     },
     {
       "code": "VID5001",

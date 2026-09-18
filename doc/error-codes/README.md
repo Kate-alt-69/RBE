@@ -32,6 +32,7 @@ The prefix identifies the subsystem. The numeric range identifies the class of f
 | `ER` | Error Reporter/recovery authority | [Runtime](runtime.md#error-reporter-codes) |
 | `VLT` | Vault/secret-runtime failures | [Runtime](runtime.md#vault-codes) |
 | `VID` | Video Manager | [Runtime](runtime.md#video-manager-codes) |
+| `CRY` | REL cryptography/authentication primitives | [Runtime](runtime.md#crypto-codes) |
 
 ## Numeric convention
 

@@ -79,7 +79,17 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
         "json" => matches!(function, "parse" | "stringify"),
         "time" => matches!(function, "now"),
         "log" => matches!(function, "info" | "warn"),
-        "crypto" => matches!(function, "hash"),
+        "crypto" => matches!(
+            function,
+            "hash"
+                | "sha256"
+                | "hmacSha256"
+                | "hmac_sha256"
+                | "randomBytes"
+                | "random_bytes"
+                | "randomToken"
+                | "random_token"
+        ),
         "http" => matches!(function, "request" | "get" | "post"),
         "request" => matches!(
             function,
@@ -831,23 +841,154 @@ fn call_log(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
     }
 }
 
+const CRYPTO_MAX_INPUT_BYTES: usize = 1024 * 1024;
+const CRYPTO_MAX_HMAC_KEY_BYTES: usize = 4 * 1024;
+const CRYPTO_MAX_RANDOM_BYTES: usize = 4 * 1024;
+const CRYPTO_DEFAULT_TOKEN_BYTES: usize = 32;
+const CRYPTO_MIN_TOKEN_BYTES: usize = 16;
+const CRYPTO_MAX_TOKEN_BYTES: usize = 64;
+
+fn crypto_error(code: &'static str, message: impl Into<String>) -> ModuleError {
+    ModuleError {
+        message: format!(
+            "{code} {}\nhelp: https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#{}",
+            message.into(),
+            code.to_ascii_lowercase()
+        ),
+    }
+}
+
+fn crypto_expect_arity(function: &str, args: &[Value], expected: usize) -> Result<(), ModuleError> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(crypto_error(
+            "CRY1001",
+            format!(
+                "crypto.{function}() expects {expected} argument(s), got {}",
+                args.len()
+            ),
+        ))
+    }
+}
+
+fn crypto_string<'a>(
+    function: &str,
+    args: &'a [Value],
+    index: usize,
+    label: &str,
+    max_bytes: usize,
+) -> Result<&'a str, ModuleError> {
+    let Some(Value::String(value)) = args.get(index) else {
+        return Err(crypto_error(
+            "CRY1001",
+            format!("crypto.{function}() {label} must be a string"),
+        ));
+    };
+    if value.len() > max_bytes {
+        return Err(crypto_error(
+            "CRY1001",
+            format!("crypto.{function}() {label} exceeds the {max_bytes}-byte limit"),
+        ));
+    }
+    Ok(value)
+}
+
+fn crypto_length(
+    function: &str,
+    value: Option<&Value>,
+    min: usize,
+    max: usize,
+) -> Result<usize, ModuleError> {
+    let Some(Value::Number(value)) = value else {
+        return Err(crypto_error(
+            "CRY1001",
+            format!("crypto.{function}() length must be a number"),
+        ));
+    };
+    if !value.is_finite() || value.fract() != 0.0 || *value < min as f64 || *value > max as f64 {
+        return Err(crypto_error(
+            "CRY1001",
+            format!("crypto.{function}() length must be an integer from {min} through {max}"),
+        ));
+    }
+    Ok(*value as usize)
+}
+
+fn secure_random_bytes(length: usize) -> Result<Vec<u8>, ModuleError> {
+    use rand::RngCore;
+    let mut bytes = vec![0_u8; length];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|error| {
+            crypto_error(
+                "CRY3001",
+                format!("operating-system secure random generation failed: {error}"),
+            )
+        })?;
+    Ok(bytes)
+}
+
 fn call_crypto(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
     match function_name {
-        "hash" => {
-            let Some(Value::String(input)) = args.first() else {
-                return Err(ModuleError {
-                    message: "crypto.hash(value) requires a string argument".into(),
-                });
-            };
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            input.hash(&mut hasher);
-            Ok(Value::String(format!("{:016x}", hasher.finish())))
+        "hash" | "sha256" => {
+            crypto_expect_arity(function_name, args, 1)?;
+            let input = crypto_string(function_name, args, 0, "input", CRYPTO_MAX_INPUT_BYTES)?;
+            use sha2::{Digest, Sha256};
+            Ok(Value::String(hex::encode(Sha256::digest(input.as_bytes()))))
         }
-        other => Err(ModuleError {
-            message: format!("crypto.{other}() does not exist"),
-        }),
+        "hmacSha256" | "hmac_sha256" => {
+            crypto_expect_arity(function_name, args, 2)?;
+            let key = crypto_string(function_name, args, 0, "key", CRYPTO_MAX_HMAC_KEY_BYTES)?;
+            if key.is_empty() {
+                return Err(crypto_error(
+                    "CRY1001",
+                    format!("crypto.{function_name}() key must not be empty"),
+                ));
+            }
+            let input = crypto_string(function_name, args, 1, "input", CRYPTO_MAX_INPUT_BYTES)?;
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
+                .map_err(|_| crypto_error("CRY1001", "crypto.hmacSha256() key is invalid"))?;
+            mac.update(input.as_bytes());
+            Ok(Value::String(hex::encode(mac.finalize().into_bytes())))
+        }
+        "randomBytes" | "random_bytes" => {
+            crypto_expect_arity(function_name, args, 1)?;
+            let length = crypto_length(function_name, args.first(), 1, CRYPTO_MAX_RANDOM_BYTES)?;
+            Ok(Value::Array(
+                secure_random_bytes(length)?
+                    .into_iter()
+                    .map(|byte| Value::Number(f64::from(byte)))
+                    .collect(),
+            ))
+        }
+        "randomToken" | "random_token" => {
+            if args.len() > 1 {
+                return Err(crypto_error(
+                    "CRY1001",
+                    format!(
+                        "crypto.{function_name}() expects zero or one argument, got {}",
+                        args.len()
+                    ),
+                ));
+            }
+            let length = match args.first() {
+                Some(value) => crypto_length(
+                    function_name,
+                    Some(value),
+                    CRYPTO_MIN_TOKEN_BYTES,
+                    CRYPTO_MAX_TOKEN_BYTES,
+                )?,
+                None => CRYPTO_DEFAULT_TOKEN_BYTES,
+            };
+            Ok(Value::String(hex::encode(secure_random_bytes(length)?)))
+        }
+        other => Err(crypto_error(
+            "CRY1002",
+            format!("crypto.{other}() does not exist"),
+        )),
     }
 }
 
@@ -1091,6 +1232,73 @@ mod tests {
         assert!(
             matches!(registry.call("security", "clientIp", &[request]).unwrap(), Value::String(value) if value == "198.51.100.4")
         );
+    }
+
+    #[test]
+    fn crypto_hash_and_sha256_use_sha256() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("crypto".into())]);
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        for function in ["hash", "sha256"] {
+            let Value::String(digest) = registry
+                .call("crypto", function, &[Value::String("abc".into())])
+                .expect("SHA-256 call")
+            else {
+                panic!("expected digest string");
+            };
+            assert_eq!(digest, expected);
+        }
+    }
+
+    #[test]
+    fn crypto_hmac_sha256_matches_known_vector() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("crypto".into())]);
+        let Value::String(mac) = registry
+            .call(
+                "crypto",
+                "hmacSha256",
+                &[
+                    Value::String("key".into()),
+                    Value::String("The quick brown fox jumps over the lazy dog".into()),
+                ],
+            )
+            .expect("HMAC-SHA256 call")
+        else {
+            panic!("expected HMAC string");
+        };
+        assert_eq!(
+            mac,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn crypto_random_generation_is_bounded_and_structured() {
+        let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("crypto".into())]);
+        let Value::Array(bytes) = registry
+            .call("crypto", "randomBytes", &[Value::Number(32.0)])
+            .expect("random bytes")
+        else {
+            panic!("expected byte array");
+        };
+        assert_eq!(bytes.len(), 32);
+        assert!(bytes.iter().all(|value| matches!(value, Value::Number(byte) if *byte >= 0.0 && *byte <= 255.0 && byte.fract() == 0.0)));
+
+        let Value::String(token) = registry
+            .call("crypto", "randomToken", &[])
+            .expect("random token")
+        else {
+            panic!("expected token string");
+        };
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let error = registry
+            .call("crypto", "randomToken", &[Value::Number(8.0)])
+            .expect_err("short tokens must fail");
+        assert!(error.message.starts_with("CRY1001 "));
+        assert!(error
+            .message
+            .contains("kastrick.vercel.app/project/rbe/doc/error-codes/runtime#cry1001"));
     }
 
     #[test]

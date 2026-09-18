@@ -2507,6 +2507,8 @@ dependencies = [
  "core-lib",
  "execution-engine",
  "hex",
+ "hmac",
+ "rand 0.8.8",
  "serde_json",
  "service-runtime",
  "sha2",

@@ -1,6 +1,6 @@
 # Runtime subsystem error codes
 
-This page covers backend/runtime (`RBE`), Error Reporter (`ER`), Vault (`VLT`) and Video Manager (`VID`) diagnostic namespaces.
+This page covers backend/runtime (`RBE`), Error Reporter (`ER`), Vault (`VLT`), Video Manager (`VID`) and REL cryptography (`CRY`) diagnostic namespaces.
 
 Most of these subsystems still contain legacy unnumbered diagnostics. The ranges below reserve stable code space for migration; existing numbered Service/Container codes remain documented in their own books.
 
@@ -116,6 +116,43 @@ Vault could not initialize the required platform keyring/Secret Service or its p
 A credential operation escaped the expected caller/ACL/secret-backend model.
 
 Treat this as a security bug and preserve the caller identity plus operation metadata.
+
+<a id="crypto-codes"></a>
+## REL cryptography codes
+
+| Range | Meaning |
+| --- | --- |
+| `CRY1000-1999` | crypto API input/operation validation |
+| `CRY3000-3999` | secure entropy/runtime preparation failures |
+| `CRY4000-4999` | password/authentication crypto execution |
+| `CRY9000-9099` | crypto invariants / probable RBE bugs |
+
+<a id="cry1001"></a>
+### CRY1001 — invalid cryptography argument
+
+**Status:** Emitted.
+
+A REL cryptography helper received the wrong number/type of arguments or a value outside its bounded input/length policy.
+
+**Action:** use the function signature and limits shown in the diagnostic. Do not remove the limits to accept attacker-controlled unbounded crypto work.
+
+<a id="cry1002"></a>
+### CRY1002 — unknown cryptography operation
+
+**Status:** Emitted.
+
+REL attempted to call a function that the `crypto` builtin does not export.
+
+**Action:** use an explicitly supported crypto operation; do not infer undocumented host cryptography APIs.
+
+<a id="cry3001"></a>
+### CRY3001 — secure random generation failed
+
+**Status:** Emitted.
+
+The operating-system cryptographically secure random generator could not supply the requested entropy. RBE fails closed rather than substituting a predictable PRNG.
+
+**Action:** inspect the host entropy/platform failure. Do not replace this failure with timestamps, counters or non-cryptographic randomness.
 
 <a id="video-manager-codes"></a>
 ## Video Manager codes
