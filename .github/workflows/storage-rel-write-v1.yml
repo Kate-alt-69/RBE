@@ -1,4 +1,4 @@
-name: One-shot REL Storage write syntax
+name: One-shot hardened REL crypto primitives
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  storage-rel-write:
+  validate-and-land:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -26,41 +26,44 @@ jobs:
         with:
           workspaces: engine
 
-      - name: Fix staging helper scope
-        run: python3 .github/patches/storage-rel-write-v1-fix.py
-
-      - name: Apply REL Storage write syntax
-        run: python3 .github/patches/storage-rel-write-v1.py
-
-      - name: Format route-engine
-        run: cargo fmt --manifest-path engine/Cargo.toml -p route-engine
-
-      - name: Diff check
-        run: git diff --check
-
-      - name: Test lexer project-root path
-        run: cargo test --manifest-path engine/Cargo.toml -p route-engine --locked project_root_path_stays_symbolic
-
-      - name: Test descriptor normalization
-        run: cargo test --manifest-path engine/Cargo.toml -p route-engine --locked parses_storage_write_descriptors_into_one_capability_argument
-
-      - name: Test route-engine
-        run: cargo test --manifest-path engine/Cargo.toml -p route-engine --locked
-
-      - name: Clippy route-engine
-        run: cargo clippy --manifest-path engine/Cargo.toml -p route-engine --all-targets --locked -- -D warnings
-
-      - name: Commit BUG-STO-003
+      - name: Apply, validate and land CRY-001
+        shell: bash
         run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/patches/cry-rel-crypto-v1.py
+
+          cargo fmt --manifest-path engine/Cargo.toml -p route-engine
+          git diff --check
+
+          # First check may update Cargo.lock because CRY-001 adds direct hmac/rand deps.
+          cargo check --manifest-path engine/Cargo.toml -p route-engine --all-targets
+          cargo test --manifest-path engine/Cargo.toml -p route-engine --locked crypto_
+          cargo test --manifest-path engine/Cargo.toml -p route-engine --locked
+          cargo clippy --manifest-path engine/Cargo.toml -p route-engine --all-targets --locked -- -D warnings
+
+          python3 -m json.tool doc/error-codes/catalog.json >/dev/null
+          grep -q '"CRY": "REL cryptography/authentication primitives"' doc/error-codes/catalog.json
+          grep -q '"code": "CRY3001"' doc/error-codes/catalog.json
+          grep -q 'Hmac::<Sha256>' engine/crates/route-engine/src/modules.rs
+          grep -q 'OsRng' engine/crates/route-engine/src/modules.rs
+          if grep -q 'DefaultHasher' engine/crates/route-engine/src/modules.rs; then
+            echo 'weak DefaultHasher still present in REL crypto implementation' >&2
+            exit 1
+          fi
+
           rm -f \
             .ci-storage-rel-write-v1-trigger \
             .github/patches/storage-rel-write-v1.py \
             .github/patches/storage-rel-write-v1-fix.py \
+            .github/patches/cry-rel-crypto-v1.py \
             .github/workflows/storage-rel-write-v1.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add -A
           git diff --cached --check
-          git commit -m "FIX | BUG-STO-003 lower REL Storage write descriptors"
+          git commit -m "FIX | BUG-CRY-001 harden REL crypto primitives"
+
           git pull --rebase origin main
           git push origin HEAD:main
