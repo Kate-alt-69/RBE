@@ -32,6 +32,7 @@ pub enum TokenKind {
     Slash,
     Percent,
     Dollar,
+    ProjectPath(String),
     Import,
     Class,
     Async,
@@ -157,7 +158,33 @@ impl<'a> Lexer<'a> {
                 }
                 '$' => {
                     self.bump();
-                    TokenKind::Dollar
+                    if self.take_if('$') {
+                        if !self.take_if('/') {
+                            return Err(LexError {
+                                message: "project-root path must start with $$/".into(),
+                                line,
+                                column,
+                            });
+                        }
+                        let mut path = String::from("$$/");
+                        while let Some(&next) = self.chars.peek() {
+                            if next.is_whitespace() || matches!(next, ']' | ',' | ')' | ';' | '}') {
+                                break;
+                            }
+                            path.push(next);
+                            self.bump();
+                        }
+                        if path == "$$/" {
+                            return Err(LexError {
+                                message: "project-root path must name a relative target".into(),
+                                line,
+                                column,
+                            });
+                        }
+                        TokenKind::ProjectPath(path)
+                    } else {
+                        TokenKind::Dollar
+                    }
                 }
                 '!' => {
                     self.bump();
@@ -439,5 +466,15 @@ mod tests {
         assert!(tokens
             .iter()
             .any(|token| matches!(&token.kind, TokenKind::Ident(name) if name == "delete")));
+    }
+
+    #[test]
+    fn project_root_path_stays_symbolic() {
+        let tokens = Lexer::new("write[$$/generated/data.json]")
+            .tokenize()
+            .unwrap();
+        assert!(tokens.iter().any(|token| {
+            matches!(&token.kind, TokenKind::ProjectPath(path) if path == "$$/generated/data.json")
+        }));
     }
 }

@@ -939,6 +939,22 @@ impl Parser {
                     self.expect(TokenKind::RParen)?;
                     expr = Expr::Call(Box::new(expr), args);
                 }
+                TokenKind::LBracket => {
+                    let Expr::Ident(descriptor) = &expr else {
+                        break;
+                    };
+                    if !matches!(descriptor.as_str(), "encode" | "data" | "write" | "level") {
+                        break;
+                    }
+                    let descriptor = descriptor.clone();
+                    self.advance();
+                    let value = self.parse_expression()?;
+                    self.expect(TokenKind::RBracket)?;
+                    expr = Expr::Object(vec![
+                        ("__rbeStorageDescriptor".into(), Expr::String(descriptor)),
+                        ("value".into(), value),
+                    ]);
+                }
                 _ => break,
             }
         }
@@ -953,6 +969,7 @@ impl Parser {
             TokenKind::False => Ok(Expr::Bool(false)),
             TokenKind::Null => Ok(Expr::Null),
             TokenKind::Ident(name) => Ok(Expr::Ident(name)),
+            TokenKind::ProjectPath(path) => Ok(Expr::String(path)),
             TokenKind::Dollar => {
                 self.expect(TokenKind::LBracket)?;
                 let name = self.expect_ident()?;

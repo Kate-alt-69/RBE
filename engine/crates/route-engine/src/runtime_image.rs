@@ -24,7 +24,8 @@ use crate::wasm_compiler::{
 };
 
 pub(crate) const STORAGE_CAPABILITY_TARGET_PREFIX: &str = "storage:";
-pub(crate) const STORAGE_CAPABILITY_OPERATIONS: [&str; 4] = ["read", "list", "snapshot", "commit"];
+pub(crate) const STORAGE_CAPABILITY_OPERATIONS: [&str; 5] =
+    ["read", "list", "snapshot", "commit", "write"];
 pub(crate) const MAX_STORAGE_NAMESPACE_BYTES: usize = 64;
 
 pub(crate) fn storage_capability_operation_allowed(operation: &str) -> bool {

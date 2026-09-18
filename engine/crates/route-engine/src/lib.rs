@@ -174,6 +174,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_storage_write_descriptor_syntax_without_global_write_rewrite() {
+        let tokens = Lexer::new(
+            r#":import[storage.write]
+            export function save() {
+                return write(
+                    encode["UTF8"],
+                    data[{ ok: true }],
+                    write[$$/generated/data.json],
+                    level[1]
+                );
+            }"#,
+        )
+        .tokenize()
+        .expect("lex failed");
+        let file = Parser::new(tokens)
+            .parse_module_file()
+            .expect("module parse failed");
+        let Statement::Return(Expr::Call(_, args)) = &file.functions[0].body[0] else {
+            panic!("expected storage.write call");
+        };
+        assert_eq!(args.len(), 4);
+        assert!(
+            matches!(&args[2], Expr::Object(fields) if fields.iter().any(|(key, value)| {
+                key == "value" && matches!(value, Expr::String(path) if path == "$$/generated/data.json")
+            }))
+        );
+    }
+
+    #[test]
     fn parses_video_manager_import_names_for_modules() {
         let tokens = Lexer::new(
             r#":import[vm as short, video-manager as media, video-manager.status as status]

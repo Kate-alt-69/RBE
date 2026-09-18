@@ -353,19 +353,95 @@ fn lower_linked_module_capability_call(
         .cloned()
         .zip(route_args)
         .collect::<BTreeMap<_, _>>();
-    let args = host_args
-        .iter()
-        .map(|argument| static_json_with_bindings(argument, &bindings))
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            "native linked Module host arguments must resolve to static JSON values".to_string()
-        })?;
+    let args = if host.kind == ContainerCapabilityKind::Storage && host.operation == "write" {
+        lower_storage_write_args(host_args, &bindings)?
+    } else {
+        host_args
+            .iter()
+            .map(|argument| static_json_with_bindings(argument, &bindings))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                "native linked Module host arguments must resolve to static JSON values".to_string()
+            })?
+    };
     let payload = serde_json::to_vec(&args)
         .map_err(|error| format!("encode native linked Module arguments: {error}"))?;
     if payload.len() > CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES {
         return Err("native linked Module argument payload exceeds the capability envelope".into());
     }
     Ok((host.kind, host.target, host.operation, payload))
+}
+
+fn lower_storage_write_args(
+    args: &[Expr],
+    bindings: &BTreeMap<String, serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    if args.len() != 4 {
+        return Err(
+            "native storage.write requires encode[], data[], write[], and level[] descriptors"
+                .into(),
+        );
+    }
+
+    let mut descriptor_values = BTreeMap::<String, serde_json::Value>::new();
+    for argument in args {
+        let (kind, value_expr) = storage_descriptor_expr(argument).ok_or_else(|| {
+            "native storage.write arguments must use descriptor brackets".to_string()
+        })?;
+        let value = static_json_with_bindings(value_expr, bindings).ok_or_else(|| {
+            format!("native storage.write {kind}[] value must resolve to static JSON")
+        })?;
+        if descriptor_values.insert(kind.to_string(), value).is_some() {
+            return Err(format!(
+                "native storage.write descriptor {kind}[] was provided more than once"
+            ));
+        }
+    }
+
+    let take = |values: &mut BTreeMap<String, serde_json::Value>, name: &str| {
+        values
+            .remove(name)
+            .ok_or_else(|| format!("native storage.write is missing {name}[]"))
+    };
+    let mut values = descriptor_values;
+    let encoding = take(&mut values, "encode")?;
+    let data = take(&mut values, "data")?;
+    let path = take(&mut values, "write")?;
+    let level = take(&mut values, "level")?;
+
+    if !matches!(&path, serde_json::Value::String(value) if value.starts_with("$$/")) {
+        return Err("native storage.write write[] must contain a symbolic $$/ path".into());
+    }
+    let level = level
+        .as_f64()
+        .filter(|value| value.fract() == 0.0 && (1.0..=3.0).contains(value))
+        .ok_or_else(|| "native storage.write level[] must be 1, 2, or 3".to_string())?;
+    let level = serde_json::Value::Number(serde_json::Number::from(level as u64));
+    if !encoding.is_string() {
+        return Err("native storage.write encode[] must be a string".into());
+    }
+
+    Ok(vec![serde_json::json!({
+        "path": path,
+        "data": data,
+        "encoding": encoding,
+        "level": level,
+    })])
+}
+
+fn storage_descriptor_expr(expr: &Expr) -> Option<(&str, &Expr)> {
+    let Expr::Object(fields) = expr else {
+        return None;
+    };
+    let descriptor = fields
+        .iter()
+        .find(|(name, _)| name == "__rbeStorageDescriptor")?;
+    let value = fields.iter().find(|(name, _)| name == "value")?;
+    let Expr::String(kind) = &descriptor.1 else {
+        return None;
+    };
+    matches!(kind.as_str(), "encode" | "data" | "write" | "level")
+        .then_some((kind.as_str(), &value.1))
 }
 
 fn static_direct_call(binding: &str, expr: &Expr) -> Option<Vec<serde_json::Value>> {
@@ -887,6 +963,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.output, br#"{"found":false}"#);
+    }
+
+    #[test]
+    fn linked_module_storage_write_lowers_descriptors_for_trusted_boundary() {
+        let module = parse_module(
+            r#":import[storage.write as writeFile]
+               export function save() {
+                   return writeFile(
+                       encode["UTF8"],
+                       data[{ ok: true }],
+                       write[$$/generated/data.json],
+                       level[2]
+                   );
+               }"#,
+        );
+        let links = link_module_function("save", "accounts.cache", &module, "save");
+        let route = parse(
+            r#":import["./module/accounts/cache".save]
+               class Route { get(req) { return save(); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route_with_links(&route, &links)
+        else {
+            panic!("static linked Storage write wrapper should compile natively");
+        };
+        let host: CapabilityHost = Box::new(|request| {
+            assert_eq!(request.kind, ContainerCapabilityKind::Storage);
+            assert_eq!(request.target, "storage:accounts.cache");
+            assert_eq!(request.operation, "write");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.payload).unwrap(),
+                serde_json::json!([{
+                    "path": "$$/generated/data.json",
+                    "data": {"ok": true},
+                    "encoding": "UTF8",
+                    "level": 2
+                }])
+            );
+            Ok(br#"{\"path\":\"$$/generated/data.json\",\"bytes\":11}"#.to_vec())
+        });
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                &[],
+                ExecutionLimits::default(),
+                Some(host),
+            )
+            .unwrap();
+        assert!(!result.output.is_empty());
     }
 
     #[test]
