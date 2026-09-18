@@ -350,6 +350,18 @@
       "doc": "runtime.md#rbe5001"
     },
     {
+      "code": "RBE5002",
+      "status": "emitted",
+      "title": "Backend Container binding metadata is invalid",
+      "doc": "runtime.md#rbe5002"
+    },
+    {
+      "code": "RBE5003",
+      "status": "emitted",
+      "title": "Packaged Container failed backend integrity verification",
+      "doc": "runtime.md#rbe5003"
+    },
+    {
       "code": "RBE5099",
       "status": "emitted",
       "title": "Backend startup failed with an unclassified boot error",

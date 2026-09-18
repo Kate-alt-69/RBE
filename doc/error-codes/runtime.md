@@ -23,6 +23,24 @@ A required packaged runtime dependency is absent from the expected application-r
 
 **Action:** rebuild/reinstall the complete RBE package for the same target. Do not satisfy this error by copying an unrelated Container binary into place.
 
+<a id="rbe5002"></a>
+### RBE5002 — backend Container binding metadata is invalid
+
+**Status:** Emitted.
+
+The backend build does not contain a complete, valid integrity binding for its packaged Container runtime. This is a package/build compatibility problem, not an instruction to disable verification.
+
+**Action:** rebuild the complete RBE package for the same target so backend and Container metadata are generated together.
+
+<a id="rbe5003"></a>
+### RBE5003 — packaged Container failed backend integrity verification
+
+**Status:** Emitted.
+
+The packaged Container could not be read/hashed or its hash/signature does not match the artifact cryptographically bound to this backend build.
+
+**Action:** replace the complete package with a coherent build for the same target. Do not copy `container`/`container.exe` between backend builds.
+
 <a id="rbe5099"></a>
 ### RBE5099 — backend startup failed with an unclassified boot error
 
