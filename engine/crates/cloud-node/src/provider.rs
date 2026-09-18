@@ -1098,7 +1098,7 @@ impl ProviderClient {
     }
 }
 
-fn provider_transport_error(error: reqwest::Error) -> anyhow::Error {
+pub(crate) fn provider_transport_error(error: reqwest::Error) -> anyhow::Error {
     anyhow::anyhow!(
         "Cloud Node provider request failed: {}",
         error.without_url()

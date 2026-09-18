@@ -14,7 +14,7 @@ use crate::client::{cached_resource_path, cleanup_outbound_cache, prepare_outbou
 use crate::config::{validate_node_id, CloudNodeSettings, ProviderConflictPolicy};
 use crate::durable;
 use crate::format::BlobKind;
-use crate::provider::{ProviderClient, ProviderObjectVersion};
+use crate::provider::{provider_transport_error, ProviderClient, ProviderObjectVersion};
 use crate::recovery::CloudNodeRecoveryReceiver;
 use crate::store::CloudNodeStore;
 use crate::sync::{SyncPlan, SyncPlanHeader};
@@ -1085,7 +1085,12 @@ async fn restore_resource(
                     resource.key
                 )
             })?;
-        if response.chunk().await?.is_some() {
+        if response
+            .chunk()
+            .await
+            .map_err(provider_transport_error)?
+            .is_some()
+        {
             anyhow::bail!(
                 "Cloud Node provider resource size mismatch for {}",
                 resource.key
@@ -1140,7 +1145,7 @@ async fn restore_resource(
     let ranged = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let mut source_offset = if ranged { offset } else { 0 };
 
-    while let Some(bytes) = response.chunk().await? {
+    while let Some(bytes) = response.chunk().await.map_err(provider_transport_error)? {
         let chunk_start = source_offset;
         source_offset = source_offset
             .checked_add(
