@@ -28,9 +28,8 @@ source = source.replace(
 old_body = '''        .layer(axum::extract::DefaultBodyLimit::max(
             state.config.security.max_json_payload_bytes,
         ))'''
-new_body = '''        // The API ceiling applies to every HTTP body, including streaming
-        // consumers. JSON receives a second, stricter security ceiling below.
-        .layer(RequestBodyLimitLayer::new(state.config.api.max_body_size_bytes))
+new_body = '''        // Extractors may consume bodies up to the API-wide ceiling. JSON
+        // receives a second, stricter security ceiling below.
         .layer(axum::extract::DefaultBodyLimit::max(
             state.config.api.max_body_size_bytes,
         ))'''
@@ -52,6 +51,17 @@ new_tail = '''        .layer(axum::middleware::from_fn_with_state(
 if old_tail not in source:
     raise SystemExit("API timeout layer anchor changed")
 source = source.replace(old_tail, new_tail, 1)
+
+# RequestBodyLimitLayer changes the concrete body type. Keep it outside the
+# FromFn-heavy ServiceBuilder so the inner Axum middleware remains Body-typed;
+# Router normalizes the bounded request before dispatching the middleware stack.
+router_anchor = '''    let router = router.layer(middleware);'''
+router_replacement = '''    let router = router
+        .layer(middleware)
+        .layer(RequestBodyLimitLayer::new(state.config.api.max_body_size_bytes));'''
+if source.count(router_anchor) != 1:
+    raise SystemExit("API router layer anchor changed")
+source = source.replace(router_anchor, router_replacement, 1)
 
 anchor = '''async fn request_timeout(
     State(timeout): State<Duration>,
