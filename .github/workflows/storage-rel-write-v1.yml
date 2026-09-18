@@ -33,6 +33,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          python3 .github/patches/cry-rel-crypto-v1-fix.py
           python3 .github/patches/cry-rel-crypto-v1.py
 
           cargo fmt --manifest-path engine/Cargo.toml -p route-engine
@@ -59,6 +60,7 @@ jobs:
             .github/patches/storage-rel-write-v1.py \
             .github/patches/storage-rel-write-v1-fix.py \
             .github/patches/cry-rel-crypto-v1.py \
+            .github/patches/cry-rel-crypto-v1-fix.py \
             .github/workflows/storage-rel-write-v1.yml
 
           git add -A
