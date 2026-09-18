@@ -7,6 +7,7 @@
 
 #[allow(dead_code)]
 mod er_recovery;
+mod error_code_book;
 mod service_boot;
 mod service_control;
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -142,6 +143,17 @@ fn process_label(args: &[String]) -> String {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if let Some(explanation) = error_code_book::requested(&args) {
+        match explanation {
+            Ok(explanation) => println!("{explanation}"),
+            Err(error) => {
+                eprintln!("Error Code Book lookup failed: {error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     if args.iter().any(|arg| arg == "--service-compat-probe") {
         if let Err(error) = emit_service_compat_probe() {

@@ -83,4 +83,15 @@ Machine-readable/JSON logging should keep `code`, `module`, severity, and struct
 
 A new stable error code should be added to this book in the same change that introduces it. Codes are never recycled after release, even if the implementation that emitted them is removed.
 
-For tooling and future `--explain <CODE>` support, see [`catalog.json`](catalog.json).
+The built backend package also supports offline long-form lookup before runtime bootstrap:
+
+```text
+backend.exe --explain RELC3001
+backend.exe --explain=RELC3001
+backend.exe --list-error-codes RELC
+service.exe --explain SVC5002
+```
+
+Unknown codes suggest numerically nearby registered codes from the same subsystem. Alphabetic filters select one exact subsystem (`REL` does not include `RELC`); filters containing digits can narrow a range such as `SVC5`. The lookup is compiled from this authoritative documentation tree, so it does not require network access or a mutable runtime docs directory.
+
+For machine-readable tooling, see [`catalog.json`](catalog.json).

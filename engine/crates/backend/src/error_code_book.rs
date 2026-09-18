@@ -1,16 +1,4 @@
-from pathlib import Path
-
-
-def replace_once(path: str, old: str, new: str) -> None:
-    p = Path(path)
-    text = p.read_text()
-    count = text.count(old)
-    if count != 1:
-        raise SystemExit(f"{path}: expected exactly one explain anchor, found {count}")
-    p.write_text(text.replace(old, new, 1))
-
-
-module = r'''//! Embedded user-facing RBE Error Code Book lookup.
+//! Embedded user-facing RBE Error Code Book lookup.
 //!
 //! The CLI must remain usable before settings/logging/runtime bootstrap, so the
 //! authoritative docs are compiled into backend/service rather than read from
@@ -79,7 +67,10 @@ fn code_number(code: &str) -> Option<u32> {
 
 fn code_matches_filter(code: &str, filter: &str) -> bool {
     let normalized = filter.trim().to_ascii_uppercase();
-    if normalized.chars().all(|character| character.is_ascii_alphabetic()) {
+    if normalized
+        .chars()
+        .all(|character| character.is_ascii_alphabetic())
+    {
         code_prefix(code) == normalized
     } else {
         code.starts_with(&normalized)
@@ -142,11 +133,7 @@ fn render_nearby_codes(
             Some((distance, code, render_entry(entry)?))
         })
         .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(right.1))
-    });
+    ranked.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
     ranked
         .into_iter()
         .take(limit)
@@ -163,7 +150,12 @@ pub fn list_codes(prefix: Option<&str>) -> anyhow::Result<String> {
         anyhow::bail!("no RBE error codes are registered for prefix {requested}");
     }
     let heading = prefix
-        .map(|value| format!("RBE Error Code Book — {}", value.trim().to_ascii_uppercase()))
+        .map(|value| {
+            format!(
+                "RBE Error Code Book — {}",
+                value.trim().to_ascii_uppercase()
+            )
+        })
         .unwrap_or_else(|| "RBE Error Code Book".to_string());
     Ok(format!("{heading}\n\n{}", lines.join("\n")))
 }
@@ -206,16 +198,18 @@ pub fn explain(code: &str) -> anyhow::Result<String> {
         .get("doc")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Error Code Book entry {requested} has no doc target"))?;
-    let (page_name, anchor) = doc
-        .split_once('#')
-        .ok_or_else(|| anyhow::anyhow!("Error Code Book entry {requested} has an invalid doc target"))?;
+    let (page_name, anchor) = doc.split_once('#').ok_or_else(|| {
+        anyhow::anyhow!("Error Code Book entry {requested} has an invalid doc target")
+    })?;
     let page = match page_name {
         "rel.md" => REL,
         "relc.md" => RELC,
         "service.md" => SERVICE,
         "container.md" => CONTAINER,
         "runtime.md" => RUNTIME,
-        other => anyhow::bail!("Error Code Book entry {requested} references unsupported page {other}"),
+        other => {
+            anyhow::bail!("Error Code Book entry {requested} references unsupported page {other}")
+        }
     };
 
     let marker = format!("<a id=\"{anchor}\"></a>");
@@ -298,86 +292,3 @@ mod tests {
         assert!(rendered.contains("SVC5002"));
     }
 }
-'''
-Path('engine/crates/backend/src/error_code_book.rs').write_text(module)
-
-# backend.exe handles Error Code Book requests before HostBootstrap/settings/logging.
-path = 'engine/crates/backend/src/main.rs'
-replace_once(
-    path,
-    'mod error_reporter_daemon;\n',
-    'mod error_code_book;\nmod error_reporter_daemon;\n',
-)
-replace_once(
-    path,
-    '''    let has = |flag: &str| args.iter().any(|arg| arg == flag);
-
-''',
-    '''    let has = |flag: &str| args.iter().any(|arg| arg == flag);
-
-    if let Some(explanation) = error_code_book::requested(&args) {
-        match explanation {
-            Ok(explanation) => {
-                println!("{explanation}");
-                return ExitCode::SUCCESS;
-            }
-            Err(error) => {
-                eprintln!("Error Code Book lookup failed: {error}");
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-''',
-)
-
-# service.exe gets the same pre-bootstrap/offline lookup.
-path = 'engine/crates/backend/src/service_main.rs'
-replace_once(
-    path,
-    'mod er_recovery;\n',
-    'mod er_recovery;\nmod error_code_book;\n',
-)
-replace_once(
-    path,
-    '''    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    if args.iter().any(|arg| arg == "--service-compat-probe") {
-''',
-    '''    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    if let Some(explanation) = error_code_book::requested(&args) {
-        match explanation {
-            Ok(explanation) => println!("{explanation}"),
-            Err(error) => {
-                eprintln!("Error Code Book lookup failed: {error}");
-                std::process::exit(2);
-            }
-        }
-        return;
-    }
-
-    if args.iter().any(|arg| arg == "--service-compat-probe") {
-''',
-)
-
-# Document the offline CLI as part of the public diagnostics contract.
-path = 'doc/error-codes/README.md'
-replace_once(
-    path,
-    '''For tooling and future `--explain <CODE>` support, see [`catalog.json`](catalog.json).
-''',
-    '''The built backend package also supports offline long-form lookup before runtime bootstrap:
-
-```text
-backend.exe --explain RELC3001
-backend.exe --explain=RELC3001
-backend.exe --list-error-codes RELC
-service.exe --explain SVC5002
-```
-
-Unknown codes suggest numerically nearby registered codes from the same subsystem. Alphabetic filters select one exact subsystem (`REL` does not include `RELC`); filters containing digits can narrow a range such as `SVC5`. The lookup is compiled from this authoritative documentation tree, so it does not require network access or a mutable runtime docs directory.
-
-For machine-readable tooling, see [`catalog.json`](catalog.json).
-''',
-)

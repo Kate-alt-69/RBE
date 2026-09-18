@@ -17,6 +17,7 @@ use supervisor::{BackendState, RestartPolicy, Supervisor};
 mod container_process;
 #[allow(dead_code)]
 mod er_recovery;
+mod error_code_book;
 mod error_reporter_daemon;
 mod host_bootstrap;
 mod host_capability;
@@ -63,6 +64,19 @@ fn render_backend_boot_fatal(error: &anyhow::Error) -> String {
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
+
+    if let Some(explanation) = error_code_book::requested(&args) {
+        match explanation {
+            Ok(explanation) => {
+                println!("{explanation}");
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => {
+                eprintln!("Error Code Book lookup failed: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     if has("--maintenance-notice") {
         let value = |flag: &str| {
