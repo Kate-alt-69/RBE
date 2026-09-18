@@ -414,6 +414,7 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                 ImportTarget::BuiltinFunction { module, function } => {
                     builtin_functions.insert(binding, (module.clone(), function.clone()));
                 }
+                ImportTarget::BuiltinSubLibrary { .. } => {}
                 ImportTarget::Custom(path) => {
                     custom_modules.insert(binding, path.clone());
                 }

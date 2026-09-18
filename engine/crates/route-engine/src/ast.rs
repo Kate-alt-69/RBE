@@ -14,6 +14,10 @@ pub enum ImportTarget {
         module: String,
         function: String,
     },
+    BuiltinSubLibrary {
+        module: String,
+        library: String,
+    },
     Custom(String),
     CustomFunction {
         path: String,

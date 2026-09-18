@@ -154,6 +154,15 @@ The operating-system cryptographically secure random generator could not supply 
 
 **Action:** inspect the host entropy/platform failure. Do not replace this failure with timestamps, counters or non-cryptographic randomness.
 
+<a id="cry4001"></a>
+### CRY4001 — Argon2id password hashing failed
+
+**Status:** Emitted.
+
+The `argon from crypto` sub-library could not complete an Argon2id password-hash operation. RBE owns the Argon2id parameters and random salt generation; REL callers cannot weaken or reuse them manually.
+
+**Action:** preserve the diagnostic and inspect resource/runtime failure. Do not fall back to a fast general-purpose hash for passwords.
+
 <a id="video-manager-codes"></a>
 ## Video Manager codes
 

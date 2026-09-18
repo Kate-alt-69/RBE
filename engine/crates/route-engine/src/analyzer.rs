@@ -63,6 +63,9 @@ fn import_source_key(import: &ImportTarget) -> String {
         ImportTarget::BuiltinFunction { module, function } => {
             format!("builtin:{module}.{function}")
         }
+        ImportTarget::BuiltinSubLibrary { module, library } => {
+            format!("builtin:{module}/{library}")
+        }
         ImportTarget::Custom(path) => format!("custom:{path}"),
         ImportTarget::CustomFunction { path, function } => format!("custom:{path}.{function}"),
         ImportTarget::Service(service) => format!("service:{service}"),
@@ -102,6 +105,17 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
                         symbol: Some(name.clone()),
                     });
                 }
+                SymbolKind::Module
+            }
+            ImportTarget::BuiltinSubLibrary { module, library } => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Error,
+                    code: "E3000",
+                    message: format!(
+                        "crypto sub-library `{library} from {module}` is not available to `.route` files"
+                    ),
+                    symbol: Some(name.clone()),
+                });
                 SymbolKind::Module
             }
             ImportTarget::BuiltinFunction { module, function } => {

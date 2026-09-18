@@ -534,6 +534,25 @@ fn validate_capabilities(
 ) -> Result<(), RelcError> {
     for import in imports {
         let base = import_base(import);
+        if let ImportTarget::BuiltinSubLibrary { module, library } = base {
+            if !(module == "crypto" && library == "argon") {
+                return Err(RelcError::Capability {
+                    code: "RELC2102",
+                    source: source.clone(),
+                    message: format!(
+                        "unknown builtin sub-library {library:?} from {module:?}; supported: `argon from crypto`"
+                    ),
+                });
+            }
+            if !matches!(kind, RelSourceKind::Module | RelSourceKind::Service) {
+                return Err(RelcError::Capability {
+                    code: "RELC2101",
+                    source: source.clone(),
+                    message: "Argon2id is an expensive crypto sub-library and is available only to Module and Service REL"
+                        .into(),
+                });
+            }
+        }
         if let ImportTarget::Builtin(name) | ImportTarget::BuiltinFunction { module: name, .. } =
             base
         {
@@ -1008,7 +1027,8 @@ fn direct_capability_requirements(
                     operation: function.clone(),
                 });
             }
-            ImportTarget::Custom(_)
+            ImportTarget::BuiltinSubLibrary { .. }
+            | ImportTarget::Custom(_)
             | ImportTarget::CustomFunction { .. }
             | ImportTarget::Aliased { .. } => {}
         }
@@ -1102,6 +1122,9 @@ fn import_label(import: &ImportTarget) -> String {
     match import {
         ImportTarget::Builtin(name) => name.clone(),
         ImportTarget::BuiltinFunction { module, function } => format!("{module}.{function}"),
+        ImportTarget::BuiltinSubLibrary { module, library } => {
+            format!("{library} from {module}")
+        }
         ImportTarget::Custom(path) => format!("module:{path}"),
         ImportTarget::CustomFunction { path, function } => format!("module:{path}.{function}"),
         ImportTarget::Service(service) => format!("service:{service}"),

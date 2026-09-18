@@ -68,7 +68,10 @@ impl Scope {
         }
         for import in imports {
             match base_import(import) {
-                ImportTarget::Builtin(_) | ImportTarget::Custom(_) | ImportTarget::Service(_) => {
+                ImportTarget::Builtin(_)
+                | ImportTarget::BuiltinSubLibrary { .. }
+                | ImportTarget::Custom(_)
+                | ImportTarget::Service(_) => {
                     names.insert(crate::modules::binding_name(import), NameKind::Module);
                 }
                 ImportTarget::BuiltinFunction { .. }

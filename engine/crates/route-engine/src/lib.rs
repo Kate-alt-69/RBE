@@ -284,6 +284,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_builtin_crypto_sublibrary_import() {
+        let tokens = Lexer::new(
+            r#":import[argon from crypto]
+            export function hash(value) { return argon.hashPassword(value); }"#,
+        )
+        .tokenize()
+        .expect("lex failed");
+        let file = Parser::new(tokens)
+            .parse_module_file()
+            .expect("module parse failed");
+        assert!(matches!(
+            file.imports.as_slice(),
+            [ImportTarget::BuiltinSubLibrary { module, library }]
+                if module == "crypto" && library == "argon"
+        ));
+        assert_eq!(binding_name(&file.imports[0]), "argon");
+    }
+
+    #[test]
     fn parses_multiple_import_entries_and_aliases() {
         let file = parse(
             r#"

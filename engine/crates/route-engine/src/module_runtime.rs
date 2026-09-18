@@ -377,6 +377,19 @@ fn validate_local(
                     message: "Video Manager must be imported as `vm` or `video-manager`; legacy `video` is not a capability".into(),
                 });
             }
+            ImportTarget::BuiltinSubLibrary { module, library }
+                if !(module == "crypto" && library == "argon") =>
+            {
+                errors.push(ModuleCompileError {
+                    code: "MOD2012",
+                    path: path.to_path_buf(),
+                    line: 1,
+                    column: 1,
+                    message: format!(
+                        "unknown builtin sub-library {library:?} from {module:?}; supported: argon from crypto"
+                    ),
+                });
+            }
             _ => {}
         }
 
@@ -440,6 +453,9 @@ fn import_source_key(import: &ImportTarget) -> String {
         ImportTarget::Builtin(name) => format!("builtin:{name}"),
         ImportTarget::BuiltinFunction { module, function } => {
             format!("builtin:{module}.{function}")
+        }
+        ImportTarget::BuiltinSubLibrary { module, library } => {
+            format!("builtin:{module}/{library}")
         }
         ImportTarget::Custom(path) => format!("module:{path}"),
         ImportTarget::CustomFunction { path, function } => {

@@ -460,7 +460,14 @@ impl Parser {
     fn parse_import_target(&mut self) -> Result<ImportTarget, ParseError> {
         match self.advance().kind {
             TokenKind::Ident(name) => {
-                if name == "service" && self.check(&TokenKind::Colon) {
+                if self.is_from_keyword() {
+                    self.advance();
+                    let module = self.expect_ident()?;
+                    Ok(ImportTarget::BuiltinSubLibrary {
+                        module,
+                        library: name,
+                    })
+                } else if name == "service" && self.check(&TokenKind::Colon) {
                     self.advance();
                     let service = self.expect_ident()?;
                     if self.check(&TokenKind::Dot) {
@@ -527,6 +534,10 @@ impl Parser {
 
     fn is_as_keyword(&self) -> bool {
         matches!(self.tokens.get(self.pos).map(|token| &token.kind), Some(TokenKind::Ident(name)) if name == "as")
+    }
+
+    fn is_from_keyword(&self) -> bool {
+        matches!(self.tokens.get(self.pos).map(|token| &token.kind), Some(TokenKind::Ident(name)) if name == "from")
     }
 
     fn parse_function(&mut self) -> Result<FunctionDef, ParseError> {

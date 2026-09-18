@@ -37,6 +37,7 @@ enum BuiltinModule {
     Time,
     Log,
     Crypto,
+    CryptoArgon,
     Http,
     Request,
     Security,
@@ -72,6 +73,18 @@ pub fn route_capability_allowed(name: &str) -> bool {
 /// Return whether a known built-in module exports a particular function.
 /// This is used by semantic analysis so unknown built-in calls fail during
 /// boot instead of becoming request-time 500s.
+pub fn builtin_sublibrary_function_exists(module: &str, library: &str, function: &str) -> bool {
+    matches!(
+        (module, library, function),
+        ("crypto", "argon", "hash")
+            | ("crypto", "argon", "hashPassword")
+            | ("crypto", "argon", "hash_password")
+            | ("crypto", "argon", "verify")
+            | ("crypto", "argon", "verifyPassword")
+            | ("crypto", "argon", "verify_password")
+    )
+}
+
 pub fn builtin_function_exists(module: &str, function: &str) -> bool {
     match module {
         "net" => matches!(function, "ping"),
@@ -159,6 +172,7 @@ pub fn binding_name(target: &ImportTarget) -> String {
         ImportTarget::Aliased { alias, .. } => alias.clone(),
         ImportTarget::Builtin(name) => name.clone(),
         ImportTarget::BuiltinFunction { function, .. } => function.clone(),
+        ImportTarget::BuiltinSubLibrary { library, .. } => library.clone(),
         ImportTarget::Custom(path) => std::path::Path::new(path)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -200,6 +214,16 @@ impl ModuleRegistry {
                         "vm" | "video-manager" => ModuleKind::Builtin(BuiltinModule::VideoManager),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{name}"),
+                            resolved_path: std::path::PathBuf::new(),
+                        },
+                    };
+                    modules.insert(binding_name(target), kind);
+                }
+                ImportTarget::BuiltinSubLibrary { module, library } => {
+                    let kind = match (module.as_str(), library.as_str()) {
+                        ("crypto", "argon") => ModuleKind::Builtin(BuiltinModule::CryptoArgon),
+                        _ => ModuleKind::CustomUnimplemented {
+                            source_path: format!("builtin:{library} from {module}"),
                             resolved_path: std::path::PathBuf::new(),
                         },
                     };
@@ -305,6 +329,9 @@ impl ModuleRegistry {
             ModuleKind::Builtin(BuiltinModule::Time) => call_time(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Log) => call_log(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Crypto) => call_crypto(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::CryptoArgon) => {
+                call_crypto_argon(function_name, args)
+            }
             ModuleKind::Builtin(BuiltinModule::Http) => Err(ModuleError {
                 message: format!(
                     "{module_name}.{function_name}() requires the async runtime HTTP host capability"
@@ -843,6 +870,8 @@ fn call_log(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
 
 const CRYPTO_MAX_INPUT_BYTES: usize = 1024 * 1024;
 const CRYPTO_MAX_HMAC_KEY_BYTES: usize = 4 * 1024;
+const CRYPTO_MAX_PASSWORD_BYTES: usize = 4 * 1024;
+const CRYPTO_MAX_PASSWORD_HASH_BYTES: usize = 1024;
 const CRYPTO_MAX_RANDOM_BYTES: usize = 4 * 1024;
 const CRYPTO_DEFAULT_TOKEN_BYTES: usize = 32;
 const CRYPTO_MIN_TOKEN_BYTES: usize = 16;
@@ -988,6 +1017,70 @@ fn call_crypto(function_name: &str, args: &[Value]) -> Result<Value, ModuleError
         other => Err(crypto_error(
             "CRY1002",
             format!("crypto.{other}() does not exist"),
+        )),
+    }
+}
+
+fn call_crypto_argon(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+    use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+    use argon2::Argon2;
+
+    match function_name {
+        "hash" | "hashPassword" | "hash_password" => {
+            crypto_expect_arity(function_name, args, 1)?;
+            let password = crypto_string(
+                function_name,
+                args,
+                0,
+                "password",
+                CRYPTO_MAX_PASSWORD_BYTES,
+            )?;
+            let salt = SaltString::generate(&mut rand::rngs::OsRng);
+            let encoded = Argon2::default()
+                .hash_password(password.as_bytes(), &salt)
+                .map_err(|error| {
+                    crypto_error(
+                        "CRY4001",
+                        format!("Argon2id password hashing failed: {error}"),
+                    )
+                })?
+                .to_string();
+            Ok(Value::String(encoded))
+        }
+        "verify" | "verifyPassword" | "verify_password" => {
+            crypto_expect_arity(function_name, args, 2)?;
+            let password = crypto_string(
+                function_name,
+                args,
+                0,
+                "password",
+                CRYPTO_MAX_PASSWORD_BYTES,
+            )?;
+            let encoded = crypto_string(
+                function_name,
+                args,
+                1,
+                "encoded hash",
+                CRYPTO_MAX_PASSWORD_HASH_BYTES,
+            )?;
+            let parsed = PasswordHash::new(encoded).map_err(|error| {
+                crypto_error("CRY1001", format!("argon encoded hash is invalid: {error}"))
+            })?;
+            if parsed.algorithm.as_str() != "argon2id" {
+                return Err(crypto_error(
+                    "CRY1001",
+                    "argon.verifyPassword() accepts Argon2id hashes only",
+                ));
+            }
+            Ok(Value::Bool(
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok(),
+            ))
+        }
+        other => Err(crypto_error(
+            "CRY1002",
+            format!("crypto sub-library argon.{other}() does not exist"),
         )),
     }
 }
@@ -1299,6 +1392,49 @@ mod tests {
         assert!(error
             .message
             .contains("kastrick.vercel.app/project/rbe/doc/error-codes/runtime#cry1001"));
+    }
+
+    #[test]
+    fn crypto_argon_hashes_and_verifies_argon2id_passwords() {
+        let target = ImportTarget::BuiltinSubLibrary {
+            module: "crypto".into(),
+            library: "argon".into(),
+        };
+        let registry = ModuleRegistry::from_imports(&[target]);
+        let Value::String(encoded) = registry
+            .call(
+                "argon",
+                "hashPassword",
+                &[Value::String("correct horse battery staple".into())],
+            )
+            .expect("argon hash")
+        else {
+            panic!("expected encoded password hash");
+        };
+        assert!(encoded.starts_with("$argon2id$"));
+        assert!(matches!(
+            registry
+                .call(
+                    "argon",
+                    "verifyPassword",
+                    &[
+                        Value::String("correct horse battery staple".into()),
+                        Value::String(encoded.clone()),
+                    ],
+                )
+                .expect("argon verify"),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            registry
+                .call(
+                    "argon",
+                    "verifyPassword",
+                    &[Value::String("wrong".into()), Value::String(encoded),],
+                )
+                .expect("argon mismatch"),
+            Value::Bool(false)
+        ));
     }
 
     #[test]
