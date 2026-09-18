@@ -135,21 +135,18 @@ mod backend_boot_diagnostic_tests {
 '''
 p.write_text(text)
 
-# Error Code Book: RBE5001 is now emitted and RBE5099 becomes the generic
-# wrapper for unclassified backend boot failures.
+# Error Code Book: replace only the RBE5001 section by stable anchor
+# boundaries so wording improvements elsewhere do not break this migration.
 path = "doc/error-codes/runtime.md"
 p = Path(path)
 text = p.read_text()
-old = '''<a id="rbe5001"></a>
-### RBE5001 — required packaged dependency missing
-
-**Status:** Reserved.
-
-A required packaged runtime dependency is absent from the expected application-relative path.
-
-**Action:** reinstall/rebuild the RBE package instead of copying arbitrary binaries into place.
-'''
-new = '''<a id="rbe5001"></a>
+start_marker = '<a id="rbe5001"></a>\n'
+end_marker = '<a id="rbe9001"></a>\n'
+start = text.find(start_marker)
+end = text.find(end_marker)
+if start < 0 or end < 0 or end <= start:
+    raise SystemExit("runtime.md RBE5001 anchor boundaries drifted")
+replacement = '''<a id="rbe5001"></a>
 ### RBE5001 — required packaged dependency missing
 
 **Status:** Emitted.
@@ -166,10 +163,10 @@ A required packaged runtime dependency is absent from the expected application-r
 Backend startup returned an error that does not yet own a narrower stable `RBExxxx` diagnostic code. If terminal logging was already initialized, RBE reports this through `FATAL [BACKEND:BOOT]`; otherwise it uses the same structured text through the early stderr fallback.
 
 **Action:** follow the nested `reason` first. If the same immutable configuration/build repeatedly fails without a more specific code, preserve the startup logs and report it so the originating branch can receive a narrower code.
+
 '''
-if text.count(old) != 1:
-    raise SystemExit("runtime.md RBE5001 anchor drifted")
-p.write_text(text.replace(old, new, 1))
+text = text[:start] + replacement + text[end:]
+p.write_text(text)
 
 path = "doc/error-codes/catalog.json"
 p = Path(path)
