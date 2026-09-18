@@ -58,4 +58,4 @@ jobs:
           git pull --rebase origin main
           git push origin HEAD:main
 
-          # retrigger: 2026-09-18-error-book-rebase
+          # retrigger: 2026-09-18-clippy-fix
