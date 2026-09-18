@@ -48,7 +48,9 @@ jobs:
           python3 -m json.tool doc/error-codes/catalog.json >/dev/null
           grep -q 'RBE5001 Required packaged Container runtime is missing' engine/crates/backend/src/main.rs
           grep -q 'RBE5099 Backend failed to start with an unclassified boot error' engine/crates/backend/src/main.rs
-          grep -q 'Logger::new("BACKEND").child("BOOT").fatal' engine/crates/backend/src/main.rs
+          grep -q 'Logger::new("BACKEND")' engine/crates/backend/src/main.rs
+          grep -q '\.child("BOOT")' engine/crates/backend/src/main.rs
+          grep -q '\.fatal(rendered)' engine/crates/backend/src/main.rs
           grep -q 'doc/error-codes/runtime.md#rbe5099' engine/crates/backend/src/main.rs
 
           git add -A
@@ -58,4 +60,4 @@ jobs:
           git pull --rebase origin main
           git push origin HEAD:main
 
-          # retrigger: 2026-09-18-clippy-fix
+          # retrigger: 2026-09-18-rustfmt-safe-gate
