@@ -66,6 +66,17 @@ fn code_prefix(code: &str) -> String {
         .to_ascii_uppercase()
 }
 
+fn code_number(code: &str) -> Option<u32> {
+    let digits = code
+        .chars()
+        .skip_while(|character| character.is_ascii_alphabetic())
+        .collect::<String>();
+    if digits.is_empty() || !digits.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 fn code_matches_filter(code: &str, filter: &str) -> bool {
     let normalized = filter.trim().to_ascii_uppercase();
     if normalized.chars().all(|character| character.is_ascii_alphabetic()) {
@@ -75,6 +86,19 @@ fn code_matches_filter(code: &str, filter: &str) -> bool {
     }
 }
 
+fn render_entry(entry: &serde_json::Value) -> Option<String> {
+    let code = entry.get("code")?.as_str()?;
+    let status = entry
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let title = entry
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("RBE diagnostic");
+    Some(format!("{code:<10} [{status:<8}] {title}"))
+}
+
 fn render_known_codes(
     entries: &[serde_json::Value],
     prefix: Option<&str>,
@@ -82,27 +106,52 @@ fn render_known_codes(
 ) -> Vec<String> {
     let mut out = entries
         .iter()
-        .filter_map(|entry| {
-            let code = entry.get("code")?.as_str()?;
-            if prefix.is_some_and(|filter| !code_matches_filter(code, filter)) {
-                return None;
-            }
-            let status = entry
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            let title = entry
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("RBE diagnostic");
-            Some(format!("{code:<10} [{status:<8}] {title}"))
+        .filter(|entry| {
+            let Some(code) = entry.get("code").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            prefix.is_none_or(|filter| code_matches_filter(code, filter))
         })
+        .filter_map(render_entry)
         .collect::<Vec<_>>();
     out.sort();
     if let Some(limit) = limit {
         out.truncate(limit);
     }
     out
+}
+
+fn render_nearby_codes(
+    entries: &[serde_json::Value],
+    requested: &str,
+    limit: usize,
+) -> Vec<String> {
+    let prefix = code_prefix(requested);
+    let requested_number = code_number(requested);
+    let mut ranked = entries
+        .iter()
+        .filter_map(|entry| {
+            let code = entry.get("code")?.as_str()?;
+            if code_prefix(code) != prefix {
+                return None;
+            }
+            let distance = match (requested_number, code_number(code)) {
+                (Some(requested), Some(candidate)) => requested.abs_diff(candidate),
+                _ => u32::MAX,
+            };
+            Some((distance, code, render_entry(entry)?))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(right.1))
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, rendered)| rendered)
+        .collect()
 }
 
 pub fn list_codes(prefix: Option<&str>) -> anyhow::Result<String> {
@@ -133,12 +182,7 @@ pub fn explain(code: &str) -> anyhow::Result<String> {
             .and_then(serde_json::Value::as_str)
             .is_some_and(|value| value.eq_ignore_ascii_case(&requested))
     }) else {
-        let prefix = code_prefix(&requested);
-        let suggestions = render_known_codes(
-            entries,
-            (!prefix.is_empty()).then_some(prefix.as_str()),
-            Some(8),
-        );
+        let suggestions = render_nearby_codes(entries, &requested, 8);
         if suggestions.is_empty() {
             anyhow::bail!(
                 "unknown RBE error code {requested}; use --list-error-codes to inspect registered codes"
@@ -211,7 +255,7 @@ mod tests {
     fn explains_specific_relc_error_from_embedded_book() {
         let rendered = explain("relc3001").expect("RELC3001 must be explainable");
         assert!(rendered.contains("RELC3001"));
-        assert!(rendered.contains("native Container execution required"));
+        assert!(rendered.contains("Native Container execution required but lowering failed"));
         assert!(rendered.contains("doc/error-codes/relc.md#relc3001"));
         assert_eq!(rendered.matches("RELC3001").count(), 1);
     }
@@ -224,10 +268,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_code_suggests_same_prefix() {
+    fn unknown_code_suggests_nearest_same_subsystem_codes() {
         let error = explain("RELC3999").expect_err("unknown codes must be rejected");
         let message = error.to_string();
         assert!(message.contains("unknown RBE error code RELC3999"));
+        assert!(message.contains("RELC4001"));
         assert!(message.contains("RELC3001"));
         assert!(!message.contains("REL1000"));
     }
@@ -333,7 +378,7 @@ backend.exe --list-error-codes RELC
 service.exe --explain SVC5002
 ```
 
-Unknown codes suggest nearby registered codes from the same subsystem. Alphabetic filters select one exact subsystem (`REL` does not include `RELC`); filters containing digits can narrow a range such as `SVC5`. The lookup is compiled from this authoritative documentation tree, so it does not require network access or a mutable runtime docs directory.
+Unknown codes suggest numerically nearby registered codes from the same subsystem. Alphabetic filters select one exact subsystem (`REL` does not include `RELC`); filters containing digits can narrow a range such as `SVC5`. The lookup is compiled from this authoritative documentation tree, so it does not require network access or a mutable runtime docs directory.
 
 For machine-readable tooling, see [`catalog.json`](catalog.json).
 ''',
