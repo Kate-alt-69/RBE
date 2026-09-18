@@ -27,7 +27,9 @@ jobs:
           workspaces: engine
 
       - name: Apply dynamic Storage write lowering
-        run: python3 .github/patches/storage-rel-write-dynamic.py
+        run: |
+          python3 .github/patches/storage-rel-write-dynamic.py
+          python3 .github/patches/storage-rel-write-dynamic-fix.py
 
       - name: Format route-engine
         run: cargo fmt --manifest-path engine/Cargo.toml -p route-engine
@@ -52,6 +54,7 @@ jobs:
           rm -f \
             .ci-storage-rel-write-dynamic-trigger \
             .github/patches/storage-rel-write-dynamic.py \
+            .github/patches/storage-rel-write-dynamic-fix.py \
             .github/workflows/storage-rel-write-dynamic.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
