@@ -2,8 +2,8 @@ from pathlib import Path
 
 workspace = Path("engine/Cargo.toml")
 source = workspace.read_text()
-old_dep = 'tower-http = { version = "0.5", features = ["trace", "cors"] }'
-new_dep = 'tower-http = { version = "0.5", features = ["trace", "cors", "limit"] }'
+old_dep = 'tower-http = { version = "0.5", features = ["trace", "cors", "compression-full"] }'
+new_dep = 'tower-http = { version = "0.5", features = ["trace", "cors", "compression-full", "limit"] }'
 if old_dep not in source:
     raise SystemExit("tower-http workspace dependency anchor changed")
 workspace.write_text(source.replace(old_dep, new_dep, 1))
@@ -16,8 +16,8 @@ source = source.replace(
     1,
 )
 source = source.replace(
-    "use axum::http::StatusCode;",
-    "use axum::http::{header::CONTENT_TYPE, StatusCode};",
+    "use axum::http::{HeaderValue, Method, StatusCode};",
+    "use axum::http::{header::CONTENT_TYPE, HeaderValue, Method, StatusCode};",
     1,
 )
 source = source.replace(
