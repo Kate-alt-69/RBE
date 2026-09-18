@@ -696,6 +696,37 @@ async fn execute(
                 }
                 input
             }
+            RouteWasmInput::JsonBodyCapability { max_bytes } => {
+                let body = args
+                    .first()
+                    .and_then(|request| match request {
+                        Value::Object(fields) => fields.get("body"),
+                        _ => None,
+                    })
+                    .unwrap_or(&Value::Null);
+                let input = match serde_json::to_vec(&value_to_json(body)) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            path = %path,
+                            "encode native capability req.body input"
+                        );
+                        return request_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "native route capability input could not be encoded",
+                        );
+                    }
+                };
+                let limit = max_bytes.min(CONTAINER_MAX_EXECUTION_INPUT_BYTES);
+                if input.len() > limit {
+                    return request_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "native route body exceeds the capability payload limit",
+                    );
+                }
+                input
+            }
         };
         return execute_native_route(plan, image.as_ref(), &state, &path, input).await;
     }
