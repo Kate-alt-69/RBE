@@ -12,13 +12,17 @@ permissions:
 jobs:
   repair:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
       - name: Apply and validate API body limits
         shell: bash
         run: |
@@ -32,13 +36,14 @@ jobs:
 
           cd engine
           cargo fmt --all
-          cargo test -p config rejects_inconsistent_api_body_limits
-          cargo check -p api
+          cargo test -p config rejects_inconsistent_api_body_limits --locked
+          cargo check -p api --all-targets --locked
+          cargo clippy -p api --all-targets --locked -- -D warnings
           cd ..
 
-          git rm .github/workflows/one-shot-api-body-limits.yml
           git rm .github/patches/api-body-limits.py
           git add engine/Cargo.toml engine/crates/api/src/lib.rs engine/crates/config/src/lib.rs engine/Cargo.lock
+          git diff --cached --check
           git commit -m "FIX | BUG-API-003 enforce generic and JSON body limits"
 
           git fetch origin main
