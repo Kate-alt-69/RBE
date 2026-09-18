@@ -118,7 +118,7 @@ if "fn supabase_duplicate_error(" not in text:
     text = text.replace(old_error, new_error, 1)
 
 test_anchor = '''    #[test]
-    fn provider_probe_records_validate_identity() {
+    fn provider_probe_record_is_versioned_and_namespace_bound() {
 '''
 tests = r'''    #[test]
     fn supabase_duplicate_errors_are_narrow() {
