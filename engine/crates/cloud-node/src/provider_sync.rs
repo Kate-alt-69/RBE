@@ -14,7 +14,7 @@ use crate::client::{cached_resource_path, cleanup_outbound_cache, prepare_outbou
 use crate::config::{validate_node_id, CloudNodeSettings, ProviderConflictPolicy};
 use crate::durable;
 use crate::format::BlobKind;
-use crate::provider::{ProviderClient, ProviderObjectVersion};
+use crate::provider::{provider_transport_error, ProviderClient, ProviderObjectVersion};
 use crate::recovery::CloudNodeRecoveryReceiver;
 use crate::store::CloudNodeStore;
 use crate::sync::{SyncPlan, SyncPlanHeader};
@@ -88,7 +88,7 @@ struct HeadPointer {
     commit: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ProviderSnapshot {
     format_version: u16,
@@ -99,7 +99,7 @@ struct ProviderSnapshot {
     resources: Vec<ProviderResource>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ProviderResource {
     kind: u8,
@@ -795,13 +795,28 @@ async fn fetch_remote_commit(
 
 async fn upload_commit(client: &ProviderClient, commit: &HistoryCommit) -> anyhow::Result<()> {
     validate_commit(commit)?;
-    client
-        .put(
-            &format!("history/commits/{}.json", commit.id),
-            serde_json::to_vec(commit)?,
-            "application/json",
-        )
-        .await
+    let key = format!("history/commits/{}.json", commit.id);
+    let bytes = serde_json::to_vec(commit)?;
+    if client
+        .put_create_only(&key, bytes, "application/json")
+        .await?
+    {
+        return Ok(());
+    }
+    let existing = fetch_remote_commit(client, &commit.id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node immutable provider history commit disappeared after create conflict"
+            )
+        })?;
+    if existing != *commit {
+        anyhow::bail!(
+            "Cloud Node immutable provider history commit collision for {}",
+            commit.id
+        );
+    }
+    Ok(())
 }
 
 async fn upload_head(
@@ -864,14 +879,19 @@ async fn upload_snapshot(
         )?;
         let (manifest_sha, manifest_size) = hash_and_size(&manifest_path).await?;
         let manifest_key = format!("{base}/{}", object.kind.manifest_name());
-        client
-            .put_file(
+        if !client
+            .put_file_create_only(
                 &manifest_key,
                 &manifest_path,
                 "application/octet-stream",
                 manifest_sha,
             )
-            .await?;
+            .await?
+        {
+            client
+                .verify_object(&manifest_key, manifest_sha, manifest_size)
+                .await?;
+        }
         resources.push(resource_record(
             object.kind,
             TransferResource::Manifest,
@@ -897,14 +917,19 @@ async fn upload_snapshot(
                 )?;
                 let payload_size = tokio::fs::metadata(&cached_payload).await?.len();
                 let payload_key = format!("{base}/payload");
-                client
-                    .put_file(
+                if !client
+                    .put_file_create_only(
                         &payload_key,
                         &cached_payload,
                         "application/octet-stream",
                         object.content_sha256,
                     )
-                    .await?;
+                    .await?
+                {
+                    client
+                        .verify_object(&payload_key, object.content_sha256, payload_size)
+                        .await?;
+                }
                 resources.push(resource_record(
                     object.kind,
                     TransferResource::FilePayload,
@@ -926,14 +951,19 @@ async fn upload_snapshot(
                     let (chunk_sha, chunk_size) = hash_and_size(&cached_chunk).await?;
                     let chunk_hex = hex::encode(chunk_sha);
                     let chunk_key = format!("{base}/chunks/{chunk_hex}.chunk");
-                    client
-                        .put_file(
+                    if !client
+                        .put_file_create_only(
                             &chunk_key,
                             &cached_chunk,
                             "application/octet-stream",
                             chunk_sha,
                         )
-                        .await?;
+                        .await?
+                    {
+                        client
+                            .verify_object(&chunk_key, chunk_sha, chunk_size)
+                            .await?;
+                    }
                     resources.push(resource_record(
                         object.kind,
                         TransferResource::VideoChunk,
@@ -957,13 +987,27 @@ async fn upload_snapshot(
         resources,
     };
     validate_snapshot(&snapshot)?;
-    client
-        .put(
-            &index_key,
-            serde_json::to_vec(&snapshot)?,
-            "application/json",
+    let bytes = serde_json::to_vec(&snapshot)?;
+    if client
+        .put_create_only(&index_key, bytes, "application/json")
+        .await?
+    {
+        return Ok(());
+    }
+    let existing = client.get(&index_key).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cloud Node immutable provider snapshot index disappeared after create conflict"
         )
-        .await
+    })?;
+    let existing: ProviderSnapshot = serde_json::from_slice(&existing)?;
+    validate_snapshot(&existing)?;
+    if existing != snapshot {
+        anyhow::bail!(
+            "Cloud Node immutable provider snapshot index collision for root {}",
+            snapshot.root_sha256
+        );
+    }
+    Ok(())
 }
 
 async fn hash_and_size(path: &Path) -> anyhow::Result<([u8; 32], u64)> {
@@ -1041,7 +1085,12 @@ async fn restore_resource(
                     resource.key
                 )
             })?;
-        if response.chunk().await?.is_some() {
+        if response
+            .chunk()
+            .await
+            .map_err(provider_transport_error)?
+            .is_some()
+        {
             anyhow::bail!(
                 "Cloud Node provider resource size mismatch for {}",
                 resource.key
@@ -1096,7 +1145,7 @@ async fn restore_resource(
     let ranged = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let mut source_offset = if ranged { offset } else { 0 };
 
-    while let Some(bytes) = response.chunk().await? {
+    while let Some(bytes) = response.chunk().await.map_err(provider_transport_error)? {
         let chunk_start = source_offset;
         source_offset = source_offset
             .checked_add(
