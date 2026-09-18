@@ -17,11 +17,20 @@ Most of these subsystems still contain legacy unnumbered diagnostics. The ranges
 <a id="rbe5001"></a>
 ### RBE5001 — required packaged dependency missing
 
-**Status:** Reserved.
+**Status:** Emitted.
 
-Backend requires a packaged runtime dependency such as Container or Service, but the expected artifact is missing.
+A required packaged runtime dependency is absent from the expected application-relative path. The normal backend boot path currently emits this code when the packaged Container runtime is missing.
 
-**Action:** rebuild/distribute the complete RBE package instead of copying only `backend(.exe)`.
+**Action:** rebuild/reinstall the complete RBE package for the same target. Do not satisfy this error by copying an unrelated Container binary into place.
+
+<a id="rbe5099"></a>
+### RBE5099 — backend startup failed with an unclassified boot error
+
+**Status:** Emitted.
+
+Backend startup returned an error that does not yet own a narrower stable `RBExxxx` diagnostic code. If terminal logging was already initialized, RBE reports this through `FATAL [BACKEND:BOOT]`; otherwise it uses the same structured text through the early stderr fallback.
+
+**Action:** follow the nested `reason` first. If the same immutable configuration/build repeatedly fails without a more specific code, preserve the startup logs and report it so the originating branch can receive a narrower code.
 
 <a id="rbe9001"></a>
 ### RBE9001 — backend control-plane invariant violated

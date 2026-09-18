@@ -7,6 +7,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +33,30 @@ mod vault_recovery;
 
 mod service_integrity {
     include!(concat!(env!("OUT_DIR"), "/service_integrity.rs"));
+}
+
+static BACKEND_LOGGING_READY: AtomicBool = AtomicBool::new(false);
+
+fn has_rbe_error_code(details: &str) -> bool {
+    details.lines().any(|line| {
+        let Some(token) = line.split_whitespace().next() else {
+            return false;
+        };
+        token.len() == 7
+            && token.starts_with("RBE")
+            && token.as_bytes()[3..].iter().all(u8::is_ascii_digit)
+    })
+}
+
+fn render_backend_boot_fatal(error: &anyhow::Error) -> String {
+    let details = format!("{error:#}");
+    if has_rbe_error_code(&details) {
+        details
+    } else {
+        format!(
+            "RBE5099 Backend failed to start with an unclassified boot error.\n\n  reason:\n    {details}\n\n  action:\n    Review the reason above and the preceding startup logs. If the failure persists with an unchanged configuration/build, preserve the logs and report it.\n\n  help:\n    doc/error-codes/runtime.md#rbe5099"
+        )
+    }
 }
 
 #[tokio::main]
@@ -127,7 +152,14 @@ async fn main() -> ExitCode {
     };
 
     if let Err(error) = boot_and_run(host_ready).await {
-        eprintln!("fatal boot error: {error:#}");
+        let rendered = render_backend_boot_fatal(&error);
+        if BACKEND_LOGGING_READY.load(Ordering::Acquire) {
+            logging::Logger::new("BACKEND")
+                .child("BOOT")
+                .fatal(rendered);
+        } else {
+            eprintln!("FATAL [BACKEND:BOOT]:\n{rendered}");
+        }
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -539,6 +571,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     boot_trace("settings loaded");
 
     logging::terminal::init(&config.logging)?;
+    BACKEND_LOGGING_READY.store(true, Ordering::Release);
     boot_trace("logging initialized");
 
     let mut supervisor = Supervisor::new(RestartPolicy::default());
@@ -664,7 +697,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     ));
     if !container_path.is_file() {
         anyhow::bail!(
-            "required container dependency is missing: {}",
+            "RBE5001 Required packaged Container runtime is missing.\n\n  expected_path:\n    {}\n\n  action:\n    Rebuild the complete RBE package for this target and keep the generated Container binary beside the backend package layout.\n\n  help:\n    doc/error-codes/runtime.md#rbe5001",
             container_path.display()
         );
     }
@@ -1428,5 +1461,30 @@ mod critical_process_supervision_tests {
         assert_eq!(er_restart_delay(2), Duration::from_secs(1));
         assert_eq!(er_restart_delay(3), Duration::from_secs(2));
         assert_eq!(er_restart_delay(30), Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod backend_boot_diagnostic_tests {
+    use super::{has_rbe_error_code, render_backend_boot_fatal};
+
+    #[test]
+    fn backend_boot_fatal_preserves_specific_rbe_codes() {
+        let error = anyhow::anyhow!(
+            "RBE5001 Required packaged Container runtime is missing.\nhelp: doc/error-codes/runtime.md#rbe5001"
+        );
+        let rendered = render_backend_boot_fatal(&error);
+        assert!(rendered.starts_with("RBE5001 "));
+        assert!(!rendered.contains("RBE5099"));
+        assert!(has_rbe_error_code(&rendered));
+    }
+
+    #[test]
+    fn backend_boot_fatal_wraps_unclassified_failures() {
+        let error = anyhow::anyhow!("synthetic backend startup failure");
+        let rendered = render_backend_boot_fatal(&error);
+        assert!(rendered.starts_with("RBE5099 "));
+        assert!(rendered.contains("synthetic backend startup failure"));
+        assert!(rendered.contains("doc/error-codes/runtime.md#rbe5099"));
     }
 }

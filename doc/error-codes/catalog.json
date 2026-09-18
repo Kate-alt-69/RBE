@@ -345,9 +345,15 @@
     },
     {
       "code": "RBE5001",
-      "status": "reserved",
+      "status": "emitted",
       "title": "Required packaged dependency missing",
       "doc": "runtime.md#rbe5001"
+    },
+    {
+      "code": "RBE5099",
+      "status": "emitted",
+      "title": "Backend startup failed with an unclassified boot error",
+      "doc": "runtime.md#rbe5099"
     },
     {
       "code": "RBE9001",

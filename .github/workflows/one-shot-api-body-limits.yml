@@ -1,4 +1,4 @@
-name: One-shot backend boot diagnostic validation
+name: One-shot API body limit repair
 
 "on":
   push:
@@ -10,54 +10,41 @@ permissions:
   contents: write
 
 jobs:
-  validate-and-land:
+  repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt,clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: engine
-      - name: Apply, validate and land DIAG-003
+          components: rustfmt
+      - name: Apply and validate API body limits
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
 
-          python3 .github/patches/diag-backend-boot.py
-
-          # Restore the unrelated API repair workflow from the last clean
-          # diagnostics commit before DIAG-003 staging.
-          git show c3556bb1c4809bee7a1ee0c891ded9aa7e0c725b:.github/workflows/one-shot-api-body-limits.yml > .github/workflows/one-shot-api-body-limits.yml
-          rm -f .github/patches/diag-backend-boot.py
+          python3 .github/patches/api-body-limits.py
 
           cd engine
           cargo fmt --all
-          cargo check -p backend --all-targets --locked
-          cargo test -p backend backend_boot_fatal_preserves_specific_rbe_codes --locked
-          cargo test -p backend backend_boot_fatal_wraps_unclassified_failures --locked
-          cargo clippy -p backend --all-targets --locked -- -D warnings
+          cargo test -p config rejects_inconsistent_api_body_limits
+          cargo check -p api
           cd ..
 
-          python3 -m json.tool doc/error-codes/catalog.json >/dev/null
-          grep -q 'RBE5001 Required packaged Container runtime is missing' engine/crates/backend/src/main.rs
-          grep -q 'RBE5099 Backend failed to start with an unclassified boot error' engine/crates/backend/src/main.rs
-          grep -q 'Logger::new("BACKEND")' engine/crates/backend/src/main.rs
-          grep -q '\.child("BOOT")' engine/crates/backend/src/main.rs
-          grep -q '\.fatal(rendered)' engine/crates/backend/src/main.rs
-          grep -q 'doc/error-codes/runtime.md#rbe5099' engine/crates/backend/src/main.rs
+          git rm .github/workflows/one-shot-api-body-limits.yml
+          git rm .github/patches/api-body-limits.py
+          git add engine/Cargo.toml engine/crates/api/src/lib.rs engine/crates/config/src/lib.rs engine/Cargo.lock
+          git commit -m "FIX | BUG-API-003 enforce generic and JSON body limits"
 
-          git add -A
-          git diff --cached --check
-          git commit -m 'FIX | BUG-DIAG-003 improve backend boot diagnostics'
-
-          git pull --rebase origin main
+          git fetch origin main
+          base="$(git rev-parse HEAD~1)"
+          current="$(git rev-parse origin/main)"
+          if [ "$current" != "$base" ]; then
+            git rebase origin/main
+          fi
           git push origin HEAD:main
-
-          # retrigger: 2026-09-18-rustfmt-safe-gate
