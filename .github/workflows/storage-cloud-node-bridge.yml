@@ -29,7 +29,18 @@ jobs:
             container-runtime
 
       - name: Apply Storage Cloud Node bridge
-        run: python3 .github/patches/storage-cloud-node-bridge.py
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/patches/storage-cloud-node-bridge.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'insert_anchor = "\\n    #[test]\\n    fn sync_header_round_trip() {"'
+          new = 'insert_anchor = "\\n    #[test]\\n    fn recovery_plan_orders_folder_video_then_file() {"'
+          if text.count(old) != 1:
+              raise SystemExit(f'sync priority staging anchor count={text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+          python3 .github/patches/storage-cloud-node-bridge.py
 
       - name: Format changed Rust crates
         run: |
