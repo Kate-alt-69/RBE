@@ -1,0 +1,93 @@
+name: One-shot Storage Cloud Node priority bridge
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .ci-storage-cloud-node-bridge-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  storage-cloud-node-bridge:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine
+            container-runtime
+
+      - name: Apply Storage Cloud Node bridge
+        run: python3 .github/patches/storage-cloud-node-bridge.py
+
+      - name: Format changed Rust crates
+        run: |
+          cargo fmt --manifest-path storage-sync-journal/Cargo.toml
+          cargo fmt --manifest-path container-runtime/Cargo.toml -p container-runtime-core
+          cargo fmt --manifest-path engine/Cargo.toml -p cloud-node
+
+      - name: Refresh workspace locks for shared journal crate
+        run: |
+          cargo check --manifest-path container-runtime/Cargo.toml -p container-runtime-core
+          cargo check --manifest-path engine/Cargo.toml -p cloud-node
+
+      - name: Diff check
+        run: git diff --check
+
+      - name: Test durable Storage sync journal
+        run: cargo test --manifest-path storage-sync-journal/Cargo.toml
+
+      - name: Test Container Storage capability
+        run: cargo test --manifest-path container-runtime/Cargo.toml -p container-runtime-core --locked
+
+      - name: Check Container executable integration
+        run: cargo check --manifest-path container-runtime/Cargo.toml -p container-bin --locked
+
+      - name: Test Cloud Node
+        run: cargo test --manifest-path engine/Cargo.toml -p cloud-node --locked
+
+      - name: Check Backend Cloud Node integration
+        run: cargo check --manifest-path engine/Cargo.toml -p backend --locked
+
+      - name: Clippy durable Storage sync journal
+        run: cargo clippy --manifest-path storage-sync-journal/Cargo.toml --all-targets -- -D warnings
+
+      - name: Clippy Container Storage capability
+        run: cargo clippy --manifest-path container-runtime/Cargo.toml -p container-runtime-core --all-targets --locked -- -D warnings
+
+      - name: Clippy Cloud Node
+        run: cargo clippy --manifest-path engine/Cargo.toml -p cloud-node --all-targets --locked -- -D warnings
+
+      - name: Verify bridge contract
+        run: |
+          grep -Fq 'storage-sync-journal' container-runtime/crates/container-runtime-core/Cargo.toml
+          grep -Fq 'storage-sync-journal' engine/crates/cloud-node/Cargo.toml
+          grep -Fq 'priority_ordered' engine/crates/cloud-node/src/sync.rs
+          grep -Fq 'ingest_storage_journal' engine/crates/cloud-node/src/main.rs
+          grep -Fq 'successful project-root writes are bridged to Cloud Node' doc/storage.md
+
+      - name: Commit BUG-STO-006
+        run: |
+          rm -f \
+            .ci-storage-cloud-node-bridge-trigger \
+            .github/patches/storage-cloud-node-bridge.py \
+            .github/workflows/storage-cloud-node-bridge.yml \
+            storage-sync-journal/Cargo.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "FIX | BUG-STO-006 bridge Storage writes into Cloud Node priority sync"
+          git pull --rebase origin main
+          git push origin HEAD:main
