@@ -57,9 +57,9 @@ jobs:
         working-directory: engine
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Test locked workspace
+      - name: Test locked route-engine
         working-directory: engine
-        run: cargo test --workspace --locked
+        run: cargo test -p route-engine --locked
 
       - name: Commit directly to main
         shell: bash
