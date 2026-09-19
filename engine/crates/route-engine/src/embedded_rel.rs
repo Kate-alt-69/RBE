@@ -1,6 +1,6 @@
 //! Literal REL source extraction from `server.server`.
 //!
-//! Extraction happens before Server REL lexing so embedded Route/Module/Service
+//! Extraction happens before Server REL lexing so embedded Route/Module/Service/Field
 //! syntax is never interpreted as Server policy syntax. The cleaned Server REL
 //! keeps the same line count for diagnostic remapping.
 
@@ -225,6 +225,7 @@ fn parse_kind(kind: &str, line: usize) -> Result<RelSourceKind, EmbeddedRelError
         "route" => Ok(RelSourceKind::Route),
         "module" => Ok(RelSourceKind::Module),
         "service" => Ok(RelSourceKind::Service),
+        "field" => Ok(RelSourceKind::Field),
         "server" => Ok(RelSourceKind::Server),
         other => Err(error(
             line,

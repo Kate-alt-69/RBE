@@ -42,6 +42,8 @@ enum BuiltinModule {
     Request,
     Security,
     Response,
+    Math,
+    Regx,
     VideoManager,
 }
 
@@ -67,6 +69,9 @@ pub fn route_capability_allowed(name: &str) -> bool {
             | "security"
             | "response"
             | "private"
+            | "math"
+            | "regx"
+            | "field"
     )
 }
 
@@ -130,6 +135,14 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
             function,
             "get" | "has" | "require" | "string" | "number" | "bool" | "object" | "array"
         ),
+        "math" => matches!(
+            function,
+            "trim" | "abs" | "floor" | "ceil" | "round" | "min" | "max" | "clamp"
+        ),
+        "regx" => matches!(function, "test" | "raw"),
+        // Reusable `.field` resolver names are application-defined and are
+        // validated against the Field source registry during RELC linking.
+        "field" => !function.is_empty(),
         "response" => matches!(
             function,
             "json"
@@ -211,6 +224,8 @@ impl ModuleRegistry {
                         "request" => ModuleKind::Builtin(BuiltinModule::Request),
                         "security" => ModuleKind::Builtin(BuiltinModule::Security),
                         "response" => ModuleKind::Builtin(BuiltinModule::Response),
+                        "math" => ModuleKind::Builtin(BuiltinModule::Math),
+                        "regx" => ModuleKind::Builtin(BuiltinModule::Regx),
                         "vm" | "video-manager" => ModuleKind::Builtin(BuiltinModule::VideoManager),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{name}"),
@@ -242,6 +257,8 @@ impl ModuleRegistry {
                         "request" => ModuleKind::Builtin(BuiltinModule::Request),
                         "security" => ModuleKind::Builtin(BuiltinModule::Security),
                         "response" => ModuleKind::Builtin(BuiltinModule::Response),
+                        "math" => ModuleKind::Builtin(BuiltinModule::Math),
+                        "regx" => ModuleKind::Builtin(BuiltinModule::Regx),
                         "vm" | "video-manager" => ModuleKind::Builtin(BuiltinModule::VideoManager),
                         _ => ModuleKind::CustomUnimplemented {
                             source_path: format!("builtin:{module}"),
@@ -340,6 +357,8 @@ impl ModuleRegistry {
             ModuleKind::Builtin(BuiltinModule::Request) => call_request(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Security) => call_security(function_name, args),
             ModuleKind::Builtin(BuiltinModule::Response) => call_response(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Math) => call_math(function_name, args),
+            ModuleKind::Builtin(BuiltinModule::Regx) => call_regx(function_name, args),
             ModuleKind::Builtin(BuiltinModule::VideoManager) => Err(ModuleError {
                 message: format!(
             "{module_name}.{function_name}() requires the privileged module Video Manager host capability"
@@ -361,6 +380,95 @@ impl ModuleRegistry {
                 })
             }
         }
+    }
+}
+
+fn math_number(value: Option<&Value>, label: &str) -> Result<f64, ModuleError> {
+    match value {
+        Some(Value::Number(value)) if value.is_finite() => Ok(*value),
+        _ => Err(ModuleError {
+            message: format!("{label} must be a finite number"),
+        }),
+    }
+}
+
+fn call_math(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+    match function_name {
+        "trim" => match args.first() {
+            Some(Value::String(value)) => Ok(Value::String(value.trim().to_string())),
+            _ => Err(ModuleError {
+                message: "math.trim() requires a string".into(),
+            }),
+        },
+        "abs" | "floor" | "ceil" | "round" => {
+            let value = math_number(args.first(), "math value")?;
+            let value = match function_name {
+                "abs" => value.abs(),
+                "floor" => value.floor(),
+                "ceil" => value.ceil(),
+                _ => value.round(),
+            };
+            Ok(Value::Number(value))
+        }
+        "min" | "max" => {
+            let left = math_number(args.first(), "left math value")?;
+            let right = math_number(args.get(1), "right math value")?;
+            Ok(Value::Number(if function_name == "min" {
+                left.min(right)
+            } else {
+                left.max(right)
+            }))
+        }
+        "clamp" => {
+            let value = math_number(args.first(), "math value")?;
+            let min = math_number(args.get(1), "minimum")?;
+            let max = math_number(args.get(2), "maximum")?;
+            if min > max {
+                return Err(ModuleError {
+                    message: "math.clamp() minimum must not exceed maximum".into(),
+                });
+            }
+            Ok(Value::Number(value.clamp(min, max)))
+        }
+        other => Err(ModuleError {
+            message: format!("math.{other}() does not exist"),
+        }),
+    }
+}
+
+const REGX_MAX_PATTERN_BYTES: usize = 4096;
+const REGX_MAX_INPUT_BYTES: usize = 1024 * 1024;
+
+fn regx_string<'a>(
+    value: Option<&'a Value>,
+    label: &str,
+    limit: usize,
+) -> Result<&'a str, ModuleError> {
+    match value {
+        Some(Value::String(value)) if value.len() <= limit => Ok(value),
+        Some(Value::String(_)) => Err(ModuleError {
+            message: format!("{label} exceeds {limit} bytes"),
+        }),
+        _ => Err(ModuleError {
+            message: format!("{label} must be a string"),
+        }),
+    }
+}
+
+fn call_regx(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+    let pattern = regx_string(args.first(), "regx pattern", REGX_MAX_PATTERN_BYTES)?;
+    let compiled = regex::Regex::new(pattern).map_err(|error| ModuleError {
+        message: format!("invalid regx pattern: {error}"),
+    })?;
+    match function_name {
+        "raw" => Ok(Value::String(compiled.as_str().to_string())),
+        "test" => {
+            let value = regx_string(args.get(1), "regx input", REGX_MAX_INPUT_BYTES)?;
+            Ok(Value::Bool(compiled.is_match(value)))
+        }
+        other => Err(ModuleError {
+            message: format!("regx.{other}() does not exist"),
+        }),
     }
 }
 

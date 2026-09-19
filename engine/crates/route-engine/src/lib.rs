@@ -47,8 +47,8 @@ pub mod wasm_compiler;
 
 pub use analyzer::{analyze, Diagnostic, Severity};
 pub use ast::{
-    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram,
-    Statement, Value,
+    BinaryOp, Expr, FieldBinding, FieldBindingMode, FieldDirective, FieldFile, FieldValueType,
+    FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram, Statement, Value,
 };
 pub use dependency_graph::{SymbolDependencyGraph, SymbolId};
 pub use discovery::RouteCache;
@@ -108,6 +108,17 @@ pub fn build_routes_from_image(
 /// route/method collisions before backend boot launches any child processes.
 pub fn validate_runtime_image_routes(image: &RuntimeImage) -> anyhow::Result<()> {
     route_collision::validate_image(image)
+}
+
+pub fn parse_field_source(source: &str) -> Result<FieldFile, ParseError> {
+    let tokens = lexer::Lexer::new(source)
+        .tokenize()
+        .map_err(|error| ParseError {
+            message: error.message,
+            line: error.line,
+            column: error.column,
+        })?;
+    parser::Parser::new(tokens).parse_field_file()
 }
 
 pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
@@ -217,6 +228,84 @@ mod tests {
         assert_eq!(binding_name(&file.imports[0]), "short");
         assert_eq!(binding_name(&file.imports[1]), "media");
         assert_eq!(binding_name(&file.imports[2]), "status");
+    }
+
+    #[test]
+    fn parses_field_manager_declarative_source() {
+        let file = parse_field_source(
+            r#"
+            :import[math, regx]
+            :field[source = query, key = "awesomeness", optional = true]
+            resolve {
+                page = optional("page", type = int, default = 1);
+                debug = optional("debug", type = bool, default = false);
+                tracking = dynamic("utm_", stripPrefix = true);
+                cookie = required("cookie");
+            }
+            "#,
+        )
+        .expect("field parse failed");
+        assert_eq!(file.imports.len(), 2);
+        assert_eq!(file.directive.source, "query");
+        assert_eq!(file.directive.key.as_deref(), Some("awesomeness"));
+        assert!(file.directive.optional);
+        assert_eq!(file.bindings.len(), 4);
+        assert_eq!(file.bindings[0].value_type, FieldValueType::Int);
+        assert_eq!(file.bindings[2].mode, FieldBindingMode::Dynamic);
+        assert!(file.bindings[2].strip_prefix);
+    }
+
+    #[test]
+    fn parses_field_manager_executable_resolver_and_import_shorthand() {
+        let field = parse_field_source(
+            r#"
+            :import[math, regx]
+            field { source = query; type = string; required = true; key = "slug"; }
+            resolve(raw, context) { return math.trim(raw); }
+            "#,
+        )
+        .expect("field resolver parse failed");
+        assert_eq!(
+            field.resolver.as_ref().unwrap().params,
+            vec!["raw", "context"]
+        );
+
+        let route = parse(
+            r#":import[field, field:awesomeness]
+               class Route { get(req) { return true; } }"#,
+        );
+        assert_eq!(route.imports.len(), 2);
+        assert!(matches!(
+            &route.imports[1],
+            ImportTarget::BuiltinFunction { module, function }
+                if module == "field" && function == "awesomeness"
+        ));
+    }
+
+    #[test]
+    fn deterministic_math_and_regx_helpers_execute() {
+        let imports = vec![
+            ImportTarget::Builtin("math".into()),
+            ImportTarget::Builtin("regx".into()),
+        ];
+        let modules = ModuleRegistry::from_imports(&imports);
+        assert!(matches!(
+            modules.call("math", "trim", &[Value::String("  hi  ".into())]).unwrap(),
+            Value::String(value) if value == "hi"
+        ));
+        assert!(matches!(
+            modules
+                .call(
+                    "regx",
+                    "test",
+                    &[
+                        Value::String("^[a-z]+$".into()),
+                        Value::String("hello".into())
+                    ]
+                )
+                .unwrap(),
+            Value::Bool(true)
+        ));
     }
 
     #[test]

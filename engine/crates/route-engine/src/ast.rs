@@ -49,6 +49,46 @@ pub struct ModuleFile {
     pub exports: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldValueType {
+    String,
+    Int,
+    Bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldBindingMode {
+    Required,
+    Optional,
+    Dynamic,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldDirective {
+    pub source: String,
+    pub key: Option<String>,
+    pub optional: bool,
+    pub value_type: FieldValueType,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldBinding {
+    pub name: String,
+    pub lookup: String,
+    pub mode: FieldBindingMode,
+    pub value_type: FieldValueType,
+    pub default: Option<Value>,
+    pub strip_prefix: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldFile {
+    pub imports: Vec<ImportTarget>,
+    pub directive: FieldDirective,
+    pub bindings: Vec<FieldBinding>,
+    pub resolver: Option<FunctionDef>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceProgram {
     pub imports: Vec<ImportTarget>,

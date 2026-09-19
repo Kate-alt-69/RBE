@@ -19,6 +19,7 @@ argon2 = "0.5"
 rand = "0.8"
 subtle = "2"
 hex = "0.4"
+regex = "1"
 wasm-encoder = "0.248"
 
 [dev-dependencies]

@@ -12,7 +12,7 @@ use core_lib::{
 use service_runtime::{service_capability_name_allowed, SERVICE_CAPABILITY_TARGET_PREFIX};
 use sha2::{Digest, Sha256};
 
-use crate::ast::{ModuleFile, RouteFile, ServiceProgram};
+use crate::ast::{FieldFile, ModuleFile, RouteFile, ServiceProgram};
 use crate::dependency_graph::{SymbolDependencyGraph, SymbolId};
 use crate::middleware_plan::MiddlewarePlan;
 use crate::runtime_env::RuntimeEnv;
@@ -284,6 +284,7 @@ pub enum RuntimeExecutable {
     Route(Arc<RouteFile>),
     Module(Arc<ModuleFile>),
     Service(Arc<ServiceProgram>),
+    Field(Arc<FieldFile>),
     Server(Arc<ServerProgram>),
 }
 
@@ -296,6 +297,7 @@ pub struct RuntimeImage {
     pub routes: Vec<SourceId>,
     pub modules: Vec<SourceId>,
     pub services: Vec<SourceId>,
+    pub fields: Vec<SourceId>,
     pub sources: Vec<RuntimeSourceManifest>,
     pub symbol_table: BTreeSet<SymbolId>,
     pub dependency_graph: SymbolDependencyGraph,
@@ -350,6 +352,13 @@ impl RuntimeImage {
 
     pub fn route_wasm_fallback(&self, id: &SourceId) -> Option<&str> {
         self.route_wasm_fallbacks.get(id).map(String::as_str)
+    }
+
+    pub fn field_file(&self, id: &SourceId) -> Option<Arc<FieldFile>> {
+        match self.executable(id) {
+            Some(RuntimeExecutable::Field(file)) => Some(file.clone()),
+            _ => None,
+        }
     }
 
     pub fn route_file(&self, id: &SourceId) -> Option<Arc<RouteFile>> {

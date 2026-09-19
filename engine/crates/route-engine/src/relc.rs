@@ -12,14 +12,14 @@ use service_runtime::ServiceCatalog;
 
 use crate::analyzer::{analyze, Severity};
 use crate::ast::{
-    Expr, FunctionDef, ImportTarget, ModuleFile, RouteFile, ServiceProgram, Statement,
+    Expr, FieldFile, FunctionDef, ImportTarget, ModuleFile, RouteFile, ServiceProgram, Statement,
 };
 use crate::dependency_graph::{SymbolDependencyGraph, SymbolId};
 use crate::embedded_rel::{extract_embedded_rel, EmbeddedRelError};
 use crate::lexer::Lexer;
 use crate::middleware_plan::{MiddlewarePlan, MiddlewarePlanError};
 use crate::module_runtime::module_owner_from_logical_name;
-use crate::modules::binding_name;
+use crate::modules::{binding_name, builtin_function_exists};
 use crate::parser::{ParseError, Parser};
 use crate::runtime_env::{RuntimeEnv, RuntimeEnvError};
 use crate::runtime_image::{
@@ -66,6 +66,7 @@ pub fn discover_physical_rel_sources(
 ) -> anyhow::Result<Vec<PhysicalRelSource>> {
     let mut out = Vec::new();
     collect_physical_dir(api_dir, RelSourceKind::Route, "route", &mut out)?;
+    collect_physical_dir(api_dir, RelSourceKind::Field, "field", &mut out)?;
     collect_physical_dir(module_dir, RelSourceKind::Module, "module", &mut out)?;
     if let Some(catalog) = service_catalog {
         for service in catalog.services() {
@@ -351,6 +352,7 @@ pub fn compile_runtime_image(
     let mut routes = Vec::new();
     let mut modules = Vec::new();
     let mut services = Vec::new();
+    let mut fields = Vec::new();
     let capabilities = capability_requirements(&registry, &compiled)?;
     let mut service_assignments = BTreeMap::new();
     let executables = compiled
@@ -414,6 +416,7 @@ pub fn compile_runtime_image(
                     "service-manager:auto".into(),
                 );
             }
+            RelSourceKind::Field => fields.push(source.id().clone()),
             RelSourceKind::Server => {}
         }
         sources.push(manifest);
@@ -432,6 +435,7 @@ pub fn compile_runtime_image(
         routes,
         modules,
         services,
+        fields,
         sources,
         symbol_table,
         dependency_graph,
@@ -521,6 +525,9 @@ fn parse_registered_source(
         RelSourceKind::Service => Parser::new(tokens)
             .parse_service_file()
             .map(CompiledUnit::Service),
+        RelSourceKind::Field => Parser::new(tokens)
+            .parse_field_file()
+            .map(CompiledUnit::Field),
         RelSourceKind::Server => unreachable!("Server REL is compiled before registry parsing"),
     };
     result.map_err(|error| RelcError::Parse {
@@ -535,6 +542,25 @@ fn validate_capabilities(
     kind: RelSourceKind,
     imports: &[ImportTarget],
 ) -> Result<(), RelcError> {
+    if kind == RelSourceKind::Field {
+        for import in imports {
+            match import_base(import) {
+                ImportTarget::Builtin(name) if matches!(name.as_str(), "math" | "regx") => {}
+                ImportTarget::BuiltinFunction { module, function }
+                    if matches!(module.as_str(), "math" | "regx")
+                        && builtin_function_exists(module, function) => {}
+                _ => {
+                    return Err(RelcError::Capability {
+                        code: "RELC2101",
+                        source: source.clone(),
+                        message: "Field REL is pure request preprocessing; only deterministic `math` and `regx` imports are allowed (no DB/network/service/module/filesystem/ENV/crypto/randomness)".into(),
+                    });
+                }
+            }
+        }
+        return Ok(());
+    }
+
     for import in imports {
         let base = import_base(import);
         if let ImportTarget::BuiltinSubLibrary { module, library } = base {
@@ -614,6 +640,17 @@ fn validate_capabilities(
                 }
             }
         }
+        if let ImportTarget::Builtin(name) | ImportTarget::BuiltinFunction { module: name, .. } =
+            base
+        {
+            if name == "field" && kind != RelSourceKind::Route {
+                return Err(RelcError::Capability {
+                    code: "RELC2101",
+                    source: source.clone(),
+                    message: "FieldManager request resolution is Route-owned; reusable logic belongs in a .field source imported by the Route".into(),
+                });
+            }
+        }
         if matches!(
             base,
             ImportTarget::Service(_) | ImportTarget::ServiceFunction { .. }
@@ -655,6 +692,20 @@ fn validate_import_targets(
                 {
                     return Err(RelcError::Link(format!(
                         "{source_id} imports missing service `{service}`"
+                    )));
+                }
+                ImportTarget::BuiltinFunction { module, function }
+                    if module == "field"
+                        && !matches!(
+                            function.as_str(),
+                            "required" | "optional" | "has" | "dynamic"
+                        )
+                        && registry
+                            .get_logical(RelSourceKind::Field, function)
+                            .is_none() =>
+                {
+                    return Err(RelcError::Link(format!(
+                        "{source_id} imports missing FieldManager source `{function}.field`"
                     )));
                 }
                 _ => {}
@@ -1150,6 +1201,7 @@ enum CompiledUnit {
     Route(RouteFile),
     Module(ModuleFile),
     Service(ServiceProgram),
+    Field(FieldFile),
     Server(ServerProgram),
 }
 
@@ -1159,6 +1211,7 @@ impl CompiledUnit {
             Self::Route(file) => RuntimeExecutable::Route(Arc::new(file.clone())),
             Self::Module(file) => RuntimeExecutable::Module(Arc::new(file.clone())),
             Self::Service(file) => RuntimeExecutable::Service(Arc::new(file.clone())),
+            Self::Field(file) => RuntimeExecutable::Field(Arc::new(file.clone())),
             Self::Server(file) => RuntimeExecutable::Server(Arc::new(file.clone())),
         }
     }
@@ -1168,6 +1221,7 @@ impl CompiledUnit {
             Self::Route(file) => &file.imports,
             Self::Module(file) => &file.imports,
             Self::Service(file) => &file.imports,
+            Self::Field(file) => &file.imports,
             Self::Server(file) => &file.imports,
         }
     }
@@ -1181,6 +1235,11 @@ impl CompiledUnit {
                 .collect(),
             Self::Module(file) => file.exports.clone(),
             Self::Service(file) => file.exports.clone(),
+            Self::Field(file) => file
+                .resolver
+                .as_ref()
+                .map(|_| vec!["resolve".into()])
+                .unwrap_or_default(),
             Self::Server(_) => Vec::new(),
         }
     }
@@ -1214,6 +1273,11 @@ impl CompiledUnit {
                             method.body.clone(),
                         ));
                     }
+                }
+            }
+            Self::Field(file) => {
+                if let Some(resolver) = &file.resolver {
+                    out.push(("resolve".into(), resolver.body.clone()));
                 }
             }
             Self::Server(file) => add_functions(&mut out, &file.functions),
@@ -1353,6 +1417,68 @@ mod tests {
             .route_wasm_fallback(dynamic_id)
             .unwrap()
             .contains("outside the native Route-WASM v3 subset"));
+    }
+
+    #[test]
+    fn field_sources_link_as_first_class_pure_runtime_sources() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Field,
+                "awesomeness",
+                "api/awesomeness.field",
+                r#":import[math, regx]
+                   :field[source = query, optional = true]
+                   resolve { page = optional("page", type = int, default = 1); }"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "uses-field",
+                "api/uses-field.route",
+                r#":import[field:awesomeness]
+                   class Route { get(req) { return true; } }"#,
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        assert_eq!(image.fields.len(), 1);
+        let field = &image.fields[0];
+        assert!(image.field_file(field).is_some());
+        assert!(image.capability_requirements(field).unwrap().is_empty());
+        assert!(image
+            .source(field)
+            .is_some_and(|source| source.kind == RelSourceKind::Field));
+    }
+
+    #[test]
+    fn field_sources_reject_ambient_capabilities() {
+        for forbidden in ["http", "storage", "service:db", "crypto", "ENV"] {
+            let source = format!(
+                ":import[{forbidden}]\n:field[source = query, key = \"id\"]\nresolve {{ id = required(\"id\"); }}"
+            );
+            let fields = vec![PhysicalRelSource::new(
+                RelSourceKind::Field,
+                "unsafe",
+                "api/unsafe.field",
+                source,
+            )];
+            let error = compile_runtime_image("server Main {}", fields, &serde_json::json!({}))
+                .expect_err("Field REL must reject ambient capabilities");
+            assert_eq!(error.code(), "RELC2101");
+        }
+    }
+
+    #[test]
+    fn route_import_of_missing_field_source_fails_link() {
+        let routes = vec![PhysicalRelSource::new(
+            RelSourceKind::Route,
+            "missing-field",
+            "api/missing-field.route",
+            r#":import[field:ghost]
+               class Route { get(req) { return true; } }"#,
+        )];
+        let error = compile_runtime_image("server Main {}", routes, &serde_json::json!({}))
+            .expect_err("missing .field source must fail linking");
+        assert!(error.to_string().contains("ghost.field"));
     }
 
     #[test]

@@ -4,8 +4,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    BinaryOp, Expr, FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceClassDef,
-    ServiceProgram, Statement, Value,
+    BinaryOp, Expr, FieldBinding, FieldBindingMode, FieldDirective, FieldFile, FieldValueType,
+    FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceClassDef, ServiceProgram,
+    Statement, Value,
 };
 use crate::lexer::{Token, TokenKind};
 
@@ -90,6 +91,283 @@ impl Parser {
             imports,
             functions,
             exports,
+        })
+    }
+
+    pub fn parse_field_file(mut self) -> Result<FieldFile, ParseError> {
+        let mut imports = Vec::new();
+        let mut directive = None;
+
+        while self.check(&TokenKind::Colon) {
+            if self.is_import_directive() {
+                imports.extend(self.parse_imports()?);
+                continue;
+            }
+            if directive.is_some() {
+                return Err(self.error_here("duplicate :field[...] declaration"));
+            }
+            directive = Some(self.parse_field_directive()?);
+        }
+
+        if directive.is_none() && self.is_ident("field") {
+            directive = Some(self.parse_field_block_directive()?);
+        }
+        let directive = directive.ok_or_else(|| {
+            self.error_here(".field source requires :field[...] or field { ... } metadata")
+        })?;
+
+        let mut bindings = Vec::new();
+        let mut resolver = None;
+        if self.is_ident("resolve") {
+            self.advance();
+            if self.check(&TokenKind::LBrace) {
+                self.advance();
+                while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                    let name = self.expect_ident()?;
+                    self.expect(TokenKind::Eq)?;
+                    let binding = self.parse_field_binding(name)?;
+                    self.expect(TokenKind::Semicolon)?;
+                    if bindings
+                        .iter()
+                        .any(|existing: &FieldBinding| existing.name == binding.name)
+                    {
+                        return Err(self.error_here("duplicate FieldManager binding"));
+                    }
+                    bindings.push(binding);
+                }
+                self.expect(TokenKind::RBrace)?;
+            } else if self.check(&TokenKind::LParen) {
+                let params = self.parse_params()?;
+                if params.len() > 2 {
+                    return Err(self.error_here(
+                        "FieldManager resolve(raw, context) accepts at most two parameters",
+                    ));
+                }
+                let body = self.parse_block()?;
+                resolver = Some(FunctionDef {
+                    name: "resolve".into(),
+                    params,
+                    body,
+                });
+            } else {
+                return Err(self.error_here("expected `{` or `(` after FieldManager resolve"));
+            }
+        }
+
+        if !self.check(&TokenKind::Eof) {
+            return Err(self.error_here("unexpected content after FieldManager resolver"));
+        }
+        if bindings.is_empty() && resolver.is_none() && directive.key.is_none() {
+            return Err(self.error_here(
+                "FieldManager source must declare a key, declarative resolve bindings, or resolve(raw, context)",
+            ));
+        }
+
+        Ok(FieldFile {
+            imports,
+            directive,
+            bindings,
+            resolver,
+        })
+    }
+
+    fn is_ident(&self, expected: &str) -> bool {
+        matches!(
+            self.tokens.get(self.pos).map(|token| &token.kind),
+            Some(TokenKind::Ident(name)) if name == expected
+        )
+    }
+
+    fn parse_field_directive(&mut self) -> Result<FieldDirective, ParseError> {
+        self.expect(TokenKind::Colon)?;
+        match self.advance().kind {
+            TokenKind::Ident(name) if name == "field" => {}
+            other => {
+                return Err(
+                    self.error_here(&format!("expected :field[...] declaration, got {other:?}"))
+                );
+            }
+        }
+        self.expect(TokenKind::LBracket)?;
+        let mut directive = FieldDirective {
+            source: "query".into(),
+            key: None,
+            optional: false,
+            value_type: FieldValueType::String,
+        };
+        while !self.check(&TokenKind::RBracket) {
+            let name = self.expect_ident()?;
+            self.expect(TokenKind::Eq)?;
+            self.apply_field_directive_option(&mut directive, &name)?;
+            if self.check(&TokenKind::Comma) {
+                self.advance();
+                if self.check(&TokenKind::RBracket) {
+                    return Err(self.error_here("trailing commas are not allowed in :field[...]"));
+                }
+            } else if !self.check(&TokenKind::RBracket) {
+                return Err(self.error_here("expected `,` between :field[...] options"));
+            }
+        }
+        self.expect(TokenKind::RBracket)?;
+        Ok(directive)
+    }
+
+    fn parse_field_block_directive(&mut self) -> Result<FieldDirective, ParseError> {
+        let name = self.expect_ident()?;
+        debug_assert_eq!(name, "field");
+        self.expect(TokenKind::LBrace)?;
+        let mut directive = FieldDirective {
+            source: "query".into(),
+            key: None,
+            optional: false,
+            value_type: FieldValueType::String,
+        };
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let option = self.expect_ident()?;
+            self.expect(TokenKind::Eq)?;
+            self.apply_field_directive_option(&mut directive, &option)?;
+            self.expect(TokenKind::Semicolon)?;
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(directive)
+    }
+
+    fn apply_field_directive_option(
+        &mut self,
+        directive: &mut FieldDirective,
+        name: &str,
+    ) -> Result<(), ParseError> {
+        match name {
+            "source" => {
+                let source = self.expect_ident()?;
+                if source != "query" {
+                    return Err(
+                        self.error_here("FieldManager source currently supports only `query`")
+                    );
+                }
+                directive.source = source;
+            }
+            "key" => match self.advance().kind {
+                TokenKind::String(value) if !value.is_empty() => directive.key = Some(value),
+                other => {
+                    return Err(self.error_here(&format!(
+                        "FieldManager key must be a non-empty string, got {other:?}"
+                    )));
+                }
+            },
+            "optional" => {
+                directive.optional = match self.advance().kind {
+                    TokenKind::True => true,
+                    TokenKind::False => false,
+                    other => {
+                        return Err(self.error_here(&format!(
+                            "FieldManager optional must be true or false, got {other:?}"
+                        )));
+                    }
+                };
+            }
+            "required" => {
+                let required = match self.advance().kind {
+                    TokenKind::True => true,
+                    TokenKind::False => false,
+                    other => {
+                        return Err(self.error_here(&format!(
+                            "FieldManager required must be true or false, got {other:?}"
+                        )));
+                    }
+                };
+                directive.optional = !required;
+            }
+            "type" => directive.value_type = self.parse_field_type()?,
+            other => {
+                return Err(
+                    self.error_here(&format!("unknown FieldManager metadata option {other:?}"))
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_field_type(&mut self) -> Result<FieldValueType, ParseError> {
+        match self.expect_ident()?.as_str() {
+            "string" => Ok(FieldValueType::String),
+            "int" => Ok(FieldValueType::Int),
+            "bool" => Ok(FieldValueType::Bool),
+            other => Err(self.error_here(&format!(
+                "unknown FieldManager type {other:?}; expected string, int, or bool"
+            ))),
+        }
+    }
+
+    fn parse_field_binding(&mut self, name: String) -> Result<FieldBinding, ParseError> {
+        let mode = match self.expect_ident()?.as_str() {
+            "required" => FieldBindingMode::Required,
+            "optional" => FieldBindingMode::Optional,
+            "dynamic" => FieldBindingMode::Dynamic,
+            other => {
+                return Err(self.error_here(&format!(
+                    "unknown FieldManager resolver {other:?}; expected required, optional, or dynamic"
+                )));
+            }
+        };
+        self.expect(TokenKind::LParen)?;
+        let lookup = match self.advance().kind {
+            TokenKind::String(value) if !value.is_empty() => value,
+            other => {
+                return Err(self.error_here(&format!(
+                    "FieldManager lookup key/prefix must be a non-empty string, got {other:?}"
+                )));
+            }
+        };
+        let mut value_type = FieldValueType::String;
+        let mut default = None;
+        let mut strip_prefix = false;
+        while self.check(&TokenKind::Comma) {
+            self.advance();
+            let option = self.expect_ident()?;
+            self.expect(TokenKind::Eq)?;
+            match option.as_str() {
+                "type" => value_type = self.parse_field_type()?,
+                "default" => {
+                    let expr = self.parse_expression()?;
+                    default = Some(self.bound_constant_value(&expr)?);
+                }
+                "stripPrefix" => {
+                    strip_prefix = match self.advance().kind {
+                        TokenKind::True => true,
+                        TokenKind::False => false,
+                        other => {
+                            return Err(self.error_here(&format!(
+                                "stripPrefix must be true or false, got {other:?}"
+                            )));
+                        }
+                    };
+                }
+                other => {
+                    return Err(
+                        self.error_here(&format!("unknown FieldManager resolver option {other:?}"))
+                    );
+                }
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        if mode == FieldBindingMode::Required && default.is_some() {
+            return Err(self.error_here("required(...) cannot declare a default"));
+        }
+        if mode == FieldBindingMode::Dynamic
+            && (default.is_some() || value_type != FieldValueType::String)
+        {
+            return Err(self.error_here(
+                "dynamic(...) supports stripPrefix only; dynamic values stay strings",
+            ));
+        }
+        Ok(FieldBinding {
+            name,
+            lookup,
+            mode,
+            value_type,
+            default,
+            strip_prefix,
         })
     }
 
@@ -466,6 +744,13 @@ impl Parser {
                     Ok(ImportTarget::BuiltinSubLibrary {
                         module,
                         library: name,
+                    })
+                } else if name == "field" && self.check(&TokenKind::Colon) {
+                    self.advance();
+                    let field = self.expect_ident()?;
+                    Ok(ImportTarget::BuiltinFunction {
+                        module: "field".into(),
+                        function: field,
                     })
                 } else if name == "service" && self.check(&TokenKind::Colon) {
                     self.advance();

@@ -10,14 +10,15 @@ use std::sync::Arc;
 
 /// The semantic role of a REL source.
 ///
-/// This is deliberately separate from grammar: Route, Module, Service and
-/// Server REL share the language grammar while exposing different runtime
+/// This is deliberately separate from grammar: Route, Module, Service, Field
+/// and Server REL share the language grammar while exposing different runtime
 /// capabilities and lifecycle surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RelSourceKind {
     Route,
     Module,
     Service,
+    Field,
     Server,
 }
 
@@ -27,6 +28,7 @@ impl RelSourceKind {
             Self::Route => "route",
             Self::Module => "module",
             Self::Service => "service",
+            Self::Field => "field",
             Self::Server => "server",
         }
     }
@@ -40,6 +42,7 @@ impl RelSourceKind {
             Some("route") => Some(Self::Route),
             Some("module") => Some(Self::Module),
             Some("service") => Some(Self::Service),
+            Some("field") => Some(Self::Field),
             Some("server")
                 if path.file_name().and_then(|name| name.to_str()) == Some("server.server") =>
             {
@@ -403,6 +406,10 @@ mod tests {
         assert_eq!(
             RelSourceKind::from_path(Path::new("api/account.route")),
             Some(RelSourceKind::Route)
+        );
+        assert_eq!(
+            RelSourceKind::from_path(Path::new("api/account.field")),
+            Some(RelSourceKind::Field)
         );
         assert_eq!(
             RelSourceKind::from_path(Path::new("module/Auth.module")),

@@ -2543,6 +2543,7 @@ dependencies = [
  "hex",
  "hmac",
  "rand 0.8.8",
+ "regex",
  "serde_json",
  "service-runtime",
  "sha2",
