@@ -19,6 +19,8 @@ Legend:
 | Typed Runtime `ENV` read | ❌ | ✅ | ✅ | ✅ |
 | Lowercase OS-process `env` | ❌ | ❌ | ❌ | ❌ |
 | `quickDB` | ❌ | ❌ | ✅ | ❌ |
+| Environment Storage (`read/list/snapshot/commit/write`) | ❌ direct | ✅ exact Module-owned capability | ❌ current language channel | ❌ |
+| `storage.write` frozen `$$/` ProjectRoot writes | ❌ direct | ✅ | ❌ | ❌ |
 | Video Manager (`vm` / `video-manager`) | ❌ | ✅ | ❌ current language channel | ❌ |
 | Route request snapshot | ✅ | through arguments only | through calls/events only | ❌ |
 | Typed HTTP response helpers | ✅ | ❌ direct HTTP ownership | ❌ direct HTTP ownership | ❌ |
@@ -69,7 +71,9 @@ RELC builds symbol-level recursive groups, but the compatibility ModuleProgram r
 
 ### Native Route WASM
 
-Native `.route` compilation is real but intentionally small. Static one-method literal-return routes can produce deterministic WASM; dynamic routes/imports/helpers receive an explicit interpreter-fallback reason in the Runtime Image. The HTTP dispatcher still retains the linked REL evaluator path while native coverage/dispatch expands.
+Native `.route` compilation is real but intentionally constrained. Compiler generation 8 keeps capability ABI v3. Static one-method literal-return routes can produce deterministic WASM, strict linked Module wrappers can lower exact HTTP/Video/Service/Storage calls, and one Module-owned `storage.write` path can receive `req.body` unchanged through `data[...]`. Other dynamic linked host arguments/import shapes receive an explicit interpreter-fallback reason in the Runtime Image. Storage-backed authority is never silently widened into direct Route access.
+
+See [`storage.md`](storage.md) for the exact `storage.write(...)` and `$$/` contract.
 
 ### Middleware
 

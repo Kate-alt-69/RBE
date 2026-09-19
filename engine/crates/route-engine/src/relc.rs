@@ -30,7 +30,10 @@ use crate::runtime_image::{
 use crate::server_policy::{ServerPolicy, ServerPolicyError};
 use crate::server_rel::{compile_server_source, ServerCompileError, ServerProgram};
 use crate::source_registry::{RelSourceKind, RelSourceRegistry, SourceId, SourceRegistryError};
-use crate::wasm_compiler::{compile_route_with_links, RouteWasmCompilation, RouteWasmLinkContext};
+use crate::wasm_compiler::{
+    compile_route_with_links, RouteWasmCompilation, RouteWasmLinkContext,
+    ROUTE_WASM_COMPILER_VERSION,
+};
 
 #[derive(Debug, Clone)]
 pub struct PhysicalRelSource {
@@ -377,7 +380,7 @@ pub fn compile_runtime_image(
                         code: "RELC3001",
                         source: id.clone(),
                         message: format!(
-                            "Environment Storage authority requires native Container execution; Route-WASM v7 could not lower this Route: {reason}"
+                            "Environment Storage authority requires native Container execution; Route-WASM generation {ROUTE_WASM_COMPILER_VERSION} could not lower this Route: {reason}"
                         ),
                     });
                 }

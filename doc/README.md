@@ -13,6 +13,7 @@ This directory is the authoritative user-facing documentation for the current RB
 - [`source-security.md`](source-security.md) — source integrity, Runtime ENV hardening, process/capability boundaries, and sealed deployment.
 - [`compatibility.md`](compatibility.md) — current cross-file capability/runtime matrix.
 - [`quickdb.md`](quickdb.md) — Service-only probabilistic membership/indexing through `quickDB`.
+- [`storage.md`](storage.md) — Environment Storage, unified `storage.write(...)`, frozen `$$/` ProjectRoot semantics, encoding, and Data-Level status.
 - [`video-manager.md`](video-manager.md) — Video Manager media pipeline, hardware normalization, and live-session control.
 
 ## File-type documentation

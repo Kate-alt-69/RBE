@@ -100,11 +100,11 @@ impl RouteWasmLinkContext {
 /// Compile the currently supported native route subset.
 ///
 /// Native lowering remains intentionally strict: one HTTP method, one return,
-/// no route helper functions. Compiler generation v7 keeps ABI v3 and permits
-/// one immutable linked Module function supplied by RELC. The linked function
-/// must itself be exactly one return of one direct HTTP, Video, Service, or
-/// Storage host call, and every Route/host argument must resolve to static JSON.
-/// Namespace imports, dynamic arguments, wider Module bodies, and nested chains
+/// no route helper functions. Compiler generation 8 keeps ABI v3 and permits
+/// one immutable linked Module function supplied by RELC. Linked host calls are
+/// normally static JSON; generation 8 additionally permits one Module-owned
+/// `storage.write` call whose `data[]` value receives `req.body` unchanged.
+/// Namespace imports, wider Module bodies, and other dynamic host arguments
 /// remain interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let links = RouteWasmLinkContext::default();
@@ -132,13 +132,13 @@ pub(crate) fn compile_route_with_links(
                 linked_import = Some((binding, linked));
             } else {
                 return fallback(
-                    "native Route-WASM v7 only supports one direct http.get/post/request import or one linked Module function import",
+                    format!("native Route-WASM generation {ROUTE_WASM_COMPILER_VERSION} only supports one direct http.get/post/request import or one linked Module function import"),
                 );
             }
         }
         _ => {
             return fallback(
-                "native Route-WASM v7 supports at most one direct or linked host-call import",
+                format!("native Route-WASM generation {ROUTE_WASM_COMPILER_VERSION} supports at most one direct or linked host-call import"),
             )
         }
     }
