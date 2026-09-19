@@ -1,0 +1,77 @@
+name: Finalize FLD-003 Inline Fields
+
+on:
+  push:
+    branches:
+      - ci/fld-003-inline-fields-20260919
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Preserve FLD-003 helper
+        shell: bash
+        run: cp .github/patches/fld-003-inline-fields.py /tmp/fld-003-inline-fields.py
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply FLD-003
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=27170faa00b35ccc2976421cbee7c26aaf174ae2
+          git reset --hard "$BASE"
+          python /tmp/fld-003-inline-fields.py
+          rm -f .github/patches/fld-003-inline-fields.py
+
+      - name: Check and format
+        working-directory: engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p route-engine --locked
+          cargo fmt --all
+          cargo fmt --all -- --check
+
+      - name: Clippy locked workspace
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test locked route-engine
+        working-directory: engine
+        run: cargo test -p route-engine --locked
+
+      - name: Commit directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=27170faa00b35ccc2976421cbee7c26aaf174ae2
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE" || {
+            echo "main moved; refusing non-fast-forward finalize"
+            exit 1
+          }
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add -A
+          git status --short
+          git diff --cached --quiet && {
+            echo "no implementation changes produced"
+            exit 1
+          }
+          git commit -m "FEAT | FLD-003 add route-local declarative fields"
+          git push origin HEAD:main
