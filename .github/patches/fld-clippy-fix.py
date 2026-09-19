@@ -44,13 +44,6 @@ replace_once(
 field_manager = Path("engine/crates/route-engine/src/field_manager.rs")
 text = field_manager.read_text(encoding="utf-8")
 
-runtime_image_import = "use crate::runtime_image::RuntimeImage;\n"
-if text.count(runtime_image_import) != 1:
-    raise SystemExit(
-        f"FieldManager obsolete RuntimeImage test import: expected one occurrence, found {text.count(runtime_image_import)}"
-    )
-text = text.replace(runtime_image_import, "", 1)
-
 request_helper = '''    fn request(entries: &[(&str, &str)]) -> Value {
         Value::Object(HashMap::from([(
             "query".into(),
