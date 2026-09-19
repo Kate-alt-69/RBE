@@ -216,6 +216,21 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
     for method in &file.methods {
         analyze_method(method, &globals, &mut used_globals, &mut diagnostics);
     }
+    if !file.field_bindings.is_empty() {
+        if globals
+            .get("field")
+            .is_some_and(|symbol| symbol.kind == SymbolKind::Module)
+        {
+            used_globals.insert("field".into());
+        } else {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E3030",
+                message: "route-local `fields { ... }` requires `:import[field]`".into(),
+                symbol: Some("field".into()),
+            });
+        }
+    }
 
     for (name, symbol) in globals {
         if used_globals.contains(&name) {
@@ -611,6 +626,7 @@ mod tests {
         };
         let file = RouteFile {
             imports: vec![target],
+            field_bindings: Vec::new(),
             functions: Vec::new(),
             class_name: "Route".into(),
             methods: vec![MethodDef {
@@ -663,6 +679,22 @@ mod tests {
         assert!(!diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == Severity::Error));
+    }
+
+    #[test]
+    fn route_local_fields_consume_direct_field_namespace() {
+        let file = parse(
+            r#":import[field]
+               fields { page = optional("page", type = int, default = 1); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        let diagnostics = analyze(&file);
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("import `field` is never used")));
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != Severity::Error));
     }
 
     #[test]

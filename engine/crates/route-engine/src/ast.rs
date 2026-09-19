@@ -37,6 +37,7 @@ pub enum ImportTarget {
 #[derive(Debug, Clone)]
 pub struct RouteFile {
     pub imports: Vec<ImportTarget>,
+    pub field_bindings: Vec<FieldBinding>,
     pub functions: Vec<FunctionDef>,
     pub class_name: String,
     pub methods: Vec<MethodDef>,

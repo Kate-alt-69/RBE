@@ -115,6 +115,7 @@ impl FieldRuntimeContext {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FieldRoutePlan {
     direct_enabled: bool,
+    inline_bindings: Vec<FieldBinding>,
     resolvers: Vec<(String, Arc<FieldFile>)>,
 }
 
@@ -125,7 +126,16 @@ impl FieldRoutePlan {
         route_logical_name: &str,
     ) -> Result<Self, String> {
         let mut direct_enabled = false;
-        let mut resolver_names = HashSet::new();
+        let inline_bindings = route.field_bindings.clone();
+        if !inline_bindings.is_empty() && !route.imports.iter().any(is_direct_field_import) {
+            return Err(format!(
+                "Route {route_logical_name:?} uses route-local fields but does not import `:import[field]`"
+            ));
+        }
+        let mut resolver_names = inline_bindings
+            .iter()
+            .map(|binding| binding.name.clone())
+            .collect::<HashSet<_>>();
         let mut resolvers = Vec::new();
 
         for import in &route.imports {
@@ -137,7 +147,9 @@ impl FieldRoutePlan {
                         continue;
                     }
                     if !resolver_names.insert(function.clone()) {
-                        continue;
+                        return Err(format!(
+                            "Route {route_logical_name:?} declares duplicate FieldManager resolver name {function:?}"
+                        ));
                     }
                     let source = field_logical_candidates(route_logical_name, function)
                         .into_iter()
@@ -165,12 +177,13 @@ impl FieldRoutePlan {
 
         Ok(Self {
             direct_enabled,
+            inline_bindings,
             resolvers,
         })
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.direct_enabled || !self.resolvers.is_empty()
+        self.direct_enabled || !self.inline_bindings.is_empty() || !self.resolvers.is_empty()
     }
 
     pub(crate) async fn resolve(
@@ -181,6 +194,11 @@ impl FieldRoutePlan {
         let query = request_query(request)?.clone();
         let mut resolved = HashMap::new();
         let mut allowed_resolvers = HashSet::new();
+        for binding in &self.inline_bindings {
+            let value = resolve_binding(&query, binding, "route-local")?;
+            resolved.insert(binding.name.clone(), value);
+            allowed_resolvers.insert(binding.name.clone());
+        }
         for (name, file) in &self.resolvers {
             let value = resolve_field_file(file.as_ref(), request, program, name).await?;
             resolved.insert(name.clone(), value);
@@ -431,6 +449,10 @@ fn field_module_error(message: impl Into<String>) -> ModuleEvalError {
     }
 }
 
+fn is_direct_field_import(import: &ImportTarget) -> bool {
+    matches!(import, ImportTarget::Builtin(module) if module == "field")
+}
+
 fn import_base(import: &ImportTarget) -> &ImportTarget {
     match import {
         ImportTarget::Aliased { target, .. } => target.as_ref(),
@@ -461,6 +483,11 @@ mod tests {
     fn field(source: &str) -> FieldFile {
         let tokens = Lexer::new(source).tokenize().unwrap();
         Parser::new(tokens).parse_field_file().unwrap()
+    }
+
+    fn route(source: &str) -> RouteFile {
+        let tokens = Lexer::new(source).tokenize().unwrap();
+        Parser::new(tokens).parse_file().unwrap()
     }
 
     fn request(entries: &[(&str, &str)]) -> Value {
@@ -547,6 +574,70 @@ mod tests {
             panic!("expected object")
         };
         assert!(matches!(values.get("page"), Some(Value::Null)));
+    }
+
+    #[test]
+    fn route_local_fields_share_the_existing_resolver_runtime() {
+        let route = route(
+            r#":import[field]
+               fields {
+                   page = optional("page", type = int, default = 1);
+                   debug = optional("debug", type = bool, default = false);
+                   tracking = dynamic("utm_", stripPrefix = true);
+                   cookie = required("cookie");
+               }
+               class Route { get(req) { return field.page(); } }"#,
+        );
+        assert_eq!(route.field_bindings.len(), 4);
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("route-local");
+        let context = block_on_ready(plan.resolve(
+            &request(&[("debug", "true"), ("utm_source", "chat"), ("cookie", "abc")]),
+            &program,
+        ))
+        .unwrap();
+
+        assert!(matches!(context.call("page", &[]).unwrap(), Value::Number(value) if value == 1.0));
+        assert!(matches!(
+            context.call("debug", &[]).unwrap(),
+            Value::Bool(true)
+        ));
+        assert!(
+            matches!(context.call("cookie", &[]).unwrap(), Value::String(value) if value == "abc")
+        );
+        let Value::Object(tracking) = context.call("tracking", &[]).unwrap() else {
+            panic!("expected tracking object")
+        };
+        assert!(matches!(tracking.get("source"), Some(Value::String(value)) if value == "chat"));
+    }
+
+    #[test]
+    fn route_local_fields_require_direct_field_import() {
+        let tokens = Lexer::new(
+            r#"fields { page = optional("page", type = int, default = 1); }
+               class Route { get(req) { return req.fields; } }"#,
+        )
+        .tokenize()
+        .unwrap();
+        let error = Parser::new(tokens).parse_file().unwrap_err();
+        assert!(error.message.contains(":import[field]"));
+    }
+
+    #[test]
+    fn route_local_fields_reject_reserved_direct_helper_names() {
+        let tokens = Lexer::new(
+            r#":import[field]
+               fields { required = optional("required"); }
+               class Route { get(req) { return req.fields; } }"#,
+        )
+        .tokenize()
+        .unwrap();
+        let error = Parser::new(tokens).parse_file().unwrap_err();
+        assert!(error.message.contains("reserved"));
     }
 
     #[test]

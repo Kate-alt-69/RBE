@@ -89,6 +89,31 @@ Required missing/invalid reusable fields fail before Route execution with HTTP 4
 
 Field-backed Routes deliberately remain on the linked evaluator path in FLD-002. Native Route-WASM adoption must consume the same pre-resolved Field context; it must not invent a second resolution model.
 
-## Remaining runtime slice
+## Route-local declarative fields (FLD-003)
 
-Route-local declarative `fields { ... }` blocks are the next FLD-003 syntax/runtime slice. They will compile into the same resolver engine rather than duplicating request parsing or validation.
+Small endpoint-owned fields can stay directly in the `.route` file while using the same FieldManager resolver engine:
+
+```text
+:import[field]
+
+fields {
+    page = optional("page", type = int, default = 1);
+    debug = optional("debug", type = bool, default = false);
+    tracking = dynamic("utm_", stripPrefix = true);
+    cookie = required("cookie");
+}
+
+class Route {
+    get(req) {
+        return {
+            page: field.page(),
+            tracking: field.tracking(),
+            all: req.fields
+        };
+    }
+}
+```
+
+The block is intentionally declarative: it reuses the same `required(...)`, `optional(...)`, `dynamic(...)`, coercion, default, and structured failure behavior as reusable `.field` files. It requires the direct `:import[field]` namespace import, may appear once per Route, and cannot reuse the reserved direct helper names `required`, `optional`, `has`, or `dynamic`.
+
+Inline and reusable FieldManager names share one per-Route namespace. A collision fails closed instead of silently shadowing one resolver. Field-backed Routes continue to use the linked evaluator path until native Route-WASM can consume the same pre-resolved Field context without creating a second resolution model.

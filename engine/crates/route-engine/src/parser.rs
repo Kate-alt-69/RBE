@@ -11,6 +11,7 @@ use crate::ast::{
 use crate::lexer::{Token, TokenKind};
 
 const KNOWN_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
+const RESERVED_INLINE_FIELD_NAMES: &[&str] = &["required", "optional", "has", "dynamic"];
 
 fn import_contains_service(import: &ImportTarget) -> bool {
     match import {
@@ -651,6 +652,7 @@ impl Parser {
     pub fn parse_file_collecting(mut self) -> (Option<RouteFile>, Vec<ParseError>) {
         let mut errors = Vec::new();
         let mut imports = Vec::new();
+        let mut field_bindings = Vec::new();
         let mut functions = Vec::new();
 
         while self.check(&TokenKind::Colon) {
@@ -661,6 +663,29 @@ impl Parser {
                     self.recover_top_level();
                 }
             }
+        }
+
+        if self.is_ident("fields") {
+            match self.parse_route_fields_block() {
+                Ok(bindings) => field_bindings = bindings,
+                Err(error) => {
+                    errors.push(error);
+                    self.recover_top_level();
+                }
+            }
+        }
+        if self.is_ident("fields") {
+            errors.push(self.error_here("duplicate route-local `fields { ... }` block"));
+            self.recover_top_level();
+        }
+        if !field_bindings.is_empty()
+            && !imports
+                .iter()
+                .any(|import| matches!(import, ImportTarget::Builtin(module) if module == "field"))
+        {
+            errors.push(self.error_here(
+                "route-local `fields { ... }` requires the direct `:import[field]` namespace import",
+            ));
         }
 
         while self.check(&TokenKind::Function) {
@@ -682,12 +707,44 @@ impl Parser {
         (
             Some(RouteFile {
                 imports,
+                field_bindings,
                 functions,
                 class_name,
                 methods,
             }),
             errors,
         )
+    }
+
+    fn parse_route_fields_block(&mut self) -> Result<Vec<FieldBinding>, ParseError> {
+        let keyword = self.expect_ident()?;
+        debug_assert_eq!(keyword, "fields");
+        self.expect(TokenKind::LBrace)?;
+
+        let mut bindings = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let name = self.expect_ident()?;
+            if RESERVED_INLINE_FIELD_NAMES.contains(&name.as_str()) {
+                return Err(self.error_here(&format!(
+                    "route-local FieldManager name {name:?} is reserved by the direct field namespace"
+                )));
+            }
+            self.expect(TokenKind::Eq)?;
+            let binding = self.parse_field_binding(name)?;
+            self.expect(TokenKind::Semicolon)?;
+            if bindings
+                .iter()
+                .any(|existing: &FieldBinding| existing.name == binding.name)
+            {
+                return Err(self.error_here("duplicate route-local FieldManager binding"));
+            }
+            bindings.push(binding);
+        }
+        self.expect(TokenKind::RBrace)?;
+        if bindings.is_empty() {
+            return Err(self.error_here("route-local `fields { ... }` cannot be empty"));
+        }
+        Ok(bindings)
     }
 
     fn parse_imports(&mut self) -> Result<Vec<ImportTarget>, ParseError> {
