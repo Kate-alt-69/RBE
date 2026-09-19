@@ -25,6 +25,7 @@ use core_lib::{
 
 use crate::analyzer::{analyze, Severity};
 use crate::ast::{FunctionDef, ModuleFile, RouteFile, Value};
+use crate::field_manager::{FieldResolveError, FieldRoutePlan};
 use crate::lexer::Lexer;
 use crate::module_eval::ModuleExecutor;
 use crate::module_runtime::{ModuleProgram, ServiceInterfaces};
@@ -266,6 +267,19 @@ fn cookies_value(headers: &HeaderMap) -> Value {
 
 fn request_error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
+}
+
+fn field_validation_response(error: FieldResolveError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "field_validation_failed",
+            "code": error.code,
+            "field": error.field,
+            "message": error.message,
+        })),
+    )
+        .into_response()
 }
 
 async fn request_value(
@@ -624,6 +638,7 @@ struct RouteHandlerPlan {
     inline_file: Arc<ModuleFile>,
     module_program: Arc<ModuleProgram>,
     native_plan: Option<Arc<NativeRoutePlan>>,
+    field_plan: Arc<FieldRoutePlan>,
     takes_request: bool,
 }
 
@@ -638,6 +653,7 @@ async fn execute(
         inline_file,
         module_program,
         native_plan,
+        field_plan,
         takes_request,
     } = plan;
     let path = request.uri().path().to_string();
@@ -652,9 +668,10 @@ async fn execute(
             return request_error(StatusCode::INTERNAL_SERVER_ERROR, error);
         }
     };
-    let args = if takes_request {
+    let needs_snapshot = takes_request || field_plan.is_active();
+    let mut request_snapshot = if needs_snapshot {
         match request_value(&state, params, query, request).await {
-            Ok(request) => vec![request],
+            Ok(request) => Some(request),
             Err(response) => return *response,
         }
     } else {
@@ -665,6 +682,29 @@ async fn execute(
             state.config.security.max_json_payload_bytes,
         )
         .await;
+        None
+    };
+
+    let field_context = if field_plan.is_active() {
+        let snapshot = request_snapshot
+            .as_ref()
+            .expect("FieldManager-active Route always builds a request snapshot");
+        match field_plan.resolve(snapshot, module_program.as_ref()).await {
+            Ok(context) => Some(context),
+            Err(error) => return field_validation_response(error),
+        }
+    } else {
+        None
+    };
+
+    if let (Some(Value::Object(request)), Some(fields)) =
+        (request_snapshot.as_mut(), field_context.as_ref())
+    {
+        request.insert("fields".into(), fields.resolved_object());
+    }
+    let args = if takes_request {
+        vec![request_snapshot.take().unwrap_or(Value::Null)]
+    } else {
         Vec::new()
     };
     if let Some(plan) = native_plan.as_deref() {
@@ -730,16 +770,29 @@ async fn execute(
         };
         return execute_native_route(plan, image.as_ref(), &state, &path, input).await;
     }
+    let host = match field_context {
+        Some(fields) => RuntimeHostCapabilities::from_state_image_and_fields(&state, image, fields),
+        None => RuntimeHostCapabilities::from_state_and_image(&state, image),
+    };
     let executor = ModuleExecutor::with_services_and_host_capabilities(
         module_program.as_ref(),
         state.services.clone(),
-        Arc::new(RuntimeHostCapabilities::from_state_and_image(&state, image)),
+        Arc::new(host),
     );
     match executor
         .call_inline(inline_file, INLINE_ROUTE_HANDLER, args)
         .await
     {
         Ok(value) => route_value_response(&path, value),
+        Err(err) if err.code.starts_with("FLD4") => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "field_validation_failed",
+                "code": err.code,
+                "message": err.message,
+            })),
+        )
+            .into_response(),
         Err(err) => {
             tracing::error!(error = %err, path = %path, "route evaluation failed");
             append_runtime_error(&path, &err.to_string());
@@ -756,6 +809,7 @@ fn build_method_router(
     file: &RouteFile,
     module_program: Arc<ModuleProgram>,
     native_plan: Option<Arc<NativeRoutePlan>>,
+    field_plan: Arc<FieldRoutePlan>,
 ) -> MethodRouter<AppState> {
     let mut router = MethodRouter::<AppState>::new();
     for method_def in &file.methods {
@@ -774,6 +828,7 @@ fn build_method_router(
             inline_file,
             module_program: module_program.clone(),
             native_plan: native_plan.clone(),
+            field_plan: field_plan.clone(),
             takes_request: method_def.param_name.is_some(),
         };
         let verb = method_def.verb.clone();
@@ -1221,7 +1276,12 @@ pub fn build_routes(
 
         router = router.route(
             &url_path,
-            build_method_router(&route_file, module_program.clone(), None),
+            build_method_router(
+                &route_file,
+                module_program.clone(),
+                None,
+                Arc::new(FieldRoutePlan::default()),
+            ),
         );
     }
 
@@ -1263,16 +1323,32 @@ pub fn build_routes_from_image(
             methods = ?route_file.methods.iter().map(|method| &method.verb).collect::<Vec<_>>(),
             "registered Runtime Image Route REL"
         );
-        let native_plan = image.route_wasm_artifact(id).map(|artifact| {
-            Arc::new(NativeRoutePlan {
-                runtime_image: image.image_id.clone(),
-                source_id: id.clone(),
-                artifact: artifact.clone(),
+        let field_plan = Arc::new(
+            FieldRoutePlan::from_route(image, route_file.as_ref(), &manifest.logical_name)
+                .map_err(anyhow::Error::msg)?,
+        );
+        // FLD-002 keeps Field-backed Routes on the linked evaluator path. The
+        // Field context is resolved before dispatch; native lowering can adopt
+        // the same pre-resolved input contract in a later compiler generation.
+        let native_plan = if field_plan.is_active() {
+            None
+        } else {
+            image.route_wasm_artifact(id).map(|artifact| {
+                Arc::new(NativeRoutePlan {
+                    runtime_image: image.image_id.clone(),
+                    source_id: id.clone(),
+                    artifact: artifact.clone(),
+                })
             })
-        });
+        };
         router = router.route(
             &url_path,
-            build_method_router(route_file.as_ref(), module_program.clone(), native_plan),
+            build_method_router(
+                route_file.as_ref(),
+                module_program.clone(),
+                native_plan,
+                field_plan,
+            ),
         );
     }
     Ok(router)

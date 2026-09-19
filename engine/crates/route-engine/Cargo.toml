@@ -20,6 +20,7 @@ rand = "0.8"
 subtle = "2"
 hex = "0.4"
 regex = "1"
+fancy-regex = "=0.16.2"
 wasm-encoder = "0.248"
 
 [dev-dependencies]

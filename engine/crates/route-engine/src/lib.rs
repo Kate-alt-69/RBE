@@ -21,6 +21,7 @@ pub mod dependency_graph;
 mod discovery;
 pub mod embedded_rel;
 pub mod execution_tracker;
+mod field_manager;
 mod interpreter;
 mod lexer;
 mod module_eval;
@@ -58,6 +59,7 @@ pub use embedded_rel::{
 pub use execution_tracker::{
     InvocationError, InvocationGuard, InvocationId, InvocationSnapshot, InvocationTracker,
 };
+pub use field_manager::{FieldResolveError, FieldRuntimeContext};
 pub use interpreter::{EvalError, Interpreter, RequestContext};
 pub use middleware_plan::{MiddlewarePlan, MiddlewarePlanError, MiddlewareStep};
 pub use module_eval::{ModuleEvalError, ModuleExecutor};

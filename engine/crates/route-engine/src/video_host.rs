@@ -5,12 +5,14 @@ use std::sync::Arc;
 use core_lib::{call_public_http, AppState, VideoLanguage};
 
 use crate::ast::Value;
+use crate::field_manager::FieldRuntimeContext;
 use crate::module_eval::{HostCapabilityCaller, HostCapabilityFuture, ModuleEvalError};
 use crate::runtime_image::RuntimeImage;
 
 pub struct RuntimeHostCapabilities {
     video: VideoLanguage,
     image: Arc<RuntimeImage>,
+    fields: Option<Arc<FieldRuntimeContext>>,
 }
 
 impl RuntimeHostCapabilities {
@@ -18,6 +20,19 @@ impl RuntimeHostCapabilities {
         Self {
             video: VideoLanguage::new(state.video_manager.clone()),
             image,
+            fields: None,
+        }
+    }
+
+    pub fn from_state_image_and_fields(
+        state: &AppState,
+        image: Arc<RuntimeImage>,
+        fields: Arc<FieldRuntimeContext>,
+    ) -> Self {
+        Self {
+            video: VideoLanguage::new(state.video_manager.clone()),
+            image,
+            fields: Some(fields),
         }
     }
 }
@@ -31,6 +46,13 @@ impl HostCapabilityCaller for RuntimeHostCapabilities {
         args: Vec<Value>,
     ) -> HostCapabilityFuture<'a> {
         Box::pin(async move {
+            if module == "field" {
+                let fields = self.fields.as_ref().ok_or_else(|| ModuleEvalError {
+                    code: "FLD4000",
+                    message: "FieldManager context is unavailable for this request".into(),
+                })?;
+                return fields.call(function, &args).map(Some);
+            }
             if module == "ENV" {
                 let value = self
                     .image

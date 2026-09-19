@@ -412,7 +412,11 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                     builtin_modules.insert(binding, module.clone());
                 }
                 ImportTarget::BuiltinFunction { module, function } => {
-                    builtin_functions.insert(binding, (module.clone(), function.clone()));
+                    if module == "field" {
+                        builtin_modules.insert(binding, module.clone());
+                    } else {
+                        builtin_functions.insert(binding, (module.clone(), function.clone()));
+                    }
                 }
                 ImportTarget::BuiltinSubLibrary { .. } => {}
                 ImportTarget::Custom(path) => {

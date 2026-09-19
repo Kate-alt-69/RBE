@@ -16,6 +16,7 @@ use crate::ast::{
 };
 use crate::dependency_graph::{SymbolDependencyGraph, SymbolId};
 use crate::embedded_rel::{extract_embedded_rel, EmbeddedRelError};
+use crate::field_manager::field_logical_candidates;
 use crate::lexer::Lexer;
 use crate::middleware_plan::{MiddlewarePlan, MiddlewarePlanError};
 use crate::module_runtime::module_owner_from_logical_name;
@@ -699,14 +700,23 @@ fn validate_import_targets(
                         && !matches!(
                             function.as_str(),
                             "required" | "optional" | "has" | "dynamic"
-                        )
-                        && registry
-                            .get_logical(RelSourceKind::Field, function)
-                            .is_none() =>
+                        ) =>
                 {
-                    return Err(RelcError::Link(format!(
-                        "{source_id} imports missing FieldManager source `{function}.field`"
-                    )));
+                    let owner = registry.get(source_id).ok_or_else(|| {
+                        RelcError::Link(format!("compiled source {source_id} is not registered"))
+                    })?;
+                    let found = field_logical_candidates(owner.logical_name(), function)
+                        .into_iter()
+                        .any(|logical| {
+                            registry
+                                .get_logical(RelSourceKind::Field, &logical)
+                                .is_some()
+                        });
+                    if !found {
+                        return Err(RelcError::Link(format!(
+                            "{source_id} imports missing FieldManager source `{function}.field` (checked sibling and API-root Field sources)"
+                        )));
+                    }
                 }
                 _ => {}
             }
@@ -1465,6 +1475,28 @@ mod tests {
                 .expect_err("Field REL must reject ambient capabilities");
             assert_eq!(error.code(), "RELC2101");
         }
+    }
+
+    #[test]
+    fn route_field_import_resolves_sibling_before_api_root() {
+        let sources = vec![
+            PhysicalRelSource::new(
+                RelSourceKind::Field,
+                "shop/awesomeness",
+                "api/shop/awesomeness.field",
+                r#":field[source = query, key = "awesome", optional = true]"#,
+            ),
+            PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "shop/item",
+                "api/shop/item.route",
+                r#":import[field:awesomeness]
+                   class Route { get(req) { return field.awesomeness(); } }"#,
+            ),
+        ];
+        let image =
+            compile_runtime_image("server Main {}", sources, &serde_json::json!({})).unwrap();
+        assert_eq!(image.fields.len(), 1);
     }
 
     #[test]

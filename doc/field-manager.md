@@ -58,10 +58,37 @@ resolve(raw, context) {
 }
 ```
 
-The resolver is compiled as REL but remains pure. `regx.test(pattern, value)` provides bounded deterministic regex matching and `regx.raw(pattern)` validates/returns a raw regex pattern.
+The resolver is compiled as REL but remains pure. `regx.test(pattern, value)` keeps ordinary patterns on Rust's linear-time regex engine. `regx.test(value, descriptor)` provides readable validation descriptors (`allow`, `require`, `min`, `max`, `exclude`, `excludeContains`, `noConsecutive`, `ignoreCase`). `regx.raw(pattern)` validates advanced syntax, while `regx.raw(pattern, value)` uses a separately bounded backtracking engine for lookarounds and backreferences. `regx` is a shared REL builtin usable from `.route`, `.module`, `.service`, `server.server`, and `.field`; Field REL remains intentionally restricted to the pure `math` + `regx` capability set.
 
-## Current implementation boundary
+## Request-time runtime
 
-FLD-001 makes `.field` a first-class RELC source, discovers physical/embedded Field sources, validates its pure import allowlist, links `field:NAME` imports, carries Field AST/IR in the immutable Runtime Image, and provides deterministic `math`/`regx` helpers.
+FLD-002 resolves reusable `.field` sources exactly once from the existing immutable request query snapshot before Route execution. A reusable import is a namespace entry:
 
-Request-time FieldManager resolution, route-local `fields { ... }`, structured required-field HTTP 400 responses, optional `null`, and `field.NAME()` execution are the next runtime slice. They must not be documented as active before that slice lands.
+```text
+:import[field:awesomeness]
+
+class Route {
+    get(req) {
+        return field.awesomeness();
+    }
+}
+```
+
+For a Route such as `api/shop/item.route`, `field:awesomeness` checks `api/shop/awesomeness.field` first and then the API-root `api/awesomeness.field` fallback.
+
+`:import[field]` enables the direct request helpers over the same snapshot:
+
+```text
+field.required("cookie")
+field.optional("utm_source")
+field.has("preview")
+field.dynamic("utm_", true) // strip prefix
+```
+
+Required missing/invalid reusable fields fail before Route execution with HTTP 400 and a structured `field_validation_failed` response. Optional missing values resolve to their declared default or `null`; optional type failures resolve `null`. Dynamic prefix bindings resolve to an object. The resolved reusable values are also attached as `req.fields` for inspection.
+
+Field-backed Routes deliberately remain on the linked evaluator path in FLD-002. Native Route-WASM adoption must consume the same pre-resolved Field context; it must not invent a second resolution model.
+
+## Remaining runtime slice
+
+Route-local declarative `fields { ... }` blocks are the next FLD-003 syntax/runtime slice. They will compile into the same resolver engine rather than duplicating request parsing or validation.

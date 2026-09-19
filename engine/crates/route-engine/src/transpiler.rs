@@ -74,6 +74,9 @@ impl Scope {
                 | ImportTarget::Service(_) => {
                     names.insert(crate::modules::binding_name(import), NameKind::Module);
                 }
+                ImportTarget::BuiltinFunction { module, .. } if module == "field" => {
+                    names.insert(crate::modules::binding_name(import), NameKind::Module);
+                }
                 ImportTarget::BuiltinFunction { .. }
                 | ImportTarget::CustomFunction { .. }
                 | ImportTarget::ServiceFunction { .. } => {

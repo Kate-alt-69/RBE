@@ -136,7 +136,11 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
                         symbol: Some(name.clone()),
                     });
                 }
-                SymbolKind::DirectFunction
+                if module == "field" {
+                    SymbolKind::Module
+                } else {
+                    SymbolKind::DirectFunction
+                }
             }
             ImportTarget::Custom(_) => SymbolKind::Module,
             ImportTarget::CustomFunction { .. } => SymbolKind::DirectFunction,
@@ -166,9 +170,15 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
                 unreachable!("import_base removes aliased import wrappers")
             }
         };
-        if globals
-            .insert(name.clone(), Symbol { kind, used: false })
-            .is_some()
+        let merged_field_namespace = name == "field"
+            && kind == SymbolKind::Module
+            && globals
+                .get(&name)
+                .is_some_and(|existing| existing.kind == SymbolKind::Module);
+        if !merged_field_namespace
+            && globals
+                .insert(name.clone(), Symbol { kind, used: false })
+                .is_some()
         {
             diagnostics.push(Diagnostic {
                 severity: Severity::Error,
@@ -641,6 +651,18 @@ mod tests {
         let file =
             parse(r#":import[private] class Route { get(req) { return private.health(); } }"#);
         assert!(analyze(&file).iter().all(|d| d.severity != Severity::Error));
+    }
+
+    #[test]
+    fn reusable_field_imports_merge_into_field_namespace() {
+        let source = r#":import[field:first, field:second]
+            class Route { get(req) { return { a: field.first(), b: field.second() }; } }"#;
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let file = crate::parser::Parser::new(tokens).parse_file().unwrap();
+        let diagnostics = analyze(&file);
+        assert!(!diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error));
     }
 
     #[test]
