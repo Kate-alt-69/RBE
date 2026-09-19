@@ -18,6 +18,12 @@ def pre() -> None:
         'insert_anchor = "\\n    #[test]\\n    fn recovery_plan_orders_folder_video_then_file() {"',
         "sync priority staging anchor",
     )
+    replace_once(
+        ".github/patches/storage-cloud-node-bridge-race-fix.py",
+        '''        .create(true)\n        .read(true)\n        .write(true)\n        .open(locks.join(format!("{id}.lock")))?;''',
+        '''        .create(true)\n        .read(true)\n        .write(true)\n        .truncate(false)\n        .open(locks.join(format!("{id}.lock")))?;''',
+        "journal lock open intent",
+    )
 
 
 def post() -> None:
