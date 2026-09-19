@@ -54,7 +54,7 @@ jobs:
           grep -Fq '[`storage.md`](storage.md)' doc/README.md
           grep -Fq 'storage.write' doc/storage.md
           grep -Fq '$$/' doc/storage.md
-          grep -Fq 'does **not yet** automatically ingest' doc/storage.md
+          grep -Fq 'does **not yet automatically ingest' doc/storage.md
 
       - name: Commit BUG-STO-005
         run: |
