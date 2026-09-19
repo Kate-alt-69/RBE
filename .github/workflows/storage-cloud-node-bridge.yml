@@ -33,6 +33,7 @@ jobs:
           python3 .github/patches/storage-cloud-node-bridge-fix.py pre
           python3 .github/patches/storage-cloud-node-bridge.py
           python3 .github/patches/storage-cloud-node-bridge-fix.py post
+          python3 .github/patches/storage-cloud-node-bridge-test-fix.py
 
       - name: Format changed Rust crates
         run: |
@@ -88,6 +89,7 @@ jobs:
             .ci-storage-cloud-node-bridge-trigger \
             .github/patches/storage-cloud-node-bridge.py \
             .github/patches/storage-cloud-node-bridge-fix.py \
+            .github/patches/storage-cloud-node-bridge-test-fix.py \
             .github/workflows/storage-cloud-node-bridge.yml \
             storage-sync-journal/Cargo.lock
           git config user.name "github-actions[bot]"
