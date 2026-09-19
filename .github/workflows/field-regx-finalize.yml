@@ -1,0 +1,412 @@
+name: Finalize FieldManager and REGX
+
+on:
+  push:
+    branches:
+      - ci/field-regx-finalize-20260919
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Apply FieldManager runtime and REGX runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=05f56af500380b27b1544c80595cf71784e51379
+          git reset --hard "$BASE"
+          python .github/patches/field-manager-runtime.py
+          rm .github/patches/field-manager-runtime.py
+          python <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one anchor, found {count}")
+              p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          cargo = Path("engine/crates/route-engine/Cargo.toml")
+          text = cargo.read_text(encoding="utf-8")
+          if 'fancy-regex = "=0.16.2"' not in text:
+              text = text.replace('regex = "1"\n', 'regex = "1"\nfancy-regex = "=0.16.2"\n', 1)
+          cargo.write_text(text, encoding="utf-8")
+
+          modules = "engine/crates/route-engine/src/modules.rs"
+          old = r'''const REGX_MAX_PATTERN_BYTES: usize = 4096;
+          const REGX_MAX_INPUT_BYTES: usize = 1024 * 1024;
+
+          fn regx_string<'a>(
+              value: Option<&'a Value>,
+              label: &str,
+              limit: usize,
+          ) -> Result<&'a str, ModuleError> {
+              match value {
+                  Some(Value::String(value)) if value.len() <= limit => Ok(value),
+                  Some(Value::String(_)) => Err(ModuleError {
+                      message: format!("{label} exceeds {limit} bytes"),
+                  }),
+                  _ => Err(ModuleError {
+                      message: format!("{label} must be a string"),
+                  }),
+              }
+          }
+
+          fn call_regx(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+              let pattern = regx_string(args.first(), "regx pattern", REGX_MAX_PATTERN_BYTES)?;
+              let compiled = regex::Regex::new(pattern).map_err(|error| ModuleError {
+                  message: format!("invalid regx pattern: {error}"),
+              })?;
+              match function_name {
+                  "raw" => Ok(Value::String(compiled.as_str().to_string())),
+                  "test" => {
+                      let value = regx_string(args.get(1), "regx input", REGX_MAX_INPUT_BYTES)?;
+                      Ok(Value::Bool(compiled.is_match(value)))
+                  }
+                  other => Err(ModuleError {
+                      message: format!("regx.{other}() does not exist"),
+                  }),
+              }
+          }
+          '''
+          new = r'''const REGX_MAX_PATTERN_BYTES: usize = 4096;
+          const REGX_MAX_INPUT_BYTES: usize = 1024 * 1024;
+          const REGX_RAW_BACKTRACK_LIMIT: usize = 1_000_000;
+
+          fn regx_string<'a>(
+              value: Option<&'a Value>,
+              label: &str,
+              limit: usize,
+          ) -> Result<&'a str, ModuleError> {
+              match value {
+                  Some(Value::String(value)) if value.len() <= limit => Ok(value),
+                  Some(Value::String(_)) => Err(ModuleError {
+                      message: format!("{label} exceeds {limit} bytes"),
+                  }),
+                  _ => Err(ModuleError {
+                      message: format!("{label} must be a string"),
+                  }),
+              }
+          }
+
+          fn regx_descriptor_usize(
+              descriptor: &HashMap<String, Value>,
+              key: &str,
+          ) -> Result<Option<usize>, ModuleError> {
+              match descriptor.get(key) {
+                  None => Ok(None),
+                  Some(Value::Number(value))
+                      if value.is_finite() && *value >= 0.0 && value.fract() == 0.0 =>
+                  {
+                      Ok(Some(*value as usize))
+                  }
+                  Some(_) => Err(ModuleError {
+                      message: format!("regx descriptor `{key}` must be a non-negative integer"),
+                  }),
+              }
+          }
+
+          fn regx_descriptor_bool(
+              descriptor: &HashMap<String, Value>,
+              key: &str,
+          ) -> Result<bool, ModuleError> {
+              match descriptor.get(key) {
+                  None => Ok(false),
+                  Some(Value::Bool(value)) => Ok(*value),
+                  Some(_) => Err(ModuleError {
+                      message: format!("regx descriptor `{key}` must be a boolean"),
+                  }),
+              }
+          }
+
+          fn regx_descriptor_strings<'a>(
+              descriptor: &'a HashMap<String, Value>,
+              key: &str,
+          ) -> Result<Vec<&'a str>, ModuleError> {
+              let Some(value) = descriptor.get(key) else {
+                  return Ok(Vec::new());
+              };
+              let Value::Array(values) = value else {
+                  return Err(ModuleError {
+                      message: format!("regx descriptor `{key}` must be an array of strings"),
+                  });
+              };
+              values
+                  .iter()
+                  .map(|value| match value {
+                      Value::String(value) => Ok(value.as_str()),
+                      _ => Err(ModuleError {
+                          message: format!("regx descriptor `{key}` must contain only strings"),
+                      }),
+                  })
+                  .collect()
+          }
+
+          fn regx_token_matches_char(token: &str, value: char) -> bool {
+              match token {
+                  "letters" => value.is_alphabetic(),
+                  "lowercase" => value.is_lowercase(),
+                  "uppercase" => value.is_uppercase(),
+                  "numbers" | "digits" => value.is_ascii_digit(),
+                  "alphanumeric" => value.is_alphanumeric(),
+                  "whitespace" => value.is_whitespace(),
+                  "symbols" => !value.is_alphanumeric() && !value.is_whitespace(),
+                  literal => literal.chars().any(|candidate| candidate == value),
+              }
+          }
+
+          fn regx_descriptor_test(
+              value: &str,
+              descriptor: &HashMap<String, Value>,
+          ) -> Result<bool, ModuleError> {
+              let length = value.chars().count();
+              if let Some(min) = regx_descriptor_usize(descriptor, "min")? {
+                  if length < min {
+                      return Ok(false);
+                  }
+              }
+              if let Some(max) = regx_descriptor_usize(descriptor, "max")? {
+                  if length > max {
+                      return Ok(false);
+                  }
+              }
+
+              let allow = regx_descriptor_strings(descriptor, "allow")?;
+              if !allow.is_empty()
+                  && !value
+                      .chars()
+                      .all(|character| allow.iter().any(|token| regx_token_matches_char(token, character)))
+              {
+                  return Ok(false);
+              }
+
+              for required in regx_descriptor_strings(descriptor, "require")? {
+                  if !value
+                      .chars()
+                      .any(|character| regx_token_matches_char(required, character))
+                  {
+                      return Ok(false);
+                  }
+              }
+
+              let ignore_case = regx_descriptor_bool(descriptor, "ignoreCase")?;
+              let normalized = if ignore_case {
+                  value.to_lowercase()
+              } else {
+                  value.to_string()
+              };
+              for excluded in regx_descriptor_strings(descriptor, "exclude")? {
+                  let excluded = if ignore_case {
+                      excluded.to_lowercase()
+                  } else {
+                      excluded.to_string()
+                  };
+                  if normalized == excluded {
+                      return Ok(false);
+                  }
+              }
+              for excluded in regx_descriptor_strings(descriptor, "excludeContains")? {
+                  let excluded = if ignore_case {
+                      excluded.to_lowercase()
+                  } else {
+                      excluded.to_string()
+                  };
+                  if !excluded.is_empty() && normalized.contains(&excluded) {
+                      return Ok(false);
+                  }
+              }
+              for token in regx_descriptor_strings(descriptor, "noConsecutive")? {
+                  if !token.is_empty() && value.contains(&format!("{token}{token}")) {
+                      return Ok(false);
+                  }
+              }
+              Ok(true)
+          }
+
+          fn build_raw_regx(pattern: &str) -> Result<fancy_regex::Regex, ModuleError> {
+              let mut builder = fancy_regex::RegexBuilder::new(pattern);
+              builder.backtrack_limit(REGX_RAW_BACKTRACK_LIMIT);
+              builder.build().map_err(|error| ModuleError {
+                  message: format!("invalid regx raw pattern: {error}"),
+              })
+          }
+
+          fn call_regx(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
+              match function_name {
+                  "raw" => {
+                      if !(1..=2).contains(&args.len()) {
+                          return Err(ModuleError {
+                              message: "regx.raw() expects pattern[, input]".into(),
+                          });
+                      }
+                      let pattern =
+                          regx_string(args.first(), "regx pattern", REGX_MAX_PATTERN_BYTES)?;
+                      let compiled = build_raw_regx(pattern)?;
+                      if args.len() == 1 {
+                          return Ok(Value::String(pattern.to_string()));
+                      }
+                      let value =
+                          regx_string(args.get(1), "regx input", REGX_MAX_INPUT_BYTES)?;
+                      compiled
+                          .is_match(value)
+                          .map(Value::Bool)
+                          .map_err(|error| ModuleError {
+                              message: format!(
+                                  "regx.raw() evaluation failed within the bounded backtracking budget: {error}"
+                              ),
+                          })
+                  }
+                  "test" => {
+                      if args.len() != 2 {
+                          return Err(ModuleError {
+                              message: "regx.test() expects exactly two arguments".into(),
+                          });
+                      }
+                      if let Some(Value::Object(descriptor)) = args.get(1) {
+                          let value =
+                              regx_string(args.first(), "regx input", REGX_MAX_INPUT_BYTES)?;
+                          return regx_descriptor_test(value, descriptor).map(Value::Bool);
+                      }
+                      let pattern =
+                          regx_string(args.first(), "regx pattern", REGX_MAX_PATTERN_BYTES)?;
+                      let value =
+                          regx_string(args.get(1), "regx input", REGX_MAX_INPUT_BYTES)?;
+                      let compiled = regex::Regex::new(pattern).map_err(|error| ModuleError {
+                          message: format!("invalid regx pattern: {error}"),
+                      })?;
+                      Ok(Value::Bool(compiled.is_match(value)))
+                  }
+                  other => Err(ModuleError {
+                      message: format!("regx.{other}() does not exist"),
+                  }),
+              }
+          }
+          '''
+          replace_once(modules, old, new, "advanced REGX runtime")
+
+          anchor = r'''    #[test]
+              fn unknown_private_function_is_reported() {
+          '''
+          tests = r'''    #[test]
+              fn regx_descriptors_cover_common_api_validation_without_raw_patterns() {
+                  let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("regx".into())]);
+                  let descriptor = Value::Object(HashMap::from([
+                      (
+                          "allow".into(),
+                          Value::Array(vec![
+                              Value::String("letters".into()),
+                              Value::String("numbers".into()),
+                              Value::String("_-".into()),
+                          ]),
+                      ),
+                      (
+                          "require".into(),
+                          Value::Array(vec![
+                              Value::String("uppercase".into()),
+                              Value::String("numbers".into()),
+                              Value::String("symbols".into()),
+                          ]),
+                      ),
+                      ("min".into(), Value::Number(8.0)),
+                      ("max".into(), Value::Number(64.0)),
+                      (
+                          "exclude".into(),
+                          Value::Array(vec![Value::String("Admin_123".into())]),
+                      ),
+                      ("ignoreCase".into(), Value::Bool(true)),
+                  ]));
+                  assert!(matches!(
+                      registry
+                          .call("regx", "test", &[Value::String("Good_123".into()), descriptor.clone()])
+                          .unwrap(),
+                      Value::Bool(true)
+                  ));
+                  assert!(matches!(
+                      registry
+                          .call("regx", "test", &[Value::String("admin_123".into()), descriptor])
+                          .unwrap(),
+                      Value::Bool(false)
+                  ));
+              }
+
+              #[test]
+              fn regx_raw_supports_lookaheads_and_backreferences() {
+                  let registry = ModuleRegistry::from_imports(&[ImportTarget::Builtin("regx".into())]);
+                  let password = r"^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*])[A-Za-z\d!@#$%^&*]{8,64}$";
+                  assert!(matches!(
+                      registry
+                          .call(
+                              "regx",
+                              "raw",
+                              &[Value::String(password.into()), Value::String("GoodPass1!".into())],
+                          )
+                          .unwrap(),
+                      Value::Bool(true)
+                  ));
+                  let repeated = r"\b(\w+)\s+\1\b";
+                  assert!(matches!(
+                      registry
+                          .call(
+                              "regx",
+                              "raw",
+                              &[Value::String(repeated.into()), Value::String("the the".into())],
+                          )
+                          .unwrap(),
+                      Value::Bool(true)
+                  ));
+              }
+
+              #[test]
+              fn unknown_private_function_is_reported() {
+          '''
+          replace_once(modules, anchor, tests, "REGX tests")
+
+          docs = Path("doc/field-manager.md")
+          text = docs.read_text(encoding="utf-8")
+          old_docs = "The resolver is compiled as REL but remains pure. `regx.test(pattern, value)` provides bounded deterministic regex matching and `regx.raw(pattern)` validates/returns a raw regex pattern."
+          new_docs = "The resolver is compiled as REL but remains pure. `regx.test(pattern, value)` keeps ordinary regexes on the fast linear engine. `regx.test(value, descriptor)` provides readable validation descriptors (`allow`, `require`, `min`, `max`, `exclude`, `excludeContains`, `noConsecutive`, `ignoreCase`). `regx.raw(pattern)` validates advanced syntax, while `regx.raw(pattern, value)` uses a separately bounded backtracking engine for lookarounds/backreferences. `regx` is a shared REL builtin available to `.route`, `.module`, `.service`, `server.server`, and `.field`; Field REL remains restricted to the pure `math` + `regx` capability set."
+          if old_docs in text:
+              text = text.replace(old_docs, new_docs, 1)
+          docs.write_text(text, encoding="utf-8")
+          PY
+      - name: Update lockfile and format
+        shell: bash
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          cargo check -p route-engine
+          cargo fmt --all
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        working-directory: engine
+        run: cargo test --workspace --locked
+      - name: Commit directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=05f56af500380b27b1544c80595cf71784e51379
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE" || { echo "main moved; refusing non-fast-forward finalize"; exit 1; }
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add -A
+          git status --short
+          git commit -m "FEAT | FLD-002 activate FieldManager runtime and advanced REGX"
+          git push origin HEAD:main
