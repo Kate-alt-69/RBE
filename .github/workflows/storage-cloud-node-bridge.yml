@@ -34,6 +34,7 @@ jobs:
           python3 .github/patches/storage-cloud-node-bridge.py
           python3 .github/patches/storage-cloud-node-bridge-fix.py post
           python3 .github/patches/storage-cloud-node-bridge-test-fix.py
+          python3 .github/patches/storage-cloud-node-bridge-race-fix.py
 
       - name: Format changed Rust crates
         run: |
@@ -82,6 +83,7 @@ jobs:
           test "$(grep -Fc 'ingest_project_writes(store, project_root)?;' engine/crates/cloud-node/src/main.rs)" -eq 2
           grep -Fq 'successful project-root writes are bridged to Cloud Node' doc/storage.md
           grep -Fq 'before every daemon sync cycle' doc/storage.md
+          grep -Fq 'same logical `$$` path are serialized' doc/storage.md
 
       - name: Commit BUG-STO-006
         run: |
@@ -90,6 +92,7 @@ jobs:
             .github/patches/storage-cloud-node-bridge.py \
             .github/patches/storage-cloud-node-bridge-fix.py \
             .github/patches/storage-cloud-node-bridge-test-fix.py \
+            .github/patches/storage-cloud-node-bridge-race-fix.py \
             .github/workflows/storage-cloud-node-bridge.yml \
             storage-sync-journal/Cargo.lock
           git config user.name "github-actions[bot]"
