@@ -22,6 +22,7 @@ jobs:
         run: |
           cp .github/patches/regx-finalize-v2.py /tmp/regx-finalize-v2.py
           cp .github/patches/fix-field-patch-driver.py /tmp/fix-field-patch-driver.py
+          cp .github/patches/fld-clippy-fix.py /tmp/fld-clippy-fix.py
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -41,6 +42,7 @@ jobs:
           python .github/patches/field-manager-runtime.py
           rm .github/patches/field-manager-runtime.py
           python /tmp/regx-finalize-v2.py
+          python /tmp/fld-clippy-fix.py
 
       - name: Resolve dependency lock and format
         working-directory: engine
