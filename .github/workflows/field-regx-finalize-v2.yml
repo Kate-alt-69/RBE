@@ -17,9 +17,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Preserve finalize helper
+      - name: Preserve finalize helpers
         shell: bash
-        run: cp .github/patches/regx-finalize-v2.py /tmp/regx-finalize-v2.py
+        run: |
+          cp .github/patches/regx-finalize-v2.py /tmp/regx-finalize-v2.py
+          cp .github/patches/fix-field-patch-driver.py /tmp/fix-field-patch-driver.py
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -35,38 +37,7 @@ jobs:
           set -euo pipefail
           BASE=05f56af500380b27b1544c80595cf71784e51379
           git reset --hard "$BASE"
-
-          python <<'PY'
-          from pathlib import Path
-          p = Path('.github/patches/field-manager-runtime.py')
-          text = p.read_text(encoding='utf-8')
-
-          old = '''    if count != 1:\n        raise SystemExit(f"{label}: expected one anchor, found {count}")\n    file.write_text(text.replace(old, new, 1), encoding="utf-8")\n'''
-          new = '''    if count == 0:\n        raise SystemExit(f"{label}: expected an anchor, found 0")\n    if count != 1 and label != "Field namespace registry":\n        raise SystemExit(f"{label}: expected one anchor, found {count}")\n    file.write_text(text.replace(old, new, 1), encoding="utf-8")\n'''
-          if old not in text:
-              raise SystemExit('unable to patch staged FieldManager driver strictness')
-          text = text.replace(old, new, 1)
-
-          stale = '''replace_once(
-              "engine/crates/route-engine/src/relc.rs",
-              "use crate::execution_tracker::InvocationTracker;\\n",
-              "use crate::execution_tracker::InvocationTracker;\\nuse crate::field_manager::field_logical_candidates;\\n",
-              "RELC Field logical resolver import",
-          )
-'''
-          current = '''replace_once(
-              "engine/crates/route-engine/src/relc.rs",
-              "use crate::embedded_rel::{extract_embedded_rel, EmbeddedRelError};\\n",
-              "use crate::embedded_rel::{extract_embedded_rel, EmbeddedRelError};\\nuse crate::field_manager::field_logical_candidates;\\n",
-              "RELC Field logical resolver import",
-          )
-'''
-          if stale not in text:
-              raise SystemExit('unable to retarget staged RELC Field import anchor')
-          text = text.replace(stale, current, 1)
-          p.write_text(text, encoding='utf-8')
-          PY
-
+          python /tmp/fix-field-patch-driver.py .github/patches/field-manager-runtime.py
           python .github/patches/field-manager-runtime.py
           rm .github/patches/field-manager-runtime.py
           python /tmp/regx-finalize-v2.py
