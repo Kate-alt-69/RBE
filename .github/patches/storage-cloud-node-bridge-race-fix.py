@@ -167,6 +167,34 @@ replace_once(
     "Container case-insensitive internal path reservation",
 )
 
+# The pre-lock regression intentionally allowed a newer same-path prepare while
+# the older writer was still alive. Under the serialized writer model that state
+# is impossible by construction and the test itself deadlocks. Remove it and keep
+# the threaded regression below, which proves the intended ordering invariant.
+replace_once(
+    "storage-sync-journal/src/lib.rs",
+    '''    #[test]
+    fn newer_same_path_intent_cannot_be_deleted_by_older_writer() {
+        let root = test_root("race");
+        fs::create_dir_all(root.join("data")).unwrap();
+        let old = prepare(&root, "data/state.json", 3, b"old").unwrap();
+        let new = prepare(&root, "data/state.json", 1, b"new").unwrap();
+        assert!(!cancel(&old).unwrap());
+        fs::write(root.join("data/state.json"), b"new").unwrap();
+        assert!(!commit(&old).unwrap());
+        assert!(commit(&new).unwrap());
+        let ready = ready_intents(&root).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].level, 1);
+        assert_eq!(ready[0].content_sha256, hex::encode(Sha256::digest(b"new")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+''',
+    "",
+    "remove obsolete overlapping same-path writer regression",
+)
+
 # Add a deterministic concurrency regression. The second thread announces that
 # it is about to prepare, then must remain blocked until the first guard drops.
 replace_once(
