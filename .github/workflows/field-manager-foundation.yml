@@ -26,6 +26,9 @@ jobs:
         with:
           workspaces: engine
 
+      - name: Repair FieldManager staging anchors
+        run: python3 .github/patches/field-manager-foundation-fix.py
+
       - name: Apply FieldManager foundation
         run: python3 .github/patches/field-manager-foundation.py
 
@@ -58,6 +61,7 @@ jobs:
           rm -f \
             .ci-field-manager-foundation-trigger \
             .github/patches/field-manager-foundation.py \
+            .github/patches/field-manager-foundation-fix.py \
             .github/workflows/field-manager-foundation.yml
           rmdir .github/patches 2>/dev/null || true
           git config user.name "github-actions[bot]"
