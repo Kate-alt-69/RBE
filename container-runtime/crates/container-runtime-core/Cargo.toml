@@ -8,6 +8,7 @@ publish.workspace = true
 environments = { path = "../environments" }
 runtime-paths = { path = "../../../runtime-paths" }
 atomic-io = { path = "../../../atomic-io" }
+storage-sync-journal = { path = "../../../storage-sync-journal" }
 resource-limits = { path = "../resource-limits" }
 sandbox-primitives = { path = "../sandbox-primitives" }
 ipc-protocol = { path = "../ipc-protocol" }

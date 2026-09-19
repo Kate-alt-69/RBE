@@ -866,7 +866,7 @@ async fn upload_snapshot(
     let cache_root = prepare_outbound_cache(store, cache_owner, plan).await?;
     let header = plan.header()?;
     let mut resources = Vec::new();
-    for object in plan.ordered() {
+    for object in plan.priority_ordered() {
         let object_hex = hex::encode(object.object_key);
         let content_hex = hex::encode(object.content_sha256);
         let base = format!("snapshots/{root}/objects/{object_hex}/{content_hex}");
@@ -1613,6 +1613,7 @@ mod tests {
                 content_sha256: [0x33; 32],
                 logical_path: "db/users.db".into(),
                 logical_size: 0,
+                priority: 2,
                 manifest_path: PathBuf::from("unused/file.blob.cn"),
                 payload_path: Some(PathBuf::from("unused/payload")),
                 chunk_paths: Vec::new(),

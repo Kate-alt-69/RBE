@@ -149,7 +149,7 @@ pub async fn synchronize_upstream(
     let cache_root = prepare_outbound_cache(store, &peer.node_id, &plan).await?;
 
     let client = http_client()?;
-    for object in plan.ordered() {
+    for object in plan.priority_ordered() {
         let cached_manifest = cached_resource_path(
             &cache_root,
             object,

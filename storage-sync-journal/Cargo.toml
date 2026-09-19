@@ -1,0 +1,14 @@
+[package]
+name = "storage-sync-journal"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+atomic-io = { path = "../atomic-io" }
+anyhow = "1"
+hex = "0.4"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

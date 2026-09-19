@@ -246,14 +246,36 @@ fn write_project_file(
     let target = resolve_project_write_path(project_root, &descriptor.path)?;
     let (bytes, normalized_encoding) =
         encode_project_write_data(&descriptor.data, &descriptor.encoding)?;
-    atomic_io::AtomicIo::new()
+    let logical_path = descriptor.path.strip_prefix("$$/").ok_or_else(|| {
+        error(
+            "CAPABILITY_STORAGE_PATH_INVALID",
+            "project write path must start with $$/",
+        )
+    })?;
+    let prepared =
+        storage_sync_journal::prepare(project_root, logical_path, descriptor.level, &bytes)
+            .map_err(|_| {
+                error(
+                    "CAPABILITY_STORAGE_WRITE_FAILED",
+                    "project-root Storage sync intent could not be staged",
+                )
+            })?;
+    if atomic_io::AtomicIo::new()
         .write_atomic(&target, &bytes)
-        .map_err(|_| {
-            error(
-                "CAPABILITY_STORAGE_WRITE_FAILED",
-                "project-root Storage write failed",
-            )
-        })?;
+        .is_err()
+    {
+        let _ = storage_sync_journal::cancel(&prepared);
+        return Err(error(
+            "CAPABILITY_STORAGE_WRITE_FAILED",
+            "project-root Storage write failed",
+        ));
+    }
+    storage_sync_journal::commit(&prepared).map_err(|_| {
+        error(
+            "CAPABILITY_STORAGE_WRITE_FAILED",
+            "project-root Storage sync intent could not be published",
+        )
+    })?;
     Ok((bytes.len(), normalized_encoding))
 }
 
@@ -309,6 +331,16 @@ fn resolve_project_write_path(
                 ));
             }
         }
+    }
+
+    if segments
+        .first()
+        .is_some_and(|segment| segment.to_string_lossy().eq_ignore_ascii_case(".rbe"))
+    {
+        return Err(error(
+            "CAPABILITY_STORAGE_PATH_INVALID",
+            "project write path targets RBE internal state",
+        ));
     }
 
     let Some(file_name) = segments.pop() else {
@@ -663,6 +695,10 @@ mod tests {
                 .unwrap();
         assert_eq!(saved["name"], "Kate");
         assert_eq!(saved["active"], true);
+        let intents = storage_sync_journal::ready_intents(&root).unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].logical_path, "data/users/kate.json");
+        assert_eq!(intents[0].level, 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -742,6 +778,21 @@ mod tests {
         .unwrap_err();
         assert_eq!(invalid_level.code, "CAPABILITY_STORAGE_ARGS_INVALID");
         assert!(!root.join("data/nope.txt").exists());
+
+        let internal = dispatch_project(
+            &storage,
+            &root,
+            &target,
+            "write",
+            json!([{
+                "path":"$$/.rbe/cloud-node/tamper.json",
+                "data":"nope",
+                "encoding":"UTF8",
+                "level":1
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(internal.code, "CAPABILITY_STORAGE_PATH_INVALID");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -15,6 +15,7 @@ client = ["dep:reqwest", "dep:tokio-util", "dep:fs2"]
 
 [dependencies]
 atomic-io = { path = "../../../atomic-io" }
+storage-sync-journal = { path = "../../../storage-sync-journal" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

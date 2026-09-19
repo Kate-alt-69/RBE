@@ -10,6 +10,7 @@ mod config;
 mod crypto;
 mod durable;
 mod format;
+mod ingest;
 mod protocol;
 #[cfg(feature = "client")]
 mod provider;

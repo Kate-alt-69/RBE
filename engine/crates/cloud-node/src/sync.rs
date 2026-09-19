@@ -18,6 +18,8 @@ pub struct SyncObject {
     pub content_sha256: [u8; 32],
     pub logical_path: String,
     pub logical_size: u64,
+    /// Local scheduling metadata only; intentionally excluded from sync-root identity.
+    pub priority: u8,
     pub manifest_path: PathBuf,
     pub payload_path: Option<PathBuf>,
     pub chunk_paths: Vec<PathBuf>,
@@ -42,7 +44,17 @@ pub struct SyncPlanHeader {
 impl SyncPlan {
     pub fn scan(store: &CloudNodeStore) -> anyhow::Result<Self> {
         let storage = store.summary().storage;
-        Self::scan_storage(&storage)
+        let mut plan = Self::scan_storage(&storage)?;
+        for object in &mut plan.folders {
+            object.priority = store.replication_priority(&object.object_key)?;
+        }
+        for object in &mut plan.videos {
+            object.priority = store.replication_priority(&object.object_key)?;
+        }
+        for object in &mut plan.files {
+            object.priority = store.replication_priority(&object.object_key)?;
+        }
+        Ok(plan)
     }
 
     pub(crate) fn scan_storage(storage: &Path) -> anyhow::Result<Self> {
@@ -129,6 +141,35 @@ impl SyncPlan {
             .iter()
             .chain(self.videos.iter())
             .chain(self.files.iter())
+    }
+
+    /// Outbound replication order. Required topology phases remain
+    /// folder -> video -> file, while Data-Level 1 precedes 2 and 3 inside
+    /// each phase. `storage.write` objects are files, so their levels order
+    /// directly against one another without changing canonical snapshot identity.
+    pub fn priority_ordered(&self) -> impl Iterator<Item = &SyncObject> {
+        let mut folders = self.folders.iter().collect::<Vec<_>>();
+        folders.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then(left.logical_path.cmp(&right.logical_path))
+                .then(left.object_key.cmp(&right.object_key))
+        });
+        let mut videos = self.videos.iter().collect::<Vec<_>>();
+        videos.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then(left.logical_path.cmp(&right.logical_path))
+                .then(left.object_key.cmp(&right.object_key))
+        });
+        let mut files = self.files.iter().collect::<Vec<_>>();
+        files.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then(left.logical_path.cmp(&right.logical_path))
+                .then(left.object_key.cmp(&right.object_key))
+        });
+        folders.into_iter().chain(videos).chain(files)
     }
 
     pub fn header(&self) -> anyhow::Result<SyncPlanHeader> {
@@ -243,6 +284,7 @@ fn sync_object(
         content_sha256: manifest.content_sha256,
         logical_path: manifest.logical_path,
         logical_size: manifest.logical_size,
+        priority: 2,
         manifest_path,
         payload_path,
         chunk_paths,
@@ -294,6 +336,53 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn data_level_orders_files_without_changing_sync_root() {
+        let root = test_root();
+        let settings: crate::CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "formatVersion": 1,
+            "node": {
+                "id": "priority-test",
+                "mode": "primary",
+                "storageRoot": root.to_string_lossy(),
+                "backupVersions": 5,
+                "preserveOriginal": true,
+                "videoChunkBytes": 1048576
+            },
+            "replication": { "targets": [] }
+        }))
+        .unwrap();
+        let store = CloudNodeStore::open(&settings).unwrap();
+        let high = root.join("high.json");
+        let low = root.join("low.json");
+        fs::write(&high, b"high").unwrap();
+        fs::write(&low, b"low").unwrap();
+        store
+            .store_file_with_priority(&low, "data/low.json", 3)
+            .unwrap();
+        store
+            .store_file_with_priority(&high, "data/high.json", 1)
+            .unwrap();
+
+        let plan = store.sync_plan().unwrap();
+        let root_before = plan.root_sha256;
+        let files = plan
+            .priority_ordered()
+            .filter(|object| object.kind == BlobKind::File)
+            .map(|object| (object.logical_path.clone(), object.priority))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files,
+            vec![("data/high.json".into(), 1), ("data/low.json".into(), 3)]
+        );
+
+        store
+            .store_file_with_priority(&high, "data/high.json", 3)
+            .unwrap();
+        assert_eq!(store.sync_plan().unwrap().root_sha256, root_before);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

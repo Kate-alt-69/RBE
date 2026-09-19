@@ -168,7 +168,11 @@ These operations act on the namespace-scoped `EnvironmentStorageManager`, not on
 | `2` | important / normal delayed replication is acceptable |
 | `3` | expendable or rebuildable data |
 
-**Current implementation boundary:** Storage validates and carries the level through the trusted write request and response, but Cloud Node does **not yet automatically ingest `$$` project writes or schedule sync by this level**. Cloud Node currently receives objects only through its own ingest/store paths. Until the Storage-to-Cloud-Node bridge is implemented, Data-Level must not be described as active replication scheduling.
+**Current implementation:** successful project-root writes are bridged to Cloud Node through a durable internal outbox under `.rbe/cloud-node/storage-ingest`. The write intent is staged before the atomic file replacement and published after it, so crash recovery can verify the expected content hash before ingestion. Cloud Node ingests the current file idempotently at startup and before every daemon sync cycle, records Data-Level as local scheduling metadata, and acknowledges only the exact intent it consumed.
+
+Data-Level does **not** change `BlobManifest` v1 or the canonical sync-root hash. Replication keeps the required folder -> video -> file topology phases, then orders objects by level (`1`, `2`, `3`) inside each phase. Because `storage.write` produces regular file objects, Level 1 project writes are transferred before Level 2/3 project writes. Provider and peer uploads use the same priority ordering.
+
+The `.rbe/` project subtree is reserved case-insensitively for RBE internal state and cannot be targeted by `storage.write`. Writes to the same logical `$$` path are serialized from intent staging through the atomic file replacement and intent publication, so concurrent callers cannot lose the intent for the file version that actually wins. `RBE_PROJECT_ROOT` can explicitly tell `cloud_node` where to consume the outbox; otherwise the parent directory of `setting.node.cn.json` is used.
 
 There is currently no public `durability[...]` descriptor, and `$env/` / `$tmp/` roots are not part of the locked Storage language contract.
 

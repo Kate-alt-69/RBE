@@ -32,6 +32,8 @@ async fn run() -> anyhow::Result<()> {
 
     let settings = CloudNodeSettings::load(&config_path)?;
     let store = CloudNodeStore::open(&settings)?;
+    let project_root = cloud_node_project_root(&config_path)?;
+    ingest_project_writes(&store, &project_root)?;
     match command {
         "evaluate" => {
             let summary = store.summary();
@@ -107,7 +109,7 @@ async fn run() -> anyhow::Result<()> {
             println!("head={}", result.final_head);
             println!("root={}", result.final_root);
         }
-        "run" => run_daemon(&settings, &store).await?,
+        "run" => run_daemon(&settings, &store, &project_root).await?,
         "sync-plan" => {
             let plan = store.sync_plan()?;
             println!("root={}", plan.root_hex());
@@ -148,22 +150,39 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_daemon(settings: &CloudNodeSettings, store: &CloudNodeStore) -> anyhow::Result<()> {
-    if settings.provider.is_some() {
-        return run_provider_daemon(settings, store).await;
+fn ingest_project_writes(store: &CloudNodeStore, project_root: &Path) -> anyhow::Result<()> {
+    let ingested = store.ingest_storage_journal(project_root)?;
+    if ingested > 0 {
+        eprintln!(
+            "cloud_node: ingested {ingested} project-root Storage write(s) from {}",
+            project_root.display()
+        );
     }
-    run_peer_daemon(settings, store).await
+    Ok(())
+}
+
+async fn run_daemon(
+    settings: &CloudNodeSettings,
+    store: &CloudNodeStore,
+    project_root: &Path,
+) -> anyhow::Result<()> {
+    if settings.provider.is_some() {
+        return run_provider_daemon(settings, store, project_root).await;
+    }
+    run_peer_daemon(settings, store, project_root).await
 }
 
 async fn run_peer_daemon(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
+    project_root: &Path,
 ) -> anyhow::Result<()> {
     let upstream = settings
         .upstream
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node run mode requires an upstream or provider"))?;
     loop {
+        ingest_project_writes(store, project_root)?;
         match probe_upstream(settings).await {
             Ok(peer) => {
                 println!(
@@ -210,6 +229,7 @@ async fn run_peer_daemon(
 async fn run_provider_daemon(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
+    project_root: &Path,
 ) -> anyhow::Result<()> {
     let provider = settings
         .provider
@@ -219,6 +239,7 @@ async fn run_provider_daemon(
     let mut retry_delay_ms = provider.reconnect_delay_ms;
     let mut write_probe_verified = false;
     loop {
+        ingest_project_writes(store, project_root)?;
         let result = if provider.sync_on_connect {
             synchronize_provider(settings, store).await.map(|sync| {
                 println!(
@@ -287,6 +308,26 @@ fn take_config_arg(args: &mut Vec<String>) -> anyhow::Result<Option<PathBuf>> {
         }
     }
     Ok(found)
+}
+
+fn cloud_node_project_root(config_path: &Path) -> anyhow::Result<PathBuf> {
+    let candidate = std::env::var_os("RBE_PROJECT_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| config_path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let root = candidate.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "Cloud Node ProjectRoot {} could not be canonicalized: {error}",
+            candidate.display()
+        )
+    })?;
+    if !root.is_dir() {
+        anyhow::bail!(
+            "Cloud Node ProjectRoot is not a directory: {}",
+            root.display()
+        );
+    }
+    Ok(root)
 }
 
 fn default_config_path() -> PathBuf {

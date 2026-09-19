@@ -121,6 +121,50 @@ impl CloudNodeStore {
         self.store_regular(source, logical_path, BlobKind::File)
     }
 
+    pub fn store_file_with_priority(
+        &self,
+        source: &Path,
+        logical_path: &str,
+        level: u8,
+    ) -> anyhow::Result<StoredObject> {
+        validate_replication_priority(level)?;
+        let stored = self.store_regular(source, logical_path, BlobKind::File)?;
+        self.set_replication_priority(&stored.object_key, level)?;
+        Ok(stored)
+    }
+
+    pub(crate) fn replication_priority(&self, object_key: &[u8; 32]) -> anyhow::Result<u8> {
+        let path = self
+            .root
+            .join("priority")
+            .join(format!("{}.level", hex::encode(object_key)));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(2),
+            Err(error) => return Err(error.into()),
+        };
+        if bytes.len() != 1 {
+            anyhow::bail!(
+                "Cloud Node replication priority sidecar is malformed: {}",
+                path.display()
+            );
+        }
+        validate_replication_priority(bytes[0])?;
+        Ok(bytes[0])
+    }
+
+    fn set_replication_priority(&self, object_key: &str, level: u8) -> anyhow::Result<()> {
+        validate_replication_priority(level)?;
+        if object_key.len() != 64 || !object_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("Cloud Node object key is invalid for replication priority metadata");
+        }
+        let path = self
+            .root
+            .join("priority")
+            .join(format!("{}.level", object_key.to_ascii_lowercase()));
+        atomic_write(&path, &[level])
+    }
+
     pub fn store_video(&self, source: &Path, logical_path: &str) -> anyhow::Result<StoredObject> {
         self.store_regular(source, logical_path, BlobKind::Video)
     }
@@ -537,6 +581,13 @@ impl CloudNodeStore {
         )?;
         prune_backup_versions(&versions, &retained)
     }
+}
+
+fn validate_replication_priority(level: u8) -> anyhow::Result<()> {
+    if !(1..=3).contains(&level) {
+        anyhow::bail!("Cloud Node replication priority must be 1, 2, or 3");
+    }
+    Ok(())
 }
 
 fn normalize_logical_path(value: &str) -> anyhow::Result<String> {
