@@ -81,6 +81,27 @@ jobs:
       - name: test
         run: cargo test
 
+  library-lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: library-lock
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: library-lock
+      - name: fmt check
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+
   portable-sdk:
     runs-on: ubuntu-latest
     timeout-minutes: 10
