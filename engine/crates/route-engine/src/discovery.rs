@@ -7,7 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
@@ -57,11 +57,26 @@ impl RouteCache {
         Self::default()
     }
 
+    fn lock_entries(&self) -> MutexGuard<'_, HashMap<PathBuf, CacheEntry>> {
+        match self.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => {
+                // Parsed Routes are disposable cache state. If a parser/cache
+                // thread panics, discard the possibly-partial cache and reparse
+                // from authoritative source instead of poisoning every reload.
+                let mut entries = poisoned.into_inner();
+                entries.clear();
+                self.entries.clear_poison();
+                entries
+            }
+        }
+    }
+
     fn load(&self, path: &Path) -> anyhow::Result<Arc<RouteFile>> {
         let bytes = fs::read(path)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
         let hash = hash_bytes(&bytes);
-        if let Some(entry) = self.entries.lock().unwrap().get(path) {
+        if let Some(entry) = self.lock_entries().get(path) {
             if entry.hash == hash {
                 return Ok(entry.file.clone());
             }
@@ -76,7 +91,7 @@ impl RouteCache {
             anyhow::anyhow!("{}:{}:{}: {}", path.display(), e.line, e.column, e.message)
         })?;
         let file = Arc::new(file);
-        self.entries.lock().unwrap().insert(
+        self.lock_entries().insert(
             path.to_path_buf(),
             CacheEntry {
                 hash,
@@ -84,6 +99,39 @@ impl RouteCache {
             },
         );
         Ok(file)
+    }
+}
+
+#[cfg(test)]
+mod route_cache_poison_tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_route_cache_is_cleared_and_reparsed() {
+        let root =
+            std::env::temp_dir().join(format!("rbe-route-cache-poison-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("health.route");
+        fs::write(&path, "class Route { get(req) { return true; } }").unwrap();
+
+        let cache = RouteCache::new();
+        cache.load(&path).unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _entries = cache.entries.lock().unwrap();
+            panic!("intentional RouteCache poison");
+        }));
+        assert!(poisoned.is_err());
+        assert!(cache.entries.is_poisoned());
+
+        let changed = b"class Route { get(req) { return false; } }";
+        fs::write(&path, changed).unwrap();
+        cache.load(&path).unwrap();
+        assert!(!cache.entries.is_poisoned());
+        let entries = cache.lock_entries();
+        assert_eq!(entries.get(&path).unwrap().hash, hash_bytes(changed));
+        drop(entries);
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
