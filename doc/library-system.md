@@ -58,6 +58,19 @@ RBE does not require global package installation. Managed runtimes/toolchains ar
 installed into `.rbe/runtimes` and pinned by project state unless policy explicitly
 chooses a compatible system installation.
 
+RBE may also maintain a private user-scoped portable runtime tree outside the
+project for its own tooling. The first planned system runtime is
+`rbe.sys.python`, stored under the user's RBE data root rather than placed on the
+machine's PATH:
+
+```text
+~/.rbe/system/rbe.sys.python/<version>/<host>/
+```
+
+`rbe.sys.python` is internal infrastructure for index discovery/scraper adapters
+and future maintenance helpers. It is distinct from the user-installable
+`runtime.python` package.
+
 ## 3. Package ZIP
 
 A source package contains source, lockfiles and a required `library.toml` rather
@@ -246,16 +259,19 @@ Python Simple Repository API
 └── `rbe-sdk` wheel/sdist
 ```
 
-`backend sdk setup` writes only project-local configuration and chooses SDK/runtime
-versions compatible with the running Library ABI. Cargo supports alternate sparse
-registries; npm supports project `.npmrc`; Bun can consume npm registry config or
-`bunfig.toml`; Python installers can consume a standards-compatible simple index.
+SDKs are installed through the same package command as every other installable
+object. `backend install sdk.<version>` writes only project-local configuration
+and chooses SDK/runtime versions compatible with the running Library ABI. Cargo
+supports alternate sparse registries; npm supports project `.npmrc`; Bun can
+consume npm registry config or `bunfig.toml`; Python installers can consume a
+standards-compatible simple index.
 
-Normal library authors should usually run RBE commands instead of configuring
-these registries by hand:
+A normal package consumer does not manually install the SDK declared by a package;
+`backend install` resolves that dependency automatically. Library authors can
+explicitly prepare an SDK version and then scaffold a project:
 
 ```text
-./backend sdk setup
+./backend install sdk.0.1.0
 ./backend library new advancenet --language rust
 ./backend library new advancenet --language bun
 ./backend library new advancenet --language python
@@ -263,15 +279,39 @@ these registries by hand:
 
 ## 10. `backend install`
 
-The install command is the package/environment resolver, not merely a downloader:
+The install command is the unified package/environment resolver, not merely a
+downloader. Packages, SDKs, runtimes, remote indexes and direct external sources
+all enter through the same command surface:
 
 ```text
 ./backend install advancenet
-./backend install https://example.com/advancenet.zip
-./backend install
+./backend install advancenet.4.0.1
+./backend install sdk.0.1.0
+./backend install runtime.python
+./backend install runtime.python.3.10
+./backend install mycooldevwebsite.here/advancenet/download -version=4.0.1
+./backend install python.org/downloads/ -version=3.10
 ```
 
-Pipeline:
+Bare web locators infer HTTPS automatically. An explicitly pasted `http://` URL
+is upgraded to HTTPS for discovery. External-source resolution is planned as:
+
+```text
+local cached external index
+→ website-native RBE index / well-known index
+→ Kastrick external-source mapping
+→ rbe.sys.python scraper adapter fallback
+→ validate normalized candidate in trusted Rust
+→ cache accepted index locally
+→ best-effort public-only observation to Kastrick
+```
+
+Private/local addresses are never silently reported to Kastrick. Scraper output
+is discovery data, not install authority: its URLs and normalized package metadata
+must still pass trusted validation, artifact integrity checks, package inspection,
+capability admission and the Library Protocol handshake.
+
+Package-install pipeline:
 
 ```text
 resolve package/index or URL
@@ -383,8 +423,8 @@ rather than inventing a second cache filesystem.
 1. Language-neutral Protocol v1 + Rust/JS/Python SDK contracts.
 2. Package manifest parser and safe ZIP inspection.
 3. Project-local runtime/toolchain manager and `rbe.lock` model.
-4. `backend sdk setup` and `backend library new`.
-5. URL/indexed `backend install` with OS build selection.
+4. Unified `backend install` grammar for packages, SDKs, runtimes and URLs.
+5. External index discovery/cache + `rbe.sys.python` scraper fallback.
 6. Library Host worker lifecycle + authenticated ABI handshake.
 7. Net/router/storage/crypto host bridges.
 8. Generic REL sub-library linker + `http` compatibility alias.

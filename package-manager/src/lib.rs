@@ -628,16 +628,11 @@ impl SdkBootstrapPlan {
 
     pub fn local_command(&self) -> String {
         let scope = if self.scope == ToolingScope::UserShared {
-            " --shared"
+            " -shared"
         } else {
             ""
         };
-        format!(
-            "backend sdk install {}@{}{}",
-            self.family.name(),
-            self.version,
-            scope
-        )
+        format!("backend install sdk.{}{}", self.version, scope)
     }
 }
 
@@ -867,7 +862,7 @@ mod tests {
             PathBuf::from("/work/project/.rbe/sdk/rust/0.1.0")
         );
         assert!(plan.dependency_hint.contains("registry = \"rbe\""));
-        assert_eq!(plan.local_command(), "backend sdk install rust@0.1.0");
+        assert_eq!(plan.local_command(), "backend install sdk.0.1.0");
         assert_eq!(plan.registry_files.len(), 3);
     }
 

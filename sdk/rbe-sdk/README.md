@@ -37,17 +37,22 @@ other privileged surface.
 ## Self-hosted distribution
 
 RBE's central package service is designed to expose a Cargo **sparse registry**
-for SDK/tooling crates in addition to RBE's own package index. The normal user
-flow will be automated by `backend` so users do not need to know Cargo registry
-internals.
+for SDK/tooling crates in addition to RBE's own package index. SDKs and runtimes
+use the same user-facing install namespace as ordinary packages; there is no
+separate `backend sdk ...` command family.
 
 Target flow:
 
 ```text
-./backend sdk setup
+./backend install sdk.0.1.0
 ./backend library new advancenet
 ./backend install advancenet
 ```
+
+A normal package consumer does not need to install its SDK manually. The package
+manifest declares the SDK requirement and `backend install` resolves the exact
+compatible SDK automatically. Explicit `backend install sdk.<version>` is mainly
+for authors preparing a local RBE library-development environment.
 
 For manual Cargo use, a project can configure the same registry directly:
 
