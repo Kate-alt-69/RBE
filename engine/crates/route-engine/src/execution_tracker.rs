@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::dependency_graph::SymbolId;
 use crate::server_policy::RecursionPolicy;
@@ -87,13 +87,28 @@ impl InvocationTracker {
         })
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, TrackerState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                // Invocation bookkeeping is reconstructable request-local state.
+                // A panic while mutating it must not permanently poison REL or
+                // trigger a second panic from InvocationGuard::drop during unwind.
+                let mut state = poisoned.into_inner();
+                *state = TrackerState::default();
+                self.state.clear_poison();
+                state
+            }
+        }
+    }
+
     pub fn begin(
         self: &Arc<Self>,
         parent_id: Option<InvocationId>,
         symbol: SymbolId,
         arguments_fingerprint: u64,
     ) -> Result<InvocationGuard, InvocationError> {
-        let mut state = self.state.lock().expect("REL invocation tracker poisoned");
+        let mut state = self.lock_state();
         let depth = match parent_id {
             Some(parent) => state
                 .invocations
@@ -140,7 +155,7 @@ impl InvocationTracker {
     }
 
     pub fn operation(&self, id: InvocationId) -> Result<u64, InvocationError> {
-        let mut state = self.state.lock().expect("REL invocation tracker poisoned");
+        let mut state = self.lock_state();
         let invocation = state
             .invocations
             .get_mut(&id)
@@ -160,7 +175,7 @@ impl InvocationTracker {
         key: impl Into<String>,
     ) -> Result<(), InvocationError> {
         let key = key.into();
-        let mut state = self.state.lock().expect("REL invocation tracker poisoned");
+        let mut state = self.lock_state();
         if !state.invocations.contains_key(&id) {
             return Err(InvocationError::Unknown(id));
         }
@@ -175,7 +190,7 @@ impl InvocationTracker {
     }
 
     pub fn ready(&self, id: InvocationId, key: &str) -> Result<(), InvocationError> {
-        let mut state = self.state.lock().expect("REL invocation tracker poisoned");
+        let mut state = self.lock_state();
         if !state.invocations.contains_key(&id) {
             return Err(InvocationError::Unknown(id));
         }
@@ -197,7 +212,7 @@ impl InvocationTracker {
         key: impl Into<String>,
     ) -> Result<(), InvocationError> {
         let key = key.into();
-        let mut state = self.state.lock().expect("REL invocation tracker poisoned");
+        let mut state = self.lock_state();
         if !state.invocations.contains_key(&id) {
             return Err(InvocationError::Unknown(id));
         }
@@ -215,7 +230,7 @@ impl InvocationTracker {
     }
 
     pub fn clear_wait(&self, id: InvocationId) -> Result<(), InvocationError> {
-        let mut state = self.state.lock().expect("REL invocation tracker poisoned");
+        let mut state = self.lock_state();
         state
             .invocations
             .get_mut(&id)
@@ -225,16 +240,11 @@ impl InvocationTracker {
     }
 
     pub fn snapshot(&self, id: InvocationId) -> Option<InvocationSnapshot> {
-        self.state
-            .lock()
-            .expect("REL invocation tracker poisoned")
-            .invocations
-            .get(&id)
-            .cloned()
+        self.lock_state().invocations.get(&id).cloned()
     }
 
     fn finish(&self, id: InvocationId) {
-        let mut state = self.state.lock().expect("REL invocation tracker poisoned");
+        let mut state = self.lock_state();
         if let Some(invocation) = state.invocations.remove(&id) {
             for key in invocation.producing {
                 if state.producers.get(&key) == Some(&id) {
@@ -319,6 +329,27 @@ mod tests {
             SourceId::physical(RelSourceKind::Module, "Tree").unwrap(),
             name,
         )
+    }
+
+    #[test]
+    fn poisoned_tracker_resets_without_panicking_guard_drop() {
+        let tracker = InvocationTracker::new(RecursionPolicy::default());
+        let guard = tracker.begin(None, symbol("root"), 1).unwrap();
+
+        let poison_target = tracker.clone();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = poison_target.state.lock().unwrap();
+            panic!("intentional invocation tracker poison");
+        }));
+        assert!(poisoned.is_err());
+        assert!(tracker.state.is_poisoned());
+
+        // This used to panic from Drop while an earlier panic was unwinding.
+        drop(guard);
+        assert!(!tracker.state.is_poisoned());
+
+        let recovered = tracker.begin(None, symbol("recovered"), 2).unwrap();
+        assert_eq!(tracker.snapshot(recovered.id()).unwrap().depth, 1);
     }
 
     #[test]
