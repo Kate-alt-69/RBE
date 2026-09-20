@@ -165,6 +165,27 @@ jobs:
       - name: test
         run: cargo test
 
+  package-manager:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: package-manager
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: package-manager
+      - name: fmt check
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+
   portable-sdk:
     runs-on: ubuntu-latest
     timeout-minutes: 10
