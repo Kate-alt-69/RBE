@@ -1,0 +1,12 @@
+[package]
+name = "rbe-library-installer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rbe-library-package = { path = "../library-package" }
+rbe-library-lock = { path = "../library-lock" }
+semver = "1"
+thiserror = "2"
+url = "2"
