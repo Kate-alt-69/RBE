@@ -1,0 +1,14 @@
+[package]
+name = "rbe-library-transaction"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rbe-library-installer = { path = "../library-installer" }
+rbe-library-package = { path = "../library-package" }
+rbe-library-lock = { path = "../library-lock" }
+rbe-sdk = { path = "../sdk/rbe-sdk" }
+semver = "1"
+thiserror = "2"
+url = "2"
