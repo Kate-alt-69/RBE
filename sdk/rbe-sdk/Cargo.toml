@@ -1,0 +1,12 @@
+[package]
+name = "rbe-sdk"
+version = "0.1.0"
+edition = "2021"
+publish = ["rbe"]
+description = "Stable SDK contract for external Rust Backend Engine libraries"
+
+[lib]
+name = "rbe_sdk"
+path = "src/lib.rs"
+
+[dependencies]

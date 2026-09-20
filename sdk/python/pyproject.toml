@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rbe-sdk"
+version = "0.1.0"
+description = "Language-neutral RBE Library ABI SDK for Python"
+requires-python = ">=3.11"
+license = { text = "UNLICENSED" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["rbe_sdk"]

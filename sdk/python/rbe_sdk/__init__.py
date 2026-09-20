@@ -1,0 +1,125 @@
+"""Stable Python SDK contract for external RBE libraries."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+LIBRARY_ABI_VERSION = 1
+SDK_VERSION = "0.1.0"
+
+NET_HTTP = "net:http"
+NET_COOKIES = "net:cookies"
+NET_HEADERS = "net:headers"
+NET_URL = "net:url"
+NET_DNS = "net:dns"
+NET_IP = "net:ip"
+NET_TCP = "net:tcp"
+NET_UDP = "net:udp"
+NET_QUIC = "net:quic"
+NET_WEBSOCKET = "net:websocket"
+NET_WEBTRANSPORT = "net:webtransport"
+NET_P2P = "net:p2p"
+NET_MASK = "net:mask"
+ROUTER_READ = "router:read"
+ROUTER_REGISTER = "router:register"
+STORAGE = "storage"
+CRYPTO = "crypto"
+
+
+def _valid_component(value: str) -> bool:
+    if not value or not value[0].isalnum():
+        return False
+    return all(char.isalnum() or char in "-_" for char in value)
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryDescriptor:
+    name: str
+    version: str
+    abi_min: int = LIBRARY_ABI_VERSION
+    abi_max: int = LIBRARY_ABI_VERSION
+
+    def validate(self) -> "LibraryDescriptor":
+        if not _valid_component(self.name):
+            raise ValueError(f"invalid RBE library name {self.name!r}")
+        if self.abi_min < 1 or self.abi_min > self.abi_max:
+            raise ValueError(f"invalid RBE ABI range {self.abi_min}..={self.abi_max}")
+        return self
+
+    def supports_host_abi(self, host_abi: int) -> bool:
+        return self.abi_min <= host_abi <= self.abi_max
+
+
+@dataclass(frozen=True, slots=True)
+class HostCall:
+    capability: str
+    target: str
+    operation: str
+    payload: Any = None
+
+
+class HostBridge(Protocol):
+    def call(self, request: HostCall) -> Any: ...
+
+
+class CapabilityClient:
+    def __init__(self, bridge: HostBridge, capability: str, target: str | None = None) -> None:
+        self._bridge = bridge
+        self.capability = capability
+        self.target = target or capability
+
+    def call(self, operation: str, payload: Any = None) -> Any:
+        return self._bridge.call(HostCall(self.capability, self.target, operation, payload))
+
+
+class NetClient:
+    def __init__(self, bridge: HostBridge) -> None:
+        self._bridge = bridge
+
+    def sublibrary(self, name: str) -> CapabilityClient:
+        if not _valid_component(name):
+            raise ValueError(f"invalid net sub-library name {name!r}")
+        return CapabilityClient(self._bridge, f"net:{name}")
+
+    def http(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_HTTP)
+
+    def p2p(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_P2P)
+
+    def mask(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_MASK)
+
+
+class RouterClient:
+    def __init__(self, bridge: HostBridge) -> None:
+        self._bridge = bridge
+
+    def inspect(self, operation: str, payload: Any = None) -> Any:
+        return CapabilityClient(self._bridge, ROUTER_READ, "router").call(operation, payload)
+
+    def register(self, operation: str, payload: Any = None) -> Any:
+        return CapabilityClient(self._bridge, ROUTER_REGISTER, "router").call(operation, payload)
+
+
+class RbeSdk:
+    def __init__(self, bridge: HostBridge) -> None:
+        if not callable(getattr(bridge, "call", None)):
+            raise TypeError("RBE HostBridge must provide call(request)")
+        self._bridge = bridge
+
+    def net(self) -> NetClient:
+        return NetClient(self._bridge)
+
+    def router(self) -> RouterClient:
+        return RouterClient(self._bridge)
+
+    def storage(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, STORAGE, "storage")
+
+    def crypto(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, CRYPTO, "crypto")
+
+    def call(self, request: HostCall) -> Any:
+        return self._bridge.call(request)

@@ -38,3 +38,36 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
         run: cargo test --workspace --locked
+
+  rbe-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdk/rbe-sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/rbe-sdk
+      - name: fmt check
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --locked
+
+  portable-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Node SDK syntax
+        run: node --check sdk/js/index.js
+      - name: Node SDK import
+        run: node --input-type=module -e "import('./sdk/js/index.js').then(m => { if (m.LIBRARY_ABI_VERSION !== 1) process.exit(1) })"
+      - name: Python SDK syntax
+        run: python3 -m py_compile sdk/python/rbe_sdk/__init__.py
