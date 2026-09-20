@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -118,12 +118,42 @@ impl Default for ArtifactCache {
 }
 
 impl ArtifactCache {
+    fn lock_profiles(&self) -> MutexGuard<'_, HashMap<String, ExecutionProfile>> {
+        match self.profiles.lock() {
+            Ok(profiles) => profiles,
+            Err(poisoned) => {
+                // Profiles are non-authoritative telemetry. A panic may have
+                // interrupted an update, so discard in-memory state instead of
+                // letting one poisoned mutex kill every later valid execution.
+                let mut profiles = poisoned.into_inner();
+                profiles.clear();
+                self.profiles.clear_poison();
+                profiles
+            }
+        }
+    }
+
+    fn lock_artifacts(&self) -> MutexGuard<'_, HashMap<String, Vec<u8>>> {
+        match self.artifacts.lock() {
+            Ok(artifacts) => artifacts,
+            Err(poisoned) => {
+                // Durable SHA-256-addressed files are authoritative. In-memory
+                // entries are only a verified fast path and are safe to drop;
+                // the next lookup will reload and verify bytes from disk.
+                let mut artifacts = poisoned.into_inner();
+                artifacts.clear();
+                self.artifacts.clear_poison();
+                artifacts
+            }
+        }
+    }
+
     pub fn record(&self, artifact_hash: &str, elapsed_ms: u64, declared_cost: WorkCost) {
         if !valid_artifact_name(artifact_hash) {
             return;
         }
         let profile = {
-            let mut profiles = self.profiles.lock().expect("artifact cache poisoned");
+            let mut profiles = self.lock_profiles();
             let profile = profiles.entry(artifact_hash.to_string()).or_default();
             profile.record(elapsed_ms, declared_cost);
             profile.clone()
@@ -139,18 +169,12 @@ impl ArtifactCache {
     }
 
     pub fn profile(&self, artifact_hash: &str) -> Option<ExecutionProfile> {
-        self.profiles
-            .lock()
-            .expect("artifact cache poisoned")
-            .get(artifact_hash)
-            .cloned()
+        self.lock_profiles().get(artifact_hash).cloned()
     }
 
     pub fn profiles(&self) -> Vec<(String, ExecutionProfile)> {
         let mut profiles = self
-            .profiles
-            .lock()
-            .expect("artifact cache poisoned")
+            .lock_profiles()
             .iter()
             .map(|(hash, profile)| (hash.clone(), profile.clone()))
             .collect::<Vec<_>>();
@@ -173,10 +197,7 @@ impl ArtifactCache {
         self.io
             .write_atomic(&dir.join(format!("{artifact_hash}.wasm")), &wasm)
             .map_err(|error| format!("persist artifact atomically: {error}"))?;
-        self.artifacts
-            .lock()
-            .expect("artifact cache poisoned")
-            .insert(artifact_hash, wasm);
+        self.lock_artifacts().insert(artifact_hash, wasm);
         Ok(())
     }
 
@@ -185,12 +206,7 @@ impl ArtifactCache {
     /// verifies SHA-256 before admitting the hash into memory. Workers still
     /// independently verify the bytes they execute.
     pub fn verified_artifact_available(&self, artifact_hash: &str) -> bool {
-        if self
-            .artifacts
-            .lock()
-            .expect("artifact cache poisoned")
-            .contains_key(artifact_hash)
-        {
+        if self.lock_artifacts().contains_key(artifact_hash) {
             return true;
         }
         self.contains_artifact(artifact_hash)
@@ -206,23 +222,15 @@ impl ArtifactCache {
         }
         let path = artifact_dir().join(format!("{artifact_hash}.wasm"));
         let Ok(bytes) = fs::read(&path) else {
-            self.artifacts
-                .lock()
-                .expect("artifact cache poisoned")
-                .remove(artifact_hash);
+            self.lock_artifacts().remove(artifact_hash);
             return false;
         };
         if !artifact_sha256_matches(artifact_hash, &bytes) {
-            self.artifacts
-                .lock()
-                .expect("artifact cache poisoned")
-                .remove(artifact_hash);
+            self.lock_artifacts().remove(artifact_hash);
             quarantine_corrupt_artifact(&path, artifact_hash);
             return false;
         }
-        self.artifacts
-            .lock()
-            .expect("artifact cache poisoned")
+        self.lock_artifacts()
             .insert(artifact_hash.to_string(), bytes);
         true
     }
@@ -231,28 +239,17 @@ impl ArtifactCache {
         if !self.contains_artifact(artifact_hash) {
             return None;
         }
-        self.artifacts
-            .lock()
-            .expect("artifact cache poisoned")
-            .get(artifact_hash)
-            .cloned()
+        self.lock_artifacts().get(artifact_hash).cloned()
     }
 
     pub fn len(&self) -> usize {
-        self.profiles.lock().expect("artifact cache poisoned").len()
+        self.lock_profiles().len()
     }
     pub fn is_empty(&self) -> bool {
-        self.profiles
-            .lock()
-            .expect("artifact cache poisoned")
-            .is_empty()
+        self.lock_profiles().is_empty()
     }
     pub fn artifact_count(&self) -> usize {
-        let memory = self
-            .artifacts
-            .lock()
-            .expect("artifact cache poisoned")
-            .len();
+        let memory = self.lock_artifacts().len();
         let disk = fs::read_dir(artifact_dir())
             .map(|entries| {
                 entries
@@ -286,5 +283,28 @@ mod integrity_tests {
         assert!(artifact_sha256_matches(&hash, bytes));
         assert!(!artifact_sha256_matches(&hash, b"rbe-artifacu"));
         assert!(!artifact_sha256_matches("not-a-sha256", bytes));
+    }
+
+    #[test]
+    fn poisoned_in_memory_cache_state_is_discarded_and_recovers() {
+        let cache = ArtifactCache::default();
+
+        let profile_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.profiles.lock().unwrap();
+            panic!("intentional profile cache poison");
+        }));
+        assert!(profile_poison.is_err());
+        assert!(cache.profiles.is_poisoned());
+        assert_eq!(cache.len(), 0);
+        assert!(!cache.profiles.is_poisoned());
+
+        let artifact_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.artifacts.lock().unwrap();
+            panic!("intentional artifact cache poison");
+        }));
+        assert!(artifact_poison.is_err());
+        assert!(cache.artifacts.is_poisoned());
+        assert!(!cache.verified_artifact_available(&"0".repeat(64)));
+        assert!(!cache.artifacts.is_poisoned());
     }
 }
