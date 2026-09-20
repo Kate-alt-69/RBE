@@ -30,6 +30,13 @@ pub fn build_router(
 ) -> anyhow::Result<Router> {
     let cors = build_cors_layer(&state);
     let image = runtime_image.snapshot();
+    if state.config.dashboards.enabled {
+        route_engine::validate_runtime_image_reserved_namespace(
+            image.as_ref(),
+            &state.config.dashboards.admin_path_prefix,
+            "dashboard",
+        )?;
+    }
     let dot_route_routes =
         route_engine::build_routes_from_image(image.as_ref(), service_interfaces)?;
 

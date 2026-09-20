@@ -611,12 +611,28 @@ impl Config {
                 ));
             }
         }
-        if !self.dashboards.admin_path_prefix.starts_with('/') {
-            return Err(ConfigError::Invalid(
-                "dashboards.adminPathPrefix must start with '/'".into(),
-            ));
-        }
+        validate_dashboard_path_prefix(&self.dashboards.admin_path_prefix)?;
         Ok(())
+    }
+}
+
+fn validate_dashboard_path_prefix(value: &str) -> Result<(), ConfigError> {
+    let valid = (2..=128).contains(&value.len())
+        && value.starts_with('/')
+        && !value.ends_with('/')
+        && value.split('/').skip(1).all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(
+            "dashboards.adminPathPrefix must be a static 1..=127 byte path such as '/admin', using only ASCII letters, digits, '.', '_' or '-' and no trailing slash"
+                .into(),
+        ))
     }
 }
 
@@ -636,6 +652,37 @@ mod tests {
         assert_eq!(config.video_manager.live_idle_secs, 7200);
         assert!(!config.video_manager.download_worker_enabled);
         assert_eq!(config.video_manager.worker_recovery_scan_secs, 30);
+    }
+
+    #[test]
+    fn rejects_dashboard_prefixes_that_can_break_router_nesting() {
+        for prefix in [
+            "admin",
+            "/",
+            "/admin/",
+            "/admin//control",
+            "/admin/{id}",
+            "/admin/*rest",
+            "/admin control",
+        ] {
+            let source = serde_json::json!({
+                "api": { "host": "0.0.0.0", "port": 8080 },
+                "dashboards": { "adminPathPrefix": prefix }
+            });
+            let config: Config = serde_json::from_value(source).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("dashboards.adminPathPrefix"),
+                "unexpected error for {prefix:?}: {error}"
+            );
+        }
+
+        let source = serde_json::json!({
+            "api": { "host": "0.0.0.0", "port": 8080 },
+            "dashboards": { "adminPathPrefix": "/control-room_v2.1" }
+        });
+        let config: Config = serde_json::from_value(source).unwrap();
+        assert!(config.validate().is_ok());
     }
 
     #[test]

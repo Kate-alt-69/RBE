@@ -112,6 +112,17 @@ pub fn validate_runtime_image_routes(image: &RuntimeImage) -> anyhow::Result<()>
     route_collision::validate_image(image)
 }
 
+/// Reserve one additional runtime-configured native namespace before the HTTP
+/// router is assembled. This is used by optional control-plane surfaces whose
+/// path is not known when RELC performs its static native-route validation.
+pub fn validate_runtime_image_reserved_namespace(
+    image: &RuntimeImage,
+    prefix: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    route_collision::validate_image_reserved_namespace(image, prefix, label)
+}
+
 pub fn parse_field_source(source: &str) -> Result<FieldFile, ParseError> {
     let tokens = lexer::Lexer::new(source)
         .tokenize()

@@ -99,6 +99,63 @@ pub(crate) fn validate_image(image: &RuntimeImage) -> anyhow::Result<()> {
     ))
 }
 
+pub(crate) fn validate_image_reserved_namespace(
+    image: &RuntimeImage,
+    prefix: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    let collisions = image_reserved_namespace_collisions(image, prefix, label)?;
+    if collisions.is_empty() {
+        return Ok(());
+    }
+
+    let report_path = write_collision_report(&collisions)?;
+    Err(collision_error(
+        &format!("Runtime Image {label} namespace validation failed"),
+        &collisions,
+        &report_path,
+    ))
+}
+
+fn image_reserved_namespace_collisions(
+    image: &RuntimeImage,
+    prefix: &str,
+    label: &str,
+) -> anyhow::Result<Vec<RouteCollision>> {
+    if let Some(native) = RESERVED_NATIVE_API_PREFIXES
+        .iter()
+        .find(|native| namespaces_overlap(prefix, native))
+    {
+        anyhow::bail!(
+            "configured {label} namespace {prefix:?} overlaps native API namespace {native:?}"
+        );
+    }
+
+    let mut collisions = Vec::new();
+    for id in &image.routes {
+        let manifest = image
+            .source(id)
+            .ok_or_else(|| anyhow::anyhow!("Runtime Image route {id} has no manifest"))?;
+        let url_path = manifest
+            .route_path
+            .clone()
+            .unwrap_or_else(|| url_path_for_logical(&manifest.logical_name));
+        if is_in_native_namespace(&url_path, prefix) {
+            collisions.push(RouteCollision {
+                path: PathBuf::from(id.as_str()),
+                message: format!(
+                    "route URL `{url_path}` conflicts with configured {label} namespace `{prefix}`"
+                ),
+            });
+        }
+    }
+    Ok(collisions)
+}
+
+fn namespaces_overlap(left: &str, right: &str) -> bool {
+    is_in_native_namespace(left, right) || is_in_native_namespace(right, left)
+}
+
 fn collision_error(
     context: &str,
     collisions: &[RouteCollision],
@@ -300,6 +357,39 @@ mod tests {
             .message
             .contains("native API namespace `/api/auth`"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_namespace_catches_valid_rel_before_router_assembly() {
+        use crate::relc::{compile_runtime_image, PhysicalRelSource};
+        use crate::source_registry::RelSourceKind;
+
+        let image = compile_runtime_image(
+            "server Main {}",
+            vec![PhysicalRelSource::new(
+                RelSourceKind::Route,
+                "control/status",
+                "api/control/status.route",
+                "class Route { get(req) { return true; } }",
+            )],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        let collisions =
+            image_reserved_namespace_collisions(&image, "/api/control", "dashboard").unwrap();
+        assert_eq!(collisions.len(), 1);
+        assert!(collisions[0]
+            .message
+            .contains("configured dashboard namespace"));
+        assert!(collisions[0].message.contains("/api/control/status"));
+
+        let native_error =
+            image_reserved_namespace_collisions(&image, "/api/auth/private", "dashboard")
+                .unwrap_err()
+                .to_string();
+        assert!(native_error.contains("overlaps native API namespace"));
+        assert!(native_error.contains("/api/auth"));
     }
 
     #[test]
