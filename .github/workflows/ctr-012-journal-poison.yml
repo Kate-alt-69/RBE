@@ -1,0 +1,67 @@
+name: Execution journal poison recovery gate
+
+on:
+  push:
+    branches:
+      - fix/ctr-012-journal-poison-20260920
+    paths:
+      - .ci-ctr-012-journal-poison-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: container-runtime
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/ctr-012-journal-poison-20260920
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: container-runtime
+
+      - name: Apply BUG-CTR-012
+        working-directory: .
+        run: python3 .github/patches/ctr-012-journal-poison.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Verify contract
+        working-directory: .
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('container-runtime/crates/container-runtime-core/src/runtime.rs').read_text()
+          assert 'fn lock_guard(&self)' in text
+          assert 'journal lock poisoned' not in text
+          assert 'poisoned_journal_lock_recovers_and_keeps_durable_replay_working' in text
+          PY
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Clippy workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Commit validated fix
+        working-directory: .
+        run: |
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add container-runtime/crates/container-runtime-core/src/runtime.rs
+          git commit -m "FIX | BUG-CTR-012 recover poisoned execution journal lock"
+          git push origin HEAD:fix/ctr-012-journal-poison-20260920
