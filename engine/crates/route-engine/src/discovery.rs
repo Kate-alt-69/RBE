@@ -2,10 +2,8 @@
 //! artifacts, and builds the Axum router. Compiler diagnostics are kept
 //! out of normal runtime logs and written to `data/admin/compiler-error.txt`.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -23,6 +21,8 @@ use core_lib::{
     ContainerWorkCost, CONTAINER_MAX_EXECUTION_INPUT_BYTES, PUBLIC_HTTP_MAX_TIMEOUT_MS,
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::analyzer::{analyze, Severity};
 use crate::ast::{FunctionDef, ModuleFile, RouteFile, Value};
 use crate::field_manager::{FieldResolveError, FieldRoutePlan};
@@ -38,14 +38,12 @@ use crate::transpiler::transpile_file;
 use crate::video_host::RuntimeHostCapabilities;
 use crate::wasm_compiler::{RouteWasmArtifact, RouteWasmInput};
 
-pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 struct CacheEntry {
-    hash: u64,
+    hash: [u8; 32],
     file: Arc<RouteFile>,
 }
 
