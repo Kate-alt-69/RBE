@@ -33,7 +33,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IoStats {
@@ -108,9 +108,23 @@ impl AtomicIo {
         }
     }
 
+    fn lock_registry(&self) -> MutexGuard<'_, HashMap<PathBuf, Arc<Mutex<()>>>> {
+        match self.inner.locks.lock() {
+            Ok(locks) => locks,
+            Err(poisoned) => {
+                // The registry is only a cache of per-path locks. Throw it away
+                // after a panic rather than making all future I/O panic forever.
+                let mut locks = poisoned.into_inner();
+                locks.clear();
+                self.inner.locks.clear_poison();
+                locks
+            }
+        }
+    }
+
     fn lock_for(&self, path: &Path) -> Arc<Mutex<()>> {
         let key = path.to_path_buf();
-        let mut locks = self.inner.locks.lock().unwrap();
+        let mut locks = self.lock_registry();
         locks
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -121,7 +135,7 @@ impl AtomicIo {
     /// Creates the parent directory if it doesn't exist.
     pub fn write_atomic(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let path_lock = self.lock_for(path);
-        let _guard = path_lock.lock().unwrap();
+        let _guard = lock_recover(&path_lock);
 
         if let Some(parent) = path
             .parent()
@@ -158,7 +172,7 @@ impl AtomicIo {
     /// process* — see the module doc comment's scoping note.
     pub fn append_locked(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let path_lock = self.lock_for(path);
-        let _guard = path_lock.lock().unwrap();
+        let _guard = lock_recover(&path_lock);
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -187,7 +201,7 @@ impl AtomicIo {
     /// `append_locked` call from another task in this process.
     pub fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         let path_lock = self.lock_for(path);
-        let _guard = path_lock.lock().unwrap();
+        let _guard = lock_recover(&path_lock);
 
         let bytes = fs::read(path)?;
 
@@ -206,8 +220,18 @@ impl AtomicIo {
     /// pattern as the engine's rate-limiter/IP-strike `sweep()`
     /// methods. Only removes entries nothing is actively holding.
     pub fn sweep_locks(&self) {
-        let mut locks = self.inner.locks.lock().unwrap();
+        let mut locks = self.lock_registry();
         locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -403,13 +427,50 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_path_lock_does_not_disable_future_io() {
+        let dir = temp_dir("poison-path");
+        let io = AtomicIo::new();
+        let path = dir.join("file.txt");
+        let path_lock = io.lock_for(&path);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = path_lock.lock().unwrap();
+            panic!("intentional path lock poison");
+        }));
+        assert!(poisoned.is_err());
+        assert!(path_lock.is_poisoned());
+
+        io.write_atomic(&path, b"recovered").unwrap();
+        assert!(!path_lock.is_poisoned());
+        assert_eq!(io.read(&path).unwrap(), b"recovered");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_registry_is_discarded_instead_of_panicking() {
+        let dir = temp_dir("poison-registry");
+        let io = AtomicIo::new();
+        let path = dir.join("file.txt");
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = io.inner.locks.lock().unwrap();
+            panic!("intentional registry poison");
+        }));
+        assert!(poisoned.is_err());
+        assert!(io.inner.locks.is_poisoned());
+
+        io.write_atomic(&path, b"recovered").unwrap();
+        assert!(!io.inner.locks.is_poisoned());
+        assert_eq!(io.read(&path).unwrap(), b"recovered");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sweep_locks_removes_unreferenced_entries() {
         let dir = temp_dir("sweep");
         let io = AtomicIo::new();
         let path = dir.join("file.txt");
         io.write_atomic(&path, b"x").unwrap();
         io.sweep_locks();
-        let locks = io.inner.locks.lock().unwrap();
+        let locks = io.lock_registry();
         assert!(locks.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
