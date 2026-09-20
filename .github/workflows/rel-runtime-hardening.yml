@@ -1,0 +1,102 @@
+name: REL runtime hardening gate
+
+on:
+  push:
+    branches:
+      - ci/rel-runtime-hardening-20260920
+    paths:
+      - .ci-rel-runtime-hardening-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/rel-runtime-hardening-20260920
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine
+            atomic-io
+
+      - name: Configure git
+        run: |
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+
+      - name: FIX BUG-REL-002 route source identity
+        run: |
+          python3 .github/patches/rel-runtime-hardening.py rel-hash
+          rustfmt --edition 2021 engine/crates/route-engine/src/discovery.rs engine/crates/route-engine/src/cache.rs
+          git add engine/crates/route-engine/src/discovery.rs engine/crates/route-engine/src/cache.rs
+          git commit -m "FIX | BUG-REL-002 use collision-resistant route cache identity"
+
+      - name: FIX BUG-REL-003 invocation tracker poison recovery
+        run: |
+          python3 .github/patches/rel-runtime-hardening.py rel-tracker
+          rustfmt --edition 2021 engine/crates/route-engine/src/execution_tracker.rs
+          git add engine/crates/route-engine/src/execution_tracker.rs
+          git commit -m "FIX | BUG-REL-003 recover poisoned invocation tracking"
+
+      - name: FIX BUG-REL-004 Route cache poison recovery
+        run: |
+          python3 .github/patches/rel-runtime-hardening.py rel-cache-poison
+          rustfmt --edition 2021 engine/crates/route-engine/src/discovery.rs
+          git add engine/crates/route-engine/src/discovery.rs
+          git commit -m "FIX | BUG-REL-004 recover poisoned Route parse cache"
+
+      - name: FIX BUG-IO-002 AtomicIo poison recovery
+        run: |
+          python3 .github/patches/rel-runtime-hardening.py io-poison
+          rustfmt --edition 2021 atomic-io/src/lib.rs
+          git add atomic-io/src/lib.rs
+          git commit -m "FIX | BUG-IO-002 recover poisoned atomic IO locks"
+
+      - name: Verify hardening contract
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          d = Path('engine/crates/route-engine/src/discovery.rs').read_text()
+          c = Path('engine/crates/route-engine/src/cache.rs').read_text()
+          t = Path('engine/crates/route-engine/src/execution_tracker.rs').read_text()
+          io = Path('atomic-io/src/lib.rs').read_text()
+          assert 'DefaultHasher' not in d
+          assert 'pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; 32]' in d
+          assert 'CACHE_MANIFEST_VERSION: u64 = 4' in c
+          assert 'REL invocation tracker poisoned' not in t
+          assert 'fn lock_state(&self)' in t
+          assert 'fn lock_entries(&self)' in d
+          assert 'fn lock_registry(&self)' in io
+          assert 'fn lock_recover<T>' in io
+          PY
+
+      - name: Test AtomicIo
+        run: cargo test --manifest-path atomic-io/Cargo.toml
+
+      - name: Clippy AtomicIo
+        run: cargo clippy --manifest-path atomic-io/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test route-engine
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p route-engine
+
+      - name: Clippy route-engine
+        run: cargo clippy --locked --manifest-path engine/Cargo.toml -p route-engine --all-targets -- -D warnings
+
+      - name: Check backend integration
+        run: cargo check --locked --manifest-path engine/Cargo.toml -p backend
+
+      - name: Ensure only intended commits are pending
+        run: git status --short
+
+      - name: Push validated FIX commits
+        run: git push origin HEAD:ci/rel-runtime-hardening-20260920
