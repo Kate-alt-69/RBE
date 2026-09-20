@@ -21,7 +21,7 @@ use crate::wasm_compiler::{
     compile_route, RouteWasmCompilation, ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
 };
 
-const CACHE_MANIFEST_VERSION: u64 = 3;
+const CACHE_MANIFEST_VERSION: u64 = 4;
 
 pub struct SyncOutcome {
     pub route_path: PathBuf,
@@ -62,11 +62,12 @@ fn existing_hash_matches(
     manifest_path: &Path,
     artifact_path: &Path,
     wasm_path: &Path,
-    current_hash: u64,
+    current_hash: [u8; 32],
 ) -> bool {
     if !artifact_path.is_file() {
         return false;
     }
+    let current_hash = hex::encode(current_hash);
     let Ok(existing) = io.read(manifest_path) else {
         return false;
     };
@@ -77,7 +78,7 @@ fn existing_hash_matches(
         || manifest
             .get("source_hash")
             .and_then(serde_json::Value::as_str)
-            != Some(current_hash.to_string().as_str())
+            != Some(current_hash.as_str())
     {
         return false;
     }
@@ -131,7 +132,7 @@ fn write_manifest(
     api_dir: &Path,
     route_path: &Path,
     manifest_path: &Path,
-    current_hash: u64,
+    current_hash: [u8; 32],
     wasm: &RouteWasmCompilation,
 ) -> Result<(), String> {
     let relative = route_path.strip_prefix(api_dir).unwrap_or(route_path);
@@ -153,7 +154,7 @@ fn write_manifest(
     let manifest = serde_json::json!({
         "version": CACHE_MANIFEST_VERSION,
         "route": relative.to_string_lossy(),
-        "source_hash": current_hash.to_string(),
+        "source_hash": hex::encode(current_hash),
         "generated_rust": "generated.rs",
         "wasm_artifact": "module.wasm",
         "wasm": wasm,
@@ -363,6 +364,16 @@ mod tests {
         let io = atomic_io::AtomicIo::new();
         let first = sync(&io, &api_dir, &cache_root).unwrap();
         assert_eq!(first[0].result, Ok(SyncAction::Regenerated));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&first[0].manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["version"].as_u64(), Some(CACHE_MANIFEST_VERSION));
+        let source_hash = manifest["source_hash"].as_str().unwrap();
+        assert_eq!(source_hash.len(), 64);
+        assert!(source_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            source_hash,
+            hex::encode(hash_bytes(b"class Route { get(req) { return true; } }"))
+        );
         let second = sync(&io, &api_dir, &cache_root).unwrap();
         assert_eq!(second[0].result, Ok(SyncAction::UpToDate));
         let _ = std::fs::remove_dir_all(&root);
