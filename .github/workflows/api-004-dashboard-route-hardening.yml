@@ -1,0 +1,79 @@
+name: Dashboard route hardening gate
+
+on:
+  push:
+    branches:
+      - ci/api-004-dashboard-route-hardening-20260920
+    paths:
+      - .ci-api-004-dashboard-route-hardening-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/api-004-dashboard-route-hardening-20260920
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply BUG-API-004
+        run: python3 .github/patches/api-004-dashboard-route-hardening.py
+
+      - name: Format changed Rust
+        run: |
+          rustfmt --edition 2021 \
+            engine/crates/config/src/lib.rs \
+            engine/crates/route-engine/src/route_collision.rs \
+            engine/crates/route-engine/src/lib.rs \
+            engine/crates/api/src/lib.rs
+
+      - name: Verify patch contract
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          config = Path('engine/crates/config/src/lib.rs').read_text()
+          collision = Path('engine/crates/route-engine/src/route_collision.rs').read_text()
+          api = Path('engine/crates/api/src/lib.rs').read_text()
+          assert 'validate_dashboard_path_prefix' in config
+          assert 'validate_image_reserved_namespace' in collision
+          assert 'namespaces_overlap' in collision
+          assert 'validate_runtime_image_reserved_namespace' in api
+          PY
+
+      - name: Test config
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p config
+
+      - name: Test route-engine
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p route-engine
+
+      - name: Test API
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p api
+
+      - name: Clippy affected crates
+        run: cargo clippy --locked --manifest-path engine/Cargo.toml -p config -p route-engine -p api --all-targets -- -D warnings
+
+      - name: Check backend integration
+        run: cargo check --locked --manifest-path engine/Cargo.toml -p backend
+
+      - name: Commit validated fix
+        run: |
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add \
+            engine/crates/config/src/lib.rs \
+            engine/crates/route-engine/src/route_collision.rs \
+            engine/crates/route-engine/src/lib.rs \
+            engine/crates/api/src/lib.rs
+          git commit -m "FIX | BUG-API-004 validate dashboard route namespace"
+          git push origin HEAD:ci/api-004-dashboard-route-hardening-20260920
