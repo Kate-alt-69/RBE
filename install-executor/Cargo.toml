@@ -1,0 +1,13 @@
+[package]
+name = "rbe-install-executor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rbe-install-request = { path = "../install-request" }
+rbe-library-package = { path = "../library-package" }
+rbe-project-package = { path = "../project-package" }
+sha2 = "0.10"
+thiserror = "2"
+url = "2"
