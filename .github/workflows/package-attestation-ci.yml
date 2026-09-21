@@ -1,0 +1,37 @@
+name: Package Attestation CI
+
+on:
+  push:
+    paths:
+      - 'package-attestation/**'
+      - '.github/workflows/package-attestation-ci.yml'
+  pull_request:
+    paths:
+      - 'package-attestation/**'
+      - '.github/workflows/package-attestation-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-attestation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: package-attestation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: package-attestation
+      - name: fmt check
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
