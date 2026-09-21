@@ -11,5 +11,8 @@ rbe-package-attestation = { path = "../package-attestation" }
 rbe-package-manager = { path = "../package-manager" }
 rbe-project-package = { path = "../project-package" }
 semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 url = "2"
