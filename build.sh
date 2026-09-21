@@ -127,7 +127,7 @@ case " $* " in
     *" --cloud-node-only "*|*" --build-cloud-node "*) CLOUD_NODE_ONLY=true ;;
 esac
 case " $* " in
-    *" --help "*|*" -h "*|*" -? "*) ;;
+    *" --help "*|*" -help "*|*" -h "*|*" -? "*) ;;
     *)
         if [ "$CLOUD_NODE_ONLY" = false ]; then
             ensure_admin_verifier

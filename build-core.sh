@@ -13,6 +13,48 @@ ARCH_ARM64=false; ARCH_ARMV7=false; CUSTOM_TARGET=""; SHOW_HELP=false
 CLOUD_NODE_ONLY=false
 CACHE_REMOVE=false; CACHE_REMOVE_WIN=false; CACHE_REMOVE_LINUX=false; CACHE_REMOVE_ALL=false; DISTRO=""
 
+show_help() {
+    cat << 'EOF'
+RBE Secure Release Builder
+
+Usage:
+  ./build-core.sh [options]
+
+Platform Flags:
+  --build-win, --build-win10, --build-win11, --build-windows
+                        Build for Windows targets
+  --build-linux         Build for Linux targets
+  --build-macos         Build for macOS targets
+  --build-all           Build standard release matrix across supported OS targets
+  --cloud-node-only, --build-cloud-node
+                        Build only the cloud-node target binary
+
+Architecture Flags:
+  --arch-x64            Target x86_64 (aliases: --achitect-x64, --architect-x64)
+  --arch-x86            Target i686 (aliases: --achitext-x86, --architect-x86)
+  --arch-arm, --arch-arm64
+                        Target aarch64
+  --arch-armv7          Target armv7
+
+Configuration & Profile Flags:
+  --musl                Linux targets: build against musl libc instead of glibc
+  --no-embed            Do not embed container-bin into backend
+  --dev-content         Copy development api/module directories into dist
+  --debug               Build with debug profile instead of release
+  --target=<triple>     Specify an explicit Rust target triple
+  --distro=<alias>      Specify target selection by Linux distribution alias
+
+Cache Cleaning Flags:
+  --cache-remove            Clean workspace Cargo build caches
+  --cache-remove-win-cache  Clean Cargo cache for Windows triples
+  --cache-remove-linux-cache Clean Cargo cache for Linux triples
+  --cache-remove-all-cache  Clean all workspace build caches
+
+Help Flags:
+  --help, -help, -h, -? Show this help message and exit
+EOF
+}
+
 for arg in "$@"; do
     case "$arg" in
         --build-win|--build-win10|--build-win11|--build-windows) BUILD_WIN=true ;;
@@ -34,13 +76,13 @@ for arg in "$@"; do
         --cache-remove-win-cache) CACHE_REMOVE_WIN=true ;;
         --cache-remove-linux-cache) CACHE_REMOVE_LINUX=true ;;
         --cache-remove-all-cache) CACHE_REMOVE_ALL=true ;;
-        --help|-h|-\?) SHOW_HELP=true ;;
+        --help|-help|-h|-\?) SHOW_HELP=true ;;
         *) echo "WARNING: unrecognized argument '$arg' — ignoring" >&2 ;;
     esac
 done
 
 if [ "$SHOW_HELP" = true ]; then
-    sed -n '1,80p' "$REPO_ROOT/build.sh"
+    show_help
     exit 0
 fi
 

@@ -13,8 +13,15 @@
   concurrently across two profiles anyway; this runs dev then release,
   sequentially, per workspace, but reports them side by side).
 
-  `module/` isn't included — it's not a Cargo workspace (`.module`
-  files aren't compiled), so there's no cargo target to check there.
+  Available Flags:
+    --skip-fmt              Skip 'cargo fmt --check'
+    --skip-clippy           Skip 'cargo clippy --all-targets'
+    --skip-test             Skip 'cargo test'
+    --skip-build            Skip 'cargo build'
+    --only=<w1,w2,...>      Run only the specified workspaces (engine,
+                            container-runtime, vault, atomic-io, error-client)
+    --show-warn[=true]      Print full Cargo stderr output for failed checks
+    --help, -help, -h, -?   Display this help documentation
 
 .EXAMPLE
   .\error-check.ps1
@@ -24,7 +31,7 @@
   .\error-check.ps1 --only=vault,atomic-io
 #>
 
-$ErrorActionPreference = "Continue"   # collect every failure instead of stopping at the first
+$ErrorActionPreference = "Continue"
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $SkipFmt = $false
@@ -36,20 +43,17 @@ $ShowWarn = $false
 
 foreach ($arg in $args) {
     switch -Regex ($arg) {
-        '^--skip-fmt$'      { $SkipFmt = $true; continue }
-        '^--skip-clippy$'   { $SkipClippy = $true; continue }
-        '^--skip-test$'     { $SkipTest = $true; continue }
-        '^--skip-build$'    { $SkipBuild = $true; continue }
-        '^--only=(.+)$'     { $OnlyList = $Matches[1] -split ','; continue }
-            '^--show-warn(=true)?$' { $ShowWarn = $true; continue }
-        '^(--help|-h|-\?)$' { Get-Help $MyInvocation.MyCommand.Path -Full; exit 0 }
+        '^--skip-fmt$'          { $SkipFmt = $true; continue }
+        '^--skip-clippy$'       { $SkipClippy = $true; continue }
+        '^--skip-test$'         { $SkipTest = $true; continue }
+        '^--skip-build$'        { $SkipBuild = $true; continue }
+        '^--only=(.+)$'         { $OnlyList = $Matches[1] -split ','; continue }
+        '^--show-warn(=true)?$' { $ShowWarn = $true; continue }
+        '^(--help|-help|-h|-\?)$' { Get-Help $MyInvocation.MyCommand.Path -Full; exit 0 }
         default { Write-Warning "error-check.ps1: unrecognized argument '$arg' — ignoring" }
     }
 }
 
-# name -> (path, is a Cargo *workspace* with --workspace support, or a
-# lone standalone crate like vault/atomic-io that just takes plain
-# cargo commands with no --workspace flag)
 $Workspaces = [ordered]@{
     "engine"            = @{ Path = "engine";            IsWorkspace = $true }
     "container-runtime" = @{ Path = "container-runtime"; IsWorkspace = $true }
@@ -70,8 +74,6 @@ if ($OnlyList) {
     }
     $Workspaces = $filtered
 }
-
-# ---------------------------------------------------------------------------
 
 function Invoke-Check {
     param([string]$WorkDir, [bool]$IsWorkspace, [string[]]$CargoArgs)
@@ -139,8 +141,6 @@ function Test-Profile {
     return $results
 }
 
-# ---------------------------------------------------------------------------
-
 $allResults = [ordered]@{}
 
 foreach ($name in $Workspaces.Keys) {
@@ -156,10 +156,6 @@ foreach ($name in $Workspaces.Keys) {
 
     $allResults[$name] = @{ Dev = $dev; Release = $release }
 }
-
-# ---------------------------------------------------------------------------
-# Summary table
-# ---------------------------------------------------------------------------
 
 function Format-Cell {
     param($StepResult)
@@ -178,7 +174,6 @@ function Parse-FirstError {
             $file = $Matches[1].Trim()
             $line = $Matches[3]
             $col = $Matches[4]
-            # find next non-empty line that looks like an error message
             for ($j = $i+1; $j -lt $lines.Count; $j++) {
                 $m = $lines[$j].Trim()
                 if (-not [string]::IsNullOrWhiteSpace($m)) {
@@ -188,13 +183,11 @@ function Parse-FirstError {
             return ("{0}:{1}:{2}: (see output)" -f $file, $line, $col)
         }
     }
-    # fallback: look for file-like patterns in the output
     foreach ($ln in $lines) {
         if ($ln -match '([\w\./\\-]+\.(rs|toml|c|cpp|h|hpp)):(\d+):(\d+)') {
             return ("{0}:{1}:{2}: (see output)" -f $Matches[1], $Matches[3], $Matches[4])
         }
     }
-    # fallback: first line that contains "error" or "warning"
     foreach ($ln in $lines) {
         if ($ln -match '\berror\b' -or $ln -match '\bwarning\b') { return $ln.Trim() }
     }

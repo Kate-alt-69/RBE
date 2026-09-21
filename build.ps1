@@ -13,13 +13,28 @@
     6. packages the exact same container artifact at dist\<target>\dep\container.exe
        (or container on Linux).
 
-  The Control Room password itself is never written to dist or passed into Cargo.
-  This wrapper derives a salted PBKDF2 verifier first; only that verifier is
-  inherited by the Rust build and embedded into the backend.
+  Platform Flags:
+    --build-win10 / --build-win11 / --build-windows
+                          Build for Windows targets
+    --build-linux         Build for Linux targets
+    --build-macos         Build for macOS targets
+    --build-all           Build for all default release targets
+    --cloud-node-only, --build-cloud-node, -CloudNodeOnly
+                          Build only the cloud_node binary
 
-  Local developer builds generate a fresh signing key in memory for each script
-  invocation and never persist it to disk. CI/release builds can provide a stable
-  key with RBE_CONTAINER_SIGNING_PRIVATE_KEY from their external secret store.
+  Architecture Flags:
+    --arch-x64            Target x86_64 (aliases: --achitect-x64, --architect-x64)
+    --arch-x86            Target i686 (aliases: --achitext-x86, --architect-x86)
+    --arch-arm64          Target aarch64 (alias: --arch-arm)
+    --arch-armv7          Target armv7
+
+  Configuration & Options:
+    --musl                Linux targets: link against musl libc
+    --no-embed            Do not embed container-bin into backend
+    --dev-content         Copy development api/module folders to dist
+    --debug               Build in debug mode instead of release
+    --target=<triple>     Specify exact Rust target triple
+    --help, -help, -h, -? Display this help documentation
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -154,7 +169,7 @@ function Initialize-AdminPasswordVerifier {
 
 try {
     $CloudNodeOnlyRequested = $args -contains '--cloud-node-only' -or $args -contains '--build-cloud-node' -or $args -contains '-CloudNodeOnly'
-    $HelpRequested = $args -contains '--help' -or $args -contains '-h' -or $args -contains '-?'
+    $HelpRequested = $args -contains '--help' -or $args -contains '-help' -or $args -contains '-h' -or $args -contains '-?'
     if (-not $HelpRequested -and -not $CloudNodeOnlyRequested) {
         Initialize-AdminPasswordVerifier
         Initialize-ContainerSigningKey
@@ -183,7 +198,7 @@ try {
             '^--arch-?arm(64)?$' { $ArchArm64 = $true; continue }
             '^--arch-?armv?7$' { $ArchArmv7 = $true; continue }
             '^--target=(.+)$' { $CustomTarget = $Matches[1]; continue }
-            '^(--help|-h|-\?)$' { $ShowHelp = $true; continue }
+            '^(--help|-help|-h|-\?)$' { $ShowHelp = $true; continue }
             default { Write-Warning "build.ps1: unrecognized argument '$arg' — ignoring" }
         }
     }
