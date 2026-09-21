@@ -1,0 +1,15 @@
+[package]
+name = "rbe-install-orchestrator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rbe-install-request = { path = "../install-request" }
+rbe-library-package = { path = "../library-package" }
+rbe-package-attestation = { path = "../package-attestation" }
+rbe-package-manager = { path = "../package-manager" }
+rbe-project-package = { path = "../project-package" }
+semver = "1"
+thiserror = "2"
+url = "2"
