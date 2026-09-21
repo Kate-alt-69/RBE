@@ -158,6 +158,54 @@ The existing Environment-owned storage surface remains separate from project-roo
 
 These operations act on the namespace-scoped `EnvironmentStorageManager`, not on `$$/` files. The Environment process remains authoritative for that transactional state; backend code does not reopen it as a fallback.
 
+### Structured transactional records
+
+`commit()` keeps the original raw-byte mutation format and additionally accepts structured JSON values. This is a compatibility extension of the existing `commit` operation, not a new Storage authority.
+
+Raw bytes remain available exactly as before:
+
+```json
+[
+  {
+    "op": "put",
+    "path": "cache/raw.bin",
+    "data_hex": "00112233"
+  }
+]
+```
+
+Structured records can instead use `data`:
+
+```json
+[
+  {
+    "op": "put",
+    "path": "users/usr_1.json",
+    "data": {
+      "userId": "usr_1",
+      "serviceId": "engine-studio",
+      "quotaBytes": 104857600
+    }
+  }
+]
+```
+
+A `put` must provide exactly one of `data_hex` or `data`. Structured `data` is serialized to UTF-8 JSON by the trusted Storage boundary before the transaction is committed.
+
+`read(path)` always preserves the original `dataHex` response. When the stored bytes are valid JSON, the response also includes parsed `data`:
+
+```json
+{
+  "found": true,
+  "dataHex": "7b22757365724964223a227573725f31227d",
+  "data": {
+    "userId": "usr_1"
+  }
+}
+```
+
+Binary or otherwise non-JSON payloads simply omit `data`, so existing byte-oriented callers keep the same behavior.
+
 ## Data-Level status
 
 `level[...]` currently has the following accepted values:

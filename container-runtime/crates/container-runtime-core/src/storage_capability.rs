@@ -31,7 +31,13 @@ impl std::error::Error for StorageCapabilityError {}
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum StorageMutationRequest {
-    Put { path: String, data_hex: String },
+    Put {
+        path: String,
+        #[serde(default)]
+        data_hex: Option<String>,
+        #[serde(default)]
+        data: Option<Value>,
+    },
     Delete { path: String },
 }
 
@@ -140,10 +146,20 @@ fn dispatch_storage_capability_inner(
                 .read(namespace, path)
                 .map_err(|_| storage_call_failed())?
             {
-                Some(bytes) => json!({
-                    "found": true,
-                    "dataHex": hex::encode(bytes),
-                }),
+                Some(bytes) => {
+                    let data_hex = hex::encode(&bytes);
+                    match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(data) => json!({
+                            "found": true,
+                            "dataHex": data_hex,
+                            "data": data,
+                        }),
+                        Err(_) => json!({
+                            "found": true,
+                            "dataHex": data_hex,
+                        }),
+                    }
+                }
                 None => json!({ "found": false }),
             }
         }
@@ -184,9 +200,12 @@ fn dispatch_storage_capability_inner(
                 .map_err(|_| storage_call_failed())?;
             for mutation in mutations {
                 match mutation {
-                    StorageMutationRequest::Put { path, data_hex } => {
-                        let bytes = hex::decode(data_hex)
-                            .map_err(|_| invalid_args("put dataHex must be hexadecimal"))?;
+                    StorageMutationRequest::Put {
+                        path,
+                        data_hex,
+                        data,
+                    } => {
+                        let bytes = encode_transactional_put(data_hex, data)?;
                         transaction
                             .put(&path, &bytes)
                             .map_err(|_| storage_call_failed())?;
@@ -233,6 +252,24 @@ fn dispatch_storage_capability_inner(
     };
 
     encode_response(&response, max_response_bytes)
+}
+
+fn encode_transactional_put(
+    data_hex: Option<String>,
+    data: Option<Value>,
+) -> Result<Vec<u8>, StorageCapabilityError> {
+    match (data_hex, data) {
+        (Some(data_hex), None) => hex::decode(data_hex)
+            .map_err(|_| invalid_args("put dataHex must be hexadecimal")),
+        (None, Some(data)) => serde_json::to_vec(&data)
+            .map_err(|_| invalid_args("put data could not be encoded as JSON")),
+        (Some(_), Some(_)) => Err(invalid_args(
+            "put must provide exactly one of data_hex or data",
+        )),
+        (None, None) => Err(invalid_args(
+            "put must provide exactly one of data_hex or data",
+        )),
+    }
 }
 
 fn write_project_file(
@@ -660,6 +697,7 @@ mod tests {
         let read = dispatch(&storage, &target, "read", json!(["users/kate.bin"])).unwrap();
         assert_eq!(read["found"], true);
         assert_eq!(read["dataHex"], "6b617465");
+        assert!(read.get("data").is_none());
 
         let listed = dispatch(&storage, &target, "list", json!([])).unwrap();
         assert_eq!(listed["entries"].as_array().unwrap().len(), 2);
@@ -667,6 +705,59 @@ mod tests {
         assert_eq!(snapshot["namespace"], "uac");
         assert_eq!(snapshot["generation"], 1);
         assert_eq!(snapshot["files"], 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn structured_commit_round_trips_json_and_preserves_data_hex() {
+        let (root, storage) = temp_storage("structured-round-trip", 4096);
+        let target = storage_capability_target("uac").unwrap();
+        dispatch(
+            &storage,
+            &target,
+            "commit",
+            json!([[
+                {
+                    "op":"put",
+                    "path":"users/usr_1.json",
+                    "data":{
+                        "userId":"usr_1",
+                        "serviceId":"engine-studio",
+                        "quotaBytes":104857600
+                    }
+                }
+            ]]),
+        )
+        .unwrap();
+
+        let read = dispatch(
+            &storage,
+            &target,
+            "read",
+            json!(["users/usr_1.json"]),
+        )
+        .unwrap();
+        assert_eq!(read["found"], true);
+        assert_eq!(read["data"]["userId"], "usr_1");
+        assert_eq!(read["data"]["serviceId"], "engine-studio");
+        assert_eq!(read["data"]["quotaBytes"], 104857600);
+        assert!(read["dataHex"].as_str().is_some_and(|value| !value.is_empty()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn structured_put_rejects_missing_or_ambiguous_payloads() {
+        let (root, storage) = temp_storage("structured-reject", 4096);
+        let target = storage_capability_target("uac").unwrap();
+
+        for mutation in [
+            json!({"op":"put", "path":"missing"}),
+            json!({"op":"put", "path":"both", "data_hex":"31", "data":1}),
+        ] {
+            let error = dispatch(&storage, &target, "commit", json!([[mutation]])).unwrap_err();
+            assert_eq!(error.code, "CAPABILITY_STORAGE_ARGS_INVALID");
+        }
+        assert_eq!(storage.snapshot("uac").unwrap().generation, 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
