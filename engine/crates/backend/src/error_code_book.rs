@@ -1,8 +1,8 @@
-//! Embedded user-facing RBE Error Code Book lookup.
+//! Pre-bootstrap backend CLI routing and embedded RBE Error Code Book lookup.
 //!
-//! The CLI must remain usable before settings/logging/runtime bootstrap, so the
-//! authoritative docs are compiled into backend/service rather than read from
-//! a mutable runtime path or fetched from the network.
+//! Public CLI commands must remain usable before settings, logging, Runtime
+//! Image compilation, port binding, or child-process startup. The Error Code
+//! Book is compiled into the backend so diagnostics remain available there too.
 
 const CATALOG: &str = include_str!("../../../../doc/error-codes/catalog.json");
 const REL: &str = include_str!("../../../../doc/error-codes/rel.md");
@@ -12,7 +12,86 @@ const CONTAINER: &str = include_str!("../../../../doc/error-codes/container.md")
 const RUNTIME: &str = include_str!("../../../../doc/error-codes/runtime.md");
 const PUBLIC_BASE_URL: &str = "https://kastrick.vercel.app/project/rbe/doc/error-codes";
 
+const GLOBAL_HELP: &str = r#"RBE backend
+
+Usage:
+  backend [boot options]
+  backend <command> [arguments]
+  backend install <target> [options]
+
+Commands:
+  install <target> [options]   Install an RBE package, runtime, SDK, URL, or local archive
+  help [command]               Show help for backend or a command
+
+Diagnostics:
+  --explain <CODE>             Explain an RBE error code
+  --list-error-codes [PREFIX]  List registered RBE error codes
+
+Boot examples:
+  backend
+  backend --settings settings.json
+  backend -debug
+
+Help aliases:
+  backend help
+  backend -h
+  backend --help
+  backend -help
+
+Run `backend help install` for install syntax."#;
+
+const INSTALL_HELP: &str = r#"RBE package installer
+
+Usage:
+  backend install <target> [options]
+  backend install help
+
+Target examples:
+  advancenet
+  advancenet.4.0.1
+  runtime.python.3.10
+  sdk.0.1.0
+  https://example.com/rbe-index.json
+  ./package.rbe-pkg
+
+Options:
+  -version <version> | --version <version>
+  -shared
+  -force
+  -no-cache
+  -refresh-index
+  -json
+  -quiet
+
+Current build status:
+  Public install command routing is active, but end-to-end package execution is
+  not yet connected to backend.exe. A valid install request therefore exits
+  with an unavailable error instead of starting the RBE server."#;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublicCliDispatch {
+    PassThrough,
+    Print(String),
+    Fail { code: u8, message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicCommandScan {
+    PassThrough,
+    GlobalHelp,
+    Command(usize),
+}
+
 pub fn requested(args: &[String]) -> Option<anyhow::Result<String>> {
+    match dispatch_public_cli(args) {
+        PublicCliDispatch::PassThrough => {}
+        PublicCliDispatch::Print(text) => return Some(Ok(text)),
+        PublicCliDispatch::Fail { code, message } => {
+            eprintln!("{message}");
+            std::process::exit(code.into());
+        }
+    }
+
     for (index, arg) in args.iter().enumerate() {
         if arg == "--explain" {
             let Some(code) = args.get(index + 1) else {
@@ -34,6 +113,220 @@ pub fn requested(args: &[String]) -> Option<anyhow::Result<String>> {
         }
     }
     None
+}
+
+fn dispatch_public_cli(args: &[String]) -> PublicCliDispatch {
+    match scan_public_command(args) {
+        PublicCommandScan::PassThrough => PublicCliDispatch::PassThrough,
+        PublicCommandScan::GlobalHelp => PublicCliDispatch::Print(GLOBAL_HELP.to_string()),
+        PublicCommandScan::Command(index) => {
+            let command = args[index].as_str();
+            let command_args = &args[index + 1..];
+            match command {
+                "help" => dispatch_help(command_args),
+                "install" => dispatch_install(command_args),
+                unknown => PublicCliDispatch::Fail {
+                    code: 2,
+                    message: format!(
+                        "error: unknown backend command `{unknown}`\n\nRun `backend help` for usage."
+                    ),
+                },
+            }
+        }
+    }
+}
+
+fn scan_public_command(args: &[String]) -> PublicCommandScan {
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+
+        if is_help(arg) {
+            return PublicCommandScan::GlobalHelp;
+        }
+
+        // These flags own their complete invocation and are handled by the
+        // existing pre-bootstrap/internal-mode code in main.rs.
+        if is_internal_or_diagnostic_mode(arg) {
+            return PublicCommandScan::PassThrough;
+        }
+
+        if !arg.starts_with('-') {
+            return PublicCommandScan::Command(index);
+        }
+
+        if matches!(arg, "--settings") {
+            if args.get(index + 1).is_none() {
+                return PublicCommandScan::PassThrough;
+            }
+            index += 2;
+            continue;
+        }
+
+        if arg.starts_with("--settings=")
+            || matches!(arg, "--allow-settings-env" | "--debug" | "--debug-boot")
+            || arg.starts_with("--debug-boot=")
+            || arg.starts_with("-debug=")
+        {
+            index += 1;
+            continue;
+        }
+
+        if arg == "-debug" {
+            if args
+                .get(index + 1)
+                .is_some_and(|value| is_boolean_literal(value))
+            {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        // Unknown leading options are left to the existing server/boot path so
+        // this router does not accidentally reinterpret a legacy flag value as
+        // a public command.
+        return PublicCommandScan::PassThrough;
+    }
+
+    PublicCommandScan::PassThrough
+}
+
+fn dispatch_help(args: &[String]) -> PublicCliDispatch {
+    let Some(command) = args.first().map(String::as_str) else {
+        return PublicCliDispatch::Print(GLOBAL_HELP.to_string());
+    };
+
+    match command {
+        "install" => PublicCliDispatch::Print(INSTALL_HELP.to_string()),
+        "help" => PublicCliDispatch::Print(GLOBAL_HELP.to_string()),
+        unknown => PublicCliDispatch::Fail {
+            code: 2,
+            message: format!(
+                "error: no help is available for unknown backend command `{unknown}`\n\nRun `backend help` for usage."
+            ),
+        },
+    }
+}
+
+fn dispatch_install(args: &[String]) -> PublicCliDispatch {
+    if args.first().is_some_and(|arg| arg == "help") || args.iter().any(|arg| is_help(arg)) {
+        return PublicCliDispatch::Print(INSTALL_HELP.to_string());
+    }
+
+    let Some(target) = args.first().filter(|target| !target.starts_with('-')) else {
+        return PublicCliDispatch::Fail {
+            code: 2,
+            message: format!(
+                "error: backend install requires a target\n\n{}",
+                install_usage()
+            ),
+        };
+    };
+
+    if let Err(message) = validate_install_options(&args[1..]) {
+        return PublicCliDispatch::Fail {
+            code: 2,
+            message: format!("error: {message}\n\n{}", install_usage()),
+        };
+    }
+
+    PublicCliDispatch::Fail {
+        // 69 is EX_UNAVAILABLE: the request is valid, but this build does not
+        // yet expose the end-to-end installer execution bridge.
+        code: 69,
+        message: format!(
+            "error: `backend install` recognized target `{target}`, but package execution is not wired into backend.exe yet.\n\nNo RBE server was started and no project package state was changed.\nRun `backend help install` for the accepted install syntax."
+        ),
+    }
+}
+
+fn validate_install_options(args: &[String]) -> Result<(), String> {
+    let mut index = 0usize;
+    let mut version_seen = false;
+
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(arg, "-version" | "--version") {
+            if version_seen {
+                return Err("version was specified more than once".to_string());
+            }
+            version_seen = true;
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return Err(format!("{arg} requires a value"));
+            };
+            validate_version(value)?;
+        } else if let Some(value) = arg
+            .strip_prefix("-version=")
+            .or_else(|| arg.strip_prefix("--version="))
+        {
+            if version_seen {
+                return Err("version was specified more than once".to_string());
+            }
+            version_seen = true;
+            validate_version(value)?;
+        } else if matches!(
+            arg,
+            "-shared"
+                | "--shared"
+                | "-force"
+                | "--force"
+                | "-no-cache"
+                | "--no-cache"
+                | "-refresh-index"
+                | "--refresh-index"
+                | "-json"
+                | "--json"
+                | "-quiet"
+                | "--quiet"
+        ) {
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown install flag `{arg}`"));
+        } else {
+            return Err(format!("unexpected extra install argument `{arg}`"));
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn validate_version(value: &str) -> Result<(), String> {
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.is_empty()
+        || parts.len() > 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(format!(
+            "invalid version selector `{value}`; use major, major.minor, or major.minor.patch"
+        ));
+    }
+    Ok(())
+}
+
+fn is_help(value: &str) -> bool {
+    matches!(value, "-h" | "--help" | "-help")
+}
+
+fn is_internal_or_diagnostic_mode(value: &str) -> bool {
+    matches!(
+        value,
+        "--maintenance-notice" | "--er" | "--vault" | "--explain" | "--list-error-codes"
+    ) || value.starts_with("--explain=")
+}
+
+fn is_boolean_literal(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "0" | "true" | "false" | "yes" | "no" | "on" | "off"
+    )
+}
+
+fn install_usage() -> &'static str {
+    "Usage: backend install <target> [options]\nRun `backend help install` for details."
 }
 
 fn catalog() -> anyhow::Result<serde_json::Value> {
@@ -246,6 +539,10 @@ pub fn explain(code: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
     #[test]
     fn explains_specific_relc_error_from_embedded_book() {
         let rendered = explain("relc3001").expect("RELC3001 must be explainable");
@@ -297,5 +594,127 @@ mod tests {
             .expect("lookup should be detected")
             .expect("lookup should succeed");
         assert!(rendered.contains("SVC5002"));
+    }
+
+    #[test]
+    fn no_args_preserve_normal_server_boot() {
+        assert_eq!(dispatch_public_cli(&[]), PublicCliDispatch::PassThrough);
+    }
+
+    #[test]
+    fn ordinary_boot_flags_preserve_server_boot() {
+        assert_eq!(
+            dispatch_public_cli(&args(&["--settings", "custom.json"])),
+            PublicCliDispatch::PassThrough
+        );
+        assert_eq!(
+            dispatch_public_cli(&args(&["-debug"])),
+            PublicCliDispatch::PassThrough
+        );
+    }
+
+    #[test]
+    fn internal_modes_remain_owned_by_existing_boot_code() {
+        for values in [
+            vec!["--er", "--launch"],
+            vec!["--vault", "--separate-process"],
+            vec!["--maintenance-notice"],
+            vec!["--explain", "RELC3001"],
+        ] {
+            assert_eq!(
+                dispatch_public_cli(&args(&values)),
+                PublicCliDispatch::PassThrough
+            );
+        }
+    }
+
+    #[test]
+    fn all_global_help_aliases_exit_before_boot() {
+        for help in ["help", "-h", "--help", "-help"] {
+            let PublicCliDispatch::Print(text) = dispatch_public_cli(&args(&[help])) else {
+                panic!("{help} must render help");
+            };
+            assert!(text.contains("backend install <target>"));
+        }
+    }
+
+    #[test]
+    fn install_help_is_a_real_subcommand_help_path() {
+        for values in [
+            vec!["install", "help"],
+            vec!["install", "--help"],
+            vec!["help", "install"],
+        ] {
+            let PublicCliDispatch::Print(text) = dispatch_public_cli(&args(&values)) else {
+                panic!("install help must render help");
+            };
+            assert!(text.contains("RBE package installer"));
+        }
+    }
+
+    #[test]
+    fn public_command_can_follow_known_global_boot_flags() {
+        let PublicCliDispatch::Fail { code, message } = dispatch_public_cli(&args(&[
+            "--settings",
+            "custom.json",
+            "-debug",
+            "install",
+            "mycoolpackage",
+        ])) else {
+            panic!("install must be dispatched before server boot");
+        };
+        assert_eq!(code, 69);
+        assert!(message.contains("mycoolpackage"));
+    }
+
+    #[test]
+    fn install_without_target_is_usage_error() {
+        assert!(matches!(
+            dispatch_public_cli(&args(&["install"])),
+            PublicCliDispatch::Fail { code: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn valid_install_request_fails_unavailable_without_booting_server() {
+        let PublicCliDispatch::Fail { code, message } =
+            dispatch_public_cli(&args(&["install", "mycoolpackage"]))
+        else {
+            panic!("install target must be intercepted");
+        };
+        assert_eq!(code, 69);
+        assert!(message.contains("mycoolpackage"));
+        assert!(message.contains("No RBE server was started"));
+    }
+
+    #[test]
+    fn install_options_are_validated_before_unavailable_error() {
+        assert!(matches!(
+            dispatch_public_cli(&args(&["install", "demo", "--wat"])),
+            PublicCliDispatch::Fail { code: 2, .. }
+        ));
+        assert!(matches!(
+            dispatch_public_cli(&args(&["install", "demo", "-version", "3.10"])),
+            PublicCliDispatch::Fail { code: 69, .. }
+        ));
+        assert!(matches!(
+            dispatch_public_cli(&args(&[
+                "install",
+                "demo",
+                "-version",
+                "3.10",
+                "--version=3.10"
+            ])),
+            PublicCliDispatch::Fail { code: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_bare_word_is_a_command_error_not_server_boot() {
+        let PublicCliDispatch::Fail { code, message } = dispatch_public_cli(&args(&["wat"])) else {
+            panic!("unknown bare command must fail");
+        };
+        assert_eq!(code, 2);
+        assert!(message.contains("unknown backend command"));
     }
 }
