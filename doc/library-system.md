@@ -1,15 +1,12 @@
-# RBE External Library System
+# RBE External Library & Project Package System
 
-Status: foundation / Library Protocol v1 design
+Status: current package/install contracts on `main`, implemented through LIB-017. Some final Backend CLI/worker wiring remains integration work and is called out explicitly below.
 
-RBE external libraries are project-local packages that can extend REL/RBE without
-being linked into `backend.exe`'s trusted address space. The system is intentionally
-language-neutral: Rust, Bun/Node.js, Python and future runtimes all speak the same
-RBE Library Protocol and receive the same capability decisions.
+This document is the authoritative overview for the current external-library and project-package architecture. It distinguishes implemented contract/runtime behavior from planned UX so old design text does not override code.
 
 ## 1. Library namespaces in REL
 
-Built-ins and external packages use one hierarchical model:
+Built-ins and external packages use one hierarchical import model:
 
 ```rel
 :import[net:http]
@@ -18,7 +15,7 @@ Built-ins and external packages use one hierarchical model:
 :import[advancenet:retry]
 ```
 
-A root import is only a namespace:
+A root import is a namespace:
 
 ```rel
 :import[net]
@@ -27,261 +24,263 @@ const <= http => net.http()
 const <= peer => net.p2p()
 ```
 
-Direct import and root accessor resolve to the same sub-library identity.
-Importing `net` does not grant every child capability. Existing `:import[http]`
-remains a compatibility alias for `net:http`.
+Direct import and root accessor resolve to the same sub-library identity. Importing a root namespace does not grant every child capability. Compatibility aliases may map older flat imports onto the hierarchical name without changing authority.
 
-## 2. Project-local package layout
+## 2. Current project package state
 
-All package state is relative to the directory in which `backend` starts:
+The current project package path is built around `package.rbe.yaml`, `package.lock.rbe.yaml`, a content-addressed package cache, RBE-owned managed tools, dependency hydration caches, and a durable install session.
 
 ```text
 project/
 ├── backend(.exe)
 ├── server.server
-├── library/
-│   ├── advancenet.zip
-│   └── image-tools.zip
-├── rbe.lock
-└── .rbe/
-    ├── library-cache/
-    ├── runtimes/
-    │   ├── rust/
-    │   ├── bun/
-    │   ├── node/
-    │   └── python/
-    ├── sdk/
-    └── registry/
+├── package.rbe.yaml
+├── package.lock.rbe.yaml
+├── library/                              # optional local package inputs
+└── .cache/
+    ├── library/
+    │   ├── <artifact-sha256>/            # verified package/artifact cache
+    │   └── .staging/                     # resumable/incomplete install staging
+    └── rbe/
+        ├── sys/
+        │   ├── python/<version>/<host>/
+        │   ├── nodejs/<version>/<host>/
+        │   ├── bunjs/<version>/<host>/
+        │   └── rust/<version>/<host>/
+        ├── build-deps/
+        │   └── <ecosystem>/<lock-sha256>/
+        │       └── hydration.rbe.json
+        └── install/
+            ├── journal.rbe.json
+            └── install.lease
 ```
 
-RBE does not require global package installation. Managed runtimes/toolchains are
-installed into `.rbe/runtimes` and pinned by project state unless policy explicitly
-chooses a compatible system installation.
+The package cache is reconstructible state, not trust. Presence under `.cache/` never proves integrity by itself.
 
-RBE may also maintain a private user-scoped portable runtime tree outside the
-project for its own tooling. The first planned system runtime is
-`rbe.sys.python`, stored under the user's RBE data root rather than placed on the
-machine's PATH:
+Older library/runtime code still contains `.rbe/runtimes/...` paths. That legacy path is not the authoritative cache layout for the newer project-package/system-runtime install path described here; do not silently rewrite old compatibility code merely to make the strings match this document.
+
+## 3. Project manifest and lockfile
+
+`package.rbe.yaml` is the human-edited project dependency manifest.
+
+`package.lock.rbe.yaml` is the exact resolver output and the activation boundary for the project package graph. The lock records the exact package/runtime/SDK resolution needed to restore the graph, including pinned artifact identity such as exact URLs and SHA-256 values.
+
+Important invariants:
+
+- deleting `.cache/library` does not require version re-resolution when the lock is intact;
+- deleted bytes still have to be downloaded again;
+- cached bytes must be re-verified against the lock before use;
+- a partially prepared new graph does not become active merely because some packages finished building;
+- graph activation occurs only after all required packages have reached the verified/ready state.
+
+## 4. RBE-owned system runtimes
+
+RBE can hydrate private portable tools without installing them globally. The current managed system-runtime identities are:
 
 ```text
-~/.rbe/system/rbe.sys.python/<version>/<host>/
+rbe.sys.python
+rbe.sys.nodejs
+rbe.sys.bunjs
+rbe.sys.rust
 ```
 
-`rbe.sys.python` is internal infrastructure for index discovery/scraper adapters
-and future maintenance helpers. It is distinct from the user-installable
-`runtime.python` package.
+A system-runtime manifest is requested from the trusted registry under:
 
-## 3. Package ZIP
+```text
+/registry/v1/system-runtime/<runtime-key>/<host>/manifest.json
+```
 
-A source package contains source, lockfiles and a required `library.toml` rather
-than prebuilt artifacts for every OS:
+The manifest binds runtime identity, version, host, HTTPS source, SHA-256, size, archive kind, and entrypoint. Optional publisher/signature metadata can also be carried.
+
+For a project cache root, runtime material is planned under:
+
+```text
+.cache/rbe/sys/<runtime>/<version>/<host>/
+```
+
+System runtime hardening currently requires:
+
+- no machine-wide PATH mutation;
+- not exposed as a user-installable package merely because RBE uses it internally;
+- HTTPS artifact sources;
+- SHA-256 verification on every use rather than trusting the cache location;
+- user-private cache permissions (`0700` policy on Unix and a user-only ACL policy on Windows);
+- host/runtime identity validation before activation.
+
+These tools are infrastructure for trusted install/build/discovery work. They are distinct from ordinary external packages.
+
+## 5. External package source layout
+
+A source package carries package metadata, source, and the lock material needed for deterministic preparation. The package metadata remains separate from the project-level `package.rbe.yaml`.
+
+A representative source archive can contain:
 
 ```text
 advancenet.zip
 ├── library.toml
 ├── src/
-├── Cargo.toml + Cargo.lock        # Rust, when applicable
-├── package.json + bun.lock        # Bun/Node, when applicable
-├── pyproject.toml/requirements    # Python, when applicable
-└── vendor/                        # optional offline dependencies/tooling
+├── Cargo.toml
+├── Cargo.lock                     # Cargo ecosystem
+├── package.json
+├── package-lock.json              # npm ecosystem
+├── bun.lock                       # Bun ecosystem
+├── pyproject.toml
+├── requirements.lock              # hash-locked Python ecosystem
+└── other package-owned files
 ```
 
-Installer requirements include traversal-safe extraction, bounded file count and
-size, no absolute paths or `..` escapes, no symlink escape, canonical-path duplicate
-rejection, hash/signature checks and atomic activation.
+Extraction is not a normal unzip into a trusted directory. The install path performs bounded, traversal-safe extraction into fresh staging state, rejects path escapes/unsafe archive structure, and computes a deterministic source identity independent of archive ordering/compression metadata.
 
-## 4. Language/runtime declaration
+The current deterministic source-tree identity is `rbe-source-tree-sha256-v1`.
 
-`library.toml` declares what the package is, which SDK/runtime it uses and how
-RBE should prepare it. Example Bun package:
+## 6. Download, cache and source verification
 
-```toml
-name = "advancenet"
-version = "1.0.0"
-language = "javascript"
-rbe_abi_min = 1
-rbe_abi_max = 1
+Artifact acquisition is bounded and resumable rather than an unbounded download straight into the final cache.
 
-[sdk]
-family = "javascript"
-package = "@rbe/sdk"
-version = "0.1"
+The execution contracts include:
 
-[runtime]
-kind = "bun"
-version = "1.x"
-managed = true
-entry = "src/index.js"
+- disk-space preflight;
+- maximum artifact/download bounds;
+- `.part` staging;
+- resumable transfer policy;
+- streaming SHA-256 verification;
+- final size/hash verification;
+- atomic promotion only after verification;
+- fresh extraction staging;
+- source-tree hashing before activation.
 
-[exports]
-root = true
-sublibraries = ["retry", "proxy", "mesh"]
+Cache paths are intentionally not authority. A matching path with altered bytes must fail verification.
 
-[capabilities]
-"net:http" = true
-"net:p2p" = true
-"router:read" = true
-"router:register" = false
-```
+## 7. Package attestation and quarantine
 
-Python can declare `runtime.kind = "python"`; Node can use `node`; Rust uses
-`rust`/Cargo. `language = "other"` is allowed only with an explicit runtime or
-build/launch contract. `other` is not permission to blindly execute an unknown
-binary.
+RBE separates package retrieval from package trust.
 
-## 5. OS-specific build/install scripts
+Attestation can evaluate:
 
-A package may define structured steps for the supported OS families:
+- the locked artifact SHA-256 versus downloaded bytes;
+- declared publisher signature state;
+- local/extracted source identity versus trusted remote source identity;
+- shipped binary identity versus a rebuilt binary when the package explicitly declares a reproducible-build contract.
 
-```toml
-[[build.windows]]
-program = "bun"
-args = ["install", "--frozen-lockfile"]
+Byte-for-byte reproducibility is not assumed for arbitrary builds. The shipped/rebuilt binary comparison is meaningful only when the package opts into an appropriate reproducible-build contract.
 
-[[build.linux]]
-program = "bun"
-args = ["install", "--frozen-lockfile"]
+A mismatch or failed trust gate is a quarantine condition, not an activation condition. Public-registry failures may support privacy-safe reporting; local/private package failures must not be silently reported as public telemetry.
 
-[[build.macos]]
-program = "bun"
-args = ["install", "--frozen-lockfile"]
+## 8. Controlled build-dependency hydration (LIB-017)
 
-[[build.other]]
-program = "bun"
-args = ["install", "--frozen-lockfile"]
-```
-
-Selection order is exact host OS first and `other` only as an explicit fallback.
-Steps are run in RBE's package build environment, not as unrestricted commands in
-Backend's own process. Build-time network/filesystem/process powers are separate
-from runtime library capabilities.
-
-A package does not need to ship a compiled artifact. `backend install` prepares
-it for the current host:
-
-- Rust: acquire/choose a compatible Rust toolchain and build with the locked graph.
-- Bun: acquire/choose Bun, install locked dependencies and optionally build/bundle.
-- Node.js: acquire/choose Node and the declared package-manager flow.
-- Python: acquire/choose Python, create a project-local environment and install
-  locked dependencies; bytecode/native-extension compilation may occur as needed.
-- Other: follow its declared managed runtime/toolchain and OS steps.
-
-Interpreted/JIT packages remain source packages but still run as isolated RBE
-library workers. They do not execute inside `backend.exe`.
-
-## 6. Language-neutral Library Protocol
-
-All workers speak `sdk/protocol` / RBE Library Protocol v1. Startup begins with a
-handshake containing at least:
+The actual package build stays network-dead. Ecosystem dependencies are hydrated in a separate bounded phase before compilation.
 
 ```text
-package identity + content hash
-SDK language/name/version
-runtime kind/version
-ABI min/max
-protocol version
+pinned dependency lock
+        |
+        v
+verify lock SHA-256
+        |
+        v
+managed rbe.sys tool only
+        |
+  restricted network
+  approved HTTPS origins only
+  no shell
+  cleared environment
+  install scripts disabled where applicable
+        |
+        v
+.cache/rbe/build-deps/<ecosystem>/<lock-sha256>/
+        |
+        +-- hydration.rbe.json
+        |
+        v
+NETWORK OFF
+        |
+        v
+actual package build
 ```
 
-RBE compares the hello frame against the admitted package manifest and `rbe.lock`.
-The worker cannot request new authority during the handshake.
+### 8.1 Ecosystem rules
 
-Privileged operations are host calls such as:
+| Ecosystem | Required lock | Hydration command contract | Default approved origins | Offline build contract |
+| --- | --- | --- | --- | --- |
+| Cargo | `Cargo.lock` | `cargo fetch --locked --manifest-path <Cargo.toml>` | `https://index.crates.io/`, `https://static.crates.io/` | same hydrated `CARGO_HOME`, `CARGO_NET_OFFLINE=true` |
+| npm | `package-lock.json` | `npm ci --ignore-scripts --no-audit --no-fund --cache <cache>` | `https://registry.npmjs.org/` | same cache, `npm_config_offline=true` |
+| Bun | `bun.lock` | `bun install --frozen-lockfile --ignore-scripts --cache-dir <cache>` | `https://registry.npmjs.org/` | same `BUN_INSTALL_CACHE_DIR`; build network remains disabled by RBE |
+| Python | `requirements.lock` | `python -m pip download --require-hashes --only-binary=:all: ...` | `https://pypi.org/`, `https://files.pythonhosted.org/` | `PIP_NO_INDEX=1`, `PIP_FIND_LINKS=<wheelhouse>`, `PIP_REQUIRE_HASHES=1` |
+
+Registry allowlist entries must be credential-free HTTPS origins. Paths, query strings, fragments, duplicate origins, and insecure schemes are rejected.
+
+Default hydration bounds are currently 1 GiB maximum observed download bytes and 10 minutes timeout unless a stricter policy is supplied.
+
+### 8.2 Hydration receipt
+
+A successful hydration produces `hydration.rbe.json` under the lock-addressed dependency cache. The receipt binds at least:
+
+- receipt format;
+- ecosystem;
+- dependency-lock SHA-256;
+- lock-addressed cache root;
+- absolute managed program path;
+- hydration arguments;
+- approved registry origins;
+- cleared-environment state;
+- shell-disabled state;
+- scripts-disabled state;
+- origin-restricted-network state;
+- hydrated artifact count;
+- observed bytes.
+
+Receipt validation rejects a cache root that is not consistent with `rbe/build-deps/<ecosystem>/<lock-sha256>`.
+
+### 8.3 Actual build isolation
+
+Hydration does not relax the build sandbox contract. Build invocations must still satisfy all of the following:
 
 ```text
-capability = net:http
-target     = net:http
-operation  = request
-payload    = ...
+network_allowed = false
+use_shell       = false
+clear_environment = true
+program         = absolute path from ManagedToolchain
+RBE_BUILD_NETWORK=disabled
 ```
 
-The host checks the package's admitted capabilities on every call.
+Only explicitly managed tools are selected. There is no fallback to an arbitrary `cargo`, `npm`, `bun`, `python`, compiler, or shell discovered from the host PATH.
 
-## 7. SDK family
+## 9. Durable install sessions and atomic graph activation
 
-First-party SDK surfaces begin with:
+Project installation is treated as a graph transaction rather than a sequence of independently activated packages.
+
+The durable session owns:
 
 ```text
-Rust                  sdk/rbe-sdk       -> registry package `rbe-sdk`
-Bun + Node.js         sdk/js            -> registry package `@rbe/sdk`
-Python                sdk/python        -> registry package `rbe-sdk`
-Other languages       Protocol v1 directly or a language wrapper
+.cache/rbe/install/journal.rbe.json
+.cache/rbe/install/install.lease
 ```
 
-SDKs provide language-native helpers but have identical authority. For example,
-`net:http` called from Python, Bun or Rust reaches the same host capability.
+The lease prevents concurrent project installers from racing the same activation boundary. The journal records durable progress so verified cache work can be reused after interruption.
 
-The SDK deliberately exposes sanctioned bridges rather than private Backend Rust
-structures:
+The high-level flow is:
 
 ```text
-net:*
-router:read
-router:register
-storage
-crypto
-future service/runtime extension points
+package.rbe.yaml
+→ resolve complete graph
+→ pin/write candidate state
+→ download and verify artifacts
+→ safe extract and source-hash
+→ hydrate required rbe.sys tools
+→ hydrate locked ecosystem dependencies
+→ NETWORK OFF
+→ build
+→ source/binary attestation
+→ every graph member READY?
+→ write package.lock.rbe.yaml.next
+→ atomic replace package.lock.rbe.yaml
+→ new graph becomes active
 ```
 
-This enables an `advancenet` package to call RBE's normal network functionality,
-add custom fallback/retry/cache/protocol logic, and expose a better/different REL
-API without forking RBE.
+If the process crashes halfway through a multi-package install, the previously active lock remains the activation boundary. Completed content-addressed cache work can be reused; incomplete staging/journal state is recovered or discarded according to the session contract.
 
-## 8. Router extension model
+## 10. `backend install` command surface and current boundary
 
-Router access is split so introspection does not imply mutation:
-
-- `router:read` — approved route/runtime metadata and inspection.
-- `router:register` — validated middleware/protocol/route-factory registration.
-
-External workers never receive raw Axum router pointers/maps. Registration is a
-request to trusted RBE code, which validates namespace collisions, ownership,
-lifecycle and policy before accepting it.
-
-## 9. Registry / SDK distribution
-
-Kastrick Backend can act as the central index while exposing protocol-compatible
-front doors for each ecosystem:
-
-```text
-RBE package index/API
-├── package search and versions
-├── signatures/hashes/publishers
-├── dependency metadata
-└── ZIP/object download locations
-
-Cargo sparse registry
-└── `rbe-sdk` Rust crate
-
-npm-compatible registry
-└── `@rbe/sdk` for both Node.js and Bun
-
-Python Simple Repository API
-└── `rbe-sdk` wheel/sdist
-```
-
-SDKs are installed through the same package command as every other installable
-object. `backend install sdk.<version>` writes only project-local configuration
-and chooses SDK/runtime versions compatible with the running Library ABI. Cargo
-supports alternate sparse registries; npm supports project `.npmrc`; Bun can
-consume npm registry config or `bunfig.toml`; Python installers can consume a
-standards-compatible simple index.
-
-A normal package consumer does not manually install the SDK declared by a package;
-`backend install` resolves that dependency automatically. Library authors can
-explicitly prepare an SDK version and then scaffold a project:
-
-```text
-./backend install sdk.0.1.0
-./backend library new advancenet --language rust
-./backend library new advancenet --language bun
-./backend library new advancenet --language python
-```
-
-## 10. `backend install`
-
-The install command is the unified package/environment resolver, not merely a
-downloader. Packages, SDKs, runtimes, remote indexes and direct external sources
-all enter through the same command surface:
+The request grammar supports one install surface for packages, SDKs, runtimes, registry targets, and direct external locators. Representative syntax includes:
 
 ```text
 ./backend install advancenet
@@ -290,77 +289,49 @@ all enter through the same command surface:
 ./backend install runtime.python
 ./backend install runtime.python.3.10
 ./backend install mycooldevwebsite.here/advancenet/download -version=4.0.1
-./backend install python.org/downloads/ -version=3.10
 ```
 
-Bare web locators infer HTTPS automatically. An explicitly pasted `http://` URL
-is upgraded to HTTPS for discovery. External-source resolution is planned as:
+The `install-request` crate is intentionally source-only: it parses/validates requests and produces discovery/runtime plans but performs no network I/O, process spawning, PATH mutation, or machine-wide install itself.
+
+That distinction matters. The request grammar, resolver/install contracts, cache/attestation/execution/session plans, and LIB-017 hydration contracts are implemented. Full Backend command execution must wire those trusted plans together; documentation must not claim the complete end-to-end CLI path is finished merely because the underlying planning crates exist.
+
+External index discovery contracts include the website-native RBE index forms, Kastrick resolution/observation endpoints, and the `rbe.sys.python` `index-discovery-v1` scraper fallback. Scraper output is discovery data only: trusted Rust still validates origin, metadata, artifact identity, package structure, capabilities, and activation gates.
+
+## 11. Language-neutral Library Protocol and SDKs
+
+External workers remain outside `backend.exe`'s trusted address space and communicate through the RBE Library Protocol / SDK boundary.
+
+Startup identity includes the admitted package identity, content identity, SDK/runtime identity, ABI range, and protocol version. A worker does not gain new authority merely by requesting it during handshake.
+
+First-party SDK families are designed around equivalent authority:
 
 ```text
-local cached external index
-→ website-native RBE index / well-known index
-→ Kastrick external-source mapping
-→ rbe.sys.python scraper adapter fallback
-→ validate normalized candidate in trusted Rust
-→ cache accepted index locally
-→ best-effort public-only observation to Kastrick
+Rust          sdk/rbe-sdk
+Bun/Node.js   sdk/js
+Python        sdk/python
+Other         Protocol v1 directly or through a language wrapper
 ```
 
-Private/local addresses are never silently reported to Kastrick. Scraper output
-is discovery data, not install authority: its URLs and normalized package metadata
-must still pass trusted validation, artifact integrity checks, package inspection,
-capability admission and the Library Protocol handshake.
+Host capabilities remain policy-checked operations such as `net:*`, router operations, storage and crypto rather than raw access to Backend internals.
 
-Package-install pipeline:
+## 12. Router extension model
 
-```text
-resolve package/index or URL
-→ download package
-→ verify size/hash/signature
-→ safe ZIP inspection
-→ parse/validate library.toml
-→ resolve dependencies
-→ resolve SDK family/version
-→ resolve or install project-local runtime/toolchain
-→ select windows/linux/macos/other steps
-→ execute build/install in package build environment
-→ verify resulting worker/entry point
-→ perform Library Protocol ABI handshake
-→ atomically activate
-→ update rbe.lock
-```
+Router authority stays split:
 
-`backend install` can therefore see a Python/Bun/Node package and understand how
-it must be prepared without requiring a precompiled binary in the ZIP.
+- `router:read` — approved route/runtime metadata and inspection;
+- `router:register` — validated middleware/protocol/route-factory registration.
 
-## 11. Reproducibility
+External workers never receive raw Axum router pointers or mutable internal maps. Registration remains a request to trusted RBE code, which validates ownership, collisions, lifecycle and policy.
 
-`rbe.lock` records at least exact package version/hash, publisher/signature
-identity, dependencies, SDK family/version, runtime kind/version, ABI requirement
-and build identity. Deployments restore from the lock instead of silently choosing
-newer packages or runtimes.
+## 13. Provider portability
 
-## 12. Provider portability
+Packages target RBE capabilities rather than assuming a particular provider such as Render, Vercel, Fly, AWS, Azure or Google Cloud.
 
-Packages target RBE capabilities, not Render/Vercel/Fly/AWS/etc. The Host
-Capability Adapter advertises what the current environment actually permits:
+The host capability layer can describe what the environment actually permits, such as inbound/outbound transports, persistent/background execution, filesystem persistence, IP families, port visibility and connection lifetime. Unsupported authority must fail explicitly or use an RBE-defined fallback; it is not silently granted.
 
-```text
-inbound HTTP / WebSocket / TCP / UDP
-outbound TCP / UDP
-QUIC
-persistent/background process
-public/private ports
-filesystem / persistent filesystem
-IPv4 / IPv6
-connection lifetime
-```
+## 14. Expanded network / P2P / MASK direction
 
-RBE selects compatible execution/fallback behavior or fails admission explicitly.
-
-## 13. Expanded network library
-
-Target namespace:
+The external-library model is intended to support hierarchical namespaces such as:
 
 ```text
 net
@@ -382,53 +353,33 @@ net
 └── mask
 ```
 
-The existing public HTTP broker remains a policy boundary. Expanding `net` does
-not hand REL or third-party workers unrestricted raw sockets.
+Expanding the namespace does not hand REL or third-party workers unrestricted raw sockets.
 
-## 14. P2P
+`net:p2p` can coordinate multiple RBE-owned transports and discovery mechanisms. Long-lived listeners naturally belong to `.service` lifecycle and should remain represented as RBE-owned listener/port leases.
 
-`net:p2p` coordinates multiple transports rather than meaning one protocol:
+`net:mask` remains the direction for a content-addressed mesh distribution/cache layer. Peers are untrusted byte sources; authenticity comes from signed manifests and content hashes, and MASK should reuse RBE/Cloud Node content-addressed storage instead of inventing an unrelated cache trust model.
 
-- TCP
-- UDP
-- QUIC
-- WebSocket
-- WebTransport
-- HTTP/2 streams
-- HTTP/3 streams
+## 15. Package-system implementation milestones
 
-Discovery may include static peers, DNS, mDNS, rendezvous, DHT and RBE Cloud.
-NAT traversal can grow into STUN/TURN, ICE-like selection, UPnP, NAT-PMP and PCP,
-with relay fallback. Long-lived listeners naturally belong to `.service`
-lifecycle and are represented as RBE-owned listener/port leases.
+The current package-system foundation has advanced through these layers:
 
-Transport and application protocol are separate. For example QUIC may carry
-`RBE-MASK/1`, while WebSocket may carry the same MASK protocol on a restricted
-host. External libraries can register their own application protocols when
-explicitly granted the relevant extension capability.
+1. **LIB-010** — cache-backed RBE system-runtime manifests (`rbe.sys.python`, Node.js, Bun and Rust).
+2. **LIB-011** — project `package.rbe.yaml` / `package.lock.rbe.yaml` state and content-addressed cache identity.
+3. **LIB-012** — package source/binary attestation and quarantine decisions.
+4. **LIB-013** — project install orchestration gates.
+5. **LIB-014** — bounded/resumable acquisition and managed build execution contracts.
+6. **LIB-015** — safe source extraction and deterministic source-tree identity.
+7. **LIB-016** — durable project install session, exclusive lease and atomic lockfile activation.
+8. **LIB-017** — controlled build-dependency hydration followed by network-dead package builds.
 
-## 15. MASK
+## 16. Remaining integration work
 
-`net:mask` is a content-addressed mesh distribution/cache layer for updates,
-installers, assets and other large versioned artifacts. Signed origin manifests
-identify hash-addressed chunks. A transfer may fetch chunks concurrently from
-local cache, multiple peers and HTTPS origin.
+The major remaining work is not to redesign the package trust model again. It is to connect the existing contracts through the trusted Backend path cleanly:
 
-Peers are untrusted byte sources; authenticity comes from signed manifests and
-content hashes. MASK should reuse RBE/Cloud Node content-addressed chunk storage
-rather than inventing a second cache filesystem.
+- execute the full install plan from request → resolve → hydrate → build → attest → activate;
+- persist/validate hydration receipts at the orchestration boundary;
+- connect worker/Library Protocol admission to the activated project lock;
+- finish public registry/publishing UX and external-index integrations;
+- expand capability bridges without weakening the package/process boundary.
 
-## 16. Implementation order
-
-1. Language-neutral Protocol v1 + Rust/JS/Python SDK contracts.
-2. Package manifest parser and safe ZIP inspection.
-3. Project-local runtime/toolchain manager and `rbe.lock` model.
-4. Unified `backend install` grammar for packages, SDKs, runtimes and URLs.
-5. External index discovery/cache + `rbe.sys.python` scraper fallback.
-6. Library Host worker lifecycle + authenticated ABI handshake.
-7. Net/router/storage/crypto host bridges.
-8. Generic REL sub-library linker + `http` compatibility alias.
-9. `net:cookies`, `net:headers`, `net:url` baseline.
-10. P2P transports/provider adapters.
-11. MASK + Storage/Cloud Node integration.
-12. Kastrick package publishing/search/signing UI and registry protocol front ends.
+When implementation and this document diverge, the implementation on `main` wins and this document should be updated in the same change.
