@@ -20,6 +20,7 @@ Usage:
   backend install <target> [options]
 
 Commands:
+  check [--settings <file>]    Compile/link the application package and exit
   install <target> [options]   Install an RBE package, runtime, SDK, URL, or local archive
   help [command]               Show help for backend or a command
 
@@ -32,13 +33,31 @@ Boot examples:
   backend --settings settings.json
   backend -debug
 
+Preflight example:
+  backend check --settings settings.json
+
 Help aliases:
   backend help
   backend -h
   backend --help
   backend -help
 
-Run `backend help install` for install syntax."#;
+Run `backend help check` or `backend help install` for command syntax."#;
+
+const CHECK_HELP: &str = r#"RBE package preflight
+
+Usage:
+  backend check
+  backend check --settings <file>
+  backend --settings <file> check
+
+`check` loads settings, compiles the .service catalog, compiles and validates the
+complete immutable Runtime Image, applies Server policy/middleware validation,
+prints the resulting image identity/counts, and exits.
+
+It runs before HostBootstrap and never binds the API port or starts Vault,
+Container, Service workers, IPC listeners, or the maintenance responder. This is
+intended for CI/build/deploy preflight and local REL diagnostics."#;
 
 const INSTALL_HELP: &str = r#"RBE package installer
 
@@ -71,6 +90,7 @@ Current build status:
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PublicCliDispatch {
     PassThrough,
+    Check,
     Print(String),
     Fail { code: u8, message: String },
 }
@@ -85,6 +105,13 @@ enum PublicCommandScan {
 pub fn requested(args: &[String]) -> Option<anyhow::Result<String>> {
     match dispatch_public_cli(args) {
         PublicCliDispatch::PassThrough => {}
+        PublicCliDispatch::Check => match run_package_check(args) {
+            Ok(rendered) => return Some(Ok(rendered)),
+            Err(error) => {
+                eprintln!("RBE package check failed.\n\n{error:#}");
+                std::process::exit(1);
+            }
+        },
         PublicCliDispatch::Print(text) => return Some(Ok(text)),
         PublicCliDispatch::Fail { code, message } => {
             eprintln!("{message}");
@@ -123,6 +150,7 @@ fn dispatch_public_cli(args: &[String]) -> PublicCliDispatch {
             let command = args[index].as_str();
             let command_args = &args[index + 1..];
             match command {
+                "check" => dispatch_check(command_args),
                 "help" => dispatch_help(command_args),
                 "install" => dispatch_install(command_args),
                 unknown => PublicCliDispatch::Fail {
@@ -199,6 +227,7 @@ fn dispatch_help(args: &[String]) -> PublicCliDispatch {
     };
 
     match command {
+        "check" => PublicCliDispatch::Print(CHECK_HELP.to_string()),
         "install" => PublicCliDispatch::Print(INSTALL_HELP.to_string()),
         "help" => PublicCliDispatch::Print(GLOBAL_HELP.to_string()),
         unknown => PublicCliDispatch::Fail {
@@ -208,6 +237,89 @@ fn dispatch_help(args: &[String]) -> PublicCliDispatch {
             ),
         },
     }
+}
+
+fn dispatch_check(args: &[String]) -> PublicCliDispatch {
+    if args.first().is_some_and(|arg| arg == "help") || args.iter().any(|arg| is_help(arg)) {
+        return PublicCliDispatch::Print(CHECK_HELP.to_string());
+    }
+    if let Err(message) = validate_check_options(args) {
+        return PublicCliDispatch::Fail {
+            code: 2,
+            message: format!("error: {message}\n\n{}", check_usage()),
+        };
+    }
+    PublicCliDispatch::Check
+}
+
+fn validate_check_options(args: &[String]) -> Result<(), String> {
+    let mut index = 0usize;
+    let mut settings_seen = false;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--settings" {
+            if settings_seen {
+                return Err("settings path was specified more than once".to_string());
+            }
+            settings_seen = true;
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return Err("--settings requires a file path".to_string());
+            };
+            if value.trim().is_empty() || value.starts_with('-') {
+                return Err("--settings requires a file path".to_string());
+            }
+        } else if let Some(value) = arg.strip_prefix("--settings=") {
+            if settings_seen {
+                return Err("settings path was specified more than once".to_string());
+            }
+            settings_seen = true;
+            if value.trim().is_empty() {
+                return Err("--settings requires a file path".to_string());
+            }
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown check flag `{arg}`"));
+        } else {
+            return Err(format!("unexpected extra check argument `{arg}`"));
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn settings_path_from_args(args: &[String]) -> String {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--settings" {
+            if let Some(value) = args.get(index + 1) {
+                return value.clone();
+            }
+        }
+        if let Some(value) = arg.strip_prefix("--settings=") {
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+    "settings.json".to_string()
+}
+
+fn run_package_check(args: &[String]) -> anyhow::Result<String> {
+    let settings_path = settings_path_from_args(args);
+    let mut config = config::Config::load(&settings_path)
+        .map_err(|error| anyhow::anyhow!("failed to load {settings_path}: {error}"))?;
+    let io = atomic_io::AtomicIo::new();
+    let service_catalog = crate::service_boot::compile(&config.services, &io)?;
+    let image = crate::runtime_image_boot::compile(&config, service_catalog.as_ref())?;
+    crate::runtime_image_boot::apply_server_policy(&mut config, &image.server_policy)?;
+    crate::runtime_image_boot::apply_middleware_plan(&mut config, &image.middleware_plan)?;
+    Ok(format!(
+        "RBE package check passed.\nsettings: {settings_path}\nruntimeImage: {}\nsourceHash: {}\nroutes: {}\nmodules: {}\nservices: {}",
+        image.image_id,
+        image.source_hash,
+        image.routes.len(),
+        image.modules.len(),
+        image.services.len()
+    ))
 }
 
 fn dispatch_install(args: &[String]) -> PublicCliDispatch {
@@ -323,6 +435,10 @@ fn is_boolean_literal(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "0" | "true" | "false" | "yes" | "no" | "on" | "off"
     )
+}
+
+fn check_usage() -> &'static str {
+    "Usage: backend check [--settings <file>]\nRun `backend help check` for details."
 }
 
 fn install_usage() -> &'static str {
@@ -635,7 +751,56 @@ mod tests {
                 panic!("{help} must render help");
             };
             assert!(text.contains("backend install <target>"));
+            assert!(text.contains("backend check"));
         }
+    }
+
+    #[test]
+    fn check_help_is_a_real_subcommand_help_path() {
+        for values in [
+            vec!["check", "help"],
+            vec!["check", "--help"],
+            vec!["help", "check"],
+        ] {
+            let PublicCliDispatch::Print(text) = dispatch_public_cli(&args(&values)) else {
+                panic!("check help must render help");
+            };
+            assert!(text.contains("RBE package preflight"));
+            assert!(text.contains("never binds the API port"));
+        }
+    }
+
+    #[test]
+    fn check_dispatches_before_server_boot_with_settings_on_either_side() {
+        assert_eq!(
+            dispatch_public_cli(&args(&["check", "--settings", "custom.json"])),
+            PublicCliDispatch::Check
+        );
+        assert_eq!(
+            dispatch_public_cli(&args(&["--settings", "custom.json", "check"])),
+            PublicCliDispatch::Check
+        );
+        assert_eq!(
+            settings_path_from_args(&args(&["check", "--settings=custom.json"])),
+            "custom.json"
+        );
+    }
+
+    #[test]
+    fn check_rejects_unknown_flags_and_duplicate_settings() {
+        assert!(matches!(
+            dispatch_public_cli(&args(&["check", "--wat"])),
+            PublicCliDispatch::Fail { code: 2, .. }
+        ));
+        assert!(matches!(
+            dispatch_public_cli(&args(&[
+                "check",
+                "--settings",
+                "one.json",
+                "--settings=two.json"
+            ])),
+            PublicCliDispatch::Fail { code: 2, .. }
+        ));
     }
 
     #[test]
