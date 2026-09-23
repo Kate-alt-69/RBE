@@ -1,8 +1,13 @@
 use std::path::Path;
 
 use config::Config;
-use route_engine::{MiddlewarePlan, RuntimeImage, ServerPolicy, ServerValue};
+use route_engine::{
+    MiddlewarePlan, PhysicalRelSource, RelcError, RuntimeImage, ServerPolicy, ServerValue, SourceId,
+};
 use service_runtime::ServiceCatalog;
+
+const RUNTIME_IMAGE_COMPILE_HELP: &str =
+    "https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5100";
 
 pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Result<RuntimeImage> {
     let root = runtime_paths::binary_dir();
@@ -27,8 +32,10 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
         catalog,
     )?;
     let settings = effective_settings_json(config);
-    let image = route_engine::compile_runtime_image(&server_source, physical, &settings)
-        .map_err(|error| anyhow::anyhow!("Runtime Image compile failed: {error}"))?;
+    let image = route_engine::compile_runtime_image(&server_source, physical.clone(), &settings)
+        .map_err(|error| {
+            anyhow::anyhow!("{}", render_runtime_image_compile_error(&error, &physical))
+        })?;
     route_engine::validate_runtime_image_routes(&image)?;
     tracing::info!(
         image = %image.image_id,
@@ -41,6 +48,263 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
         "linked immutable Runtime Image"
     );
     Ok(image)
+}
+
+fn render_runtime_image_compile_error(error: &RelcError, physical: &[PhysicalRelSource]) -> String {
+    let compiler_error = match error {
+        RelcError::Parse {
+            source,
+            code,
+            error: parse_error,
+        } => render_rel_parse_diagnostic(
+            source,
+            code,
+            parse_error,
+            error.help_url().as_str(),
+            physical,
+        ),
+        _ => error.to_string(),
+    };
+
+    format!(
+        "RBE5100 Backend could not compile the Runtime Image.\n\nError:\n{}\n\nNote:\n  Startup stopped before the API listener was bound. Fix the compiler error above and retry.\n\nHelp:\n  {RUNTIME_IMAGE_COMPILE_HELP}",
+        indent_block(&compiler_error, 2)
+    )
+}
+
+fn render_rel_parse_diagnostic(
+    source_id: &SourceId,
+    code: &str,
+    parse_error: &route_engine::ParseError,
+    help_url: &str,
+    physical: &[PhysicalRelSource],
+) -> String {
+    let title = friendly_parse_message(&parse_error.message);
+    let (note, hint) = parse_note_and_hint(&parse_error.message);
+    let source = physical_source_for(source_id, physical);
+
+    let Some(source) = source else {
+        return format!(
+            "error[{code}]: {title}\n  --> {source_id}:{}:{}\n   |\nnote: {note}\nhint: {hint}\nhelp: {help_url}",
+            parse_error.line, parse_error.column
+        );
+    };
+
+    let source_line = parse_error
+        .line
+        .checked_sub(1)
+        .and_then(|index| source.source.lines().nth(index));
+    let path = diagnostic_path(&source.path);
+    let Some(source_line) = source_line else {
+        return format!(
+            "error[{code}]: {title}\n  --> {path}:{}:{}\n   |\nnote: {note}\nhint: {hint}\nhelp: {help_url}",
+            parse_error.line, parse_error.column
+        );
+    };
+
+    let marker_column = corrected_marker_column(source_line, parse_error.column, &parse_error.message);
+    let display_line = expand_tabs(source_line);
+    let marker_padding = marker_padding(source_line, marker_column);
+    let line_no = parse_error.line.max(1);
+    let width = line_no.to_string().len();
+    let gutter = " ".repeat(width);
+
+    format!(
+        "error[{code}]: {title}\n  --> {path}:{line_no}:{marker_column}\n{gutter} |\n{line_no:>width$} | {display_line}\n{gutter} | {marker_padding}^ {title}\n{gutter} |\nnote: {note}\nhint: {hint}\nhelp: {help_url}",
+        width = width,
+    )
+}
+
+fn physical_source_for<'a>(
+    source_id: &SourceId,
+    physical: &'a [PhysicalRelSource],
+) -> Option<&'a PhysicalRelSource> {
+    physical.iter().find(|candidate| {
+        SourceId::physical(candidate.kind, &candidate.logical_name)
+            .ok()
+            .as_ref()
+            == Some(source_id)
+    })
+}
+
+fn diagnostic_path(path: &Path) -> String {
+    let root = runtime_paths::binary_dir();
+    path.strip_prefix(&root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn friendly_parse_message(message: &str) -> String {
+    if let Some(token) = message.strip_prefix("unexpected token in expression: ") {
+        return format!("expected an expression, found {}", token_label(token));
+    }
+    humanize_token_names(message)
+}
+
+fn token_label(token: &str) -> String {
+    let token = token.trim();
+    let symbol = match token {
+        "LParen" => "(",
+        "RParen" => ")",
+        "LBracket" => "[",
+        "RBracket" => "]",
+        "LBrace" => "{",
+        "RBrace" => "}",
+        "Semicolon" => ";",
+        "Comma" => ",",
+        "Colon" => ":",
+        "Dot" => ".",
+        "Eq" => "=",
+        "EqEq" => "==",
+        "EqEqEq" => "===",
+        "NotEq" => "!=",
+        "NotEqEq" => "!==",
+        "AndAnd" => "&&",
+        "OrOr" => "||",
+        "Plus" => "+",
+        "Minus" => "-",
+        "Star" => "*",
+        "Slash" => "/",
+        "Percent" => "%",
+        "Lt" => "<",
+        "LtEq" => "<=",
+        "Gt" => ">",
+        "GtEq" => ">=",
+        "Eof" => "end of file",
+        _ => token,
+    };
+    format!("`{symbol}`")
+}
+
+fn humanize_token_names(message: &str) -> String {
+    [
+        ("EqEqEq", "`===`"),
+        ("NotEqEq", "`!==`"),
+        ("EqEq", "`==`"),
+        ("NotEq", "`!=`"),
+        ("AndAnd", "`&&`"),
+        ("OrOr", "`||`"),
+        ("LtEq", "`<=`"),
+        ("GtEq", "`>=`"),
+        ("LParen", "`(`"),
+        ("RParen", "`)`"),
+        ("LBracket", "`[`"),
+        ("RBracket", "`]`"),
+        ("LBrace", "`{`"),
+        ("RBrace", "`}`"),
+        ("Semicolon", "`;`"),
+        ("Comma", "`,`"),
+        ("Colon", "`:`"),
+        ("Dot", "`.`"),
+        ("Eof", "end of file"),
+    ]
+    .into_iter()
+    .fold(message.to_string(), |rendered, (raw, friendly)| {
+        rendered.replace(raw, friendly)
+    })
+}
+
+fn parse_note_and_hint(message: &str) -> (&'static str, &'static str) {
+    if message.contains("unexpected token in expression: RParen") {
+        return (
+            "`)` closes the current expression, but REL was still waiting for an operand.",
+            "check for a dangling operator immediately before `)` (for example `&& )` or `|| )`) or add the missing expression.",
+        );
+    }
+    if message.contains("unexpected token in expression") {
+        return (
+            "REL expected a value or expression at the highlighted location.",
+            "check nearby operators, commas and delimiters; binary operators such as `&&` and `||` need an expression on both sides.",
+        );
+    }
+    if message.contains("expected RParen") || message.contains("expected RBracket") {
+        return (
+            "a delimited expression or argument list was not closed where the grammar expected it.",
+            "check the opening delimiter and nested expressions before the highlighted token.",
+        );
+    }
+    if message.contains("expected Semicolon") {
+        return (
+            "REL statements currently require an explicit `;` terminator.",
+            "add `;` before the highlighted token if the preceding statement is complete.",
+        );
+    }
+    if message.contains("expected identifier") {
+        return (
+            "this grammar position requires an identifier name.",
+            "replace the highlighted token with a valid REL identifier or check the delimiter immediately before it.",
+        );
+    }
+    (
+        "the REL parser reached a token that is not valid in the current grammar position.",
+        "inspect the highlighted token and the operator or delimiter immediately before it; the compiler location is where parsing could no longer continue.",
+    )
+}
+
+fn unexpected_symbol(message: &str) -> Option<&'static str> {
+    let token = message.strip_prefix("unexpected token in expression: ")?.trim();
+    match token {
+        "LParen" => Some("("),
+        "RParen" => Some(")"),
+        "LBracket" => Some("["),
+        "RBracket" => Some("]"),
+        "LBrace" => Some("{"),
+        "RBrace" => Some("}"),
+        "Semicolon" => Some(";"),
+        "Comma" => Some(","),
+        _ => None,
+    }
+}
+
+fn corrected_marker_column(line: &str, reported_column: usize, message: &str) -> usize {
+    let chars = line.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return 1;
+    }
+    let reported = reported_column.max(1).min(chars.len() + 1);
+    let Some(symbol) = unexpected_symbol(message).and_then(|value| value.chars().next()) else {
+        return reported;
+    };
+
+    let center = reported.saturating_sub(1).min(chars.len().saturating_sub(1));
+    for distance in 0..=4 {
+        if let Some(index) = center.checked_sub(distance) {
+            if chars.get(index) == Some(&symbol) {
+                return index + 1;
+            }
+        }
+        let index = center.saturating_add(distance);
+        if chars.get(index) == Some(&symbol) {
+            return index + 1;
+        }
+    }
+    reported
+}
+
+fn marker_padding(line: &str, column: usize) -> String {
+    let mut padding = String::new();
+    for character in line.chars().take(column.saturating_sub(1)) {
+        if character == '\t' {
+            padding.push_str("    ");
+        } else {
+            padding.push(' ');
+        }
+    }
+    padding
+}
+
+fn expand_tabs(line: &str) -> String {
+    line.replace('\t', "    ")
+}
+
+fn indent_block(value: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    value
+        .lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn apply_middleware_plan(config: &mut Config, plan: &MiddlewarePlan) -> anyhow::Result<()> {
@@ -299,3 +563,43 @@ fn string_array(policy: &ServerPolicy, key: &str) -> anyhow::Result<Option<Vec<S
 
 #[allow(dead_code)]
 fn _path_marker(_: &Path) {}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn rel_parse_failure_renders_source_frame_note_hint_and_both_help_links() {
+        let module = r#"export function broken(value) {
+    if (value && ) {
+        return true;
+    }
+    return false;
+}
+"#;
+        let sources = vec![PhysicalRelSource::new(
+            route_engine::RelSourceKind::Module,
+            "broken",
+            "module/broken.module",
+            module,
+        )];
+        let error = route_engine::compile_runtime_image(
+            "server Main {}",
+            sources.clone(),
+            &serde_json::json!({}),
+        )
+        .expect_err("invalid REL must fail");
+
+        let rendered = render_runtime_image_compile_error(&error, &sources);
+        assert!(rendered.starts_with("RBE5100 "));
+        assert!(rendered.contains("error[REL1100]:"));
+        assert!(rendered.contains("module/broken.module:2:"));
+        assert!(rendered.contains("if (value && )"));
+        assert!(rendered.contains("^ expected an expression"));
+        assert!(rendered.contains("note:"));
+        assert!(rendered.contains("hint:"));
+        assert!(rendered.contains("/rel#rel1100"));
+        assert!(rendered.contains("/runtime#rbe5100"));
+        assert!(!rendered.contains("RBE5099"));
+    }
+}
