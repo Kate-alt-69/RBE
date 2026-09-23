@@ -1,0 +1,10 @@
+[package]
+name = "rbe-library-registry"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rbe-install-request = { path = "../install-request" }
+rbe-library-resolver = { path = "../library-resolver" }
+thiserror = "2"
