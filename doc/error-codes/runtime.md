@@ -50,6 +50,17 @@ Backend startup returned an error that does not yet own a narrower stable `RBExx
 
 **Action:** follow the nested `reason` first. If the same immutable configuration/build repeatedly fails without a more specific code, preserve the startup logs and report it so the originating branch can receive a narrower code.
 
+<a id="rbe5100"></a>
+### RBE5100 — Runtime Image compilation failed during backend startup
+
+**Status:** Emitted.
+
+Backend startup reached Runtime Image compilation, but REL/RELC rejected one of the application sources or linking rules before the API listener was bound. `RBE5100` is the boot-level classification; the nested compiler diagnostic remains authoritative for the actual source problem, for example `REL1100` for parser syntax or a `RELCxxxx` capability/link error.
+
+For physical REL parse failures, RBE renders a RustC-style source frame with the source path, exact line/column, the offending source line, a caret, a human-readable `note:`, a likely `hint:`, and the nested REL/RELC Error Code Book link. Parser token debug names such as `RParen` are converted to source spelling such as `)` in the user-facing diagnostic.
+
+**Action:** fix the nested compiler diagnostic first, then restart/redeploy. Do not treat `RBE5100` as an instruction to bypass RELC validation; compilation intentionally stops before RBE binds the public API.
+
 <a id="rbe9001"></a>
 ### RBE9001 — backend control-plane invariant violated
 
