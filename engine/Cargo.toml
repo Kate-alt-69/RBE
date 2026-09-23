@@ -11,6 +11,9 @@ members = [
     "crates/route-engine",
     "crates/service-runtime",
     "crates/video-manager",
+    "crates/sdk-package",
+    "crates/rpx",
+    "crates/sdk-backend",
     "crates/cloud-node",
 ]
 # `vault` used to be a workspace member here; it's now a standalone
