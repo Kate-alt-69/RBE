@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-rbe-library-installer = { path = "../library-installer" }
+rbe-install-request = { path = "../install-request" }
 rbe-sdk = { path = "../sdk/rbe-sdk" }
 semver = "1"
 thiserror = "2"
