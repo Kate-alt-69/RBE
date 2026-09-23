@@ -38,7 +38,9 @@ enum StorageMutationRequest {
         #[serde(default)]
         data: Option<Value>,
     },
-    Delete { path: String },
+    Delete {
+        path: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,8 +261,9 @@ fn encode_transactional_put(
     data: Option<Value>,
 ) -> Result<Vec<u8>, StorageCapabilityError> {
     match (data_hex, data) {
-        (Some(data_hex), None) => hex::decode(data_hex)
-            .map_err(|_| invalid_args("put dataHex must be hexadecimal")),
+        (Some(data_hex), None) => {
+            hex::decode(data_hex).map_err(|_| invalid_args("put dataHex must be hexadecimal"))
+        }
         (None, Some(data)) => serde_json::to_vec(&data)
             .map_err(|_| invalid_args("put data could not be encoded as JSON")),
         (Some(_), Some(_)) => Err(invalid_args(
@@ -730,18 +733,14 @@ mod tests {
         )
         .unwrap();
 
-        let read = dispatch(
-            &storage,
-            &target,
-            "read",
-            json!(["users/usr_1.json"]),
-        )
-        .unwrap();
+        let read = dispatch(&storage, &target, "read", json!(["users/usr_1.json"])).unwrap();
         assert_eq!(read["found"], true);
         assert_eq!(read["data"]["userId"], "usr_1");
         assert_eq!(read["data"]["serviceId"], "engine-studio");
         assert_eq!(read["data"]["quotaBytes"], 104857600);
-        assert!(read["dataHex"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(read["dataHex"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
         let _ = std::fs::remove_dir_all(root);
     }
 
