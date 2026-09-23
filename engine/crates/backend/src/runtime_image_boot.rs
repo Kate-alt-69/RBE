@@ -102,7 +102,8 @@ fn render_rel_parse_diagnostic(
         );
     };
 
-    let marker_column = corrected_marker_column(source_line, parse_error.column, &parse_error.message);
+    let marker_column =
+        corrected_marker_column(source_line, parse_error.column, &parse_error.message);
     let display_line = expand_tabs(source_line);
     let marker_padding = marker_padding(source_line, marker_column);
     let line_no = parse_error.line.max(1);
@@ -243,7 +244,9 @@ fn parse_note_and_hint(message: &str) -> (&'static str, &'static str) {
 }
 
 fn unexpected_symbol(message: &str) -> Option<&'static str> {
-    let token = message.strip_prefix("unexpected token in expression: ")?.trim();
+    let token = message
+        .strip_prefix("unexpected token in expression: ")?
+        .trim();
     match token {
         "LParen" => Some("("),
         "RParen" => Some(")"),
@@ -267,7 +270,9 @@ fn corrected_marker_column(line: &str, reported_column: usize, message: &str) ->
         return reported;
     };
 
-    let center = reported.saturating_sub(1).min(chars.len().saturating_sub(1));
+    let center = reported
+        .saturating_sub(1)
+        .min(chars.len().saturating_sub(1));
     for distance in 0..=4 {
         if let Some(index) = center.checked_sub(distance) {
             if chars.get(index) == Some(&symbol) {
