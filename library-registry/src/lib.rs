@@ -88,30 +88,36 @@ mod tests {
 
     #[test]
     fn validated_registry_metadata_feeds_the_deterministic_solver() {
-        let transport = RegistryPackageIndex::parse_json(
-            &index_json("transport", "2.1.0", "{}"),
-            "transport",
-        )
-        .unwrap();
+        let transport =
+            RegistryPackageIndex::parse_json(&index_json("transport", "2.1.0", "{}"), "transport")
+                .unwrap();
         let advancenet = RegistryPackageIndex::parse_json(
             &index_json("advancenet", "4.0.1", r#"{"transport":"^2"}"#),
             "advancenet",
         )
         .unwrap();
 
-        let catalog = catalog_from_registry_indexes([
-            ("transport", &transport),
-            ("advancenet", &advancenet),
-        ])
-        .unwrap();
+        let catalog =
+            catalog_from_registry_indexes([("transport", &transport), ("advancenet", &advancenet)])
+                .unwrap();
         let resolution = resolve(
             &catalog,
             [ResolutionRequest::new("advancenet", "=4.0.1").unwrap()],
         )
         .unwrap();
 
-        assert_eq!(resolution.release("advancenet").unwrap().version.to_string(), "4.0.1");
-        assert_eq!(resolution.release("transport").unwrap().version.to_string(), "2.1.0");
+        assert_eq!(
+            resolution
+                .release("advancenet")
+                .unwrap()
+                .version
+                .to_string(),
+            "4.0.1"
+        );
+        assert_eq!(
+            resolution.release("transport").unwrap().version.to_string(),
+            "2.1.0"
+        );
         assert_eq!(
             resolution.install_order,
             vec!["transport".to_string(), "advancenet".to_string()]
