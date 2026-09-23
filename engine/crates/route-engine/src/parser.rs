@@ -1318,6 +1318,11 @@ impl Parser {
                 self.expect(TokenKind::RBracket)?;
                 Ok(Expr::Ident(name))
             }
+            TokenKind::LParen => {
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::RParen)?;
+                Ok(expr)
+            }
             TokenKind::LBrace => self.parse_object_tail(),
             TokenKind::LBracket => self.parse_array_tail(),
             other => Err(self.error_here(&format!("unexpected token in expression: {other:?}"))),
