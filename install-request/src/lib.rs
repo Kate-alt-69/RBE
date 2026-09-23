@@ -6,10 +6,12 @@
 #![forbid(unsafe_code)]
 
 mod discovery;
+mod registry;
 mod request;
 mod system_runtime;
 
 pub use discovery::*;
+pub use registry::*;
 pub use request::*;
 pub use system_runtime::*;
 
