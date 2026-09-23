@@ -2,7 +2,8 @@ use std::path::Path;
 
 use config::Config;
 use route_engine::{
-    MiddlewarePlan, PhysicalRelSource, RelcError, RuntimeImage, ServerPolicy, ServerValue, SourceId,
+    MiddlewarePlan, PhysicalRelSource, RelcError, RuntimeImage, ServerCompileError, ServerPolicy,
+    ServerValue, SourceId,
 };
 use service_runtime::ServiceCatalog;
 
@@ -34,7 +35,10 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
     let settings = effective_settings_json(config);
     let image = route_engine::compile_runtime_image(&server_source, physical.clone(), &settings)
         .map_err(|error| {
-            anyhow::anyhow!("{}", render_runtime_image_compile_error(&error, &physical))
+            anyhow::anyhow!(
+                "{}",
+                render_runtime_image_compile_error(&error, &server_source, &physical)
+            )
         })?;
     route_engine::validate_runtime_image_routes(&image)?;
     tracing::info!(
@@ -50,19 +54,60 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
     Ok(image)
 }
 
-fn render_runtime_image_compile_error(error: &RelcError, physical: &[PhysicalRelSource]) -> String {
+fn render_runtime_image_compile_error(
+    error: &RelcError,
+    server_source: &str,
+    physical: &[PhysicalRelSource],
+) -> String {
     let compiler_error = match error {
         RelcError::Parse {
             source,
             code,
             error: parse_error,
-        } => render_rel_parse_diagnostic(
-            source,
-            code,
-            parse_error,
-            error.help_url().as_str(),
-            physical,
-        ),
+        } => {
+            let code = classify_rel_diagnostic(code, &parse_error.message);
+            let help_url = rel_help_url(code);
+            render_rel_parse_diagnostic(source, code, parse_error, &help_url, physical)
+        }
+        RelcError::Server(ServerCompileError::Parse(parse_error)) => {
+            let code = classify_rel_diagnostic("REL1100", &parse_error.message);
+            let help_url = rel_help_url(code);
+            let title = friendly_parse_message(&parse_error.message);
+            let (note, hint) = parse_note_and_hint(code, &parse_error.message);
+            render_text_source_diagnostic(
+                "server.server",
+                code,
+                &title,
+                parse_error.line,
+                parse_error.column,
+                server_source,
+                note,
+                hint,
+                &help_url,
+                &parse_error.message,
+            )
+        }
+        RelcError::Server(ServerCompileError::Semantic {
+            message,
+            line,
+            column,
+        }) => {
+            let code = "REL2004";
+            let help_url = rel_help_url(code);
+            let (note, hint) = server_semantic_note_and_hint(message);
+            render_text_source_diagnostic(
+                "server.server",
+                code,
+                message,
+                *line,
+                *column,
+                server_source,
+                note,
+                hint,
+                &help_url,
+                message,
+            )
+        }
         _ => error.to_string(),
     };
 
@@ -70,6 +115,118 @@ fn render_runtime_image_compile_error(error: &RelcError, physical: &[PhysicalRel
         "RBE5100 Backend could not compile the Runtime Image.\n\nError:\n{}\n\nNote:\n  Startup stopped before the API listener was bound. Fix the compiler error above and retry.\n\nHelp:\n  {RUNTIME_IMAGE_COMPILE_HELP}",
         indent_block(&compiler_error, 2)
     )
+}
+
+fn rel_help_url(code: &str) -> String {
+    format!(
+        "https://kastrick.vercel.app/project/rbe/doc/error-codes/rel#{}",
+        code.to_ascii_lowercase()
+    )
+}
+
+fn classify_rel_diagnostic<'a>(fallback: &'a str, message: &str) -> &'a str {
+    if message.contains("malformed numeric literal") {
+        return "REL1004";
+    }
+    if message.contains("project-root path") {
+        return "REL1003";
+    }
+    if message.contains("unterminated string") || message.contains("unterminated escape") {
+        return "REL1002";
+    }
+    if message.starts_with("unexpected character")
+        || message.starts_with("single '&'")
+        || message.starts_with("single '|'")
+    {
+        return "REL1001";
+    }
+    if message.contains("duplicate ") {
+        return "REL1204";
+    }
+    if message.contains("not an HTTP verb") || message.contains("lifecycle method") {
+        return "REL1205";
+    }
+    if message.contains(":import")
+        || message.contains("import entry")
+        || message.contains("import inside")
+        || message.contains("module path, or service import")
+    {
+        return "REL1203";
+    }
+    if message.contains(":field[")
+        || message.contains(":service[")
+        || message.contains("REL directive")
+    {
+        return "REL1201";
+    }
+    if message.contains(".field source requires")
+        || message.contains("source requires")
+        || message.contains("must declare a key")
+    {
+        return "REL1206";
+    }
+    if message.contains("expected `function`")
+        || message.contains("expected `function`, `export function`, or `class`")
+        || message.contains("lifecycle class must be named")
+    {
+        return "REL1202";
+    }
+    if message.contains("class bound constants") {
+        return "REL1302";
+    }
+    if message.contains("accepts at most")
+        || message.contains("zero or one parameter")
+        || message.contains("currently accept zero or one")
+    {
+        return "REL1303";
+    }
+    if message.contains("FieldManager")
+        && (message.contains("must")
+            || message.contains("unknown")
+            || message.contains("cannot")
+            || message.contains("supports"))
+    {
+        return "REL1304";
+    }
+    if message.contains("must be true or false")
+        || message.contains("must be a non-empty string")
+        || message.contains("unknown FieldManager type")
+    {
+        return "REL1301";
+    }
+    if message.contains("unexpected token in expression: RParen")
+        || message.contains("unexpected token in expression: RBracket")
+        || message.contains("unexpected token in expression: Comma")
+        || message.contains("unexpected token in expression: Semicolon")
+        || message.contains("unexpected token in expression: RBrace")
+        || message.contains("unexpected token in expression: Eof")
+    {
+        return "REL1104";
+    }
+    if message.contains("unexpected token in expression") {
+        return "REL1101";
+    }
+    if message.contains("expected identifier") {
+        return "REL1103";
+    }
+    if message.contains("expected RParen")
+        || message.contains("expected RBracket")
+        || message.contains("expected RBrace")
+        || message.contains("expected Semicolon")
+        || message.contains("unterminated :service")
+    {
+        return "REL1102";
+    }
+    if message.contains("parameter list") || message.contains("argument list") {
+        return "REL1106";
+    }
+    if message.contains("unterminated") && message.contains("function") {
+        return "REL1107";
+    }
+    if message.contains("unexpected content") || message.contains("unexpected tokens after") {
+        return "REL1105";
+    }
+    fallback
 }
 
 fn render_rel_parse_diagnostic(
@@ -80,7 +237,7 @@ fn render_rel_parse_diagnostic(
     physical: &[PhysicalRelSource],
 ) -> String {
     let title = friendly_parse_message(&parse_error.message);
-    let (note, hint) = parse_note_and_hint(&parse_error.message);
+    let (note, hint) = parse_note_and_hint(code, &parse_error.message);
     let source = physical_source_for(source_id, physical);
 
     let Some(source) = source else {
@@ -90,23 +247,46 @@ fn render_rel_parse_diagnostic(
         );
     };
 
-    let source_line = parse_error
-        .line
+    render_text_source_diagnostic(
+        &diagnostic_path(&source.path),
+        code,
+        &title,
+        parse_error.line,
+        parse_error.column,
+        &source.source,
+        note,
+        hint,
+        help_url,
+        &parse_error.message,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_text_source_diagnostic(
+    path: &str,
+    code: &str,
+    title: &str,
+    line: usize,
+    column: usize,
+    source: &str,
+    note: &str,
+    hint: &str,
+    help_url: &str,
+    raw_message: &str,
+) -> String {
+    let source_line = line
         .checked_sub(1)
-        .and_then(|index| source.source.lines().nth(index));
-    let path = diagnostic_path(&source.path);
+        .and_then(|index| source.lines().nth(index));
     let Some(source_line) = source_line else {
         return format!(
-            "error[{code}]: {title}\n  --> {path}:{}:{}\n   |\nnote: {note}\nhint: {hint}\nhelp: {help_url}",
-            parse_error.line, parse_error.column
+            "error[{code}]: {title}\n  --> {path}:{line}:{column}\n   |\nnote: {note}\nhint: {hint}\nhelp: {help_url}"
         );
     };
 
-    let marker_column =
-        corrected_marker_column(source_line, parse_error.column, &parse_error.message);
+    let marker_column = corrected_marker_column(source_line, column, raw_message);
     let display_line = expand_tabs(source_line);
     let marker_padding = marker_padding(source_line, marker_column);
-    let line_no = parse_error.line.max(1);
+    let line_no = line.max(1);
     let width = line_no.to_string().len();
     let gutter = " ".repeat(width);
 
@@ -206,40 +386,131 @@ fn humanize_token_names(message: &str) -> String {
     })
 }
 
-fn parse_note_and_hint(message: &str) -> (&'static str, &'static str) {
-    if message.contains("unexpected token in expression: RParen") {
-        return (
-            "`)` closes the current expression, but REL was still waiting for an operand.",
-            "check for a dangling operator immediately before `)` (for example `&& )` or `|| )`) or add the missing expression.",
-        );
-    }
-    if message.contains("unexpected token in expression") {
-        return (
-            "REL expected a value or expression at the highlighted location.",
-            "check nearby operators, commas and delimiters; binary operators such as `&&` and `||` need an expression on both sides.",
-        );
-    }
-    if message.contains("expected RParen") || message.contains("expected RBracket") {
-        return (
-            "a delimited expression or argument list was not closed where the grammar expected it.",
-            "check the opening delimiter and nested expressions before the highlighted token.",
-        );
-    }
-    if message.contains("expected Semicolon") {
-        return (
-            "REL statements currently require an explicit `;` terminator.",
-            "add `;` before the highlighted token if the preceding statement is complete.",
-        );
-    }
-    if message.contains("expected identifier") {
-        return (
+fn parse_note_and_hint(code: &str, message: &str) -> (&'static str, &'static str) {
+    match code {
+        "REL1001" => (
+            "the lexer found punctuation or an operator spelling that REL does not accept.",
+            "replace the highlighted token with supported REL syntax; use `&&`/`||` rather than a single `&`/`|`.",
+        ),
+        "REL1002" => (
+            "a string or escape sequence reached the end of its valid source range before closing.",
+            "close the quoted string and verify the final escape sequence.",
+        ),
+        "REL1003" => (
+            "project-root paths must use the `$$/` prefix and name a relative target.",
+            "use a non-empty path such as `$$/generated/data.json`.",
+        ),
+        "REL1004" => (
+            "REL refuses to silently coerce malformed numeric text into another value.",
+            "rewrite the highlighted value as one valid number; for example use `1.23` instead of `1.2.3`.",
+        ),
+        "REL1102" => (
+            "a delimiter, block terminator, or explicit statement `;` is missing.",
+            "check matching `()`, `[]`, `{}` and the statement immediately before the highlighted token.",
+        ),
+        "REL1103" => (
             "this grammar position requires an identifier name.",
-            "replace the highlighted token with a valid REL identifier or check the delimiter immediately before it.",
+            "replace the highlighted token with a valid REL identifier or fix the delimiter immediately before it.",
+        ),
+        "REL1104" => (
+            "an operator is missing an operand or the expression ended before REL could complete it.",
+            "check for a dangling operator such as `&&`, `||`, a comparison, or arithmetic operator before the highlighted token.",
+        ),
+        "REL1105" => (
+            "REL completed the preceding construct but found trailing source that cannot start another valid statement/declaration.",
+            "remove the stray source or fix the preceding statement/block so parsing resumes at the intended boundary.",
+        ),
+        "REL1106" => (
+            "a parameter or argument list has invalid item/separator syntax.",
+            "verify commas, each parameter/expression, and the closing `)`.",
+        ),
+        "REL1107" => (
+            "REL could not reconstruct a complete function/class/control-flow body.",
+            "check the opening and closing braces around the highlighted declaration.",
+        ),
+        "REL1201" => (
+            "the REL directive is malformed or uses syntax not accepted by that directive.",
+            "check the directive name, brackets, fields, separators, and supported options.",
+        ),
+        "REL1202" => (
+            "this file does not match the top-level declaration shape required by its REL source role.",
+            "use the required Route/Module/Service/Field/Server declaration structure for this file.",
+        ),
+        "REL1203" => (
+            "the import declaration is syntactically malformed before RELC can resolve its target.",
+            "fix the `:import[...]` target, alias, commas, or closing bracket.",
+        ),
+        "REL1204" => (
+            "this declaration identity must be unique in its current scope.",
+            "remove the duplicate or rename one declaration/export/member/binding.",
+        ),
+        "REL1205" => (
+            "the class member name is not supported by the active REL source role.",
+            "use a supported HTTP verb for Route or a supported lifecycle member for Service.",
+        ),
+        "REL1206" => (
+            "the active REL source role requires metadata or a structural declaration that is missing.",
+            "add the required declaration shown by the compiler message.",
+        ),
+        "REL1301" => (
+            "the value exists syntactically but has the wrong literal/type shape for this construct.",
+            "replace it with one of the value types accepted by the compiler message.",
+        ),
+        "REL1302" => (
+            "this location is restricted to compile-time constants.",
+            "use a literal/array/object constant here or move dynamic work into executable REL.",
+        ),
+        "REL1303" => (
+            "this language-owned declaration/call has a fixed parameter count.",
+            "match the parameter/argument count shown by the compiler message.",
+        ),
+        "REL1304" => (
+            "the FieldManager binding combines options or a resolver mode that is not valid together.",
+            "use a supported `required`, `optional`, or `dynamic` binding shape and only its permitted options.",
+        ),
+        _ if message.contains("unexpected token in expression: RParen") => (
+            "`)` closes the current expression, but REL was still waiting for an operand.",
+            "check for a dangling operator immediately before `)` or add the missing expression.",
+        ),
+        _ if message.contains("unexpected token in expression") => (
+            "REL expected a value or expression at the highlighted location.",
+            "check nearby operators, commas and delimiters; binary operators need an expression on both sides.",
+        ),
+        _ => (
+            "the REL parser reached a token that is not valid in the current grammar position.",
+            "inspect the highlighted token and the operator or delimiter immediately before it.",
+        ),
+    }
+}
+
+fn server_semantic_note_and_hint(message: &str) -> (&'static str, &'static str) {
+    if message.contains("duplicate") {
+        return (
+            "this Server REL setting/section is unique and was declared more than once.",
+            "merge the configuration into one section or remove the duplicate declaration.",
+        );
+    }
+    if message.contains("status") {
+        return (
+            "Server REL status is a validated runtime policy value, not an arbitrary string.",
+            "use one of `online`, `maintenance`, `draining`, `readonly`, or `offline`.",
+        );
+    }
+    if message.contains("configuration block") {
+        return (
+            "this Server REL setting owns nested configuration and therefore requires `{ ... }`.",
+            "wrap the setting entries in a configuration block.",
+        );
+    }
+    if message.contains("Runtime ENV") {
+        return (
+            "Runtime ENV defaults must be deterministic values accepted during Runtime Image compilation.",
+            "use a literal or identifier value and keep each ENV default name unique.",
         );
     }
     (
-        "the REL parser reached a token that is not valid in the current grammar position.",
-        "inspect the highlighted token and the operator or delimiter immediately before it; the compiler location is where parsing could no longer continue.",
+        "server.server parsed, but the highlighted setting violates a Server REL semantic rule.",
+        "adjust the highlighted setting according to the compiler message; do not bypass ServerPolicy validation.",
     )
 }
 
@@ -574,7 +845,7 @@ mod diagnostic_tests {
     use super::*;
 
     #[test]
-    fn rel_parse_failure_renders_source_frame_note_hint_and_both_help_links() {
+    fn rel_parse_failure_renders_source_frame_note_hint_and_narrow_help_link() {
         let module = r#"export function broken(value) {
     if (value && ) {
         return true;
@@ -595,16 +866,50 @@ mod diagnostic_tests {
         )
         .expect_err("invalid REL must fail");
 
-        let rendered = render_runtime_image_compile_error(&error, &sources);
+        let rendered = render_runtime_image_compile_error(&error, "server Main {}", &sources);
         assert!(rendered.starts_with("RBE5100 "));
-        assert!(rendered.contains("error[REL1100]:"));
+        assert!(rendered.contains("error[REL1104]:"));
         assert!(rendered.contains("module/broken.module:2:"));
         assert!(rendered.contains("if (value && )"));
         assert!(rendered.contains("^ expected an expression"));
         assert!(rendered.contains("note:"));
         assert!(rendered.contains("hint:"));
-        assert!(rendered.contains("/rel#rel1100"));
+        assert!(rendered.contains("/rel#rel1104"));
         assert!(rendered.contains("/runtime#rbe5100"));
         assert!(!rendered.contains("RBE5099"));
+    }
+
+    #[test]
+    fn malformed_number_gets_specific_rel1004_diagnostic() {
+        let module = "export function broken() { return 1.2.3; }";
+        let sources = vec![PhysicalRelSource::new(
+            route_engine::RelSourceKind::Module,
+            "broken-number",
+            "module/broken-number.module",
+            module,
+        )];
+        let error = route_engine::compile_runtime_image(
+            "server Main {}",
+            sources.clone(),
+            &serde_json::json!({}),
+        )
+        .expect_err("malformed numeric literal must fail");
+        let rendered = render_runtime_image_compile_error(&error, "server Main {}", &sources);
+        assert!(rendered.contains("error[REL1004]:"));
+        assert!(rendered.contains("malformed numeric literal"));
+        assert!(rendered.contains("/rel#rel1004"));
+    }
+
+    #[test]
+    fn server_semantic_failure_gets_source_frame() {
+        let server = "server Main {\n    status bananas;\n}\n";
+        let error = route_engine::compile_runtime_image(server, Vec::new(), &serde_json::json!({}))
+            .expect_err("invalid Server REL status must fail");
+        let rendered = render_runtime_image_compile_error(&error, server, &[]);
+        assert!(rendered.contains("error[REL2004]:"));
+        assert!(rendered.contains("server.server:2:"));
+        assert!(rendered.contains("status bananas;"));
+        assert!(rendered.contains("online"));
+        assert!(rendered.contains("/rel#rel2004"));
     }
 }

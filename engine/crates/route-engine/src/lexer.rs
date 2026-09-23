@@ -269,7 +269,7 @@ impl<'a> Lexer<'a> {
                     TokenKind::Percent
                 }
                 '"' | '\'' => self.read_string(c, line, column)?,
-                c if c.is_ascii_digit() => self.read_number(),
+                c if c.is_ascii_digit() => self.read_number(line, column)?,
                 c if c.is_alphabetic() || c == '_' => {
                     self.read_ident_or_keyword(recognize_keywords)
                 }
@@ -378,7 +378,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_number(&mut self) -> TokenKind {
+    fn read_number(&mut self, line: usize, column: usize) -> Result<TokenKind, LexError> {
         let mut out = String::new();
         while let Some(&c) = self.chars.peek() {
             if c.is_ascii_digit() || c == '.' {
@@ -388,7 +388,19 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        TokenKind::Number(out.parse().unwrap_or(0.0))
+        let number = out.parse::<f64>().map_err(|_| LexError {
+            message: format!("malformed numeric literal {out:?}"),
+            line,
+            column,
+        })?;
+        if !number.is_finite() {
+            return Err(LexError {
+                message: format!("malformed numeric literal {out:?}"),
+                line,
+                column,
+            });
+        }
+        Ok(TokenKind::Number(number))
     }
 
     fn read_ident_or_keyword(&mut self, recognize_keywords: bool) -> TokenKind {
@@ -476,5 +488,15 @@ mod tests {
         assert!(tokens.iter().any(|token| {
             matches!(&token.kind, TokenKind::ProjectPath(path) if path == "$$/generated/data.json")
         }));
+    }
+
+    #[test]
+    fn malformed_numeric_literal_is_an_error_not_zero() {
+        let error = Lexer::new("const value = 1.2.3;")
+            .tokenize()
+            .expect_err("malformed numeric literal must fail closed");
+        assert_eq!(error.line, 1);
+        assert_eq!(error.column, 15);
+        assert!(error.message.contains("malformed numeric literal"));
     }
 }
