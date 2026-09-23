@@ -1,0 +1,41 @@
+name: Library Registry CI
+
+on:
+  push:
+    paths:
+      - 'library-registry/**'
+      - 'install-request/**'
+      - 'library-resolver/**'
+      - '.github/workflows/library-registry-ci.yml'
+  pull_request:
+    paths:
+      - 'library-registry/**'
+      - 'install-request/**'
+      - 'library-resolver/**'
+      - '.github/workflows/library-registry-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  library-registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: library-registry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: library-registry
+      - name: fmt check
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
