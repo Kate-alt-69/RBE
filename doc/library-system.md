@@ -1,6 +1,6 @@
 # RBE External Library & Project Package System
 
-Status: current package/install contracts on `main`, implemented through LIB-017. Some final Backend CLI/worker wiring remains integration work and is called out explicitly below.
+Status: current package/install contracts on `main`, implemented through LIB-018. Some final Backend CLI/worker wiring remains integration work and is called out explicitly below.
 
 This document is the authoritative overview for the current external-library and project-package architecture. It distinguishes implemented contract/runtime behavior from planned UX so old design text does not override code.
 
@@ -293,7 +293,34 @@ The request grammar supports one install surface for packages, SDKs, runtimes, r
 
 The `install-request` crate is intentionally source-only: it parses/validates requests and produces discovery/runtime plans but performs no network I/O, process spawning, PATH mutation, or machine-wide install itself.
 
-That distinction matters. The request grammar, resolver/install contracts, cache/attestation/execution/session plans, and LIB-017 hydration contracts are implemented. Full Backend command execution must wire those trusted plans together; documentation must not claim the complete end-to-end CLI path is finished merely because the underlying planning crates exist.
+That distinction matters. The request grammar, resolver/install contracts, cache/attestation/execution/session plans, LIB-017 hydration contracts, and LIB-018 typed registry bridge are implemented. Full Backend command execution must wire those trusted plans together; documentation must not claim the complete end-to-end CLI path is finished merely because the underlying planning crates exist.
+
+### 10.1 Typed package registry and resolver bridge (LIB-018)
+
+Public package index metadata now has a typed source-only contract in `rbe-install-request`. The contract validates the requested package identity and release metadata, including artifact source, SHA-256 and byte-size pins, before the metadata can be consumed downstream.
+
+The boundary is intentionally split:
+
+```text
+registry response bytes
+        |
+        v
+rbe-install-request::registry
+  parse + validate wire/trust metadata
+        |
+        v
+rbe-library-registry
+  source-only adapter
+  transactional catalog ingestion
+        |
+        v
+rbe-library-resolver
+  deterministic semver solving only
+```
+
+The resolver does not know registry URLs, JSON structure or artifact hashes. Conversely, registry artifact trust data is not discarded from the validated registry object merely because it is irrelevant to dependency solving; download/verification code consumes those pins later at the artifact boundary.
+
+Registry-to-catalog ingestion is all-or-nothing. If any release cannot be represented by the resolver, the caller's existing resolver catalog remains unchanged rather than exposing a partially imported package index.
 
 External index discovery contracts include the website-native RBE index forms, Kastrick resolution/observation endpoints, and the `rbe.sys.python` `index-discovery-v1` scraper fallback. Scraper output is discovery data only: trusted Rust still validates origin, metadata, artifact identity, package structure, capabilities, and activation gates.
 
@@ -311,6 +338,8 @@ Bun/Node.js   sdk/js
 Python        sdk/python
 Other         Protocol v1 directly or through a language wrapper
 ```
+
+The Rust, JavaScript/Bun/Node.js, Python and shared Protocol v1 source surfaces are present in the repository. Publishing reproducible downloadable SDK artifacts (for example crate/package archives and Python wheels/sdists) and binding their final registry URLs/hashes remains distribution/integration work rather than a missing protocol design.
 
 Host capabilities remain policy-checked operations such as `net:*`, router operations, storage and crypto rather than raw access to Backend internals.
 
@@ -371,6 +400,7 @@ The current package-system foundation has advanced through these layers:
 6. **LIB-015** — safe source extraction and deterministic source-tree identity.
 7. **LIB-016** — durable project install session, exclusive lease and atomic lockfile activation.
 8. **LIB-017** — controlled build-dependency hydration followed by network-dead package builds.
+9. **LIB-018** — typed package-registry metadata and a transactional source-only bridge into the deterministic resolver.
 
 ## 16. Remaining integration work
 
@@ -379,7 +409,7 @@ The major remaining work is not to redesign the package trust model again. It is
 - execute the full install plan from request → resolve → hydrate → build → attest → activate;
 - persist/validate hydration receipts at the orchestration boundary;
 - connect worker/Library Protocol admission to the activated project lock;
-- finish public registry/publishing UX and external-index integrations;
+- finish public registry publishing/artifact-distribution UX and external-index integrations;
 - expand capability bridges without weakening the package/process boundary.
 
 When implementation and this document diverge, the implementation on `main` wins and this document should be updated in the same change.

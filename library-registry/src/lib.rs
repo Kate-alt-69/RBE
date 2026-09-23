@@ -14,15 +14,22 @@ use rbe_library_resolver::{PackageCatalog, PackageRelease, ResolveError};
 /// The response identity is validated against `expected_package` before any
 /// release metadata reaches the solver. Artifact pins remain in the validated
 /// registry object and are intentionally not copied into resolver state.
+///
+/// Catalog mutation is transactional: either every release is accepted by the
+/// resolver or the caller's existing catalog is left unchanged.
 pub fn add_registry_index(
     catalog: &mut PackageCatalog,
     expected_package: &str,
     index: &RegistryPackageIndex,
 ) -> Result<(), RegistryBridgeError> {
     index.validate_for(expected_package)?;
+
+    let mut staged = catalog.clone();
     for release in &index.releases {
-        catalog.add(to_resolver_release(expected_package, release)?)?;
+        staged.add(to_resolver_release(expected_package, release)?)?;
     }
+
+    *catalog = staged;
     Ok(())
 }
 
@@ -150,5 +157,30 @@ mod tests {
             error,
             RegistryBridgeError::Resolve(ResolveError::InvalidVersion { .. })
         ));
+    }
+
+    #[test]
+    fn failed_registry_ingestion_does_not_partially_mutate_catalog() {
+        let mut index = RegistryPackageIndex::parse_json(
+            &index_json("advancenet", "4.0.1", "{}"),
+            "advancenet",
+        )
+        .unwrap();
+        let invalid = RegistryPackageIndex::parse_json(
+            &index_json("advancenet", "not-semver", "{}"),
+            "advancenet",
+        )
+        .unwrap();
+        index.releases.extend(invalid.releases);
+
+        let mut catalog = PackageCatalog::default();
+        let before = catalog.clone();
+        let error = add_registry_index(&mut catalog, "advancenet", &index).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RegistryBridgeError::Resolve(ResolveError::InvalidVersion { .. })
+        ));
+        assert_eq!(catalog, before);
     }
 }
