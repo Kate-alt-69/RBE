@@ -196,8 +196,10 @@ impl Parser {
             optional: false,
             value_type: FieldValueType::String,
         };
+        let mut seen_options = HashSet::new();
         while !self.check(&TokenKind::RBracket) {
             let name = self.expect_ident()?;
+            self.register_field_directive_option(&mut seen_options, &name)?;
             self.expect(TokenKind::Eq)?;
             self.apply_field_directive_option(&mut directive, &name)?;
             if self.check(&TokenKind::Comma) {
@@ -223,14 +225,36 @@ impl Parser {
             optional: false,
             value_type: FieldValueType::String,
         };
+        let mut seen_options = HashSet::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
             let option = self.expect_ident()?;
+            self.register_field_directive_option(&mut seen_options, &option)?;
             self.expect(TokenKind::Eq)?;
             self.apply_field_directive_option(&mut directive, &option)?;
             self.expect(TokenKind::Semicolon)?;
         }
         self.expect(TokenKind::RBrace)?;
         Ok(directive)
+    }
+
+    fn register_field_directive_option(
+        &self,
+        seen_options: &mut HashSet<String>,
+        name: &str,
+    ) -> Result<(), ParseError> {
+        if !seen_options.insert(name.to_string()) {
+            return Err(
+                self.error_here(&format!("duplicate FieldManager metadata option {name:?}"))
+            );
+        }
+        if (name == "required" && seen_options.contains("optional"))
+            || (name == "optional" && seen_options.contains("required"))
+        {
+            return Err(self.error_here(
+                "FieldManager metadata cannot declare both `required` and `optional`",
+            ));
+        }
+        Ok(())
     }
 
     fn apply_field_directive_option(

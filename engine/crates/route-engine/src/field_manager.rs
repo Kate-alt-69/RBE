@@ -1207,4 +1207,41 @@ mod tests {
             .contains("duplicate FieldManager resolver option"));
         assert!(error.message.contains("source"));
     }
+
+    #[test]
+    fn field_metadata_rejects_duplicate_options_in_both_syntaxes() {
+        for source in [
+            r#":field[source = query, source = body, key = "value"]"#,
+            r#"field {
+                   source = query;
+                   source = body;
+                   key = "value";
+               }"#,
+        ] {
+            let tokens = Lexer::new(source).tokenize().unwrap();
+            let error = Parser::new(tokens).parse_field_file().unwrap_err();
+            assert!(error
+                .message
+                .contains("duplicate FieldManager metadata option"));
+            assert!(error.message.contains("source"));
+        }
+    }
+
+    #[test]
+    fn field_metadata_rejects_required_optional_alias_collisions() {
+        for source in [
+            r#":field[required = true, optional = false, key = "value"]"#,
+            r#"field {
+                   optional = true;
+                   required = false;
+                   key = "value";
+               }"#,
+        ] {
+            let tokens = Lexer::new(source).tokenize().unwrap();
+            let error = Parser::new(tokens).parse_field_file().unwrap_err();
+            assert!(error
+                .message
+                .contains("cannot declare both `required` and `optional`"));
+        }
+    }
 }
