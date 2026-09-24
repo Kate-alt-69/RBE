@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
-use sdk_package::{check_package, find_package_root, CheckedPackage, PACKAGE_MANIFEST};
+use anyhow::{bail, Result};
+use sdk_package::{check_package, CheckedPackage, PACKAGE_MANIFEST};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
