@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use sdk_package::{check_package, CheckedPackage, PACKAGE_MANIFEST};
+use sdk_package::{check_package, check_target, CheckedPackage, PACKAGE_MANIFEST};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ fn run() -> Result<()> {
     match command.as_str() {
         "check" => {
             let target = target_from(&args, 0)?;
-            let package = check_package(target)?;
+            let package = check_target(target)?;
             print_check(&package);
         }
         "compile" => {
@@ -45,7 +45,7 @@ fn run() -> Result<()> {
         }
         "info" => {
             let target = target_from(&args, 0)?;
-            let package = check_package(target)?;
+            let package = check_target(target)?;
             println!("{}", serde_json::to_string_pretty(&package.index())?);
         }
         unknown => bail!("unknown RPX command {unknown:?}"),
@@ -65,17 +65,28 @@ fn target_from(args: &[String], index: usize) -> Result<PathBuf> {
 }
 
 fn compile(target: PathBuf) -> Result<()> {
-    let package = check_package(&target)?;
+    let package = check_target(&target)?;
     let cache = package.root.join(".cache").join("rbe").join("build");
     fs::create_dir_all(&cache)?;
-    let index_path = cache.join("package-index.json");
+
+    let index_name = if package.components.len() == 1 && is_component_target(&package, &target) {
+        format!("component-{}.json", package.components[0].name)
+    } else {
+        "package-index.json".to_string()
+    };
+    let index_path = cache.join(index_name);
     fs::write(&index_path, serde_json::to_vec_pretty(&package.index())?)?;
 
     print_check(&package);
     println!("\nCOMPILE OK");
     println!("  index: {}", index_path.display());
+    if package.components.len() == 1 && is_component_target(&package, &target) {
+        println!("  scope: component/{}", package.components[0].name);
+    } else {
+        println!("  scope: complete package");
+    }
     println!(
-        "  note: component source syntax compilation is delegated to the installed {} SDK compiler",
+        "  note: source syntax/type compilation is delegated to the installed {} SDK compiler",
         language_name(package.manifest.package.language)
     );
     Ok(())
@@ -101,8 +112,32 @@ fn compile_package(target: PathBuf) -> Result<()> {
     print_check(&package);
     println!("\nPACKAGE OK");
     println!("  artifact: {}", archive_path.display());
-    println!("  transitive RBE dependencies: private to this package graph");
+    println!("  scope: complete package");
+    println!("  transitive RBE dependencies: package-private graph");
     Ok(())
+}
+
+fn is_component_target(package: &CheckedPackage, target: &Path) -> bool {
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(target),
+            Err(_) => return false,
+        }
+    };
+    let Ok(target) = target.canonicalize() else {
+        return false;
+    };
+    let component_root = package.root.join(&package.manifest.components.root);
+    let Ok(component_root) = component_root.canonicalize() else {
+        return false;
+    };
+    target
+        .strip_prefix(component_root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some()
 }
 
 fn append_tree(
@@ -165,7 +200,7 @@ fn print_check(package: &CheckedPackage) {
         "  language: {}",
         language_name(package.manifest.package.language)
     );
-    println!("  components: {}", package.components.len());
+    println!("  components checked: {}", package.components.len());
     for component in &package.components {
         println!("    ✓ {} -> {}", component.name, component.source.display());
     }
@@ -195,7 +230,7 @@ fn render_error(error: &anyhow::Error) {
     eprintln!();
     eprintln!("{error:#}");
     eprintln!();
-    eprintln!("HINT : run `rpx check .` from a directory containing {PACKAGE_MANIFEST} and make sure every components/<name>/ folder contains <name>.<language-extension>.");
+    eprintln!("HINT : run `rpx check .` for the complete package or `rpx check components/<name>` for one component. Every exported component folder must contain <name>.<language-extension>, and the package root must contain {PACKAGE_MANIFEST}.");
 }
 
 fn print_help() {
@@ -209,6 +244,7 @@ Usage:\n\
   rpx package [path]\n\
   rpx info [path]\n\n\
 `path` defaults to the current directory. RPX walks upward until it finds package.rbe.toml.\n\
+A path inside components/<name>/ checks/compiles only that component.\n\
 Package exports are discovered from components/<name>/<name>.<ext>."
     );
 }
