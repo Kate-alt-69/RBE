@@ -1,7 +1,7 @@
 //! Recursive-descent / precedence parser for the RBE `.route` language.
 //! The parser is intentionally strict and reports line/column information.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     BinaryOp, Expr, FieldBinding, FieldBindingMode, FieldDirective, FieldFile, FieldValueType,
@@ -331,10 +331,16 @@ impl Parser {
         let mut default = None;
         let mut strip_prefix = false;
         let mut max_matches = DEFAULT_DYNAMIC_FIELD_MATCHES;
+        let mut seen_options = HashSet::new();
         while self.check(&TokenKind::Comma) {
             self.advance();
             let option = self.expect_ident()?;
             self.expect(TokenKind::Eq)?;
+            if !seen_options.insert(option.clone()) {
+                return Err(self.error_here(&format!(
+                    "duplicate FieldManager resolver option {option:?}"
+                )));
+            }
             match option.as_str() {
                 "source" => source = self.parse_field_source()?,
                 "type" => value_type = self.parse_field_type()?,
@@ -378,18 +384,22 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RParen)?;
-        if mode == FieldBindingMode::Required && default.is_some() {
+        if mode == FieldBindingMode::Required && seen_options.contains("default") {
             return Err(self.error_here("required(...) cannot declare a default"));
         }
-        if mode == FieldBindingMode::Dynamic
-            && (default.is_some() || value_type != FieldValueType::String)
-        {
-            return Err(self.error_here(
-                "dynamic(...) supports stripPrefix and maxMatches only; dynamic values stay strings",
-            ));
-        }
-        if mode != FieldBindingMode::Dynamic && max_matches != DEFAULT_DYNAMIC_FIELD_MATCHES {
-            return Err(self.error_here("maxMatches is only valid for dynamic(...)"));
+        if mode == FieldBindingMode::Dynamic {
+            if seen_options.contains("default") || seen_options.contains("type") {
+                return Err(self.error_here(
+                    "dynamic(...) supports source, stripPrefix, and maxMatches only; dynamic values stay strings",
+                ));
+            }
+        } else {
+            if seen_options.contains("stripPrefix") {
+                return Err(self.error_here("stripPrefix is only valid for dynamic(...)"));
+            }
+            if seen_options.contains("maxMatches") {
+                return Err(self.error_here("maxMatches is only valid for dynamic(...)"));
+            }
         }
         Ok(FieldBinding {
             name,

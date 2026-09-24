@@ -1170,4 +1170,41 @@ mod tests {
         };
         assert!(tracking.is_empty());
     }
+
+    #[test]
+    fn resolver_options_fail_closed_when_used_by_the_wrong_mode() {
+        let error_for = |binding: &str| {
+            let source = format!(
+                ":import[field]\nfields {{ value = {binding}; }}\nclass Route {{ get(req) {{ return req.fields; }} }}"
+            );
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            Parser::new(tokens).parse_file().unwrap_err()
+        };
+
+        let error = error_for(r#"optional("page", maxMatches = 64)"#);
+        assert!(error
+            .message
+            .contains("maxMatches is only valid for dynamic"));
+
+        let error = error_for(r#"required("page", stripPrefix = false)"#);
+        assert!(error
+            .message
+            .contains("stripPrefix is only valid for dynamic"));
+
+        let error = error_for(r#"dynamic("utm_", type = string)"#);
+        assert!(error.message.contains("dynamic(...) supports source"));
+    }
+
+    #[test]
+    fn resolver_options_reject_duplicates_instead_of_last_value_wins() {
+        let source = r#":import[field]
+            fields { value = optional("page", source = query, source = body); }
+            class Route { get(req) { return req.fields; } }"#;
+        let tokens = Lexer::new(source).tokenize().unwrap();
+        let error = Parser::new(tokens).parse_file().unwrap_err();
+        assert!(error
+            .message
+            .contains("duplicate FieldManager resolver option"));
+        assert!(error.message.contains("source"));
+    }
 }
