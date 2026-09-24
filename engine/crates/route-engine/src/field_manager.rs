@@ -103,6 +103,7 @@ impl FieldRuntimeContext {
                 };
                 dynamic_values(
                     &self.query,
+                    "query",
                     key,
                     strip_prefix,
                     DEFAULT_DYNAMIC_FIELD_MATCHES,
@@ -323,6 +324,7 @@ fn resolve_binding(
         return match values {
             Some(values) => dynamic_values(
                 values,
+                &binding.source,
                 &binding.lookup,
                 binding.strip_prefix,
                 binding.max_matches,
@@ -433,15 +435,32 @@ impl std::fmt::Display for DynamicValuesError {
     }
 }
 
+fn dynamic_suffix<'a>(key: &'a str, source: &str, prefix: &str) -> Option<&'a str> {
+    if source == "header" {
+        let candidate = key.get(..prefix.len())?;
+        if candidate.eq_ignore_ascii_case(prefix) {
+            key.get(prefix.len()..)
+        } else {
+            None
+        }
+    } else {
+        key.strip_prefix(prefix)
+    }
+}
+
 fn dynamic_values(
     values: &HashMap<String, Value>,
+    source: &str,
     prefix: &str,
     strip_prefix: bool,
     max_matches: usize,
 ) -> Result<HashMap<String, Value>, DynamicValuesError> {
     // Count before inspecting value types so overflow always wins regardless of
     // HashMap iteration order. Dynamic families are bounded before output work.
-    let matched = values.keys().filter(|key| key.starts_with(prefix)).count();
+    let matched = values
+        .keys()
+        .filter(|key| dynamic_suffix(key, source, prefix).is_some())
+        .count();
     if matched > max_matches {
         return Err(DynamicValuesError::TooMany {
             prefix: prefix.to_string(),
@@ -453,7 +472,7 @@ fn dynamic_values(
     // a stable diagnostic even though request objects are stored in a HashMap.
     if let Some(key) = values
         .iter()
-        .filter(|(key, _)| key.starts_with(prefix))
+        .filter(|(key, _)| dynamic_suffix(key, source, prefix).is_some())
         .filter(|(_, value)| !matches!(value, Value::String(_)))
         .map(|(key, _)| key)
         .min()
@@ -463,7 +482,7 @@ fn dynamic_values(
 
     let mut output = HashMap::with_capacity(matched);
     for (key, value) in values {
-        let Some(suffix) = key.strip_prefix(prefix) else {
+        let Some(suffix) = dynamic_suffix(key, source, prefix) else {
             continue;
         };
         let Value::String(value) = value else {
@@ -1078,5 +1097,77 @@ mod tests {
         let error = block_on_ready(plan.resolve(&request, &program)).unwrap_err();
         assert_eq!(error.code, "FLD4004");
         assert!(error.message.contains("more than 1 fields"));
+    }
+
+    #[test]
+    fn header_dynamic_prefixes_are_ascii_case_insensitive() {
+        let route = route(
+            r#":import[field]
+               fields { trace = dynamic("X-Trace-", source = header, stripPrefix = true); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        let request = Value::Object(HashMap::from([
+            ("query".into(), Value::Object(HashMap::new())),
+            ("params".into(), Value::Object(HashMap::new())),
+            (
+                "headers".into(),
+                Value::Object(HashMap::from([
+                    ("x-trace-id".into(), Value::String("abc".into())),
+                    ("x-trace-span".into(), Value::String("root".into())),
+                    (
+                        "content-type".into(),
+                        Value::String("application/json".into()),
+                    ),
+                ])),
+            ),
+            ("cookies".into(), Value::Object(HashMap::new())),
+            ("body".into(), Value::Null),
+        ]));
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("dynamic-header-case");
+        let context = block_on_ready(plan.resolve(&request, &program)).unwrap();
+        let Value::Object(trace) = context.call("trace", &[]).unwrap() else {
+            panic!("expected trace object");
+        };
+        assert!(matches!(trace.get("id"), Some(Value::String(value)) if value == "abc"));
+        assert!(matches!(trace.get("span"), Some(Value::String(value)) if value == "root"));
+        assert_eq!(trace.len(), 2);
+    }
+
+    #[test]
+    fn non_header_dynamic_prefixes_remain_case_sensitive() {
+        let route = route(
+            r#":import[field]
+               fields { tracking = dynamic("utm_"); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        let request = Value::Object(HashMap::from([
+            (
+                "query".into(),
+                Value::Object(HashMap::from([(
+                    "UTM_source".into(),
+                    Value::String("chat".into()),
+                )])),
+            ),
+            ("params".into(), Value::Object(HashMap::new())),
+            ("headers".into(), Value::Object(HashMap::new())),
+            ("cookies".into(), Value::Object(HashMap::new())),
+            ("body".into(), Value::Null),
+        ]));
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("dynamic-query-case");
+        let context = block_on_ready(plan.resolve(&request, &program)).unwrap();
+        let Value::Object(tracking) = context.call("tracking", &[]).unwrap() else {
+            panic!("expected tracking object");
+        };
+        assert!(tracking.is_empty());
     }
 }
