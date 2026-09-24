@@ -1,0 +1,62 @@
+name: Finalize FLD-006 Bounded Dynamic Fields
+
+on:
+  push:
+    branches:
+      - ci/fld-006-bounded-dynamic-20260924
+    paths:
+      - ".github/patches/fld-006-bounded-dynamic.py"
+      - ".github/workflows/fld-006-finalize.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/fld-006-bounded-dynamic-20260924
+          fetch-depth: 2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply FLD-006
+        run: python .github/patches/fld-006-bounded-dynamic.py
+
+      - name: Format and check route-engine
+        working-directory: engine
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check -p route-engine
+
+      - name: Clippy route-engine
+        working-directory: engine
+        run: cargo clippy -p route-engine --all-targets -- -D warnings
+
+      - name: Test route-engine
+        working-directory: engine
+        run: cargo test -p route-engine
+
+      - name: Commit verified FLD-006 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add engine/crates/route-engine/src/ast.rs \
+                  engine/crates/route-engine/src/parser.rs \
+                  engine/crates/route-engine/src/field_manager.rs \
+                  doc/field-manager.md
+          git diff --cached --quiet && { echo "FLD-006 produced no source diff"; exit 1; }
+          git commit -m "FEAT | FLD-006 bound dynamic FieldManager families"
+          git push origin HEAD:ci/fld-006-bounded-dynamic-20260924
