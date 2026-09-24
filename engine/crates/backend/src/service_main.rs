@@ -18,6 +18,44 @@ mod service_integrity {
     include!(concat!(env!("OUT_DIR"), "/service_integrity.rs"));
 }
 
+// `error_code_book` is shared with backend.exe and therefore contains the
+// public `backend check` routing path. The Service executable must never gain
+// backend Runtime Image compilation authority just to compile that shared
+// source. This fail-closed shim satisfies the shared type surface while making
+// accidental `service check` use terminate before any Service runtime starts.
+mod runtime_image_boot {
+    pub struct UnsupportedRuntimeImage {
+        pub image_id: String,
+        pub source_hash: String,
+        pub routes: Vec<()>,
+        pub modules: Vec<()>,
+        pub services: Vec<()>,
+        pub server_policy: (),
+        pub middleware_plan: (),
+    }
+
+    pub fn compile<T>(
+        _config: &config::Config,
+        _catalog: Option<&T>,
+    ) -> anyhow::Result<UnsupportedRuntimeImage> {
+        anyhow::bail!("RBE package preflight is only available from backend.exe")
+    }
+
+    pub fn apply_server_policy(
+        _config: &mut config::Config,
+        _policy: &(),
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("RBE package preflight is only available from backend.exe")
+    }
+
+    pub fn apply_middleware_plan(
+        _config: &mut config::Config,
+        _plan: &(),
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("RBE package preflight is only available from backend.exe")
+    }
+}
+
 // er_recovery is shared source with backend for now, but service.exe only needs
 // the already-issued in-memory CONTROL key type. Keeping this tiny shim here
 // prevents Linux HostBootstrap/keyring/package-manager code from entering the
