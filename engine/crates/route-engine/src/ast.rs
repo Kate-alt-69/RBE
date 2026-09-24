@@ -76,6 +76,7 @@ pub struct FieldDirective {
 pub struct FieldBinding {
     pub name: String,
     pub lookup: String,
+    pub source: String,
     pub mode: FieldBindingMode,
     pub value_type: FieldValueType,
     pub default: Option<Value>,

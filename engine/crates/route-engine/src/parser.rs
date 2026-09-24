@@ -126,7 +126,7 @@ impl Parser {
                 while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
                     let name = self.expect_ident()?;
                     self.expect(TokenKind::Eq)?;
-                    let binding = self.parse_field_binding(name)?;
+                    let binding = self.parse_field_binding(name, &directive.source)?;
                     self.expect(TokenKind::Semicolon)?;
                     if bindings
                         .iter()
@@ -239,15 +239,7 @@ impl Parser {
         name: &str,
     ) -> Result<(), ParseError> {
         match name {
-            "source" => {
-                let source = self.expect_ident()?;
-                if source != "query" {
-                    return Err(
-                        self.error_here("FieldManager source currently supports only `query`")
-                    );
-                }
-                directive.source = source;
-            }
+            "source" => directive.source = self.parse_field_source()?,
             "key" => match self.advance().kind {
                 TokenKind::String(value) if !value.is_empty() => directive.key = Some(value),
                 other => {
@@ -289,6 +281,16 @@ impl Parser {
         Ok(())
     }
 
+    fn parse_field_source(&mut self) -> Result<String, ParseError> {
+        let source = self.expect_ident()?;
+        match source.as_str() {
+            "query" | "body" | "param" | "header" | "cookie" => Ok(source),
+            other => Err(self.error_here(&format!(
+                "unknown FieldManager source {other:?}; expected query, body, param, header, or cookie"
+            ))),
+        }
+    }
+
     fn parse_field_type(&mut self) -> Result<FieldValueType, ParseError> {
         match self.expect_ident()?.as_str() {
             "string" => Ok(FieldValueType::String),
@@ -300,7 +302,11 @@ impl Parser {
         }
     }
 
-    fn parse_field_binding(&mut self, name: String) -> Result<FieldBinding, ParseError> {
+    fn parse_field_binding(
+        &mut self,
+        name: String,
+        default_source: &str,
+    ) -> Result<FieldBinding, ParseError> {
         let mode = match self.expect_ident()?.as_str() {
             "required" => FieldBindingMode::Required,
             "optional" => FieldBindingMode::Optional,
@@ -320,6 +326,7 @@ impl Parser {
                 )));
             }
         };
+        let mut source = default_source.to_string();
         let mut value_type = FieldValueType::String;
         let mut default = None;
         let mut strip_prefix = false;
@@ -328,6 +335,7 @@ impl Parser {
             let option = self.expect_ident()?;
             self.expect(TokenKind::Eq)?;
             match option.as_str() {
+                "source" => source = self.parse_field_source()?,
                 "type" => value_type = self.parse_field_type()?,
                 "default" => {
                     let expr = self.parse_expression()?;
@@ -365,6 +373,7 @@ impl Parser {
         Ok(FieldBinding {
             name,
             lookup,
+            source,
             mode,
             value_type,
             default,
@@ -730,7 +739,7 @@ impl Parser {
                 )));
             }
             self.expect(TokenKind::Eq)?;
-            let binding = self.parse_field_binding(name)?;
+            let binding = self.parse_field_binding(name, "query")?;
             self.expect(TokenKind::Semicolon)?;
             if bindings
                 .iter()

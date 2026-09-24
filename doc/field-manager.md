@@ -1,6 +1,6 @@
 # FieldManager
 
-FieldManager is RBE's typed URL/query-field layer. `.field` is a first-class REL source with normal shared REL expression grammar but a deliberately restricted capability surface.
+FieldManager is RBE's typed request-field layer. `.field` is a first-class REL source with normal shared REL expression grammar but a deliberately restricted capability surface.
 
 ## Imports
 
@@ -117,3 +117,49 @@ class Route {
 The block is intentionally declarative: it reuses the same `required(...)`, `optional(...)`, `dynamic(...)`, coercion, default, and structured failure behavior as reusable `.field` files. It requires the direct `:import[field]` namespace import, may appear once per Route, and cannot reuse the reserved direct helper names `required`, `optional`, `has`, or `dynamic`.
 
 Inline and reusable FieldManager names share one per-Route namespace. A collision fails closed instead of silently shadowing one resolver. Field-backed Routes continue to use the linked evaluator path until native Route-WASM can consume the same pre-resolved Field context without creating a second resolution model.
+
+
+## Multi-source fields (FLD-004)
+
+FieldManager can resolve from the immutable request snapshot without re-parsing the HTTP request. Supported declarative sources are:
+
+```text
+query
+body
+param
+header
+cookie
+```
+
+A reusable `.field` chooses its default source in metadata:
+
+```text
+:field[source = header, key = "authorization", optional = true]
+```
+
+Declarative bindings inherit that source, while an individual binding may override it:
+
+```text
+:field[source = body, optional = true]
+resolve {
+    email = required("email");
+    trace = optional("x-trace-id", source = header);
+}
+```
+
+Route-local fields default to query for compatibility and can select a source per binding:
+
+```text
+:import[field]
+
+fields {
+    id = required("id", source = param);
+    token = required("Authorization", source = header);
+    session = optional("session", source = cookie);
+    enabled = optional("enabled", source = body, type = bool, default = false);
+}
+```
+
+Header lookup is ASCII case-insensitive. Named `body` bindings require a JSON object; an empty body behaves like a missing object so optional/default bindings still work. `body` integer and boolean fields may use native JSON numbers/booleans or their string forms. A `.field` with `source = body` and no key receives the complete body value in `resolve(raw, context)`, including non-object JSON or text bodies.
+
+The direct helpers `field.required(...)`, `field.optional(...)`, `field.has(...)`, and `field.dynamic(...)` intentionally remain query shorthands. Use declarative bindings when selecting another source so source ownership remains visible in compiled Field IR.

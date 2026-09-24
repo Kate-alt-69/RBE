@@ -1,6 +1,6 @@
 //! Request-time FieldManager resolution.
 //!
-//! Query parsing remains owned by the HTTP edge. This layer consumes the
+//! Request parsing remains owned by the HTTP edge. This layer consumes the
 //! immutable REL request snapshot, applies validated `.field` programs once,
 //! and exposes the same resolved values to the Route `field` namespace.
 
@@ -195,7 +195,7 @@ impl FieldRoutePlan {
         let mut resolved = HashMap::new();
         let mut allowed_resolvers = HashSet::new();
         for binding in &self.inline_bindings {
-            let value = resolve_binding(&query, binding, "route-local")?;
+            let value = resolve_binding(request, binding, "route-local")?;
             resolved.insert(binding.name.clone(), value);
             allowed_resolvers.insert(binding.name.clone());
         }
@@ -230,43 +230,51 @@ async fn resolve_field_file(
     program: &ModuleProgram,
     resolver_name: &str,
 ) -> Result<Value, FieldResolveError> {
-    let query = request_query(request)?;
-
     if !file.bindings.is_empty() {
         let mut output = HashMap::with_capacity(file.bindings.len());
         for binding in &file.bindings {
             output.insert(
                 binding.name.clone(),
-                resolve_binding(query, binding, resolver_name)?,
+                resolve_binding(request, binding, resolver_name)?,
             );
         }
         return Ok(Value::Object(output));
     }
 
     let raw = if let Some(key) = file.directive.key.as_deref() {
-        match query.get(key) {
-            Some(value) => match coerce_value(value, file.directive.value_type) {
-                Ok(value) => value,
-                Err(_) if file.directive.optional => Value::Null,
-                Err(message) => {
-                    return Err(resolve_error(
-                        "FLD4002",
-                        resolver_name,
-                        format!("query field {key:?} is invalid: {message}"),
-                    ));
+        let values = request_source_map(request, &file.directive.source, resolver_name)?;
+        let value = values.and_then(|values| source_lookup(values, &file.directive.source, key));
+        match value {
+            Some(value) => {
+                match coerce_value(value, file.directive.value_type, &file.directive.source) {
+                    Ok(value) => value,
+                    Err(_) if file.directive.optional => Value::Null,
+                    Err(message) => {
+                        return Err(resolve_error(
+                            "FLD4002",
+                            resolver_name,
+                            format!(
+                                "{} field {key:?} is invalid: {message}",
+                                file.directive.source
+                            ),
+                        ));
+                    }
                 }
-            },
+            }
             None if file.directive.optional => Value::Null,
             None => {
                 return Err(resolve_error(
                     "FLD4001",
                     resolver_name,
-                    format!("required query field {key:?} is missing"),
+                    format!(
+                        "required {} field {key:?} is missing",
+                        file.directive.source
+                    ),
                 ));
             }
         }
     } else {
-        Value::Object(query.clone())
+        request_source_value(request, &file.directive.source, resolver_name)?.clone()
     };
 
     let Some(resolver) = file.resolver.clone() else {
@@ -303,26 +311,27 @@ async fn resolve_field_file(
 }
 
 fn resolve_binding(
-    query: &HashMap<String, Value>,
+    request: &Value,
     binding: &FieldBinding,
     resolver_name: &str,
 ) -> Result<Value, FieldResolveError> {
+    let values = request_source_map(request, &binding.source, &binding.name)?;
     if binding.mode == FieldBindingMode::Dynamic {
-        return Ok(Value::Object(dynamic_values(
-            query,
-            &binding.lookup,
-            binding.strip_prefix,
-        )));
+        return Ok(Value::Object(match values {
+            Some(values) => dynamic_values(values, &binding.lookup, binding.strip_prefix),
+            None => HashMap::new(),
+        }));
     }
 
-    let Some(raw) = query.get(&binding.lookup) else {
+    let raw = values.and_then(|values| source_lookup(values, &binding.source, &binding.lookup));
+    let Some(raw) = raw else {
         return match binding.mode {
             FieldBindingMode::Required => Err(resolve_error(
                 "FLD4001",
                 &binding.name,
                 format!(
-                    "required query field {:?} for resolver {resolver_name:?} is missing",
-                    binding.lookup
+                    "required {} field {:?} for resolver {resolver_name:?} is missing",
+                    binding.source, binding.lookup
                 ),
             )),
             FieldBindingMode::Optional => Ok(binding.default.clone().unwrap_or(Value::Null)),
@@ -330,44 +339,59 @@ fn resolve_binding(
         };
     };
 
-    match coerce_value(raw, binding.value_type) {
+    match coerce_value(raw, binding.value_type, &binding.source) {
         Ok(value) => Ok(value),
         Err(_) if binding.mode == FieldBindingMode::Optional => Ok(Value::Null),
         Err(message) => Err(resolve_error(
             "FLD4002",
             &binding.name,
             format!(
-                "query field {:?} for resolver {resolver_name:?} is invalid: {message}",
-                binding.lookup
+                "{} field {:?} for resolver {resolver_name:?} is invalid: {message}",
+                binding.source, binding.lookup
             ),
         )),
     }
 }
 
-fn coerce_value(value: &Value, value_type: FieldValueType) -> Result<Value, String> {
-    let Value::String(raw) = value else {
-        return Err("query value is not a string".into());
-    };
+fn coerce_value(value: &Value, value_type: FieldValueType, source: &str) -> Result<Value, String> {
     match value_type {
-        FieldValueType::String => Ok(Value::String(raw.clone())),
-        FieldValueType::Int => raw
-            .parse::<i64>()
-            .map(|value| Value::Number(value as f64))
-            .map_err(|_| "expected an integer".into()),
-        FieldValueType::Bool => match raw.to_ascii_lowercase().as_str() {
-            "true" => Ok(Value::Bool(true)),
-            "false" => Ok(Value::Bool(false)),
+        FieldValueType::String => match value {
+            Value::String(value) => Ok(Value::String(value.clone())),
+            _ => Err(format!("{source} value is not a string")),
+        },
+        FieldValueType::Int => match value {
+            Value::String(raw) => raw
+                .parse::<i64>()
+                .map(|value| Value::Number(value as f64))
+                .map_err(|_| "expected an integer".into()),
+            Value::Number(value)
+                if value.is_finite()
+                    && value.fract() == 0.0
+                    && *value >= i64::MIN as f64
+                    && *value <= i64::MAX as f64 =>
+            {
+                Ok(Value::Number(*value))
+            }
+            _ => Err("expected an integer".into()),
+        },
+        FieldValueType::Bool => match value {
+            Value::Bool(value) => Ok(Value::Bool(*value)),
+            Value::String(raw) => match raw.to_ascii_lowercase().as_str() {
+                "true" => Ok(Value::Bool(true)),
+                "false" => Ok(Value::Bool(false)),
+                _ => Err("expected true or false".into()),
+            },
             _ => Err("expected true or false".into()),
         },
     }
 }
 
 fn dynamic_values(
-    query: &HashMap<String, Value>,
+    values: &HashMap<String, Value>,
     prefix: &str,
     strip_prefix: bool,
 ) -> HashMap<String, Value> {
-    query
+    values
         .iter()
         .filter_map(|(key, value)| {
             key.strip_prefix(prefix).map(|suffix| {
@@ -382,7 +406,7 @@ fn dynamic_values(
         .collect()
 }
 
-fn request_query(request: &Value) -> Result<&HashMap<String, Value>, FieldResolveError> {
+fn request_object(request: &Value) -> Result<&HashMap<String, Value>, FieldResolveError> {
     let Value::Object(request) = request else {
         return Err(resolve_error(
             "FLD5000",
@@ -390,6 +414,79 @@ fn request_query(request: &Value) -> Result<&HashMap<String, Value>, FieldResolv
             "FieldManager request snapshot is not an object",
         ));
     };
+    Ok(request)
+}
+
+fn request_source_key(source: &str) -> Result<&'static str, FieldResolveError> {
+    match source {
+        "query" => Ok("query"),
+        "body" => Ok("body"),
+        "param" => Ok("params"),
+        "header" => Ok("headers"),
+        "cookie" => Ok("cookies"),
+        other => Err(resolve_error(
+            "FLD5000",
+            "source",
+            format!("compiled FieldManager source {other:?} is invalid"),
+        )),
+    }
+}
+
+fn request_source_value<'a>(
+    request: &'a Value,
+    source: &str,
+    field: &str,
+) -> Result<&'a Value, FieldResolveError> {
+    let request = request_object(request)?;
+    let key = request_source_key(source)?;
+    request.get(key).ok_or_else(|| {
+        resolve_error(
+            "FLD5000",
+            field,
+            format!("FieldManager request snapshot has no {source} source"),
+        )
+    })
+}
+
+fn request_source_map<'a>(
+    request: &'a Value,
+    source: &str,
+    field: &str,
+) -> Result<Option<&'a HashMap<String, Value>>, FieldResolveError> {
+    let value = request_source_value(request, source, field)?;
+    match value {
+        Value::Object(values) => Ok(Some(values)),
+        Value::Null if source == "body" => Ok(None),
+        _ if source == "body" => Err(resolve_error(
+            "FLD4002",
+            field,
+            "body source must be a JSON object for named FieldManager bindings",
+        )),
+        _ => Err(resolve_error(
+            "FLD5000",
+            field,
+            format!("FieldManager request snapshot {source} source is not an object"),
+        )),
+    }
+}
+
+fn source_lookup<'a>(
+    values: &'a HashMap<String, Value>,
+    source: &str,
+    key: &str,
+) -> Option<&'a Value> {
+    if source == "header" {
+        values
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    } else {
+        values.get(key)
+    }
+}
+
+fn request_query(request: &Value) -> Result<&HashMap<String, Value>, FieldResolveError> {
+    let request = request_object(request)?;
     match request.get("query") {
         Some(Value::Object(query)) => Ok(query),
         _ => Err(resolve_error(
@@ -659,5 +756,120 @@ mod tests {
             context.call("awesome", &[]).unwrap(),
             Value::Number(7.0)
         ));
+    }
+
+    #[test]
+    fn parser_accepts_all_field_sources_and_rejects_unknown_sources() {
+        for source in ["query", "body", "param", "header", "cookie"] {
+            let parsed = field(&format!(
+                ":field[source = {source}, key = \"value\", optional = true]"
+            ));
+            assert_eq!(parsed.directive.source, source);
+        }
+
+        let tokens = Lexer::new(":field[source = socket, key = \"value\"]")
+            .tokenize()
+            .unwrap();
+        let error = Parser::new(tokens).parse_field_file().unwrap_err();
+        assert!(error
+            .message
+            .contains("expected query, body, param, header, or cookie"));
+    }
+
+    #[test]
+    fn route_local_bindings_can_select_request_sources() {
+        let route = route(
+            r#":import[field]
+               fields {
+                   id = required("id", source = param);
+                   token = required("Authorization", source = header);
+                   session = optional("session", source = cookie);
+                   enabled = required("enabled", source = body, type = bool);
+                   count = required("count", source = body, type = int);
+               }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        assert_eq!(route.field_bindings[0].source, "param");
+        assert_eq!(route.field_bindings[1].source, "header");
+        assert_eq!(route.field_bindings[2].source, "cookie");
+        assert_eq!(route.field_bindings[3].source, "body");
+
+        let request = Value::Object(HashMap::from([
+            ("query".into(), Value::Object(HashMap::new())),
+            (
+                "params".into(),
+                Value::Object(HashMap::from([("id".into(), Value::String("42".into()))])),
+            ),
+            (
+                "headers".into(),
+                Value::Object(HashMap::from([(
+                    "authorization".into(),
+                    Value::String("Bearer abc".into()),
+                )])),
+            ),
+            (
+                "cookies".into(),
+                Value::Object(HashMap::from([(
+                    "session".into(),
+                    Value::String("cookie-value".into()),
+                )])),
+            ),
+            (
+                "body".into(),
+                Value::Object(HashMap::from([
+                    ("enabled".into(), Value::Bool(true)),
+                    ("count".into(), Value::Number(7.0)),
+                ])),
+            ),
+        ]));
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("multi-source");
+        let context = block_on_ready(plan.resolve(&request, &program)).unwrap();
+        assert!(matches!(context.call("id", &[]).unwrap(), Value::String(value) if value == "42"));
+        assert!(
+            matches!(context.call("token", &[]).unwrap(), Value::String(value) if value == "Bearer abc")
+        );
+        assert!(
+            matches!(context.call("session", &[]).unwrap(), Value::String(value) if value == "cookie-value")
+        );
+        assert!(matches!(
+            context.call("enabled", &[]).unwrap(),
+            Value::Bool(true)
+        ));
+        assert!(
+            matches!(context.call("count", &[]).unwrap(), Value::Number(value) if value == 7.0)
+        );
+    }
+
+    #[test]
+    fn field_directive_source_is_inherited_by_declarative_bindings() {
+        let file = field(
+            r#":field[source = header, optional = true]
+               resolve { token = required("Authorization"); }"#,
+        );
+        assert_eq!(file.bindings[0].source, "header");
+        let request = Value::Object(HashMap::from([
+            ("query".into(), Value::Object(HashMap::new())),
+            ("params".into(), Value::Object(HashMap::new())),
+            (
+                "headers".into(),
+                Value::Object(HashMap::from([(
+                    "authorization".into(),
+                    Value::String("Bearer abc".into()),
+                )])),
+            ),
+            ("cookies".into(), Value::Object(HashMap::new())),
+            ("body".into(), Value::Null),
+        ]));
+        let program = empty_program("header-source");
+        let value = block_on_ready(resolve_field_file(&file, &request, &program, "auth")).unwrap();
+        let Value::Object(values) = value else {
+            panic!("expected object")
+        };
+        assert!(matches!(values.get("token"), Some(Value::String(value)) if value == "Bearer abc"));
     }
 }
