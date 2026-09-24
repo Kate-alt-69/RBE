@@ -13,6 +13,12 @@ impl VideoManager {
         ffprobe_policy: &FfprobePolicy,
         ffmpeg_policy: &FfmpegPolicy,
     ) -> anyhow::Result<VideoVariant> {
+        // Always give the async executor a scheduling boundary between queued
+        // items. Some fail-closed paths can return before their first real
+        // await, so a permanently busy queue would otherwise be able to spin
+        // synchronously and starve recovery timers, shutdown, and sibling tasks.
+        tokio::task::yield_now().await;
+
         self.run_queued_download(queued, download_policy).await?;
         self.inspect_download_container(queued).await?;
         let probe = self.probe_download_media(queued, ffprobe_policy).await?;
