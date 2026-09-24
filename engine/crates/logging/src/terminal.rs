@@ -171,7 +171,11 @@ impl SuppressedLevels {
     }
 
     fn extend(&mut self, raw: &str) -> anyhow::Result<()> {
-        for value in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        for value in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             match value.to_ascii_lowercase().as_str() {
                 "warning" | "warn" => self.warn = true,
                 "error" => self.error = true,
