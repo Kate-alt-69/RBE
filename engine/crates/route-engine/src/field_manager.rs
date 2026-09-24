@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::ast::{
     FieldBinding, FieldBindingMode, FieldFile, FieldValueType, ImportTarget, ModuleFile, RouteFile,
-    Value,
+    Value, DEFAULT_DYNAMIC_FIELD_MATCHES,
 };
 use crate::module_eval::{ModuleEvalError, ModuleExecutor};
 use crate::module_runtime::ModuleProgram;
@@ -101,11 +101,14 @@ impl FieldRuntimeContext {
                         ));
                     }
                 };
-                Ok(Value::Object(dynamic_values(
+                dynamic_values(
                     &self.query,
                     key,
                     strip_prefix,
-                )))
+                    DEFAULT_DYNAMIC_FIELD_MATCHES,
+                )
+                .map(Value::Object)
+                .map_err(field_module_error)
             }
             _ => unreachable!("direct FieldManager function allowlist checked above"),
         }
@@ -317,10 +320,23 @@ fn resolve_binding(
 ) -> Result<Value, FieldResolveError> {
     let values = request_source_map(request, &binding.source, &binding.name)?;
     if binding.mode == FieldBindingMode::Dynamic {
-        return Ok(Value::Object(match values {
-            Some(values) => dynamic_values(values, &binding.lookup, binding.strip_prefix),
-            None => HashMap::new(),
-        }));
+        return match values {
+            Some(values) => dynamic_values(
+                values,
+                &binding.lookup,
+                binding.strip_prefix,
+                binding.max_matches,
+            )
+            .map(Value::Object)
+            .map_err(|message| {
+                resolve_error(
+                    "FLD4004",
+                    &binding.name,
+                    format!("{message} for resolver {resolver_name:?}"),
+                )
+            }),
+            None => Ok(Value::Object(HashMap::new())),
+        };
     }
 
     let raw = values.and_then(|values| source_lookup(values, &binding.source, &binding.lookup));
@@ -390,20 +406,28 @@ fn dynamic_values(
     values: &HashMap<String, Value>,
     prefix: &str,
     strip_prefix: bool,
-) -> HashMap<String, Value> {
-    values
-        .iter()
-        .filter_map(|(key, value)| {
-            key.strip_prefix(prefix).map(|suffix| {
-                let key = if strip_prefix {
-                    suffix.to_string()
-                } else {
-                    key.clone()
-                };
-                (key, value.clone())
-            })
-        })
-        .collect()
+    max_matches: usize,
+) -> Result<HashMap<String, Value>, String> {
+    let mut output = HashMap::new();
+    let mut matched = 0usize;
+    for (key, value) in values {
+        let Some(suffix) = key.strip_prefix(prefix) else {
+            continue;
+        };
+        matched = matched.saturating_add(1);
+        if matched > max_matches {
+            return Err(format!(
+                "dynamic FieldManager prefix {prefix:?} matched more than {max_matches} fields"
+            ));
+        }
+        let key = if strip_prefix {
+            suffix.to_string()
+        } else {
+            key.clone()
+        };
+        output.insert(key, value.clone());
+    }
+    Ok(output)
 }
 
 fn request_object(request: &Value) -> Result<&HashMap<String, Value>, FieldResolveError> {
@@ -843,6 +867,76 @@ mod tests {
         assert!(
             matches!(context.call("count", &[]).unwrap(), Value::Number(value) if value == 7.0)
         );
+    }
+
+    #[test]
+    fn dynamic_bindings_are_bounded_and_configurable() {
+        let route = route(
+            r#":import[field]
+               fields { tracking = dynamic("utm_", stripPrefix = true, maxMatches = 2); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        assert_eq!(route.field_bindings[0].max_matches, 2);
+
+        let request = Value::Object(HashMap::from([
+            (
+                "query".into(),
+                Value::Object(HashMap::from([
+                    ("utm_a".into(), Value::String("a".into())),
+                    ("utm_b".into(), Value::String("b".into())),
+                    ("utm_c".into(), Value::String("c".into())),
+                ])),
+            ),
+            ("params".into(), Value::Object(HashMap::new())),
+            ("headers".into(), Value::Object(HashMap::new())),
+            ("cookies".into(), Value::Object(HashMap::new())),
+            ("body".into(), Value::Null),
+        ]));
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("dynamic-bound");
+        let error = block_on_ready(plan.resolve(&request, &program)).unwrap_err();
+        assert_eq!(error.code, "FLD4004");
+        assert!(error.message.contains("more than 2 fields"));
+    }
+
+    #[test]
+    fn dynamic_binding_limits_are_validated_at_parse_time() {
+        for source in [
+            r#":import[field]
+               fields { tracking = dynamic("utm_", maxMatches = 0); }
+               class Route { get(req) { return req.fields; } }"#,
+            r#":import[field]
+               fields { tracking = dynamic("utm_", maxMatches = 257); }
+               class Route { get(req) { return req.fields; } }"#,
+            r#":import[field]
+               fields { page = optional("page", maxMatches = 2); }
+               class Route { get(req) { return req.fields; } }"#,
+        ] {
+            let tokens = Lexer::new(source).tokenize().unwrap();
+            let error = Parser::new(tokens).parse_file().unwrap_err();
+            assert!(error.message.contains("maxMatches"));
+        }
+    }
+
+    #[test]
+    fn direct_dynamic_helper_uses_the_default_bound() {
+        let query = (0..=DEFAULT_DYNAMIC_FIELD_MATCHES)
+            .map(|index| (format!("utm_{index}"), Value::String(index.to_string())))
+            .collect();
+        let context = FieldRuntimeContext {
+            query,
+            resolved: HashMap::new(),
+            allowed_resolvers: HashSet::new(),
+            direct_enabled: true,
+        };
+        let error = context
+            .call("dynamic", &[Value::String("utm_".into())])
+            .unwrap_err();
+        assert!(error.message.contains("more than 64 fields"));
     }
 
     #[test]
