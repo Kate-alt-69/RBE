@@ -156,9 +156,15 @@ fn should_skip(relative: &Path) -> bool {
 
 fn print_check(package: &CheckedPackage) {
     println!("RBE PACKAGE CHECK");
-    println!("  package: {}@{}", package.manifest.package.name, package.manifest.package.version);
+    println!(
+        "  package: {}@{}",
+        package.manifest.package.name, package.manifest.package.version
+    );
     println!("  manifest: {}", package.manifest_path.display());
-    println!("  language: {}", language_name(package.manifest.package.language));
+    println!(
+        "  language: {}",
+        language_name(package.manifest.package.language)
+    );
     println!("  components: {}", package.components.len());
     for component in &package.components {
         println!("    ✓ {} -> {}", component.name, component.source.display());
