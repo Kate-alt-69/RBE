@@ -1,0 +1,126 @@
+name: SDK Toolchain
+
+on:
+  push:
+    tags:
+      - 'sdk-v*'
+    paths:
+      - 'engine/crates/sdk-package/**'
+      - 'engine/crates/rpx/**'
+      - 'engine/crates/sdk-backend/**'
+      - 'build.ps1'
+      - 'build.sh'
+      - 'build-select.ps1'
+      - 'build-select.sh'
+      - '.github/workflows/sdk-toolchain.yml'
+  pull_request:
+    paths:
+      - 'engine/crates/sdk-package/**'
+      - 'engine/crates/rpx/**'
+      - 'engine/crates/sdk-backend/**'
+      - 'build.ps1'
+      - 'build.sh'
+      - 'build-select.ps1'
+      - 'build-select.sh'
+      - '.github/workflows/sdk-toolchain.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format SDK crates
+        run: |
+          cargo fmt --manifest-path engine/crates/sdk-package/Cargo.toml -- --check
+          cargo fmt --manifest-path engine/crates/rpx/Cargo.toml -- --check
+          cargo fmt --manifest-path engine/crates/sdk-backend/Cargo.toml -- --check
+      - name: Check SDK crates
+        run: |
+          cargo check --manifest-path engine/crates/sdk-package/Cargo.toml
+          cargo check --manifest-path engine/crates/rpx/Cargo.toml
+          cargo check --manifest-path engine/crates/sdk-backend/Cargo.toml
+      - name: Clippy SDK crates
+        run: |
+          cargo clippy --manifest-path engine/crates/sdk-package/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path engine/crates/rpx/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path engine/crates/sdk-backend/Cargo.toml --all-targets -- -D warnings
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: rbe-sdk-linux-x64
+            shell: bash
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: rbe-sdk-windows-x64
+            shell: pwsh
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: rbe-sdk-macos-x64
+            shell: bash
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: rbe-sdk-macos-arm64
+            shell: bash
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build SDK bundle (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case '${{ matrix.target }}' in
+            x86_64-unknown-linux-gnu) ./build.sh --build-sdk --build-linux --arch-x64 ;;
+            x86_64-apple-darwin) ./build.sh --build-sdk --build-macos --arch-x64 ;;
+            aarch64-apple-darwin) ./build.sh --build-sdk --build-macos --arch-arm64 ;;
+            *) echo 'unsupported SDK target' >&2; exit 2 ;;
+          esac
+          tar -C 'dist/${{ matrix.target }}/sdk' -czf '${{ matrix.artifact }}.tar.gz' .
+          shasum -a 256 '${{ matrix.artifact }}.tar.gz' > '${{ matrix.artifact }}.tar.gz.sha256'
+      - name: Build SDK bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./build.ps1 --build-sdk --build-windows --arch-x64
+          Compress-Archive -Path 'dist/${{ matrix.target }}/sdk/*' -DestinationPath '${{ matrix.artifact }}.zip' -Force
+          $hash = (Get-FileHash '${{ matrix.artifact }}.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.artifact }}.zip" | Set-Content '${{ matrix.artifact }}.zip.sha256' -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/sdk-v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/**/*.tar.gz
+            release/**/*.tar.gz.sha256
+            release/**/*.zip
+            release/**/*.zip.sha256
