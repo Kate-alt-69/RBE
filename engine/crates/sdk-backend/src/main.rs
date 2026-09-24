@@ -27,13 +27,19 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() || args.iter().any(|arg| matches!(arg.as_str(), "-h" | "--help")) {
+    if args.is_empty()
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
         help();
         return Ok(());
     }
 
     if args.first().is_some_and(|arg| arg == "install") {
-        let sdk = args.get(1).context("expected `sdk.<version>` after install")?;
+        let sdk = args
+            .get(1)
+            .context("expected `sdk.<version>` after install")?;
         let version = sdk
             .strip_prefix("sdk.")
             .context("SDK installs use `backend install sdk.<version>`")?;
@@ -135,7 +141,8 @@ fn repair(project: &Path) -> Result<()> {
     let project = absolute(project)?;
     let lock_path = project.join(".rbe").join(LOCK_FILE);
     let lock: SdkLock = serde_json::from_slice(
-        &fs::read(&lock_path).with_context(|| format!("SDK lock not found: {}", lock_path.display()))?,
+        &fs::read(&lock_path)
+            .with_context(|| format!("SDK lock not found: {}", lock_path.display()))?,
     )?;
     install(&project, lock.version, &lock.language)
 }
@@ -144,7 +151,8 @@ fn status(project: &Path) -> Result<()> {
     let project = absolute(project)?;
     let lock_path = project.join(".rbe").join(LOCK_FILE);
     let lock: SdkLock = serde_json::from_slice(
-        &fs::read(&lock_path).with_context(|| format!("SDK lock not found: {}", lock_path.display()))?,
+        &fs::read(&lock_path)
+            .with_context(|| format!("SDK lock not found: {}", lock_path.display()))?,
     )?;
     let backend_ok = project.join(".rbe").join(&lock.backend).is_file();
     let rpx_ok = project.join(".rbe").join(&lock.rpx).is_file();
@@ -155,7 +163,10 @@ fn status(project: &Path) -> Result<()> {
     println!("  backend: {}", if backend_ok { "OK" } else { "MISSING" });
     println!("  rpx: {}", if rpx_ok { "OK" } else { "MISSING" });
     if !backend_ok || !rpx_ok {
-        bail!("SDK installation is incomplete; run `backend sdk repair -path={}`", project.display());
+        bail!(
+            "SDK installation is incomplete; run `backend sdk repair -path={}`",
+            project.display()
+        );
     }
     Ok(())
 }
