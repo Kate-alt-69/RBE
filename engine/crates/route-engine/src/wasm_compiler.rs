@@ -26,19 +26,28 @@ use crate::modules::binding_name;
 use crate::runtime_image::{storage_capability_operation_allowed, storage_capability_target};
 
 pub const ROUTE_WASM_ABI_VERSION: u32 = 3;
-/// Generation 8 lets one linked Module storage.write descriptor receive the
-/// evaluator-visible req.body unchanged. The WASM guest builds the capability
-/// JSON envelope; direct Route-to-Storage remains unreachable and ABI v3 stays stable.
-pub const ROUTE_WASM_COMPILER_VERSION: u32 = 8;
+/// Generation 9 keeps FieldManager resolution host-side and lets native Routes
+/// consume the already-resolved `req.fields` object or one `field.<name>()`
+/// value through the existing bounded input ABI. No second field resolver or
+/// guest-side JSON parser is introduced; ABI v3 stays stable.
+pub const ROUTE_WASM_COMPILER_VERSION: u32 = 9;
 const MAX_STATIC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteWasmInput {
     None,
     /// Invocation input is the JSON encoding of the evaluator-visible `req.body`
     /// value. This keeps strings/null/objects/arrays semantically identical.
     JsonBody,
+    /// Invocation input is the JSON encoding of the pre-resolved `req.fields`
+    /// object produced by the one host-side FieldManager pipeline.
+    JsonFields,
+    /// Invocation input is one pre-resolved FieldManager value. The field name
+    /// is compiler-owned metadata and is never selected by request data.
+    JsonField {
+        name: String,
+    },
     /// Raw JSON req.body used by a guest-built capability payload. The limit is
     /// compiler-derived after accounting for the static capability envelope.
     JsonBodyCapability {
@@ -100,12 +109,11 @@ impl RouteWasmLinkContext {
 /// Compile the currently supported native route subset.
 ///
 /// Native lowering remains intentionally strict: one HTTP method, one return,
-/// no route helper functions. Compiler generation 8 keeps ABI v3 and permits
+/// no route helper functions. Compiler generation 9 keeps ABI v3 and permits
 /// one immutable linked Module function supplied by RELC. Linked host calls are
-/// normally static JSON; generation 8 additionally permits one Module-owned
-/// `storage.write` call whose `data[]` value receives `req.body` unchanged.
-/// Namespace imports, wider Module bodies, and other dynamic host arguments
-/// remain interpreter-only.
+/// normally static JSON; dynamic native inputs include unchanged `req.body`,
+/// pre-resolved `req.fields`, and one pre-resolved `field.<name>()` value.
+/// Wider Module bodies and other dynamic host arguments remain interpreter-only.
 pub fn compile_route(file: &RouteFile) -> RouteWasmCompilation {
     let links = RouteWasmLinkContext::default();
     compile_route_with_links(file, &links)
@@ -117,7 +125,13 @@ pub(crate) fn compile_route_with_links(
 ) -> RouteWasmCompilation {
     let mut host_import = None;
     let mut linked_import = None;
-    match file.imports.as_slice() {
+    let runtime_imports = file
+        .imports
+        .iter()
+        .filter(|import| !is_field_import(import))
+        .cloned()
+        .collect::<Vec<_>>();
+    match runtime_imports.as_slice() {
         [] => {}
         [import] => {
             if let Some(found) = direct_capability_import(import) {
@@ -132,13 +146,13 @@ pub(crate) fn compile_route_with_links(
                 linked_import = Some((binding, linked));
             } else {
                 return fallback(
-                    format!("native Route-WASM generation {ROUTE_WASM_COMPILER_VERSION} only supports one direct http.get/post/request import or one linked Module function import"),
+                    format!("native Route-WASM generation {ROUTE_WASM_COMPILER_VERSION} only supports FieldManager namespaces plus one direct http.get/post/request import or one linked Module function import"),
                 );
             }
         }
         _ => {
             return fallback(
-                format!("native Route-WASM generation {ROUTE_WASM_COMPILER_VERSION} supports at most one direct or linked host-call import"),
+                format!("native Route-WASM generation {ROUTE_WASM_COMPILER_VERSION} supports FieldManager namespaces plus at most one direct or linked host-call import"),
             )
         }
     }
@@ -215,6 +229,13 @@ pub(crate) fn compile_route_with_links(
         (encode_static_json_module(&output), RouteWasmInput::None)
     } else if returns_request_body(method.param_name.as_deref(), expr) {
         (encode_input_echo_module(), RouteWasmInput::JsonBody)
+    } else if returns_request_fields(method.param_name.as_deref(), expr) {
+        (encode_input_echo_module(), RouteWasmInput::JsonFields)
+    } else if let Some(name) = returns_field_resolver(expr) {
+        (
+            encode_input_echo_module(),
+            RouteWasmInput::JsonField { name },
+        )
     } else {
         return fallback("route return value is outside the native Route-WASM v3 subset");
     };
@@ -268,6 +289,14 @@ fn base_import(import: &ImportTarget) -> &ImportTarget {
     match import {
         ImportTarget::Aliased { target, .. } => base_import(target),
         other => other,
+    }
+}
+
+fn is_field_import(import: &ImportTarget) -> bool {
+    match base_import(import) {
+        ImportTarget::Builtin(module) => module == "field",
+        ImportTarget::BuiltinFunction { module, .. } => module == "field",
+        _ => false,
     }
 }
 
@@ -660,6 +689,31 @@ fn returns_request_body(parameter: Option<&str>, expr: &Expr) -> bool {
         Expr::Member(target, field)
             if field == "body" && matches!(target.as_ref(), Expr::Ident(name) if name == parameter)
     )
+}
+
+fn returns_request_fields(parameter: Option<&str>, expr: &Expr) -> bool {
+    let Some(parameter) = parameter else {
+        return false;
+    };
+    matches!(
+        expr,
+        Expr::Member(target, field)
+            if field == "fields" && matches!(target.as_ref(), Expr::Ident(name) if name == parameter)
+    )
+}
+
+fn returns_field_resolver(expr: &Expr) -> Option<String> {
+    let Expr::Call(target, args) = expr else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let Expr::Member(namespace, name) = target.as_ref() else {
+        return None;
+    };
+    matches!(namespace.as_ref(), Expr::Ident(namespace) if namespace == "field")
+        .then(|| name.clone())
 }
 
 fn static_json(expr: &Expr) -> Option<serde_json::Value> {
@@ -1110,6 +1164,90 @@ mod tests {
         assert_eq!(first.sha256, second.sha256);
         assert_eq!(&first.bytes[..4], b"\0asm");
         wasmparser::validate(&first.bytes).unwrap();
+    }
+
+    #[test]
+    fn field_namespace_does_not_force_static_route_out_of_native_wasm() {
+        let route = parse(
+            r#":import[field]
+               fields { page = optional("page", type = int, default = 1); }
+               class Route { get(req) { return { ok: true }; } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("FieldManager namespace should not disable a static native Route");
+        };
+        assert_eq!(artifact.input, RouteWasmInput::None);
+        wasmparser::validate(&artifact.bytes).unwrap();
+    }
+
+    #[test]
+    fn native_route_can_echo_pre_resolved_req_fields() {
+        let route = parse(
+            r#":import[field]
+               fields { page = optional("page", type = int, default = 1); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("req.fields should lower to bounded native input echo");
+        };
+        assert_eq!(artifact.input, RouteWasmInput::JsonFields);
+        wasmparser::validate(&artifact.bytes).unwrap();
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                br#"{"page":7}"#,
+                ExecutionLimits::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.output, br#"{"page":7}"#);
+    }
+
+    #[test]
+    fn native_route_can_echo_one_pre_resolved_field_value() {
+        let route = parse(
+            r#":import[field]
+               fields { page = optional("page", type = int, default = 1); }
+               class Route { get() { return field.page(); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("field.page() should lower to one pre-resolved native input");
+        };
+        assert_eq!(
+            artifact.input,
+            RouteWasmInput::JsonField {
+                name: "page".into()
+            }
+        );
+        wasmparser::validate(&artifact.bytes).unwrap();
+        let result = WasmExecutor::new()
+            .unwrap()
+            .execute_with_input_and_capabilities(
+                &artifact.bytes,
+                b"7",
+                ExecutionLimits::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.output, b"7");
+    }
+
+    #[test]
+    fn reusable_field_import_is_native_input_metadata_not_host_capability() {
+        let route = parse(
+            r#":import[field:awesomeness]
+               class Route { get() { return field.awesomeness(); } }"#,
+        );
+        let RouteWasmCompilation::Native(artifact) = compile_route(&route) else {
+            panic!("reusable FieldManager resolver should compile as pre-resolved input");
+        };
+        assert_eq!(
+            artifact.input,
+            RouteWasmInput::JsonField {
+                name: "awesomeness".into()
+            }
+        );
     }
 
     #[test]

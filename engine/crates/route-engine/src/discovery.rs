@@ -578,6 +578,43 @@ fn route_value_response(path: &str, value: Value) -> Response {
     }
 }
 
+fn request_snapshot_member<'a>(request: Option<&'a Value>, member: &str) -> Option<&'a Value> {
+    request.and_then(|request| match request {
+        Value::Object(fields) => fields.get(member),
+        _ => None,
+    })
+}
+
+fn request_snapshot_field<'a>(request: Option<&'a Value>, name: &str) -> Option<&'a Value> {
+    request_snapshot_member(request, "fields").and_then(|fields| match fields {
+        Value::Object(fields) => fields.get(name),
+        _ => None,
+    })
+}
+
+fn encode_native_route_input(
+    path: &str,
+    value: &Value,
+    label: &str,
+    limit: usize,
+    too_large_message: &'static str,
+) -> Result<Vec<u8>, Box<Response>> {
+    let input = serde_json::to_vec(&value_to_json(value)).map_err(|error| {
+        tracing::error!(error = %error, path = %path, input = label, "encode native Route-WASM input");
+        Box::new(request_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "native route input could not be encoded",
+        ))
+    })?;
+    if input.len() > limit {
+        return Err(Box::new(request_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            too_large_message,
+        )));
+    }
+    Ok(input)
+}
+
 async fn execute_native_route(
     plan: &NativeRoutePlan,
     image: &RuntimeImage,
@@ -748,74 +785,70 @@ async fn execute(
     {
         request.insert("fields".into(), fields.resolved_object());
     }
+    if let Some(plan) = native_plan.as_deref() {
+        let snapshot = request_snapshot.as_ref();
+        let input = match &plan.artifact.input {
+            RouteWasmInput::None => Vec::new(),
+            RouteWasmInput::JsonBody => {
+                let body = request_snapshot_member(snapshot, "body").unwrap_or(&Value::Null);
+                match encode_native_route_input(
+                    &path,
+                    body,
+                    "req.body",
+                    CONTAINER_MAX_EXECUTION_INPUT_BYTES,
+                    "native route body exceeds the Container execution input limit",
+                ) {
+                    Ok(input) => input,
+                    Err(response) => return *response,
+                }
+            }
+            RouteWasmInput::JsonFields => {
+                let fields = request_snapshot_member(snapshot, "fields").unwrap_or(&Value::Null);
+                match encode_native_route_input(
+                    &path,
+                    fields,
+                    "req.fields",
+                    CONTAINER_MAX_EXECUTION_INPUT_BYTES,
+                    "native route fields exceed the Container execution input limit",
+                ) {
+                    Ok(input) => input,
+                    Err(response) => return *response,
+                }
+            }
+            RouteWasmInput::JsonField { name } => {
+                let value = request_snapshot_field(snapshot, name).unwrap_or(&Value::Null);
+                match encode_native_route_input(
+                    &path,
+                    value,
+                    name,
+                    CONTAINER_MAX_EXECUTION_INPUT_BYTES,
+                    "native route field exceeds the Container execution input limit",
+                ) {
+                    Ok(input) => input,
+                    Err(response) => return *response,
+                }
+            }
+            RouteWasmInput::JsonBodyCapability { max_bytes } => {
+                let body = request_snapshot_member(snapshot, "body").unwrap_or(&Value::Null);
+                match encode_native_route_input(
+                    &path,
+                    body,
+                    "capability req.body",
+                    (*max_bytes).min(CONTAINER_MAX_EXECUTION_INPUT_BYTES),
+                    "native route body exceeds the capability payload limit",
+                ) {
+                    Ok(input) => input,
+                    Err(response) => return *response,
+                }
+            }
+        };
+        return execute_native_route(plan, image.as_ref(), &state, &path, input).await;
+    }
     let args = if takes_request {
         vec![request_snapshot.take().unwrap_or(Value::Null)]
     } else {
         Vec::new()
     };
-    if let Some(plan) = native_plan.as_deref() {
-        let input = match plan.artifact.input {
-            RouteWasmInput::None => Vec::new(),
-            RouteWasmInput::JsonBody => {
-                let body = args
-                    .first()
-                    .and_then(|request| match request {
-                        Value::Object(fields) => fields.get("body"),
-                        _ => None,
-                    })
-                    .unwrap_or(&Value::Null);
-                let input = match serde_json::to_vec(&value_to_json(body)) {
-                    Ok(input) => input,
-                    Err(error) => {
-                        tracing::error!(error = %error, path = %path, "encode native req.body input");
-                        return request_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "native route input could not be encoded",
-                        );
-                    }
-                };
-                if input.len() > CONTAINER_MAX_EXECUTION_INPUT_BYTES {
-                    return request_error(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "native route body exceeds the Container execution input limit",
-                    );
-                }
-                input
-            }
-            RouteWasmInput::JsonBodyCapability { max_bytes } => {
-                let body = args
-                    .first()
-                    .and_then(|request| match request {
-                        Value::Object(fields) => fields.get("body"),
-                        _ => None,
-                    })
-                    .unwrap_or(&Value::Null);
-                let input = match serde_json::to_vec(&value_to_json(body)) {
-                    Ok(input) => input,
-                    Err(error) => {
-                        tracing::error!(
-                            error = %error,
-                            path = %path,
-                            "encode native capability req.body input"
-                        );
-                        return request_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "native route capability input could not be encoded",
-                        );
-                    }
-                };
-                let limit = max_bytes.min(CONTAINER_MAX_EXECUTION_INPUT_BYTES);
-                if input.len() > limit {
-                    return request_error(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "native route body exceeds the capability payload limit",
-                    );
-                }
-                input
-            }
-        };
-        return execute_native_route(plan, image.as_ref(), &state, &path, input).await;
-    }
     let host = match field_context {
         Some(fields) => RuntimeHostCapabilities::from_state_image_and_fields(&state, image, fields),
         None => RuntimeHostCapabilities::from_state_and_image(&state, image),
@@ -1373,20 +1406,16 @@ pub fn build_routes_from_image(
             FieldRoutePlan::from_route(image, route_file.as_ref(), &manifest.logical_name)
                 .map_err(anyhow::Error::msg)?,
         );
-        // FLD-002 keeps Field-backed Routes on the linked evaluator path. The
-        // Field context is resolved before dispatch; native lowering can adopt
-        // the same pre-resolved input contract in a later compiler generation.
-        let native_plan = if field_plan.is_active() {
-            None
-        } else {
-            image.route_wasm_artifact(id).map(|artifact| {
-                Arc::new(NativeRoutePlan {
-                    runtime_image: image.image_id.clone(),
-                    source_id: id.clone(),
-                    artifact: artifact.clone(),
-                })
+        // FLD-005 lets native Route-WASM consume the exact host-resolved
+        // FieldManager context. Unsupported route shapes still have no artifact
+        // and therefore fall back to the linked evaluator as before.
+        let native_plan = image.route_wasm_artifact(id).map(|artifact| {
+            Arc::new(NativeRoutePlan {
+                runtime_image: image.image_id.clone(),
+                source_id: id.clone(),
+                artifact: artifact.clone(),
             })
-        };
+        });
         router = router.route(
             &url_path,
             build_method_router(

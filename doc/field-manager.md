@@ -87,7 +87,7 @@ field.dynamic("utm_", true) // strip prefix
 
 Required missing/invalid reusable fields fail before Route execution with HTTP 400 and a structured `field_validation_failed` response. Optional missing values resolve to their declared default or `null`; optional type failures resolve `null`. Dynamic prefix bindings resolve to an object. The resolved reusable values are also attached as `req.fields` for inspection.
 
-Field-backed Routes deliberately remain on the linked evaluator path in FLD-002. Native Route-WASM adoption must consume the same pre-resolved Field context; it must not invent a second resolution model.
+Field resolution is always host-owned and runs before Route dispatch. FLD-005 allows the native Route-WASM subset to consume that same pre-resolved context; native execution never creates a second FieldManager resolver.
 
 ## Route-local declarative fields (FLD-003)
 
@@ -116,7 +116,7 @@ class Route {
 
 The block is intentionally declarative: it reuses the same `required(...)`, `optional(...)`, `dynamic(...)`, coercion, default, and structured failure behavior as reusable `.field` files. It requires the direct `:import[field]` namespace import, may appear once per Route, and cannot reuse the reserved direct helper names `required`, `optional`, `has`, or `dynamic`.
 
-Inline and reusable FieldManager names share one per-Route namespace. A collision fails closed instead of silently shadowing one resolver. Field-backed Routes continue to use the linked evaluator path until native Route-WASM can consume the same pre-resolved Field context without creating a second resolution model.
+Inline and reusable FieldManager names share one per-Route namespace. A collision fails closed instead of silently shadowing one resolver. Native-capable field-backed Routes consume the same pre-resolved context; unsupported REL shapes continue to fall back to the linked evaluator.
 
 
 ## Multi-source fields (FLD-004)
@@ -163,3 +163,16 @@ fields {
 Header lookup is ASCII case-insensitive. Named `body` bindings require a JSON object; an empty body behaves like a missing object so optional/default bindings still work. `body` integer and boolean fields may use native JSON numbers/booleans or their string forms. A `.field` with `source = body` and no key receives the complete body value in `resolve(raw, context)`, including non-object JSON or text bodies.
 
 The direct helpers `field.required(...)`, `field.optional(...)`, `field.has(...)`, and `field.dynamic(...)` intentionally remain query shorthands. Use declarative bindings when selecting another source so source ownership remains visible in compiled Field IR.
+
+
+## Native Route-WASM field inputs (FLD-005)
+
+FieldManager resolution still happens exactly once on the host before dispatch. Route-WASM compiler generation 9 can now keep a field-backed Route native when the Route body is already inside the native subset and returns one of these shapes:
+
+```text
+return { ok: true };       // static output, even with fields declared
+return req.fields;         // entire pre-resolved field object
+return field.page();       // one pre-resolved inline/reusable field value
+```
+
+The guest receives only bounded JSON bytes selected by compiler-owned metadata and echoes them through the existing ABI. It does not parse the request again, execute `.field` code, or decide which field to read. `field.required(...)`, transforms, multi-expression Route bodies, and other unsupported dynamic shapes still use the linked evaluator.
