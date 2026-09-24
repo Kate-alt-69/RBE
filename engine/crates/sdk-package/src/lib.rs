@@ -4,6 +4,10 @@
 //! directories under `components/`. A component named `request` is imported as
 //! `:import[request from <package>]`; internal implementation code should live
 //! outside `components/` and therefore is not discoverable as a package export.
+//!
+//! Packages are single-language by default. `language = "global"` is the only
+//! explicit opt-in that allows individual components to use different SDK
+//! languages.
 
 #![forbid(unsafe_code)]
 
@@ -89,7 +93,7 @@ impl Default for ComponentsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DependencyConfig {
-    /// RBE-package dependencies are always package-private transitive dependencies.
+    /// RBE-package dependencies are package-private transitive dependencies.
     /// They do not become directly importable by a consuming REL project unless
     /// that project also declares/installs them as a root package.
     #[serde(default)]
@@ -177,33 +181,80 @@ pub fn find_package_root(start: impl AsRef<Path>) -> Result<PathBuf, PackageErro
     }
 }
 
-pub fn check_package(root: impl AsRef<Path>) -> Result<CheckedPackage, PackageError> {
-    let root = find_package_root(root)?;
+/// Check an entire package, regardless of whether `start` points at a child path.
+pub fn check_package(start: impl AsRef<Path>) -> Result<CheckedPackage, PackageError> {
+    let root = find_package_root(start)?;
+    check_with_selection(root, None)
+}
+
+/// Check the package target represented by `start`.
+///
+/// A path inside `components/<name>/...` checks only that component. A package
+/// root, the `components/` directory itself, or any non-component path checks
+/// the complete package. This makes `rpx compile components/endpoint` a real
+/// targeted compile/preflight instead of silently validating unrelated exports.
+pub fn check_target(start: impl AsRef<Path>) -> Result<CheckedPackage, PackageError> {
+    let start = absolute_path(start.as_ref())?;
+    if !start.exists() {
+        return Err(PackageError::TargetNotFound(start));
+    }
+
+    let root = find_package_root(&start)?;
+    let manifest = load_manifest(&root)?;
+    let component_name = selected_component_name(&root, &manifest, &start)?;
+    check_loaded(root, manifest, component_name.as_deref())
+}
+
+fn check_with_selection(root: PathBuf, component: Option<&str>) -> Result<CheckedPackage, PackageError> {
+    let manifest = load_manifest(&root)?;
+    check_loaded(root, manifest, component)
+}
+
+fn load_manifest(root: &Path) -> Result<PackageManifest, PackageError> {
     let manifest_path = root.join(PACKAGE_MANIFEST);
     let input = fs::read_to_string(&manifest_path)?;
     let manifest: PackageManifest = toml::from_str(&input)?;
     validate_manifest(&manifest)?;
+    Ok(manifest)
+}
 
+fn check_loaded(
+    root: PathBuf,
+    manifest: PackageManifest,
+    component: Option<&str>,
+) -> Result<CheckedPackage, PackageError> {
+    let manifest_path = root.join(PACKAGE_MANIFEST);
     let components_root = root.join(&manifest.components.root);
     if !components_root.is_dir() {
         return Err(PackageError::ComponentsDirectoryMissing(components_root));
     }
 
     let mut components = Vec::new();
-    for entry in fs::read_dir(&components_root)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_dir() {
-            continue;
+    if let Some(name) = component {
+        validate_name("component", name)?;
+        let directory = components_root.join(name);
+        if !directory.is_dir() {
+            return Err(PackageError::ComponentDirectoryMissing {
+                component: name.to_string(),
+                directory,
+            });
         }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| PackageError::InvalidComponentName("<non-utf8>".into()))?;
-        validate_name("component", &name)?;
-        components.push(check_component(&manifest, &name, &entry.path())?);
+        components.push(check_component(&manifest, name, &directory)?);
+    } else {
+        for entry in fs::read_dir(&components_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| PackageError::InvalidComponentName("<non-utf8>".into()))?;
+            validate_name("component", &name)?;
+            components.push(check_component(&manifest, &name, &entry.path())?);
+        }
+        components.sort_by(|left, right| left.name.cmp(&right.name));
     }
-    components.sort_by(|left, right| left.name.cmp(&right.name));
 
     if components.is_empty() {
         return Err(PackageError::NoComponents(components_root));
@@ -215,6 +266,33 @@ pub fn check_package(root: impl AsRef<Path>) -> Result<CheckedPackage, PackageEr
         manifest,
         components,
     })
+}
+
+fn selected_component_name(
+    root: &Path,
+    manifest: &PackageManifest,
+    target: &Path,
+) -> Result<Option<String>, PackageError> {
+    let components_root = root.join(&manifest.components.root);
+    let target = target.canonicalize()?;
+    let components_root = match components_root.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+
+    let Ok(relative) = target.strip_prefix(&components_root) else {
+        return Ok(None);
+    };
+    let mut parts = relative.components();
+    let Some(Component::Normal(name)) = parts.next() else {
+        return Ok(None);
+    };
+    let name = name
+        .to_str()
+        .ok_or_else(|| PackageError::InvalidComponentName("<non-utf8>".into()))?
+        .to_string();
+    validate_name("component", &name)?;
+    Ok(Some(name))
 }
 
 fn validate_manifest(manifest: &PackageManifest) -> Result<(), PackageError> {
@@ -304,6 +382,14 @@ fn check_component(
     })
 }
 
+fn absolute_path(path: &Path) -> Result<PathBuf, PackageError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
 fn validate_name(field: &'static str, value: &str) -> Result<(), PackageError> {
     if value.is_empty()
         || value.len() > 192
@@ -346,6 +432,8 @@ fn relative_slash(root: &Path, path: &Path) -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageError {
+    #[error("package target does not exist: {0}")]
+    TargetNotFound(PathBuf),
     #[error("package.rbe.toml was not found from {0}")]
     ManifestNotFound(PathBuf),
     #[error("failed to access package files: {0}")]
@@ -366,6 +454,8 @@ pub enum PackageError {
     ComponentsDirectoryMissing(PathBuf),
     #[error("package has no component directories under {0}")]
     NoComponents(PathBuf),
+    #[error("component {component:?} directory does not exist: {directory}")]
+    ComponentDirectoryMissing { component: String, directory: PathBuf },
     #[error("invalid component name {0:?}")]
     InvalidComponentName(String),
     #[error("component {component:?} is missing its language entry file: {expected}")]
@@ -390,6 +480,7 @@ pub enum PackageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn package_language_extensions_are_stable() {
@@ -402,5 +493,31 @@ mod tests {
     fn package_names_do_not_accept_path_syntax() {
         assert!(validate_name("package", "advancenet").is_ok());
         assert!(validate_name("package", "../advancenet").is_err());
+    }
+
+    #[test]
+    fn component_target_does_not_validate_unrelated_components() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rbe-sdk-package-{stamp}"));
+        let request = root.join("components/request");
+        let broken = root.join("components/broken");
+        fs::create_dir_all(&request).unwrap();
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(
+            root.join(PACKAGE_MANIFEST),
+            "[package]\nname = \"advancenet\"\nversion = \"1.0.0\"\nlanguage = \"typescript\"\nruntime = \"bun\"\n",
+        )
+        .unwrap();
+        fs::write(request.join("request.ts"), "export const request = 1;\n").unwrap();
+
+        let targeted = check_target(&request).unwrap();
+        assert_eq!(targeted.components.len(), 1);
+        assert_eq!(targeted.components[0].name, "request");
+        assert!(check_package(&root).is_err());
+
+        let _ = fs::remove_dir_all(root);
     }
 }
