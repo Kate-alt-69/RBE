@@ -4,10 +4,16 @@
 //! `package.lock.rbe.yaml` is the deterministic resolver output used to skip
 //! unnecessary registry resolution and to rehydrate a deleted package cache from
 //! exact artifact URLs and integrity hashes.
+//!
+//! Root packages are directly importable by the REL project. Transitive RBE
+//! dependencies are locked inside a root-scoped private graph. Two roots may
+//! therefore resolve different versions of the same dependency without exposing
+//! either dependency as a project-level import. Artifact bytes remain globally
+//! deduplicated by SHA-256 under `.cache/library`.
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -132,8 +138,13 @@ impl PackageRequirement {
 #[serde(deny_unknown_fields)]
 pub struct ProjectPackageLock {
     pub format: u32,
+    /// Explicit project roots. Only these names are directly importable by REL.
     #[serde(default)]
     pub packages: BTreeMap<String, LockedProjectPackage>,
+    /// Root-scoped transitive graphs. `private[root][package]` is visible only
+    /// while compiling/executing that root package.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub private: BTreeMap<String, BTreeMap<String, LockedProjectPackage>>,
 }
 
 impl Default for ProjectPackageLock {
@@ -141,8 +152,17 @@ impl Default for ProjectPackageLock {
         Self {
             format: PROJECT_PACKAGE_FORMAT,
             packages: BTreeMap::new(),
+            private: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LockedPackageInstance<'a> {
+    pub root: &'a str,
+    pub package: &'a str,
+    pub is_root: bool,
+    pub locked: &'a LockedProjectPackage,
 }
 
 impl ProjectPackageLock {
@@ -165,7 +185,70 @@ impl ProjectPackageLock {
             validate_install_key(key)?;
             package.validate()?;
         }
+        for (root, graph) in &self.private {
+            validate_install_key(root)?;
+            if !self.packages.contains_key(root) {
+                return Err(ProjectPackageError::PrivateScopeWithoutRoot(root.clone()));
+            }
+            for (key, package) in graph {
+                validate_install_key(key)?;
+                package.validate()?;
+            }
+        }
         Ok(())
+    }
+
+    pub fn private_graph(&self, root: &str) -> Option<&BTreeMap<String, LockedProjectPackage>> {
+        self.private.get(root)
+    }
+
+    pub fn locked_for_root(&self, root: &str, package: &str) -> Option<&LockedProjectPackage> {
+        if root == package {
+            self.packages.get(root)
+        } else {
+            self.private.get(root).and_then(|graph| graph.get(package))
+        }
+    }
+
+    pub fn instances(&self) -> Vec<LockedPackageInstance<'_>> {
+        let private_count = self.private.values().map(BTreeMap::len).sum::<usize>();
+        let mut instances = Vec::with_capacity(self.packages.len() + private_count);
+        for (root, package) in &self.packages {
+            instances.push(LockedPackageInstance {
+                root,
+                package: root,
+                is_root: true,
+                locked: package,
+            });
+            if let Some(graph) = self.private.get(root) {
+                for (name, dependency) in graph {
+                    instances.push(LockedPackageInstance {
+                        root,
+                        package: name,
+                        is_root: false,
+                        locked: dependency,
+                    });
+                }
+            }
+        }
+        instances
+    }
+
+    /// Returns true when every dependency reachable from `root` has a matching
+    /// package instance in that root's private graph and the graph is acyclic.
+    pub fn root_graph_complete(&self, root: &str) -> bool {
+        let Some(root_package) = self.packages.get(root) else {
+            return false;
+        };
+        if root_package.dependencies.is_empty() {
+            return true;
+        }
+        let Some(graph) = self.private.get(root) else {
+            return false;
+        };
+        let mut visiting = BTreeSet::new();
+        let mut complete = BTreeSet::new();
+        dependencies_complete(root_package, graph, &mut visiting, &mut complete)
     }
 
     pub fn rehydration_plan(
@@ -173,21 +256,48 @@ impl ProjectPackageLock {
         layout: &ProjectCacheLayout,
     ) -> Result<Vec<LockedArtifactFetch>, ProjectPackageError> {
         self.validate()?;
-        self.packages
-            .iter()
-            .map(|(key, package)| {
+        self.instances()
+            .into_iter()
+            .map(|instance| {
                 Ok(LockedArtifactFetch {
-                    package: key.clone(),
-                    version: package.version.clone(),
-                    artifact_url: parse_https_url(&package.artifact_url)?,
-                    artifact_sha256: package.artifact_sha256.clone(),
-                    manifest_sha256: package.manifest_sha256.clone(),
-                    source_sha256: package.source_sha256.clone(),
-                    cache_path: layout.library_artifact_dir(&package.artifact_sha256)?,
+                    root: instance.root.to_string(),
+                    package: instance.package.to_string(),
+                    private: !instance.is_root,
+                    version: instance.locked.version.clone(),
+                    artifact_url: parse_https_url(&instance.locked.artifact_url)?,
+                    artifact_sha256: instance.locked.artifact_sha256.clone(),
+                    manifest_sha256: instance.locked.manifest_sha256.clone(),
+                    source_sha256: instance.locked.source_sha256.clone(),
+                    cache_path: layout.library_artifact_dir(&instance.locked.artifact_sha256)?,
                 })
             })
             .collect()
     }
+}
+
+fn dependencies_complete(
+    package: &LockedProjectPackage,
+    graph: &BTreeMap<String, LockedProjectPackage>,
+    visiting: &mut BTreeSet<String>,
+    complete: &mut BTreeSet<String>,
+) -> bool {
+    for dependency in package.dependencies.keys() {
+        if complete.contains(dependency) {
+            continue;
+        }
+        let Some(locked) = graph.get(dependency) else {
+            return false;
+        };
+        if !visiting.insert(dependency.clone()) {
+            return false;
+        }
+        if !dependencies_complete(locked, graph, visiting, complete) {
+            return false;
+        }
+        visiting.remove(dependency);
+        complete.insert(dependency.clone());
+    }
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,7 +358,9 @@ impl LockedToolchain {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockedArtifactFetch {
+    pub root: String,
     pub package: String,
+    pub private: bool,
     pub version: String,
     pub artifact_url: Url,
     pub artifact_sha256: String,
@@ -386,6 +498,8 @@ pub enum ProjectPackageError {
     UnsupportedFormat(u32),
     #[error("invalid package key {0:?}")]
     InvalidPackageKey(String),
+    #[error("private dependency scope {0:?} has no matching root package")]
+    PrivateScopeWithoutRoot(String),
     #[error("package requirement must contain a version and/or source")]
     EmptyRequirement,
     #[error("invalid version requirement {0:?}")]
@@ -458,6 +572,8 @@ packages:
             .rehydration_plan(&ProjectCacheLayout::new("/work/backend"))
             .unwrap();
         assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].root, "advancenet");
+        assert!(!plan[0].private);
         assert_eq!(
             plan[0].cache_path,
             PathBuf::from("/work/backend/.cache/library").join("a".repeat(64))
@@ -466,6 +582,71 @@ packages:
             plan[0].artifact_url.as_str(),
             "https://cdn.kastrick.invalid/advancenet-4.0.1.zip"
         );
+    }
+
+    #[test]
+    fn roots_can_lock_conflicting_private_dependency_versions() {
+        let yaml = format!(
+            r#"
+format: 1
+packages:
+  advancenet:
+    version: 2.0.0
+    resolved_from: registry:advancenet
+    artifact_url: https://cdn.kastrick.invalid/advancenet.zip
+    artifact_sha256: {a}
+    manifest_sha256: {m}
+    dependencies:
+      rbe-compiler-syntax: ^1.5
+  awesome-http:
+    version: 1.0.0
+    resolved_from: registry:awesome-http
+    artifact_url: https://cdn.kastrick.invalid/awesome-http.zip
+    artifact_sha256: {b}
+    manifest_sha256: {n}
+    dependencies:
+      rbe-compiler-syntax: "~1.3"
+private:
+  advancenet:
+    rbe-compiler-syntax:
+      version: 1.5.2
+      resolved_from: registry:rbe-compiler-syntax
+      artifact_url: https://cdn.kastrick.invalid/syntax-1.5.2.zip
+      artifact_sha256: {c}
+      manifest_sha256: {o}
+  awesome-http:
+    rbe-compiler-syntax:
+      version: 1.3.9
+      resolved_from: registry:rbe-compiler-syntax
+      artifact_url: https://cdn.kastrick.invalid/syntax-1.3.9.zip
+      artifact_sha256: {d}
+      manifest_sha256: {p}
+"#,
+            a = "a".repeat(64),
+            b = "b".repeat(64),
+            c = "c".repeat(64),
+            d = "d".repeat(64),
+            m = "1".repeat(64),
+            n = "2".repeat(64),
+            o = "3".repeat(64),
+            p = "4".repeat(64),
+        );
+        let lock = ProjectPackageLock::parse_yaml(&yaml).unwrap();
+        assert!(lock.root_graph_complete("advancenet"));
+        assert!(lock.root_graph_complete("awesome-http"));
+        assert_eq!(
+            lock.locked_for_root("advancenet", "rbe-compiler-syntax")
+                .unwrap()
+                .version,
+            "1.5.2"
+        );
+        assert_eq!(
+            lock.locked_for_root("awesome-http", "rbe-compiler-syntax")
+                .unwrap()
+                .version,
+            "1.3.9"
+        );
+        assert_eq!(lock.instances().len(), 4);
     }
 
     #[test]
