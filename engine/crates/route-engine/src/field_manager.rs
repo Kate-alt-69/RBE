@@ -108,7 +108,7 @@ impl FieldRuntimeContext {
                     DEFAULT_DYNAMIC_FIELD_MATCHES,
                 )
                 .map(Value::Object)
-                .map_err(field_module_error)
+                .map_err(|error| field_module_error(error.to_string()))
             }
             _ => unreachable!("direct FieldManager function allowlist checked above"),
         }
@@ -328,12 +328,20 @@ fn resolve_binding(
                 binding.max_matches,
             )
             .map(Value::Object)
-            .map_err(|message| {
-                resolve_error(
+            .map_err(|error| match error {
+                error @ DynamicValuesError::TooMany { .. } => resolve_error(
                     "FLD4004",
                     &binding.name,
-                    format!("{message} for resolver {resolver_name:?}"),
-                )
+                    format!("{error} for resolver {resolver_name:?}"),
+                ),
+                DynamicValuesError::NonString { key } => resolve_error(
+                    "FLD4002",
+                    &binding.name,
+                    format!(
+                        "{} dynamic field {key:?} for resolver {resolver_name:?} must be a string",
+                        binding.source
+                    ),
+                ),
             }),
             None => Ok(Value::Object(HashMap::new())),
         };
@@ -402,30 +410,71 @@ fn coerce_value(value: &Value, value_type: FieldValueType, source: &str) -> Resu
     }
 }
 
+#[derive(Debug)]
+enum DynamicValuesError {
+    TooMany { prefix: String, max_matches: usize },
+    NonString { key: String },
+}
+
+impl std::fmt::Display for DynamicValuesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooMany {
+                prefix,
+                max_matches,
+            } => write!(
+                f,
+                "dynamic FieldManager prefix {prefix:?} matched more than {max_matches} fields"
+            ),
+            Self::NonString { key } => {
+                write!(f, "dynamic FieldManager field {key:?} is not a string")
+            }
+        }
+    }
+}
+
 fn dynamic_values(
     values: &HashMap<String, Value>,
     prefix: &str,
     strip_prefix: bool,
     max_matches: usize,
-) -> Result<HashMap<String, Value>, String> {
-    let mut output = HashMap::new();
-    let mut matched = 0usize;
+) -> Result<HashMap<String, Value>, DynamicValuesError> {
+    // Count before inspecting value types so overflow always wins regardless of
+    // HashMap iteration order. Dynamic families are bounded before output work.
+    let matched = values.keys().filter(|key| key.starts_with(prefix)).count();
+    if matched > max_matches {
+        return Err(DynamicValuesError::TooMany {
+            prefix: prefix.to_string(),
+            max_matches,
+        });
+    }
+
+    // Pick the first invalid key lexicographically so a malformed body produces
+    // a stable diagnostic even though request objects are stored in a HashMap.
+    if let Some(key) = values
+        .iter()
+        .filter(|(key, _)| key.starts_with(prefix))
+        .filter(|(_, value)| !matches!(value, Value::String(_)))
+        .map(|(key, _)| key)
+        .min()
+    {
+        return Err(DynamicValuesError::NonString { key: key.clone() });
+    }
+
+    let mut output = HashMap::with_capacity(matched);
     for (key, value) in values {
         let Some(suffix) = key.strip_prefix(prefix) else {
             continue;
         };
-        matched = matched.saturating_add(1);
-        if matched > max_matches {
-            return Err(format!(
-                "dynamic FieldManager prefix {prefix:?} matched more than {max_matches} fields"
-            ));
-        }
+        let Value::String(value) = value else {
+            unreachable!("dynamic value types were validated before output construction");
+        };
         let key = if strip_prefix {
             suffix.to_string()
         } else {
             key.clone()
         };
-        output.insert(key, value.clone());
+        output.insert(key, Value::String(value.clone()));
     }
     Ok(output)
 }
@@ -965,5 +1014,69 @@ mod tests {
             panic!("expected object")
         };
         assert!(matches!(values.get("token"), Some(Value::String(value)) if value == "Bearer abc"));
+    }
+
+    #[test]
+    fn body_dynamic_bindings_reject_non_string_values() {
+        let route = route(
+            r#":import[field]
+               fields { tracking = dynamic("utm_", source = body, maxMatches = 4); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        let request = Value::Object(HashMap::from([
+            ("query".into(), Value::Object(HashMap::new())),
+            ("params".into(), Value::Object(HashMap::new())),
+            ("headers".into(), Value::Object(HashMap::new())),
+            ("cookies".into(), Value::Object(HashMap::new())),
+            (
+                "body".into(),
+                Value::Object(HashMap::from([
+                    ("utm_source".into(), Value::String("chat".into())),
+                    ("utm_count".into(), Value::Number(7.0)),
+                ])),
+            ),
+        ]));
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("dynamic-body-type");
+        let error = block_on_ready(plan.resolve(&request, &program)).unwrap_err();
+        assert_eq!(error.code, "FLD4002");
+        assert_eq!(error.field, "tracking");
+        assert!(error.message.contains("utm_count"));
+        assert!(error.message.contains("must be a string"));
+    }
+
+    #[test]
+    fn dynamic_overflow_precedes_value_type_errors() {
+        let route = route(
+            r#":import[field]
+               fields { tracking = dynamic("utm_", source = body, maxMatches = 1); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        let request = Value::Object(HashMap::from([
+            ("query".into(), Value::Object(HashMap::new())),
+            ("params".into(), Value::Object(HashMap::new())),
+            ("headers".into(), Value::Object(HashMap::new())),
+            ("cookies".into(), Value::Object(HashMap::new())),
+            (
+                "body".into(),
+                Value::Object(HashMap::from([
+                    ("utm_source".into(), Value::String("chat".into())),
+                    ("utm_count".into(), Value::Number(7.0)),
+                ])),
+            ),
+        ]));
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("dynamic-overflow-priority");
+        let error = block_on_ready(plan.resolve(&request, &program)).unwrap_err();
+        assert_eq!(error.code, "FLD4004");
+        assert!(error.message.contains("more than 1 fields"));
     }
 }
