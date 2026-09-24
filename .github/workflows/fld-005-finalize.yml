@@ -1,0 +1,61 @@
+name: Finalize FLD-005 Native FieldManager Inputs
+
+on:
+  push:
+    branches:
+      - ci/fld-005-native-fields-20260924
+    paths:
+      - ".github/patches/fld-005-native-fields.py"
+      - ".github/workflows/fld-005-finalize.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/fld-005-native-fields-20260924
+          fetch-depth: 2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply FLD-005
+        run: python .github/patches/fld-005-native-fields.py
+
+      - name: Format and check route-engine
+        working-directory: engine
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check -p route-engine
+
+      - name: Clippy route-engine
+        working-directory: engine
+        run: cargo clippy -p route-engine --all-targets -- -D warnings
+
+      - name: Test route-engine
+        working-directory: engine
+        run: cargo test -p route-engine
+
+      - name: Commit verified FLD-005 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add engine/crates/route-engine/src/wasm_compiler.rs \
+                  engine/crates/route-engine/src/discovery.rs \
+                  doc/field-manager.md
+          git diff --cached --quiet && { echo "FLD-005 produced no source diff"; exit 1; }
+          git commit -m "FEAT | FLD-005 add native FieldManager inputs"
+          git push origin HEAD:ci/fld-005-native-fields-20260924
