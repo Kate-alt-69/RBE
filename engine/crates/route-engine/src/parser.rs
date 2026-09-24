@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::ast::{
     BinaryOp, Expr, FieldBinding, FieldBindingMode, FieldDirective, FieldFile, FieldValueType,
     FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceClassDef, ServiceProgram,
-    Statement, Value,
+    Statement, Value, DEFAULT_DYNAMIC_FIELD_MATCHES, MAX_DYNAMIC_FIELD_MATCHES,
 };
 use crate::lexer::{Token, TokenKind};
 
@@ -330,6 +330,7 @@ impl Parser {
         let mut value_type = FieldValueType::String;
         let mut default = None;
         let mut strip_prefix = false;
+        let mut max_matches = DEFAULT_DYNAMIC_FIELD_MATCHES;
         while self.check(&TokenKind::Comma) {
             self.advance();
             let option = self.expect_ident()?;
@@ -352,6 +353,23 @@ impl Parser {
                         }
                     };
                 }
+                "maxMatches" => {
+                    max_matches = match self.advance().kind {
+                        TokenKind::Number(value)
+                            if value.is_finite()
+                                && value.fract() == 0.0
+                                && value >= 1.0
+                                && value <= MAX_DYNAMIC_FIELD_MATCHES as f64 =>
+                        {
+                            value as usize
+                        }
+                        other => {
+                            return Err(self.error_here(&format!(
+                                "maxMatches must be an integer from 1 to {MAX_DYNAMIC_FIELD_MATCHES}, got {other:?}"
+                            )));
+                        }
+                    };
+                }
                 other => {
                     return Err(
                         self.error_here(&format!("unknown FieldManager resolver option {other:?}"))
@@ -367,8 +385,11 @@ impl Parser {
             && (default.is_some() || value_type != FieldValueType::String)
         {
             return Err(self.error_here(
-                "dynamic(...) supports stripPrefix only; dynamic values stay strings",
+                "dynamic(...) supports stripPrefix and maxMatches only; dynamic values stay strings",
             ));
+        }
+        if mode != FieldBindingMode::Dynamic && max_matches != DEFAULT_DYNAMIC_FIELD_MATCHES {
+            return Err(self.error_here("maxMatches is only valid for dynamic(...)"));
         }
         Ok(FieldBinding {
             name,
@@ -378,6 +399,7 @@ impl Parser {
             value_type,
             default,
             strip_prefix,
+            max_matches,
         })
     }
 

@@ -57,6 +57,9 @@ pub enum FieldValueType {
     Bool,
 }
 
+pub const DEFAULT_DYNAMIC_FIELD_MATCHES: usize = 64;
+pub const MAX_DYNAMIC_FIELD_MATCHES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldBindingMode {
     Required,
@@ -81,6 +84,7 @@ pub struct FieldBinding {
     pub value_type: FieldValueType,
     pub default: Option<Value>,
     pub strip_prefix: bool,
+    pub max_matches: usize,
 }
 
 #[derive(Debug, Clone)]
