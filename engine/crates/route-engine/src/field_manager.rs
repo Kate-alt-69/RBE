@@ -1244,4 +1244,49 @@ mod tests {
                 .contains("cannot declare both `required` and `optional`"));
         }
     }
+
+    #[test]
+    fn optional_defaults_must_match_the_declared_type() {
+        for binding in [
+            r#"optional("page", type = int, default = "oops")"#,
+            r#"optional("page", default = "oops", type = int)"#,
+            r#"optional("page", type = int, default = 1.5)"#,
+            r#"optional("enabled", type = bool, default = "false")"#,
+            r#"optional("name", type = string, default = 1)"#,
+        ] {
+            let source = format!(
+                ":import[field]\nfields {{ value = {binding}; }}\nclass Route {{ get(req) {{ return req.fields; }} }}"
+            );
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            let error = Parser::new(tokens).parse_file().unwrap_err();
+            assert!(error
+                .message
+                .contains("FieldManager default does not match declared type"));
+        }
+    }
+
+    #[test]
+    fn optional_defaults_accept_typed_constants_and_null() {
+        let route = route(
+            r#":import[field]
+               fields {
+                   page = optional("page", type = int, default = 1);
+                   enabled = optional("enabled", type = bool, default = false);
+                   name = optional("name", type = string, default = "guest");
+                   missing = optional("missing", type = int, default = null);
+               }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        assert!(
+            matches!(route.field_bindings[0].default, Some(Value::Number(value)) if value == 1.0)
+        );
+        assert!(matches!(
+            route.field_bindings[1].default,
+            Some(Value::Bool(false))
+        ));
+        assert!(
+            matches!(route.field_bindings[2].default, Some(Value::String(ref value)) if value == "guest")
+        );
+        assert!(matches!(route.field_bindings[3].default, Some(Value::Null)));
+    }
 }
