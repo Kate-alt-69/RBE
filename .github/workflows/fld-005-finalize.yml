@@ -6,6 +6,7 @@ on:
       - ci/fld-005-native-fields-20260924
     paths:
       - ".github/patches/fld-005-native-fields.py"
+      - ".github/patches/fld-005-box-errors.py"
       - ".github/workflows/fld-005-finalize.yml"
 
 permissions:
@@ -30,7 +31,9 @@ jobs:
           workspaces: engine
 
       - name: Apply FLD-005
-        run: python .github/patches/fld-005-native-fields.py
+        run: |
+          python .github/patches/fld-005-native-fields.py
+          python .github/patches/fld-005-box-errors.py
 
       - name: Format and check route-engine
         working-directory: engine
