@@ -220,7 +220,9 @@ pub fn check_package(root: impl AsRef<Path>) -> Result<CheckedPackage, PackageEr
 fn validate_manifest(manifest: &PackageManifest) -> Result<(), PackageError> {
     validate_name("package", &manifest.package.name)?;
     if manifest.package.version.trim().is_empty() || manifest.package.version.len() > 128 {
-        return Err(PackageError::InvalidVersion(manifest.package.version.clone()));
+        return Err(PackageError::InvalidVersion(
+            manifest.package.version.clone(),
+        ));
     }
     validate_relative_dir(&manifest.components.root)?;
 
@@ -306,9 +308,7 @@ fn validate_name(field: &'static str, value: &str) -> Result<(), PackageError> {
     if value.is_empty()
         || value.len() > 192
         || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'-' | b'_')
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
         })
     {
         return Err(PackageError::InvalidName {
@@ -369,11 +369,20 @@ pub enum PackageError {
     #[error("invalid component name {0:?}")]
     InvalidComponentName(String),
     #[error("component {component:?} is missing its language entry file: {expected}")]
-    ComponentSourceMissing { component: String, expected: PathBuf },
+    ComponentSourceMissing {
+        component: String,
+        expected: PathBuf,
+    },
     #[error("global component {component:?} needs exactly one named .rs/.js/.ts/.py entry file under {directory}")]
-    GlobalComponentSourceMissing { component: String, directory: PathBuf },
+    GlobalComponentSourceMissing {
+        component: String,
+        directory: PathBuf,
+    },
     #[error("global component {component:?} has multiple named SDK-language entry files under {directory}")]
-    GlobalComponentAmbiguous { component: String, directory: PathBuf },
+    GlobalComponentAmbiguous {
+        component: String,
+        directory: PathBuf,
+    },
     #[error("invalid private RBE dependency version for {package:?}: {version:?}")]
     InvalidDependencyVersion { package: String, version: String },
 }
