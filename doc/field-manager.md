@@ -160,7 +160,7 @@ fields {
 }
 ```
 
-Header lookup is ASCII case-insensitive. Named `body` bindings require a JSON object; an empty body behaves like a missing object so optional/default bindings still work. `body` integer and boolean fields may use native JSON numbers/booleans or their string forms. A `.field` with `source = body` and no key receives the complete body value in `resolve(raw, context)`, including non-object JSON or text bodies.
+Header lookup, including dynamic prefix matching, is ASCII case-insensitive. Named `body` bindings require a JSON object; an empty body behaves like a missing object so optional/default bindings still work. `body` integer and boolean fields may use native JSON numbers/booleans or their string forms. A `.field` with `source = body` and no key receives the complete body value in `resolve(raw, context)`, including non-object JSON or text bodies.
 
 The direct helpers `field.required(...)`, `field.optional(...)`, `field.has(...)`, and `field.dynamic(...)` intentionally remain query shorthands. Use declarative bindings when selecting another source so source ownership remains visible in compiled Field IR.
 
