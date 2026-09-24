@@ -4,15 +4,6 @@ on:
   push:
     tags:
       - 'sdk-v*'
-    paths:
-      - 'engine/crates/sdk-package/**'
-      - 'engine/crates/rpx/**'
-      - 'engine/crates/sdk-backend/**'
-      - 'build.ps1'
-      - 'build.sh'
-      - 'build-select.ps1'
-      - 'build-select.sh'
-      - '.github/workflows/sdk-toolchain.yml'
   pull_request:
     paths:
       - 'engine/crates/sdk-package/**'
