@@ -1,0 +1,19 @@
+[package]
+name = "rbe-install-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rbe-install-executor = { path = "../install-executor" }
+rbe-install-request = { path = "../install-request" }
+rbe-library-registry = { path = "../library-registry" }
+rbe-library-resolver = { path = "../library-resolver" }
+fs2 = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
