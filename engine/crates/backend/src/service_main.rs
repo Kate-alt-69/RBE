@@ -41,17 +41,11 @@ mod runtime_image_boot {
         anyhow::bail!("RBE package preflight is only available from backend.exe")
     }
 
-    pub fn apply_server_policy(
-        _config: &mut config::Config,
-        _policy: &(),
-    ) -> anyhow::Result<()> {
+    pub fn apply_server_policy(_config: &mut config::Config, _policy: &()) -> anyhow::Result<()> {
         anyhow::bail!("RBE package preflight is only available from backend.exe")
     }
 
-    pub fn apply_middleware_plan(
-        _config: &mut config::Config,
-        _plan: &(),
-    ) -> anyhow::Result<()> {
+    pub fn apply_middleware_plan(_config: &mut config::Config, _plan: &()) -> anyhow::Result<()> {
         anyhow::bail!("RBE package preflight is only available from backend.exe")
     }
 }
