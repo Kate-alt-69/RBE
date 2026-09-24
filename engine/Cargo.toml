@@ -11,9 +11,6 @@ members = [
     "crates/route-engine",
     "crates/service-runtime",
     "crates/video-manager",
-    "crates/sdk-package",
-    "crates/rpx",
-    "crates/sdk-backend",
     "crates/cloud-node",
 ]
 # `vault` used to be a workspace member here; it's now a standalone
@@ -22,12 +19,21 @@ members = [
 # doc comment for why (the container runtime's payment environment
 # needs it too, and a separate Cargo workspace can't share a member
 # crate directly).
+# The SDK authoring toolchain is deliberately standalone as well. Keeping
+# sdk-package/RPX/sdk-backend outside the production engine workspace means
+# `cargo --locked` for backend releases never needs to change merely because
+# package-author tooling changed, and `--build-sdk` can compile a trimmed tree.
 # The container runtime is intentionally its own separate Cargo workspace
 # (container-runtime/), not a member of this one. See the migration plan
 # §3 "non-negotiable exception" — it stays a fully separate executable,
 # never merged into the API process, and gets its own build/versioning
 # lifecycle from day one.
-exclude = ["container-runtime"]
+exclude = [
+    "container-runtime",
+    "crates/sdk-package",
+    "crates/rpx",
+    "crates/sdk-backend",
+]
 
 [workspace.package]
 version = "0.1.0"
