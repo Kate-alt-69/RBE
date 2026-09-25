@@ -30,7 +30,10 @@ pub fn requested(args: &[String]) -> Option<anyhow::Result<String>> {
 fn backend_install_authority() -> bool {
     std::env::current_exe()
         .ok()
-        .and_then(|path| path.file_stem().map(|name| name.to_string_lossy().into_owned()))
+        .and_then(|path| {
+            path.file_stem()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
         .is_some_and(|name| name.eq_ignore_ascii_case("backend"))
 }
 

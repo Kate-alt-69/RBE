@@ -145,11 +145,7 @@ mod tests {
     fn constraints_still_unify_inside_one_root_graph() {
         let mut catalog = PackageCatalog::default();
         catalog
-            .add(release(
-                "app",
-                "1.0.0",
-                &[("alpha", "^1"), ("beta", "^1")],
-            ))
+            .add(release("app", "1.0.0", &[("alpha", "^1"), ("beta", "^1")]))
             .unwrap();
         catalog
             .add(release("alpha", "1.0.0", &[("shared", "^1")]))
@@ -160,8 +156,8 @@ mod tests {
         catalog.add(release("shared", "1.5.0", &[])).unwrap();
         catalog.add(release("shared", "1.2.0", &[])).unwrap();
 
-        let result = resolve_scoped(&catalog, [ResolutionRequest::new("app", "^1").unwrap()])
-            .unwrap();
+        let result =
+            resolve_scoped(&catalog, [ResolutionRequest::new("app", "^1").unwrap()]).unwrap();
         assert_eq!(
             result
                 .root("app")

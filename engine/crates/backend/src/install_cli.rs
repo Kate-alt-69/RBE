@@ -103,7 +103,9 @@ pub fn requested(args: &[String]) -> Option<Result<String, InstallCliFailure>> {
         // SDK/runtime and external/local archive execution remain owned by
         // their existing lanes. Let the legacy dispatcher preserve its current
         // explicit unavailable behavior rather than stealing those commands.
-        InstallTarget::Named { .. } | InstallTarget::External { .. } | InstallTarget::LocalArchive(_) => None,
+        InstallTarget::Named { .. }
+        | InstallTarget::External { .. }
+        | InstallTarget::LocalArchive(_) => None,
     }
 }
 
@@ -181,9 +183,8 @@ async fn resolve_named_async(
     json: bool,
     quiet: bool,
 ) -> Result<String, InstallCliFailure> {
-    let client = RegistryClient::new(registry).map_err(|error| {
-        InstallCliFailure::config(format!("invalid {REGISTRY_ENV}: {error}"))
-    })?;
+    let client = RegistryClient::new(registry)
+        .map_err(|error| InstallCliFailure::config(format!("invalid {REGISTRY_ENV}: {error}")))?;
     let (catalog, indexes) = client.hydrate_catalog(key).await.map_err(|error| {
         InstallCliFailure::unavailable(format!(
             "package registry resolution for `{key}` failed: {error}"
@@ -360,10 +361,6 @@ mod tests {
     fn reserved_and_external_targets_remain_outside_this_lane() {
         assert!(requested(&args(&["install", "sdk.0.1.0"])).is_none());
         assert!(requested(&args(&["install", "runtime.python.3.10"])).is_none());
-        assert!(requested(&args(&[
-            "install",
-            "https://example.com/package.rbe-pkg"
-        ]))
-        .is_none());
+        assert!(requested(&args(&["install", "https://example.com/package.rbe-pkg"])).is_none());
     }
 }
