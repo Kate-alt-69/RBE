@@ -168,11 +168,7 @@ fn materialize_archive(
                     planned.archive_path.clone(),
                 ));
             }
-            ensure_directory(
-                &plan.root,
-                &planned.destination,
-                &mut created_directories,
-            )?;
+            ensure_directory(&plan.root, &planned.destination, &mut created_directories)?;
             continue;
         }
 
@@ -439,16 +435,21 @@ entry = "src/index.js"
         let extraction_root = extraction_parent.join("advancenet");
         let selection = SourceSelection::new(["src"]).unwrap();
 
-        let prepared =
-            prepare_promoted_source(&stage, &extraction_root, &selection).unwrap();
+        let prepared = prepare_promoted_source(&stage, &extraction_root, &selection).unwrap();
 
         assert_eq!(prepared.root, extraction_root);
         assert_eq!(prepared.manifest.name, "advancenet");
         assert_eq!(prepared.source_digest.file_count, 1);
         assert_eq!(prepared.source_digest.total_bytes, 17);
         assert_eq!(prepared.extracted_files, 3);
-        assert_eq!(fs::read(prepared.root.join("src/index.js")).unwrap(), b"export default 1;");
-        assert_eq!(fs::read(prepared.root.join("dist/prebuilt.bin")).unwrap(), b"native-binary");
+        assert_eq!(
+            fs::read(prepared.root.join("src/index.js")).unwrap(),
+            b"export default 1;"
+        );
+        assert_eq!(
+            fs::read(prepared.root.join("dist/prebuilt.bin")).unwrap(),
+            b"native-binary"
+        );
     }
 
     #[test]
@@ -462,7 +463,10 @@ entry = "src/index.js"
         let selection = SourceSelection::new(["src"]).unwrap();
 
         let error = prepare_promoted_source(&stage, &extraction_root, &selection).unwrap_err();
-        assert!(matches!(error, InstallRuntimeError::ExtractionRootExists(_)));
+        assert!(matches!(
+            error,
+            InstallRuntimeError::ExtractionRootExists(_)
+        ));
     }
 
     #[test]
