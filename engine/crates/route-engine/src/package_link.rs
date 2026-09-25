@@ -199,13 +199,19 @@ pub struct ResolvedPackageExport<'a> {
     pub language: &'a str,
 }
 
-fn object<'a>(value: &'a JsonValue, label: &str) -> Result<&'a JsonMap<String, JsonValue>, PackageLinkError> {
+fn object<'a>(
+    value: &'a JsonValue,
+    label: &str,
+) -> Result<&'a JsonMap<String, JsonValue>, PackageLinkError> {
     value
         .as_object()
         .ok_or_else(|| PackageLinkError::InvalidShape(format!("{label} must be a JSON object")))
 }
 
-fn string_value<'a>(value: Option<&'a JsonValue>, field: &str) -> Result<&'a str, PackageLinkError> {
+fn string_value<'a>(
+    value: Option<&'a JsonValue>,
+    field: &str,
+) -> Result<&'a str, PackageLinkError> {
     value
         .and_then(JsonValue::as_str)
         .ok_or_else(|| PackageLinkError::InvalidShape(format!("{field} must be a JSON string")))
@@ -305,18 +311,27 @@ impl fmt::Display for PackageLinkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Json(error) => write!(formatter, "invalid package-link JSON: {error}"),
-            Self::InvalidShape(message) => write!(formatter, "invalid package-link JSON: {message}"),
-            Self::UnsupportedFormat(format) => write!(formatter, "unsupported package-link format {format}"),
+            Self::InvalidShape(message) => {
+                write!(formatter, "invalid package-link JSON: {message}")
+            }
+            Self::UnsupportedFormat(format) => {
+                write!(formatter, "unsupported package-link format {format}")
+            }
             Self::InvalidName(value) => write!(formatter, "invalid package/export name {value:?}"),
             Self::InvalidVersion(value) => write!(formatter, "invalid package version {value:?}"),
             Self::InvalidSha256(value) => {
                 write!(formatter, "invalid package artifact SHA-256 {value:?}")
             }
-            Self::InvalidEntry(value) => write!(formatter, "invalid package export entry {value:?}"),
+            Self::InvalidEntry(value) => {
+                write!(formatter, "invalid package export entry {value:?}")
+            }
             Self::InvalidLanguage(value) => {
                 write!(formatter, "unsupported package export language {value:?}")
             }
-            Self::NoExports(package) => write!(formatter, "root package {package:?} exposes no public exports"),
+            Self::NoExports(package) => write!(
+                formatter,
+                "root package {package:?} exposes no public exports"
+            ),
             Self::ExportNotFound { package, export } => write!(
                 formatter,
                 "PACKAGE_EXPORT_NOT_FOUND: package export not found: {export} from {package}"
@@ -375,10 +390,9 @@ mod tests {
 
     #[test]
     fn json_parser_rejects_unknown_fields() {
-        let error = PackageLinkContext::parse_json(
-            r#"{"format":1,"roots":{},"private":{"secret":{}}}"#,
-        )
-        .unwrap_err();
+        let error =
+            PackageLinkContext::parse_json(r#"{"format":1,"roots":{},"private":{"secret":{}}}"#)
+                .unwrap_err();
         assert!(error.to_string().contains("unknown field"));
     }
 
