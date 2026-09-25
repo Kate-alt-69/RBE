@@ -2497,12 +2497,16 @@ dependencies = [
  "fs2",
  "rbe-install-executor",
  "rbe-install-request",
+ "rbe-library-package",
  "rbe-library-registry",
  "rbe-library-resolver",
+ "rbe-project-package",
  "reqwest",
+ "sha2",
  "thiserror 2.0.20",
  "tokio",
  "url",
+ "zip",
 ]
 
 [[package]]

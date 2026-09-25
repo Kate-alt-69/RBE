@@ -8,9 +8,13 @@
 
 mod artifact;
 mod http;
+mod package;
 mod registry;
 
 pub use artifact::{stage_artifact, ArtifactStage};
+pub use package::{
+    inspect_registry_stage, registry_artifact_plan, stage_registry_package, VerifiedRegistryPackage,
+};
 pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
     MAX_REGISTRY_INDEX_BYTES,
@@ -24,6 +28,12 @@ pub enum InstallRuntimeError {
     RegistryContract(#[from] rbe_install_request::RegistryContractError),
     #[error(transparent)]
     RegistryBridge(#[from] rbe_library_registry::RegistryBridgeError),
+    #[error(transparent)]
+    PackageArchive(#[from] rbe_library_package::ArchiveError),
+    #[error(transparent)]
+    ProjectPackage(#[from] rbe_project_package::ProjectPackageError),
+    #[error(transparent)]
+    Zip(#[from] zip::result::ZipError),
     #[error("invalid install-runtime URL {value:?}: {source}")]
     InvalidUrl {
         value: String,
@@ -80,6 +90,19 @@ pub enum InstallRuntimeError {
     SymlinkedPath(String),
     #[error("installer staging entry has an unexpected filesystem type: {0}")]
     UnsafeStagingEntry(String),
+    #[error("registry release {package:?} {version:?} is yanked and cannot be staged")]
+    YankedRegistryRelease { package: String, version: String },
+    #[error(
+        "registry/package manifest mismatch for {package:?} field {field}: registry={registry:?}, manifest={manifest:?}"
+    )]
+    PackageMetadataMismatch {
+        package: String,
+        field: &'static str,
+        registry: String,
+        manifest: String,
+    },
+    #[error("library.toml is not a bounded regular manifest suitable for hashing")]
+    InvalidManifestForHashing,
     #[error("install-runtime filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
 }
