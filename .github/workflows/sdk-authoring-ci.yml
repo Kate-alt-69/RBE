@@ -1,0 +1,68 @@
+name: SDK Authoring CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'engine/crates/sdk-package/**'
+      - 'engine/crates/rpx/**'
+      - 'engine/crates/sdk-backend/**'
+      - 'build.ps1'
+      - 'build.sh'
+      - 'build-select.ps1'
+      - 'build-select.sh'
+      - '.github/workflows/sdk-authoring-ci.yml'
+  pull_request:
+    paths:
+      - 'engine/crates/sdk-package/**'
+      - 'engine/crates/rpx/**'
+      - 'engine/crates/sdk-backend/**'
+      - 'build.ps1'
+      - 'build.sh'
+      - 'build-select.ps1'
+      - 'build-select.sh'
+      - '.github/workflows/sdk-authoring-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-authoring-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sdk-authoring:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format standalone SDK crates
+        run: |
+          cargo fmt --manifest-path engine/crates/sdk-package/Cargo.toml -- --check
+          cargo fmt --manifest-path engine/crates/rpx/Cargo.toml -- --check
+          cargo fmt --manifest-path engine/crates/sdk-backend/Cargo.toml -- --check
+      - name: Clippy standalone SDK crates
+        run: |
+          cargo clippy --manifest-path engine/crates/sdk-package/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path engine/crates/rpx/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path engine/crates/sdk-backend/Cargo.toml --all-targets -- -D warnings
+      - name: Test standalone SDK crates
+        run: |
+          cargo test --manifest-path engine/crates/sdk-package/Cargo.toml
+          cargo test --manifest-path engine/crates/rpx/Cargo.toml
+          cargo test --manifest-path engine/crates/sdk-backend/Cargo.toml
+      - name: Smoke build complete SDK bundle
+        run: ./build.sh --build-sdk --build-linux --arch-x64
+      - name: Validate SDK bundle contents
+        run: |
+          test -x dist/x86_64-unknown-linux-gnu/sdk/backend
+          test -x dist/x86_64-unknown-linux-gnu/sdk/rpx
+          test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/rust/Cargo.toml
+          test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/javascript/index.js
+          test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/typescript/index.d.ts
+          test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/python/pyproject.toml
