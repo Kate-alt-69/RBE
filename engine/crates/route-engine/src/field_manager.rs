@@ -74,24 +74,24 @@ impl FieldRuntimeContext {
     }
 
     fn call_direct(&self, function: &str, args: &[Value]) -> Result<Value, ModuleEvalError> {
+        if function == "dynamic" {
+            require_arity(function, args, 1, 2)?;
+        } else {
+            require_arity(function, args, 1, 1)?;
+        }
         let key = string_arg(args.first(), "FieldManager key/prefix")?;
+        if key.is_empty() {
+            return Err(field_module_error(
+                "FieldManager key/prefix must be a non-empty string",
+            ));
+        }
         match function {
-            "has" => {
-                require_arity(function, args, 1, 1)?;
-                Ok(Value::Bool(self.query.contains_key(key)))
-            }
-            "required" => {
-                require_arity(function, args, 1, 1)?;
-                self.query.get(key).cloned().ok_or_else(|| {
-                    field_module_error(format!("required query field {key:?} is missing"))
-                })
-            }
-            "optional" => {
-                require_arity(function, args, 1, 1)?;
-                Ok(self.query.get(key).cloned().unwrap_or(Value::Null))
-            }
+            "has" => Ok(Value::Bool(self.query.contains_key(key))),
+            "required" => self.query.get(key).cloned().ok_or_else(|| {
+                field_module_error(format!("required query field {key:?} is missing"))
+            }),
+            "optional" => Ok(self.query.get(key).cloned().unwrap_or(Value::Null)),
             "dynamic" => {
-                require_arity(function, args, 1, 2)?;
                 let strip_prefix = match args.get(1) {
                     None => false,
                     Some(Value::Bool(value)) => *value,
@@ -1315,5 +1315,37 @@ mod tests {
             field_logical_candidates("item", "auth"),
             vec!["auth".to_string()]
         );
+    }
+
+    #[test]
+    fn direct_field_helpers_reject_empty_keys_and_prefixes() {
+        let context = FieldRuntimeContext {
+            query: HashMap::new(),
+            resolved: HashMap::new(),
+            allowed_resolvers: HashSet::new(),
+            direct_enabled: true,
+        };
+        for function in ["has", "required", "optional", "dynamic"] {
+            let error = context
+                .call(function, &[Value::String(String::new())])
+                .unwrap_err();
+            assert!(
+                error.message.contains("non-empty"),
+                "{function}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn direct_field_helpers_validate_arity_before_key_type() {
+        let context = FieldRuntimeContext {
+            query: HashMap::new(),
+            resolved: HashMap::new(),
+            allowed_resolvers: HashSet::new(),
+            direct_enabled: true,
+        };
+        let error = context.call("required", &[]).unwrap_err();
+        assert!(error.message.contains("argument"));
     }
 }
