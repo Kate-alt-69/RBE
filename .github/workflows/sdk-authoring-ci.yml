@@ -70,8 +70,8 @@ jobs:
           const bridge = {
             call(request) {
               calls.push(request);
-              if (request.operation === 'fail') throw new Error('expected smoke failure');
-              return { operation: request.operation };
+              if (request.operation.startsWith('fail')) throw new Error('expected smoke failure');
+              return { operation: request.operation, unwind: [] };
             }
           };
           const sdk = new RbeSdk(bridge);
@@ -82,13 +82,43 @@ jobs:
             advanced.request('future:thing', 'thing:42', 'fail')
           ]);
           if (calls.length !== 3 || !results[0].ok || results[1].ok) process.exit(2);
+
+          const events = [];
+          const interceptor = (name) => ({
+            before(request) {
+              events.push(`${name}:before`);
+              return { ...request, operation: `${request.operation}-${name}` };
+            },
+            after(request, reply) {
+              events.push(`${name}:after`);
+              return { ...reply, unwind: [...reply.unwind, name] };
+            },
+            onError(request, error) {
+              events.push(`${name}:error`);
+              return new Error(`${error.message}:${name}`);
+            }
+          });
+          const hooked = sdk.intercept(interceptor('outer'), interceptor('inner'));
+          const hookedReply = await hooked.capability('custom:hooks').call('hook', {});
+          if (calls.at(-1).operation !== 'hook-outer-inner') process.exit(3);
+          if (hookedReply.unwind.join(',') !== 'inner,outer') process.exit(4);
+          if (events.join(',') !== 'outer:before,inner:before,inner:after,outer:after') process.exit(5);
+
+          events.length = 0;
+          try {
+            await hooked.capability('custom:hooks').call('fail', {});
+            process.exit(6);
+          } catch (error) {
+            if (error.message !== 'expected smoke failure:inner:outer') process.exit(7);
+          }
+          if (events.join(',') !== 'outer:before,inner:before,inner:error,outer:error') process.exit(8);
           NODE
       - name: Smoke Python advanced SDK surface
         env:
           PYTHONPATH: sdk/python
         run: |
           python3 <<'PY'
-          from rbe_sdk import RbeSdk
+          from rbe_sdk import HostCall, HostInterceptor, RbeSdk
 
           class Bridge:
               def __init__(self):
@@ -96,7 +126,7 @@ jobs:
 
               def call(self, request):
                   self.calls.append(request)
-                  if request.operation == "fail":
+                  if request.operation.startswith("fail"):
                       raise RuntimeError("expected smoke failure")
                   return request.operation
 
@@ -109,6 +139,43 @@ jobs:
               advanced.request("future:thing", "thing:42", "fail"),
           ))
           assert len(bridge.calls) == 3 and results[0].ok and not results[1].ok
+
+          events = []
+
+          class Trace(HostInterceptor):
+              def __init__(self, name):
+                  self.name = name
+
+              def before(self, request):
+                  events.append(f"{self.name}:before")
+                  return HostCall(
+                      request.capability,
+                      request.target,
+                      f"{request.operation}-{self.name}",
+                      request.payload,
+                  )
+
+              def after(self, request, reply):
+                  events.append(f"{self.name}:after")
+                  return f"{reply}:{self.name}"
+
+              def on_error(self, request, error):
+                  events.append(f"{self.name}:error")
+                  return RuntimeError(f"{error}:{self.name}")
+
+          hooked = sdk.intercept(Trace("outer"), Trace("inner"))
+          hooked_reply = hooked.capability("custom:hooks").call("hook", {})
+          assert bridge.calls[-1].operation == "hook-outer-inner"
+          assert hooked_reply == "hook-outer-inner:inner:outer"
+          assert events == ["outer:before", "inner:before", "inner:after", "outer:after"]
+
+          events.clear()
+          try:
+              hooked.capability("custom:hooks").call("fail", {})
+              raise AssertionError("expected intercepted failure")
+          except RuntimeError as error:
+              assert str(error) == "expected smoke failure:inner:outer"
+          assert events == ["outer:before", "inner:before", "inner:error", "outer:error"]
           PY
       - name: Smoke build complete SDK bundle
         run: ./build.sh --build-sdk --build-linux --arch-x64
