@@ -18,14 +18,6 @@ pub enum ImportTarget {
         module: String,
         library: String,
     },
-    /// RELC-linked public export from an explicitly installed/root RBE package.
-    /// The parser never creates this variant directly; package linking lowers
-    /// the ambiguous surface form `:import[export from package]` into it only
-    /// after checking the root-package link context.
-    PackageExport {
-        package: String,
-        export: String,
-    },
     Custom(String),
     CustomFunction {
         path: String,
