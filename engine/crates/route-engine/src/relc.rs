@@ -36,6 +36,13 @@ use crate::wasm_compiler::{
     ROUTE_WASM_COMPILER_VERSION,
 };
 
+#[path = "package_link.rs"]
+mod package_link;
+pub use package_link::{
+    PackageExportLink, PackageLinkContext, PackageLinkError, PackageRootLink,
+    ResolvedPackageExport, PACKAGE_LINK_FORMAT,
+};
+
 #[derive(Debug, Clone)]
 pub struct PhysicalRelSource {
     pub kind: RelSourceKind,
@@ -248,13 +255,35 @@ impl From<MiddlewarePlanError> for RelcError {
     }
 }
 
-/// Compiles one whole application image. All sources are registered before
-/// parsing/linking, so source order never decides whether a dependency exists.
+/// Compiles one whole application image without installed package roots. This
+/// compatibility entrypoint remains strict: any non-builtin `X from Y` import
+/// fails package linking unless the caller supplies an explicit root context.
 pub fn compile_runtime_image(
+    raw_server_source: &str,
+    physical_sources: Vec<PhysicalRelSource>,
+    settings_json: &JsonValue,
+) -> Result<RuntimeImage, RelcError> {
+    compile_runtime_image_with_packages(
+        raw_server_source,
+        physical_sources,
+        settings_json,
+        &PackageLinkContext::default(),
+    )
+}
+
+/// Compiles one whole application image with a verified, root-only package
+/// export view. Package resolution/install remains outside RELC; this function
+/// only links already-installed explicit roots and never sees private deps.
+pub fn compile_runtime_image_with_packages(
     raw_server_source: &str,
     mut physical_sources: Vec<PhysicalRelSource>,
     settings_json: &JsonValue,
+    package_links: &PackageLinkContext,
 ) -> Result<RuntimeImage, RelcError> {
+    package_links
+        .validate()
+        .map_err(|error| RelcError::Link(error.to_string()))?;
+
     let extracted = extract_embedded_rel(raw_server_source)?;
     let server = compile_server_source(&extracted.server_source)?;
 
@@ -331,7 +360,7 @@ pub fn compile_runtime_image(
     validate_capabilities(&server_id, RelSourceKind::Server, &server.imports)?;
 
     // PASS 3/4: declaration + import target collection.
-    validate_import_targets(&registry, &compiled)?;
+    validate_import_targets(&registry, &compiled, package_links)?;
     validate_service_dependency_cycles(&registry, &compiled)?;
 
     // PASS 5: symbol graph. Import cycles are not rejected; only actual symbol
@@ -565,23 +594,27 @@ fn validate_capabilities(
     for import in imports {
         let base = import_base(import);
         if let ImportTarget::BuiltinSubLibrary { module, library } = base {
-            if !(module == "crypto" && library == "argon") {
-                return Err(RelcError::Capability {
-                    code: "RELC2102",
-                    source: source.clone(),
-                    message: format!(
-                        "unknown builtin sub-library {library:?} from {module:?}; supported: `argon from crypto`"
-                    ),
-                });
+            if module == "crypto" {
+                if library != "argon" {
+                    return Err(RelcError::Capability {
+                        code: "RELC2102",
+                        source: source.clone(),
+                        message: format!(
+                            "unknown crypto sub-library {library:?}; supported: `argon from crypto`"
+                        ),
+                    });
+                }
+                if !matches!(kind, RelSourceKind::Module | RelSourceKind::Service) {
+                    return Err(RelcError::Capability {
+                        code: "RELC2101",
+                        source: source.clone(),
+                        message: "Argon2id is an expensive crypto sub-library and is available only to Module and Service REL"
+                            .into(),
+                    });
+                }
             }
-            if !matches!(kind, RelSourceKind::Module | RelSourceKind::Service) {
-                return Err(RelcError::Capability {
-                    code: "RELC2101",
-                    source: source.clone(),
-                    message: "Argon2id is an expensive crypto sub-library and is available only to Module and Service REL"
-                        .into(),
-                });
-            }
+            // Every non-crypto `X from Y` pair is a package-export candidate.
+            // Installed-root visibility is validated in the link pass below.
         }
         if let ImportTarget::Builtin(name) | ImportTarget::BuiltinFunction { module: name, .. } =
             base
@@ -671,6 +704,7 @@ fn validate_capabilities(
 fn validate_import_targets(
     registry: &RelSourceRegistry,
     compiled: &BTreeMap<SourceId, CompiledUnit>,
+    package_links: &PackageLinkContext,
 ) -> Result<(), RelcError> {
     for (source_id, unit) in compiled {
         for import in unit.imports() {
@@ -694,6 +728,11 @@ fn validate_import_targets(
                     return Err(RelcError::Link(format!(
                         "{source_id} imports missing service `{service}`"
                     )));
+                }
+                ImportTarget::BuiltinSubLibrary { module, library } if module != "crypto" => {
+                    package_links.resolve(module, library).map_err(|error| {
+                        RelcError::Link(format!("{source_id} {error}"))
+                    })?;
                 }
                 ImportTarget::BuiltinFunction { module, function }
                     if module == "field"
@@ -1308,6 +1347,26 @@ fn add_functions(output: &mut Vec<(String, Vec<Statement>)>, functions: &[Functi
 mod tests {
     use super::*;
 
+    fn package_links() -> PackageLinkContext {
+        PackageLinkContext {
+            format: PACKAGE_LINK_FORMAT,
+            roots: BTreeMap::from([(
+                "advancenet".into(),
+                PackageRootLink {
+                    version: "2.0.0".into(),
+                    artifact_sha256: "a".repeat(64),
+                    exports: BTreeMap::from([(
+                        "request".into(),
+                        PackageExportLink {
+                            entry: "components/request/request.ts".into(),
+                            language: "typescript".into(),
+                        },
+                    )]),
+                },
+            )]),
+        }
+    }
+
     #[test]
     fn rel_parser_failures_emit_stable_rel_code_and_help() {
         let routes = vec![PhysicalRelSource::new(
@@ -1334,6 +1393,44 @@ mod tests {
         assert!(rendered.contains(
             "help: https://kastrick.vercel.app/project/rbe/doc/error-codes/relc#relc2000"
         ));
+    }
+
+    #[test]
+    fn explicit_root_package_export_links_without_exposing_private_graphs() {
+        let routes = vec![PhysicalRelSource::new(
+            RelSourceKind::Route,
+            "package-client",
+            "api/package-client.route",
+            r#":import[request from advancenet]
+               class Route { get(req) { return request.get("https://example.com"); } }"#,
+        )];
+        let links = package_links();
+        let image = compile_runtime_image_with_packages(
+            "server Main {}",
+            routes,
+            &serde_json::json!({}),
+            &links,
+        )
+        .unwrap();
+        let route = image.source(&image.routes[0]).unwrap();
+        assert_eq!(route.imports, vec!["request from advancenet"]);
+    }
+
+    #[test]
+    fn package_candidate_without_explicit_root_fails_with_generic_public_error() {
+        let routes = vec![PhysicalRelSource::new(
+            RelSourceKind::Route,
+            "package-client",
+            "api/package-client.route",
+            r#":import[parser from rbe-compiler-syntax]
+               class Route { get(req) { return parser.parse("hello"); } }"#,
+        )];
+        let error = compile_runtime_image("server Main {}", routes, &serde_json::json!({}))
+            .expect_err("private or absent package roots must not be importable");
+        let rendered = error.to_string();
+        assert_eq!(error.code(), "RELC2000");
+        assert!(rendered.contains("PACKAGE_EXPORT_NOT_FOUND:"));
+        assert!(rendered.contains("parser from rbe-compiler-syntax"));
     }
 
     #[test]
