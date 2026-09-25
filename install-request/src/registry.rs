@@ -170,9 +170,7 @@ pub fn validate_registry_package_name(value: &str) -> Result<(), RegistryContrac
         return Err(RegistryContractError::InvalidPackageName(value.to_string()));
     };
     let valid = (first.is_ascii_lowercase() || first.is_ascii_digit())
-        && chars.all(|ch| {
-            ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_'
-        });
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_');
     if !valid || value.len() > 96 {
         return Err(RegistryContractError::InvalidPackageName(value.to_string()));
     }
