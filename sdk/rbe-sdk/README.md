@@ -84,6 +84,60 @@ The JavaScript/TypeScript and Python bindings expose the same split through
 `RbeSdk.capability(...)`, `RbeSdk.advanced()`, reusable requests, retargetable
 capability clients, independent batch results, and direct bridge access.
 
+### SDK-local interceptors
+
+JavaScript/TypeScript and Python packages can additionally wrap their `HostBridge`
+with package-local interceptors. These hooks are intentionally SDK-side mechanism:
+they can observe or rewrite a request before it crosses the bridge and observe or
+rewrite the reply/error afterward, but they do **not** grant a capability or bypass
+RBE's host checks.
+
+JavaScript/TypeScript:
+
+```js
+const traced = new RbeSdk(host).intercept({
+  before(request) {
+    console.log("->", request.capability, request.operation);
+    return request;
+  },
+  after(request, reply) {
+    console.log("<-", request.capability, request.operation);
+    return reply;
+  },
+  onError(request, error) {
+    console.error("x", request.capability, error);
+    return error;
+  }
+});
+```
+
+Python:
+
+```python
+from rbe_sdk import HostInterceptor, RbeSdk
+
+class Trace(HostInterceptor):
+    def before(self, request):
+        print("->", request.capability, request.operation)
+        return request
+
+sdk = RbeSdk(host).intercept(Trace())
+```
+
+Hooks run in registration order before the host call and in reverse order on the
+way back out. This makes nested instrumentation/policy wrappers predictable.
+JavaScript hooks are synchronous even when the wrapped `HostBridge` returns a
+Promise; Python hooks follow the normal synchronous Python bridge contract.
+
+Package authors can use the hook surface for tracing, metrics, request rewriting,
+local policy, retry wrappers, caching layers, or their own higher-level SDK design.
+A hook may reject a call locally, but it cannot turn a host-denied capability into
+an allowed one.
+
+Rust interceptor parity is intentionally a separate follow-up so the Rust API can
+keep lifetime/object-safety ergonomics clean instead of copying the dynamic-language
+shape blindly.
+
 ## Self-hosted distribution
 
 RBE's central package service is designed to expose a Cargo **sparse registry**

@@ -70,6 +70,73 @@ class HostBridge(Protocol):
     def call(self, request: HostCall) -> Any: ...
 
 
+class HostInterceptor:
+    """SDK-local hook surface around HostBridge calls.
+
+    Hooks do not grant capabilities and do not bypass the wrapped RBE host.
+    Subclasses may rewrite a request, reply, or error by returning a replacement.
+    """
+
+    def before(self, request: HostCall) -> HostCall:
+        return request
+
+    def after(self, request: HostCall, reply: Any) -> Any:
+        return reply
+
+    def on_error(self, request: HostCall, error: BaseException) -> BaseException:
+        return error
+
+
+class InterceptedBridge:
+    def __init__(self, bridge: HostBridge, interceptors: tuple[HostInterceptor, ...]) -> None:
+        if not callable(getattr(bridge, "call", None)):
+            raise TypeError("RBE HostBridge must provide call(request)")
+        self._bridge = bridge
+        self._interceptors = interceptors
+
+    @property
+    def bridge(self) -> HostBridge:
+        return self._bridge
+
+    @property
+    def interceptors(self) -> tuple[HostInterceptor, ...]:
+        return self._interceptors
+
+    def call(self, request: HostCall) -> Any:
+        current = request
+        for interceptor in self._interceptors:
+            hook = getattr(interceptor, "before", None)
+            if callable(hook):
+                next_request = hook(current)
+                if next_request is not None:
+                    if not isinstance(next_request, HostCall):
+                        raise TypeError("RBE SDK interceptor before() must return HostCall or None")
+                    current = next_request
+
+        try:
+            reply = self._bridge.call(current)
+        except BaseException as original_error:
+            error: BaseException = original_error
+            for interceptor in reversed(self._interceptors):
+                hook = getattr(interceptor, "on_error", None)
+                if callable(hook):
+                    next_error = hook(current, error)
+                    if next_error is not None:
+                        if not isinstance(next_error, BaseException):
+                            raise TypeError(
+                                "RBE SDK interceptor on_error() must return BaseException or None"
+                            )
+                        error = next_error
+            raise error
+
+        current_reply = reply
+        for interceptor in reversed(self._interceptors):
+            hook = getattr(interceptor, "after", None)
+            if callable(hook):
+                current_reply = hook(current, current_reply)
+        return current_reply
+
+
 class CapabilityClient:
     def __init__(self, bridge: HostBridge, capability: str, target: str | None = None) -> None:
         self._bridge = bridge
@@ -84,6 +151,13 @@ class CapabilityClient:
 
     def retarget(self, target: str) -> "CapabilityClient":
         return CapabilityClient(self._bridge, self.capability, target)
+
+    def intercept(self, *interceptors: HostInterceptor) -> "CapabilityClient":
+        return CapabilityClient(
+            InterceptedBridge(self._bridge, tuple(interceptors)),
+            self.capability,
+            self.target,
+        )
 
 
 class NetClient:
@@ -144,6 +218,9 @@ class AdvancedClient:
                 results.append(BatchResult(ok=False, error=error))
         return results
 
+    def intercept(self, *interceptors: HostInterceptor) -> "AdvancedClient":
+        return AdvancedClient(InterceptedBridge(self._bridge, tuple(interceptors)))
+
     def host_bridge(self) -> HostBridge:
         return self._bridge
 
@@ -171,6 +248,9 @@ class RbeSdk:
 
     def advanced(self) -> AdvancedClient:
         return AdvancedClient(self._bridge)
+
+    def intercept(self, *interceptors: HostInterceptor) -> "RbeSdk":
+        return RbeSdk(InterceptedBridge(self._bridge, tuple(interceptors)))
 
     def host_bridge(self) -> HostBridge:
         return self._bridge

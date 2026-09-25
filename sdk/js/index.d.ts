@@ -16,6 +16,12 @@ export interface HostBridge {
   call(request: HostRequest): unknown | Promise<unknown>;
 }
 
+export interface HostInterceptor {
+  before?(request: HostRequest): HostRequest | void;
+  after?(request: HostRequest, reply: unknown): unknown | void;
+  onError?(request: HostRequest, error: unknown): unknown | void;
+}
+
 export type LibraryDescriptor = Readonly<{
   name: string;
   version: string;
@@ -32,6 +38,13 @@ export declare function libraryDescriptor(input: {
   abiMax?: number;
 }): LibraryDescriptor;
 
+export declare class InterceptedBridge implements HostBridge {
+  constructor(bridge: HostBridge, interceptors?: readonly HostInterceptor[]);
+  readonly bridge: HostBridge;
+  readonly interceptors: readonly HostInterceptor[];
+  call(request: HostRequest): unknown | Promise<unknown>;
+}
+
 export declare class CapabilityClient {
   constructor(bridge: HostBridge, capabilityId: string, target?: string);
   readonly bridge: HostBridge;
@@ -40,6 +53,7 @@ export declare class CapabilityClient {
   request(operation: string, payload?: unknown): HostRequest;
   call(operation: string, payload?: unknown): unknown | Promise<unknown>;
   retarget(target: string): CapabilityClient;
+  intercept(...interceptors: HostInterceptor[]): CapabilityClient;
 }
 
 export declare class AdvancedClient {
@@ -48,6 +62,7 @@ export declare class AdvancedClient {
   request(capabilityId: string, target: string, operation: string, payload?: unknown): HostRequest;
   send(request: HostRequest): unknown | Promise<unknown>;
   batch(requests: readonly HostRequest[]): Promise<BatchResult[]>;
+  intercept(...interceptors: HostInterceptor[]): AdvancedClient;
   hostBridge(): HostBridge;
 }
 
@@ -56,6 +71,7 @@ export declare class RbeSdk {
   call(request: HostRequest): unknown | Promise<unknown>;
   capability(capabilityId: string, target?: string): CapabilityClient;
   advanced(): AdvancedClient;
+  intercept(...interceptors: HostInterceptor[]): RbeSdk;
   hostBridge(): HostBridge;
   net(): {
     sublibrary(name: string): CapabilityClient;

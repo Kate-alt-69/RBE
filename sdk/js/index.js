@@ -31,6 +31,17 @@ function validComponent(value) {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value);
 }
 
+function isPromiseLike(value) {
+  return value && typeof value.then === "function";
+}
+
+function syncHookResult(name, value) {
+  if (isPromiseLike(value)) {
+    throw new TypeError(`RBE SDK interceptor ${name} hook must be synchronous`);
+  }
+  return value;
+}
+
 export function libraryDescriptor({ name, version, abiMin = 1, abiMax = abiMin }) {
   if (!validComponent(name)) {
     throw new TypeError(`invalid RBE library name ${JSON.stringify(name)}`);
@@ -39,6 +50,69 @@ export function libraryDescriptor({ name, version, abiMin = 1, abiMax = abiMin }
     throw new TypeError(`invalid RBE ABI range ${abiMin}..=${abiMax}`);
   }
   return Object.freeze({ name, version, abiMin, abiMax });
+}
+
+/**
+ * SDK-local HostBridge wrapper for package-defined instrumentation and call policy.
+ * Hooks never grant capabilities; the wrapped RBE HostBridge remains authoritative.
+ */
+export class InterceptedBridge {
+  constructor(bridge, interceptors = []) {
+    assertBridge(bridge);
+    if (!Array.isArray(interceptors)) {
+      throw new TypeError("RBE SDK interceptors must be an array");
+    }
+    this.bridge = bridge;
+    this.interceptors = Object.freeze([...interceptors]);
+  }
+
+  call(request) {
+    let current = { ...request };
+
+    for (const interceptor of this.interceptors) {
+      if (!interceptor || typeof interceptor !== "object") {
+        throw new TypeError("RBE SDK interceptor must be an object");
+      }
+      if (typeof interceptor.before === "function") {
+        const next = syncHookResult("before", interceptor.before(current));
+        if (next !== undefined) current = next;
+      }
+    }
+
+    const after = (reply) => {
+      let currentReply = reply;
+      for (let index = this.interceptors.length - 1; index >= 0; index -= 1) {
+        const interceptor = this.interceptors[index];
+        if (typeof interceptor.after === "function") {
+          const next = syncHookResult("after", interceptor.after(current, currentReply));
+          if (next !== undefined) currentReply = next;
+        }
+      }
+      return currentReply;
+    };
+
+    const onError = (error) => {
+      let currentError = error;
+      for (let index = this.interceptors.length - 1; index >= 0; index -= 1) {
+        const interceptor = this.interceptors[index];
+        if (typeof interceptor.onError === "function") {
+          const next = syncHookResult("onError", interceptor.onError(current, currentError));
+          if (next !== undefined) currentError = next;
+        }
+      }
+      throw currentError;
+    };
+
+    try {
+      const result = this.bridge.call(current);
+      if (isPromiseLike(result)) {
+        return Promise.resolve(result).then(after, onError);
+      }
+      return after(result);
+    } catch (error) {
+      return onError(error);
+    }
+  }
 }
 
 export class CapabilityClient {
@@ -64,6 +138,14 @@ export class CapabilityClient {
 
   retarget(target) {
     return new CapabilityClient(this.bridge, this.capabilityId, target);
+  }
+
+  intercept(...interceptors) {
+    return new CapabilityClient(
+      new InterceptedBridge(this.bridge, interceptors),
+      this.capabilityId,
+      this.target
+    );
   }
 }
 
@@ -126,6 +208,10 @@ export class AdvancedClient {
     }));
   }
 
+  intercept(...interceptors) {
+    return new AdvancedClient(new InterceptedBridge(this.bridge, interceptors));
+  }
+
   hostBridge() {
     return this.bridge;
   }
@@ -148,6 +234,10 @@ export class RbeSdk {
 
   advanced() {
     return new AdvancedClient(this.bridge);
+  }
+
+  intercept(...interceptors) {
+    return new RbeSdk(new InterceptedBridge(this.bridge, interceptors));
   }
 
   hostBridge() {
