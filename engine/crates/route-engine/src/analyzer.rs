@@ -63,8 +63,11 @@ fn import_source_key(import: &ImportTarget) -> String {
         ImportTarget::BuiltinFunction { module, function } => {
             format!("builtin:{module}.{function}")
         }
-        ImportTarget::BuiltinSubLibrary { module, library } => {
+        ImportTarget::BuiltinSubLibrary { module, library } if module == "crypto" => {
             format!("builtin:{module}/{library}")
+        }
+        ImportTarget::BuiltinSubLibrary { module, library } => {
+            format!("package:{module}/{library}")
         }
         ImportTarget::Custom(path) => format!("custom:{path}"),
         ImportTarget::CustomFunction { path, function } => format!("custom:{path}.{function}"),
@@ -108,14 +111,20 @@ pub fn analyze(file: &RouteFile) -> Vec<Diagnostic> {
                 SymbolKind::Module
             }
             ImportTarget::BuiltinSubLibrary { module, library } => {
-                diagnostics.push(Diagnostic {
-                    severity: Severity::Error,
-                    code: "E3000",
-                    message: format!(
-                        "crypto sub-library `{library} from {module}` is not available to `.route` files"
-                    ),
-                    symbol: Some(name.clone()),
-                });
+                // `X from crypto` is the builtin crypto sub-library form. Any
+                // other `X from Y` is intentionally left as a package-export
+                // candidate for RELC, which owns installed-root visibility and
+                // must not leak private/transitive dependency names here.
+                if module == "crypto" {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "E3000",
+                        message: format!(
+                            "crypto sub-library `{library} from {module}` is not available to `.route` files"
+                        ),
+                        symbol: Some(name.clone()),
+                    });
+                }
                 SymbolKind::Module
             }
             ImportTarget::BuiltinFunction { module, function } => {
@@ -602,6 +611,28 @@ mod tests {
             d.code == "E3000"
                 && d.symbol.as_deref() == Some("env")
                 && d.message.contains("not available to `.route` files")
+        }));
+    }
+
+    #[test]
+    fn package_export_candidate_is_deferred_to_relc() {
+        let file = parse(
+            r#":import[request from advancenet]
+               class Route { get(req) { return request.get("https://example.com"); } }"#,
+        );
+        assert!(analyze(&file)
+            .iter()
+            .all(|diagnostic| diagnostic.severity != Severity::Error));
+    }
+
+    #[test]
+    fn crypto_sublibrary_still_rejects_route_access() {
+        let file = parse(
+            r#":import[argon from crypto]
+               class Route { get(req) { return argon.hashPassword("secret"); } }"#,
+        );
+        assert!(analyze(&file).iter().any(|diagnostic| {
+            diagnostic.code == "E3000" && diagnostic.symbol.as_deref() == Some("argon")
         }));
     }
 
