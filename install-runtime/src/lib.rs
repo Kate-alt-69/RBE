@@ -136,7 +136,9 @@ pub enum InstallRuntimeError {
     ArtifactSizeOverflow,
     #[error("artifact cache entry has an unsafe filesystem type: {0}")]
     UnsafeCacheEntry(String),
-    #[error("existing artifact cache entry {path} does not match expected SHA-256 {expected_sha256}")]
+    #[error(
+        "existing artifact cache entry {path} does not match expected SHA-256 {expected_sha256}"
+    )]
     ExistingArtifactMismatch {
         path: String,
         expected_sha256: String,
