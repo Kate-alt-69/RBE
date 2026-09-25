@@ -120,6 +120,54 @@ jobs:
           test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/javascript/index.js
           test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/typescript/index.d.ts
           test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/python/pyproject.toml
+      - name: Smoke RPX language compiler checks
+        run: |
+          RPX="$PWD/dist/x86_64-unknown-linux-gnu/sdk/rpx"
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+
+          mkdir -p "$TMP/js/components/hello" "$TMP/js/components/broken"
+          cat > "$TMP/js/package.rbe.toml" <<'EOF'
+          [package]
+          name = "smoke-js"
+          version = "1.0.0"
+          language = "javascript"
+          runtime = "node"
+          EOF
+          cat > "$TMP/js/components/hello/hello.js" <<'EOF'
+          export function hello(name) { return `hi ${name}`; }
+          EOF
+          cat > "$TMP/js/components/broken/broken.js" <<'EOF'
+          export function broken( { return true; }
+          EOF
+
+          "$RPX" compile "$TMP/js/components/hello"
+          if "$RPX" compile "$TMP/js/components/broken"; then
+            echo "RPX accepted invalid JavaScript" >&2
+            exit 1
+          fi
+
+          mkdir -p "$TMP/python/components/hello" "$TMP/python/components/broken"
+          cat > "$TMP/python/package.rbe.toml" <<'EOF'
+          [package]
+          name = "smoke-python"
+          version = "1.0.0"
+          language = "python"
+          EOF
+          cat > "$TMP/python/components/hello/hello.py" <<'EOF'
+          def hello(name):
+              return f"hi {name}"
+          EOF
+          cat > "$TMP/python/components/broken/broken.py" <<'EOF'
+          def broken(:
+              return True
+          EOF
+
+          "$RPX" compile "$TMP/python/components/hello"
+          if "$RPX" compile "$TMP/python/components/broken"; then
+            echo "RPX accepted invalid Python" >&2
+            exit 1
+          fi
       - name: Smoke build SDK backend only
         run: |
           rm -rf dist/x86_64-unknown-linux-gnu/sdk
