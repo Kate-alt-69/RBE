@@ -5,8 +5,6 @@
 //! manifest hash required by `ProjectPackageLock`. It must never report an
 //! install as successful before cache promotion/session activation completes.
 
-use std::process::ExitCode;
-
 use rbe_install_request::{InstallCommand, InstallTarget};
 use rbe_install_runtime::RegistryClient;
 use rbe_library_resolver::{resolve_scoped, ResolutionRequest};
@@ -106,19 +104,6 @@ pub fn requested(args: &[String]) -> Option<Result<String, InstallCliFailure>> {
         InstallTarget::Named { .. }
         | InstallTarget::External { .. }
         | InstallTarget::LocalArchive(_) => None,
-    }
-}
-
-pub fn exit_for(result: Result<String, InstallCliFailure>) -> ExitCode {
-    match result {
-        Ok(rendered) => {
-            println!("{rendered}");
-            ExitCode::SUCCESS
-        }
-        Err(failure) => {
-            eprintln!("{}", failure.message);
-            ExitCode::from(failure.code)
-        }
     }
 }
 
@@ -267,9 +252,7 @@ fn install_command_index(args: &[String]) -> Option<usize> {
             return (arg == "install").then_some(index);
         }
         if arg == "--settings" {
-            if args.get(index + 1).is_none() {
-                return None;
-            }
+            args.get(index + 1)?;
             index += 2;
             continue;
         }
