@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $EngineDir = Join-Path $RepoRoot 'engine'
 $ContainerDir = Join-Path $RepoRoot 'container-runtime'
+$SdkSourceDir = Join-Path $RepoRoot 'sdk'
 $DistRoot = Join-Path $RepoRoot 'dist'
 
 $BuildSdk = $false
@@ -41,6 +42,7 @@ if ($ShowHelp) {
     Write-Host '  ./build.ps1 --build-sdk [--only-backend|--only-rpx] [platform/arch flags]'
     Write-Host '  ./build.ps1 --only-<binary> [platform/arch flags]'
     Write-Host 'Known binaries: backend, service, cloud-node, container, rpx.'
+    Write-Host 'A full --build-sdk bundle includes Rust, JavaScript/TypeScript, and Python SDK bindings.'
     exit 0
 }
 if (-not $BuildSdk -and -not $OnlyBinary) { throw 'Selective builder requires --build-sdk and/or --only-<binary>.' }
@@ -78,6 +80,23 @@ function Invoke-Cargo([string]$WorkingDir, [string[]]$CargoArgs, [string]$Target
 function Build-WorkspaceBinary([string]$Workspace, [string]$Package, [string]$Binary, [string]$Target) { $a = @('build','-p',$Package,'--bin',$Binary,'--target',$Target); if ($Release) {$a += '--release'}; Invoke-Cargo $Workspace $a $Target; $p = Get-BinaryPath $Workspace $Binary $Target; if (-not (Test-Path $p)) { throw "Expected binary was not produced: $p" }; return $p }
 function Build-Standalone([string]$CrateDir, [string]$Binary, [string]$Target) { $manifest = Join-Path $CrateDir 'Cargo.toml'; $a = @('build','--manifest-path',$manifest,'--bin',$Binary,'--target',$Target); if ($Release) {$a += '--release'}; Invoke-Cargo $RepoRoot $a $Target; $p = Get-BinaryPath $CrateDir $Binary $Target; if (-not (Test-Path $p)) { throw "Expected binary was not produced: $p" }; return $p }
 function Copy-Binary([string]$Source, [string]$DestinationBase, [string]$Target) { $dest = if ((Get-TargetOs $Target) -eq 'windows') { "$DestinationBase.exe" } else { $DestinationBase }; Copy-Item $Source $dest -Force; Write-Host "  -> $dest" -ForegroundColor Green }
+function Copy-CleanTree([string]$Source, [string]$Destination) {
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { throw "SDK binding source is missing: $Source" }
+    if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    Get-ChildItem -LiteralPath $Source -Force | Where-Object { $_.Name -notin @('target','node_modules','__pycache__','.pytest_cache') } | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $Destination -Recurse -Force
+    }
+}
+function Copy-SdkBindings([string]$Output) {
+    $bindings = Join-Path $Output 'bindings'
+    New-Item -ItemType Directory -Force -Path $bindings | Out-Null
+    Copy-CleanTree (Join-Path $SdkSourceDir 'rbe-sdk') (Join-Path $bindings 'rust')
+    Copy-CleanTree (Join-Path $SdkSourceDir 'js') (Join-Path $bindings 'javascript')
+    Copy-CleanTree (Join-Path $SdkSourceDir 'js') (Join-Path $bindings 'typescript')
+    Copy-CleanTree (Join-Path $SdkSourceDir 'python') (Join-Path $bindings 'python')
+    Write-Host "  -> $(Join-Path $Output 'bindings')" -ForegroundColor Green
+}
 
 foreach ($target in $targets) {
     if ($target -notmatch '^[A-Za-z0-9._-]+$') { throw "Unsafe target name: $target" }
@@ -87,7 +106,8 @@ foreach ($target in $targets) {
         $out = Join-Path (Join-Path $DistRoot $target) 'sdk'; New-Item -ItemType Directory -Force -Path $out | Out-Null
         if (-not $OnlyBinary -or $OnlyBinary -in @('backend','sdk-backend')) { Write-Host '-- SDK backend --' -ForegroundColor Cyan; $p = Build-Standalone (Join-Path $EngineDir 'crates/sdk-backend') 'sdk-backend' $target; Copy-Binary $p (Join-Path $out 'backend') $target }
         if (-not $OnlyBinary -or $OnlyBinary -eq 'rpx') { Write-Host '-- RPX --' -ForegroundColor Cyan; $p = Build-Standalone (Join-Path $EngineDir 'crates/rpx') 'rpx' $target; Copy-Binary $p (Join-Path $out 'rpx') $target }
-        $meta = @{ format = 1; target = $target; profile = $(if ($Release) {'release'} else {'debug'}); sdk_backend = (-not $OnlyBinary -or $OnlyBinary -in @('backend','sdk-backend')); rpx = (-not $OnlyBinary -or $OnlyBinary -eq 'rpx') } | ConvertTo-Json
+        if (-not $OnlyBinary) { Write-Host '-- Language SDK bindings --' -ForegroundColor Cyan; Copy-SdkBindings $out }
+        $meta = @{ format = 1; target = $target; profile = $(if ($Release) {'release'} else {'debug'}); sdk_backend = (-not $OnlyBinary -or $OnlyBinary -in @('backend','sdk-backend')); rpx = (-not $OnlyBinary -or $OnlyBinary -eq 'rpx'); bindings = (-not $OnlyBinary) } | ConvertTo-Json
         Set-Content -LiteralPath (Join-Path $out 'sdk-build.json') -Value $meta -Encoding UTF8
         continue
     }
