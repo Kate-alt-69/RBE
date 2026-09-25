@@ -76,10 +76,8 @@ pub fn inspect_registry_stage(
     let policy = ArchivePolicy::default();
     let inspected = inspect_zip(File::open(&stage.promotion.verified_partial)?, policy)?;
     validate_manifest_matches_release(package, release, &inspected.manifest)?;
-    let manifest_sha256 = hash_manifest(
-        &stage.promotion.verified_partial,
-        policy.max_manifest_bytes,
-    )?;
+    let manifest_sha256 =
+        hash_manifest(&stage.promotion.verified_partial, policy.max_manifest_bytes)?;
 
     let locked = LockedProjectPackage {
         version: release.version.clone(),
@@ -262,10 +260,7 @@ rbe-core = "^1"
         assert_eq!(package.locked.version, "4.0.1");
         assert_eq!(package.locked.manifest_sha256, package.manifest_sha256);
         assert_eq!(package.locked.runtime.as_ref().unwrap().kind, "bun");
-        assert_eq!(
-            package.locked.sdk.as_ref().unwrap().kind,
-            "javascript"
-        );
+        assert_eq!(package.locked.sdk.as_ref().unwrap().kind, "javascript");
     }
 
     #[tokio::test]
