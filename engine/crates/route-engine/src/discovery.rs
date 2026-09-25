@@ -279,6 +279,15 @@ fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String
         .map(ToOwned::to_owned)
 }
 
+fn is_json_content_type(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let media_type = value.split(';').next().unwrap_or_default().trim();
+    media_type.eq_ignore_ascii_case("application/json")
+        || media_type.to_ascii_lowercase().ends_with("+json")
+}
+
 fn headers_value(headers: &HeaderMap) -> Value {
     let mut out = HashMap::new();
     for name in headers.keys() {
@@ -370,10 +379,7 @@ async fn request_value(
     let content_type = header_string(&parts.headers, header::CONTENT_TYPE);
     let body_value = if raw.is_empty() {
         Value::Null
-    } else if content_type
-        .as_deref()
-        .is_some_and(|value| value.contains("application/json") || value.contains("+json"))
-    {
+    } else if is_json_content_type(content_type.as_deref()) {
         let parsed = serde_json::from_slice::<serde_json::Value>(&raw).map_err(|error| {
             Box::new(request_error(
                 StatusCode::BAD_REQUEST,
@@ -1464,6 +1470,28 @@ mod http_edge_tests {
         );
         assert_eq!(collision_key_for("/api/users/:uid"), "/api/users/:");
         assert_eq!(collision_key_for("/api/users/:name"), "/api/users/:");
+    }
+
+    #[test]
+    fn json_content_type_detection_matches_structured_media_types() {
+        for content_type in [
+            "application/json",
+            "Application/JSON; Charset=UTF-8",
+            "application/problem+json",
+            "APPLICATION/VND.API+JSON; charset=utf-8",
+        ] {
+            assert!(is_json_content_type(Some(content_type)), "{content_type}");
+        }
+
+        for content_type in [
+            "text/plain",
+            "text/application/jsonish",
+            "application/problem+jsonx",
+            "application/jsonish",
+        ] {
+            assert!(!is_json_content_type(Some(content_type)), "{content_type}");
+        }
+        assert!(!is_json_content_type(None));
     }
 
     #[test]
