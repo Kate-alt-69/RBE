@@ -1,15 +1,16 @@
 //! Real pre-bootstrap `backend install` package path.
 //!
 //! Named installs resolve registry metadata, stage and verify every selected
-//! artifact, inspect package manifests, and construct an exact root-scoped lock
-//! candidate before normal Backend boot. The executable still refuses to claim
-//! installation success until cache promotion, preparation/build, attestation,
-//! and durable session activation complete.
+//! artifact, inspect package manifests, construct an exact root-scoped lock
+//! candidate, and durably promote verified artifacts into the content-addressed
+//! project cache before normal Backend boot. The executable still refuses to
+//! claim installation success until preparation/build, attestation, and durable
+//! session activation complete.
 
 use std::path::Path;
 
 use rbe_install_request::{InstallCommand, InstallTarget};
-use rbe_install_runtime::{stage_resolved_root, RegistryClient};
+use rbe_install_runtime::{promote_verified_graph, stage_resolved_root, RegistryClient};
 use rbe_library_resolver::{resolve_scoped, ResolutionRequest};
 
 const REGISTRY_ENV: &str = "RBE_PACKAGE_REGISTRY";
@@ -38,11 +39,11 @@ Registry configuration:
 
 Current execution boundary:
   Named-package registry hydration, deterministic dependency resolution,
-  verified artifact staging, manifest inspection, and exact root-scoped lock
-  candidate construction are active before Backend boot. Durable cache
-  promotion, package preparation/build, attestation, install-session activation,
-  and package.lock.rbe.yaml commit remain gated, so a verified graph exits
-  unavailable instead of claiming installation success."#;
+  verified artifact staging, manifest inspection, exact root-scoped lock
+  candidate construction, and durable content-addressed artifact promotion are
+  active before Backend boot. Package preparation/build, attestation,
+  install-session activation, and package.lock.rbe.yaml commit remain gated, so
+  a promoted graph exits unavailable instead of claiming installation success."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCliFailure {
@@ -204,6 +205,11 @@ async fn resolve_named_async(
                 "verify resolved package graph for `{key}` failed: {error}"
             ))
         })?;
+    let promotion = promote_verified_graph(&graph).map_err(|error| {
+        InstallCliFailure::unavailable(format!(
+            "promote verified package graph for `{key}` failed: {error}"
+        ))
+    })?;
     let root = graph.lock.packages.get(key).ok_or_else(|| {
         InstallCliFailure::software(format!(
             "verified lock candidate contains no root package `{key}`"
@@ -223,12 +229,16 @@ async fn resolve_named_async(
 
     let message = if json {
         serde_json::json!({
-            "status": "verified_lock_candidate_not_activated",
+            "status": "promoted_lock_candidate_not_activated",
             "package": key,
             "version": root.version,
             "dependencies": dependencies,
             "verified_packages": graph.packages.len(),
             "verified_bytes": verified_bytes,
+            "cache": {
+                "published": promotion.published,
+                "reused_existing": promotion.reused_existing,
+            },
             "artifact": {
                 "source": root.artifact_url,
                 "sha256": root.artifact_sha256,
@@ -239,20 +249,22 @@ async fn resolve_named_async(
             "registry": registry,
             "server_started": false,
             "project_lock_changed": false,
-            "next_boundary": "durable promotion, preparation/build, attestation, and session activation"
+            "next_boundary": "package preparation/build, attestation, and durable session activation"
         })
         .to_string()
     } else if quiet {
         format!(
-            "`{key}` {} and {dependencies} dependenc{} verified; durable activation is not connected yet",
+            "`{key}` {} and {dependencies} dependenc{} verified and cached; durable activation is not connected yet",
             root.version,
             if dependencies == 1 { "y" } else { "ies" },
         )
     } else {
         format!(
-            "`backend install` verified the complete `{key}` {} root graph: {} package(s), {verified_bytes} byte(s).\nroot artifact: {}\nartifact sha256: {}\nmanifest sha256: {}\n\nAll selected registry artifacts were staged, hash-verified, inspected, and converted into a complete root/private lock candidate. Durable promotion, package preparation/build, attestation, and install-session activation are not connected to backend.exe yet. No RBE server was started and package.lock.rbe.yaml was not changed.",
+            "`backend install` verified and cached the complete `{key}` {} root graph: {} package(s), {verified_bytes} byte(s).\ncache: {} published, {} reused\nroot artifact: {}\nartifact sha256: {}\nmanifest sha256: {}\n\nAll selected registry artifacts were staged, hash-verified, inspected, converted into a complete root/private lock candidate, and durably promoted into the content-addressed project cache. Package preparation/build, attestation, and install-session activation are not connected to backend.exe yet. No RBE server was started and package.lock.rbe.yaml was not changed.",
             root.version,
             graph.packages.len(),
+            promotion.published,
+            promotion.reused_existing,
             root.artifact_url,
             root.artifact_sha256,
             root.manifest_sha256,
