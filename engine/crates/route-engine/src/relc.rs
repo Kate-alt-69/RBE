@@ -730,9 +730,9 @@ fn validate_import_targets(
                     )));
                 }
                 ImportTarget::BuiltinSubLibrary { module, library } if module != "crypto" => {
-                    package_links.resolve(module, library).map_err(|error| {
-                        RelcError::Link(format!("{source_id} {error}"))
-                    })?;
+                    package_links
+                        .resolve(module, library)
+                        .map_err(|error| RelcError::Link(format!("{source_id} {error}")))?;
                 }
                 ImportTarget::BuiltinFunction { module, function }
                     if module == "field"
