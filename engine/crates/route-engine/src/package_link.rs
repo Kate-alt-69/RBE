@@ -12,13 +12,22 @@ use serde::{Deserialize, Serialize};
 
 pub const PACKAGE_LINK_FORMAT: u32 = 1;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageLinkContext {
     #[serde(default = "package_link_format")]
     pub format: u32,
     #[serde(default)]
     pub roots: BTreeMap<String, PackageRootLink>,
+}
+
+impl Default for PackageLinkContext {
+    fn default() -> Self {
+        Self {
+            format: PACKAGE_LINK_FORMAT,
+            roots: BTreeMap::new(),
+        }
+    }
 }
 
 const fn package_link_format() -> u32 {
@@ -216,6 +225,14 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn empty_default_context_is_a_valid_format_one_context() {
+        let context = PackageLinkContext::default();
+        assert_eq!(context.format, PACKAGE_LINK_FORMAT);
+        assert!(context.roots.is_empty());
+        context.validate().unwrap();
     }
 
     #[test]
