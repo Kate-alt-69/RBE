@@ -7,14 +7,17 @@ publish = false
 [dependencies]
 rbe-install-executor = { path = "../install-executor" }
 rbe-install-request = { path = "../install-request" }
+rbe-library-package = { path = "../library-package" }
 rbe-library-registry = { path = "../library-registry" }
 rbe-library-resolver = { path = "../library-resolver" }
+rbe-project-package = { path = "../project-package" }
 fs2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
 url = "2"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-rbe-project-package = { path = "../project-package" }
 tempfile = "3"
