@@ -16,4 +16,5 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi
 url = "2"
 
 [dev-dependencies]
+rbe-project-package = { path = "../project-package" }
 tempfile = "3"
