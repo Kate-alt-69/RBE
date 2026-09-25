@@ -1,0 +1,42 @@
+name: CLI-002 Prepare
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cli002-prepare.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Refresh backend dependency lock
+        working-directory: engine
+        run: cargo check -p backend || true
+      - name: Apply canonical Rust formatting
+        working-directory: engine
+        run: cargo fmt --all
+      - name: Commit generated preparation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/Cargo.lock \
+                  engine/crates/backend/Cargo.toml \
+                  engine/crates/backend/src/error_code_book.rs \
+                  engine/crates/backend/src/error_code_book_core.rs \
+                  engine/crates/backend/src/install_cli.rs \
+                  install-request/src/registry.rs \
+                  library-resolver/src/scoped.rs
+          if git diff --cached --quiet; then
+            echo "No preparation changes required"
+            exit 0
+          fi
+          git commit -m "TEMP | format CLI-002 and refresh engine lock"
+          git push origin HEAD:${GITHUB_REF_NAME}
