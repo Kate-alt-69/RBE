@@ -123,6 +123,7 @@ jobs:
       - name: Smoke RPX language compiler checks
         run: |
           RPX="$PWD/dist/x86_64-unknown-linux-gnu/sdk/rpx"
+          SDK_BINDINGS="$PWD/dist/x86_64-unknown-linux-gnu/sdk/bindings"
           TMP="$(mktemp -d)"
           trap 'rm -rf "$TMP"' EXIT
 
@@ -166,6 +167,39 @@ jobs:
           "$RPX" compile "$TMP/python/components/hello"
           if "$RPX" compile "$TMP/python/components/broken"; then
             echo "RPX accepted invalid Python" >&2
+            exit 1
+          fi
+
+          mkdir -p "$TMP/rust/components/hello" "$TMP/rust/components/broken" "$TMP/rust/.rbe/sdk"
+          cp -R "$SDK_BINDINGS/rust" "$TMP/rust/.rbe/sdk/rust"
+          cat > "$TMP/rust/package.rbe.toml" <<'EOF'
+          [package]
+          name = "smoke-rust"
+          version = "1.0.0"
+          language = "rust"
+          EOF
+          cat > "$TMP/rust/components/hello/hello.rs" <<'EOF'
+          mod helper;
+
+          pub fn hello(name: &str) -> String {
+              helper::message(name)
+          }
+          EOF
+          cat > "$TMP/rust/components/hello/helper.rs" <<'EOF'
+          pub fn message(name: &str) -> String {
+              format!("hi {name}")
+          }
+          EOF
+          cat > "$TMP/rust/components/broken/broken.rs" <<'EOF'
+          pub fn broken() -> bool {
+              let value = ;
+              value
+          }
+          EOF
+
+          "$RPX" compile "$TMP/rust/components/hello"
+          if "$RPX" compile "$TMP/rust/components/broken"; then
+            echo "RPX accepted invalid Rust" >&2
             exit 1
           fi
       - name: Smoke build SDK backend only
