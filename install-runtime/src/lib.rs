@@ -18,7 +18,9 @@ pub use artifact::ArtifactStage;
 pub use cache::stage_artifact_cached as stage_artifact;
 pub use graph::{stage_resolved_root, VerifiedRootGraph};
 pub use package::{
-    inspect_registry_stage, registry_artifact_plan, stage_registry_package, VerifiedRegistryPackage,
+    inspect_registry_stage, read_verified_rpx_root_indexes, registry_artifact_plan,
+    stage_registry_package, VerifiedRegistryPackage, VerifiedRpxRootIndex,
+    MAX_RPX_PACKAGE_INDEX_BYTES, RPX_PACKAGE_INDEX,
 };
 pub use promotion::{
     promote_artifact, promote_verified_graph, ArtifactPromotionResult, ArtifactPromotionState,
@@ -112,6 +114,18 @@ pub enum InstallRuntimeError {
     },
     #[error("library.toml is not a bounded regular manifest suitable for hashing")]
     InvalidManifestForHashing,
+    #[error("RPX package index for root {package:?} is not a regular file")]
+    InvalidRpxPackageIndexEntry { package: String },
+    #[error(
+        "RPX package index for root {package:?} exceeded {limit} bytes (observed at least {observed})"
+    )]
+    RpxPackageIndexTooLarge {
+        package: String,
+        limit: u64,
+        observed: u64,
+    },
+    #[error("RPX package index for root {package:?} is not valid UTF-8")]
+    RpxPackageIndexUtf8 { package: String },
     #[error("resolver root graph {root:?} is missing selected package {package:?}")]
     ResolutionPackageMissing { root: String, package: String },
     #[error("resolver install order for root {root:?} repeats package {package:?}")]
