@@ -3,6 +3,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$REPO_ROOT/engine"
 CONTAINER_DIR="$REPO_ROOT/container-runtime"
+SDK_SOURCE_DIR="$REPO_ROOT/sdk"
 DIST_ROOT="$REPO_ROOT/dist"
 BUILD_SDK=false; ONLY=""; RELEASE=true; BUILD_WIN=false; BUILD_LINUX=false; BUILD_MACOS=false; BUILD_ALL=false; MUSL=false; CUSTOM_TARGET=""
 ARCHES=()
@@ -27,6 +28,7 @@ RBE selective/SDK builder
   ./build.sh --build-sdk [--only-backend|--only-rpx] [platform/arch flags]
   ./build.sh --only-<binary> [platform/arch flags]
 Known binaries: backend, service, cloud-node, container, rpx.
+A full --build-sdk bundle includes Rust, JavaScript/TypeScript, and Python SDK bindings.
 EOF
       exit 0 ;;
     *) echo "WARNING: build-select.sh: ignoring unrecognized argument '$arg'" >&2 ;;
@@ -50,6 +52,8 @@ fi
 profile=debug; $RELEASE && profile=release
 cargo_build() { local cwd="$1" target="$2"; shift 2; rustup target list --installed | grep -qx "$target" || rustup target add "$target"; local tool=cargo; if [ "$(target_os "$target")" != "$HOST_OS" ] && command -v cross >/dev/null 2>&1; then tool=cross; elif [ "$(target_os "$target")" != "$HOST_OS" ]; then echo "WARNING: cross-OS target $target requested without cross; linker may fail" >&2; fi; (cd "$cwd" && "$tool" "$@"); }
 copy_bin() { local source="$1" base="$2" target="$3"; local dest="$base"; [ "$(target_os "$target")" = windows ] && dest="$dest.exe"; cp "$source" "$dest"; echo "  -> $dest" >&2; }
+copy_clean_tree() { local source="$1" dest="$2"; [ -d "$source" ] || { echo "ERROR: SDK binding source is missing: $source" >&2; exit 2; }; rm -rf "$dest"; mkdir -p "$dest"; cp -R "$source"/. "$dest"/; rm -rf "$dest/target" "$dest/node_modules" "$dest/__pycache__" "$dest/.pytest_cache"; find "$dest" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true; }
+copy_sdk_bindings() { local out="$1" bindings="$1/bindings"; mkdir -p "$bindings"; copy_clean_tree "$SDK_SOURCE_DIR/rbe-sdk" "$bindings/rust"; copy_clean_tree "$SDK_SOURCE_DIR/js" "$bindings/javascript"; copy_clean_tree "$SDK_SOURCE_DIR/js" "$bindings/typescript"; copy_clean_tree "$SDK_SOURCE_DIR/python" "$bindings/python"; echo "  -> $bindings" >&2; }
 for target in "${targets[@]}"; do
   [[ "$target" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ERROR: unsafe target '$target'" >&2; exit 2; }
   echo; echo "=== Selective build for $target ===" >&2
@@ -59,7 +63,12 @@ for target in "${targets[@]}"; do
     out="$DIST_ROOT/$target/sdk"; mkdir -p "$out"
     if [ -z "$ONLY" ] || [ "$ONLY" = backend ] || [ "$ONLY" = sdk-backend ]; then cargo_build "$REPO_ROOT" "$target" build --manifest-path "$ENGINE_DIR/crates/sdk-backend/Cargo.toml" --bin sdk-backend --target "$target" "${rel[@]}"; p="$ENGINE_DIR/crates/sdk-backend/target/$target/$profile/sdk-backend"; [ "$(target_os "$target")" = windows ] && p="$p.exe"; copy_bin "$p" "$out/backend" "$target"; fi
     if [ -z "$ONLY" ] || [ "$ONLY" = rpx ]; then cargo_build "$REPO_ROOT" "$target" build --manifest-path "$ENGINE_DIR/crates/rpx/Cargo.toml" --bin rpx --target "$target" "${rel[@]}"; p="$ENGINE_DIR/crates/rpx/target/$target/$profile/rpx"; [ "$(target_os "$target")" = windows ] && p="$p.exe"; copy_bin "$p" "$out/rpx" "$target"; fi
-    printf '{"format":1,"target":"%s","profile":"%s"}\n' "$target" "$profile" > "$out/sdk-build.json"
+    if [ -z "$ONLY" ]; then echo '-- Language SDK bindings --' >&2; copy_sdk_bindings "$out"; fi
+    has_backend=false; has_rpx=false; has_bindings=false
+    if [ -z "$ONLY" ] || [ "$ONLY" = backend ] || [ "$ONLY" = sdk-backend ]; then has_backend=true; fi
+    if [ -z "$ONLY" ] || [ "$ONLY" = rpx ]; then has_rpx=true; fi
+    if [ -z "$ONLY" ]; then has_bindings=true; fi
+    printf '{"format":1,"target":"%s","profile":"%s","sdk_backend":%s,"rpx":%s,"bindings":%s}\n' "$target" "$profile" "$has_backend" "$has_rpx" "$has_bindings" > "$out/sdk-build.json"
     continue
   fi
   out="$DIST_ROOT/$target"; mkdir -p "$out"
