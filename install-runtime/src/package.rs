@@ -1,15 +1,21 @@
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rbe_install_executor::{ArtifactDownloadPlan, DownloadLimits, ResumePolicy};
 use rbe_install_request::{validate_registry_package_name, RegistryPackageRelease};
 use rbe_library_package::{inspect_zip, ArchivePolicy, LibraryManifest, LIBRARY_MANIFEST};
-use rbe_project_package::{LockedProjectPackage, LockedToolchain, ProjectCacheLayout};
+use rbe_project_package::{
+    LockedProjectPackage, LockedToolchain, ProjectCacheLayout, ProjectPackageLock,
+};
 use sha2::{Digest, Sha256};
+use zip::result::ZipError;
 use zip::ZipArchive;
 
 use crate::{stage_artifact, ArtifactStage, InstallRuntimeError};
+
+pub const RPX_PACKAGE_INDEX: &str = ".rbe/package-index.json";
+pub const MAX_RPX_PACKAGE_INDEX_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug)]
 pub struct VerifiedRegistryPackage {
@@ -17,6 +23,14 @@ pub struct VerifiedRegistryPackage {
     pub manifest: LibraryManifest,
     pub manifest_sha256: String,
     pub locked: LockedProjectPackage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRpxRootIndex {
+    pub package: String,
+    pub version: String,
+    pub artifact_sha256: String,
+    pub index_json: String,
 }
 
 pub fn registry_artifact_plan(
@@ -109,6 +123,134 @@ pub fn inspect_registry_stage(
     })
 }
 
+/// Read the public RPX package indexes for the project's explicit root packages.
+///
+/// This deliberately iterates `lock.packages` only. Root-scoped transitive
+/// packages in `lock.private` are install details and can never become REL
+/// package namespaces through this API. Every cache artifact is re-hashed
+/// against the pinned lock SHA before its index is trusted.
+pub fn read_verified_rpx_root_indexes(
+    project_root: &Path,
+) -> Result<Vec<VerifiedRpxRootIndex>, InstallRuntimeError> {
+    let layout = ProjectCacheLayout::new(project_root);
+    let lock_path = layout.lock_path();
+    if !lock_path.try_exists()? {
+        return Ok(Vec::new());
+    }
+
+    let lock = ProjectPackageLock::parse_yaml(&std::fs::read_to_string(&lock_path)?)?;
+    let mut indexes = Vec::new();
+    for (package, locked) in &lock.packages {
+        if let Some(index_json) = read_verified_rpx_index(&layout, package, locked)? {
+            indexes.push(VerifiedRpxRootIndex {
+                package: package.clone(),
+                version: locked.version.clone(),
+                artifact_sha256: locked.artifact_sha256.to_ascii_lowercase(),
+                index_json,
+            });
+        }
+    }
+    Ok(indexes)
+}
+
+fn read_verified_rpx_index(
+    layout: &ProjectCacheLayout,
+    package: &str,
+    locked: &LockedProjectPackage,
+) -> Result<Option<String>, InstallRuntimeError> {
+    let artifact_dir = layout.library_artifact_dir(&locked.artifact_sha256)?;
+    let artifact_path = artifact_dir.join("artifact.rbe");
+    verify_locked_cache_artifact(&artifact_path, &locked.artifact_sha256)?;
+
+    let mut archive = ZipArchive::new(File::open(&artifact_path)?)?;
+    let mut index = match archive.by_name(RPX_PACKAGE_INDEX) {
+        Ok(index) => index,
+        Err(ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if index.is_dir() {
+        return Err(InstallRuntimeError::InvalidRpxPackageIndexEntry {
+            package: package.to_string(),
+        });
+    }
+    if index.size() > MAX_RPX_PACKAGE_INDEX_BYTES {
+        return Err(InstallRuntimeError::RpxPackageIndexTooLarge {
+            package: package.to_string(),
+            limit: MAX_RPX_PACKAGE_INDEX_BYTES,
+            observed: index.size(),
+        });
+    }
+
+    let capacity = usize::try_from(index.size()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    index
+        .by_ref()
+        .take(MAX_RPX_PACKAGE_INDEX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RPX_PACKAGE_INDEX_BYTES {
+        return Err(InstallRuntimeError::RpxPackageIndexTooLarge {
+            package: package.to_string(),
+            limit: MAX_RPX_PACKAGE_INDEX_BYTES,
+            observed: bytes.len() as u64,
+        });
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| InstallRuntimeError::RpxPackageIndexUtf8 {
+            package: package.to_string(),
+        })
+}
+
+fn verify_locked_cache_artifact(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<(), InstallRuntimeError> {
+    ensure_no_symlink_components(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(InstallRuntimeError::UnsafeCacheEntry(
+            path.display().to_string(),
+        ));
+    }
+
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected_sha256.to_ascii_lowercase() {
+        return Err(InstallRuntimeError::ExistingArtifactMismatch {
+            path: path.display().to_string(),
+            expected_sha256: expected_sha256.to_ascii_lowercase(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_no_symlink_components(path: &Path) -> Result<(), InstallRuntimeError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(InstallRuntimeError::SymlinkedPath(
+                    current.display().to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn validate_manifest_matches_release(
     package: &str,
     release: &RegistryPackageRelease,
@@ -175,6 +317,7 @@ mod tests {
     use std::io::{Cursor, Write};
 
     use rbe_install_request::RegistryArtifact;
+    use rbe_project_package::ProjectPackageLock;
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions;
 
@@ -218,24 +361,51 @@ rbe-core = "^1"
         bytes.into_inner()
     }
 
-    fn release(bytes: &[u8]) -> RegistryPackageRelease {
-        RegistryPackageRelease {
-            version: "4.0.1".into(),
-            rbe_abi_min: 1,
-            rbe_abi_max: 1,
-            yanked: false,
-            dependencies: BTreeMap::from([("rbe-core".into(), "^1".into())]),
-            artifact: RegistryArtifact {
-                source: "https://example.com/advancenet.rbe".into(),
-                sha256: format!("{:x}", Sha256::digest(bytes)),
-                size_bytes: bytes.len() as u64,
-                source_sha256: None,
-                publisher: None,
-                signature: None,
-                reproducible_build: false,
-                shipped_binary_sha256: None,
-            },
+    fn rpx_package_bytes(index: Option<&str>) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut bytes);
+            writer
+                .start_file("package.rbe.toml", SimpleFileOptions::default())
+                .unwrap();
+            writer
+                .write_all(b"[package]\nname='demo'\nversion='1.0.0'\n")
+                .unwrap();
+            if let Some(index) = index {
+                writer
+                    .start_file(RPX_PACKAGE_INDEX, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(index.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
         }
+        bytes.into_inner()
+    }
+
+    fn locked(version: &str, bytes: &[u8]) -> LockedProjectPackage {
+        LockedProjectPackage {
+            version: version.into(),
+            resolved_from: "registry:demo".into(),
+            artifact_url: "https://example.com/demo.rbe".into(),
+            artifact_sha256: format!("{:x}", Sha256::digest(bytes)),
+            manifest_sha256: "b".repeat(64),
+            source_sha256: None,
+            dependencies: BTreeMap::new(),
+            runtime: None,
+            sdk: None,
+        }
+    }
+
+    fn write_cached_artifact(
+        layout: &ProjectCacheLayout,
+        locked: &LockedProjectPackage,
+        bytes: &[u8],
+    ) {
+        let dir = layout
+            .library_artifact_dir(&locked.artifact_sha256)
+            .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("artifact.rbe"), bytes).unwrap();
     }
 
     #[tokio::test]
@@ -283,5 +453,97 @@ rbe-core = "^1"
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn verified_rpx_index_reader_exposes_only_explicit_roots() {
+        let temp = tempdir().unwrap();
+        let layout = ProjectCacheLayout::new(temp.path());
+        let root_index = r#"{"format":1,"package":{"name":"advancenet","version":"2.0.0","language":"typescript"},"exports":[],"private_dependencies":{}}"#;
+        let private_index = r#"{"format":1,"package":{"name":"secret-parser","version":"9.0.0","language":"rust"},"exports":[],"private_dependencies":{}}"#;
+        let root_bytes = rpx_package_bytes(Some(root_index));
+        let private_bytes = rpx_package_bytes(Some(private_index));
+        let root_locked = locked("2.0.0", &root_bytes);
+        let private_locked = locked("9.0.0", &private_bytes);
+        write_cached_artifact(&layout, &root_locked, &root_bytes);
+        write_cached_artifact(&layout, &private_locked, &private_bytes);
+
+        let lock = ProjectPackageLock {
+            format: 1,
+            packages: BTreeMap::from([("advancenet".into(), root_locked)]),
+            private: BTreeMap::from([(
+                "advancenet".into(),
+                BTreeMap::from([("secret-parser".into(), private_locked)]),
+            )]),
+        };
+        std::fs::write(layout.lock_path(), lock.render_yaml().unwrap()).unwrap();
+
+        let indexes = read_verified_rpx_root_indexes(temp.path()).unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].package, "advancenet");
+        assert_eq!(indexes[0].version, "2.0.0");
+        assert_eq!(indexes[0].index_json, root_index);
+        assert!(!indexes[0].index_json.contains("secret-parser"));
+    }
+
+    #[test]
+    fn legacy_root_without_rpx_index_is_not_exposed() {
+        let temp = tempdir().unwrap();
+        let layout = ProjectCacheLayout::new(temp.path());
+        let bytes = rpx_package_bytes(None);
+        let root_locked = locked("1.0.0", &bytes);
+        write_cached_artifact(&layout, &root_locked, &bytes);
+        let lock = ProjectPackageLock {
+            format: 1,
+            packages: BTreeMap::from([("legacy".into(), root_locked)]),
+            private: BTreeMap::new(),
+        };
+        std::fs::write(layout.lock_path(), lock.render_yaml().unwrap()).unwrap();
+
+        assert!(read_verified_rpx_root_indexes(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rpx_index_reader_rejects_cache_bytes_that_do_not_match_lock_hash() {
+        let temp = tempdir().unwrap();
+        let layout = ProjectCacheLayout::new(temp.path());
+        let bytes = rpx_package_bytes(Some("{}"));
+        let root_locked = locked("1.0.0", &bytes);
+        let dir = layout
+            .library_artifact_dir(&root_locked.artifact_sha256)
+            .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("artifact.rbe"), b"corrupt").unwrap();
+        let lock = ProjectPackageLock {
+            format: 1,
+            packages: BTreeMap::from([("demo".into(), root_locked)]),
+            private: BTreeMap::new(),
+        };
+        std::fs::write(layout.lock_path(), lock.render_yaml().unwrap()).unwrap();
+
+        assert!(matches!(
+            read_verified_rpx_root_indexes(temp.path()),
+            Err(InstallRuntimeError::ExistingArtifactMismatch { .. })
+        ));
+    }
+
+    fn release(bytes: &[u8]) -> RegistryPackageRelease {
+        RegistryPackageRelease {
+            version: "4.0.1".into(),
+            rbe_abi_min: 1,
+            rbe_abi_max: 1,
+            yanked: false,
+            dependencies: BTreeMap::from([("rbe-core".into(), "^1".into())]),
+            artifact: RegistryArtifact {
+                source: "https://example.com/advancenet.rbe".into(),
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+                size_bytes: bytes.len() as u64,
+                source_sha256: None,
+                publisher: None,
+                signature: None,
+                reproducible_build: false,
+                shipped_binary_sha256: None,
+            },
+        }
     }
 }
