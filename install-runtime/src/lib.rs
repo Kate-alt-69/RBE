@@ -13,8 +13,7 @@ mod registry;
 
 pub use artifact::{stage_artifact, ArtifactStage};
 pub use package::{
-    inspect_registry_stage, registry_artifact_plan, stage_registry_package,
-    VerifiedRegistryPackage,
+    inspect_registry_stage, registry_artifact_plan, stage_registry_package, VerifiedRegistryPackage,
 };
 pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
