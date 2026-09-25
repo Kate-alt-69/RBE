@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const LOCK_FILE: &str = "sdk.lock.json";
+const POWERSHELL_INSTALLER: &str = "https://kastrick-backend.onrender.com/api/sdk/install.ps1";
+const SHELL_INSTALLER: &str = "https://kastrick-backend.onrender.com/api/sdk/install.sh";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SdkLock {
@@ -54,10 +56,7 @@ fn run() -> Result<()> {
         let path = option(&args, "path").unwrap_or_else(|| ".".to_string());
         match action {
             "repair" => repair(Path::new(&path))?,
-            "update" => {
-                let language = option(&args, "language").unwrap_or_else(|| "global".to_string());
-                install(Path::new(&path), resolve_version("latest"), &language)?;
-            }
+            "update" => update_instruction(Path::new(&path))?,
             "status" => status(Path::new(&path))?,
             other => bail!("unknown SDK action {other:?}; expected status, repair, or update"),
         }
@@ -90,8 +89,9 @@ fn install(project: &Path, version: String, language: &str) -> Result<()> {
         .join(executable_name("rpx"));
     if !rpx_source.is_file() {
         bail!(
-            "RPX is missing beside the SDK backend at {}. The SDK artifact must ship backend and rpx together.",
-            rpx_source.display()
+            "RPX is missing beside the SDK backend at {}. The SDK artifact must ship backend and rpx together. Re-run the official SDK installer to repair a damaged toolchain.\n{}",
+            rpx_source.display(),
+            installer_hint(&project)
         );
     }
     let rpx_dest = bin.join(executable_name("rpx"));
@@ -144,7 +144,27 @@ fn repair(project: &Path) -> Result<()> {
         &fs::read(&lock_path)
             .with_context(|| format!("SDK lock not found: {}", lock_path.display()))?,
     )?;
+
+    let current = std::env::current_exe()?;
+    let bundled_rpx = current
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(executable_name("rpx"));
+    if !bundled_rpx.is_file() {
+        bail!(
+            "local RPX is missing, so the running SDK backend has no trusted replacement bytes to repair it from.\n{}",
+            installer_hint(&project)
+        );
+    }
     install(&project, lock.version, &lock.language)
+}
+
+fn update_instruction(project: &Path) -> Result<()> {
+    let project = absolute(project)?;
+    bail!(
+        "SDK update requires a fresh verified bootstrap bundle; the running project-local backend cannot safely replace itself in place (especially on Windows).\n{}",
+        installer_hint(&project)
+    )
 }
 
 fn status(project: &Path) -> Result<()> {
@@ -164,11 +184,25 @@ fn status(project: &Path) -> Result<()> {
     println!("  rpx: {}", if rpx_ok { "OK" } else { "MISSING" });
     if !backend_ok || !rpx_ok {
         bail!(
-            "SDK installation is incomplete; run `backend sdk repair -path={}`",
-            project.display()
+            "SDK installation is incomplete.\n{}",
+            installer_hint(&project)
         );
     }
     Ok(())
+}
+
+fn installer_hint(project: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "Update/repair command (PowerShell):\n  $p = Join-Path $env:TEMP 'rbe-sdk-install.ps1'; iwr {POWERSHELL_INSTALLER} -OutFile $p; & $p -Path '{}'",
+            project.display()
+        )
+    } else {
+        format!(
+            "Update/repair command:\n  curl -fsSL {SHELL_INSTALLER} -o /tmp/rbe-sdk-install.sh && sh /tmp/rbe-sdk-install.sh --path '{}'",
+            project.display()
+        )
+    }
 }
 
 fn option(args: &[String], name: &str) -> Option<String> {
@@ -238,13 +272,14 @@ fn copy_if_different(source: &Path, destination: &Path) -> Result<()> {
 fn help() {
     println!(
         "RBE SDK backend (project-local)\n\n\
-Install/update:\n\
-  backend install sdk.latest -path=<project> [-language=global]\n\
+Install from a freshly verified SDK bundle:\n\
   backend install sdk.<version> -path=<project> [-language=typescript]\n\n\
-Repair/status:\n\
-  backend sdk repair -path=<project>\n\
-  backend sdk update -path=<project> [-language=global]\n\
-  backend sdk status -path=<project>\n\n\
+Local status/repair:\n\
+  backend sdk status -path=<project>\n\
+  backend sdk repair -path=<project>\n\n\
+Update:\n\
+  Re-run the official Kastrick SDK installer so backend/RPX can be replaced from a fresh verified bundle.\n\
+  `backend sdk update -path=<project>` prints the platform-specific bootstrap command.\n\n\
 The SDK backend never performs a machine-wide install."
     );
 }
