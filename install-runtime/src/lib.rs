@@ -10,12 +10,16 @@ mod artifact;
 mod graph;
 mod http;
 mod package;
+mod promotion;
 mod registry;
 
 pub use artifact::{stage_artifact, ArtifactStage};
 pub use graph::{stage_resolved_root, VerifiedRootGraph};
 pub use package::{
     inspect_registry_stage, registry_artifact_plan, stage_registry_package, VerifiedRegistryPackage,
+};
+pub use promotion::{
+    promote_verified_artifact, PromotedArtifact, PromotionDisposition,
 };
 pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
@@ -121,6 +125,24 @@ pub enum InstallRuntimeError {
     VerifiedRootMissing(String),
     #[error("verified root graph for {0:?} does not contain a complete private dependency graph")]
     VerifiedRootGraphIncomplete(String),
+    #[error("artifact promotion plan is structurally invalid")]
+    InvalidPromotionPlan,
+    #[error("artifact cache entry at {path:?} conflicts with verified staged bytes: {reason}")]
+    ExistingArtifactConflict { path: String, reason: String },
+    #[error("artifact at {path:?} changed size before/during promotion: expected {expected}, got {actual}")]
+    PromotedArtifactSizeMismatch {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("artifact size overflow while re-verifying promotion bytes")]
+    PromotedArtifactSizeOverflow,
+    #[error("artifact at {path:?} failed SHA-256 re-verification: expected {expected}, got {actual}")]
+    PromotedArtifactHashMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
     #[error("install-runtime filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
 }
