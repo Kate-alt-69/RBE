@@ -20,9 +20,11 @@ pub async fn stage_artifact_cached(
                     plan.final_artifact_path.display().to_string(),
                 ));
             }
-            verify_cached_final(plan).map_err(|_| InstallRuntimeError::ExistingArtifactMismatch {
-                path: plan.final_artifact_path.display().to_string(),
-                expected_sha256: plan.expected_sha256.clone(),
+            verify_cached_final(plan).map_err(|_| {
+                InstallRuntimeError::ExistingArtifactMismatch {
+                    path: plan.final_artifact_path.display().to_string(),
+                    expected_sha256: plan.expected_sha256.clone(),
+                }
             })?;
             seed_staging_from_cache(plan)?;
             stage_network_artifact(plan).await
