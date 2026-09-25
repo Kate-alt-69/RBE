@@ -87,6 +87,8 @@ field.dynamic("utm_", true) // strip prefix
 
 Required missing/invalid reusable fields fail before Route execution with HTTP 400 and a structured `field_validation_failed` response. Optional missing values resolve to their declared default or `null`; optional type failures resolve `null`. Dynamic prefix bindings resolve to an object. The resolved reusable values are also attached as `req.fields` for inspection. Dynamic families are fail-closed and bounded: they accept at most 64 matches by default, declarative `dynamic(...)` may set `maxMatches = N`, and `N` must be between 1 and 256. Exceeding the bound returns `FLD4004`; values are never partially truncated. Dynamic families are string maps: a matched non-string body value fails with `FLD4002` instead of leaking an untyped JSON value through the field namespace.
 
+FieldManager keeps client validation and runtime invariants separate at the HTTP edge. `FLD4xxx` failures are client-facing validation errors and return HTTP 400 with `field_validation_failed`. `FLD5xxx` failures indicate an internal request-snapshot/compiler/runtime invariant failure; they are logged with the Route path and return HTTP 500 with `field_runtime_failed` instead of incorrectly blaming the request.
+
 Field resolution is always host-owned and runs before Route dispatch. FLD-005 allows the native Route-WASM subset to consume that same pre-resolved context; native execution never creates a second FieldManager resolver.
 
 ## Route-local declarative fields (FLD-003)

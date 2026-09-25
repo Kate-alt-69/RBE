@@ -315,14 +315,32 @@ fn request_error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
 }
 
-fn field_validation_response(error: FieldResolveError) -> Response {
+fn field_resolution_response(path: &str, error: FieldResolveError) -> Response {
+    if error.code.starts_with("FLD4") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "field_validation_failed",
+                "code": error.code,
+                "field": error.field,
+                "message": error.message,
+            })),
+        )
+            .into_response();
+    }
+
+    tracing::error!(
+        path = %path,
+        code = error.code,
+        field = %error.field,
+        message = %error.message,
+        "FieldManager request resolution failed internally"
+    );
     (
-        StatusCode::BAD_REQUEST,
+        StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
-            "error": "field_validation_failed",
+            "error": "field_runtime_failed",
             "code": error.code,
-            "field": error.field,
-            "message": error.message,
         })),
     )
         .into_response()
@@ -774,7 +792,7 @@ async fn execute(
             .expect("FieldManager-active Route always builds a request snapshot");
         match field_plan.resolve(snapshot, module_program.as_ref()).await {
             Ok(context) => Some(context),
-            Err(error) => return field_validation_response(error),
+            Err(error) => return field_resolution_response(&path, error),
         }
     } else {
         None
@@ -1446,6 +1464,29 @@ mod http_edge_tests {
         );
         assert_eq!(collision_key_for("/api/users/:uid"), "/api/users/:");
         assert_eq!(collision_key_for("/api/users/:name"), "/api/users/:");
+    }
+
+    #[test]
+    fn field_resolution_errors_keep_client_and_internal_boundaries_separate() {
+        let validation = field_resolution_response(
+            "/api/test",
+            FieldResolveError {
+                code: "FLD4002",
+                field: "count".into(),
+                message: "invalid integer".into(),
+            },
+        );
+        assert_eq!(validation.status(), StatusCode::BAD_REQUEST);
+
+        let internal = field_resolution_response(
+            "/api/test",
+            FieldResolveError {
+                code: "FLD5000",
+                field: "request".into(),
+                message: "request snapshot is invalid".into(),
+            },
+        );
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
