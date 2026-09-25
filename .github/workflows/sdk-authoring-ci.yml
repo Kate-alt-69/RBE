@@ -66,3 +66,10 @@ jobs:
           test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/javascript/index.js
           test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/typescript/index.d.ts
           test -f dist/x86_64-unknown-linux-gnu/sdk/bindings/python/pyproject.toml
+      - name: Smoke build SDK backend only
+        run: |
+          rm -rf dist/x86_64-unknown-linux-gnu/sdk
+          ./build.sh --build-sdk --only-backend --build-linux --arch-x64
+          test -x dist/x86_64-unknown-linux-gnu/sdk/backend
+          test ! -e dist/x86_64-unknown-linux-gnu/sdk/rpx
+          test ! -d dist/x86_64-unknown-linux-gnu/sdk/bindings
