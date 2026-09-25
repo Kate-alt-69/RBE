@@ -124,11 +124,7 @@ fn compile_package(target: PathBuf) -> Result<()> {
 }
 
 fn compile_sources(package: &CheckedPackage) -> Result<()> {
-    let build_root = package
-        .root
-        .join(".cache")
-        .join("rbe")
-        .join("compile");
+    let build_root = package.root.join(".cache").join("rbe").join("compile");
     fs::create_dir_all(&build_root)?;
 
     for component in &package.components {
@@ -167,10 +163,7 @@ fn compile_rust(
     fs::create_dir_all(&src)?;
     fs::copy(&component.source, src.join("lib.rs"))?;
 
-    let crate_name = format!(
-        "rbe_component_check_{}",
-        component.name.replace('-', "_")
-    );
+    let crate_name = format!("rbe_component_check_{}", component.name.replace('-', "_"));
     let sdk_path = toml_path(&sdk.canonicalize()?);
     let manifest = format!(
         "[package]\nname = \"{crate_name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[dependencies]\nrbe-sdk = {{ path = \"{sdk_path}\" }}\n"
@@ -241,11 +234,7 @@ fn compile_typescript(
     component: &CheckedComponent,
     build_root: &Path,
 ) -> Result<()> {
-    let sdk = package
-        .root
-        .join(".rbe")
-        .join("sdk")
-        .join("typescript");
+    let sdk = package.root.join(".rbe").join("sdk").join("typescript");
     require_sdk_binding(&sdk, "typescript")?;
 
     let work = build_root.join("typescript").join(&component.name);
@@ -271,7 +260,11 @@ fn compile_typescript(
     fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
 
     let mut command = Command::new("tsc");
-    command.arg("--pretty").arg("false").arg("-p").arg(&config_path);
+    command
+        .arg("--pretty")
+        .arg("false")
+        .arg("-p")
+        .arg(&config_path);
     run_required(
         command,
         "tsc",
