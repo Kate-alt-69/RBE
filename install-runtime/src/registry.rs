@@ -51,7 +51,10 @@ impl RegistryClient {
         Ok(self)
     }
 
-    pub fn with_graph_limit(mut self, maximum_packages: usize) -> Result<Self, InstallRuntimeError> {
+    pub fn with_graph_limit(
+        mut self,
+        maximum_packages: usize,
+    ) -> Result<Self, InstallRuntimeError> {
         if maximum_packages == 0 || maximum_packages > DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES {
             return Err(InstallRuntimeError::InvalidRegistryGraphLimit {
                 requested: maximum_packages,

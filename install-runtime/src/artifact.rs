@@ -158,7 +158,9 @@ fn partial_size(path: &Path) -> Result<u64, InstallRuntimeError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
-                return Err(InstallRuntimeError::SymlinkedPath(path.display().to_string()));
+                return Err(InstallRuntimeError::SymlinkedPath(
+                    path.display().to_string(),
+                ));
             }
             if !metadata.is_file() {
                 return Err(InstallRuntimeError::UnsafeStagingEntry(
@@ -272,8 +274,7 @@ mod tests {
     use rbe_project_package::LockedArtifactFetch;
     use url::Url;
 
-    const ABC_SHA256: &str =
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     #[test]
     fn content_range_validates_numeric_start_end_and_total() {

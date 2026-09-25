@@ -112,11 +112,14 @@ async fn send_once(
     let client = builder.build().map_err(InstallRuntimeError::HttpClient)?;
     let mut request = client.get(url.clone());
     if let Some(range) = range {
-        let value = HeaderValue::from_str(range)
-            .map_err(|_| InstallRuntimeError::ResumeRejected)?;
+        let value =
+            HeaderValue::from_str(range).map_err(|_| InstallRuntimeError::ResumeRejected)?;
         request = request.header(RANGE, value);
     }
-    request.send().await.map_err(InstallRuntimeError::HttpRequest)
+    request
+        .send()
+        .await
+        .map_err(InstallRuntimeError::HttpRequest)
 }
 
 pub(crate) async fn get_following_redirects(
@@ -174,7 +177,10 @@ mod tests {
             "fe80::1",
             "2001:db8::1",
         ] {
-            assert!(forbidden_ip(value.parse().unwrap()), "{value} must be blocked");
+            assert!(
+                forbidden_ip(value.parse().unwrap()),
+                "{value} must be blocked"
+            );
         }
         assert!(!forbidden_ip("1.1.1.1".parse().unwrap()));
         assert!(!forbidden_ip("2606:4700:4700::1111".parse().unwrap()));
