@@ -7,6 +7,7 @@ use crate::ast::{
     BinaryOp, Expr, FieldBinding, FieldBindingMode, FieldDirective, FieldFile, FieldValueType,
     FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceClassDef, ServiceProgram,
     Statement, Value, DEFAULT_DYNAMIC_FIELD_MATCHES, MAX_DYNAMIC_FIELD_MATCHES,
+    MAX_EXACT_FIELD_INTEGER, MIN_EXACT_FIELD_INTEGER,
 };
 use crate::lexer::{Token, TokenKind};
 
@@ -452,8 +453,8 @@ impl Parser {
             (FieldValueType::Int, Value::Number(value)) => {
                 value.is_finite()
                     && value.fract() == 0.0
-                    && *value >= i64::MIN as f64
-                    && *value <= i64::MAX as f64
+                    && *value >= MIN_EXACT_FIELD_INTEGER as f64
+                    && *value <= MAX_EXACT_FIELD_INTEGER as f64
             }
             _ => false,
         };

@@ -59,6 +59,8 @@ pub enum FieldValueType {
 
 pub const DEFAULT_DYNAMIC_FIELD_MATCHES: usize = 64;
 pub const MAX_DYNAMIC_FIELD_MATCHES: usize = 256;
+pub const MAX_EXACT_FIELD_INTEGER: i64 = 9_007_199_254_740_991;
+pub const MIN_EXACT_FIELD_INTEGER: i64 = -MAX_EXACT_FIELD_INTEGER;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldBindingMode {

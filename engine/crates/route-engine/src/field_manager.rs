@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::ast::{
     FieldBinding, FieldBindingMode, FieldFile, FieldValueType, ImportTarget, ModuleFile, RouteFile,
-    Value, DEFAULT_DYNAMIC_FIELD_MATCHES,
+    Value, DEFAULT_DYNAMIC_FIELD_MATCHES, MAX_EXACT_FIELD_INTEGER, MIN_EXACT_FIELD_INTEGER,
 };
 use crate::module_eval::{ModuleEvalError, ModuleExecutor};
 use crate::module_runtime::ModuleProgram;
@@ -387,18 +387,28 @@ fn coerce_value(value: &Value, value_type: FieldValueType, source: &str) -> Resu
             _ => Err(format!("{source} value is not a string")),
         },
         FieldValueType::Int => match value {
-            Value::String(raw) => raw
-                .parse::<i64>()
-                .map(|value| Value::Number(value as f64))
-                .map_err(|_| "expected an integer".into()),
+            Value::String(raw) => {
+                let parsed = raw
+                    .parse::<i64>()
+                    .map_err(|_| "expected an integer".to_string())?;
+                if !(MIN_EXACT_FIELD_INTEGER..=MAX_EXACT_FIELD_INTEGER).contains(&parsed) {
+                    return Err(format!(
+                        "integer must be exactly representable between {MIN_EXACT_FIELD_INTEGER} and {MAX_EXACT_FIELD_INTEGER}"
+                    ));
+                }
+                Ok(Value::Number(parsed as f64))
+            }
             Value::Number(value)
                 if value.is_finite()
                     && value.fract() == 0.0
-                    && *value >= i64::MIN as f64
-                    && *value <= i64::MAX as f64 =>
+                    && *value >= MIN_EXACT_FIELD_INTEGER as f64
+                    && *value <= MAX_EXACT_FIELD_INTEGER as f64 =>
             {
                 Ok(Value::Number(*value))
             }
+            Value::Number(value) if value.is_finite() && value.fract() == 0.0 => Err(format!(
+                "integer must be exactly representable between {MIN_EXACT_FIELD_INTEGER} and {MAX_EXACT_FIELD_INTEGER}"
+            )),
             _ => Err("expected an integer".into()),
         },
         FieldValueType::Bool => match value {
@@ -936,6 +946,60 @@ mod tests {
         assert!(
             matches!(context.call("count", &[]).unwrap(), Value::Number(value) if value == 7.0)
         );
+    }
+
+    #[test]
+    fn integer_fields_preserve_exact_numeric_identity() {
+        for raw in ["9007199254740991", "-9007199254740991"] {
+            let value =
+                coerce_value(&Value::String(raw.into()), FieldValueType::Int, "query").unwrap();
+            assert!(matches!(value, Value::Number(_)));
+        }
+
+        for value in [
+            Value::String("9007199254740992".into()),
+            Value::String("-9007199254740992".into()),
+            Value::Number(9_007_199_254_740_992.0),
+            Value::Number(-9_007_199_254_740_992.0),
+        ] {
+            let error = coerce_value(&value, FieldValueType::Int, "query").unwrap_err();
+            assert!(error.contains("exactly representable"));
+            assert!(error.contains("9007199254740991"));
+        }
+    }
+
+    #[test]
+    fn unsafe_integer_binding_fails_with_field_validation_error() {
+        let route = route(
+            r#":import[field]
+               fields { count = required("count", type = int); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        let request = request(&[("count", "9007199254740992")]);
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("safe-integer");
+        let error = block_on_ready(plan.resolve(&request, &program)).unwrap_err();
+        assert_eq!(error.code, "FLD4002");
+        assert_eq!(error.field, "count");
+        assert!(error.message.contains("exactly representable"));
+    }
+
+    #[test]
+    fn unsafe_integer_defaults_fail_during_parse() {
+        for raw in ["9007199254740992", "-9007199254740992"] {
+            let source = format!(
+                r#":import[field]
+fields {{ count = optional("count", type = int, default = {raw}); }}
+class Route {{ get(req) {{ return req.fields; }} }}"#
+            );
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            let error = Parser::new(tokens).parse_file().unwrap_err();
+            assert!(!error.message.is_empty());
+        }
     }
 
     #[test]

@@ -163,6 +163,8 @@ fields {
 
 Header lookup, including dynamic prefix matching, is ASCII case-insensitive. Named `body` bindings require a JSON object; an empty body behaves like a missing object so optional/default bindings still work. `body` integer and boolean fields may use native JSON numbers/booleans or their string forms. A `.field` with `source = body` and no key receives the complete body value in `resolve(raw, context)`, including non-object JSON or text bodies.
 
+`type = int` is exact rather than lossy: FieldManager accepts only integers from `-9007199254740991` through `9007199254740991` (the exactly representable integer range of REL's numeric value type). Request values outside that range fail with `FLD4002`, and out-of-range integer defaults are rejected at parse time, instead of either path rounding to a different integer.
+
 The direct helpers `field.required(...)`, `field.optional(...)`, `field.has(...)`, and `field.dynamic(...)` intentionally remain query shorthands. Use declarative bindings when selecting another source so source ownership remains visible in compiled Field IR.
 
 
