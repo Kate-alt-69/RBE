@@ -7,15 +7,22 @@
 #![forbid(unsafe_code)]
 
 mod artifact;
+mod cache;
 mod graph;
 mod http;
 mod package;
+mod promotion;
 mod registry;
 
-pub use artifact::{stage_artifact, ArtifactStage};
+pub use artifact::ArtifactStage;
+pub use cache::stage_artifact_cached as stage_artifact;
 pub use graph::{stage_resolved_root, VerifiedRootGraph};
 pub use package::{
     inspect_registry_stage, registry_artifact_plan, stage_registry_package, VerifiedRegistryPackage,
+};
+pub use promotion::{
+    promote_artifact, promote_verified_graph, ArtifactPromotionResult, ArtifactPromotionState,
+    RootGraphPromotion,
 };
 pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
@@ -121,6 +128,28 @@ pub enum InstallRuntimeError {
     VerifiedRootMissing(String),
     #[error("verified root graph for {0:?} does not contain a complete private dependency graph")]
     VerifiedRootGraphIncomplete(String),
+    #[error("verified root graph {root:?} is missing staged package {package:?}")]
+    VerifiedGraphPackageMissing { root: String, package: String },
+    #[error("invalid verified-artifact promotion plan")]
+    InvalidPromotionPlan,
+    #[error("artifact promotion verification size accounting overflow")]
+    ArtifactSizeOverflow,
+    #[error("artifact cache entry has an unsafe filesystem type: {0}")]
+    UnsafeCacheEntry(String),
+    #[error(
+        "existing artifact cache entry {path} does not match expected SHA-256 {expected_sha256}"
+    )]
+    ExistingArtifactMismatch {
+        path: String,
+        expected_sha256: String,
+    },
+    #[error("artifact promotion race produced no reusable cache winner at {path}")]
+    PromotionRace { path: String },
+    #[error("promoted artifact {path} failed verification against SHA-256 {expected_sha256}")]
+    PromotedArtifactVerification {
+        path: String,
+        expected_sha256: String,
+    },
     #[error("install-runtime filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
 }
