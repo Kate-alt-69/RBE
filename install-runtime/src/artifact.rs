@@ -291,7 +291,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache_path = temp.path().join(".cache/library").join(ABC_SHA256);
         let fetch = LockedArtifactFetch {
+            root: "advancenet".into(),
             package: "advancenet".into(),
+            private: false,
             version: "4.0.1".into(),
             artifact_url: Url::parse("https://example.com/advancenet.rbe").unwrap(),
             artifact_sha256: ABC_SHA256.into(),
