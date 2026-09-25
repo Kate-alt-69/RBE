@@ -1244,4 +1244,55 @@ mod tests {
                 .contains("cannot declare both `required` and `optional`"));
         }
     }
+
+    #[test]
+    fn route_local_defaults_must_match_declared_types_regardless_of_option_order() {
+        for source in [
+            r#":import[field]
+               fields { page = optional("page", type = int, default = "oops"); }
+               class Route { get(req) { return req.fields; } }"#,
+            r#":import[field]
+               fields { page = optional("page", default = "oops", type = int); }
+               class Route { get(req) { return req.fields; } }"#,
+            r#":import[field]
+               fields { debug = optional("debug", type = bool, default = 1); }
+               class Route { get(req) { return req.fields; } }"#,
+            r#":import[field]
+               fields { label = optional("label", type = string, default = false); }
+               class Route { get(req) { return req.fields; } }"#,
+        ] {
+            let tokens = Lexer::new(source).tokenize().unwrap();
+            let error = Parser::new(tokens).parse_file().unwrap_err();
+            assert!(error.message.contains("default"));
+            assert!(error.message.contains("declared type"));
+        }
+    }
+
+    #[test]
+    fn route_local_defaults_accept_matching_values_and_null() {
+        let parsed = route(
+            r#":import[field]
+               fields {
+                   page = optional("page", type = int, default = 1);
+                   debug = optional("debug", type = bool, default = false);
+                   label = optional("label", type = string, default = "ok");
+                   nullable = optional("nullable", type = int, default = null);
+               }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        assert!(
+            matches!(parsed.field_bindings[0].default, Some(Value::Number(value)) if value == 1.0)
+        );
+        assert!(matches!(
+            parsed.field_bindings[1].default,
+            Some(Value::Bool(false))
+        ));
+        assert!(
+            matches!(parsed.field_bindings[2].default, Some(Value::String(ref value)) if value == "ok")
+        );
+        assert!(matches!(
+            parsed.field_bindings[3].default,
+            Some(Value::Null)
+        ));
+    }
 }

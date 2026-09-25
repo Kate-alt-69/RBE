@@ -425,6 +425,9 @@ impl Parser {
                 return Err(self.error_here("maxMatches is only valid for dynamic(...)"));
             }
         }
+        if let Some(default) = default.as_ref() {
+            self.validate_field_default(default, value_type)?;
+        }
         Ok(FieldBinding {
             name,
             lookup,
@@ -435,6 +438,36 @@ impl Parser {
             strip_prefix,
             max_matches,
         })
+    }
+
+    fn validate_field_default(
+        &self,
+        default: &Value,
+        value_type: FieldValueType,
+    ) -> Result<(), ParseError> {
+        let valid = match (value_type, default) {
+            (_, Value::Null) => true,
+            (FieldValueType::String, Value::String(_)) => true,
+            (FieldValueType::Bool, Value::Bool(_)) => true,
+            (FieldValueType::Int, Value::Number(value)) => {
+                value.is_finite()
+                    && value.fract() == 0.0
+                    && *value >= i64::MIN as f64
+                    && *value <= i64::MAX as f64
+            }
+            _ => false,
+        };
+        if valid {
+            return Ok(());
+        }
+        let expected = match value_type {
+            FieldValueType::String => "string or null",
+            FieldValueType::Int => "integer or null",
+            FieldValueType::Bool => "boolean or null",
+        };
+        Err(self.error_here(&format!(
+            "FieldManager default does not match declared type; expected {expected}"
+        )))
     }
 
     pub fn parse_service_file(mut self) -> Result<ServiceProgram, ParseError> {
