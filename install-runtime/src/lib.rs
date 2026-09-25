@@ -130,6 +130,8 @@ pub enum InstallRuntimeError {
     VerifiedGraphPackageMissing { root: String, package: String },
     #[error("invalid verified-artifact promotion plan")]
     InvalidPromotionPlan,
+    #[error("artifact promotion verification size accounting overflow")]
+    ArtifactSizeOverflow,
     #[error("artifact cache entry has an unsafe filesystem type: {0}")]
     UnsafeCacheEntry(String),
     #[error("existing artifact cache entry {path} does not match expected SHA-256 {expected_sha256}")]
