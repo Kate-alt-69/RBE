@@ -173,10 +173,16 @@ fn status(project: &Path) -> Result<()> {
     println!("  rpx: {}", if rpx_ok { "OK" } else { "MISSING" });
     for language in &bindings {
         let present = !missing_bindings.contains(language);
-        println!("  sdk/{language}: {}", if present { "OK" } else { "MISSING" });
+        println!(
+            "  sdk/{language}: {}",
+            if present { "OK" } else { "MISSING" }
+        );
     }
     if !backend_ok || !rpx_ok || !missing_bindings.is_empty() {
-        bail!("SDK installation is incomplete.\n{}", installer_hint(&project));
+        bail!(
+            "SDK installation is incomplete.\n{}",
+            installer_hint(&project)
+        );
     }
     Ok(())
 }
@@ -270,7 +276,10 @@ fn copy_if_different(source: &Path, destination: &Path) -> Result<()> {
 fn replace_tree(source: &Path, destination: &Path) -> Result<()> {
     if destination.exists() {
         fs::remove_dir_all(destination).with_context(|| {
-            format!("failed to replace old SDK binding at {}", destination.display())
+            format!(
+                "failed to replace old SDK binding at {}",
+                destination.display()
+            )
         })?;
     }
     copy_tree(source, destination)
