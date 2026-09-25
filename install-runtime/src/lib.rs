@@ -7,11 +7,13 @@
 #![forbid(unsafe_code)]
 
 mod artifact;
+mod graph;
 mod http;
 mod package;
 mod registry;
 
 pub use artifact::{stage_artifact, ArtifactStage};
+pub use graph::{stage_resolved_root, VerifiedRootGraph};
 pub use package::{
     inspect_registry_stage, registry_artifact_plan, stage_registry_package, VerifiedRegistryPackage,
 };
@@ -103,6 +105,22 @@ pub enum InstallRuntimeError {
     },
     #[error("library.toml is not a bounded regular manifest suitable for hashing")]
     InvalidManifestForHashing,
+    #[error("resolver root graph {root:?} is missing selected package {package:?}")]
+    ResolutionPackageMissing { root: String, package: String },
+    #[error("resolver install order for root {root:?} repeats package {package:?}")]
+    ResolutionOrderDuplicate { root: String, package: String },
+    #[error("resolver install order for root {root:?} omits selected package {package:?}")]
+    ResolutionOrderIncomplete { root: String, package: String },
+    #[error("hydrated registry graph is missing package index {package:?}")]
+    RegistryIndexMissing { package: String },
+    #[error("registry index for {package:?} is missing resolved release {version:?}")]
+    RegistryReleaseMissing { package: String, version: String },
+    #[error("verified root graph {root:?} contains duplicate package {package:?}")]
+    DuplicateVerifiedPackage { root: String, package: String },
+    #[error("verified root graph is missing requested root package {0:?}")]
+    VerifiedRootMissing(String),
+    #[error("verified root graph for {0:?} does not contain a complete private dependency graph")]
+    VerifiedRootGraphIncomplete(String),
     #[error("install-runtime filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
 }

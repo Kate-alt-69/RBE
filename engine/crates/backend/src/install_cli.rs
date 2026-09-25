@@ -1,12 +1,15 @@
-//! Real pre-bootstrap `backend install` resolution path.
+//! Real pre-bootstrap `backend install` package path.
 //!
-//! The executable intentionally stops after trusted registry hydration and
-//! deterministic resolution until verified artifact inspection can supply the
-//! manifest hash required by `ProjectPackageLock`. It must never report an
-//! install as successful before cache promotion/session activation completes.
+//! Named installs resolve registry metadata, stage and verify every selected
+//! artifact, inspect package manifests, and construct an exact root-scoped lock
+//! candidate before normal Backend boot. The executable still refuses to claim
+//! installation success until cache promotion, preparation/build, attestation,
+//! and durable session activation complete.
+
+use std::path::Path;
 
 use rbe_install_request::{InstallCommand, InstallTarget};
-use rbe_install_runtime::RegistryClient;
+use rbe_install_runtime::{stage_resolved_root, RegistryClient};
 use rbe_library_resolver::{resolve_scoped, ResolutionRequest};
 
 const REGISTRY_ENV: &str = "RBE_PACKAGE_REGISTRY";
@@ -34,11 +37,12 @@ Registry configuration:
   RBE_PACKAGE_REGISTRY=https://<trusted-registry-base>/
 
 Current execution boundary:
-  Named-package registry hydration and deterministic dependency resolution are
-  active. Verified artifact ingress exists in rbe-install-runtime. Final
-  artifact inspection, durable cache promotion, install-session activation,
-  and package.lock.rbe.yaml commit are not yet connected to backend.exe, so a
-  successfully resolved package exits unavailable instead of claiming success."#;
+  Named-package registry hydration, deterministic dependency resolution,
+  verified artifact staging, manifest inspection, and exact root-scoped lock
+  candidate construction are active before Backend boot. Durable cache
+  promotion, package preparation/build, attestation, install-session activation,
+  and package.lock.rbe.yaml commit remain gated, so a verified graph exits
+  unavailable instead of claiming installation success."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCliFailure {
@@ -126,12 +130,16 @@ fn resolve_named(command: InstallCommand) -> Result<String, InstallCliFailure> {
             "{REGISTRY_ENV} must not be empty"
         )));
     }
+    let project_root = std::env::current_dir().map_err(|error| {
+        InstallCliFailure::software(format!("resolve package project directory: {error}"))
+    })?;
 
     let json = command.flags.json;
     let quiet = command.flags.quiet;
     let key_for_worker = key.clone();
     let requirement_for_worker = requirement.clone();
     let registry_for_worker = registry.clone();
+    let project_root_for_worker = project_root.clone();
 
     let worker = std::thread::Builder::new()
         .name("rbe-package-install-resolver".into())
@@ -146,6 +154,7 @@ fn resolve_named(command: InstallCommand) -> Result<String, InstallCliFailure> {
                 })?;
             runtime.block_on(resolve_named_async(
                 &registry_for_worker,
+                &project_root_for_worker,
                 &key_for_worker,
                 &requirement_for_worker,
                 json,
@@ -163,6 +172,7 @@ fn resolve_named(command: InstallCommand) -> Result<String, InstallCliFailure> {
 
 async fn resolve_named_async(
     registry: &str,
+    project_root: &Path,
     key: &str,
     requirement: &str,
     json: bool,
@@ -186,55 +196,66 @@ async fn resolve_named_async(
             "resolver returned no root graph for requested package `{key}`"
         ))
     })?;
-    let root = resolution.release(key).ok_or_else(|| {
-        InstallCliFailure::software(format!(
-            "resolver returned no selected root release for `{key}`"
-        ))
-    })?;
-    let selected_version = root.version.to_string();
-    let index = indexes.get(key).ok_or_else(|| {
-        InstallCliFailure::software(format!(
-            "registry hydration returned no root index for `{key}`"
-        ))
-    })?;
-    let metadata = index
-        .releases
-        .iter()
-        .find(|release| release.version == selected_version)
-        .ok_or_else(|| {
-            InstallCliFailure::software(format!(
-                "resolved `{key}` {selected_version} is missing from the validated registry index"
+
+    let graph = stage_resolved_root(project_root, key, resolution, &indexes)
+        .await
+        .map_err(|error| {
+            InstallCliFailure::unavailable(format!(
+                "verify resolved package graph for `{key}` failed: {error}"
             ))
         })?;
-    let dependencies = resolution.selected.len().saturating_sub(1);
+    let root = graph.lock.packages.get(key).ok_or_else(|| {
+        InstallCliFailure::software(format!(
+            "verified lock candidate contains no root package `{key}`"
+        ))
+    })?;
+    let root_stage = graph.packages.get(key).ok_or_else(|| {
+        InstallCliFailure::software(format!(
+            "verified package graph contains no staged root package `{key}`"
+        ))
+    })?;
+    let dependencies = graph.packages.len().saturating_sub(1);
+    let verified_bytes = graph
+        .packages
+        .values()
+        .map(|package| package.stage.verified.size_bytes)
+        .sum::<u64>();
 
     let message = if json {
         serde_json::json!({
-            "status": "resolved_not_activated",
+            "status": "verified_lock_candidate_not_activated",
             "package": key,
-            "version": selected_version,
+            "version": root.version,
             "dependencies": dependencies,
+            "verified_packages": graph.packages.len(),
+            "verified_bytes": verified_bytes,
             "artifact": {
-                "source": metadata.artifact.source,
-                "sha256": metadata.artifact.sha256,
-                "size_bytes": metadata.artifact.size_bytes,
+                "source": root.artifact_url,
+                "sha256": root.artifact_sha256,
+                "size_bytes": root_stage.stage.verified.size_bytes,
+                "manifest_sha256": root.manifest_sha256,
             },
+            "root_graph_complete": graph.lock.root_graph_complete(key),
             "registry": registry,
             "server_started": false,
-            "next_boundary": "verified artifact inspection and durable activation"
+            "project_lock_changed": false,
+            "next_boundary": "durable promotion, preparation/build, attestation, and session activation"
         })
         .to_string()
     } else if quiet {
         format!(
-            "`{key}` {selected_version} resolved, but durable package activation is not connected yet"
+            "`{key}` {} and {dependencies} dependenc{} verified; durable activation is not connected yet",
+            root.version,
+            if dependencies == 1 { "y" } else { "ies" },
         )
     } else {
         format!(
-            "`backend install` resolved `{key}` {selected_version} with {dependencies} dependenc{} from the configured registry.\nartifact: {}\nsha256: {}\nsize: {} bytes\n\nVerified artifact ingress is available, but artifact manifest inspection and durable cache/session activation are not connected to backend.exe yet. No RBE server was started and no project lockfile was changed.",
-            if dependencies == 1 { "y" } else { "ies" },
-            metadata.artifact.source,
-            metadata.artifact.sha256,
-            metadata.artifact.size_bytes,
+            "`backend install` verified the complete `{key}` {} root graph: {} package(s), {verified_bytes} byte(s).\nroot artifact: {}\nartifact sha256: {}\nmanifest sha256: {}\n\nAll selected registry artifacts were staged, hash-verified, inspected, and converted into a complete root/private lock candidate. Durable promotion, package preparation/build, attestation, and install-session activation are not connected to backend.exe yet. No RBE server was started and package.lock.rbe.yaml was not changed.",
+            root.version,
+            graph.packages.len(),
+            root.artifact_url,
+            root.artifact_sha256,
+            root.manifest_sha256,
         )
     };
 
