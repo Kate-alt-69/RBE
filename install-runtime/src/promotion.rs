@@ -38,7 +38,11 @@ pub fn promote_artifact(
     stage: &ArtifactStage,
 ) -> Result<ArtifactPromotionResult, InstallRuntimeError> {
     let plan = &stage.promotion;
-    validate_promotion_shape(plan.verified_partial.as_path(), &plan.final_dir, &plan.final_artifact)?;
+    validate_promotion_shape(
+        plan.verified_partial.as_path(),
+        &plan.final_dir,
+        &plan.final_artifact,
+    )?;
     verify_regular_file(&plan.verified_partial, &stage.verified)?;
 
     ensure_safe_directory(&plan.final_dir)?;
@@ -69,11 +73,10 @@ pub fn promote_artifact(
                 state: ArtifactPromotionState::Published,
             })
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            reuse_existing(stage)?.ok_or_else(|| InstallRuntimeError::PromotionRace {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => reuse_existing(stage)?
+            .ok_or_else(|| InstallRuntimeError::PromotionRace {
                 path: plan.final_artifact.display().to_string(),
-            })
-        }
+            }),
         Err(error) => Err(error.into()),
     }
 }
@@ -86,13 +89,12 @@ pub fn promote_verified_graph(
     let mut artifacts = Vec::with_capacity(graph.install_order.len());
 
     for package in &graph.install_order {
-        let verified = graph
-            .packages
-            .get(package)
-            .ok_or_else(|| InstallRuntimeError::VerifiedGraphPackageMissing {
+        let verified = graph.packages.get(package).ok_or_else(|| {
+            InstallRuntimeError::VerifiedGraphPackageMissing {
                 root: graph.root.clone(),
                 package: package.clone(),
-            })?;
+            }
+        })?;
         let result = promote_artifact(&verified.stage)?;
         match result.state {
             ArtifactPromotionState::Published => published += 1,
