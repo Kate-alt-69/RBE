@@ -205,7 +205,10 @@ pub fn check_target(start: impl AsRef<Path>) -> Result<CheckedPackage, PackageEr
     check_loaded(root, manifest, component_name.as_deref())
 }
 
-fn check_with_selection(root: PathBuf, component: Option<&str>) -> Result<CheckedPackage, PackageError> {
+fn check_with_selection(
+    root: PathBuf,
+    component: Option<&str>,
+) -> Result<CheckedPackage, PackageError> {
     let manifest = load_manifest(&root)?;
     check_loaded(root, manifest, component)
 }
@@ -455,7 +458,10 @@ pub enum PackageError {
     #[error("package has no component directories under {0}")]
     NoComponents(PathBuf),
     #[error("component {component:?} directory does not exist: {directory}")]
-    ComponentDirectoryMissing { component: String, directory: PathBuf },
+    ComponentDirectoryMissing {
+        component: String,
+        directory: PathBuf,
+    },
     #[error("invalid component name {0:?}")]
     InvalidComponentName(String),
     #[error("component {component:?} is missing its language entry file: {expected}")]
