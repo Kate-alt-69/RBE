@@ -13,6 +13,7 @@ mod http;
 mod package;
 mod promotion;
 mod registry;
+mod source;
 
 pub use artifact::ArtifactStage;
 pub use cache::stage_artifact_cached as stage_artifact;
@@ -28,11 +29,14 @@ pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
     MAX_REGISTRY_INDEX_BYTES,
 };
+pub use source::{prepare_promoted_source, PreparedSource};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallRuntimeError {
     #[error(transparent)]
     Executor(#[from] rbe_install_executor::ExecutorError),
+    #[error(transparent)]
+    SourceStage(#[from] rbe_install_executor::SourceStageError),
     #[error(transparent)]
     RegistryContract(#[from] rbe_install_request::RegistryContractError),
     #[error(transparent)]
@@ -150,6 +154,36 @@ pub enum InstallRuntimeError {
         path: String,
         expected_sha256: String,
     },
+    #[error("source preparation artifact path must be absolute: {0}")]
+    PreparedArtifactMustBeAbsolute(String),
+    #[error("source extraction policy lost required hardening")]
+    UnsafeExtractionPolicy,
+    #[error("source extraction root already exists: {0}")]
+    ExtractionRootExists(String),
+    #[error("source extraction parent must already be a safe directory: {0}")]
+    ExtractionParentInvalid(String),
+    #[error("package archive changed between inspection and extraction")]
+    ArchiveChangedDuringPreparation,
+    #[error("source extraction entry mismatch: expected {expected:?}, got {actual:?}")]
+    ExtractionEntryMismatch { expected: String, actual: String },
+    #[error("package archive contains a non-empty directory entry: {0:?}")]
+    NonEmptyDirectoryEntry(String),
+    #[error("source extraction destination already exists: {0}")]
+    ExtractionDestinationExists(String),
+    #[error("source extraction destination escaped its fresh root: {0}")]
+    ExtractionDestinationEscaped(String),
+    #[error("unsafe package archive entry during extraction: {0:?}")]
+    UnsafeArchiveEntry(String),
+    #[error("extracted entry {path:?} size mismatch: expected {expected}, got {actual}")]
+    ExtractedEntrySizeMismatch {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("extracted archive size mismatch: expected {expected}, got {actual}")]
+    ExtractedArchiveSizeMismatch { expected: u64, actual: u64 },
+    #[error("prepared package runtime entry is missing or unsafe: {0:?}")]
+    RuntimeEntryMissing(String),
     #[error("install-runtime filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
 }
