@@ -41,7 +41,7 @@ export function libraryDescriptor({ name, version, abiMin = 1, abiMax = abiMin }
   return Object.freeze({ name, version, abiMin, abiMax });
 }
 
-class CapabilityClient {
+export class CapabilityClient {
   constructor(bridge, capabilityId, target = capabilityId) {
     assertBridge(bridge);
     this.bridge = bridge;
@@ -49,13 +49,21 @@ class CapabilityClient {
     this.target = target;
   }
 
-  call(operation, payload = null) {
-    return this.bridge.call({
+  request(operation, payload = null) {
+    return {
       capability: this.capabilityId,
       target: this.target,
       operation,
       payload
-    });
+    };
+  }
+
+  call(operation, payload = null) {
+    return this.bridge.call(this.request(operation, payload));
+  }
+
+  retarget(target) {
+    return new CapabilityClient(this.bridge, this.capabilityId, target);
   }
 }
 
@@ -90,6 +98,39 @@ class RouterClient {
   }
 }
 
+export class AdvancedClient {
+  constructor(bridge) {
+    assertBridge(bridge);
+    this.bridge = bridge;
+  }
+
+  capability(capabilityId, target = capabilityId) {
+    return new CapabilityClient(this.bridge, capabilityId, target);
+  }
+
+  request(capabilityId, target, operation, payload = null) {
+    return { capability: capabilityId, target, operation, payload };
+  }
+
+  send(request) {
+    return this.bridge.call(request);
+  }
+
+  async batch(requests) {
+    return Promise.all(requests.map(async (request) => {
+      try {
+        return { ok: true, value: await this.send(request) };
+      } catch (error) {
+        return { ok: false, error };
+      }
+    }));
+  }
+
+  hostBridge() {
+    return this.bridge;
+  }
+}
+
 export class RbeSdk {
   constructor(bridge) {
     assertBridge(bridge);
@@ -100,6 +141,18 @@ export class RbeSdk {
   router() { return new RouterClient(this.bridge); }
   storage() { return new CapabilityClient(this.bridge, capability.STORAGE, "storage"); }
   crypto() { return new CapabilityClient(this.bridge, capability.CRYPTO, "crypto"); }
+
+  capability(capabilityId, target = capabilityId) {
+    return new CapabilityClient(this.bridge, capabilityId, target);
+  }
+
+  advanced() {
+    return new AdvancedClient(this.bridge);
+  }
+
+  hostBridge() {
+    return this.bridge;
+  }
 
   call(request) {
     return this.bridge.call(request);

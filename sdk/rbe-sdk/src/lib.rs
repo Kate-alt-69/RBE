@@ -90,6 +90,49 @@ impl<'a> HostCall<'a> {
     }
 }
 
+/// Owned host request for advanced SDK composition, queues, and batching.
+///
+/// The SDK deliberately does not keep a hardcoded allowlist here. Packages may
+/// target future or package-specific host surfaces without waiting for a new
+/// convenience wrapper release. RBE remains the authority and can reject any
+/// request not granted to the package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRequest {
+    pub capability: String,
+    pub target: String,
+    pub operation: String,
+    pub payload: Vec<u8>,
+}
+
+impl HostRequest {
+    pub fn new(
+        capability: impl Into<String>,
+        target: impl Into<String>,
+        operation: impl Into<String>,
+    ) -> Self {
+        Self {
+            capability: capability.into(),
+            target: target.into(),
+            operation: operation.into(),
+            payload: Vec::new(),
+        }
+    }
+
+    pub fn payload(mut self, payload: impl Into<Vec<u8>>) -> Self {
+        self.payload = payload.into();
+        self
+    }
+
+    pub fn as_call(&self) -> HostCall<'_> {
+        HostCall::new(
+            &self.capability,
+            &self.target,
+            &self.operation,
+            &self.payload,
+        )
+    }
+}
+
 /// Opaque payload returned by the RBE host.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HostReply {
@@ -191,8 +234,12 @@ impl<'a> LibraryDescriptor<'a> {
     }
 }
 
-/// Entry point exposed to library code. Convenience namespaces below still use
-/// the same capability bridge and therefore cannot bypass host policy.
+/// Entry point exposed to library code.
+///
+/// Common helpers (`net`, `router`, `storage`, `crypto`) are the easy path. The
+/// generic `capability` and `advanced` surfaces intentionally remain open-ended
+/// so advanced packages can compose RBE features without the SDK policing their
+/// application design.
 #[derive(Clone, Copy)]
 pub struct RbeSdk<'a> {
     bridge: &'a dyn HostBridge,
@@ -227,8 +274,101 @@ impl<'a> RbeSdk<'a> {
         }
     }
 
+    /// Create a generic capability client. The capability is also used as the
+    /// default target, which matches RBE's built-in namespace convention.
+    pub fn capability(self, capability: impl Into<String>) -> CapabilityClient<'a> {
+        let capability = capability.into();
+        CapabilityClient {
+            bridge: self.bridge,
+            target: capability.clone(),
+            capability,
+        }
+    }
+
+    /// Create a generic capability client with an independent target identity.
+    pub fn capability_target(
+        self,
+        capability: impl Into<String>,
+        target: impl Into<String>,
+    ) -> CapabilityClient<'a> {
+        CapabilityClient {
+            bridge: self.bridge,
+            capability: capability.into(),
+            target: target.into(),
+        }
+    }
+
+    pub const fn advanced(self) -> AdvancedSdk<'a> {
+        AdvancedSdk {
+            bridge: self.bridge,
+        }
+    }
+
+    /// Escape hatch for packages that need to build their own SDK abstraction.
+    /// The bridge is still capability checked by RBE.
+    pub const fn host_bridge(self) -> &'a dyn HostBridge {
+        self.bridge
+    }
+
     pub fn call(self, call: HostCall<'_>) -> Result<HostReply, SdkError> {
         self.bridge.call(call).map_err(Into::into)
+    }
+}
+
+/// Open-ended advanced SDK surface.
+///
+/// This intentionally supplies mechanism rather than policy: package authors
+/// choose how to compose calls, retries, queues, caches, and higher-level APIs.
+/// Host authority, ABI validation, and capability grants remain RBE-owned.
+#[derive(Clone, Copy)]
+pub struct AdvancedSdk<'a> {
+    bridge: &'a dyn HostBridge,
+}
+
+impl<'a> AdvancedSdk<'a> {
+    pub fn capability(self, capability: impl Into<String>) -> CapabilityClient<'a> {
+        let capability = capability.into();
+        CapabilityClient {
+            bridge: self.bridge,
+            target: capability.clone(),
+            capability,
+        }
+    }
+
+    pub fn target(
+        self,
+        capability: impl Into<String>,
+        target: impl Into<String>,
+    ) -> CapabilityClient<'a> {
+        CapabilityClient {
+            bridge: self.bridge,
+            capability: capability.into(),
+            target: target.into(),
+        }
+    }
+
+    pub fn request(
+        self,
+        capability: impl Into<String>,
+        target: impl Into<String>,
+        operation: impl Into<String>,
+    ) -> HostRequest {
+        HostRequest::new(capability, target, operation)
+    }
+
+    pub fn send(self, request: &HostRequest) -> Result<HostReply, SdkError> {
+        self.bridge.call(request.as_call()).map_err(Into::into)
+    }
+
+    /// Execute every request independently and preserve each result. One failed
+    /// operation does not hide the results of the others; package code decides
+    /// whether that means retry, fallback, rollback, or ignore.
+    pub fn batch(self, requests: &[HostRequest]) -> Vec<Result<HostReply, SdkError>> {
+        requests.iter().map(|request| self.send(request)).collect()
+    }
+
+    pub const fn host_bridge(self) -> &'a dyn HostBridge {
+        self.bridge
     }
 }
 
@@ -242,8 +382,9 @@ impl<'a> Net<'a> {
         if !valid_component(name) {
             return Err(SdkError::InvalidNetSublibrary(name.to_string()));
         }
-        Ok(NetLibrary {
+        Ok(CapabilityClient {
             bridge: self.bridge,
+            capability: format!("net:{name}"),
             target: format!("net:{name}"),
         })
     }
@@ -261,27 +402,52 @@ impl<'a> Net<'a> {
     }
 
     fn known(self, target: &'static str) -> NetLibrary<'a> {
-        NetLibrary {
+        CapabilityClient {
             bridge: self.bridge,
+            capability: target.to_string(),
             target: target.to_string(),
         }
     }
 }
 
-pub struct NetLibrary<'a> {
+/// Generic reusable client for one capability/target pair.
+pub struct CapabilityClient<'a> {
     bridge: &'a dyn HostBridge,
+    capability: String,
     target: String,
 }
 
-impl NetLibrary<'_> {
+impl CapabilityClient<'_> {
+    pub fn capability_id(&self) -> &str {
+        &self.capability
+    }
+
     pub fn target(&self) -> &str {
         &self.target
+    }
+
+    pub fn retarget(mut self, target: impl Into<String>) -> Self {
+        self.target = target.into();
+        self
+    }
+
+    pub fn request(
+        &self,
+        operation: impl Into<String>,
+        payload: impl Into<Vec<u8>>,
+    ) -> HostRequest {
+        HostRequest {
+            capability: self.capability.clone(),
+            target: self.target.clone(),
+            operation: operation.into(),
+            payload: payload.into(),
+        }
     }
 
     pub fn call(&self, operation: &str, payload: &[u8]) -> Result<HostReply, SdkError> {
         self.bridge
             .call(HostCall::new(
-                &self.target,
+                &self.capability,
                 &self.target,
                 operation,
                 payload,
@@ -289,6 +455,8 @@ impl NetLibrary<'_> {
             .map_err(Into::into)
     }
 }
+
+pub type NetLibrary<'a> = CapabilityClient<'a>;
 
 #[derive(Clone, Copy)]
 pub struct Router<'a> {
@@ -443,5 +611,40 @@ mod tests {
         let calls = bridge.calls.lock().unwrap();
         assert_eq!(calls[0].0, capability::ROUTER_READ);
         assert_eq!(calls[1].0, capability::ROUTER_REGISTER);
+    }
+
+    #[test]
+    fn advanced_surface_supports_custom_targets_and_independent_batch_results() {
+        let bridge = RecordingBridge::default();
+        let sdk = RbeSdk::new(&bridge);
+
+        let custom = sdk
+            .capability_target("video:encode", "encoder:primary")
+            .retarget("encoder:gpu0");
+        assert_eq!(custom.capability_id(), "video:encode");
+        assert_eq!(custom.target(), "encoder:gpu0");
+        custom.call("submit", b"frame").unwrap();
+
+        let advanced = sdk.advanced();
+        let requests = [
+            advanced
+                .request("net:quic", "peer:alpha", "connect")
+                .payload(b"one".to_vec()),
+            advanced
+                .request("custom:future", "thing:42", "do-work")
+                .payload(b"two".to_vec()),
+        ];
+        let results = advanced.batch(&requests);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(Result::is_ok));
+
+        let calls = bridge.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, "video:encode");
+        assert_eq!(calls[0].1, "encoder:gpu0");
+        assert_eq!(calls[1].0, "net:quic");
+        assert_eq!(calls[1].1, "peer:alpha");
+        assert_eq!(calls[2].0, "custom:future");
+        assert_eq!(calls[2].1, "thing:42");
     }
 }

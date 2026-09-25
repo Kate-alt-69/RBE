@@ -8,6 +8,7 @@ on:
       - 'engine/crates/sdk-package/**'
       - 'engine/crates/rpx/**'
       - 'engine/crates/sdk-backend/**'
+      - 'sdk/**'
       - 'build.ps1'
       - 'build.sh'
       - 'build-select.ps1'
@@ -18,6 +19,7 @@ on:
       - 'engine/crates/sdk-package/**'
       - 'engine/crates/rpx/**'
       - 'engine/crates/sdk-backend/**'
+      - 'sdk/**'
       - 'build.ps1'
       - 'build.sh'
       - 'build-select.ps1'
@@ -46,16 +48,68 @@ jobs:
           cargo fmt --manifest-path engine/crates/sdk-package/Cargo.toml -- --check
           cargo fmt --manifest-path engine/crates/rpx/Cargo.toml -- --check
           cargo fmt --manifest-path engine/crates/sdk-backend/Cargo.toml -- --check
+          cargo fmt --manifest-path sdk/rbe-sdk/Cargo.toml -- --check
       - name: Clippy standalone SDK crates
         run: |
           cargo clippy --manifest-path engine/crates/sdk-package/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path engine/crates/rpx/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path engine/crates/sdk-backend/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path sdk/rbe-sdk/Cargo.toml --all-targets -- -D warnings
       - name: Test standalone SDK crates
         run: |
           cargo test --manifest-path engine/crates/sdk-package/Cargo.toml
           cargo test --manifest-path engine/crates/rpx/Cargo.toml
           cargo test --manifest-path engine/crates/sdk-backend/Cargo.toml
+          cargo test --manifest-path sdk/rbe-sdk/Cargo.toml
+      - name: Smoke JavaScript advanced SDK surface
+        run: |
+          node --input-type=module <<'NODE'
+          import { RbeSdk } from './sdk/js/index.js';
+
+          const calls = [];
+          const bridge = {
+            call(request) {
+              calls.push(request);
+              if (request.operation === 'fail') throw new Error('expected smoke failure');
+              return { operation: request.operation };
+            }
+          };
+          const sdk = new RbeSdk(bridge);
+          sdk.capability('video:encode', 'encoder:gpu0').retarget('encoder:gpu1').call('submit', {});
+          const advanced = sdk.advanced();
+          const results = await advanced.batch([
+            advanced.request('net:quic', 'peer:a', 'connect'),
+            advanced.request('future:thing', 'thing:42', 'fail')
+          ]);
+          if (calls.length !== 3 || !results[0].ok || results[1].ok) process.exit(2);
+          NODE
+      - name: Smoke Python advanced SDK surface
+        env:
+          PYTHONPATH: sdk/python
+        run: |
+          python3 <<'PY'
+          from rbe_sdk import RbeSdk
+
+          class Bridge:
+              def __init__(self):
+                  self.calls = []
+
+              def call(self, request):
+                  self.calls.append(request)
+                  if request.operation == "fail":
+                      raise RuntimeError("expected smoke failure")
+                  return request.operation
+
+          bridge = Bridge()
+          sdk = RbeSdk(bridge)
+          sdk.capability("video:encode", "encoder:gpu0").retarget("encoder:gpu1").call("submit", {})
+          advanced = sdk.advanced()
+          results = advanced.batch((
+              advanced.request("net:quic", "peer:a", "connect"),
+              advanced.request("future:thing", "thing:42", "fail"),
+          ))
+          assert len(bridge.calls) == 3 and results[0].ok and not results[1].ok
+          PY
       - name: Smoke build complete SDK bundle
         run: ./build.sh --build-sdk --build-linux --arch-x64
       - name: Validate SDK bundle contents

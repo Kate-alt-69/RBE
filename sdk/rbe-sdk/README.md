@@ -34,6 +34,56 @@ The RBE library host remains the authority. If `advancenet` was not granted
 The same rule applies to router registration, P2P listeners, storage, and every
 other privileged surface.
 
+## Easy by default, advanced by choice
+
+The SDK is intentionally a **mechanism layer, not an opinionated application
+framework**. Normal packages can stay on the tiny convenience API:
+
+```rust
+let reply = RbeSdk::new(host)
+    .net()
+    .http()
+    .call("request", payload)?;
+```
+
+Advanced packages can instead create arbitrary capability/target clients, build
+owned requests for queues or retries, batch independent calls, or wrap the raw
+`HostBridge` with a completely custom abstraction:
+
+```rust
+let sdk = RbeSdk::new(host);
+
+let encoder = sdk
+    .capability_target("video:encode", "encoder:gpu0")
+    .retarget("encoder:gpu1");
+encoder.call("submit", frame)?;
+
+let advanced = sdk.advanced();
+let requests = [
+    advanced
+        .request("net:quic", "peer:primary", "connect")
+        .payload(handshake),
+    advanced
+        .request("my-extension:cache", "cache:hot", "warm")
+        .payload(seed),
+];
+let results = advanced.batch(&requests);
+```
+
+That open-ended surface is deliberate. The SDK does not try to predict every
+future RBE feature or third-party extension and does not police package-level
+business logic, retry strategy, caching model, or abstraction design. A package
+can build something extremely high level or work almost directly against the
+host protocol.
+
+The boundary RBE *does* keep is authority: arbitrary SDK calls do not magically
+grant capabilities. The host still validates the package identity, ABI,
+capability grant, target, and operation before privileged work is accepted.
+
+The JavaScript/TypeScript and Python bindings expose the same split through
+`RbeSdk.capability(...)`, `RbeSdk.advanced()`, reusable requests, retargetable
+capability clients, independent batch results, and direct bridge access.
+
 ## Self-hosted distribution
 
 RBE's central package service is designed to expose a Cargo **sparse registry**

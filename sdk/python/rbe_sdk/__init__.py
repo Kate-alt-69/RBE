@@ -59,6 +59,13 @@ class HostCall:
     payload: Any = None
 
 
+@dataclass(frozen=True, slots=True)
+class BatchResult:
+    ok: bool
+    value: Any = None
+    error: BaseException | None = None
+
+
 class HostBridge(Protocol):
     def call(self, request: HostCall) -> Any: ...
 
@@ -69,8 +76,14 @@ class CapabilityClient:
         self.capability = capability
         self.target = target or capability
 
+    def request(self, operation: str, payload: Any = None) -> HostCall:
+        return HostCall(self.capability, self.target, operation, payload)
+
     def call(self, operation: str, payload: Any = None) -> Any:
-        return self._bridge.call(HostCall(self.capability, self.target, operation, payload))
+        return self._bridge.call(self.request(operation, payload))
+
+    def retarget(self, target: str) -> "CapabilityClient":
+        return CapabilityClient(self._bridge, self.capability, target)
 
 
 class NetClient:
@@ -103,6 +116,38 @@ class RouterClient:
         return CapabilityClient(self._bridge, ROUTER_REGISTER, "router").call(operation, payload)
 
 
+class AdvancedClient:
+    def __init__(self, bridge: HostBridge) -> None:
+        self._bridge = bridge
+
+    def capability(self, capability: str, target: str | None = None) -> CapabilityClient:
+        return CapabilityClient(self._bridge, capability, target)
+
+    def request(
+        self,
+        capability: str,
+        target: str,
+        operation: str,
+        payload: Any = None,
+    ) -> HostCall:
+        return HostCall(capability, target, operation, payload)
+
+    def send(self, request: HostCall) -> Any:
+        return self._bridge.call(request)
+
+    def batch(self, requests: list[HostCall] | tuple[HostCall, ...]) -> list[BatchResult]:
+        results: list[BatchResult] = []
+        for request in requests:
+            try:
+                results.append(BatchResult(ok=True, value=self.send(request)))
+            except BaseException as error:
+                results.append(BatchResult(ok=False, error=error))
+        return results
+
+    def host_bridge(self) -> HostBridge:
+        return self._bridge
+
+
 class RbeSdk:
     def __init__(self, bridge: HostBridge) -> None:
         if not callable(getattr(bridge, "call", None)):
@@ -120,6 +165,15 @@ class RbeSdk:
 
     def crypto(self) -> CapabilityClient:
         return CapabilityClient(self._bridge, CRYPTO, "crypto")
+
+    def capability(self, capability: str, target: str | None = None) -> CapabilityClient:
+        return CapabilityClient(self._bridge, capability, target)
+
+    def advanced(self) -> AdvancedClient:
+        return AdvancedClient(self._bridge)
+
+    def host_bridge(self) -> HostBridge:
+        return self._bridge
 
     def call(self, request: HostCall) -> Any:
         return self._bridge.call(request)
