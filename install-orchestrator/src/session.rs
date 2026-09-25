@@ -584,9 +584,7 @@ mod tests {
 
     fn lock_with_private_conflict() -> ProjectPackageLock {
         let mut alpha = package("1.0.0", 'a');
-        alpha
-            .dependencies
-            .insert("shared".into(), "^1.5".into());
+        alpha.dependencies.insert("shared".into(), "^1.5".into());
         let mut beta = package("2.0.0", 'b');
         beta.dependencies.insert("shared".into(), "~1.3".into());
         ProjectPackageLock {
