@@ -3,7 +3,7 @@ use std::path::Path;
 
 use rbe_install_request::RegistryPackageIndex;
 use rbe_library_resolver::Resolution;
-use rbe_project_package::{ProjectPackageLock, ProjectCacheLayout};
+use rbe_project_package::{ProjectCacheLayout, ProjectPackageLock};
 
 use crate::{stage_registry_package, InstallRuntimeError, VerifiedRegistryPackage};
 
@@ -53,11 +53,12 @@ pub async fn stage_resolved_root(
             }
         })?;
         let selected_version = selected.version.to_string();
-        let index = indexes
-            .get(package)
-            .ok_or_else(|| InstallRuntimeError::RegistryIndexMissing {
-                package: package.clone(),
-            })?;
+        let index =
+            indexes
+                .get(package)
+                .ok_or_else(|| InstallRuntimeError::RegistryIndexMissing {
+                    package: package.clone(),
+                })?;
         index.validate_for(package)?;
         let release = index
             .releases
@@ -245,33 +246,21 @@ entry = "src/index.js"
             selected: BTreeMap::from([
                 (
                     "advancenet".into(),
-                    PackageRelease::new(
-                        "advancenet",
-                        "4.0.1",
-                        1,
-                        1,
-                        false,
-                        dependency_map,
-                    )
-                    .unwrap(),
+                    PackageRelease::new("advancenet", "4.0.1", 1, 1, false, dependency_map)
+                        .unwrap(),
                 ),
                 (
                     "rbe-core".into(),
-                    PackageRelease::new(
-                        "rbe-core",
-                        "1.2.0",
-                        1,
-                        1,
-                        false,
-                        BTreeMap::new(),
-                    )
-                    .unwrap(),
+                    PackageRelease::new("rbe-core", "1.2.0", 1, 1, false, BTreeMap::new()).unwrap(),
                 ),
             ]),
             install_order: vec!["rbe-core".into(), "advancenet".into()],
         };
         let indexes = BTreeMap::from([
-            ("advancenet".into(), index("advancenet", root_registry.clone())),
+            (
+                "advancenet".into(),
+                index("advancenet", root_registry.clone()),
+            ),
             ("rbe-core".into(), index("rbe-core", dep_registry.clone())),
         ]);
         let temp = tempdir().unwrap();
@@ -301,24 +290,12 @@ entry = "src/index.js"
 
     #[tokio::test]
     async fn incomplete_install_order_is_rejected_before_activation() {
-        let root_release = PackageRelease::new(
-            "advancenet",
-            "4.0.1",
-            1,
-            1,
-            false,
-            BTreeMap::from([("rbe-core".into(), "^1".into())]),
-        )
-        .unwrap();
-        let dependency = PackageRelease::new(
-            "rbe-core",
-            "1.2.0",
-            1,
-            1,
-            false,
-            BTreeMap::new(),
-        )
-        .unwrap();
+        let dependency_map = BTreeMap::from([("rbe-core".into(), "^1".into())]);
+        let root_release =
+            PackageRelease::new("advancenet", "4.0.1", 1, 1, false, dependency_map.clone())
+                .unwrap();
+        let dependency =
+            PackageRelease::new("rbe-core", "1.2.0", 1, 1, false, BTreeMap::new()).unwrap();
         let resolution = Resolution {
             selected: BTreeMap::from([
                 ("advancenet".into(), root_release),
@@ -326,14 +303,24 @@ entry = "src/index.js"
             ]),
             install_order: vec!["advancenet".into()],
         };
+        let root_manifest = manifest("advancenet", "4.0.1", &dependency_map);
+        let root_bytes = package_bytes(&root_manifest);
+        let root_registry = registry_release("4.0.1", dependency_map, &root_bytes);
+        let indexes = BTreeMap::from([(
+            "advancenet".into(),
+            index("advancenet", root_registry.clone()),
+        )]);
+        let temp = tempdir().unwrap();
+        let layout = ProjectCacheLayout::new(temp.path());
+        seed_verified_partial(&layout, "advancenet", &root_registry, &root_bytes);
 
-        let error = stage_resolved_root(tempdir().unwrap().path(), "advancenet", &resolution, &BTreeMap::new())
+        let error = stage_resolved_root(temp.path(), "advancenet", &resolution, &indexes)
             .await
             .unwrap_err();
         assert!(matches!(
             error,
-            InstallRuntimeError::RegistryIndexMissing { package }
-                if package == "advancenet"
+            InstallRuntimeError::ResolutionOrderIncomplete { package, .. }
+                if package == "rbe-core"
         ));
     }
 }
