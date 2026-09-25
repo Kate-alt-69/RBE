@@ -1,0 +1,45 @@
+name: Install Runtime CI
+
+on:
+  push:
+    paths:
+      - 'install-runtime/**'
+      - 'install-executor/**'
+      - 'install-request/**'
+      - 'library-registry/**'
+      - 'library-resolver/**'
+      - '.github/workflows/install-runtime-ci.yml'
+  pull_request:
+    paths:
+      - 'install-runtime/**'
+      - 'install-executor/**'
+      - 'install-request/**'
+      - 'library-registry/**'
+      - 'library-resolver/**'
+      - '.github/workflows/install-runtime-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: install-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: install-runtime
+      - name: fmt check
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
