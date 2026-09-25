@@ -26,6 +26,9 @@ vault-process = { path = "../../../vault-process" }
 atomic-io = { path = "../../../atomic-io" }
 runtime-paths = { path = "../../../runtime-paths" }
 error-client = { path = "../../../error-client" }
+rbe-install-request = { path = "../../../install-request" }
+rbe-install-runtime = { path = "../../../install-runtime" }
+rbe-library-resolver = { path = "../../../library-resolver" }
 route-engine = { path = "../route-engine" }
 ipc-protocol = { path = "../../../container-runtime/crates/ipc-protocol" }
 axum = { workspace = true }
