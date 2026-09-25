@@ -161,6 +161,11 @@ fn compile_rust(
     let src = work.join("src");
     recreate_dir(&work)?;
     fs::create_dir_all(&src)?;
+    let component_dir = component
+        .source
+        .parent()
+        .context("Rust component source has no parent directory")?;
+    copy_source_tree(component_dir, &src)?;
     fs::copy(&component.source, src.join("lib.rs"))?;
 
     let crate_name = format!("rbe_component_check_{}", component.name.replace('-', "_"));
@@ -194,8 +199,18 @@ fn compile_javascript(
 ) -> Result<()> {
     match package.manifest.package.runtime {
         Some(JsRuntime::Node) => {
+            // RBE JavaScript components are modules. `node --check file.js`
+            // inherits Node's package-mode detection and can parse a standalone
+            // .js file as CommonJS, which is not the grammar RPX needs to
+            // validate. Stage the exact bytes as .mjs so Node performs a real
+            // ES-module syntax check without executing package code.
+            let out = build_root.join("javascript").join(&component.name);
+            recreate_dir(&out)?;
+            let staged = out.join(format!("{}.mjs", component.name));
+            fs::copy(&component.source, &staged)?;
+
             let mut command = Command::new("node");
-            command.arg("--check").arg(&component.source);
+            command.arg("--check").arg(staged);
             run_required(
                 command,
                 "node",
@@ -376,6 +391,21 @@ fn recreate_dir(path: &Path) -> Result<()> {
         fs::remove_dir_all(path)?;
     }
     fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn copy_source_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_source_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
     Ok(())
 }
 
