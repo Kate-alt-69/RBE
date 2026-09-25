@@ -7,13 +7,15 @@
 #![forbid(unsafe_code)]
 
 mod artifact;
+mod cache;
 mod graph;
 mod http;
 mod package;
 mod promotion;
 mod registry;
 
-pub use artifact::{stage_artifact, ArtifactStage};
+pub use artifact::ArtifactStage;
+pub use cache::stage_artifact_cached as stage_artifact;
 pub use graph::{stage_resolved_root, VerifiedRootGraph};
 pub use package::{
     inspect_registry_stage, registry_artifact_plan, stage_registry_package, VerifiedRegistryPackage,
