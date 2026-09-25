@@ -1,6 +1,6 @@
 # RBE External Library & Project Package System
 
-Status: current package/install contracts on `main`, implemented through LIB-018. Some final Backend CLI/worker wiring remains integration work and is called out explicitly below.
+Status: current package/install contracts on `main`, implemented through LIB-019 plus CLI-002. Named-package `backend install` now performs real pre-bootstrap registry hydration and root-scoped dependency resolution. Full durable installation is intentionally not reported as complete until verified artifact inspection, manifest hashing, promotion, session activation, and project-lock commit are connected end to end.
 
 This document is the authoritative overview for the current external-library and project-package architecture. It distinguishes implemented contract/runtime behavior from planned UX so old design text does not override code.
 
@@ -28,7 +28,7 @@ Direct import and root accessor resolve to the same sub-library identity. Import
 
 ## 2. Current project package state
 
-The current project package path is built around `package.rbe.yaml`, `package.lock.rbe.yaml`, a content-addressed package cache, RBE-owned managed tools, dependency hydration caches, and a durable install session.
+The current project package path is built around `package.rbe.yaml`, `package.lock.rbe.yaml`, a content-addressed package cache, RBE-owned managed tools, dependency hydration caches, verified artifact staging, and a durable install session.
 
 ```text
 project/
@@ -57,7 +57,7 @@ project/
 
 The package cache is reconstructible state, not trust. Presence under `.cache/` never proves integrity by itself.
 
-Older library/runtime code still contains `.rbe/runtimes/...` paths. That legacy path is not the authoritative cache layout for the newer project-package/system-runtime install path described here; do not silently rewrite old compatibility code merely to make the strings match this document.
+Older library/runtime code still contains `.rbe/runtimes/...` paths. That legacy path is not the authoritative cache layout for the newer project-package/system-runtime install path described here; do not silently rewrite compatibility code merely to make strings match this document.
 
 ## 3. Project manifest and lockfile
 
@@ -71,7 +71,8 @@ Important invariants:
 - deleted bytes still have to be downloaded again;
 - cached bytes must be re-verified against the lock before use;
 - a partially prepared new graph does not become active merely because some packages finished building;
-- graph activation occurs only after all required packages have reached the verified/ready state.
+- graph activation occurs only after all required packages have reached the verified/ready state;
+- the installer must not invent a manifest SHA-256 before the verified package artifact has been inspected.
 
 ## 4. RBE-owned system runtimes
 
@@ -92,13 +93,13 @@ A system-runtime manifest is requested from the trusted registry under:
 
 The manifest binds runtime identity, version, host, HTTPS source, SHA-256, size, archive kind, and entrypoint. Optional publisher/signature metadata can also be carried.
 
-For a project cache root, runtime material is planned under:
+For a project cache root, runtime material belongs under:
 
 ```text
 .cache/rbe/sys/<runtime>/<version>/<host>/
 ```
 
-System runtime hardening currently requires:
+System runtime hardening requires:
 
 - no machine-wide PATH mutation;
 - not exposed as a user-installable package merely because RBE uses it internally;
@@ -133,7 +134,7 @@ Extraction is not a normal unzip into a trusted directory. The install path perf
 
 The current deterministic source-tree identity is `rbe-source-tree-sha256-v1`.
 
-## 6. Download, cache and source verification
+## 6. Download, cache, and verified artifact ingress (LIB-014 / LIB-019)
 
 Artifact acquisition is bounded and resumable rather than an unbounded download straight into the final cache.
 
@@ -145,9 +146,13 @@ The execution contracts include:
 - resumable transfer policy;
 - streaming SHA-256 verification;
 - final size/hash verification;
-- atomic promotion only after verification;
+- atomic promotion planning only after verification;
 - fresh extraction staging;
 - source-tree hashing before activation.
+
+LIB-019 adds the trusted host-side network executor for these contracts. `rbe-install-runtime::stage_artifact` performs bounded HTTPS retrieval into the installer staging path, re-hashes reusable partial bytes, validates Range/Content-Range behavior, validates pinned size when present, streams bytes through the verifier, and returns a verified download plus its promotion plan.
+
+The network layer rejects credential-bearing/non-HTTPS URLs, non-public destinations, unsafe redirect behavior, oversized registry graphs/bodies, and unsafe staging filesystem state. Package-controlled code never receives raw sockets or a shell merely because installation requires network access.
 
 Cache paths are intentionally not authority. A matching path with altered bytes must fail verification.
 
@@ -183,7 +188,7 @@ managed rbe.sys tool only
   approved HTTPS origins only
   no shell
   cleared environment
-  install scripts disabled where applicable
+  dependency scripts disabled where applicable
         |
         v
 .cache/rbe/build-deps/<ecosystem>/<lock-sha256>/
@@ -223,7 +228,7 @@ A successful hydration produces `hydration.rbe.json` under the lock-addressed de
 - approved registry origins;
 - cleared-environment state;
 - shell-disabled state;
-- scripts-disabled state;
+- dependency-script-disabled state;
 - origin-restricted-network state;
 - hydrated artifact count;
 - observed bytes.
@@ -235,16 +240,16 @@ Receipt validation rejects a cache root that is not consistent with `rbe/build-d
 Hydration does not relax the build sandbox contract. Build invocations must still satisfy all of the following:
 
 ```text
-network_allowed = false
-use_shell       = false
+network_allowed   = false
+use_shell         = false
 clear_environment = true
-program         = absolute path from ManagedToolchain
-RBE_BUILD_NETWORK=disabled
+program           = absolute path from ManagedToolchain
+RBE_BUILD_NETWORK = disabled
 ```
 
 Only explicitly managed tools are selected. There is no fallback to an arbitrary `cargo`, `npm`, `bun`, `python`, compiler, or shell discovered from the host PATH.
 
-## 9. Durable install sessions and atomic graph activation
+## 9. Durable install sessions and atomic graph activation (LIB-016)
 
 Project installation is treated as a graph transaction rather than a sequence of independently activated packages.
 
@@ -257,13 +262,15 @@ The durable session owns:
 
 The lease prevents concurrent project installers from racing the same activation boundary. The journal records durable progress so verified cache work can be reused after interruption.
 
-The high-level flow is:
+The intended end-to-end flow is:
 
 ```text
-package.rbe.yaml
-→ resolve complete graph
-→ pin/write candidate state
-→ download and verify artifacts
+package.rbe.yaml / CLI request
+→ resolve complete root-scoped graph
+→ fetch pinned artifacts
+→ verify artifact bytes
+→ inspect package manifest and obtain manifest SHA-256
+→ construct exact target lock
 → safe extract and source-hash
 → hydrate required rbe.sys tools
 → hydrate locked ecosystem dependencies
@@ -293,11 +300,9 @@ The request grammar supports one install surface for packages, SDKs, runtimes, r
 
 The `install-request` crate is intentionally source-only: it parses/validates requests and produces discovery/runtime plans but performs no network I/O, process spawning, PATH mutation, or machine-wide install itself.
 
-That distinction matters. The request grammar, resolver/install contracts, cache/attestation/execution/session plans, LIB-017 hydration contracts, and LIB-018 typed registry bridge are implemented. Full Backend command execution must wire those trusted plans together; documentation must not claim the complete end-to-end CLI path is finished merely because the underlying planning crates exist.
-
 ### 10.1 Typed package registry and resolver bridge (LIB-018)
 
-Public package index metadata now has a typed source-only contract in `rbe-install-request`. The contract validates the requested package identity and release metadata, including artifact source, SHA-256 and byte-size pins, before the metadata can be consumed downstream.
+Public package index metadata has a typed source-only contract in `rbe-install-request`. The contract validates requested package identity and release metadata, including artifact source, SHA-256, and byte-size pins, before the metadata can be consumed downstream.
 
 The boundary is intentionally split:
 
@@ -318,11 +323,39 @@ rbe-library-resolver
   deterministic semver solving only
 ```
 
-The resolver does not know registry URLs, JSON structure or artifact hashes. Conversely, registry artifact trust data is not discarded from the validated registry object merely because it is irrelevant to dependency solving; download/verification code consumes those pins later at the artifact boundary.
+The resolver does not know registry URLs, JSON structure, or artifact hashes. Conversely, registry artifact trust data is not discarded from the validated registry object merely because it is irrelevant to dependency solving; download/verification code consumes those pins later at the artifact boundary.
 
 Registry-to-catalog ingestion is all-or-nothing. If any release cannot be represented by the resolver, the caller's existing resolver catalog remains unchanged rather than exposing a partially imported package index.
 
-External index discovery contracts include the website-native RBE index forms, Kastrick resolution/observation endpoints, and the `rbe.sys.python` `index-discovery-v1` scraper fallback. Scraper output is discovery data only: trusted Rust still validates origin, metadata, artifact identity, package structure, capabilities, and activation gates.
+### 10.2 Real pre-bootstrap named-package resolution (CLI-002)
+
+`backend.exe` now intercepts ordinary named-package `install` commands before normal Backend boot. The standalone `service` binary does not receive install authority.
+
+Named-package installation requires an explicit trusted registry base:
+
+```text
+RBE_PACKAGE_REGISTRY=https://<trusted-registry-base>/
+```
+
+For a normal named package such as `advancenet`, Backend now performs:
+
+```text
+canonical InstallCommand parse
+→ validate RBE_PACKAGE_REGISTRY
+→ fetch + validate root package index
+→ hydrate dependency package indexes
+→ transactional registry-to-catalog bridge
+→ root-scoped deterministic semver resolution
+→ select pinned artifact metadata
+```
+
+This path runs before settings/bootstrap/server startup. The install resolver uses a short-lived worker/runtime and returns before the normal server boot path can begin.
+
+CLI-002 deliberately stops after real resolution today. A successful resolution returns an unavailable/non-success outcome describing the selected package/artifact instead of printing `installed`, because verified artifact inspection and durable graph activation are not yet connected to `backend.exe`.
+
+That is a correctness boundary, not a placeholder package-not-found response: registry/HTTP/requirement failures now surface from the real registry and resolver path.
+
+Reserved SDK/runtime targets and external/local archive targets remain in their existing lanes until those execution paths are connected through the same trust model.
 
 ## 11. Language-neutral Library Protocol and SDKs
 
@@ -339,9 +372,9 @@ Python        sdk/python
 Other         Protocol v1 directly or through a language wrapper
 ```
 
-The Rust, JavaScript/Bun/Node.js, Python and shared Protocol v1 source surfaces are present in the repository. Publishing reproducible downloadable SDK artifacts (for example crate/package archives and Python wheels/sdists) and binding their final registry URLs/hashes remains distribution/integration work rather than a missing protocol design.
+The Rust, JavaScript/Bun/Node.js, Python, and shared Protocol v1 source surfaces are present in the repository. Publishing reproducible downloadable SDK artifacts and binding their final registry URLs/hashes remains distribution/integration work rather than a missing protocol design.
 
-Host capabilities remain policy-checked operations such as `net:*`, router operations, storage and crypto rather than raw access to Backend internals.
+Host capabilities remain policy-checked operations such as `net:*`, router operations, storage, and crypto rather than raw access to Backend internals.
 
 ## 12. Router extension model
 
@@ -350,13 +383,13 @@ Router authority stays split:
 - `router:read` — approved route/runtime metadata and inspection;
 - `router:register` — validated middleware/protocol/route-factory registration.
 
-External workers never receive raw Axum router pointers or mutable internal maps. Registration remains a request to trusted RBE code, which validates ownership, collisions, lifecycle and policy.
+External workers never receive raw Axum router pointers or mutable internal maps. Registration remains a request to trusted RBE code, which validates ownership, collisions, lifecycle, and policy.
 
 ## 13. Provider portability
 
-Packages target RBE capabilities rather than assuming a particular provider such as Render, Vercel, Fly, AWS, Azure or Google Cloud.
+Packages target RBE capabilities rather than assuming a particular provider such as Render, Vercel, Fly, AWS, Azure, or Google Cloud.
 
-The host capability layer can describe what the environment actually permits, such as inbound/outbound transports, persistent/background execution, filesystem persistence, IP families, port visibility and connection lifetime. Unsupported authority must fail explicitly or use an RBE-defined fallback; it is not silently granted.
+The host capability layer can describe what the environment actually permits, such as inbound/outbound transports, persistent/background execution, filesystem persistence, IP families, port visibility, and connection lifetime. Unsupported authority must fail explicitly or use an RBE-defined fallback; it is not silently granted.
 
 ## 14. Expanded network / P2P / MASK direction
 
@@ -392,23 +425,29 @@ Expanding the namespace does not hand REL or third-party workers unrestricted ra
 
 The current package-system foundation has advanced through these layers:
 
-1. **LIB-010** — cache-backed RBE system-runtime manifests (`rbe.sys.python`, Node.js, Bun and Rust).
+1. **LIB-010** — cache-backed RBE system-runtime manifests (`rbe.sys.python`, Node.js, Bun, and Rust).
 2. **LIB-011** — project `package.rbe.yaml` / `package.lock.rbe.yaml` state and content-addressed cache identity.
 3. **LIB-012** — package source/binary attestation and quarantine decisions.
 4. **LIB-013** — project install orchestration gates.
 5. **LIB-014** — bounded/resumable acquisition and managed build execution contracts.
 6. **LIB-015** — safe source extraction and deterministic source-tree identity.
-7. **LIB-016** — durable project install session, exclusive lease and atomic lockfile activation.
+7. **LIB-016** — durable project install session, exclusive lease, and atomic lockfile activation.
 8. **LIB-017** — controlled build-dependency hydration followed by network-dead package builds.
 9. **LIB-018** — typed package-registry metadata and a transactional source-only bridge into the deterministic resolver.
+10. **LIB-019** — trusted host-side registry/artifact network execution, bounded resumable staging, streaming verification, and promotion planning.
+11. **CLI-002** — real pre-bootstrap named-package registry hydration and root-scoped resolution in `backend.exe` without granting install authority to the standalone `service` binary.
 
 ## 16. Remaining integration work
 
-The major remaining work is not to redesign the package trust model again. It is to connect the existing contracts through the trusted Backend path cleanly:
+The major remaining work is not to redesign the package trust model again. It is to connect the already-implemented contracts across the last activation boundaries:
 
-- execute the full install plan from request → resolve → hydrate → build → attest → activate;
-- persist/validate hydration receipts at the orchestration boundary;
+- connect CLI-002's selected artifact metadata to `rbe-install-runtime::stage_artifact`;
+- inspect the verified package artifact and derive/validate the package manifest SHA-256 required by `ProjectPackageLock`;
+- construct the exact root-scoped target lock only after that inspection;
+- connect extraction, source identity, managed runtime/dependency hydration, network-dead build, attestation, and quarantine decisions to the durable install session;
+- atomically promote verified cache entries and activate `package.lock.rbe.yaml` only after the complete graph is ready;
 - connect worker/Library Protocol admission to the activated project lock;
+- finish SDK/runtime/external/local-archive execution through the same trust model;
 - finish public registry publishing/artifact-distribution UX and external-index integrations;
 - expand capability bridges without weakening the package/process boundary.
 
