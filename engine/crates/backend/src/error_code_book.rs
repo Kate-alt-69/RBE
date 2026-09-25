@@ -10,8 +10,6 @@ mod core;
 #[path = "install_cli.rs"]
 mod install_cli;
 
-pub use core::{explain, list_codes};
-
 pub fn requested(args: &[String]) -> Option<anyhow::Result<String>> {
     if backend_install_authority() {
         if let Some(result) = install_cli::requested(args) {
@@ -43,7 +41,7 @@ mod tests {
 
     #[test]
     fn diagnostic_lookup_still_delegates_to_embedded_book() {
-        let rendered = explain("SVC5002").expect("embedded code book must remain available");
+        let rendered = core::explain("SVC5002").expect("embedded code book must remain available");
         assert!(rendered.contains("SVC5002"));
     }
 }
