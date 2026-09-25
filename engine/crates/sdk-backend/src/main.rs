@@ -55,8 +55,7 @@ fn run() -> Result<()> {
         let action = args.get(1).map(String::as_str).unwrap_or("status");
         let path = option(&args, "path").unwrap_or_else(|| ".".to_string());
         match action {
-            "repair" => repair(Path::new(&path))?,
-            "update" => update_instruction(Path::new(&path))?,
+            "repair" | "update" => bootstrap_instruction(Path::new(&path), action)?,
             "status" => status(Path::new(&path))?,
             other => bail!("unknown SDK action {other:?}; expected status, repair, or update"),
         }
@@ -79,17 +78,15 @@ fn install(project: &Path, version: String, language: &str) -> Result<()> {
     fs::create_dir_all(project.join("components"))?;
 
     let current = std::env::current_exe()?;
+    let bundle_root = current.parent().unwrap_or(Path::new("."));
     let backend_name = executable_name("backend");
     let backend_dest = bin.join(&backend_name);
     copy_if_different(&current, &backend_dest)?;
 
-    let rpx_source = current
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(executable_name("rpx"));
+    let rpx_source = bundle_root.join(executable_name("rpx"));
     if !rpx_source.is_file() {
         bail!(
-            "RPX is missing beside the SDK backend at {}. The SDK artifact must ship backend and rpx together. Re-run the official SDK installer to repair a damaged toolchain.\n{}",
+            "RPX is missing beside the SDK backend at {}. A complete SDK bundle must ship backend and rpx together.\n{}",
             rpx_source.display(),
             installer_hint(&project)
         );
@@ -97,24 +94,30 @@ fn install(project: &Path, version: String, language: &str) -> Result<()> {
     let rpx_dest = bin.join(executable_name("rpx"));
     copy_if_different(&rpx_source, &rpx_dest)?;
 
-    let languages = if language == "global" {
-        vec!["rust", "javascript", "typescript", "python"]
-    } else {
-        vec![language]
-    };
+    let binding_root = bundle_root.join("bindings");
+    let languages = requested_languages(language);
     for item in &languages {
-        let language_dir = sdk.join(item);
-        fs::create_dir_all(&language_dir)?;
+        let source = binding_root.join(item);
+        if !source.is_dir() {
+            bail!(
+                "SDK binding payload {item:?} is missing from {}. A complete SDK bundle must contain bindings/rust, bindings/javascript, bindings/typescript, and bindings/python.\n{}",
+                binding_root.display(),
+                installer_hint(&project)
+            );
+        }
+        let destination = sdk.join(item);
+        replace_tree(&source, &destination)?;
         let manifest = serde_json::json!({
             "format": 1,
             "sdk_version": version,
             "language": item,
             "package_manifest": "package.rbe.toml",
             "components_root": "components",
-            "dependency_scope": "package-private"
+            "dependency_scope": "package-private",
+            "binding_root": format!("sdk/{item}")
         });
         fs::write(
-            language_dir.join("sdk.json"),
+            destination.join("sdk.json"),
             serde_json::to_vec_pretty(&manifest)?,
         )?;
     }
@@ -132,37 +135,16 @@ fn install(project: &Path, version: String, language: &str) -> Result<()> {
     println!("  project: {}", project.display());
     println!("  version: {version}");
     println!("  language: {language}");
+    println!("  bindings: {}", languages.join(", "));
     println!("  RPX: {}", rpx_dest.display());
     println!("  scope: project-local only");
     Ok(())
 }
 
-fn repair(project: &Path) -> Result<()> {
-    let project = absolute(project)?;
-    let lock_path = project.join(".rbe").join(LOCK_FILE);
-    let lock: SdkLock = serde_json::from_slice(
-        &fs::read(&lock_path)
-            .with_context(|| format!("SDK lock not found: {}", lock_path.display()))?,
-    )?;
-
-    let current = std::env::current_exe()?;
-    let bundled_rpx = current
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(executable_name("rpx"));
-    if !bundled_rpx.is_file() {
-        bail!(
-            "local RPX is missing, so the running SDK backend has no trusted replacement bytes to repair it from.\n{}",
-            installer_hint(&project)
-        );
-    }
-    install(&project, lock.version, &lock.language)
-}
-
-fn update_instruction(project: &Path) -> Result<()> {
+fn bootstrap_instruction(project: &Path, action: &str) -> Result<()> {
     let project = absolute(project)?;
     bail!(
-        "SDK update requires a fresh verified bootstrap bundle; the running project-local backend cannot safely replace itself in place (especially on Windows).\n{}",
+        "SDK {action} requires a fresh verified bootstrap bundle. The project-local backend intentionally does not keep a second complete SDK payload or replace itself in place.\n{}",
         installer_hint(&project)
     )
 }
@@ -176,19 +158,35 @@ fn status(project: &Path) -> Result<()> {
     )?;
     let backend_ok = project.join(".rbe").join(&lock.backend).is_file();
     let rpx_ok = project.join(".rbe").join(&lock.rpx).is_file();
+    let bindings = requested_languages(&lock.language);
+    let missing_bindings = bindings
+        .iter()
+        .filter(|language| !project.join(".rbe").join("sdk").join(language).is_dir())
+        .copied()
+        .collect::<Vec<_>>();
+
     println!("RBE SDK STATUS");
     println!("  project: {}", project.display());
     println!("  version: {}", lock.version);
     println!("  language: {}", lock.language);
     println!("  backend: {}", if backend_ok { "OK" } else { "MISSING" });
     println!("  rpx: {}", if rpx_ok { "OK" } else { "MISSING" });
-    if !backend_ok || !rpx_ok {
-        bail!(
-            "SDK installation is incomplete.\n{}",
-            installer_hint(&project)
-        );
+    for language in &bindings {
+        let present = !missing_bindings.contains(language);
+        println!("  sdk/{language}: {}", if present { "OK" } else { "MISSING" });
+    }
+    if !backend_ok || !rpx_ok || !missing_bindings.is_empty() {
+        bail!("SDK installation is incomplete.\n{}", installer_hint(&project));
     }
     Ok(())
+}
+
+fn requested_languages(language: &str) -> Vec<&str> {
+    if language == "global" {
+        vec!["rust", "javascript", "typescript", "python"]
+    } else {
+        vec![language]
+    }
 }
 
 fn installer_hint(project: &Path) -> String {
@@ -269,17 +267,46 @@ fn copy_if_different(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn replace_tree(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        fs::remove_dir_all(destination).with_context(|| {
+            format!("failed to replace old SDK binding at {}", destination.display())
+        })?;
+    }
+    copy_tree(source, destination)
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &target).with_context(|| {
+                format!(
+                    "failed to copy SDK binding {} to {}",
+                    entry.path().display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn help() {
     println!(
         "RBE SDK backend (project-local)\n\n\
-Install from a freshly verified SDK bundle:\n\
+Install from a freshly verified complete SDK bundle:\n\
   backend install sdk.<version> -path=<project> [-language=typescript]\n\n\
-Local status/repair:\n\
-  backend sdk status -path=<project>\n\
-  backend sdk repair -path=<project>\n\n\
-Update:\n\
-  Re-run the official Kastrick SDK installer so backend/RPX can be replaced from a fresh verified bundle.\n\
-  `backend sdk update -path=<project>` prints the platform-specific bootstrap command.\n\n\
+Status:\n\
+  backend sdk status -path=<project>\n\n\
+Update/repair:\n\
+  Re-run the official Kastrick SDK installer so backend, RPX, and language bindings are restored from a fresh verified bundle.\n\
+  `backend sdk update -path=<project>` and `backend sdk repair -path=<project>` print that bootstrap command.\n\n\
 The SDK backend never performs a machine-wide install."
     );
 }
