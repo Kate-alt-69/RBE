@@ -74,7 +74,7 @@ class Route {
 }
 ```
 
-For a Route such as `api/shop/item.route`, `field:awesomeness` checks `api/shop/awesomeness.field` first and then the API-root `api/awesomeness.field` fallback.
+For a Route such as `api/shop/item.route`, `field:awesomeness` resolves only the sibling `api/shop/awesomeness.field`. Nested Routes never fall back to an API-root `.field`; reusable field ownership is explicit and directory-scoped. A root Route such as `api/item.route` naturally resolves the root sibling `api/awesomeness.field`.
 
 `:import[field]` enables the direct request helpers over the same snapshot:
 

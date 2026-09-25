@@ -218,14 +218,15 @@ impl FieldRoutePlan {
 }
 
 pub(crate) fn field_logical_candidates(route_logical_name: &str, name: &str) -> Vec<String> {
-    let mut out = Vec::with_capacity(2);
-    if let Some((directory, _)) = route_logical_name.rsplit_once('/') {
-        out.push(format!("{directory}/{name}"));
-    }
-    if !out.iter().any(|candidate| candidate == name) {
-        out.push(name.to_string());
-    }
-    out
+    // Reusable FieldManager sources are intentionally local to the importing
+    // Route's directory. A nested Route must never fall back to an API-root
+    // `.field`, because that would recreate an implicit global registry and
+    // make dependency ownership depend on unrelated files elsewhere in `api/`.
+    let logical = route_logical_name
+        .rsplit_once('/')
+        .map(|(directory, _)| format!("{directory}/{name}"))
+        .unwrap_or_else(|| name.to_string());
+    vec![logical]
 }
 
 async fn resolve_field_file(
@@ -1294,5 +1295,25 @@ mod tests {
             parsed.field_bindings[3].default,
             Some(Value::Null)
         ));
+    }
+
+    #[test]
+    fn reusable_field_lookup_is_strictly_route_directory_scoped() {
+        assert_eq!(
+            field_logical_candidates("shop/item", "auth"),
+            vec!["shop/auth".to_string()]
+        );
+        assert_eq!(
+            field_logical_candidates("shop/admin/item", "auth"),
+            vec!["shop/admin/auth".to_string()]
+        );
+    }
+
+    #[test]
+    fn root_routes_still_resolve_root_sibling_fields() {
+        assert_eq!(
+            field_logical_candidates("item", "auth"),
+            vec!["auth".to_string()]
+        );
     }
 }
