@@ -98,21 +98,21 @@ impl PackageLinkContext {
         package: &str,
         export: &str,
     ) -> Result<ResolvedPackageExport<'_>, PackageLinkError> {
-        let Some(root) = self.roots.get(package) else {
+        let Some((canonical_package, root)) = self.roots.get_key_value(package) else {
             return Err(PackageLinkError::ExportNotFound {
                 package: package.to_string(),
                 export: export.to_string(),
             });
         };
-        let Some(link) = root.exports.get(export) else {
+        let Some((canonical_export, link)) = root.exports.get_key_value(export) else {
             return Err(PackageLinkError::ExportNotFound {
                 package: package.to_string(),
                 export: export.to_string(),
             });
         };
         Ok(ResolvedPackageExport {
-            package,
-            export,
+            package: canonical_package,
+            export: canonical_export,
             version: &root.version,
             artifact_sha256: &root.artifact_sha256,
             entry: &link.entry,
