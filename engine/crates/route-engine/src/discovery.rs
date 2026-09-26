@@ -321,6 +321,27 @@ fn comma_header_values(
     Ok(output)
 }
 
+fn trusted_forwarded_protocol(headers: &HeaderMap) -> Result<String, String> {
+    let name = HeaderName::from_static("x-forwarded-proto");
+    let present = headers.contains_key(&name);
+    let protocols = comma_header_values(headers, name)?;
+    if protocols.is_empty() {
+        return if present {
+            Err("trusted x-forwarded-proto header contains no protocol value".into())
+        } else {
+            Ok("http".into())
+        };
+    }
+    for protocol in &protocols {
+        if !protocol.eq_ignore_ascii_case("http") && !protocol.eq_ignore_ascii_case("https") {
+            return Err(format!(
+                "trusted x-forwarded-proto contains unsupported protocol {protocol:?}"
+            ));
+        }
+    }
+    Ok(protocols[0].to_ascii_lowercase())
+}
+
 fn is_json_content_type(value: Option<&str>) -> bool {
     let Some(value) = value else {
         return false;
@@ -431,6 +452,45 @@ mod header_snapshot_tests {
         let error = comma_header_values(&headers, name).unwrap_err();
         assert!(error.contains("x-forwarded-for"), "{error}");
         assert!(error.contains("non-text bytes"), "{error}");
+    }
+
+    #[test]
+    fn trusted_forwarded_protocol_defaults_only_when_header_is_absent() {
+        assert_eq!(
+            trusted_forwarded_protocol(&HeaderMap::new()).unwrap(),
+            "http"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("   "),
+        );
+        let error = trusted_forwarded_protocol(&headers).unwrap_err();
+        assert!(error.contains("no protocol value"), "{error}");
+    }
+
+    #[test]
+    fn trusted_forwarded_protocol_consumes_all_lines_and_canonicalizes() {
+        let mut headers = HeaderMap::new();
+        let name = HeaderName::from_static("x-forwarded-proto");
+        headers.append(name.clone(), HeaderValue::from_static("HTTPS"));
+        headers.append(name, HeaderValue::from_static("http"));
+
+        assert_eq!(trusted_forwarded_protocol(&headers).unwrap(), "https");
+    }
+
+    #[test]
+    fn trusted_forwarded_protocol_rejects_unknown_tokens_anywhere() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https, ftp"),
+        );
+
+        let error = trusted_forwarded_protocol(&headers).unwrap_err();
+        assert!(error.contains("unsupported protocol"), "{error}");
+        assert!(error.contains("ftp"), "{error}");
     }
 }
 
@@ -724,16 +784,10 @@ async fn request_value(
         .map(Value::String)
         .unwrap_or(Value::Null);
     let protocol = if trust_proxy {
-        parts
-            .headers
-            .get("x-forwarded-proto")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
-            .map(str::trim)
-            .filter(|value| matches!(*value, "http" | "https"))
-            .unwrap_or("http")
+        trusted_forwarded_protocol(&parts.headers)
+            .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?
     } else {
-        "http"
+        "http".to_string()
     };
     let host = singleton_header_string(&parts.headers, header::HOST)
         .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?
@@ -782,7 +836,7 @@ async fn request_value(
         ("rawBody".into(), Value::String(raw_body)),
         ("ip".into(), client_ip),
         ("forwardedFor".into(), Value::Array(forwarded_for)),
-        ("protocol".into(), Value::String(protocol.to_string())),
+        ("protocol".into(), Value::String(protocol)),
         ("host".into(), host),
         ("userAgent".into(), user_agent),
         (
