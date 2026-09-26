@@ -62,9 +62,7 @@ pub use execution_tracker::{
 pub use field_manager::{FieldResolveError, FieldRuntimeContext};
 pub use interpreter::{EvalError, Interpreter, RequestContext};
 pub use middleware_plan::{MiddlewarePlan, MiddlewarePlanError, MiddlewareStep};
-pub use module_eval::{
-    ModuleEvalError, ModuleExecutor, PackageCallFuture, PackageExportCaller,
-};
+pub use module_eval::{ModuleEvalError, ModuleExecutor, PackageCallFuture, PackageExportCaller};
 pub use module_runtime::{
     ModuleCompileError, ModuleCompileErrors, ModuleProgram, ServiceInterfaces,
 };
