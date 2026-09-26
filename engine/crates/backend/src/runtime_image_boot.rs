@@ -7,6 +7,9 @@ use route_engine::{
 };
 use service_runtime::ServiceCatalog;
 
+#[path = "package_links.rs"]
+mod package_links;
+
 const RUNTIME_IMAGE_COMPILE_HELP: &str =
     "https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5100";
 
@@ -33,13 +36,23 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
         catalog,
     )?;
     let settings = effective_settings_json(config);
-    let image = route_engine::compile_runtime_image(&server_source, physical.clone(), &settings)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "{}",
-                render_runtime_image_compile_error(&error, &server_source, &physical)
-            )
-        })?;
+    let package_links = package_links::load(&root).map_err(|error| {
+        anyhow::anyhow!(
+            "RBE5100 Backend could not load verified package exports for Runtime Image linking.\n\nError:\n  {error:#}\n\nNote:\n  Runtime Image startup refuses unverified or stale package-link metadata. Rehydrate the active package graph and retry.\n\nHelp:\n  {RUNTIME_IMAGE_COMPILE_HELP}"
+        )
+    })?;
+    let image = route_engine::relc::compile_runtime_image_with_packages(
+        &server_source,
+        physical.clone(),
+        &settings,
+        &package_links,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "{}",
+            render_runtime_image_compile_error(&error, &server_source, &physical)
+        )
+    })?;
     route_engine::validate_runtime_image_routes(&image)?;
     tracing::info!(
         image = %image.image_id,
@@ -47,6 +60,7 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
         routes = image.routes.len(),
         modules = image.modules.len(),
         services = image.services.len(),
+        package_roots = package_links.roots.len(),
         server = %image.server_policy.server_name,
         status = image.server_policy.status.as_str(),
         "linked immutable Runtime Image"
@@ -370,7 +384,7 @@ fn humanize_token_names(message: &str) -> String {
         ("GtEq", "`>=`"),
         ("LParen", "`(`"),
         ("RParen", "`)`"),
-        ("LBracket", "`[`"),
+        ("LBracket", "`[`") ,
         ("RBracket", "`]`"),
         ("LBrace", "`{`"),
         ("RBrace", "`}`"),
