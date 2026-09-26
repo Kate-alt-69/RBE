@@ -153,7 +153,9 @@ pub fn typescript_check(
     ];
 
     match &tsc.compiler {
-        ResolvedCompiler::Managed { path: tsc_entry, .. } => {
+        ResolvedCompiler::Managed {
+            path: tsc_entry, ..
+        } => {
             let runtime = plan
                 .tool("node")
                 .or_else(|| plan.tool("bun"))

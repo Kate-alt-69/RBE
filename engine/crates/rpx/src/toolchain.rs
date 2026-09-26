@@ -105,16 +105,17 @@ impl CompilerResolver {
         allow_host_authoring: bool,
     ) -> Result<Self, ToolchainError> {
         let path = project_root.as_ref().join(RPX_TOOLCHAIN_RELATIVE_PATH);
-        let managed = match fs::read_to_string(&path) {
-            Ok(input) => Some(ManagedCompilerToolchain::parse_json(&input).map_err(|source| {
-                ToolchainError::InvalidFile {
-                    path,
-                    source: Box::new(source),
-                }
-            })?),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => return Err(ToolchainError::Read { path, source }),
-        };
+        let managed =
+            match fs::read_to_string(&path) {
+                Ok(input) => Some(ManagedCompilerToolchain::parse_json(&input).map_err(
+                    |source| ToolchainError::InvalidFile {
+                        path,
+                        source: Box::new(source),
+                    },
+                )?),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => return Err(ToolchainError::Read { path, source }),
+            };
         Ok(Self {
             managed,
             allow_host_authoring,
