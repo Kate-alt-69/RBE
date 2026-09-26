@@ -129,8 +129,27 @@ pub struct HostCall {
 pub struct PackageInvocation {
     pub call_id: u64,
     pub export: String,
+    pub operation: String,
     #[serde(default)]
     pub payload: Vec<u8>,
+}
+
+impl PackageInvocation {
+    pub fn validate(&self) -> Result<(), LibraryHostError> {
+        validate_text("package export", &self.export, MAX_LIBRARY_NAME_BYTES)?;
+        validate_text(
+            "package operation",
+            &self.operation,
+            MAX_LIBRARY_OPERATION_BYTES,
+        )?;
+        if self.payload.len() > MAX_LIBRARY_PAYLOAD_BYTES {
+            return Err(LibraryHostError::PayloadTooLarge {
+                limit: MAX_LIBRARY_PAYLOAD_BYTES,
+                observed: self.payload.len(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,15 +515,45 @@ mod tests {
     }
 
     #[test]
-    fn library_frames_use_existing_bounded_ipc_framing() {
+    fn package_invocation_preserves_export_and_operation_identity() {
         let message = PackageInvocation {
             call_id: 9,
             export: "request".into(),
+            operation: "get".into(),
             payload: b"payload".to_vec(),
         };
+        message.validate().unwrap();
         let mut bytes = Vec::new();
         write_message(&mut bytes, &message).unwrap();
         let decoded: PackageInvocation = read_message(&mut bytes.as_slice()).unwrap();
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn package_invocation_rejects_invalid_identity_and_oversized_payload() {
+        let mut invocation = PackageInvocation {
+            call_id: 1,
+            export: String::new(),
+            operation: "get".into(),
+            payload: Vec::new(),
+        };
+        assert!(matches!(
+            invocation.validate(),
+            Err(LibraryHostError::InvalidText("package export"))
+        ));
+
+        invocation.export = "request".into();
+        invocation.operation.clear();
+        assert!(matches!(
+            invocation.validate(),
+            Err(LibraryHostError::InvalidText("package operation"))
+        ));
+
+        invocation.operation = "get".into();
+        invocation.payload = vec![0; MAX_LIBRARY_PAYLOAD_BYTES + 1];
+        assert!(matches!(
+            invocation.validate(),
+            Err(LibraryHostError::PayloadTooLarge { .. })
+        ));
     }
 }
