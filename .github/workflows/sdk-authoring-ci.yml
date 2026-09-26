@@ -209,8 +209,8 @@ jobs:
           export function broken( { return true; }
           EOF
 
-          "$RPX" compile "$TMP/js/components/hello"
-          if "$RPX" compile "$TMP/js/components/broken"; then
+          "$RPX" compile "$TMP/js/components/hello" --allow-host-toolchain
+          if "$RPX" compile "$TMP/js/components/broken" --allow-host-toolchain; then
             echo "RPX accepted invalid JavaScript" >&2
             exit 1
           fi
@@ -231,8 +231,8 @@ jobs:
               return True
           EOF
 
-          "$RPX" compile "$TMP/python/components/hello"
-          if "$RPX" compile "$TMP/python/components/broken"; then
+          "$RPX" compile "$TMP/python/components/hello" --allow-host-toolchain
+          if "$RPX" compile "$TMP/python/components/broken" --allow-host-toolchain; then
             echo "RPX accepted invalid Python" >&2
             exit 1
           fi
@@ -264,8 +264,8 @@ jobs:
           }
           EOF
 
-          "$RPX" compile "$TMP/rust/components/hello"
-          if "$RPX" compile "$TMP/rust/components/broken"; then
+          "$RPX" compile "$TMP/rust/components/hello" --allow-host-toolchain
+          if "$RPX" compile "$TMP/rust/components/broken" --allow-host-toolchain; then
             echo "RPX accepted invalid Rust" >&2
             exit 1
           fi
