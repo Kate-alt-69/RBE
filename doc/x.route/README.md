@@ -62,7 +62,7 @@ request.contentLength
 
 JSON bodies are decoded to REL values. Other current v1 body types are exposed as UTF-8 strings; invalid UTF-8 returns HTTP 400 rather than being replacement-decoded. Invalid JSON returns HTTP 400 and configured body-limit violations return HTTP 413 before REL execution. Route REL v1 has no first-class binary request-body value type.
 
-Forwarded client/protocol data is trusted only when `trustedProxyHeaders` policy is enabled. Otherwise `request.ip` is derived from the socket peer.
+Forwarded client/protocol data is trusted only when `trustedProxyHeaders` policy is enabled. Otherwise `request.ip` is derived from the socket peer. When proxy trust is enabled, every textual `X-Forwarded-For` field-line is consumed in `HeaderMap` order, comma-delimited entries are flattened in order, and `request.ip` uses the first resulting entry; non-text forwarding field-lines fail with HTTP 400 instead of being ignored.
 
 Current transport behavior joins repeatable duplicate request headers, while semantic singleton headers such as `Content-Type` and `Host` are rejected when repeated so the structured snapshot cannot disagree with HTTP interpretation. There is no first-class binary-body value type.
 
