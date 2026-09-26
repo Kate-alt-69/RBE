@@ -78,11 +78,12 @@ pub fn rust_check(
             manifest_path.to_string_lossy().into_owned(),
         ],
     );
-    invocation.environment.insert(
-        "RUSTC".into(),
-        compiler_program_value(&rustc.compiler)?,
-    );
-    invocation.environment.insert("CARGO_NET_OFFLINE".into(), "true".into());
+    invocation
+        .environment
+        .insert("RUSTC".into(), compiler_program_value(&rustc.compiler)?);
+    invocation
+        .environment
+        .insert("CARGO_NET_OFFLINE".into(), "true".into());
     Ok(invocation)
 }
 
@@ -99,7 +100,10 @@ pub fn node_check(
     Ok(CompilerInvocation::from_tool(
         node,
         working_directory,
-        vec!["--check".into(), staged_module.to_string_lossy().into_owned()],
+        vec![
+            "--check".into(),
+            staged_module.to_string_lossy().into_owned(),
+        ],
     ))
 }
 
@@ -218,7 +222,10 @@ impl fmt::Display for CompilerExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RequiredToolMissing(tool) => {
-                write!(formatter, "resolved RPX compiler plan is missing required tool {tool:?}")
+                write!(
+                    formatter,
+                    "resolved RPX compiler plan is missing required tool {tool:?}"
+                )
             }
             Self::MissingWorkingDirectory => {
                 write!(formatter, "RPX compiler input has no working directory")
@@ -285,16 +292,11 @@ mod tests {
 
     #[test]
     fn node_invocation_uses_exact_managed_program() {
-        let resolver = managed(
-            r#"{"format":1,"tools":{"node":"/opt/rbe/node/bin/node"}}"#,
-        );
-        let plan = CompilerPlan::for_component(
-            PackageLanguage::Javascript,
-            Some(JsRuntime::Node),
-        )
-        .unwrap()
-        .resolve(&resolver)
-        .unwrap();
+        let resolver = managed(r#"{"format":1,"tools":{"node":"/opt/rbe/node/bin/node"}}"#);
+        let plan = CompilerPlan::for_component(PackageLanguage::Javascript, Some(JsRuntime::Node))
+            .unwrap()
+            .resolve(&resolver)
+            .unwrap();
         let invocation = node_check(&plan, "/tmp/check/hello.mjs").unwrap();
         assert_eq!(
             invocation.program,
@@ -305,16 +307,17 @@ mod tests {
 
     #[test]
     fn python_invocation_sets_private_pycache_location() {
-        let resolver = managed(
-            r#"{"format":1,"tools":{"python":"/opt/rbe/python/bin/python"}}"#,
-        );
+        let resolver = managed(r#"{"format":1,"tools":{"python":"/opt/rbe/python/bin/python"}}"#);
         let plan = CompilerPlan::for_component(PackageLanguage::Python, None)
             .unwrap()
             .resolve(&resolver)
             .unwrap();
         let invocation = python_compile(&plan, "/tmp/pkg/hello.py", "/tmp/cache/pycache").unwrap();
         assert_eq!(
-            invocation.environment.get("PYTHONPYCACHEPREFIX").map(String::as_str),
+            invocation
+                .environment
+                .get("PYTHONPYCACHEPREFIX")
+                .map(String::as_str),
             Some("/tmp/cache/pycache")
         );
         assert_eq!(invocation.args[..2], ["-m", "py_compile"]);
@@ -322,16 +325,12 @@ mod tests {
 
     #[test]
     fn hostile_execution_policy_is_rejected_before_process_creation() {
-        let resolver = managed(
-            r#"{"format":1,"tools":{"node":"/opt/rbe/node/bin/node"}}"#,
-        );
-        let mut plan = CompilerPlan::for_component(
-            PackageLanguage::Javascript,
-            Some(JsRuntime::Node),
-        )
-        .unwrap()
-        .resolve(&resolver)
-        .unwrap();
+        let resolver = managed(r#"{"format":1,"tools":{"node":"/opt/rbe/node/bin/node"}}"#);
+        let mut plan =
+            CompilerPlan::for_component(PackageLanguage::Javascript, Some(JsRuntime::Node))
+                .unwrap()
+                .resolve(&resolver)
+                .unwrap();
         plan.network_allowed = true;
         assert_eq!(
             node_check(&plan, "/tmp/check/hello.mjs").unwrap_err(),
