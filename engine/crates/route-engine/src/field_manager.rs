@@ -567,7 +567,35 @@ fn request_source_map<'a>(
     let value = request_source_value(request, source, field)?;
     match value {
         Value::Object(values) => Ok(Some(values)),
-        Value::Null if source == "body" => Ok(None),
+        Value::Null if source == "body" => {
+            let request = request_object(request)?;
+            let raw_body = match request.get("rawBody") {
+                Some(Value::String(raw_body)) => raw_body,
+                Some(_) => {
+                    return Err(resolve_error(
+                        "FLD5000",
+                        field,
+                        "FieldManager request snapshot rawBody is not a string",
+                    ));
+                }
+                None => {
+                    return Err(resolve_error(
+                        "FLD5000",
+                        field,
+                        "FieldManager request snapshot has no rawBody string",
+                    ));
+                }
+            };
+            if raw_body.is_empty() {
+                Ok(None)
+            } else {
+                Err(resolve_error(
+                    "FLD4002",
+                    field,
+                    "body source must be a JSON object for named FieldManager bindings",
+                ))
+            }
+        }
         _ if source == "body" => Err(resolve_error(
             "FLD4002",
             field,
@@ -1078,6 +1106,64 @@ class Route {{ get(req) {{ return req.fields; }} }}"#
             .call("dynamic", &[Value::String("utm_".into())])
             .unwrap_err();
         assert!(error.message.contains("more than 64 fields"));
+    }
+
+    #[test]
+    fn named_body_bindings_distinguish_empty_body_from_explicit_json_null() {
+        let route = route(
+            r#":import[field]
+               fields { enabled = optional("enabled", source = body, type = bool, default = false); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("body-null-vs-empty");
+
+        let empty_request = Value::Object(HashMap::from([
+            ("query".into(), Value::Object(HashMap::new())),
+            ("body".into(), Value::Null),
+            ("rawBody".into(), Value::String(String::new())),
+        ]));
+        let empty_context = block_on_ready(plan.resolve(&empty_request, &program)).unwrap();
+        assert!(matches!(
+            empty_context.call("enabled", &[]).unwrap(),
+            Value::Bool(false)
+        ));
+
+        let null_request = Value::Object(HashMap::from([
+            ("query".into(), Value::Object(HashMap::new())),
+            ("body".into(), Value::Null),
+            ("rawBody".into(), Value::String("null".into())),
+        ]));
+        let error = block_on_ready(plan.resolve(&null_request, &program)).unwrap_err();
+        assert_eq!(error.code, "FLD4002");
+        assert_eq!(error.field, "enabled");
+        assert!(error.message.contains("JSON object"));
+    }
+
+    #[test]
+    fn null_body_snapshot_requires_raw_body_identity() {
+        let route = route(
+            r#":import[field]
+               fields { enabled = optional("enabled", source = body, type = bool, default = false); }
+               class Route { get(req) { return req.fields; } }"#,
+        );
+        let request = Value::Object(HashMap::from([
+            ("query".into(), Value::Object(HashMap::new())),
+            ("body".into(), Value::Null),
+        ]));
+        let plan = FieldRoutePlan {
+            direct_enabled: true,
+            inline_bindings: route.field_bindings.clone(),
+            resolvers: Vec::new(),
+        };
+        let program = empty_program("body-null-invariant");
+        let error = block_on_ready(plan.resolve(&request, &program)).unwrap_err();
+        assert_eq!(error.code, "FLD5000");
+        assert!(error.message.contains("rawBody"));
     }
 
     #[test]
