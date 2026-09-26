@@ -1,16 +1,15 @@
 //! Trusted host-side contract for RBE external package workers.
 //!
-//! This crate owns protocol/session validation only. It does not spawn a worker,
-//! choose a package runtime, or grant capabilities. Callers must derive the
-//! expected identity and admitted capability set from already-verified package
-//! state before creating a [`LibrarySession`].
-
-#![forbid(unsafe_code)]
+//! This module owns protocol/session validation only. It does not spawn a
+//! worker, choose a package runtime, or grant capabilities. Callers must derive
+//! the expected identity and admitted capability set from already-verified
+//! package state before creating a [`LibrarySession`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::{self, Read, Write};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 
 pub const LIBRARY_PROTOCOL_VERSION: u32 = 1;
 pub const LIBRARY_ABI_VERSION: u32 = 1;
@@ -19,8 +18,7 @@ pub const MAX_LIBRARY_NAME_BYTES: usize = 192;
 pub const MAX_LIBRARY_OPERATION_BYTES: usize = 128;
 pub const MAX_LIBRARY_TARGET_BYTES: usize = 256;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerHello {
     pub protocol: u32,
     pub package: PackageIdentity,
@@ -30,27 +28,86 @@ pub struct WorkerHello {
     pub abi_max: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl WorkerHello {
+    pub fn from_value(value: &Value) -> Result<Self, LibraryHostError> {
+        let object = object(value, "worker hello")?;
+        reject_unknown(
+            object,
+            &["protocol", "package", "sdk", "runtime", "abi_min", "abi_max"],
+            "worker hello",
+        )?;
+        Ok(Self {
+            protocol: u32_value(required(object, "protocol")?, "protocol")?,
+            package: PackageIdentity::from_value(required(object, "package")?)?,
+            sdk: SdkIdentity::from_value(required(object, "sdk")?)?,
+            runtime: RuntimeIdentity::from_value(required(object, "runtime")?)?,
+            abi_min: u32_value(required(object, "abi_min")?, "abi_min")?,
+            abi_max: u32_value(required(object, "abi_max")?, "abi_max")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageIdentity {
     pub name: String,
     pub version: String,
     pub artifact_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl PackageIdentity {
+    fn from_value(value: &Value) -> Result<Self, LibraryHostError> {
+        let object = object(value, "package identity")?;
+        reject_unknown(
+            object,
+            &["name", "version", "artifact_sha256"],
+            "package identity",
+        )?;
+        Ok(Self {
+            name: string_value(required(object, "name")?, "package name")?.to_string(),
+            version: string_value(required(object, "version")?, "package version")?.to_string(),
+            artifact_sha256: string_value(
+                required(object, "artifact_sha256")?,
+                "package artifact SHA-256",
+            )?
+            .to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SdkIdentity {
     pub language: String,
     pub name: String,
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl SdkIdentity {
+    fn from_value(value: &Value) -> Result<Self, LibraryHostError> {
+        let object = object(value, "SDK identity")?;
+        reject_unknown(object, &["language", "name", "version"], "SDK identity")?;
+        Ok(Self {
+            language: string_value(required(object, "language")?, "SDK language")?.to_string(),
+            name: string_value(required(object, "name")?, "SDK name")?.to_string(),
+            version: string_value(required(object, "version")?, "SDK version")?.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeIdentity {
     pub kind: String,
     pub version: String,
+}
+
+impl RuntimeIdentity {
+    fn from_value(value: &Value) -> Result<Self, LibraryHostError> {
+        let object = object(value, "runtime identity")?;
+        reject_unknown(object, &["kind", "version"], "runtime identity")?;
+        Ok(Self {
+            kind: string_value(required(object, "kind")?, "runtime kind")?.to_string(),
+            version: string_value(required(object, "version")?, "runtime version")?.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,31 +163,45 @@ impl CapabilityGrant {
             || self.max_response_bytes > MAX_LIBRARY_PAYLOAD_BYTES
         {
             return Err(LibraryHostError::InvalidGrant(
-                "grant payload limits must be within the Library Protocol payload ceiling".into(),
+                "grant payload limits must fit the Library Protocol ceiling".into(),
             ));
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostCall {
     pub call_id: u64,
     pub capability: String,
     pub target: String,
     pub operation: String,
-    #[serde(default)]
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl HostCall {
+    pub fn from_value(value: &Value) -> Result<Self, LibraryHostError> {
+        let object = object(value, "host call")?;
+        reject_unknown(
+            object,
+            &["call_id", "capability", "target", "operation", "payload"],
+            "host call",
+        )?;
+        Ok(Self {
+            call_id: u64_value(required(object, "call_id")?, "call_id")?,
+            capability: string_value(required(object, "capability")?, "capability")?.to_string(),
+            target: string_value(required(object, "target")?, "target")?.to_string(),
+            operation: string_value(required(object, "operation")?, "operation")?.to_string(),
+            payload: bytes_value(object.get("payload"), "payload")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageInvocation {
     pub call_id: u64,
     pub export: String,
     pub operation: String,
-    #[serde(default)]
     pub payload: Vec<u8>,
 }
 
@@ -150,17 +221,45 @@ impl PackageInvocation {
         }
         Ok(())
     }
+
+    pub fn to_value(&self) -> Result<Value, LibraryHostError> {
+        self.validate()?;
+        Ok(json!({
+            "call_id": self.call_id,
+            "export": self.export,
+            "operation": self.operation,
+            "payload": self.payload,
+        }))
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageReply {
     pub call_id: u64,
     pub ok: bool,
-    #[serde(default)]
     pub payload: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl PackageReply {
+    pub fn from_value(value: &Value) -> Result<Self, LibraryHostError> {
+        let object = object(value, "package reply")?;
+        reject_unknown(
+            object,
+            &["call_id", "ok", "payload", "error"],
+            "package reply",
+        )?;
+        let error = match object.get("error") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(string_value(value, "worker error")?.to_string()),
+        };
+        Ok(Self {
+            call_id: u64_value(required(object, "call_id")?, "call_id")?,
+            ok: bool_value(required(object, "ok")?, "ok")?,
+            payload: bytes_value(object.get("payload"), "payload")?,
+            error,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,11 +403,11 @@ impl LibrarySession {
     }
 }
 
-pub fn write_message<W: Write>(writer: &mut W, message: &impl Serialize) -> io::Result<()> {
+pub fn write_json_message<W: Write>(writer: &mut W, message: &Value) -> io::Result<()> {
     ipc_protocol::write_frame(writer, message)
 }
 
-pub fn read_message<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T, LibraryHostError> {
+pub fn read_json_message<R: Read>(reader: &mut R) -> Result<Value, LibraryHostError> {
     let frame = ipc_protocol::read_frame(reader)?;
     serde_json::from_slice(&frame).map_err(LibraryHostError::Json)
 }
@@ -370,43 +469,180 @@ fn validate_sha256(value: &str) -> Result<(), LibraryHostError> {
     Ok(())
 }
 
-#[derive(Debug, thiserror::Error)]
+fn object<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>, LibraryHostError> {
+    value
+        .as_object()
+        .ok_or_else(|| LibraryHostError::InvalidMessage(format!("{label} must be a JSON object")))
+}
+
+fn required<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a Value, LibraryHostError> {
+    object
+        .get(field)
+        .ok_or_else(|| LibraryHostError::InvalidMessage(format!("missing field {field:?}")))
+}
+
+fn reject_unknown(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    label: &str,
+) -> Result<(), LibraryHostError> {
+    if let Some(field) = object.keys().find(|field| !allowed.contains(&field.as_str())) {
+        return Err(LibraryHostError::InvalidMessage(format!(
+            "{label} contains unknown field {field:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn string_value<'a>(value: &'a Value, field: &str) -> Result<&'a str, LibraryHostError> {
+    value
+        .as_str()
+        .ok_or_else(|| LibraryHostError::InvalidMessage(format!("{field} must be a string")))
+}
+
+fn u64_value(value: &Value, field: &str) -> Result<u64, LibraryHostError> {
+    value
+        .as_u64()
+        .ok_or_else(|| LibraryHostError::InvalidMessage(format!("{field} must be a u64")))
+}
+
+fn u32_value(value: &Value, field: &str) -> Result<u32, LibraryHostError> {
+    u64_value(value, field)?
+        .try_into()
+        .map_err(|_| LibraryHostError::InvalidMessage(format!("{field} must be a u32")))
+}
+
+fn bool_value(value: &Value, field: &str) -> Result<bool, LibraryHostError> {
+    value
+        .as_bool()
+        .ok_or_else(|| LibraryHostError::InvalidMessage(format!("{field} must be boolean")))
+}
+
+fn bytes_value(value: Option<&Value>, field: &str) -> Result<Vec<u8>, LibraryHostError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| LibraryHostError::InvalidMessage(format!("{field} must be a byte array")))?;
+    if values.len() > MAX_LIBRARY_PAYLOAD_BYTES {
+        return Err(LibraryHostError::PayloadTooLarge {
+            limit: MAX_LIBRARY_PAYLOAD_BYTES,
+            observed: values.len(),
+        });
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| {
+                    LibraryHostError::InvalidMessage(format!(
+                        "{field} entries must be bytes (0..=255)"
+                    ))
+                })
+        })
+        .collect()
+}
+
+#[derive(Debug)]
 pub enum LibraryHostError {
-    #[error("invalid Library Protocol state: expected {expected:?}, currently {actual:?}")]
     InvalidState {
         expected: SessionState,
         actual: SessionState,
     },
-    #[error("Library Protocol mismatch: expected {expected}, got {actual}")]
-    ProtocolMismatch { expected: u32, actual: u32 },
-    #[error(
-        "Library ABI mismatch: selected {selected}, worker supports {worker_min}..={worker_max}"
-    )]
+    ProtocolMismatch {
+        expected: u32,
+        actual: u32,
+    },
     AbiMismatch {
         selected: u32,
         worker_min: u32,
         worker_max: u32,
     },
-    #[error("package worker identity does not match the verified package/SDK/runtime state")]
     IdentityMismatch,
-    #[error("invalid worker identity: {0}")]
     InvalidIdentity(String),
-    #[error("invalid capability grant: {0}")]
     InvalidGrant(String),
-    #[error("{0} must be non-empty, bounded and free of control characters")]
     InvalidText(&'static str),
-    #[error("package host capability denied: {capability} -> {target} / {operation}")]
+    InvalidMessage(String),
     CapabilityDenied {
         capability: String,
         target: String,
         operation: String,
     },
-    #[error("Library Protocol payload exceeds {limit} bytes (observed {observed})")]
-    PayloadTooLarge { limit: usize, observed: usize },
-    #[error("Library Protocol IPC failed: {0}")]
-    Io(#[from] io::Error),
-    #[error("Library Protocol frame is invalid JSON: {0}")]
+    PayloadTooLarge {
+        limit: usize,
+        observed: usize,
+    },
+    Io(io::Error),
     Json(serde_json::Error),
+}
+
+impl fmt::Display for LibraryHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidState { expected, actual } => write!(
+                formatter,
+                "invalid Library Protocol state: expected {expected:?}, currently {actual:?}"
+            ),
+            Self::ProtocolMismatch { expected, actual } => write!(
+                formatter,
+                "Library Protocol mismatch: expected {expected}, got {actual}"
+            ),
+            Self::AbiMismatch {
+                selected,
+                worker_min,
+                worker_max,
+            } => write!(
+                formatter,
+                "Library ABI mismatch: selected {selected}, worker supports {worker_min}..={worker_max}"
+            ),
+            Self::IdentityMismatch => write!(
+                formatter,
+                "package worker identity does not match verified package/SDK/runtime state"
+            ),
+            Self::InvalidIdentity(message) => write!(formatter, "invalid worker identity: {message}"),
+            Self::InvalidGrant(message) => write!(formatter, "invalid capability grant: {message}"),
+            Self::InvalidText(field) => write!(
+                formatter,
+                "{field} must be non-empty, bounded and free of control characters"
+            ),
+            Self::InvalidMessage(message) => {
+                write!(formatter, "invalid Library Protocol message: {message}")
+            }
+            Self::CapabilityDenied {
+                capability,
+                target,
+                operation,
+            } => write!(
+                formatter,
+                "package host capability denied: {capability} -> {target} / {operation}"
+            ),
+            Self::PayloadTooLarge { limit, observed } => write!(
+                formatter,
+                "Library Protocol payload exceeds {limit} bytes (observed {observed})"
+            ),
+            Self::Io(error) => write!(formatter, "Library Protocol IPC failed: {error}"),
+            Self::Json(error) => write!(formatter, "Library Protocol frame is invalid JSON: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LibraryHostError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Json(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for LibraryHostError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
 }
 
 #[cfg(test)]
@@ -448,10 +684,14 @@ mod tests {
     fn session() -> LibrarySession {
         LibrarySession::new(
             expected(),
-            [
-                CapabilityGrant::new("net:http", "net:http", ["request".to_string()], 1024, 4096)
-                    .unwrap(),
-            ],
+            [CapabilityGrant::new(
+                "net:http",
+                "net:http",
+                ["request".to_string()],
+                1024,
+                4096,
+            )
+            .unwrap()],
         )
         .unwrap()
     }
@@ -522,11 +762,32 @@ mod tests {
             operation: "get".into(),
             payload: b"payload".to_vec(),
         };
-        message.validate().unwrap();
+        let value = message.to_value().unwrap();
         let mut bytes = Vec::new();
-        write_message(&mut bytes, &message).unwrap();
-        let decoded: PackageInvocation = read_message(&mut bytes.as_slice()).unwrap();
-        assert_eq!(decoded, message);
+        write_json_message(&mut bytes, &value).unwrap();
+        let decoded = read_json_message(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn worker_hello_rejects_unknown_fields() {
+        let value = json!({
+            "protocol": 1,
+            "package": {
+                "name": "advancenet",
+                "version": "2.0.0",
+                "artifact_sha256": "a".repeat(64),
+            },
+            "sdk": {"language":"typescript", "name":"@rbe/sdk", "version":"1.0.0"},
+            "runtime": {"kind":"bun", "version":"1.3.0"},
+            "abi_min": 1,
+            "abi_max": 1,
+            "surprise": true,
+        });
+        assert!(matches!(
+            WorkerHello::from_value(&value),
+            Err(LibraryHostError::InvalidMessage(_))
+        ));
     }
 
     #[test]
