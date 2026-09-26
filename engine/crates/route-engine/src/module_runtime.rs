@@ -123,7 +123,11 @@ impl ModuleProgram {
             };
             let mut path = module_dir.join(&manifest.logical_name);
             path.set_extension("module");
-            validate_local(&path, file.as_ref(), Some(services), &mut errors);
+            // Package-style `X from Y` imports in an immutable Runtime Image
+            // have already passed RELC's verified PackageLinkContext gate.
+            // The legacy filesystem loader has no such trusted context and
+            // therefore keeps rejecting non-builtin sub-library spellings.
+            validate_local(&path, file.as_ref(), Some(services), true, &mut errors);
             modules.insert(normalize(&path), file);
         }
 
@@ -165,7 +169,7 @@ impl ModuleProgram {
         for path in files {
             match load_one(&path) {
                 Ok(file) => {
-                    validate_local(&path, &file, services, &mut errors);
+                    validate_local(&path, &file, services, false, &mut errors);
                     modules.insert(normalize(&path), Arc::new(file));
                 }
                 Err(error) => errors.push(error),
@@ -297,6 +301,7 @@ fn validate_local(
     path: &Path,
     file: &ModuleFile,
     services: Option<&ServiceInterfaces>,
+    linked_package_imports: bool,
     errors: &mut Vec<ModuleCompileError>,
 ) {
     let mut functions = HashSet::new();
@@ -378,7 +383,8 @@ fn validate_local(
                 });
             }
             ImportTarget::BuiltinSubLibrary { module, library }
-                if !(module == "crypto" && library == "argon") =>
+                if (module == "crypto" && library != "argon")
+                    || (module != "crypto" && !linked_package_imports) =>
             {
                 errors.push(ModuleCompileError {
                     code: "MOD2012",
@@ -386,7 +392,7 @@ fn validate_local(
                     line: 1,
                     column: 1,
                     message: format!(
-                        "unknown builtin sub-library {library:?} from {module:?}; supported: argon from crypto"
+                        "unknown builtin sub-library {library:?} from {module:?}; supported local builtin: argon from crypto"
                     ),
                 });
             }
@@ -594,9 +600,15 @@ fn visit(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::relc::{
+        PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
+    };
+
+    use super::*;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -672,6 +684,61 @@ mod tests {
             .expect_err("direct imports must reference a real export");
         assert!(errors.0.iter().any(|error| error.code == "MOD2011"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_loader_rejects_unlinked_package_imports() {
+        let root = root();
+        fs::write(
+            root.join("module/package.module"),
+            ":import[request from advancenet]\nexport function run() { return true; }",
+        )
+        .unwrap();
+        let errors = ModuleProgram::load(&root.join("module"))
+            .expect_err("filesystem loading has no verified package-link context");
+        assert!(errors.0.iter().any(|error| error.code == "MOD2012"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_image_accepts_relc_verified_package_imports() {
+        let package_links = PackageLinkContext {
+            format: PACKAGE_LINK_FORMAT,
+            roots: BTreeMap::from([(
+                "advancenet".into(),
+                PackageRootLink {
+                    version: "2.0.0".into(),
+                    artifact_sha256: "a".repeat(64),
+                    exports: BTreeMap::from([(
+                        "request".into(),
+                        PackageExportLink {
+                            entry: "components/request/request.ts".into(),
+                            language: "typescript".into(),
+                        },
+                    )]),
+                },
+            )]),
+        };
+        let source = crate::PhysicalRelSource::new(
+            crate::RelSourceKind::Module,
+            "consumer",
+            "module/consumer.module",
+            ":import[request from advancenet]\nexport function run() { return true; }",
+        );
+        let image = crate::relc::compile_runtime_image_with_packages(
+            "server Main {}",
+            vec![source],
+            &serde_json::json!({}),
+            &package_links,
+        )
+        .expect("RELC should link the explicit package root");
+
+        let program = ModuleProgram::from_runtime_image_with_services(
+            &image,
+            &ServiceInterfaces::new(),
+        )
+        .expect("linked Runtime Image must not be rejected as an unknown builtin sub-library");
+        assert_eq!(program.len(), 1);
     }
 
     #[test]
