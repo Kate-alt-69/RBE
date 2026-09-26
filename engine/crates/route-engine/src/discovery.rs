@@ -288,18 +288,53 @@ fn is_json_content_type(value: Option<&str>) -> bool {
         || media_type.to_ascii_lowercase().ends_with("+json")
 }
 
-fn headers_value(headers: &HeaderMap) -> Value {
+fn headers_value(headers: &HeaderMap) -> Result<Value, String> {
     let mut out = HashMap::new();
     for name in headers.keys() {
-        let values = headers
-            .get_all(name)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.insert(name.as_str().to_string(), Value::String(values));
+        let mut values = Vec::new();
+        for value in headers.get_all(name).iter() {
+            let value = value
+                .to_str()
+                .map_err(|_| format!("header {:?} contains non-text bytes", name.as_str()))?;
+            values.push(value);
+        }
+        out.insert(name.as_str().to_string(), Value::String(values.join(", ")));
     }
-    Value::Object(out)
+    Ok(Value::Object(out))
+}
+
+#[cfg(test)]
+mod header_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn header_snapshot_joins_repeated_text_values() {
+        let mut headers = HeaderMap::new();
+        let name = HeaderName::from_static("x-rbe-test");
+        headers.append(name.clone(), HeaderValue::from_static("one"));
+        headers.append(name, HeaderValue::from_static("two"));
+
+        let Value::Object(values) = headers_value(&headers).unwrap() else {
+            panic!("expected header object");
+        };
+        assert!(matches!(
+            values.get("x-rbe-test"),
+            Some(Value::String(value)) if value == "one, two"
+        ));
+    }
+
+    #[test]
+    fn header_snapshot_rejects_non_text_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-rbe-binary"),
+            HeaderValue::from_bytes(&[0x80]).expect("obs-text header should parse"),
+        );
+
+        let error = headers_value(&headers).unwrap_err();
+        assert!(error.contains("x-rbe-binary"), "{error}");
+        assert!(error.contains("non-text bytes"), "{error}");
+    }
 }
 
 fn cookies_value(headers: &HeaderMap) -> Result<Value, String> {
@@ -584,6 +619,8 @@ async fn request_value(
         .and_then(|value| value.parse::<u64>().ok())
         .map(|value| Value::Number(value as f64))
         .unwrap_or(Value::Null);
+    let headers = headers_value(&parts.headers)
+        .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?;
     let cookies = cookies_value(&parts.headers)
         .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?;
 
@@ -612,7 +649,7 @@ async fn request_value(
                     .collect(),
             ),
         ),
-        ("headers".into(), headers_value(&parts.headers)),
+        ("headers".into(), headers),
         ("cookies".into(), cookies),
         ("body".into(), body_value),
         (
