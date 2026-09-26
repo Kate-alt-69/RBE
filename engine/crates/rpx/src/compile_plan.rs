@@ -124,7 +124,9 @@ impl CompilerPlan {
     }
 
     pub fn requires(&self, tool: &str) -> bool {
-        self.tools.iter().any(|requirement| requirement.name == tool)
+        self.tools
+            .iter()
+            .any(|requirement| requirement.name == tool)
     }
 }
 
@@ -194,28 +196,25 @@ mod tests {
 
     #[test]
     fn javascript_plan_follows_declared_runtime() {
-        let node = CompilerPlan::for_component(
-            PackageLanguage::Javascript,
-            Some(JsRuntime::Node),
-        )
-        .unwrap();
-        assert_eq!(node.tools.iter().map(|tool| tool.name).collect::<Vec<_>>(), ["node"]);
+        let node = CompilerPlan::for_component(PackageLanguage::Javascript, Some(JsRuntime::Node))
+            .unwrap();
+        assert_eq!(
+            node.tools.iter().map(|tool| tool.name).collect::<Vec<_>>(),
+            ["node"]
+        );
 
-        let bun = CompilerPlan::for_component(
-            PackageLanguage::Javascript,
-            Some(JsRuntime::Bun),
-        )
-        .unwrap();
-        assert_eq!(bun.tools.iter().map(|tool| tool.name).collect::<Vec<_>>(), ["bun"]);
+        let bun =
+            CompilerPlan::for_component(PackageLanguage::Javascript, Some(JsRuntime::Bun)).unwrap();
+        assert_eq!(
+            bun.tools.iter().map(|tool| tool.name).collect::<Vec<_>>(),
+            ["bun"]
+        );
     }
 
     #[test]
     fn typescript_plan_requires_tsc_and_declared_runtime() {
-        let plan = CompilerPlan::for_component(
-            PackageLanguage::Typescript,
-            Some(JsRuntime::Node),
-        )
-        .unwrap();
+        let plan = CompilerPlan::for_component(PackageLanguage::Typescript, Some(JsRuntime::Node))
+            .unwrap();
         assert!(plan.requires("node"));
         assert!(plan.requires("tsc"));
     }
