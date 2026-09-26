@@ -1,8 +1,14 @@
+mod toolchain_install;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use toolchain_install::{
+    install_verified_toolchain, project_toolchain_exists, verify_project_toolchain,
+    PROJECT_TOOLCHAIN_FILE,
+};
 
 const LOCK_FILE: &str = "sdk.lock.json";
 const POWERSHELL_INSTALLER: &str = "https://kastrick-backend.onrender.com/api/sdk/install.ps1";
@@ -15,6 +21,8 @@ struct SdkLock {
     language: String,
     backend: String,
     rpx: String,
+    #[serde(default)]
+    managed_toolchain: bool,
 }
 
 fn main() -> ExitCode {
@@ -47,7 +55,13 @@ fn run() -> Result<()> {
             .context("SDK installs use `backend install sdk.<version>`")?;
         let path = option(&args, "path").unwrap_or_else(|| ".".to_string());
         let language = option(&args, "language").unwrap_or_else(|| "global".to_string());
-        install(Path::new(&path), resolve_version(version), &language)?;
+        let toolchain = option(&args, "toolchain").map(PathBuf::from);
+        install(
+            Path::new(&path),
+            resolve_version(version),
+            &language,
+            toolchain.as_deref(),
+        )?;
         return Ok(());
     }
 
@@ -57,7 +71,14 @@ fn run() -> Result<()> {
         match action {
             "repair" | "update" => bootstrap_instruction(Path::new(&path), action)?,
             "status" => status(Path::new(&path))?,
-            other => bail!("unknown SDK action {other:?}; expected status, repair, or update"),
+            "toolchain" => {
+                let file = option(&args, "file")
+                    .context("`backend sdk toolchain` requires -file=<verified-rpx-toolchain.json>")?;
+                install_toolchain(Path::new(&path), Path::new(&file))?;
+            }
+            other => bail!(
+                "unknown SDK action {other:?}; expected status, repair, update, or toolchain"
+            ),
         }
         return Ok(());
     }
@@ -65,7 +86,12 @@ fn run() -> Result<()> {
     bail!("unknown SDK backend command; run with --help")
 }
 
-fn install(project: &Path, version: String, language: &str) -> Result<()> {
+fn install(
+    project: &Path,
+    version: String,
+    language: &str,
+    toolchain_source: Option<&Path>,
+) -> Result<()> {
     validate_language(language)?;
     let project = absolute(project)?;
     fs::create_dir_all(&project)?;
@@ -122,14 +148,25 @@ fn install(project: &Path, version: String, language: &str) -> Result<()> {
         )?;
     }
 
+    let toolchain_count = if let Some(source) = toolchain_source {
+        Some(install_verified_toolchain(&project, source)?)
+    } else if project_toolchain_exists(&project) {
+        // Reinstalls preserve an already-admitted toolchain only after checking
+        // that every currently installed compiler still matches its pin.
+        Some(verify_project_toolchain(&project)?)
+    } else {
+        None
+    };
+
     let lock = SdkLock {
-        format: 1,
+        format: 2,
         version: version.clone(),
         language: language.to_string(),
         backend: format!("bin/{backend_name}"),
         rpx: format!("bin/{}", executable_name("rpx")),
+        managed_toolchain: toolchain_count.is_some(),
     };
-    fs::write(rbe.join(LOCK_FILE), serde_json::to_vec_pretty(&lock)?)?;
+    write_lock(&project, &lock)?;
 
     println!("RBE SDK installed");
     println!("  project: {}", project.display());
@@ -137,7 +174,34 @@ fn install(project: &Path, version: String, language: &str) -> Result<()> {
     println!("  language: {language}");
     println!("  bindings: {}", languages.join(", "));
     println!("  RPX: {}", rpx_dest.display());
+    match toolchain_count {
+        Some(count) => println!(
+            "  managed toolchain: VERIFIED ({count} pinned tool{})",
+            if count == 1 { "" } else { "s" }
+        ),
+        None => println!(
+            "  managed toolchain: NOT CONFIGURED (RPX compile remains fail-closed unless explicit local --allow-host-toolchain is used)"
+        ),
+    }
     println!("  scope: project-local only");
+    Ok(())
+}
+
+fn install_toolchain(project: &Path, source: &Path) -> Result<()> {
+    let project = absolute(project)?;
+    let mut lock = load_lock(&project)?;
+    let count = install_verified_toolchain(&project, source)?;
+    lock.format = 2;
+    lock.managed_toolchain = true;
+    write_lock(&project, &lock)?;
+    println!("RBE SDK managed toolchain installed");
+    println!("  project: {}", project.display());
+    println!("  file: .rbe/{PROJECT_TOOLCHAIN_FILE}");
+    println!(
+        "  tools: {count} pinned compiler{} verified",
+        if count == 1 { "" } else { "s" }
+    );
+    println!("  host PATH fallback: disabled by default");
     Ok(())
 }
 
@@ -151,11 +215,10 @@ fn bootstrap_instruction(project: &Path, action: &str) -> Result<()> {
 
 fn status(project: &Path) -> Result<()> {
     let project = absolute(project)?;
-    let lock_path = project.join(".rbe").join(LOCK_FILE);
-    let lock: SdkLock = serde_json::from_slice(
-        &fs::read(&lock_path)
-            .with_context(|| format!("SDK lock not found: {}", lock_path.display()))?,
-    )?;
+    let lock = load_lock(&project)?;
+    if !matches!(lock.format, 1 | 2) {
+        bail!("unsupported SDK lock format {}", lock.format);
+    }
     let backend_ok = project.join(".rbe").join(&lock.backend).is_file();
     let rpx_ok = project.join(".rbe").join(&lock.rpx).is_file();
     let bindings = requested_languages(&lock.language);
@@ -164,6 +227,12 @@ fn status(project: &Path) -> Result<()> {
         .filter(|language| !project.join(".rbe").join("sdk").join(language).is_dir())
         .copied()
         .collect::<Vec<_>>();
+
+    let toolchain_count = if lock.managed_toolchain {
+        Some(verify_project_toolchain(&project)?)
+    } else {
+        None
+    };
 
     println!("RBE SDK STATUS");
     println!("  project: {}", project.display());
@@ -178,6 +247,16 @@ fn status(project: &Path) -> Result<()> {
             if present { "OK" } else { "MISSING" }
         );
     }
+    match toolchain_count {
+        Some(count) => println!(
+            "  managed toolchain: VERIFIED ({count} pinned tool{})",
+            if count == 1 { "" } else { "s" }
+        ),
+        None if project_toolchain_exists(&project) => println!(
+            "  managed toolchain: UNTRACKED (descriptor exists but this SDK lock does not admit it)"
+        ),
+        None => println!("  managed toolchain: NOT CONFIGURED"),
+    }
     if !backend_ok || !rpx_ok || !missing_bindings.is_empty() {
         bail!(
             "SDK installation is incomplete.\n{}",
@@ -185,6 +264,21 @@ fn status(project: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn load_lock(project: &Path) -> Result<SdkLock> {
+    let lock_path = project.join(".rbe").join(LOCK_FILE);
+    serde_json::from_slice(
+        &fs::read(&lock_path)
+            .with_context(|| format!("SDK lock not found: {}", lock_path.display()))?,
+    )
+    .with_context(|| format!("invalid SDK lock: {}", lock_path.display()))
+}
+
+fn write_lock(project: &Path, lock: &SdkLock) -> Result<()> {
+    let path = project.join(".rbe").join(LOCK_FILE);
+    fs::write(&path, serde_json::to_vec_pretty(lock)?)
+        .with_context(|| format!("failed to write SDK lock: {}", path.display()))
 }
 
 fn requested_languages(language: &str) -> Vec<&str> {
@@ -310,11 +404,14 @@ fn help() {
     println!(
         "RBE SDK backend (project-local)\n\n\
 Install from a freshly verified complete SDK bundle:\n\
-  backend install sdk.<version> -path=<project> [-language=typescript]\n\n\
+  backend install sdk.<version> -path=<project> [-language=typescript] [-toolchain=<verified-rpx-toolchain.json>]\n\n\
 Status:\n\
   backend sdk status -path=<project>\n\n\
+Managed compiler handoff:\n\
+  backend sdk toolchain -path=<project> -file=<verified-rpx-toolchain.json>\n\n\
+The toolchain descriptor must be RPX format 2 and every absolute compiler/entry path must still match its pinned SHA-256. The SDK backend never discovers host compilers through PATH.\n\n\
 Update/repair:\n\
-  Re-run the official Kastrick SDK installer so backend, RPX, and language bindings are restored from a fresh verified bundle.\n\
+  Re-run the official Kastrick SDK installer so backend, RPX, language bindings, and managed compiler state are restored from a fresh verified bundle/handoff.\n\
   `backend sdk update -path=<project>` and `backend sdk repair -path=<project>` print that bootstrap command.\n\n\
 The SDK backend never performs a machine-wide install."
     );
