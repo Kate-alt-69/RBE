@@ -348,7 +348,10 @@ mod tests {
         };
         let invocation = node_check(&plan, "/tmp/check/hello.mjs").unwrap();
         assert!(!invocation.clear_environment);
-        assert_eq!(invocation.program, CompilerProgram::HostAuthoring("node".into()));
+        assert_eq!(
+            invocation.program,
+            CompilerProgram::HostAuthoring("node".into())
+        );
     }
 
     #[test]
