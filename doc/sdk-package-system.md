@@ -55,7 +55,53 @@ rpx compile.package .
 rpx info
 ```
 
-`rpx compile` validates the package/component graph and writes a canonical package index under `.cache/rbe/build/`. Language syntax/type compilation is delegated to the installed language SDK compiler. `rpx compile.package` creates the `.rbe.zip` distributable and embeds the canonical package index.
+`rpx check` validates the package/component graph without invoking a language compiler.
+
+`rpx compile` validates the graph, performs real language syntax/type/compiler checks and writes a canonical package index under `.cache/rbe/build/`. `rpx compile.package` performs the same compiler checks before creating the `.rbe.zip` distributable and embedding the canonical package index.
+
+### Managed compiler authority
+
+Normal RPX compilation is fail-closed and uses the project-local managed compiler map:
+
+```text
+.rbe/rpx-toolchain.json
+```
+
+Format 1 is a map from canonical RBE compiler tool names to **absolute executable/entry paths**. Example:
+
+```json
+{
+  "format": 1,
+  "tools": {
+    "node": "/opt/rbe/node/bin/node",
+    "tsc": "/opt/rbe/typescript/lib/tsc.js"
+  }
+}
+```
+
+The current compiler requirements are:
+
+| Package language | Required managed tools |
+| --- | --- |
+| Rust | `cargo`, `rustc` |
+| JavaScript + Node | `node` |
+| JavaScript + Bun | `bun` |
+| TypeScript + Node | `node`, `tsc` |
+| TypeScript + Bun | `bun`, `tsc` |
+| Python | `python` |
+
+Compiler plans are shell-disabled and network-disabled. Managed invocations are launched from their exact configured absolute paths with a cleared environment plus only the minimal RBE-selected environment needed for the compiler contract. Rust checks are explicitly offline and bind Cargo to the selected managed `rustc`. Managed TypeScript invokes the selected `tsc` entry through the package's declared managed Node/Bun runtime rather than relying on a launcher finding a runtime through host `PATH`.
+
+A present managed toolchain file is authoritative. If it is malformed or lacks a required tool, RPX fails; it does **not** fall back to a similarly named program installed on the host machine.
+
+For deliberate local development only, an author may opt into host-installed tools:
+
+```text
+rpx compile . --allow-host-toolchain
+rpx compile.package . --allow-host-toolchain
+```
+
+That flag is an explicit authoring escape hatch, not the production/default compiler-discovery path. It only applies when no managed toolchain file exists; it cannot turn a partial managed toolchain into a host fallback.
 
 ## SDK bootstrap
 
@@ -69,3 +115,5 @@ backend sdk status -path=.
 ```
 
 A `global` SDK install explicitly installs all language bindings; mixed-language packages are only valid when `language = "global"` is deliberately selected in `package.rbe.toml`.
+
+The SDK bootstrap/install path is responsible for supplying project-local SDK bindings and, as the managed compiler integration is completed, the verified compiler/tool paths consumed by RPX. RPX itself does not silently discover or trust arbitrary host compilers in its default mode.
