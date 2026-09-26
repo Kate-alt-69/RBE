@@ -302,26 +302,36 @@ fn headers_value(headers: &HeaderMap) -> Value {
     Value::Object(out)
 }
 
-fn cookies_value(headers: &HeaderMap) -> Value {
+fn cookies_value(headers: &HeaderMap) -> Result<Value, String> {
     let mut cookies = HashMap::new();
-    for raw in headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-    {
-        for part in raw.split(';') {
-            let Some((name, value)) = part.trim().split_once('=') else {
-                continue;
+    for header_value in headers.get_all(header::COOKIE).iter() {
+        let raw = header_value
+            .to_str()
+            .map_err(|_| "Cookie header contains non-text bytes".to_string())?;
+        for part in raw
+            .split(';')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            let Some((name, value)) = part.split_once('=') else {
+                return Err(format!(
+                    "malformed Cookie pair {part:?}; expected name=value"
+                ));
             };
-            if !name.is_empty() {
-                // Cookie header field-lines are processed in HeaderMap order.
-                // Preserve the existing last-value-wins behavior when a client
-                // repeats the same cookie name across one or more field-lines.
-                cookies.insert(name.to_string(), Value::String(value.to_string()));
+            if name.is_empty() || name.trim() != name {
+                return Err(format!("malformed Cookie name {name:?}"));
+            }
+            if cookies
+                .insert(name.to_string(), Value::String(value.to_string()))
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate cookie field {name:?} is ambiguous; each cookie name may appear only once"
+                ));
             }
         }
     }
-    Value::Object(cookies)
+    Ok(Value::Object(cookies))
 }
 
 #[cfg(test)]
@@ -331,21 +341,54 @@ mod cookie_snapshot_tests {
     #[test]
     fn cookie_snapshot_consumes_all_header_field_lines_in_order() {
         let mut headers = HeaderMap::new();
-        headers.append(
-            header::COOKIE,
-            HeaderValue::from_static("first=one; shared=old"),
-        );
-        headers.append(
-            header::COOKIE,
-            HeaderValue::from_static("second=two; shared=new"),
-        );
+        headers.append(header::COOKIE, HeaderValue::from_static("first=one"));
+        headers.append(header::COOKIE, HeaderValue::from_static("second=two"));
 
-        let Value::Object(cookies) = cookies_value(&headers) else {
+        let Value::Object(cookies) = cookies_value(&headers).unwrap() else {
             panic!("expected cookie object");
         };
         assert!(matches!(cookies.get("first"), Some(Value::String(value)) if value == "one"));
         assert!(matches!(cookies.get("second"), Some(Value::String(value)) if value == "two"));
-        assert!(matches!(cookies.get("shared"), Some(Value::String(value)) if value == "new"));
+    }
+
+    #[test]
+    fn cookie_snapshot_rejects_duplicate_names_in_one_field_line() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("session=old; session=new"),
+        );
+
+        let error = cookies_value(&headers).unwrap_err();
+        assert!(error.contains("duplicate cookie field"), "{error}");
+        assert!(error.contains("session"), "{error}");
+    }
+
+    #[test]
+    fn cookie_snapshot_rejects_duplicate_names_across_field_lines() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("session=old"));
+        headers.append(header::COOKIE, HeaderValue::from_static("session=new"));
+
+        let error = cookies_value(&headers).unwrap_err();
+        assert!(error.contains("duplicate cookie field"), "{error}");
+        assert!(error.contains("session"), "{error}");
+    }
+
+    #[test]
+    fn cookie_snapshot_rejects_malformed_pairs() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("session=ok; malformed"),
+        );
+        let error = cookies_value(&headers).unwrap_err();
+        assert!(error.contains("malformed Cookie pair"), "{error}");
+
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("=missing-name"));
+        let error = cookies_value(&headers).unwrap_err();
+        assert!(error.contains("malformed Cookie name"), "{error}");
     }
 }
 
@@ -541,6 +584,8 @@ async fn request_value(
         .and_then(|value| value.parse::<u64>().ok())
         .map(|value| Value::Number(value as f64))
         .unwrap_or(Value::Null);
+    let cookies = cookies_value(&parts.headers)
+        .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?;
 
     let fields = HashMap::from([
         (
@@ -568,7 +613,7 @@ async fn request_value(
             ),
         ),
         ("headers".into(), headers_value(&parts.headers)),
-        ("cookies".into(), cookies_value(&parts.headers)),
+        ("cookies".into(), cookies),
         ("body".into(), body_value),
         (
             "rawBody".into(),
