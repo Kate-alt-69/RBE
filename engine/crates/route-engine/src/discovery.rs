@@ -533,6 +533,53 @@ fn field_resolution_response(path: &str, error: FieldResolveError) -> Response {
         .into_response()
 }
 
+fn request_body_values(raw: &[u8], content_type: Option<&str>) -> Result<(Value, String), String> {
+    let raw_body = std::str::from_utf8(raw)
+        .map_err(|error| format!("request body is not valid UTF-8: {error}"))?
+        .to_owned();
+    let body = if raw.is_empty() {
+        Value::Null
+    } else if is_json_content_type(content_type) {
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw_body)
+            .map_err(|error| format!("invalid JSON request body: {error}"))?;
+        json_to_value(parsed)
+    } else {
+        Value::String(raw_body.clone())
+    };
+    Ok((body, raw_body))
+}
+
+#[cfg(test)]
+mod request_body_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn text_body_and_raw_body_share_exact_utf8() {
+        let (body, raw_body) = request_body_values("héllo".as_bytes(), Some("text/plain")).unwrap();
+        assert!(matches!(body, Value::String(value) if value == "héllo"));
+        assert_eq!(raw_body, "héllo");
+    }
+
+    #[test]
+    fn request_body_rejects_invalid_utf8() {
+        let error = request_body_values(&[0x66, 0x80, 0x6f], Some("text/plain")).unwrap_err();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn json_body_keeps_semantic_and_raw_views() {
+        let raw = br#"{"enabled":true,"count":7}"#;
+        let (body, raw_body) =
+            request_body_values(raw, Some("application/json; charset=utf-8")).unwrap();
+        let Value::Object(values) = body else {
+            panic!("expected JSON object");
+        };
+        assert!(matches!(values.get("enabled"), Some(Value::Bool(true))));
+        assert!(matches!(values.get("count"), Some(Value::Number(value)) if *value == 7.0));
+        assert_eq!(raw_body, r#"{"enabled":true,"count":7}"#);
+    }
+}
+
 async fn request_value(
     state: &AppState,
     params: HashMap<String, String>,
@@ -555,19 +602,8 @@ async fn request_value(
         })?;
 
     let content_type = header_string(&parts.headers, header::CONTENT_TYPE);
-    let body_value = if raw.is_empty() {
-        Value::Null
-    } else if is_json_content_type(content_type.as_deref()) {
-        let parsed = serde_json::from_slice::<serde_json::Value>(&raw).map_err(|error| {
-            Box::new(request_error(
-                StatusCode::BAD_REQUEST,
-                format!("invalid JSON request body: {error}"),
-            ))
-        })?;
-        json_to_value(parsed)
-    } else {
-        Value::String(String::from_utf8_lossy(&raw).into_owned())
-    };
+    let (body_value, raw_body) = request_body_values(&raw, content_type.as_deref())
+        .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?;
 
     let trust_proxy = state.config.security.trusted_proxy_headers;
     let forwarded_for = if trust_proxy {
@@ -652,10 +688,7 @@ async fn request_value(
         ("headers".into(), headers),
         ("cookies".into(), cookies),
         ("body".into(), body_value),
-        (
-            "rawBody".into(),
-            Value::String(String::from_utf8_lossy(&raw).into_owned()),
-        ),
+        ("rawBody".into(), Value::String(raw_body)),
         ("ip".into(), client_ip),
         ("forwardedFor".into(), Value::Array(forwarded_for)),
         ("protocol".into(), Value::String(protocol.to_string())),
