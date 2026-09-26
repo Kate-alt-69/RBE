@@ -91,6 +91,17 @@ pub use wasm_compiler::{
     ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
 };
 
+pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
+    let tokens = lexer::Lexer::new(source)
+        .tokenize()
+        .map_err(|error| ParseError {
+            message: error.message,
+            line: error.line,
+            column: error.column,
+        })?;
+    parser::Parser::new(tokens).parse_service_file()
+}
+
 pub fn build_routes(
     api_dir: &std::path::Path,
     service_interfaces: &ServiceInterfaces,
