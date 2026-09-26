@@ -10,8 +10,10 @@ use std::fmt;
 use std::path::{Component, Path};
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use sha2::{Digest, Sha256};
 
 pub const PACKAGE_LINK_FORMAT: u32 = 1;
+const PACKAGE_LINK_IDENTITY_DOMAIN: &[u8] = b"RBE_PACKAGE_LINK_CONTEXT_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageLinkContext {
@@ -132,6 +134,22 @@ impl PackageLinkContext {
         let mut output = serde_json::to_string_pretty(&value)?;
         output.push('\n');
         Ok(output)
+    }
+
+    /// Stable identity for the verified explicit package-root graph RELC sees.
+    ///
+    /// This is deliberately derived from the canonical root-only JSON view, so
+    /// private/transitive install metadata cannot affect or widen REL package
+    /// visibility. The digest is suitable for binding the package graph into a
+    /// Runtime Image identity; it is not a replacement for artifact SHA-256
+    /// verification performed by the installer.
+    pub fn identity_sha256(&self) -> Result<String, PackageLinkError> {
+        let canonical = self.render_json()?;
+        let mut hash = Sha256::new();
+        hash.update(PACKAGE_LINK_IDENTITY_DOMAIN);
+        hash.update((canonical.len() as u64).to_be_bytes());
+        hash.update(canonical.as_bytes());
+        Ok(hex::encode(hash.finalize()))
     }
 
     pub fn validate(&self) -> Result<(), PackageLinkError> {
@@ -386,6 +404,39 @@ mod tests {
         let context = context();
         let rendered = context.render_json().unwrap();
         assert_eq!(PackageLinkContext::parse_json(&rendered).unwrap(), context);
+    }
+
+    #[test]
+    fn identity_hash_is_stable_and_tracks_verified_root_identity() {
+        let context = context();
+        let original = context.identity_sha256().unwrap();
+        assert_eq!(original.len(), 64);
+        assert_eq!(
+            original,
+            PackageLinkContext::parse_json(&context.render_json().unwrap())
+                .unwrap()
+                .identity_sha256()
+                .unwrap()
+        );
+
+        let mut changed_artifact = context.clone();
+        changed_artifact
+            .roots
+            .get_mut("advancenet")
+            .unwrap()
+            .artifact_sha256 = "b".repeat(64);
+        assert_ne!(original, changed_artifact.identity_sha256().unwrap());
+
+        let mut changed_entry = context.clone();
+        changed_entry
+            .roots
+            .get_mut("advancenet")
+            .unwrap()
+            .exports
+            .get_mut("request")
+            .unwrap()
+            .entry = "components/request/v2.ts".into();
+        assert_ne!(original, changed_entry.identity_sha256().unwrap());
     }
 
     #[test]
