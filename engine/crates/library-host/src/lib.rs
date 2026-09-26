@@ -216,7 +216,10 @@ impl LibrarySession {
         Ok(())
     }
 
-    pub fn authorize_host_call(&self, call: &HostCall) -> Result<&CapabilityGrant, LibraryHostError> {
+    pub fn authorize_host_call(
+        &self,
+        call: &HostCall,
+    ) -> Result<&CapabilityGrant, LibraryHostError> {
         if self.state != SessionState::Accepted {
             return Err(LibraryHostError::InvalidState {
                 expected: SessionState::Accepted,
@@ -241,7 +244,9 @@ impl LibrarySession {
                 target: call.target.clone(),
                 operation: call.operation.clone(),
             })?;
-        if !grant.operations.contains(&call.operation) || call.payload.len() > grant.max_request_bytes {
+        if !grant.operations.contains(&call.operation)
+            || call.payload.len() > grant.max_request_bytes
+        {
             return Err(LibraryHostError::CapabilityDenied {
                 capability: call.capability.clone(),
                 target: call.target.clone(),
@@ -355,7 +360,9 @@ pub enum LibraryHostError {
     },
     #[error("Library Protocol mismatch: expected {expected}, got {actual}")]
     ProtocolMismatch { expected: u32, actual: u32 },
-    #[error("Library ABI mismatch: selected {selected}, worker supports {worker_min}..={worker_max}")]
+    #[error(
+        "Library ABI mismatch: selected {selected}, worker supports {worker_min}..={worker_max}"
+    )]
     AbiMismatch {
         selected: u32,
         worker_min: u32,
@@ -422,14 +429,10 @@ mod tests {
     fn session() -> LibrarySession {
         LibrarySession::new(
             expected(),
-            [CapabilityGrant::new(
-                "net:http",
-                "net:http",
-                ["request".to_string()],
-                1024,
-                4096,
-            )
-            .unwrap()],
+            [
+                CapabilityGrant::new("net:http", "net:http", ["request".to_string()], 1024, 4096)
+                    .unwrap(),
+            ],
         )
         .unwrap()
     }
