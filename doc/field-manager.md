@@ -54,11 +54,17 @@ field {
     key = "slug";
 }
 resolve(raw, context) {
-    return math.trim(raw);
+    const slug = math.trim(raw);
+    if (slug == "blocked") {
+        reject("invalid_slug");
+    }
+    return slug;
 }
 ```
 
-The resolver is compiled as REL but remains pure. `regx.test(pattern, value)` keeps ordinary patterns on Rust's linear-time regex engine. `regx.test(value, descriptor)` provides readable validation descriptors (`allow`, `require`, `min`, `max`, `exclude`, `excludeContains`, `noConsecutive`, `ignoreCase`). `regx.raw(pattern)` validates advanced syntax, while `regx.raw(pattern, value)` uses a separately bounded backtracking engine for lookarounds and backreferences. `regx` is a shared REL builtin usable from `.route`, `.module`, `.service`, `server.server`, and `.field`; Field REL remains intentionally restricted to the pure `math` + `regx` capability set.
+The resolver is compiled as REL but remains pure. Executable `.field` resolvers additionally receive the field-only `reject("reason_code")` intrinsic. `reject` takes exactly one bounded reason code (1–128 ASCII bytes; letters, digits, `_`, `-`, `.`, and `:` only) and intentionally terminates resolution as `FLD4003`, which becomes the normal HTTP 400 `field_validation_failed` path. Ordinary evaluator/programming failures are not client validation: they become internal `FLD5002` failures and the HTTP edge returns `field_runtime_failed`. `reject` is not enabled for `.route`, `.module`, `.service`, or `server.server`, and it does not grant any new host capability.
+
+`regx.test(pattern, value)` keeps ordinary patterns on Rust's linear-time regex engine. `regx.test(value, descriptor)` provides readable validation descriptors (`allow`, `require`, `min`, `max`, `exclude`, `excludeContains`, `noConsecutive`, `ignoreCase`). `regx.raw(pattern)` validates advanced syntax, while `regx.raw(pattern, value)` uses a separately bounded backtracking engine for lookarounds and backreferences. `regx` is a shared REL builtin usable from `.route`, `.module`, `.service`, `server.server`, and `.field`; Field REL remains intentionally restricted to the pure `math` + `regx` capability set.
 
 ## Request-time runtime
 
