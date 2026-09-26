@@ -29,6 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           python .github/patches/fld-019-query-identity.py
+          python .github/patches/fld-019-test-fix.py
 
       - name: Format and check route-engine
         working-directory: engine
