@@ -1,4 +1,10 @@
 use anyhow::{bail, Context, Result};
+use rpx::compile_plan::{CompilerPlan, ResolvedCompilerPlan};
+use rpx::compiler_execution::{
+    bun_build, node_check, python_compile, rust_check, typescript_check, CompilerInvocation,
+    CompilerProgram,
+};
+use rpx::toolchain::CompilerResolver;
 use sdk_package::{
     check_package, check_target, CheckedComponent, CheckedPackage, JsRuntime, PackageLanguage,
     PACKAGE_MANIFEST,
@@ -26,6 +32,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    let allow_host_toolchain = take_flag(&mut args, "--allow-host-toolchain");
     let command = args.remove(0);
     match command.as_str() {
         "check" => {
@@ -36,15 +43,15 @@ fn run() -> Result<()> {
         "compile" => {
             if args.first().is_some_and(|value| value == "package") {
                 let target = target_from(&args, 1)?;
-                compile_package(target)?;
+                compile_package(target, allow_host_toolchain)?;
             } else {
                 let target = target_from(&args, 0)?;
-                compile(target)?;
+                compile(target, allow_host_toolchain)?;
             }
         }
         "compile.package" | "package" => {
             let target = target_from(&args, 0)?;
-            compile_package(target)?;
+            compile_package(target, allow_host_toolchain)?;
         }
         "info" => {
             let target = target_from(&args, 0)?;
@@ -54,6 +61,19 @@ fn run() -> Result<()> {
         unknown => bail!("unknown RPX command {unknown:?}"),
     }
     Ok(())
+}
+
+fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
+    let mut found = false;
+    args.retain(|value| {
+        if value == flag {
+            found = true;
+            false
+        } else {
+            true
+        }
+    });
+    found
 }
 
 fn target_from(args: &[String], index: usize) -> Result<PathBuf> {
@@ -67,9 +87,9 @@ fn target_from(args: &[String], index: usize) -> Result<PathBuf> {
     }
 }
 
-fn compile(target: PathBuf) -> Result<()> {
+fn compile(target: PathBuf, allow_host_toolchain: bool) -> Result<()> {
     let package = check_target(&target)?;
-    compile_sources(&package)?;
+    compile_sources(&package, allow_host_toolchain)?;
 
     let cache = package.root.join(".cache").join("rbe").join("build");
     fs::create_dir_all(&cache)?;
@@ -95,9 +115,9 @@ fn compile(target: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn compile_package(target: PathBuf) -> Result<()> {
+fn compile_package(target: PathBuf, allow_host_toolchain: bool) -> Result<()> {
     let package = check_package(&target)?;
-    compile_sources(&package)?;
+    compile_sources(&package, allow_host_toolchain)?;
 
     let dist = package.root.join("dist");
     fs::create_dir_all(&dist)?;
@@ -123,9 +143,20 @@ fn compile_package(target: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn compile_sources(package: &CheckedPackage) -> Result<()> {
+fn compile_sources(package: &CheckedPackage, allow_host_toolchain: bool) -> Result<()> {
     let build_root = package.root.join(".cache").join("rbe").join("compile");
     fs::create_dir_all(&build_root)?;
+
+    let resolver = CompilerResolver::from_project(&package.root, allow_host_toolchain)
+        .context("failed to resolve RPX compiler toolchain")?;
+    println!(
+        "  compiler authority: {}",
+        if resolver.is_managed() {
+            "RBE-managed"
+        } else {
+            "explicit host authoring"
+        }
+    );
 
     for component in &package.components {
         println!(
@@ -133,11 +164,28 @@ fn compile_sources(package: &CheckedPackage) -> Result<()> {
             component.name,
             language_name(component.language)
         );
+        let plan = CompilerPlan::for_component(
+            component.language,
+            package.manifest.package.runtime,
+        )
+        .with_context(|| format!("could not plan compiler for component {:?}", component.name))?
+        .resolve(&resolver)
+        .with_context(|| {
+            format!(
+                "could not resolve compiler tools for component {:?}",
+                component.name
+            )
+        })?;
+
         match component.language {
-            PackageLanguage::Rust => compile_rust(package, component, &build_root)?,
-            PackageLanguage::Javascript => compile_javascript(package, component, &build_root)?,
-            PackageLanguage::Typescript => compile_typescript(package, component, &build_root)?,
-            PackageLanguage::Python => compile_python(component, &build_root)?,
+            PackageLanguage::Rust => compile_rust(package, component, &build_root, &plan)?,
+            PackageLanguage::Javascript => {
+                compile_javascript(package, component, &build_root, &plan)?
+            }
+            PackageLanguage::Typescript => {
+                compile_typescript(package, component, &build_root, &plan)?
+            }
+            PackageLanguage::Python => compile_python(component, &build_root, &plan)?,
             PackageLanguage::Global => {
                 bail!(
                     "component {:?} resolved to global instead of a concrete SDK language",
@@ -153,6 +201,7 @@ fn compile_rust(
     package: &CheckedPackage,
     component: &CheckedComponent,
     build_root: &Path,
+    plan: &ResolvedCompilerPlan,
 ) -> Result<()> {
     let sdk = package.root.join(".rbe").join("sdk").join("rust");
     require_sdk_binding(&sdk, "rust")?;
@@ -176,19 +225,8 @@ fn compile_rust(
     fs::write(work.join("Cargo.toml"), manifest)?;
 
     let manifest_path = work.join("Cargo.toml");
-    let mut command = Command::new("cargo");
-    command
-        .arg("check")
-        .arg("--quiet")
-        .arg("--offline")
-        .arg("--manifest-path")
-        .arg(&manifest_path);
-    run_required(
-        command,
-        "cargo",
-        component,
-        "Rust package checking uses Cargo in offline mode. Install Rust/Cargo and hydrate any required crates before compiling.",
-    )?;
+    let invocation = rust_check(plan, &manifest_path)?;
+    execute_invocation(invocation, component)?;
     Ok(())
 }
 
@@ -196,45 +234,23 @@ fn compile_javascript(
     package: &CheckedPackage,
     component: &CheckedComponent,
     build_root: &Path,
+    plan: &ResolvedCompilerPlan,
 ) -> Result<()> {
     match package.manifest.package.runtime {
         Some(JsRuntime::Node) => {
-            // RBE JavaScript components are modules. `node --check file.js`
-            // inherits Node's package-mode detection and can parse a standalone
-            // .js file as CommonJS, which is not the grammar RPX needs to
-            // validate. Stage the exact bytes as .mjs so Node performs a real
-            // ES-module syntax check without executing package code.
+            // RBE JavaScript components are modules. Stage the exact bytes as
+            // .mjs so Node performs a real ES-module syntax check without
+            // executing package code.
             let out = build_root.join("javascript").join(&component.name);
             recreate_dir(&out)?;
             let staged = out.join(format!("{}.mjs", component.name));
             fs::copy(&component.source, &staged)?;
-
-            let mut command = Command::new("node");
-            command.arg("--check").arg(staged);
-            run_required(
-                command,
-                "node",
-                component,
-                "This JavaScript package declares runtime = \"node\". Install Node.js 20+ or install the RBE-managed Node runtime.",
-            )?;
+            execute_invocation(node_check(plan, &staged)?, component)?;
         }
         Some(JsRuntime::Bun) => {
             let out = build_root.join("javascript").join(&component.name);
             recreate_dir(&out)?;
-            let mut command = Command::new("bun");
-            command
-                .arg("build")
-                .arg(&component.source)
-                .arg("--target=bun")
-                .arg("--external=@rbe/sdk")
-                .arg("--outdir")
-                .arg(&out);
-            run_required(
-                command,
-                "bun",
-                component,
-                "This JavaScript package declares runtime = \"bun\". Install Bun or install the RBE-managed Bun runtime.",
-            )?;
+            execute_invocation(bun_build(plan, &component.source, &out)?, component)?;
         }
         None => bail!(
             "JavaScript component {:?} has no Node/Bun runtime in package.rbe.toml",
@@ -248,6 +264,7 @@ fn compile_typescript(
     package: &CheckedPackage,
     component: &CheckedComponent,
     build_root: &Path,
+    plan: &ResolvedCompilerPlan,
 ) -> Result<()> {
     let sdk = package.root.join(".rbe").join("sdk").join("typescript");
     require_sdk_binding(&sdk, "typescript")?;
@@ -274,81 +291,70 @@ fn compile_typescript(
     let config_path = work.join("tsconfig.rbe.json");
     fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
 
-    let mut command = Command::new("tsc");
-    command
-        .arg("--pretty")
-        .arg("false")
-        .arg("-p")
-        .arg(&config_path);
-    run_required(
-        command,
-        "tsc",
-        component,
-        "TypeScript compilation requires `tsc` on PATH for now. Install TypeScript locally or use an RBE SDK/runtime bundle that provides the TypeScript compiler.",
-    )?;
+    execute_invocation(typescript_check(plan, &config_path)?, component)?;
     Ok(())
 }
 
-fn compile_python(component: &CheckedComponent, build_root: &Path) -> Result<()> {
+fn compile_python(
+    component: &CheckedComponent,
+    build_root: &Path,
+    plan: &ResolvedCompilerPlan,
+) -> Result<()> {
     let pycache = build_root.join("python").join("pycache");
     fs::create_dir_all(&pycache)?;
-
-    let attempts = if cfg!(windows) {
-        vec![
-            ("py", vec!["-3", "-m", "py_compile"]),
-            ("python", vec!["-m", "py_compile"]),
-            ("python3", vec!["-m", "py_compile"]),
-        ]
-    } else {
-        vec![
-            ("python3", vec!["-m", "py_compile"]),
-            ("python", vec!["-m", "py_compile"]),
-        ]
-    };
-
-    let mut missing = true;
-    for (program, args) in attempts {
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .arg(&component.source)
-            .env("PYTHONPYCACHEPREFIX", &pycache);
-        match command.output() {
-            Ok(output) => {
-                missing = false;
-                ensure_success(program, component, output)?;
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if missing {
-        bail!(
-            "compiler not found for component {:?}: Python 3 is required. Install Python or install the RBE-managed Python runtime.",
-            component.name
-        );
-    }
+    execute_invocation(python_compile(plan, &component.source, &pycache)?, component)?;
     Ok(())
 }
 
-fn run_required(
-    mut command: Command,
-    program: &str,
+fn execute_invocation(
+    invocation: CompilerInvocation,
     component: &CheckedComponent,
-    hint: &str,
 ) -> Result<()> {
+    if invocation.network_allowed {
+        bail!("RPX refused compiler invocation with network authority");
+    }
+    if invocation.use_shell {
+        bail!("RPX refused compiler invocation with shell authority");
+    }
+
+    let (mut command, program_name) = match &invocation.program {
+        CompilerProgram::Managed(path) => (
+            Command::new(path),
+            path.to_string_lossy().into_owned(),
+        ),
+        CompilerProgram::HostAuthoring(name) => (Command::new(name), name.clone()),
+    };
+    command
+        .current_dir(&invocation.working_directory)
+        .args(&invocation.args);
+    if invocation.clear_environment {
+        command.env_clear();
+        if cfg!(windows) {
+            for key in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+        } else if let Some(value) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", value);
+        }
+    }
+    command.envs(&invocation.environment);
+
     let output = match command.output() {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             bail!(
-                "compiler not found for component {:?}: `{program}` is not available.\nHINT: {hint}",
-                component.name
+                "compiler not found for component {:?}: resolved tool `{}` could not be launched",
+                component.name,
+                program_name
             )
         }
-        Err(error) => return Err(error).with_context(|| format!("failed to launch {program}")),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to launch {program_name}"))
+        }
     };
-    ensure_success(program, component, output)
+    ensure_success(&program_name, component, output)
 }
 
 fn ensure_success(program: &str, component: &CheckedComponent, output: Output) -> Result<()> {
@@ -530,7 +536,7 @@ fn render_error(error: &anyhow::Error) {
     eprintln!();
     eprintln!("{error:#}");
     eprintln!();
-    eprintln!("HINT : run `rpx check .` for package structure or `rpx compile .` for real compiler checks. Use `rpx compile components/<name>` to compile only one exported component. Every exported component folder must contain <name>.<language-extension>, and the package root must contain {PACKAGE_MANIFEST}.");
+    eprintln!("HINT : run `rpx check .` for package structure or `rpx compile .` for real compiler checks. Managed compilation reads .rbe/rpx-toolchain.json; use --allow-host-toolchain only for explicit local authoring. Use `rpx compile components/<name>` to compile only one exported component. Every exported component folder must contain <name>.<language-extension>, and the package root must contain {PACKAGE_MANIFEST}.");
 }
 
 fn print_help() {
@@ -538,14 +544,15 @@ fn print_help() {
         "RPX — RBE package executor\n\n\
 Usage:\n\
   rpx check [path]\n\
-  rpx compile [path]\n\
-  rpx compile.package [path]\n\
-  rpx compile package [path]\n\
-  rpx package [path]\n\
+  rpx compile [path] [--allow-host-toolchain]\n\
+  rpx compile.package [path] [--allow-host-toolchain]\n\
+  rpx compile package [path] [--allow-host-toolchain]\n\
+  rpx package [path] [--allow-host-toolchain]\n\
   rpx info [path]\n\n\
 `path` defaults to the current directory. RPX walks upward until it finds package.rbe.toml.\n\
 A path inside components/<name>/ checks/compiles only that component.\n\
 `check` validates RBE package/component structure. `compile` additionally invokes the selected language compiler/toolchain.\n\
+Compiler execution is RBE-managed by default through .rbe/rpx-toolchain.json. --allow-host-toolchain is an explicit local-authoring escape hatch and is never an automatic fallback from a partial managed toolchain.\n\
 Package exports are discovered from components/<name>/<name>.<ext>."
     );
 }
