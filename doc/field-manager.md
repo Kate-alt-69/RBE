@@ -130,7 +130,7 @@ Inline and reusable FieldManager names share one per-Route namespace. A collisio
 
 ## Multi-source fields (FLD-004)
 
-FieldManager can resolve from the immutable request snapshot without re-parsing the HTTP request. Query names are decoded at the HTTP boundary and remain scalar identities: the same decoded query name may appear only once. Repeated names (including percent-encoded aliases that decode to the same name) are rejected with HTTP 400 instead of being silently collapsed by first/last-value-wins behavior. Supported declarative sources are:
+FieldManager can resolve from the immutable request snapshot without re-parsing the HTTP request. Query names are decoded at the HTTP boundary and remain scalar identities: the same decoded query name may appear only once. Repeated names (including percent-encoded aliases that decode to the same name) are rejected with HTTP 400 instead of being silently collapsed by first/last-value-wins behavior. Percent escapes must be syntactically complete hexadecimal byte escapes, and decoded query names/values must be valid UTF-8; malformed or lossy identities are rejected with HTTP 400 instead of being replacement-decoded. Supported declarative sources are:
 
 ```text
 query
