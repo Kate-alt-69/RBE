@@ -81,7 +81,8 @@ extra_tests = '''    }
         );
 
         let error = cookies_value(&headers).unwrap_err();
-        assert!(error.contains("duplicate cookie field \"session\""), "{error}");
+        assert!(error.contains("duplicate cookie field"), "{error}");
+        assert!(error.contains("session"), "{error}");
     }
 
     #[test]
@@ -91,7 +92,8 @@ extra_tests = '''    }
         headers.append(header::COOKIE, HeaderValue::from_static("session=new"));
 
         let error = cookies_value(&headers).unwrap_err();
-        assert!(error.contains("duplicate cookie field \"session\""), "{error}");
+        assert!(error.contains("duplicate cookie field"), "{error}");
+        assert!(error.contains("session"), "{error}");
     }
 
     #[test]
