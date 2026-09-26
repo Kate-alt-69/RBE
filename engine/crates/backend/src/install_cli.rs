@@ -2,15 +2,17 @@
 //!
 //! Named installs resolve registry metadata, stage and verify every selected
 //! artifact, inspect package manifests, construct an exact root-scoped lock
-//! candidate, and durably promote verified artifacts into the content-addressed
-//! project cache before normal Backend boot. The executable still refuses to
-//! claim installation success until preparation/build, attestation, and durable
-//! session activation complete.
+//! candidate, durably promote verified artifacts into the content-addressed
+//! project cache, and build a non-mutating merged project target before normal
+//! Backend boot. The executable still refuses to claim installation success
+//! until preparation/build, attestation, and durable session activation complete.
 
 use std::path::Path;
 
 use rbe_install_request::{InstallCommand, InstallTarget};
-use rbe_install_runtime::{promote_verified_graph, stage_resolved_root, RegistryClient};
+use rbe_install_runtime::{
+    load_named_install_target, promote_verified_graph, stage_resolved_root, RegistryClient,
+};
 use rbe_library_resolver::{resolve_scoped, ResolutionRequest};
 
 const REGISTRY_ENV: &str = "RBE_PACKAGE_REGISTRY";
@@ -40,10 +42,11 @@ Registry configuration:
 Current execution boundary:
   Named-package registry hydration, deterministic dependency resolution,
   verified artifact staging, manifest inspection, exact root-scoped lock
-  candidate construction, and durable content-addressed artifact promotion are
-  active before Backend boot. Package preparation/build, attestation,
-  install-session activation, and package.lock.rbe.yaml commit remain gated, so
-  a promoted graph exits unavailable instead of claiming installation success."#;
+  construction, durable content-addressed artifact promotion, and safe merge
+  with the existing project manifest/lock are active before Backend boot.
+  Package preparation/build, attestation, install-session activation, and the
+  final package.rbe.yaml/package.lock.rbe.yaml commit remain gated, so a
+  prepared project target exits unavailable instead of claiming success."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCliFailure {
@@ -210,9 +213,14 @@ async fn resolve_named_async(
             "promote verified package graph for `{key}` failed: {error}"
         ))
     })?;
-    let root = graph.lock.packages.get(key).ok_or_else(|| {
+    let target = load_named_install_target(project_root, key, requirement, &graph).map_err(|error| {
+        InstallCliFailure::unavailable(format!(
+            "construct safe project install target for `{key}` failed: {error}"
+        ))
+    })?;
+    let root = target.lock.packages.get(key).ok_or_else(|| {
         InstallCliFailure::software(format!(
-            "verified lock candidate contains no root package `{key}`"
+            "merged project target contains no root package `{key}`"
         ))
     })?;
     let root_stage = graph.packages.get(key).ok_or_else(|| {
@@ -229,7 +237,7 @@ async fn resolve_named_async(
 
     let message = if json {
         serde_json::json!({
-            "status": "promoted_lock_candidate_not_activated",
+            "status": "merged_project_target_not_activated",
             "package": key,
             "version": root.version,
             "dependencies": dependencies,
@@ -245,22 +253,28 @@ async fn resolve_named_async(
                 "size_bytes": root_stage.stage.verified.size_bytes,
                 "manifest_sha256": root.manifest_sha256,
             },
-            "root_graph_complete": graph.lock.root_graph_complete(key),
+            "project_target": {
+                "roots": target.lock.packages.len(),
+                "manifest_sha256": target.manifest_sha256,
+                "lock_sha256": target.lock_sha256,
+            },
+            "root_graph_complete": target.lock.root_graph_complete(key),
             "registry": registry,
             "server_started": false,
+            "project_manifest_changed": false,
             "project_lock_changed": false,
             "next_boundary": "package preparation/build, attestation, and durable session activation"
         })
         .to_string()
     } else if quiet {
         format!(
-            "`{key}` {} and {dependencies} dependenc{} verified and cached; durable activation is not connected yet",
+            "`{key}` {} and {dependencies} dependenc{} verified and cached; safe project target built, durable activation is not connected yet",
             root.version,
             if dependencies == 1 { "y" } else { "ies" },
         )
     } else {
         format!(
-            "`backend install` verified and cached the complete `{key}` {} root graph: {} package(s), {verified_bytes} byte(s).\ncache: {} published, {} reused\nroot artifact: {}\nartifact sha256: {}\nmanifest sha256: {}\n\nAll selected registry artifacts were staged, hash-verified, inspected, converted into a complete root/private lock candidate, and durably promoted into the content-addressed project cache. Package preparation/build, attestation, and install-session activation are not connected to backend.exe yet. No RBE server was started and package.lock.rbe.yaml was not changed.",
+            "`backend install` verified and cached the complete `{key}` {} root graph: {} package(s), {verified_bytes} byte(s).\ncache: {} published, {} reused\nroot artifact: {}\nartifact sha256: {}\nmanifest sha256: {}\nproject target roots: {}\nproject manifest sha256: {}\nproject lock sha256: {}\n\nThe requested root/private graph was safely merged with the existing project state without mutating package.rbe.yaml or package.lock.rbe.yaml. Package preparation/build, attestation, and install-session activation are not connected to backend.exe yet. No RBE server was started and no project package state was changed.",
             root.version,
             graph.packages.len(),
             promotion.published,
@@ -268,6 +282,9 @@ async fn resolve_named_async(
             root.artifact_url,
             root.artifact_sha256,
             root.manifest_sha256,
+            target.lock.packages.len(),
+            target.manifest_sha256,
+            target.lock_sha256,
         )
     };
 
