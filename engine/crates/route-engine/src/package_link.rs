@@ -12,6 +12,9 @@ use std::path::{Component, Path};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
+use crate::ast::ImportTarget;
+use crate::modules::binding_name;
+
 pub const PACKAGE_LINK_FORMAT: u32 = 1;
 const PACKAGE_LINK_IDENTITY_DOMAIN: &[u8] = b"RBE_PACKAGE_LINK_CONTEXT_V1";
 
@@ -174,6 +177,28 @@ impl PackageLinkContext {
 
     pub fn root(&self, package: &str) -> Option<&PackageRootLink> {
         self.roots.get(package)
+    }
+
+    /// Resolve one parsed REL import into its verified package-export identity.
+    /// Built-ins, local modules and services return `Ok(None)`; only non-crypto
+    /// `X from Y` imports are treated as package exports. Aliases affect the
+    /// local binding name only and never the package/export authority.
+    pub fn resolve_import(
+        &self,
+        import: &ImportTarget,
+    ) -> Result<Option<(String, ResolvedPackageExport<'_>)>, PackageLinkError> {
+        let base = match import {
+            ImportTarget::Aliased { target, .. } => target.as_ref(),
+            other => other,
+        };
+        let ImportTarget::BuiltinSubLibrary { module, library } = base else {
+            return Ok(None);
+        };
+        if module == "crypto" {
+            return Ok(None);
+        }
+        let resolved = self.resolve(module, library)?;
+        Ok(Some((binding_name(import), resolved)))
     }
 
     /// Resolve only an explicit root package export. The returned public error
@@ -469,6 +494,61 @@ mod tests {
             .to_string();
         assert!(missing_root.starts_with("PACKAGE_EXPORT_NOT_FOUND:"));
         assert!(missing_export.starts_with("PACKAGE_EXPORT_NOT_FOUND:"));
+    }
+
+    #[test]
+    fn import_resolution_preserves_alias_and_verified_identity() {
+        let context = context();
+        let import = ImportTarget::Aliased {
+            target: Box::new(ImportTarget::BuiltinSubLibrary {
+                module: "advancenet".into(),
+                library: "request".into(),
+            }),
+            alias: "client".into(),
+        };
+        let (binding, resolved) = context
+            .resolve_import(&import)
+            .unwrap()
+            .expect("package import should resolve");
+        assert_eq!(binding, "client");
+        assert_eq!(resolved.package, "advancenet");
+        assert_eq!(resolved.version, "2.0.0");
+        assert_eq!(resolved.artifact_sha256, "a".repeat(64));
+        assert_eq!(resolved.export, "request");
+        assert_eq!(resolved.entry, "components/request/request.ts");
+        assert_eq!(resolved.language, "typescript");
+    }
+
+    #[test]
+    fn import_resolution_does_not_reclassify_crypto_or_normal_imports() {
+        let context = context();
+        let crypto = ImportTarget::BuiltinSubLibrary {
+            module: "crypto".into(),
+            library: "argon".into(),
+        };
+        assert!(context.resolve_import(&crypto).unwrap().is_none());
+        assert!(context
+            .resolve_import(&ImportTarget::Builtin("net".into()))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn import_resolution_uses_same_non_disclosing_error_for_missing_root_or_export() {
+        let context = context();
+        for import in [
+            ImportTarget::BuiltinSubLibrary {
+                module: "missing-package".into(),
+                library: "request".into(),
+            },
+            ImportTarget::BuiltinSubLibrary {
+                module: "advancenet".into(),
+                library: "hidden".into(),
+            },
+        ] {
+            let error = context.resolve_import(&import).unwrap_err().to_string();
+            assert!(error.starts_with("PACKAGE_EXPORT_NOT_FOUND:"));
+        }
     }
 
     #[test]
