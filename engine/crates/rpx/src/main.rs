@@ -326,6 +326,16 @@ fn execute_invocation(invocation: CompilerInvocation, component: &CheckedCompone
         }
         CompilerProgram::HostAuthoring(name) => (Command::new(name), name.clone()),
     };
+
+    for input in &invocation.managed_inputs {
+        verify_managed_program(&input.path, &input.sha256).with_context(|| {
+            format!(
+                "refused RBE-managed compiler input {:?} because its pinned identity no longer matches",
+                input.tool
+            )
+        })?;
+    }
+
     command
         .current_dir(&invocation.working_directory)
         .args(&invocation.args);

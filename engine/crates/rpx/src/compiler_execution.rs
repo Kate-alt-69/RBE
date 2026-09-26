@@ -14,12 +14,24 @@ use std::path::{Path, PathBuf};
 pub struct CompilerInvocation {
     pub tool: &'static str,
     pub program: CompilerProgram,
+    /// Managed compiler inputs that are not the process executable itself but
+    /// still gain execution authority through it (for example `rustc` passed to
+    /// Cargo or `tsc.js` passed to Node/Bun). These identities must be verified
+    /// immediately before the primary process is created.
+    pub managed_inputs: Vec<ManagedCompilerInput>,
     pub args: Vec<String>,
     pub working_directory: PathBuf,
     pub clear_environment: bool,
     pub environment: BTreeMap<String, String>,
     pub network_allowed: bool,
     pub use_shell: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCompilerInput {
+    pub tool: &'static str,
+    pub path: PathBuf,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,12 +61,23 @@ impl CompilerInvocation {
         Self {
             tool: tool.name,
             program: CompilerProgram::from(&tool.compiler),
+            managed_inputs: Vec::new(),
             args,
             working_directory: working_directory.into(),
             clear_environment: matches!(tool.compiler, ResolvedCompiler::Managed { .. }),
             environment: BTreeMap::new(),
             network_allowed: false,
             use_shell: false,
+        }
+    }
+
+    fn require_managed_input(&mut self, tool: &ResolvedCompilerTool) {
+        if let ResolvedCompiler::Managed { path, sha256 } = &tool.compiler {
+            self.managed_inputs.push(ManagedCompilerInput {
+                tool: tool.name,
+                path: path.clone(),
+                sha256: sha256.clone(),
+            });
         }
     }
 }
@@ -81,6 +104,7 @@ pub fn rust_check(
             manifest_path.to_string_lossy().into_owned(),
         ],
     );
+    invocation.require_managed_input(rustc);
     invocation
         .environment
         .insert("RUSTC".into(), compiler_program_value(&rustc.compiler)?);
@@ -168,11 +192,10 @@ pub fn typescript_check(
                     .ok_or(CompilerExecutionError::NonUtf8ManagedProgram)?,
             );
             runtime_arguments.extend(arguments);
-            Ok(CompilerInvocation::from_tool(
-                runtime,
-                working_directory,
-                runtime_arguments,
-            ))
+            let mut invocation =
+                CompilerInvocation::from_tool(runtime, working_directory, runtime_arguments);
+            invocation.require_managed_input(tsc);
+            Ok(invocation)
         }
         ResolvedCompiler::HostAuthoring(_) => Ok(CompilerInvocation::from_tool(
             tsc,
@@ -312,6 +335,14 @@ mod tests {
                 sha256: HASH_A.into(),
             }
         );
+        assert_eq!(
+            invocation.managed_inputs,
+            vec![ManagedCompilerInput {
+                tool: "rustc",
+                path: PathBuf::from("/opt/rbe/rust/bin/rustc"),
+                sha256: HASH_B.into(),
+            }]
+        );
         assert!(invocation.args.contains(&"--offline".to_string()));
         assert_eq!(
             invocation.environment.get("RUSTC").map(String::as_str),
@@ -346,6 +377,7 @@ mod tests {
                 sha256: HASH_A.into(),
             }
         );
+        assert!(invocation.managed_inputs.is_empty());
         assert_eq!(invocation.args[0], "--check");
         assert!(invocation.clear_environment);
     }
@@ -364,6 +396,7 @@ mod tests {
         };
         let invocation = node_check(&plan, "/tmp/check/hello.mjs").unwrap();
         assert!(!invocation.clear_environment);
+        assert!(invocation.managed_inputs.is_empty());
         assert_eq!(
             invocation.program,
             CompilerProgram::HostAuthoring("node".into())
@@ -371,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_typescript_runs_tsc_through_declared_runtime() {
+    fn managed_typescript_runs_tsc_through_declared_runtime_and_pins_entry() {
         let resolver = managed(&format!(
             r#"{{"format":2,"tools":{{"node":{{"path":"/opt/rbe/node/bin/node","sha256":"{HASH_A}"}},"tsc":{{"path":"/opt/rbe/typescript/lib/tsc.js","sha256":"{HASH_B}"}}}}}}"#
         ));
@@ -386,6 +419,14 @@ mod tests {
                 path: PathBuf::from("/opt/rbe/node/bin/node"),
                 sha256: HASH_A.into(),
             }
+        );
+        assert_eq!(
+            invocation.managed_inputs,
+            vec![ManagedCompilerInput {
+                tool: "tsc",
+                path: PathBuf::from("/opt/rbe/typescript/lib/tsc.js"),
+                sha256: HASH_B.into(),
+            }]
         );
         assert_eq!(invocation.args[0], "/opt/rbe/typescript/lib/tsc.js");
         assert!(invocation.clear_environment);
@@ -408,6 +449,7 @@ mod tests {
                 .map(String::as_str),
             Some("/tmp/cache/pycache")
         );
+        assert!(invocation.managed_inputs.is_empty());
         assert_eq!(invocation.args[..2], ["-m", "py_compile"]);
     }
 
