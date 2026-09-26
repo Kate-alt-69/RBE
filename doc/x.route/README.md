@@ -60,7 +60,7 @@ request.contentType
 request.contentLength
 ```
 
-JSON bodies are decoded to REL values. Other current v1 body types are exposed as strings. Invalid JSON returns HTTP 400 and configured body-limit violations return HTTP 413 before REL execution.
+JSON bodies are decoded to REL values. Other current v1 body types are exposed as UTF-8 strings; invalid UTF-8 returns HTTP 400 rather than being replacement-decoded. Invalid JSON returns HTTP 400 and configured body-limit violations return HTTP 413 before REL execution. Route REL v1 has no first-class binary request-body value type.
 
 Forwarded client/protocol data is trusted only when `trustedProxyHeaders` policy is enabled. Otherwise `request.ip` is derived from the socket peer.
 
