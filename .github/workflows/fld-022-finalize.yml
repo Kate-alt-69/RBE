@@ -36,15 +36,15 @@ jobs:
         run: |
           cargo fmt --all
           cargo fmt --all -- --check
-          cargo check -p route-engine --locked
+          cargo check -p route-engine
 
       - name: Clippy route-engine
         working-directory: engine
-        run: cargo clippy -p route-engine --all-targets --locked -- -D warnings
+        run: cargo clippy -p route-engine --all-targets -- -D warnings
 
       - name: Test route-engine
         working-directory: engine
-        run: cargo test -p route-engine --locked
+        run: cargo test -p route-engine
 
       - name: Commit verified FLD-022 source
         run: |
