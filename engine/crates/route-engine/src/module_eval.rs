@@ -15,6 +15,7 @@ use crate::module_runtime::ModuleProgram;
 use crate::modules::{binding_name, ModuleRegistry};
 
 const MAX_MODULE_CALL_DEPTH: usize = 64;
+const MAX_FIELD_REJECTION_REASON_BYTES: usize = 128;
 
 type EvalFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ModuleEvalError>> + Send + 'a>>;
 type FlowFuture<'a> = Pin<Box<dyn Future<Output = Result<Flow, ModuleEvalError>> + Send + 'a>>;
@@ -87,6 +88,7 @@ pub struct ModuleExecutor<'a> {
     services: Option<Arc<dyn ServiceCaller>>,
     host_capabilities: Option<Arc<dyn HostCapabilityCaller>>,
     classes: Arc<HashMap<String, ServiceClassDef>>,
+    field_reject_enabled: bool,
 }
 
 impl<'a> ModuleExecutor<'a> {
@@ -96,7 +98,14 @@ impl<'a> ModuleExecutor<'a> {
             services: None,
             host_capabilities: None,
             classes: Arc::new(HashMap::new()),
+            field_reject_enabled: false,
         }
+    }
+
+    pub(crate) fn for_field_resolver(program: &'a ModuleProgram) -> Self {
+        let mut executor = Self::new(program);
+        executor.field_reject_enabled = true;
+        executor
     }
 
     pub fn with_services(program: &'a ModuleProgram, services: ServiceManager) -> Self {
@@ -113,6 +122,7 @@ impl<'a> ModuleExecutor<'a> {
             services: Some(Arc::new(services)),
             host_capabilities: Some(host_capabilities),
             classes: Arc::new(HashMap::new()),
+            field_reject_enabled: false,
         }
     }
 
@@ -125,6 +135,7 @@ impl<'a> ModuleExecutor<'a> {
             services: Some(services),
             host_capabilities: None,
             classes: Arc::new(HashMap::new()),
+            field_reject_enabled: false,
         }
     }
 
@@ -137,6 +148,7 @@ impl<'a> ModuleExecutor<'a> {
             services: None,
             host_capabilities: Some(host_capabilities),
             classes: Arc::new(HashMap::new()),
+            field_reject_enabled: false,
         }
     }
 
@@ -150,6 +162,7 @@ impl<'a> ModuleExecutor<'a> {
             services: None,
             host_capabilities: Some(host_capabilities),
             classes,
+            field_reject_enabled: false,
         }
     }
 
@@ -164,7 +177,40 @@ impl<'a> ModuleExecutor<'a> {
             services: Some(Arc::new(services)),
             host_capabilities: Some(host_capabilities),
             classes,
+            field_reject_enabled: false,
         }
+    }
+
+    fn reject_field_request(&self, args: &[Value]) -> Result<Value, ModuleEvalError> {
+        if args.len() != 1 {
+            return Err(ModuleEvalError::new(
+                "FLD5002",
+                format!(
+                    "field reject() expects exactly one reason string, got {} argument(s)",
+                    args.len()
+                ),
+            ));
+        }
+        let Value::String(reason) = &args[0] else {
+            return Err(ModuleEvalError::new(
+                "FLD5002",
+                "field reject() reason must be a string",
+            ));
+        };
+        let valid_reason = !reason.is_empty()
+            && reason.len() <= MAX_FIELD_REJECTION_REASON_BYTES
+            && reason.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            });
+        if !valid_reason {
+            return Err(ModuleEvalError::new(
+                "FLD5002",
+                format!(
+                    "field reject() reason must be 1..={MAX_FIELD_REJECTION_REASON_BYTES} bytes and contain only ASCII letters, digits, `_`, `-`, `.`, or `:`"
+                ),
+            ));
+        }
+        Err(ModuleEvalError::new("FLD4003", reason.clone()))
     }
 
     async fn call_host_capability(
@@ -579,6 +625,13 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                     }
 
                     if let Expr::Ident(name) = callee.as_ref() {
+                        if name == "reject"
+                            && self.executor.field_reject_enabled
+                            && !self.scope.contains_key(name)
+                            && !self.is_import_binding(name)
+                        {
+                            return self.executor.reject_field_request(&args);
+                        }
                         if let Some((module, function)) = self.builtin_functions.get(name).cloned()
                         {
                             if let Some(value) = self

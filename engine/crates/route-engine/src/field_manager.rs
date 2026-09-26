@@ -303,15 +303,23 @@ async fn resolve_field_file(
         functions: Vec::new(),
         exports: Vec::new(),
     });
-    ModuleExecutor::new(program)
+    ModuleExecutor::for_field_resolver(program)
         .call_inline_definition(synthetic, resolver, args)
         .await
         .map_err(|error| {
-            resolve_error(
-                "FLD4003",
-                resolver_name,
-                format!("Field resolver rejected the request: {}", error.message),
-            )
+            if error.code == "FLD4003" {
+                resolve_error(
+                    "FLD4003",
+                    resolver_name,
+                    format!("Field resolver rejected the request: {}", error.message),
+                )
+            } else {
+                resolve_error(
+                    "FLD5002",
+                    resolver_name,
+                    format!("Field resolver execution failed internally: {error}"),
+                )
+            }
         })
 }
 
@@ -1399,6 +1407,81 @@ class Route {{ get(req) {{ return req.fields; }} }}"#
                 error.message
             );
         }
+    }
+
+    #[test]
+    fn executable_field_reject_is_client_validation() {
+        let file = field(
+            r#":field[source = query, key = "username"]
+               resolve(raw) {
+                   if (raw == "bad") {
+                       reject("invalid_username");
+                   }
+                   return raw;
+               }"#,
+        );
+        let program = empty_program("explicit-reject");
+        let error = block_on_ready(resolve_field_file(
+            &file,
+            &request(&[("username", "bad")]),
+            &program,
+            "username",
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, "FLD4003");
+        assert_eq!(error.field, "username");
+        assert!(error.message.contains("invalid_username"));
+
+        let accepted = block_on_ready(resolve_field_file(
+            &file,
+            &request(&[("username", "good")]),
+            &program,
+            "username",
+        ))
+        .unwrap();
+        assert!(matches!(accepted, Value::String(value) if value == "good"));
+    }
+
+    #[test]
+    fn executable_field_evaluator_fault_is_internal() {
+        let file = field(
+            r#":field[source = query, key = "username"]
+               resolve(raw) {
+                   missing(raw);
+                   return raw;
+               }"#,
+        );
+        let program = empty_program("resolver-fault");
+        let error = block_on_ready(resolve_field_file(
+            &file,
+            &request(&[("username", "bad")]),
+            &program,
+            "username",
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, "FLD5002");
+        assert!(error.message.contains("MOD3201"));
+    }
+
+    #[test]
+    fn malformed_field_reject_is_internal() {
+        let file = field(
+            r#":field[source = query, key = "username"]
+               resolve(raw) {
+                   reject("not a reason code");
+                   return raw;
+               }"#,
+        );
+        let program = empty_program("malformed-reject");
+        let error = block_on_ready(resolve_field_file(
+            &file,
+            &request(&[("username", "bad")]),
+            &program,
+            "username",
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, "FLD5002");
+        assert!(error.message.contains("reject() reason"));
     }
 
     #[test]
