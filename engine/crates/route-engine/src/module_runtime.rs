@@ -733,11 +733,11 @@ mod tests {
         )
         .expect("RELC should link the explicit package root");
 
-        let program = ModuleProgram::from_runtime_image_with_services(
-            &image,
-            &ServiceInterfaces::new(),
-        )
-        .expect("linked Runtime Image must not be rejected as an unknown builtin sub-library");
+        let program =
+            ModuleProgram::from_runtime_image_with_services(&image, &ServiceInterfaces::new())
+                .expect(
+                    "linked Runtime Image must not be rejected as an unknown builtin sub-library",
+                );
         assert_eq!(program.len(), 1);
     }
 
