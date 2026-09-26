@@ -725,10 +725,10 @@ mod tests {
     #[test]
     fn artifact_identity_drift_rejects_worker() {
         let mut session = session();
-        let mut hello = hello();
-        hello.package.artifact_sha256 = "b".repeat(64);
+        let mut probe = hello();
+        probe.package.artifact_sha256 = "b".repeat(64);
         assert!(matches!(
-            session.accept_hello(&hello()),
+            session.accept_hello(&probe),
             Err(LibraryHostError::IdentityMismatch)
         ));
     }
