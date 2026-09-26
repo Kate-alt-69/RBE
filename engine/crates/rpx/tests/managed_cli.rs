@@ -86,7 +86,7 @@ fn compile_executes_exact_managed_program_with_cleared_environment() {
     fs::write(
         &fake_node,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nif [ -n \"$PATH\" ]; then printf 'PATH=%s\\n' \"$PATH\" >> '{}'; fi\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nif [ -n \"$RPX_TEST_HOST_SENTINEL\" ]; then printf 'SENTINEL=%s\\n' \"$RPX_TEST_HOST_SENTINEL\" >> '{}'; fi\nexit 0\n",
             marker.display(),
             marker.display()
         ),
@@ -106,7 +106,12 @@ fn compile_executes_exact_managed_program_with_cleared_environment() {
     )
     .unwrap();
 
-    let output = compile(&root, &[]);
+    let output = Command::new(rpx())
+        .arg("compile")
+        .arg(root.join("components/hello"))
+        .env("RPX_TEST_HOST_SENTINEL", "must-not-leak")
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -114,6 +119,6 @@ fn compile_executes_exact_managed_program_with_cleared_environment() {
     );
     let invocation = fs::read_to_string(&marker).unwrap();
     assert!(invocation.contains("--check"));
-    assert!(!invocation.contains("PATH="));
+    assert!(!invocation.contains("SENTINEL="));
     fs::remove_dir_all(root).unwrap();
 }
