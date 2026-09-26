@@ -123,13 +123,7 @@ pub fn load_named_install_target(
     let layout = ProjectCacheLayout::new(project_root);
     let manifest = read_optional_manifest(&layout.manifest_path())?.unwrap_or_default();
     let lock = read_optional_lock(&layout.lock_path())?.unwrap_or_default();
-    merge_named_install_target(
-        manifest,
-        lock,
-        requested_root,
-        requested_requirement,
-        graph,
-    )
+    merge_named_install_target(manifest, lock, requested_root, requested_requirement, graph)
 }
 
 fn read_optional_manifest(
@@ -236,14 +230,9 @@ mod tests {
         let mut lock = ProjectPackageLock::default();
         lock.packages.insert("alpha".into(), locked("1.0.0", None));
 
-        let target = merge_named_install_target(
-            manifest,
-            lock,
-            "beta",
-            "^2",
-            &graph("beta", "2.4.0"),
-        )
-        .unwrap();
+        let target =
+            merge_named_install_target(manifest, lock, "beta", "^2", &graph("beta", "2.4.0"))
+                .unwrap();
 
         assert_eq!(target.lock.packages.len(), 2);
         assert_eq!(target.lock.packages["alpha"].version, "1.0.0");
@@ -289,14 +278,9 @@ mod tests {
         let manifest = ProjectPackageManifest::default();
         let mut lock = ProjectPackageLock::default();
         lock.packages.insert("stale".into(), locked("9.0.0", None));
-        let target = merge_named_install_target(
-            manifest,
-            lock,
-            "beta",
-            "2.0.0",
-            &graph("beta", "2.0.0"),
-        )
-        .unwrap();
+        let target =
+            merge_named_install_target(manifest, lock, "beta", "2.0.0", &graph("beta", "2.0.0"))
+                .unwrap();
         assert!(!target.lock.packages.contains_key("stale"));
         assert!(target.lock.packages.contains_key("beta"));
     }
