@@ -60,6 +60,25 @@ pub trait HostCapabilityCaller: Send + Sync {
     ) -> HostCapabilityFuture<'a>;
 }
 
+pub type PackageCallFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+
+/// Trusted bridge for a REL package export namespace such as
+/// `:import[request from advancenet]` followed by `request.get(...)`.
+///
+/// The evaluator carries only logical package/export/operation identity and REL
+/// values. Artifact paths, runtime executables and worker handles remain owned
+/// by the host implementation behind this trait.
+pub trait PackageExportCaller: Send + Sync {
+    fn call<'a>(
+        &'a self,
+        package: &'a str,
+        export: &'a str,
+        operation: &'a str,
+        args: Vec<Value>,
+    ) -> PackageCallFuture<'a>;
+}
+
 #[derive(Debug, Clone)]
 pub struct ModuleEvalError {
     pub code: &'static str,
@@ -87,6 +106,7 @@ pub struct ModuleExecutor<'a> {
     program: &'a ModuleProgram,
     services: Option<Arc<dyn ServiceCaller>>,
     host_capabilities: Option<Arc<dyn HostCapabilityCaller>>,
+    package_exports: Option<Arc<dyn PackageExportCaller>>,
     classes: Arc<HashMap<String, ServiceClassDef>>,
     field_reject_enabled: bool,
 }
@@ -97,6 +117,7 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: None,
             host_capabilities: None,
+            package_exports: None,
             classes: Arc::new(HashMap::new()),
             field_reject_enabled: false,
         }
@@ -121,6 +142,7 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: Some(Arc::new(services)),
             host_capabilities: Some(host_capabilities),
+            package_exports: None,
             classes: Arc::new(HashMap::new()),
             field_reject_enabled: false,
         }
@@ -134,6 +156,7 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: Some(services),
             host_capabilities: None,
+            package_exports: None,
             classes: Arc::new(HashMap::new()),
             field_reject_enabled: false,
         }
@@ -147,9 +170,18 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: None,
             host_capabilities: Some(host_capabilities),
+            package_exports: None,
             classes: Arc::new(HashMap::new()),
             field_reject_enabled: false,
         }
+    }
+
+    pub fn with_package_export_caller(
+        mut self,
+        package_exports: Arc<dyn PackageExportCaller>,
+    ) -> Self {
+        self.package_exports = Some(package_exports);
+        self
     }
 
     pub(crate) fn with_host_capabilities_and_classes(
@@ -161,6 +193,7 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: None,
             host_capabilities: Some(host_capabilities),
+            package_exports: None,
             classes,
             field_reject_enabled: false,
         }
@@ -176,6 +209,7 @@ impl<'a> ModuleExecutor<'a> {
             program,
             services: Some(Arc::new(services)),
             host_capabilities: Some(host_capabilities),
+            package_exports: None,
             classes,
             field_reject_enabled: false,
         }
@@ -279,6 +313,32 @@ impl<'a> ModuleExecutor<'a> {
                 )
             })?;
         value_from_json(value)
+    }
+
+    async fn call_package_export(
+        &self,
+        package: &str,
+        export: &str,
+        operation: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, ModuleEvalError> {
+        let package_exports = self.package_exports.as_ref().ok_or_else(|| {
+            ModuleEvalError::new(
+                "MOD3600",
+                format!(
+                    "package runtime is unavailable while calling {export}.{operation} from {package}"
+                ),
+            )
+        })?;
+        package_exports
+            .call(package, export, operation, args)
+            .await
+            .map_err(|message| {
+                ModuleEvalError::new(
+                    "MOD3601",
+                    format!("package {export}.{operation} from {package} failed: {message}"),
+                )
+            })
     }
 
     async fn call_class_method(
@@ -428,6 +488,7 @@ struct Frame<'exec, 'program> {
     modules: ModuleRegistry,
     builtin_modules: HashMap<String, String>,
     builtin_functions: HashMap<String, (String, String)>,
+    package_modules: HashMap<String, (String, String)>,
     custom_modules: HashMap<String, String>,
     custom_functions: HashMap<String, (String, String)>,
     service_modules: HashMap<String, String>,
@@ -447,6 +508,7 @@ impl<'exec, 'program> Frame<'exec, 'program> {
         let modules = ModuleRegistry::from_imports(&file.imports);
         let mut builtin_modules = HashMap::new();
         let mut builtin_functions = HashMap::new();
+        let mut package_modules = HashMap::new();
         let mut custom_modules = HashMap::new();
         let mut custom_functions = HashMap::new();
         let mut service_modules = HashMap::new();
@@ -464,7 +526,11 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                         builtin_functions.insert(binding, (module.clone(), function.clone()));
                     }
                 }
-                ImportTarget::BuiltinSubLibrary { .. } => {}
+                ImportTarget::BuiltinSubLibrary { module, library } => {
+                    if module != "crypto" {
+                        package_modules.insert(binding, (module.clone(), library.clone()));
+                    }
+                }
                 ImportTarget::Custom(path) => {
                     custom_modules.insert(binding, path.clone());
                 }
@@ -486,6 +552,7 @@ impl<'exec, 'program> Frame<'exec, 'program> {
             modules,
             builtin_modules,
             builtin_functions,
+            package_modules,
             custom_modules,
             custom_functions,
             service_modules,
@@ -711,7 +778,14 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                                     return Ok(value);
                                 }
                             }
-
+                            if let Some((package, export)) =
+                                self.package_modules.get(module_name).cloned()
+                            {
+                                return self
+                                    .executor
+                                    .call_package_export(&package, &export, function_name, args)
+                                    .await;
+                            }
                             if let Some(service) = self.service_modules.get(module_name).cloned() {
                                 return self
                                     .executor
@@ -1020,6 +1094,92 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[derive(Default)]
+    struct FakePackages {
+        calls: std::sync::Mutex<Vec<(String, String, String, Vec<Value>)>>,
+    }
+
+    impl PackageExportCaller for FakePackages {
+        fn call<'a>(
+            &'a self,
+            package: &'a str,
+            export: &'a str,
+            operation: &'a str,
+            args: Vec<Value>,
+        ) -> PackageCallFuture<'a> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((
+                    package.to_string(),
+                    export.to_string(),
+                    operation.to_string(),
+                    args,
+                ));
+                Ok(Value::String(format!(
+                    "{package}:{export}:{operation}"
+                )))
+            })
+        }
+    }
+
+    fn package_inline_file() -> Arc<ModuleFile> {
+        Arc::new(ModuleFile {
+            imports: vec![ImportTarget::BuiltinSubLibrary {
+                module: "advancenet".into(),
+                library: "request".into(),
+            }],
+            functions: vec![FunctionDef {
+                name: "\0package-test".into(),
+                params: Vec::new(),
+                body: vec![Statement::Return(Expr::Call(
+                    Box::new(Expr::Member(
+                        Box::new(Expr::Ident("request".into())),
+                        "get".into(),
+                    )),
+                    vec![Expr::String("https://example.com".into())],
+                ))],
+            }],
+            exports: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn linked_package_namespace_dispatches_export_operation_to_host() {
+        let root = root();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let caller = Arc::new(FakePackages::default());
+        let executor =
+            ModuleExecutor::new(&program).with_package_export_caller(caller.clone());
+        let value = block_on_ready(executor.call_inline(
+            package_inline_file(),
+            "\0package-test",
+            Vec::new(),
+        ))
+        .unwrap();
+        assert!(matches!(value, Value::String(value) if value == "advancenet:request:get"));
+        let calls = caller.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "advancenet");
+        assert_eq!(calls[0].1, "request");
+        assert_eq!(calls[0].2, "get");
+        assert!(matches!(calls[0].3.as_slice(), [Value::String(value)] if value == "https://example.com"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linked_package_call_without_host_is_explicit() {
+        let root = root();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let executor = ModuleExecutor::new(&program);
+        let error = block_on_ready(executor.call_inline(
+            package_inline_file(),
+            "\0package-test",
+            Vec::new(),
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, "MOD3600");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
