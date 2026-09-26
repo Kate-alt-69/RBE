@@ -304,20 +304,49 @@ fn headers_value(headers: &HeaderMap) -> Value {
 
 fn cookies_value(headers: &HeaderMap) -> Value {
     let mut cookies = HashMap::new();
-    if let Some(raw) = headers
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
+    for raw in headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
     {
         for part in raw.split(';') {
             let Some((name, value)) = part.trim().split_once('=') else {
                 continue;
             };
             if !name.is_empty() {
+                // Cookie header field-lines are processed in HeaderMap order.
+                // Preserve the existing last-value-wins behavior when a client
+                // repeats the same cookie name across one or more field-lines.
                 cookies.insert(name.to_string(), Value::String(value.to_string()));
             }
         }
     }
     Value::Object(cookies)
+}
+
+#[cfg(test)]
+mod cookie_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn cookie_snapshot_consumes_all_header_field_lines_in_order() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("first=one; shared=old"),
+        );
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("second=two; shared=new"),
+        );
+
+        let Value::Object(cookies) = cookies_value(&headers) else {
+            panic!("expected cookie object");
+        };
+        assert!(matches!(cookies.get("first"), Some(Value::String(value)) if value == "one"));
+        assert!(matches!(cookies.get("second"), Some(Value::String(value)) if value == "two"));
+        assert!(matches!(cookies.get("shared"), Some(Value::String(value)) if value == "new"));
+    }
 }
 
 fn request_error(status: StatusCode, message: impl Into<String>) -> Response {

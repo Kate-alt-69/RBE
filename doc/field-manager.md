@@ -163,7 +163,7 @@ fields {
 }
 ```
 
-Header lookup, including dynamic prefix matching, is ASCII case-insensitive. Named `body` bindings require a JSON object; an empty body behaves like a missing object so optional/default bindings still work. `body` integer and boolean fields may use native JSON numbers/booleans or their string forms. A `.field` with `source = body` and no key receives the complete body value in `resolve(raw, context)`, including non-object JSON or text bodies.
+Header lookup, including dynamic prefix matching, is ASCII case-insensitive. Cookie source extraction consumes every `Cookie` header field-line in request order instead of only the first one; if the same cookie name appears more than once, the later value wins consistently with the existing single-line parser behavior. Named `body` bindings require a JSON object; an empty body behaves like a missing object so optional/default bindings still work. `body` integer and boolean fields may use native JSON numbers/booleans or their string forms. A `.field` with `source = body` and no key receives the complete body value in `resolve(raw, context)`, including non-object JSON or text bodies.
 
 JSON body detection follows the HTTP media type rather than substring matching: `application/json` and structured `+json` media types are recognized case-insensitively, parameters such as `charset` are ignored, and lookalikes such as `application/jsonish` remain text. This keeps `source = body` deterministic with the same JSON media-type rule used by RBE's API layer.
 
