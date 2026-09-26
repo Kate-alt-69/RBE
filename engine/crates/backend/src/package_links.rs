@@ -49,18 +49,17 @@ pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
     from_verified_indexes(indexes)
 }
 
-fn from_verified_indexes(
-    indexes: Vec<VerifiedRpxRootIndex>,
-) -> anyhow::Result<PackageLinkContext> {
+fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<PackageLinkContext> {
     let mut roots = BTreeMap::new();
 
     for verified in indexes {
-        let index: RpxPackageIndex = serde_json::from_str(&verified.index_json).with_context(|| {
-            format!(
-                "parse RPX package index for explicit root {:?}",
-                verified.package
-            )
-        })?;
+        let index: RpxPackageIndex =
+            serde_json::from_str(&verified.index_json).with_context(|| {
+                format!(
+                    "parse RPX package index for explicit root {:?}",
+                    verified.package
+                )
+            })?;
 
         if index.format != RPX_PACKAGE_INDEX_FORMAT {
             bail!(
@@ -98,10 +97,7 @@ fn from_verified_indexes(
         // Parsed deliberately, never linked. This keeps malformed indexes from
         // slipping through while making the visibility rule impossible to
         // accidentally widen through iteration over transitive dependency data.
-        let _private_dependency_names = index
-            .private_dependencies
-            .keys()
-            .collect::<BTreeSet<_>>();
+        let _private_dependency_names = index.private_dependencies.keys().collect::<BTreeSet<_>>();
 
         let mut exports = BTreeMap::new();
         for export in index.exports {

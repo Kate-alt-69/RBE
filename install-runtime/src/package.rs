@@ -500,7 +500,9 @@ rbe-core = "^1"
         };
         std::fs::write(layout.lock_path(), lock.render_yaml().unwrap()).unwrap();
 
-        assert!(read_verified_rpx_root_indexes(temp.path()).unwrap().is_empty());
+        assert!(read_verified_rpx_root_indexes(temp.path())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

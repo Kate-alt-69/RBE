@@ -384,7 +384,7 @@ fn humanize_token_names(message: &str) -> String {
         ("GtEq", "`>=`"),
         ("LParen", "`(`"),
         ("RParen", "`)`"),
-        ("LBracket", "`[`") ,
+        ("LBracket", "`[`"),
         ("RBracket", "`]`"),
         ("LBrace", "`{`"),
         ("RBrace", "`}`"),
