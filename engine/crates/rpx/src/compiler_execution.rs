@@ -24,14 +24,17 @@ pub struct CompilerInvocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompilerProgram {
-    Managed(PathBuf),
+    Managed { path: PathBuf, sha256: String },
     HostAuthoring(String),
 }
 
 impl From<&ResolvedCompiler> for CompilerProgram {
     fn from(value: &ResolvedCompiler) -> Self {
         match value {
-            ResolvedCompiler::Managed(path) => Self::Managed(path.clone()),
+            ResolvedCompiler::Managed { path, sha256 } => Self::Managed {
+                path: path.clone(),
+                sha256: sha256.clone(),
+            },
             ResolvedCompiler::HostAuthoring(name) => Self::HostAuthoring(name.clone()),
         }
     }
@@ -48,7 +51,7 @@ impl CompilerInvocation {
             program: CompilerProgram::from(&tool.compiler),
             args,
             working_directory: working_directory.into(),
-            clear_environment: matches!(tool.compiler, ResolvedCompiler::Managed(_)),
+            clear_environment: matches!(tool.compiler, ResolvedCompiler::Managed { .. }),
             environment: BTreeMap::new(),
             network_allowed: false,
             use_shell: false,
@@ -150,7 +153,7 @@ pub fn typescript_check(
     ];
 
     match &tsc.compiler {
-        ResolvedCompiler::Managed(tsc_entry) => {
+        ResolvedCompiler::Managed { path: tsc_entry, .. } => {
             let runtime = plan
                 .tool("node")
                 .or_else(|| plan.tool("bun"))
@@ -224,7 +227,7 @@ fn require_safe_plan(plan: &ResolvedCompilerPlan) -> Result<(), CompilerExecutio
 
 fn compiler_program_value(program: &ResolvedCompiler) -> Result<String, CompilerExecutionError> {
     match program {
-        ResolvedCompiler::Managed(path) => path
+        ResolvedCompiler::Managed { path, .. } => path
             .to_str()
             .map(ToOwned::to_owned)
             .ok_or(CompilerExecutionError::NonUtf8ManagedProgram),
@@ -283,15 +286,18 @@ mod tests {
     use crate::toolchain::{CompilerResolver, ManagedCompilerToolchain};
     use sdk_package::{JsRuntime, PackageLanguage};
 
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     fn managed(json: &str) -> CompilerResolver {
         CompilerResolver::managed(ManagedCompilerToolchain::parse_json(json).unwrap()).unwrap()
     }
 
     #[test]
     fn rust_invocation_is_offline_shellless_and_pins_rustc() {
-        let resolver = managed(
-            r#"{"format":1,"tools":{"cargo":"/opt/rbe/rust/bin/cargo","rustc":"/opt/rbe/rust/bin/rustc"}}"#,
-        );
+        let resolver = managed(&format!(
+            r#"{{"format":2,"tools":{{"cargo":{{"path":"/opt/rbe/rust/bin/cargo","sha256":"{HASH_A}"}},"rustc":{{"path":"/opt/rbe/rust/bin/rustc","sha256":"{HASH_B}"}}}}}}"#
+        ));
         let plan = CompilerPlan::for_component(PackageLanguage::Rust, None)
             .unwrap()
             .resolve(&resolver)
@@ -299,7 +305,10 @@ mod tests {
         let invocation = rust_check(&plan, "/tmp/rbe-check/Cargo.toml").unwrap();
         assert_eq!(
             invocation.program,
-            CompilerProgram::Managed(PathBuf::from("/opt/rbe/rust/bin/cargo"))
+            CompilerProgram::Managed {
+                path: PathBuf::from("/opt/rbe/rust/bin/cargo"),
+                sha256: HASH_A.into(),
+            }
         );
         assert!(invocation.args.contains(&"--offline".to_string()));
         assert_eq!(
@@ -320,7 +329,9 @@ mod tests {
 
     #[test]
     fn node_invocation_uses_exact_managed_program() {
-        let resolver = managed(r#"{"format":1,"tools":{"node":"/opt/rbe/node/bin/node"}}"#);
+        let resolver = managed(&format!(
+            r#"{{"format":2,"tools":{{"node":{{"path":"/opt/rbe/node/bin/node","sha256":"{HASH_A}"}}}}}}"#
+        ));
         let plan = CompilerPlan::for_component(PackageLanguage::Javascript, Some(JsRuntime::Node))
             .unwrap()
             .resolve(&resolver)
@@ -328,7 +339,10 @@ mod tests {
         let invocation = node_check(&plan, "/tmp/check/hello.mjs").unwrap();
         assert_eq!(
             invocation.program,
-            CompilerProgram::Managed(PathBuf::from("/opt/rbe/node/bin/node"))
+            CompilerProgram::Managed {
+                path: PathBuf::from("/opt/rbe/node/bin/node"),
+                sha256: HASH_A.into(),
+            }
         );
         assert_eq!(invocation.args[0], "--check");
         assert!(invocation.clear_environment);
@@ -356,9 +370,9 @@ mod tests {
 
     #[test]
     fn managed_typescript_runs_tsc_through_declared_runtime() {
-        let resolver = managed(
-            r#"{"format":1,"tools":{"node":"/opt/rbe/node/bin/node","tsc":"/opt/rbe/typescript/lib/tsc.js"}}"#,
-        );
+        let resolver = managed(&format!(
+            r#"{{"format":2,"tools":{{"node":{{"path":"/opt/rbe/node/bin/node","sha256":"{HASH_A}"}},"tsc":{{"path":"/opt/rbe/typescript/lib/tsc.js","sha256":"{HASH_B}"}}}}}}"#
+        ));
         let plan = CompilerPlan::for_component(PackageLanguage::Typescript, Some(JsRuntime::Node))
             .unwrap()
             .resolve(&resolver)
@@ -366,7 +380,10 @@ mod tests {
         let invocation = typescript_check(&plan, "/tmp/check/tsconfig.json").unwrap();
         assert_eq!(
             invocation.program,
-            CompilerProgram::Managed(PathBuf::from("/opt/rbe/node/bin/node"))
+            CompilerProgram::Managed {
+                path: PathBuf::from("/opt/rbe/node/bin/node"),
+                sha256: HASH_A.into(),
+            }
         );
         assert_eq!(invocation.args[0], "/opt/rbe/typescript/lib/tsc.js");
         assert!(invocation.clear_environment);
@@ -374,7 +391,9 @@ mod tests {
 
     #[test]
     fn python_invocation_sets_private_pycache_location() {
-        let resolver = managed(r#"{"format":1,"tools":{"python":"/opt/rbe/python/bin/python"}}"#);
+        let resolver = managed(&format!(
+            r#"{{"format":2,"tools":{{"python":{{"path":"/opt/rbe/python/bin/python","sha256":"{HASH_A}"}}}}}}"#
+        ));
         let plan = CompilerPlan::for_component(PackageLanguage::Python, None)
             .unwrap()
             .resolve(&resolver)
@@ -392,7 +411,9 @@ mod tests {
 
     #[test]
     fn hostile_execution_policy_is_rejected_before_process_creation() {
-        let resolver = managed(r#"{"format":1,"tools":{"node":"/opt/rbe/node/bin/node"}}"#);
+        let resolver = managed(&format!(
+            r#"{{"format":2,"tools":{{"node":{{"path":"/opt/rbe/node/bin/node","sha256":"{HASH_A}"}}}}}}"#
+        ));
         let mut plan =
             CompilerPlan::for_component(PackageLanguage::Javascript, Some(JsRuntime::Node))
                 .unwrap()

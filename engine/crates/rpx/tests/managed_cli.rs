@@ -1,3 +1,4 @@
+use rpx::toolchain::sha256_file;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,6 +43,24 @@ fn compile(root: &Path, extra: &[&str]) -> std::process::Output {
     command.output().unwrap()
 }
 
+fn write_toolchain(root: &Path, tool: &str, path: &Path, sha256: &str) {
+    fs::create_dir_all(root.join(".rbe")).unwrap();
+    fs::write(
+        root.join(".rbe/rpx-toolchain.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format": 2,
+            "tools": {
+                tool: {
+                    "path": path,
+                    "sha256": sha256,
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn compile_fails_closed_without_managed_toolchain() {
     let root = temp_project("missing");
@@ -55,17 +74,13 @@ fn compile_fails_closed_without_managed_toolchain() {
 #[test]
 fn partial_managed_toolchain_never_falls_back_to_host_even_when_opted_in() {
     let root = temp_project("partial");
-    fs::create_dir_all(root.join(".rbe")).unwrap();
     let fake_python = root.join("fake-python");
-    fs::write(
-        root.join(".rbe/rpx-toolchain.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "format": 1,
-            "tools": { "python": fake_python }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    write_toolchain(
+        &root,
+        "python",
+        &fake_python,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
 
     let output = compile(&root, &["--allow-host-toolchain"]);
     assert!(!output.status.success());
@@ -80,7 +95,6 @@ fn compile_executes_exact_managed_program_with_cleared_environment() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = temp_project("exact-program");
-    fs::create_dir_all(root.join(".rbe")).unwrap();
     let marker = root.join("managed-invocation.txt");
     let fake_node = root.join("managed-node.sh");
     fs::write(
@@ -95,16 +109,9 @@ fn compile_executes_exact_managed_program_with_cleared_environment() {
     let mut permissions = fs::metadata(&fake_node).unwrap().permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&fake_node, permissions).unwrap();
-
-    fs::write(
-        root.join(".rbe/rpx-toolchain.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "format": 1,
-            "tools": { "node": fake_node.canonicalize().unwrap() }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let fake_node = fake_node.canonicalize().unwrap();
+    let sha256 = sha256_file(&fake_node).unwrap();
+    write_toolchain(&root, "node", &fake_node, &sha256);
 
     let output = Command::new(rpx())
         .arg("compile")
@@ -120,5 +127,35 @@ fn compile_executes_exact_managed_program_with_cleared_environment() {
     let invocation = fs::read_to_string(&marker).unwrap();
     assert!(invocation.contains("--check"));
     assert!(!invocation.contains("SENTINEL="));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_managed_program_is_rejected_before_execution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_project("tampered-program");
+    let marker = root.join("tampered-ran.txt");
+    let fake_node = root.join("managed-node.sh");
+    fs::write(&fake_node, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&fake_node).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fake_node, permissions).unwrap();
+    let fake_node = fake_node.canonicalize().unwrap();
+    let sha256 = sha256_file(&fake_node).unwrap();
+    write_toolchain(&root, "node", &fake_node, &sha256);
+
+    fs::write(
+        &fake_node,
+        format!("#!/bin/sh\nprintf 'ran' > '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+
+    let output = compile(&root, &[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("SHA-256 mismatch"), "{stderr}");
+    assert!(!marker.exists(), "tampered compiler was executed");
     fs::remove_dir_all(root).unwrap();
 }

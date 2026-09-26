@@ -138,7 +138,7 @@ impl ResolvedCompilerPlan {
     pub fn all_managed(&self) -> bool {
         self.tools
             .iter()
-            .all(|tool| matches!(tool.compiler, ResolvedCompiler::Managed(_)))
+            .all(|tool| matches!(tool.compiler, ResolvedCompiler::Managed { .. }))
     }
 }
 
@@ -185,6 +185,9 @@ mod tests {
     use super::*;
     use crate::toolchain::ManagedCompilerToolchain;
 
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     #[test]
     fn rust_plan_requires_cargo_and_rustc_without_network_or_shell() {
         let plan = CompilerPlan::for_component(PackageLanguage::Rust, None).unwrap();
@@ -221,9 +224,9 @@ mod tests {
 
     #[test]
     fn managed_resolution_fails_if_any_required_tool_is_missing() {
-        let toolchain = ManagedCompilerToolchain::parse_json(
-            r#"{"format":1,"tools":{"cargo":"/opt/rbe/rust/bin/cargo"}}"#,
-        )
+        let toolchain = ManagedCompilerToolchain::parse_json(&format!(
+            r#"{{"format":2,"tools":{{"cargo":{{"path":"/opt/rbe/rust/bin/cargo","sha256":"{HASH_A}"}}}}}}"#
+        ))
         .unwrap();
         let resolver = CompilerResolver::managed(toolchain).unwrap();
         let plan = CompilerPlan::for_component(PackageLanguage::Rust, None).unwrap();
@@ -235,10 +238,10 @@ mod tests {
     }
 
     #[test]
-    fn complete_managed_plan_keeps_every_tool_absolute() {
-        let toolchain = ManagedCompilerToolchain::parse_json(
-            r#"{"format":1,"tools":{"cargo":"/opt/rbe/rust/bin/cargo","rustc":"/opt/rbe/rust/bin/rustc"}}"#,
-        )
+    fn complete_managed_plan_keeps_every_tool_absolute_and_pinned() {
+        let toolchain = ManagedCompilerToolchain::parse_json(&format!(
+            r#"{{"format":2,"tools":{{"cargo":{{"path":"/opt/rbe/rust/bin/cargo","sha256":"{HASH_A}"}},"rustc":{{"path":"/opt/rbe/rust/bin/rustc","sha256":"{HASH_B}"}}}}}}"#
+        ))
         .unwrap();
         let resolver = CompilerResolver::managed(toolchain).unwrap();
         let plan = CompilerPlan::for_component(PackageLanguage::Rust, None)
@@ -248,7 +251,8 @@ mod tests {
         assert!(plan.all_managed());
         assert!(matches!(
             plan.tool("cargo").unwrap().compiler,
-            ResolvedCompiler::Managed(_)
+            ResolvedCompiler::Managed { ref path, ref sha256 }
+                if path == std::path::Path::new("/opt/rbe/rust/bin/cargo") && sha256 == HASH_A
         ));
     }
 }

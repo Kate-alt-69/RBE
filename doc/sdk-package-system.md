@@ -67,14 +67,20 @@ Normal RPX compilation is fail-closed and uses the project-local managed compile
 .rbe/rpx-toolchain.json
 ```
 
-Format 1 is a map from canonical RBE compiler tool names to **absolute executable/entry paths**. Example:
+Format 2 maps canonical RBE compiler tool names to an **absolute executable/entry path plus its pinned SHA-256 identity**. Example:
 
 ```json
 {
-  "format": 1,
+  "format": 2,
   "tools": {
-    "node": "/opt/rbe/node/bin/node",
-    "tsc": "/opt/rbe/typescript/lib/tsc.js"
+    "node": {
+      "path": "/opt/rbe/node/bin/node",
+      "sha256": "<64-hex-sha256>"
+    },
+    "tsc": {
+      "path": "/opt/rbe/typescript/lib/tsc.js",
+      "sha256": "<64-hex-sha256>"
+    }
   }
 }
 ```
@@ -92,7 +98,9 @@ The current compiler requirements are:
 
 Compiler plans are shell-disabled and network-disabled. Managed invocations are launched from their exact configured absolute paths with a cleared environment plus only the minimal RBE-selected environment needed for the compiler contract. Rust checks are explicitly offline and bind Cargo to the selected managed `rustc`. Managed TypeScript invokes the selected `tsc` entry through the package's declared managed Node/Bun runtime rather than relying on a launcher finding a runtime through host `PATH`.
 
-A present managed toolchain file is authoritative. If it is malformed or lacks a required tool, RPX fails; it does **not** fall back to a similarly named program installed on the host machine.
+An absolute cache path is not authority. Every managed compiler/entry file is SHA-256 pinned in the toolchain map and RPX re-hashes the selected file immediately before process creation. A replaced/tampered managed compiler is rejected before it can execute.
+
+A present managed toolchain file is authoritative. If it is malformed, lacks a required tool, uses a non-absolute path, carries an invalid digest, or the selected file no longer matches its pinned SHA-256, RPX fails; it does **not** fall back to a similarly named program installed on the host machine.
 
 For deliberate local development only, an author may opt into host-installed tools:
 
@@ -101,7 +109,7 @@ rpx compile . --allow-host-toolchain
 rpx compile.package . --allow-host-toolchain
 ```
 
-That flag is an explicit authoring escape hatch, not the production/default compiler-discovery path. It only applies when no managed toolchain file exists; it cannot turn a partial managed toolchain into a host fallback.
+That flag is an explicit authoring escape hatch, not the production/default compiler-discovery path. It only applies when no managed toolchain file exists; it cannot turn a partial or tampered managed toolchain into a host fallback.
 
 ## SDK bootstrap
 
@@ -116,4 +124,4 @@ backend sdk status -path=.
 
 A `global` SDK install explicitly installs all language bindings; mixed-language packages are only valid when `language = "global"` is deliberately selected in `package.rbe.toml`.
 
-The SDK bootstrap/install path is responsible for supplying project-local SDK bindings and, as the managed compiler integration is completed, the verified compiler/tool paths consumed by RPX. RPX itself does not silently discover or trust arbitrary host compilers in its default mode.
+The SDK bootstrap/install path is responsible for supplying project-local SDK bindings and, as the managed compiler integration is completed, the verified compiler/tool paths and SHA-256 identities consumed by RPX. RPX itself does not silently discover or trust arbitrary host compilers in its default mode.

@@ -4,7 +4,7 @@ use rpx::compiler_execution::{
     bun_build, node_check, python_compile, rust_check, typescript_check, CompilerInvocation,
     CompilerProgram,
 };
-use rpx::toolchain::CompilerResolver;
+use rpx::toolchain::{verify_managed_program, CompilerResolver};
 use sdk_package::{
     check_package, check_target, CheckedComponent, CheckedPackage, JsRuntime, PackageLanguage,
     PACKAGE_MANIFEST,
@@ -315,7 +315,15 @@ fn execute_invocation(invocation: CompilerInvocation, component: &CheckedCompone
     }
 
     let (mut command, program_name) = match &invocation.program {
-        CompilerProgram::Managed(path) => (Command::new(path), path.to_string_lossy().into_owned()),
+        CompilerProgram::Managed { path, sha256 } => {
+            verify_managed_program(path, sha256).with_context(|| {
+                format!(
+                    "refused RBE-managed compiler {:?} because its pinned identity no longer matches",
+                    invocation.tool
+                )
+            })?;
+            (Command::new(path), path.to_string_lossy().into_owned())
+        }
         CompilerProgram::HostAuthoring(name) => (Command::new(name), name.clone()),
     };
     command
@@ -530,7 +538,7 @@ fn render_error(error: &anyhow::Error) {
     eprintln!();
     eprintln!("{error:#}");
     eprintln!();
-    eprintln!("HINT : run `rpx check .` for package structure or `rpx compile .` for real compiler checks. Managed compilation reads .rbe/rpx-toolchain.json; use --allow-host-toolchain only for explicit local authoring. Use `rpx compile components/<name>` to compile only one exported component. Every exported component folder must contain <name>.<language-extension>, and the package root must contain {PACKAGE_MANIFEST}.");
+    eprintln!("HINT : run `rpx check .` for package structure or `rpx compile .` for real compiler checks. Managed compilation reads .rbe/rpx-toolchain.json and verifies pinned compiler SHA-256 identities before execution; use --allow-host-toolchain only for explicit local authoring. Use `rpx compile components/<name>` to compile only one exported component. Every exported component folder must contain <name>.<language-extension>, and the package root must contain {PACKAGE_MANIFEST}.");
 }
 
 fn print_help() {
@@ -546,7 +554,7 @@ Usage:\n\
 `path` defaults to the current directory. RPX walks upward until it finds package.rbe.toml.\n\
 A path inside components/<name>/ checks/compiles only that component.\n\
 `check` validates RBE package/component structure. `compile` additionally invokes the selected language compiler/toolchain.\n\
-Compiler execution is RBE-managed by default through .rbe/rpx-toolchain.json. --allow-host-toolchain is an explicit local-authoring escape hatch and is never an automatic fallback from a partial managed toolchain.\n\
+Compiler execution is RBE-managed by default through .rbe/rpx-toolchain.json. Managed compiler files are SHA-256 pinned and re-verified immediately before execution. --allow-host-toolchain is an explicit local-authoring escape hatch and is never an automatic fallback from a partial managed toolchain.\n\
 Package exports are discovered from components/<name>/<name>.<ext>."
     );
 }
