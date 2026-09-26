@@ -11,6 +11,7 @@ mod cache;
 mod graph;
 mod http;
 mod package;
+mod prepare;
 mod promotion;
 mod registry;
 mod target;
@@ -22,6 +23,9 @@ pub use package::{
     inspect_registry_stage, read_verified_rpx_root_indexes, registry_artifact_plan,
     stage_registry_package, VerifiedRegistryPackage, VerifiedRpxRootIndex,
     MAX_RPX_PACKAGE_INDEX_BYTES, RPX_PACKAGE_INDEX,
+};
+pub use prepare::{
+    prepare_verified_graph_sources, PreparedPackageSource, PreparedRootGraph,
 };
 pub use promotion::{
     promote_artifact, promote_verified_graph, ArtifactPromotionResult, ArtifactPromotionState,
@@ -39,6 +43,8 @@ pub use target::{
 pub enum InstallRuntimeError {
     #[error(transparent)]
     Executor(#[from] rbe_install_executor::ExecutorError),
+    #[error(transparent)]
+    SourceStage(#[from] rbe_install_executor::SourceStageError),
     #[error(transparent)]
     RegistryContract(#[from] rbe_install_request::RegistryContractError),
     #[error(transparent)]
@@ -167,6 +173,30 @@ pub enum InstallRuntimeError {
     PromotedArtifactVerification {
         path: String,
         expected_sha256: String,
+    },
+    #[error("package preparation requires an absolute project root, got {0}")]
+    PreparationProjectRootMustBeAbsolute(String),
+    #[error("invalid package preparation session id {0:?}")]
+    InvalidPreparationSessionId(String),
+    #[error("package preparation root already exists: {0}")]
+    PreparationRootAlreadyExists(String),
+    #[error("verified package manifest drifted before preparation for {package:?}")]
+    PreparedManifestDrift { package: String },
+    #[error(
+        "verified package manifest hash changed before preparation for {package:?}: expected {expected}, got {actual}"
+    )]
+    PreparedManifestHashMismatch {
+        package: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("prepared archive entry changed after inspection: {0:?}")]
+    ExtractedEntryMismatch(String),
+    #[error("failed to clean incomplete package preparation tree {path}: {source}")]
+    PreparationCleanupFailed {
+        path: String,
+        #[source]
+        source: std::io::Error,
     },
     #[error("install-runtime filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
