@@ -4,6 +4,7 @@
 //! backend/container/service/video state without owning those runtimes.
 
 mod container_client;
+mod library_host;
 mod metrics;
 mod network_broker;
 mod video_language;
@@ -31,6 +32,15 @@ pub use ipc_protocol::{
     MAX_CAPABILITY_PAYLOAD_BYTES as CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES,
     MAX_CAPABILITY_TARGET_BYTES as CONTAINER_MAX_CAPABILITY_TARGET_BYTES,
     MAX_EXECUTION_INPUT_BYTES as CONTAINER_MAX_EXECUTION_INPUT_BYTES,
+};
+pub use library_host::{
+    read_json_message as read_library_message, write_json_message as write_library_message,
+    CapabilityGrant as LibraryCapabilityGrant, ExpectedWorkerIdentity, HostCall as LibraryHostCall,
+    LibraryHostError, LibrarySession, PackageIdentity as LibraryPackageIdentity, PackageInvocation,
+    PackageReply, RuntimeIdentity as LibraryRuntimeIdentity, SdkIdentity as LibrarySdkIdentity,
+    SessionState as LibrarySessionState, WorkerHello as LibraryWorkerHello, LIBRARY_ABI_VERSION,
+    LIBRARY_PROTOCOL_VERSION, MAX_LIBRARY_NAME_BYTES, MAX_LIBRARY_OPERATION_BYTES,
+    MAX_LIBRARY_PAYLOAD_BYTES, MAX_LIBRARY_TARGET_BYTES,
 };
 pub use metrics::{
     BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
