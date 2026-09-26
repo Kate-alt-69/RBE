@@ -56,6 +56,22 @@ if old not in source:
     raise SystemExit("cookies_value implementation marker not found")
 source = source.replace(old, new, 1)
 
+old_fixture = '''            HeaderValue::from_static("first=one; shared=old"),
+        );
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("second=two; shared=new"),
+        );'''
+new_fixture = '''            HeaderValue::from_static("first=one"),
+        );
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("second=two"),
+        );'''
+if old_fixture not in source:
+    raise SystemExit("legacy cookie snapshot fixture marker not found")
+source = source.replace(old_fixture, new_fixture, 1)
+
 old_test = '''        let Value::Object(cookies) = cookies_value(&headers) else {
             panic!("expected cookie object");
         };'''
@@ -65,6 +81,12 @@ new_test = '''        let Value::Object(cookies) = cookies_value(&headers).unwra
 if old_test not in source:
     raise SystemExit("cookie snapshot test marker not found")
 source = source.replace(old_test, new_test, 1)
+
+old_shared_assert = '''        assert!(matches!(cookies.get("shared"), Some(Value::String(value)) if value == "new"));
+'''
+if old_shared_assert not in source:
+    raise SystemExit("legacy duplicate-cookie assertion marker not found")
+source = source.replace(old_shared_assert, "", 1)
 
 close_marker = '''    }
 }
