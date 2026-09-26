@@ -164,18 +164,18 @@ fn compile_sources(package: &CheckedPackage, allow_host_toolchain: bool) -> Resu
             component.name,
             language_name(component.language)
         );
-        let plan = CompilerPlan::for_component(
-            component.language,
-            package.manifest.package.runtime,
-        )
-        .with_context(|| format!("could not plan compiler for component {:?}", component.name))?
-        .resolve(&resolver)
-        .with_context(|| {
-            format!(
-                "could not resolve compiler tools for component {:?}",
-                component.name
-            )
-        })?;
+        let plan =
+            CompilerPlan::for_component(component.language, package.manifest.package.runtime)
+                .with_context(|| {
+                    format!("could not plan compiler for component {:?}", component.name)
+                })?
+                .resolve(&resolver)
+                .with_context(|| {
+                    format!(
+                        "could not resolve compiler tools for component {:?}",
+                        component.name
+                    )
+                })?;
 
         match component.language {
             PackageLanguage::Rust => compile_rust(package, component, &build_root, &plan)?,
@@ -238,9 +238,6 @@ fn compile_javascript(
 ) -> Result<()> {
     match package.manifest.package.runtime {
         Some(JsRuntime::Node) => {
-            // RBE JavaScript components are modules. Stage the exact bytes as
-            // .mjs so Node performs a real ES-module syntax check without
-            // executing package code.
             let out = build_root.join("javascript").join(&component.name);
             recreate_dir(&out)?;
             let staged = out.join(format!("{}.mjs", component.name));
@@ -302,14 +299,14 @@ fn compile_python(
 ) -> Result<()> {
     let pycache = build_root.join("python").join("pycache");
     fs::create_dir_all(&pycache)?;
-    execute_invocation(python_compile(plan, &component.source, &pycache)?, component)?;
+    execute_invocation(
+        python_compile(plan, &component.source, &pycache)?,
+        component,
+    )?;
     Ok(())
 }
 
-fn execute_invocation(
-    invocation: CompilerInvocation,
-    component: &CheckedComponent,
-) -> Result<()> {
+fn execute_invocation(invocation: CompilerInvocation, component: &CheckedComponent) -> Result<()> {
     if invocation.network_allowed {
         bail!("RPX refused compiler invocation with network authority");
     }
@@ -318,10 +315,7 @@ fn execute_invocation(
     }
 
     let (mut command, program_name) = match &invocation.program {
-        CompilerProgram::Managed(path) => (
-            Command::new(path),
-            path.to_string_lossy().into_owned(),
-        ),
+        CompilerProgram::Managed(path) => (Command::new(path), path.to_string_lossy().into_owned()),
         CompilerProgram::HostAuthoring(name) => (Command::new(name), name.clone()),
     };
     command
