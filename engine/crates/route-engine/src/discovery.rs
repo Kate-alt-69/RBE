@@ -300,6 +300,27 @@ fn singleton_header_string(
         .map_err(|_| format!("header {label:?} contains non-text bytes"))
 }
 
+fn comma_header_values(
+    headers: &HeaderMap,
+    name: header::HeaderName,
+) -> Result<Vec<String>, String> {
+    let label = name.as_str().to_string();
+    let mut output = Vec::new();
+    for value in headers.get_all(name).iter() {
+        let value = value
+            .to_str()
+            .map_err(|_| format!("header {label:?} contains non-text bytes"))?;
+        output.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+    Ok(output)
+}
+
 fn is_json_content_type(value: Option<&str>) -> bool {
     let Some(value) = value else {
         return false;
@@ -380,6 +401,36 @@ mod header_snapshot_tests {
         let error = singleton_header_string(&headers, header::HOST).unwrap_err();
         assert!(error.contains("host"), "{error}");
         assert!(error.contains("may appear only once"), "{error}");
+    }
+
+    #[test]
+    fn comma_header_values_consume_all_field_lines_in_order() {
+        let mut headers = HeaderMap::new();
+        let name = HeaderName::from_static("x-forwarded-for");
+        headers.append(
+            name.clone(),
+            HeaderValue::from_static("203.0.113.10, 10.0.0.1"),
+        );
+        headers.append(name.clone(), HeaderValue::from_static("10.0.0.2"));
+
+        assert_eq!(
+            comma_header_values(&headers, name).unwrap(),
+            vec!["203.0.113.10", "10.0.0.1", "10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn comma_header_values_reject_non_text_field_lines() {
+        let mut headers = HeaderMap::new();
+        let name = HeaderName::from_static("x-forwarded-for");
+        headers.append(
+            name.clone(),
+            HeaderValue::from_bytes(&[0x80]).expect("obs-text header should parse"),
+        );
+
+        let error = comma_header_values(&headers, name).unwrap_err();
+        assert!(error.contains("x-forwarded-for"), "{error}");
+        assert!(error.contains("non-text bytes"), "{error}");
     }
 }
 
@@ -654,19 +705,11 @@ async fn request_value(
 
     let trust_proxy = state.config.security.trusted_proxy_headers;
     let forwarded_for = if trust_proxy {
-        parts
-            .headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| Value::String(value.to_string()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+        comma_header_values(&parts.headers, HeaderName::from_static("x-forwarded-for"))
+            .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?
+            .into_iter()
+            .map(Value::String)
+            .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
