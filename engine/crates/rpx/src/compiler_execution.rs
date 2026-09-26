@@ -48,7 +48,7 @@ impl CompilerInvocation {
             program: CompilerProgram::from(&tool.compiler),
             args,
             working_directory: working_directory.into(),
-            clear_environment: true,
+            clear_environment: matches!(tool.compiler, ResolvedCompiler::Managed(_)),
             environment: BTreeMap::new(),
             network_allowed: false,
             use_shell: false,
@@ -142,16 +142,39 @@ pub fn typescript_check(
     let working_directory = config_path
         .parent()
         .ok_or(CompilerExecutionError::MissingWorkingDirectory)?;
-    Ok(CompilerInvocation::from_tool(
-        tsc,
-        working_directory,
-        vec![
-            "--pretty".into(),
-            "false".into(),
-            "-p".into(),
-            config_path.to_string_lossy().into_owned(),
-        ],
-    ))
+    let arguments = vec![
+        "--pretty".into(),
+        "false".into(),
+        "-p".into(),
+        config_path.to_string_lossy().into_owned(),
+    ];
+
+    match &tsc.compiler {
+        ResolvedCompiler::Managed(tsc_entry) => {
+            let runtime = plan
+                .tool("node")
+                .or_else(|| plan.tool("bun"))
+                .ok_or(CompilerExecutionError::MissingTypescriptRuntime)?;
+            let mut runtime_arguments = Vec::with_capacity(arguments.len() + 1);
+            runtime_arguments.push(
+                tsc_entry
+                    .to_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or(CompilerExecutionError::NonUtf8ManagedProgram)?,
+            );
+            runtime_arguments.extend(arguments);
+            Ok(CompilerInvocation::from_tool(
+                runtime,
+                working_directory,
+                runtime_arguments,
+            ))
+        }
+        ResolvedCompiler::HostAuthoring(_) => Ok(CompilerInvocation::from_tool(
+            tsc,
+            working_directory,
+            arguments,
+        )),
+    }
 }
 
 pub fn python_compile(
@@ -213,6 +236,7 @@ fn compiler_program_value(program: &ResolvedCompiler) -> Result<String, Compiler
 pub enum CompilerExecutionError {
     RequiredToolMissing(&'static str),
     MissingWorkingDirectory,
+    MissingTypescriptRuntime,
     NetworkEnabled,
     ShellEnabled,
     NonUtf8ManagedProgram,
@@ -230,6 +254,10 @@ impl fmt::Display for CompilerExecutionError {
             Self::MissingWorkingDirectory => {
                 write!(formatter, "RPX compiler input has no working directory")
             }
+            Self::MissingTypescriptRuntime => write!(
+                formatter,
+                "managed TypeScript compiler plan is missing its declared Node/Bun runtime"
+            ),
             Self::NetworkEnabled => write!(
                 formatter,
                 "RPX compiler execution refuses a plan that permits network access"
@@ -303,6 +331,42 @@ mod tests {
             CompilerProgram::Managed(PathBuf::from("/opt/rbe/node/bin/node"))
         );
         assert_eq!(invocation.args[0], "--check");
+        assert!(invocation.clear_environment);
+    }
+
+    #[test]
+    fn host_authoring_invocation_keeps_the_developer_environment() {
+        let plan = ResolvedCompilerPlan {
+            language: PackageLanguage::Javascript,
+            tools: vec![ResolvedCompilerTool {
+                name: "node",
+                purpose: "authoring test",
+                compiler: ResolvedCompiler::HostAuthoring("node".into()),
+            }],
+            network_allowed: false,
+            use_shell: false,
+        };
+        let invocation = node_check(&plan, "/tmp/check/hello.mjs").unwrap();
+        assert!(!invocation.clear_environment);
+        assert_eq!(invocation.program, CompilerProgram::HostAuthoring("node".into()));
+    }
+
+    #[test]
+    fn managed_typescript_runs_tsc_through_declared_runtime() {
+        let resolver = managed(
+            r#"{"format":1,"tools":{"node":"/opt/rbe/node/bin/node","tsc":"/opt/rbe/typescript/lib/tsc.js"}}"#,
+        );
+        let plan = CompilerPlan::for_component(PackageLanguage::Typescript, Some(JsRuntime::Node))
+            .unwrap()
+            .resolve(&resolver)
+            .unwrap();
+        let invocation = typescript_check(&plan, "/tmp/check/tsconfig.json").unwrap();
+        assert_eq!(
+            invocation.program,
+            CompilerProgram::Managed(PathBuf::from("/opt/rbe/node/bin/node"))
+        );
+        assert_eq!(invocation.args[0], "/opt/rbe/typescript/lib/tsc.js");
+        assert!(invocation.clear_environment);
     }
 
     #[test]
