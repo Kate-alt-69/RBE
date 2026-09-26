@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rbe_project_package::{
     PackageRequirement, ProjectCacheLayout, ProjectPackageError, ProjectPackageLock,
