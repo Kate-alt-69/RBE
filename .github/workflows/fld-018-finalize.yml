@@ -17,9 +17,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Preserve FLD-018 patch
-        run: cp .github/patches/fld-018-explicit-null-body.py /tmp/fld-018-explicit-null-body.py
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -31,8 +28,7 @@ jobs:
       - name: Apply FLD-018
         run: |
           set -euo pipefail
-          git reset --hard 8e9507de0f2733f497790bb677972db4f5bd4a11
-          python /tmp/fld-018-explicit-null-body.py
+          python .github/patches/fld-018-explicit-null-body.py
 
       - name: Format and check route-engine
         working-directory: engine
