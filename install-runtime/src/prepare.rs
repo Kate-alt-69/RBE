@@ -92,13 +92,7 @@ pub fn prepare_verified_graph_sources(
     std::fs::create_dir(&session_build_root)?;
     ensure_no_symlink_components(&session_build_root)?;
 
-    match prepare_graph_inner(
-        &layout,
-        session_id,
-        graph,
-        host,
-        session_build_root.clone(),
-    ) {
+    match prepare_graph_inner(&layout, session_id, graph, host, session_build_root.clone()) {
         Ok(prepared) => Ok(prepared),
         Err(error) => {
             if let Err(source) = std::fs::remove_dir_all(&session_build_root) {
@@ -175,7 +169,9 @@ fn prepare_package(
     host: HostOs,
     root_build_dir: &Path,
 ) -> Result<PreparedPackageSource, InstallRuntimeError> {
-    if verified.manifest.name != package_name || verified.locked.version != verified.manifest.version {
+    if verified.manifest.name != package_name
+        || verified.locked.version != verified.manifest.version
+    {
         return Err(InstallRuntimeError::PreparedManifestDrift {
             package: package_name.to_string(),
         });
@@ -335,7 +331,10 @@ fn source_tree_identity(plan: &ExtractionPlan) -> Result<SourceTreeDigest, Insta
     Ok(SourceTreeDigest::from_files(&selection, digests)?)
 }
 
-fn verify_regular_file_sha256(path: &Path, expected_sha256: &str) -> Result<(), InstallRuntimeError> {
+fn verify_regular_file_sha256(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<(), InstallRuntimeError> {
     ensure_no_symlink_components(path)?;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -512,9 +511,15 @@ args = ["build"]
             let mut writer = zip::ZipWriter::new(&mut bytes);
             let options = SimpleFileOptions::default();
             let files = if reverse {
-                vec![("src/index.js", b"export default 1;".as_slice()), (LIBRARY_MANIFEST, manifest.as_bytes())]
+                vec![
+                    ("src/index.js", b"export default 1;".as_slice()),
+                    (LIBRARY_MANIFEST, manifest.as_bytes()),
+                ]
             } else {
-                vec![(LIBRARY_MANIFEST, manifest.as_bytes()), ("src/index.js", b"export default 1;".as_slice())]
+                vec![
+                    (LIBRARY_MANIFEST, manifest.as_bytes()),
+                    ("src/index.js", b"export default 1;".as_slice()),
+                ]
             };
             for (path, contents) in files {
                 writer.start_file(path, options).unwrap();
@@ -590,7 +595,8 @@ args = ["build"]
         let graph = graph(temp.path(), &bytes, &source);
 
         let prepared =
-            prepare_verified_graph_sources(temp.path(), "session-1", &graph, HostOs::Linux).unwrap();
+            prepare_verified_graph_sources(temp.path(), "session-1", &graph, HostOs::Linux)
+                .unwrap();
         let package = prepared.packages.get("demo").unwrap();
         assert_eq!(package.build_steps[0].args, ["build"]);
         assert!(package.build_root.join("src/index.js").is_file());
@@ -608,7 +614,8 @@ args = ["build"]
         let second_graph = graph(second.path(), &package_bytes(&source, true), &source);
 
         let first_prepared =
-            prepare_verified_graph_sources(first.path(), "s1", &first_graph, HostOs::Linux).unwrap();
+            prepare_verified_graph_sources(first.path(), "s1", &first_graph, HostOs::Linux)
+                .unwrap();
         let second_prepared =
             prepare_verified_graph_sources(second.path(), "s2", &second_graph, HostOs::Linux)
                 .unwrap();
@@ -625,15 +632,12 @@ args = ["build"]
         let source = manifest();
         let bytes = package_bytes(&source, false);
         let graph = graph(temp.path(), &bytes, &source);
-        let existing = temp
-            .path()
-            .join(".cache/rbe/install/build/session-1");
+        let existing = temp.path().join(".cache/rbe/install/build/session-1");
         std::fs::create_dir_all(&existing).unwrap();
         std::fs::write(existing.join("keep.txt"), b"keep").unwrap();
 
-        let error =
-            prepare_verified_graph_sources(temp.path(), "session-1", &graph, HostOs::Linux)
-                .unwrap_err();
+        let error = prepare_verified_graph_sources(temp.path(), "session-1", &graph, HostOs::Linux)
+            .unwrap_err();
         assert!(matches!(
             error,
             InstallRuntimeError::PreparationRootAlreadyExists(_)
@@ -654,9 +658,8 @@ args = ["build"]
             .join("artifact.rbe");
         std::fs::write(artifact, b"tampered").unwrap();
 
-        let error =
-            prepare_verified_graph_sources(temp.path(), "session-1", &graph, HostOs::Linux)
-                .unwrap_err();
+        let error = prepare_verified_graph_sources(temp.path(), "session-1", &graph, HostOs::Linux)
+            .unwrap_err();
         assert!(matches!(
             error,
             InstallRuntimeError::ExistingArtifactMismatch { .. }
@@ -675,9 +678,8 @@ args = ["build"]
         let mut graph = graph(temp.path(), &bytes, &source);
         graph.packages.get_mut("demo").unwrap().manifest.version = "9.9.9".into();
 
-        let error =
-            prepare_verified_graph_sources(temp.path(), "session-1", &graph, HostOs::Linux)
-                .unwrap_err();
+        let error = prepare_verified_graph_sources(temp.path(), "session-1", &graph, HostOs::Linux)
+            .unwrap_err();
         assert!(matches!(
             error,
             InstallRuntimeError::PreparedManifestDrift { .. }
@@ -692,7 +694,8 @@ args = ["build"]
         let graph = graph(temp.path(), &bytes, &source);
 
         let windows =
-            prepare_verified_graph_sources(temp.path(), "windows", &graph, HostOs::Windows).unwrap();
+            prepare_verified_graph_sources(temp.path(), "windows", &graph, HostOs::Windows)
+                .unwrap();
         let linux =
             prepare_verified_graph_sources(temp.path(), "linux", &graph, HostOs::Linux).unwrap();
         assert_eq!(windows.packages["demo"].build_steps[0].args, ["test"]);
