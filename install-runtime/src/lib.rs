@@ -13,6 +13,7 @@ mod http;
 mod package;
 mod promotion;
 mod registry;
+mod target;
 
 pub use artifact::ArtifactStage;
 pub use cache::stage_artifact_cached as stage_artifact;
@@ -29,6 +30,9 @@ pub use promotion::{
 pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
     MAX_REGISTRY_INDEX_BYTES,
+};
+pub use target::{
+    load_named_install_target, merge_named_install_target, InstallTargetError, NamedInstallTarget,
 };
 
 #[derive(Debug, thiserror::Error)]
