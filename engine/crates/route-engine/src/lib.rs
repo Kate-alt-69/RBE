@@ -118,6 +118,7 @@ pub fn validate_runtime_image_routes(image: &RuntimeImage) -> anyhow::Result<()>
 pub fn validate_runtime_image_reserved_namespace(
     image: &RuntimeImage,
     prefix: &str,
+    label: &str,
 ) -> anyhow::Result<()> {
-    route_collision::validate_image_reserved_namespace(image, prefix)
+    route_collision::validate_image_reserved_namespace(image, prefix, label)
 }
