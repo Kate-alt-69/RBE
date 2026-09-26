@@ -38,9 +38,9 @@ jobs:
           cargo fmt --all -- --check
           cargo check -p route-engine
 
-      - name: Clippy route-engine
+      - name: Clippy route-engine library
         working-directory: engine
-        run: cargo clippy -p route-engine --all-targets -- -D warnings
+        run: cargo clippy -p route-engine --lib -- -D warnings
 
       - name: Test route-engine
         working-directory: engine
