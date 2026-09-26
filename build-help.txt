@@ -1,0 +1,71 @@
+RBE Build
+
+Usage:
+  ./build.ps1 [release flags]
+  ./build.sh  [release flags]
+
+Selective builds:
+  ./build.ps1 --only-<component> [platform/arch flags]
+  ./build.sh  --only-<component> [platform/arch flags]
+  ./build.ps1 --build-sdk [--only-backend|--only-rpx] [platform/arch flags]
+  ./build.sh  --build-sdk [--only-backend|--only-rpx] [platform/arch flags]
+
+Selective components:
+  backend       Compile only the production backend binary
+  service       Compile only the service binary
+  cloud-node    Compile only cloud_node
+  container     Compile only container-bin and emit it as container(.exe)
+  rpx           Compile only RPX
+  sdk-backend   SDK backend selector; use with --build-sdk
+
+Selective semantics:
+  --only-<component> means ONLY compile that selected component. It does not run
+  the normal secure release dependency choreography first.
+
+SDK bundle:
+  --build-sdk              Build the complete project-local SDK bundle
+  --build-sdk --only-backend
+                           Build only the SDK backend binary
+  --build-sdk --only-rpx   Build only RPX
+
+PowerShell-friendly aliases:
+  -build-sdk
+  -only-backend
+  -only-service
+  -only-cloud-node
+  -only-container
+  -only-rpx
+  -only-sdk-backend
+
+Legacy compatibility aliases:
+  --cloud-node-only, --build-cloud-node, -CloudNodeOnly
+                           Equivalent to --only-cloud-node
+
+Platform flags:
+  --build-win, --build-win10, --build-win11, --build-windows
+                           Build Windows targets
+  --build-linux            Build Linux targets
+  --build-macos            Build macOS targets
+  --build-all              Build the default release target matrix
+
+Architecture flags:
+  --arch-x64               Target x86_64
+  --arch-x86               Target i686
+  --arch-arm, --arch-arm64 Target aarch64
+  --arch-armv7             Target armv7
+
+Configuration:
+  --musl                   Linux: use musl targets
+  --no-embed               Full release: do not embed container-bin into backend
+  --dev-content            Full release: copy development api/module content
+  --debug                  Build debug profile instead of release
+  --target=<triple>        Build one exact Rust target triple
+
+Examples:
+  ./build.ps1 --only-backend --build-windows --arch-x64
+  ./build.ps1 -only-cloud-node --build-linux --arch-arm64
+  ./build.ps1 --build-sdk --only-rpx --build-linux --arch-x64
+  ./build.sh --only-container --build-linux --musl --arch-x64
+
+Without --build-sdk or --only-<component>, the normal secure release builder is
+used and may build/package container, service, cloud_node, and backend together.
