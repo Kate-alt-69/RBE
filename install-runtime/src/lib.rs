@@ -24,9 +24,7 @@ pub use package::{
     stage_registry_package, VerifiedRegistryPackage, VerifiedRpxRootIndex,
     MAX_RPX_PACKAGE_INDEX_BYTES, RPX_PACKAGE_INDEX,
 };
-pub use prepare::{
-    prepare_verified_graph_sources, PreparedPackageSource, PreparedRootGraph,
-};
+pub use prepare::{prepare_verified_graph_sources, PreparedPackageSource, PreparedRootGraph};
 pub use promotion::{
     promote_artifact, promote_verified_graph, ArtifactPromotionResult, ArtifactPromotionState,
     RootGraphPromotion,
