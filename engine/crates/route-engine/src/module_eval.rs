@@ -60,8 +60,7 @@ pub trait HostCapabilityCaller: Send + Sync {
     ) -> HostCapabilityFuture<'a>;
 }
 
-pub type PackageCallFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+pub type PackageCallFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 
 /// Trusted bridge for a REL package export namespace such as
 /// `:import[request from advancenet]` followed by `request.get(...)`.
@@ -1116,9 +1115,7 @@ mod tests {
                     operation.to_string(),
                     args,
                 ));
-                Ok(Value::String(format!(
-                    "{package}:{export}:{operation}"
-                )))
+                Ok(Value::String(format!("{package}:{export}:{operation}")))
             })
         }
     }
@@ -1149,8 +1146,7 @@ mod tests {
         let root = root();
         let program = ModuleProgram::load(&root.join("module")).unwrap();
         let caller = Arc::new(FakePackages::default());
-        let executor =
-            ModuleExecutor::new(&program).with_package_export_caller(caller.clone());
+        let executor = ModuleExecutor::new(&program).with_package_export_caller(caller.clone());
         let value = block_on_ready(executor.call_inline(
             package_inline_file(),
             "\0package-test",
@@ -1163,7 +1159,9 @@ mod tests {
         assert_eq!(calls[0].0, "advancenet");
         assert_eq!(calls[0].1, "request");
         assert_eq!(calls[0].2, "get");
-        assert!(matches!(calls[0].3.as_slice(), [Value::String(value)] if value == "https://example.com"));
+        assert!(
+            matches!(calls[0].3.as_slice(), [Value::String(value)] if value == "https://example.com")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
