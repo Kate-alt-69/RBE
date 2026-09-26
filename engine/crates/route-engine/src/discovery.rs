@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::extract::{Path as AxumPath, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::MethodRouter;
@@ -347,6 +347,20 @@ mod cookie_snapshot_tests {
         assert!(matches!(cookies.get("second"), Some(Value::String(value)) if value == "two"));
         assert!(matches!(cookies.get("shared"), Some(Value::String(value)) if value == "new"));
     }
+}
+
+fn query_fields(raw_query: Option<&str>) -> Result<HashMap<String, String>, String> {
+    let mut query = HashMap::new();
+    for (key, value) in form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        let key = key.into_owned();
+        let value = value.into_owned();
+        if query.insert(key.clone(), value).is_some() {
+            return Err(format!(
+                "duplicate query field {key:?} is ambiguous; each decoded query name may appear only once"
+            ));
+        }
+    }
+    Ok(query)
 }
 
 fn request_error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -782,7 +796,7 @@ async fn execute(
     plan: RouteHandlerPlan,
     state: AppState,
     params: HashMap<String, String>,
-    query: HashMap<String, String>,
+    raw_query: Option<String>,
     request: Request,
 ) -> Response {
     let RouteHandlerPlan {
@@ -793,6 +807,10 @@ async fn execute(
         takes_request,
     } = plan;
     let path = request.uri().path().to_string();
+    let query = match query_fields(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(error) => return request_error(StatusCode::BAD_REQUEST, error),
+    };
     let image = match request
         .extensions()
         .get::<Arc<crate::runtime_image::RuntimeImageSlot>>()
@@ -966,10 +984,10 @@ fn build_method_router(
         let verb = method_def.verb.clone();
         let handler = move |State(state): State<AppState>,
                             AxumPath(params): AxumPath<HashMap<String, String>>,
-                            Query(query): Query<HashMap<String, String>>,
+                            RawQuery(raw_query): RawQuery,
                             request: Request| {
             let handler_plan = handler_plan.clone();
-            async move { execute(handler_plan, state, params, query, request).await }
+            async move { execute(handler_plan, state, params, raw_query, request).await }
         };
         router = match verb.as_str() {
             "get" => router.get(handler),
@@ -1499,6 +1517,28 @@ mod http_edge_tests {
         );
         assert_eq!(collision_key_for("/api/users/:uid"), "/api/users/:");
         assert_eq!(collision_key_for("/api/users/:name"), "/api/users/:");
+    }
+
+    #[test]
+    fn query_fields_decode_unique_scalar_values() {
+        let query = query_fields(Some("a=1&b=hello+world&encoded%20key=value%2Ftwo")).unwrap();
+        assert_eq!(query.get("a").map(String::as_str), Some("1"));
+        assert_eq!(query.get("b").map(String::as_str), Some("hello world"));
+        assert_eq!(
+            query.get("encoded key").map(String::as_str),
+            Some("value/two")
+        );
+        assert!(query_fields(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn query_fields_reject_repeated_decoded_names() {
+        for raw in ["id=first&id=second", "%69%64=first&id=second"] {
+            let error = query_fields(Some(raw)).unwrap_err();
+            assert!(error.contains("duplicate query field"), "{error}");
+            assert!(error.contains("id"), "{error}");
+            assert!(error.contains("may appear only once"), "{error}");
+        }
     }
 
     #[test]
