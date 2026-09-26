@@ -1,0 +1,49 @@
+name: Finalize FLD-021 Cookie Identity
+
+on:
+  push:
+    branches:
+      - ci/fld-021-cookie-identity-20260926
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Apply FLD-021
+        run: python .github/patches/fld-021-cookie-identity.py
+      - name: Format and check route-engine
+        working-directory: engine
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check -p route-engine
+      - name: Clippy route-engine library
+        working-directory: engine
+        run: cargo clippy -p route-engine --lib -- -D warnings
+      - name: Test route-engine
+        working-directory: engine
+        run: cargo test -p route-engine
+      - name: Commit verified FLD-021 source
+        run: |
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add doc/field-manager.md engine/crates/route-engine/src/discovery.rs
+          if git diff --cached --quiet; then
+            echo "FLD-021 source already finalized"
+            exit 0
+          fi
+          git commit -m "FIX | FLD-021 reject ambiguous cookie identities"
+          git push origin HEAD:ci/fld-021-cookie-identity-20260926
