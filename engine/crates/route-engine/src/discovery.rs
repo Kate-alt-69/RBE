@@ -279,6 +279,27 @@ fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String
         .map(ToOwned::to_owned)
 }
 
+fn singleton_header_string(
+    headers: &HeaderMap,
+    name: header::HeaderName,
+) -> Result<Option<String>, String> {
+    let label = name.as_str().to_string();
+    let values = headers.get_all(name);
+    let mut values = values.iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(format!(
+            "duplicate header {label:?} is ambiguous; {label} may appear only once"
+        ));
+    }
+    value
+        .to_str()
+        .map(|value| Some(value.to_owned()))
+        .map_err(|_| format!("header {label:?} contains non-text bytes"))
+}
+
 fn is_json_content_type(value: Option<&str>) -> bool {
     let Some(value) = value else {
         return false;
@@ -334,6 +355,31 @@ mod header_snapshot_tests {
         let error = headers_value(&headers).unwrap_err();
         assert!(error.contains("x-rbe-binary"), "{error}");
         assert!(error.contains("non-text bytes"), "{error}");
+    }
+
+    #[test]
+    fn singleton_content_type_rejects_duplicate_field_lines() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.append(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let error = singleton_header_string(&headers, header::CONTENT_TYPE).unwrap_err();
+        assert!(error.contains("content-type"), "{error}");
+        assert!(error.contains("may appear only once"), "{error}");
+    }
+
+    #[test]
+    fn singleton_host_rejects_duplicate_field_lines() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::HOST, HeaderValue::from_static("api.example.test"));
+        headers.append(header::HOST, HeaderValue::from_static("admin.example.test"));
+
+        let error = singleton_header_string(&headers, header::HOST).unwrap_err();
+        assert!(error.contains("host"), "{error}");
+        assert!(error.contains("may appear only once"), "{error}");
     }
 }
 
@@ -601,7 +647,8 @@ async fn request_value(
             ))
         })?;
 
-    let content_type = header_string(&parts.headers, header::CONTENT_TYPE);
+    let content_type = singleton_header_string(&parts.headers, header::CONTENT_TYPE)
+        .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?;
     let (body_value, raw_body) = request_body_values(&raw, content_type.as_deref())
         .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?;
 
@@ -645,7 +692,8 @@ async fn request_value(
     } else {
         "http"
     };
-    let host = header_string(&parts.headers, header::HOST)
+    let host = singleton_header_string(&parts.headers, header::HOST)
+        .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?
         .map(Value::String)
         .unwrap_or(Value::Null);
     let user_agent = header_string(&parts.headers, header::USER_AGENT)

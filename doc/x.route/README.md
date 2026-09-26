@@ -64,7 +64,7 @@ JSON bodies are decoded to REL values. Other current v1 body types are exposed a
 
 Forwarded client/protocol data is trusted only when `trustedProxyHeaders` policy is enabled. Otherwise `request.ip` is derived from the socket peer.
 
-Current transport limitations include collapsed duplicate query keys, joined duplicate request headers, and no first-class binary-body value type.
+Current transport behavior joins repeatable duplicate request headers, while semantic singleton headers such as `Content-Type` and `Host` are rejected when repeated so the structured snapshot cannot disagree with HTTP interpretation. There is no first-class binary-body value type.
 
 ## Responses
 
