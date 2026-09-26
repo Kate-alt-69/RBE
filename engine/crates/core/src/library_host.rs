@@ -33,7 +33,9 @@ impl WorkerHello {
         let object = object(value, "worker hello")?;
         reject_unknown(
             object,
-            &["protocol", "package", "sdk", "runtime", "abi_min", "abi_max"],
+            &[
+                "protocol", "package", "sdk", "runtime", "abi_min", "abi_max",
+            ],
             "worker hello",
         )?;
         Ok(Self {
@@ -475,7 +477,10 @@ fn object<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>, L
         .ok_or_else(|| LibraryHostError::InvalidMessage(format!("{label} must be a JSON object")))
 }
 
-fn required<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a Value, LibraryHostError> {
+fn required<'a>(
+    object: &'a Map<String, Value>,
+    field: &str,
+) -> Result<&'a Value, LibraryHostError> {
     object
         .get(field)
         .ok_or_else(|| LibraryHostError::InvalidMessage(format!("missing field {field:?}")))
@@ -486,7 +491,10 @@ fn reject_unknown(
     allowed: &[&str],
     label: &str,
 ) -> Result<(), LibraryHostError> {
-    if let Some(field) = object.keys().find(|field| !allowed.contains(&field.as_str())) {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
         return Err(LibraryHostError::InvalidMessage(format!(
             "{label} contains unknown field {field:?}"
         )));
@@ -684,14 +692,10 @@ mod tests {
     fn session() -> LibrarySession {
         LibrarySession::new(
             expected(),
-            [CapabilityGrant::new(
-                "net:http",
-                "net:http",
-                ["request".to_string()],
-                1024,
-                4096,
-            )
-            .unwrap()],
+            [
+                CapabilityGrant::new("net:http", "net:http", ["request".to_string()], 1024, 4096)
+                    .unwrap(),
+            ],
         )
         .unwrap()
     }
