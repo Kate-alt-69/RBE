@@ -1,0 +1,57 @@
+name: Finalize FLD-024 Singleton Headers
+
+on:
+  push:
+    branches:
+      - ci/fld-024-singleton-headers-20260926
+    paths:
+      - .github/patches/fld-024-singleton-headers.py
+      - .github/workflows/fld-024-finalize.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply FLD-024
+        run: python .github/patches/fld-024-singleton-headers.py
+
+      - name: Format and check route-engine
+        working-directory: engine
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check -p route-engine
+
+      - name: Clippy route-engine library
+        working-directory: engine
+        run: cargo clippy -p route-engine --lib -- -D warnings
+
+      - name: Test route-engine
+        working-directory: engine
+        run: cargo test -p route-engine
+
+      - name: Commit verified FLD-024 source
+        run: |
+          set -euo pipefail
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add doc/field-manager.md doc/x.route/README.md engine/crates/route-engine/src/discovery.rs
+          git diff --cached --quiet && { echo "no FLD-024 source changes"; exit 1; }
+          git commit -m "FIX | FLD-024 reject ambiguous singleton headers"
+          git push origin HEAD:ci/fld-024-singleton-headers-20260926
