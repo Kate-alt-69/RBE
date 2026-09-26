@@ -21,6 +21,7 @@ subtle = "2"
 hex = "0.4"
 regex = "1"
 fancy-regex = "=0.16.2"
+form_urlencoded = "1"
 wasm-encoder = "0.248"
 
 [dev-dependencies]
