@@ -12,6 +12,7 @@ mod package_links;
 
 const RUNTIME_IMAGE_COMPILE_HELP: &str =
     "https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5100";
+const PACKAGE_GRAPH_SETTINGS_KEY: &str = "__rbePackageGraphSha256";
 
 pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Result<RuntimeImage> {
     let root = runtime_paths::binary_dir();
@@ -35,12 +36,13 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
         &route_engine::default_module_dir(),
         catalog,
     )?;
-    let settings = effective_settings_json(config);
     let package_links = package_links::load(&root).map_err(|error| {
         anyhow::anyhow!(
             "RBE5100 Backend could not load verified package exports for Runtime Image linking.\n\nError:\n  {error:#}\n\nNote:\n  Runtime Image startup refuses unverified or stale package-link metadata. Rehydrate the active package graph and retry.\n\nHelp:\n  {RUNTIME_IMAGE_COMPILE_HELP}"
         )
     })?;
+    let mut settings = effective_settings_json(config);
+    let package_graph_sha256 = bind_package_graph_identity(&mut settings, &package_links)?;
     let image = route_engine::relc::compile_runtime_image_with_packages(
         &server_source,
         physical.clone(),
@@ -57,6 +59,7 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
     tracing::info!(
         image = %image.image_id,
         source_hash = %image.source_hash,
+        package_graph_sha256 = %package_graph_sha256,
         routes = image.routes.len(),
         modules = image.modules.len(),
         services = image.services.len(),
@@ -66,6 +69,23 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
         "linked immutable Runtime Image"
     );
     Ok(image)
+}
+
+fn bind_package_graph_identity(
+    settings: &mut serde_json::Value,
+    package_links: &route_engine::relc::PackageLinkContext,
+) -> anyhow::Result<String> {
+    let identity = package_links
+        .identity_sha256()
+        .map_err(|error| anyhow::anyhow!("could not hash verified package graph: {error}"))?;
+    let settings = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("effective Runtime Image settings must be a JSON object"))?;
+    settings.insert(
+        PACKAGE_GRAPH_SETTINGS_KEY.to_string(),
+        serde_json::Value::String(identity.clone()),
+    );
+    Ok(identity)
 }
 
 fn render_runtime_image_compile_error(
@@ -856,6 +876,12 @@ fn _path_marker(_: &Path) {}
 
 #[cfg(test)]
 mod diagnostic_tests {
+    use std::collections::BTreeMap;
+
+    use route_engine::relc::{
+        PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
+    };
+
     use super::*;
 
     #[test]
@@ -925,5 +951,53 @@ mod diagnostic_tests {
         assert!(rendered.contains("status bananas;"));
         assert!(rendered.contains("online"));
         assert!(rendered.contains("/rel#rel2004"));
+    }
+
+    #[test]
+    fn verified_package_graph_identity_changes_runtime_image_id() {
+        fn package_links(artifact: char) -> PackageLinkContext {
+            PackageLinkContext {
+                format: PACKAGE_LINK_FORMAT,
+                roots: BTreeMap::from([(
+                    "advancenet".into(),
+                    PackageRootLink {
+                        version: "2.0.0".into(),
+                        artifact_sha256: artifact.to_string().repeat(64),
+                        exports: BTreeMap::from([(
+                            "request".into(),
+                            PackageExportLink {
+                                entry: "components/request/request.ts".into(),
+                                language: "typescript".into(),
+                            },
+                        )]),
+                    },
+                )]),
+            }
+        }
+
+        let first_links = package_links('a');
+        let second_links = package_links('b');
+        let mut first_settings = serde_json::json!({});
+        let mut second_settings = serde_json::json!({});
+        bind_package_graph_identity(&mut first_settings, &first_links).unwrap();
+        bind_package_graph_identity(&mut second_settings, &second_links).unwrap();
+
+        let first = route_engine::relc::compile_runtime_image_with_packages(
+            "server Main {}",
+            Vec::new(),
+            &first_settings,
+            &first_links,
+        )
+        .unwrap();
+        let second = route_engine::relc::compile_runtime_image_with_packages(
+            "server Main {}",
+            Vec::new(),
+            &second_settings,
+            &second_links,
+        )
+        .unwrap();
+
+        assert_eq!(first.source_hash, second.source_hash);
+        assert_ne!(first.image_id, second.image_id);
     }
 }
