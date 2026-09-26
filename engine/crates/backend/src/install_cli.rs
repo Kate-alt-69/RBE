@@ -213,11 +213,12 @@ async fn resolve_named_async(
             "promote verified package graph for `{key}` failed: {error}"
         ))
     })?;
-    let target = load_named_install_target(project_root, key, requirement, &graph).map_err(|error| {
-        InstallCliFailure::unavailable(format!(
-            "construct safe project install target for `{key}` failed: {error}"
-        ))
-    })?;
+    let target =
+        load_named_install_target(project_root, key, requirement, &graph).map_err(|error| {
+            InstallCliFailure::unavailable(format!(
+                "construct safe project install target for `{key}` failed: {error}"
+            ))
+        })?;
     let root = target.lock.packages.get(key).ok_or_else(|| {
         InstallCliFailure::software(format!(
             "merged project target contains no root package `{key}`"
