@@ -95,18 +95,17 @@ impl CompilerResolver {
         allow_host_authoring: bool,
     ) -> Result<Self, ToolchainError> {
         let path = project_root.as_ref().join(RPX_TOOLCHAIN_RELATIVE_PATH);
-        let managed = match fs::read_to_string(&path) {
-            Ok(input) => Some(
-                ManagedCompilerToolchain::parse_json(&input).map_err(|source| {
-                    ToolchainError::InvalidFile {
+        let managed =
+            match fs::read_to_string(&path) {
+                Ok(input) => Some(ManagedCompilerToolchain::parse_json(&input).map_err(
+                    |source| ToolchainError::InvalidFile {
                         path,
                         source: Box::new(source),
-                    }
-                })?,
-            ),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => return Err(ToolchainError::Read { path, source }),
-        };
+                    },
+                )?),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => return Err(ToolchainError::Read { path, source }),
+            };
         Ok(Self {
             managed,
             allow_host_authoring,
@@ -124,7 +123,9 @@ impl CompilerResolver {
     pub fn resolve(&self, tool: &str) -> Result<ResolvedCompiler, ToolchainError> {
         validate_tool_name(tool)?;
         if let Some(toolchain) = &self.managed {
-            return Ok(ResolvedCompiler::Managed(toolchain.program(tool)?.to_path_buf()));
+            return Ok(ResolvedCompiler::Managed(
+                toolchain.program(tool)?.to_path_buf(),
+            ));
         }
         if self.allow_host_authoring {
             return Ok(ResolvedCompiler::HostAuthoring(tool.to_string()));
@@ -245,10 +246,9 @@ mod tests {
 
     #[test]
     fn managed_toolchain_requires_absolute_paths() {
-        let error = ManagedCompilerToolchain::parse_json(
-            r#"{"format":1,"tools":{"cargo":"bin/cargo"}}"#,
-        )
-        .unwrap_err();
+        let error =
+            ManagedCompilerToolchain::parse_json(r#"{"format":1,"tools":{"cargo":"bin/cargo"}}"#)
+                .unwrap_err();
         assert!(matches!(
             error,
             ToolchainError::ToolPathMustBeAbsolute { .. }
