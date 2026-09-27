@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use atomic_io::AtomicIo;
-use fs2::FileExt;
 use rbe_install_orchestrator::{
     delta_install_session, ActivationGate, DeltaSessionError, InstallSession, InstallSessionPhase,
     SessionError, INSTALL_JOURNAL_FILE, INSTALL_LEASE_FILE,
@@ -150,7 +149,8 @@ fn recover_project_activation_locked(
     atomic: &AtomicIo,
 ) -> Result<ProjectInstallRecovery, ActivationRuntimeError> {
     let journal = journal_path(layout);
-    let Some(journal_json) = read_optional_bounded_text(&journal, MAX_INSTALL_JOURNAL_BYTES)? else {
+    let Some(journal_json) = read_optional_bounded_text(&journal, MAX_INSTALL_JOURNAL_BYTES)?
+    else {
         // A staged manifest without a journal can never be authoritative.
         remove_file_if_exists(&staged_manifest_path(layout))?;
         return Ok(ProjectInstallRecovery::Clean);
@@ -173,14 +173,9 @@ fn recover_project_activation_locked(
         return Ok(ProjectInstallRecovery::RolledBackUncommitted);
     }
 
-    let current_manifest = read_optional_bounded_text(
-        &layout.manifest_path(),
-        MAX_STAGED_MANIFEST_BYTES,
-    )?;
-    if current_manifest
-        .as_deref()
-        .map(sha256_text)
-        .as_deref()
+    let current_manifest =
+        read_optional_bounded_text(&layout.manifest_path(), MAX_STAGED_MANIFEST_BYTES)?;
+    if current_manifest.as_deref().map(sha256_text).as_deref()
         == Some(session.manifest_sha256.as_str())
     {
         remove_file_if_exists(&staged_manifest)?;
@@ -226,7 +221,9 @@ fn persist_session(
     Ok(())
 }
 
-fn acquire_install_lease(layout: &ProjectCacheLayout) -> Result<InstallLease, ActivationRuntimeError> {
+fn acquire_install_lease(
+    layout: &ProjectCacheLayout,
+) -> Result<InstallLease, ActivationRuntimeError> {
     let root = install_state_root(layout);
     ensure_safe_directory(&root)?;
     let path = root.join(INSTALL_LEASE_FILE);
@@ -290,7 +287,9 @@ fn ensure_safe_directory(path: &Path) -> Result<(), ActivationRuntimeError> {
     reject_symlink_components(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(ActivationRuntimeError::UnsafeInstallState(path.to_path_buf()));
+        return Err(ActivationRuntimeError::UnsafeInstallState(
+            path.to_path_buf(),
+        ));
     }
     Ok(())
 }
@@ -313,9 +312,9 @@ fn reject_symlink_components(path: &Path) -> Result<(), ActivationRuntimeError> 
 
 fn reject_symlink_if_present(path: &Path) -> Result<(), ActivationRuntimeError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(ActivationRuntimeError::UnsafeInstallState(path.to_path_buf()))
-        }
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(
+            ActivationRuntimeError::UnsafeInstallState(path.to_path_buf()),
+        ),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -342,7 +341,9 @@ fn read_optional_bounded_text(
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(ActivationRuntimeError::UnsafeInstallState(path.to_path_buf()));
+        return Err(ActivationRuntimeError::UnsafeInstallState(
+            path.to_path_buf(),
+        ));
     }
     if metadata.len() > maximum_bytes {
         return Err(ActivationRuntimeError::InstallStateTooLarge {
@@ -502,8 +503,14 @@ mod tests {
 
         let result = activate_project_target(temp.path(), &target, &work, &proofs).unwrap();
         let layout = ProjectCacheLayout::new(temp.path());
-        assert_eq!(fs::read_to_string(layout.manifest_path()).unwrap(), target.manifest_yaml);
-        assert_eq!(fs::read_to_string(layout.lock_path()).unwrap(), target.lock_yaml);
+        assert_eq!(
+            fs::read_to_string(layout.manifest_path()).unwrap(),
+            target.manifest_yaml
+        );
+        assert_eq!(
+            fs::read_to_string(layout.lock_path()).unwrap(),
+            target.lock_yaml
+        );
         assert!(!journal_path(&layout).exists());
         assert!(!staged_manifest_path(&layout).exists());
         assert_eq!(result.activated_packages, 1);
@@ -531,15 +538,24 @@ mod tests {
         session.mark_ready("demo").unwrap();
         persist_session(&atomic, &session, &layout).unwrap();
         atomic
-            .write_atomic(&staged_manifest_path(&layout), target.manifest_yaml.as_bytes())
+            .write_atomic(
+                &staged_manifest_path(&layout),
+                target.manifest_yaml.as_bytes(),
+            )
             .unwrap();
         atomic
             .write_atomic(&layout.lock_path(), target.lock_yaml.as_bytes())
             .unwrap();
 
         let recovered = recover_project_activation(temp.path()).unwrap();
-        assert_eq!(recovered, ProjectInstallRecovery::CompletedManifestPublication);
-        assert_eq!(fs::read_to_string(layout.manifest_path()).unwrap(), target.manifest_yaml);
+        assert_eq!(
+            recovered,
+            ProjectInstallRecovery::CompletedManifestPublication
+        );
+        assert_eq!(
+            fs::read_to_string(layout.manifest_path()).unwrap(),
+            target.manifest_yaml
+        );
         assert!(!journal_path(&layout).exists());
     }
 
@@ -558,11 +574,17 @@ mod tests {
         .unwrap();
         persist_session(&atomic, &session, &layout).unwrap();
         atomic
-            .write_atomic(&staged_manifest_path(&layout), target.manifest_yaml.as_bytes())
+            .write_atomic(
+                &staged_manifest_path(&layout),
+                target.manifest_yaml.as_bytes(),
+            )
             .unwrap();
 
         let recovered = recover_project_activation(temp.path()).unwrap();
-        assert_eq!(recovered, ProjectInstallRecovery::RolledBackUncommitted);
+        assert_eq!(
+            recovered,
+            ProjectInstallRecovery::RolledBackUncommitted
+        );
         assert!(!staged_manifest_path(&layout).exists());
         assert!(!journal_path(&layout).exists());
         assert!(!layout.lock_path().exists());
@@ -572,8 +594,8 @@ mod tests {
     fn activation_requires_exact_proof_set() {
         let temp = tempfile::tempdir().unwrap();
         let (target, work) = target();
-        let error = activate_project_target(temp.path(), &target, &work, &BTreeMap::new())
-            .unwrap_err();
+        let error =
+            activate_project_target(temp.path(), &target, &work, &BTreeMap::new()).unwrap_err();
         assert!(matches!(error, ActivationRuntimeError::MissingProof(name) if name == "demo"));
     }
 }
