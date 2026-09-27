@@ -37,11 +37,12 @@ pub fn prepare_prebuilt_activation_proofs(
                 root: graph.root.clone(),
                 package: package.clone(),
             })?;
-        let index = indexes
-            .get(package)
-            .ok_or_else(|| PrebuiltPreparationError::RegistryIndexMissing {
-                package: package.clone(),
-            })?;
+        let index =
+            indexes
+                .get(package)
+                .ok_or_else(|| PrebuiltPreparationError::RegistryIndexMissing {
+                    package: package.clone(),
+                })?;
         index.validate_for(package)?;
         let release = index
             .releases
@@ -51,6 +52,12 @@ pub fn prepare_prebuilt_activation_proofs(
                 package: package.clone(),
                 version: locked.version.clone(),
             })?;
+        let short_sha = verified
+            .stage
+            .verified
+            .sha256
+            .get(..16)
+            .ok_or_else(|| PrebuiltPreparationError::InvalidVerifiedArtifactSha(package.clone()))?;
 
         let input = PackageAttestationInput {
             package: package.clone(),
@@ -65,13 +72,15 @@ pub fn prepare_prebuilt_activation_proofs(
             reproducible_build: release.artifact.reproducible_build,
             shipped_binary_sha256: release.artifact.shipped_binary_sha256.clone(),
             rebuilt_binary_sha256: None,
-            build_id: format!(
-                "prebuilt:{package}:{}",
-                &verified.stage.verified.sha256[..16]
-            ),
+            build_id: format!("prebuilt:{package}:{short_sha}"),
             host: host.clone(),
         };
         let gate = gate_activation(&input, AttestationPolicy::default())?;
+        if !gate.can_activate() {
+            return Err(PrebuiltPreparationError::AttestationRejected {
+                package: package.clone(),
+            });
+        }
         let instance = if package == &graph.root {
             package.clone()
         } else {
@@ -127,8 +136,12 @@ pub enum PrebuiltPreparationError {
     RegistryIndexMissing { package: String },
     #[error("registry index for {package:?} is missing resolved release {version:?}")]
     RegistryReleaseMissing { package: String, version: String },
+    #[error("verified artifact SHA-256 for package {0:?} is malformed")]
+    InvalidVerifiedArtifactSha(String),
     #[error("package {package:?} requires {steps} managed build step(s) on this host")]
     ManagedBuildRequired { package: String, steps: usize },
+    #[error("package {package:?} failed attestation and cannot enter an install session")]
+    AttestationRejected { package: String },
     #[error("duplicate activation proof for package instance {0:?}")]
     DuplicateActivationProof(String),
     #[error("activation proof count mismatch: expected {expected}, got {actual}")]
@@ -203,9 +216,9 @@ mod tests {
                 size_bytes: 10,
             },
             promotion: PromotionPlan {
-                verified_partial: PathBuf::from("/tmp/demo.part"),
-                final_dir: PathBuf::from("/tmp/demo"),
-                final_artifact: PathBuf::from("/tmp/demo/artifact.rbe"),
+                verified_partial: PathBuf::from("demo.part"),
+                final_dir: PathBuf::from("demo"),
+                final_artifact: PathBuf::from("demo/artifact.rbe"),
                 create_final_dir: true,
                 replace_existing: false,
                 fsync_before_publish: true,
@@ -282,9 +295,11 @@ mod tests {
     }
 
     #[test]
-    fn declared_signature_is_never_assumed_verified() {
+    fn declared_signature_is_rejected_before_session_creation() {
         let (graph, indexes) = fixture(BuildSpec::default(), Some("signature".into()));
-        let proofs = prepare_prebuilt_activation_proofs(&graph, &indexes).unwrap();
-        assert!(!proofs["demo"].gate.can_activate());
+        assert!(matches!(
+            prepare_prebuilt_activation_proofs(&graph, &indexes),
+            Err(PrebuiltPreparationError::AttestationRejected { package }) if package == "demo"
+        ));
     }
 }
