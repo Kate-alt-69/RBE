@@ -6,9 +6,6 @@
 
 #![forbid(unsafe_code)]
 
-// Keep installer tests self-contained instead of adding a dev-only dependency
-// edge to the production engine lock graph. `extern crate self as tempfile`
-// preserves the existing `tempfile::tempdir()` spelling inside unit tests.
 #[cfg(test)]
 extern crate self as tempfile;
 
@@ -61,6 +58,7 @@ mod cache;
 mod graph;
 mod http;
 mod package;
+mod prepare;
 mod promotion;
 mod registry;
 mod target;
@@ -78,6 +76,7 @@ pub use package::{
     stage_registry_package, VerifiedRegistryPackage, VerifiedRpxRootIndex,
     MAX_RPX_PACKAGE_INDEX_BYTES, RPX_PACKAGE_INDEX,
 };
+pub use prepare::{prepare_prebuilt_activation_proofs, PrebuiltPreparationError};
 pub use promotion::{
     promote_artifact, promote_verified_graph, ArtifactPromotionResult, ArtifactPromotionState,
     RootGraphPromotion,
