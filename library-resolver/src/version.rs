@@ -24,16 +24,16 @@ pub fn version_satisfies_requirement(
     requirement: &str,
     resolved_version: &str,
 ) -> Result<bool, VersionMatchError> {
-    let requirement = VersionReq::parse(requirement).map_err(|source| {
-        VersionMatchError::InvalidRequirement {
+    let requirement =
+        VersionReq::parse(requirement).map_err(|source| VersionMatchError::InvalidRequirement {
             value: requirement.to_string(),
             source,
-        }
-    })?;
-    let version = Version::parse(resolved_version).map_err(|source| VersionMatchError::InvalidVersion {
-        value: resolved_version.to_string(),
-        source,
-    })?;
+        })?;
+    let version =
+        Version::parse(resolved_version).map_err(|source| VersionMatchError::InvalidVersion {
+            value: resolved_version.to_string(),
+            source,
+        })?;
     Ok(requirement.matches(&version))
 }
 
