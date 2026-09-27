@@ -15,6 +15,100 @@
 // not currently call them directly.
 #![allow(dead_code)]
 
+// `discovery` only needs the parser half of application/x-www-form-urlencoded.
+// Keep that tiny surface in-tree so request decoding does not add another direct
+// dependency edge to Route Engine's locked workspace graph.
+extern crate self as form_urlencoded;
+
+mod form_urlencoded_compat {
+    use std::borrow::Cow;
+
+    fn hex_nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    fn decode(input: &[u8]) -> String {
+        let mut decoded = Vec::with_capacity(input.len());
+        let mut index = 0usize;
+        while index < input.len() {
+            match input[index] {
+                b'+' => {
+                    decoded.push(b' ');
+                    index += 1;
+                }
+                b'%' if index + 2 < input.len() => {
+                    match (hex_nibble(input[index + 1]), hex_nibble(input[index + 2])) {
+                        (Some(high), Some(low)) => {
+                            decoded.push((high << 4) | low);
+                            index += 3;
+                        }
+                        _ => {
+                            decoded.push(b'%');
+                            index += 1;
+                        }
+                    }
+                }
+                byte => {
+                    decoded.push(byte);
+                    index += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&decoded).into_owned()
+    }
+
+    pub(crate) fn parse(
+        input: &[u8],
+    ) -> impl Iterator<Item = (Cow<'static, str>, Cow<'static, str>)> {
+        let mut pairs = Vec::new();
+        for sequence in input.split(|byte| *byte == b'&') {
+            if sequence.is_empty() {
+                continue;
+            }
+            let mut parts = sequence.splitn(2, |byte| *byte == b'=');
+            let name = parts.next().unwrap_or_default();
+            let value = parts.next().unwrap_or_default();
+            pairs.push((Cow::Owned(decode(name)), Cow::Owned(decode(value))));
+        }
+        pairs.into_iter()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse;
+
+        #[test]
+        fn decodes_form_pairs_like_query_input() {
+            let pairs = parse(b"first+name=Kate%20K&flag&&encoded=%23ok%25")
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                pairs,
+                vec![
+                    ("first name".to_string(), "Kate K".to_string()),
+                    ("flag".to_string(), String::new()),
+                    ("encoded".to_string(), "#ok%".to_string()),
+                ]
+            );
+        }
+
+        #[test]
+        fn malformed_percent_sequences_remain_literal() {
+            let pairs = parse(b"value=%GG%2")
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(pairs, vec![("value".to_string(), "%GG%2".to_string())]);
+        }
+    }
+}
+
+pub(crate) use form_urlencoded_compat::parse;
+
 mod analyzer;
 mod ast;
 pub mod dependency_graph;
