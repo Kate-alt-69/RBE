@@ -118,6 +118,7 @@ pub mod execution_tracker;
 mod field_manager;
 mod interpreter;
 mod lexer;
+#[cfg_attr(test, allow(clippy::type_complexity))]
 mod module_eval;
 mod module_runtime;
 mod modules;
