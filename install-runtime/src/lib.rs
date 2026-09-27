@@ -64,6 +64,7 @@ mod package;
 mod promotion;
 mod registry;
 mod target;
+mod verified_worker;
 
 pub use activation::{
     activate_project_target, recover_project_activation, ActivationRuntimeError,
@@ -88,6 +89,9 @@ pub use registry::{
 pub use target::{
     load_named_install_target, merge_named_install_target, InstallTargetError, NamedInstallTarget,
 };
+pub use verified_worker::{
+    read_verified_root_worker_identities, VerifiedPackageWorkerIdentity,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallRuntimeError {
@@ -101,6 +105,8 @@ pub enum InstallRuntimeError {
     PackageArchive(#[from] rbe_library_package::ArchiveError),
     #[error(transparent)]
     ProjectPackage(#[from] rbe_project_package::ProjectPackageError),
+    #[error(transparent)]
+    VersionMatch(#[from] rbe_library_resolver::VersionMatchError),
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),
     #[error("invalid install-runtime URL {value:?}: {source}")]
@@ -169,6 +175,29 @@ pub enum InstallRuntimeError {
         field: &'static str,
         registry: String,
         manifest: String,
+    },
+    #[error(
+        "verified package root {package:?} field {field} mismatch: lock={locked:?}, artifact={artifact:?}"
+    )]
+    VerifiedPackageMetadataMismatch {
+        package: String,
+        field: &'static str,
+        locked: String,
+        artifact: String,
+    },
+    #[error("verified package root {package:?} is missing pinned {toolchain} identity")]
+    MissingLockedToolchain {
+        package: String,
+        toolchain: &'static str,
+    },
+    #[error(
+        "verified package root {package:?} resolved {toolchain} version {resolved:?} does not satisfy artifact requirement {requirement:?}"
+    )]
+    ToolchainRequirementMismatch {
+        package: String,
+        toolchain: &'static str,
+        resolved: String,
+        requirement: String,
     },
     #[error("library.toml is not a bounded regular manifest suitable for hashing")]
     InvalidManifestForHashing,
