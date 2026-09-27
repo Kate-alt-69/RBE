@@ -581,10 +581,7 @@ mod tests {
             .unwrap();
 
         let recovered = recover_project_activation(temp.path()).unwrap();
-        assert_eq!(
-            recovered,
-            ProjectInstallRecovery::RolledBackUncommitted
-        );
+        assert_eq!(recovered, ProjectInstallRecovery::RolledBackUncommitted);
         assert!(!staged_manifest_path(&layout).exists());
         assert!(!journal_path(&layout).exists());
         assert!(!layout.lock_path().exists());
