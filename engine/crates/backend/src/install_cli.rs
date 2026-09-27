@@ -3,15 +3,16 @@
 //! Named installs resolve registry metadata, stage and verify every selected
 //! artifact, inspect package manifests, construct an exact root-scoped lock
 //! candidate, durably promote verified artifacts into the content-addressed
-//! project cache, and build a non-mutating merged project target before normal
-//! Backend boot. The executable still refuses to claim installation success
-//! until preparation/build, attestation, and durable session activation complete.
+//! project cache, merge with current project state, and atomically activate
+//! fully prebuilt graphs before normal Backend boot. Packages that require host
+//! compilation remain gated until the managed build executor is connected.
 
 use std::path::Path;
 
 use rbe_install_request::{InstallCommand, InstallTarget};
 use rbe_install_runtime::{
-    load_named_install_target, promote_verified_graph, stage_resolved_root, RegistryClient,
+    activate_project_target, load_named_install_target, prepare_prebuilt_activation_proofs,
+    promote_verified_graph, stage_resolved_root, RegistryClient,
 };
 use rbe_library_resolver::{resolve_scoped, ResolutionRequest};
 
@@ -42,11 +43,11 @@ Registry configuration:
 Current execution boundary:
   Named-package registry hydration, deterministic dependency resolution,
   verified artifact staging, manifest inspection, exact root-scoped lock
-  construction, durable content-addressed artifact promotion, and safe merge
-  with the existing project manifest/lock are active before Backend boot.
-  Package preparation/build, attestation, install-session activation, and the
-  final package.rbe.yaml/package.lock.rbe.yaml commit remain gated, so a
-  prepared project target exits unavailable instead of claiming success."#;
+  construction, durable content-addressed artifact promotion, safe project
+  state merge, attestation, crash-recoverable install sessions, and atomic
+  project activation are active before Backend boot for package graphs that
+  require no host build steps. Packages that require compilation fail closed
+  until the managed build executor is connected."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCliFailure {
@@ -219,6 +220,18 @@ async fn resolve_named_async(
                 "construct safe project install target for `{key}` failed: {error}"
             ))
         })?;
+    let proofs = prepare_prebuilt_activation_proofs(&graph, &indexes).map_err(|error| {
+        InstallCliFailure::unavailable(format!(
+            "prepare activation proofs for `{key}` failed: {error}"
+        ))
+    })?;
+    let activation =
+        activate_project_target(project_root, &target, &graph.lock, &proofs).map_err(|error| {
+            InstallCliFailure::unavailable(format!(
+                "activate project package target for `{key}` failed: {error}"
+            ))
+        })?;
+
     let root = target.lock.packages.get(key).ok_or_else(|| {
         InstallCliFailure::software(format!(
             "merged project target contains no root package `{key}`"
@@ -238,7 +251,7 @@ async fn resolve_named_async(
 
     let message = if json {
         serde_json::json!({
-            "status": "merged_project_target_not_activated",
+            "status": "installed",
             "package": key,
             "version": root.version,
             "dependencies": dependencies,
@@ -254,6 +267,12 @@ async fn resolve_named_async(
                 "size_bytes": root_stage.stage.verified.size_bytes,
                 "manifest_sha256": root.manifest_sha256,
             },
+            "activation": {
+                "session_id": activation.session_id,
+                "activated_packages": activation.activated_packages,
+                "manifest_sha256": activation.manifest_sha256,
+                "lock_sha256": activation.lock_sha256,
+            },
             "project_target": {
                 "roots": target.lock.packages.len(),
                 "manifest_sha256": target.manifest_sha256,
@@ -262,20 +281,19 @@ async fn resolve_named_async(
             "root_graph_complete": target.lock.root_graph_complete(key),
             "registry": registry,
             "server_started": false,
-            "project_manifest_changed": false,
-            "project_lock_changed": false,
-            "next_boundary": "package preparation/build, attestation, and durable session activation"
+            "project_manifest_changed": true,
+            "project_lock_changed": true,
         })
         .to_string()
     } else if quiet {
         format!(
-            "`{key}` {} and {dependencies} dependenc{} verified and cached; safe project target built, durable activation is not connected yet",
+            "installed `{key}` {} with {dependencies} dependenc{}",
             root.version,
             if dependencies == 1 { "y" } else { "ies" },
         )
     } else {
         format!(
-            "`backend install` verified and cached the complete `{key}` {} root graph: {} package(s), {verified_bytes} byte(s).\ncache: {} published, {} reused\nroot artifact: {}\nartifact sha256: {}\nmanifest sha256: {}\nproject target roots: {}\nproject manifest sha256: {}\nproject lock sha256: {}\n\nThe requested root/private graph was safely merged with the existing project state without mutating package.rbe.yaml or package.lock.rbe.yaml. Package preparation/build, attestation, and install-session activation are not connected to backend.exe yet. No RBE server was started and no project package state was changed.",
+            "Installed `{key}` {} successfully.\nverified graph: {} package(s), {verified_bytes} byte(s)\ncache: {} published, {} reused\nroot artifact: {}\nartifact sha256: {}\nmanifest sha256: {}\nproject roots: {}\nproject manifest sha256: {}\nproject lock sha256: {}\ninstall session: {}\nactivated package instances: {}\n\npackage.rbe.yaml and package.lock.rbe.yaml were activated atomically before Backend boot. No RBE server was started.",
             root.version,
             graph.packages.len(),
             promotion.published,
@@ -284,12 +302,14 @@ async fn resolve_named_async(
             root.artifact_sha256,
             root.manifest_sha256,
             target.lock.packages.len(),
-            target.manifest_sha256,
-            target.lock_sha256,
+            activation.manifest_sha256,
+            activation.lock_sha256,
+            activation.session_id,
+            activation.activated_packages,
         )
     };
 
-    Err(InstallCliFailure::unavailable(message))
+    Ok(message)
 }
 
 fn install_command_index(args: &[String]) -> Option<usize> {

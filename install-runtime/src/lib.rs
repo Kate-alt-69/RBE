@@ -61,6 +61,7 @@ mod cache;
 mod graph;
 mod http;
 mod package;
+mod prepare;
 mod promotion;
 mod registry;
 mod snapshot;
@@ -79,6 +80,7 @@ pub use package::{
     stage_registry_package, VerifiedRegistryPackage, VerifiedRpxRootIndex,
     MAX_RPX_PACKAGE_INDEX_BYTES, RPX_PACKAGE_INDEX,
 };
+pub use prepare::{prepare_prebuilt_activation_proofs, PrebuiltPreparationError};
 pub use promotion::{
     promote_artifact, promote_verified_graph, ArtifactPromotionResult, ArtifactPromotionState,
     RootGraphPromotion,
