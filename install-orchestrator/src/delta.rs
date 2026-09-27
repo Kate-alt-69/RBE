@@ -143,13 +143,7 @@ mod tests {
         let mut work = ProjectPackageLock::default();
         work.packages.insert("beta".into(), locked("2.0.0", 'b'));
 
-        let session = delta_install_session(
-            "delta-1",
-            "c".repeat(64),
-            &target,
-            &work,
-        )
-        .unwrap();
+        let session = delta_install_session("delta-1", "c".repeat(64), &target, &work).unwrap();
 
         assert_eq!(session.packages.len(), 1);
         assert!(session.packages.contains_key("beta"));
