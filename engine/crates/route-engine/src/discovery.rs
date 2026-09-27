@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -321,6 +321,29 @@ fn comma_header_values(
     Ok(output)
 }
 
+fn trusted_forwarded_for(headers: &HeaderMap) -> Result<Vec<String>, String> {
+    let name = HeaderName::from_static("x-forwarded-for");
+    let present = headers.contains_key(&name);
+    let forwarded = comma_header_values(headers, name)?;
+    if forwarded.is_empty() {
+        return if present {
+            Err("trusted x-forwarded-for header contains no IP value".into())
+        } else {
+            Ok(Vec::new())
+        };
+    }
+
+    forwarded
+        .into_iter()
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .map(|ip| ip.to_string())
+                .map_err(|_| format!("trusted x-forwarded-for contains invalid IP {value:?}"))
+        })
+        .collect()
+}
+
 fn trusted_forwarded_protocol(headers: &HeaderMap) -> Result<String, String> {
     let name = HeaderName::from_static("x-forwarded-proto");
     let present = headers.contains_key(&name);
@@ -452,6 +475,48 @@ mod header_snapshot_tests {
         let error = comma_header_values(&headers, name).unwrap_err();
         assert!(error.contains("x-forwarded-for"), "{error}");
         assert!(error.contains("non-text bytes"), "{error}");
+    }
+
+    #[test]
+    fn trusted_forwarded_for_defaults_only_when_header_is_absent() {
+        assert!(trusted_forwarded_for(&HeaderMap::new()).unwrap().is_empty());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("   "),
+        );
+        let error = trusted_forwarded_for(&headers).unwrap_err();
+        assert!(error.contains("no IP value"), "{error}");
+    }
+
+    #[test]
+    fn trusted_forwarded_for_validates_and_canonicalizes_every_token() {
+        let mut headers = HeaderMap::new();
+        let name = HeaderName::from_static("x-forwarded-for");
+        headers.append(
+            name.clone(),
+            HeaderValue::from_static("203.0.113.10, 2001:0db8::1"),
+        );
+        headers.append(name, HeaderValue::from_static("10.0.0.2"));
+
+        assert_eq!(
+            trusted_forwarded_for(&headers).unwrap(),
+            vec!["203.0.113.10", "2001:db8::1", "10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn trusted_forwarded_for_rejects_invalid_tokens_anywhere() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("203.0.113.10, not-an-ip"),
+        );
+
+        let error = trusted_forwarded_for(&headers).unwrap_err();
+        assert!(error.contains("invalid IP"), "{error}");
+        assert!(error.contains("not-an-ip"), "{error}");
     }
 
     #[test]
@@ -765,7 +830,7 @@ async fn request_value(
 
     let trust_proxy = state.config.security.trusted_proxy_headers;
     let forwarded_for = if trust_proxy {
-        comma_header_values(&parts.headers, HeaderName::from_static("x-forwarded-for"))
+        trusted_forwarded_for(&parts.headers)
             .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?
             .into_iter()
             .map(Value::String)
