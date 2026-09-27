@@ -121,11 +121,7 @@ mod tests {
         }
     }
 
-    fn worker(
-        package: &str,
-        version: &str,
-        artifact: char,
-    ) -> VerifiedPackageWorkerIdentity {
+    fn worker(package: &str, version: &str, artifact: char) -> VerifiedPackageWorkerIdentity {
         VerifiedPackageWorkerIdentity {
             package: package.into(),
             version: version.into(),
