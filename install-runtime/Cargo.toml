@@ -12,6 +12,7 @@ rbe-install-request = { path = "../install-request" }
 rbe-library-package = { path = "../library-package" }
 rbe-library-registry = { path = "../library-registry" }
 rbe-library-resolver = { path = "../library-resolver" }
+rbe-package-attestation = { path = "../package-attestation" }
 rbe-project-package = { path = "../project-package" }
 fs2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
@@ -20,6 +21,3 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
 url = "2"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
-
-[dev-dependencies]
-rbe-package-attestation = { path = "../package-attestation" }
