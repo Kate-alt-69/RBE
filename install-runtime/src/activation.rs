@@ -230,6 +230,7 @@ fn acquire_install_lease(
     reject_symlink_if_present(&path)?;
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)?;
