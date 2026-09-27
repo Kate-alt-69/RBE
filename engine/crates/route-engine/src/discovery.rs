@@ -272,6 +272,63 @@ fn json_to_value(value: serde_json::Value) -> Value {
     }
 }
 
+const MAX_EXACT_JSON_INTEGER: i64 = 9_007_199_254_740_991;
+const MIN_EXACT_JSON_INTEGER: i64 = -MAX_EXACT_JSON_INTEGER;
+
+fn request_json_number_to_value(value: serde_json::Number) -> Result<Value, String> {
+    let rendered = value.to_string();
+    if let Some(value) = value.as_i64() {
+        if !(MIN_EXACT_JSON_INTEGER..=MAX_EXACT_JSON_INTEGER).contains(&value) {
+            return Err(format!(
+                "JSON integer {rendered} cannot be represented exactly by REL; supported exact integer range is {MIN_EXACT_JSON_INTEGER} through {MAX_EXACT_JSON_INTEGER}"
+            ));
+        }
+        return Ok(Value::Number(value as f64));
+    }
+    if let Some(value) = value.as_u64() {
+        if value > MAX_EXACT_JSON_INTEGER as u64 {
+            return Err(format!(
+                "JSON integer {rendered} cannot be represented exactly by REL; supported exact integer range is {MIN_EXACT_JSON_INTEGER} through {MAX_EXACT_JSON_INTEGER}"
+            ));
+        }
+        return Ok(Value::Number(value as f64));
+    }
+
+    let value = value
+        .as_f64()
+        .ok_or_else(|| format!("JSON number {rendered} cannot be represented by REL"))?;
+    if !value.is_finite() {
+        return Err(format!("JSON number {rendered} is not finite"));
+    }
+    if value.fract() == 0.0
+        && !(MIN_EXACT_JSON_INTEGER as f64..=MAX_EXACT_JSON_INTEGER as f64).contains(&value)
+    {
+        return Err(format!(
+            "JSON integer {rendered} cannot be represented exactly by REL; supported exact integer range is {MIN_EXACT_JSON_INTEGER} through {MAX_EXACT_JSON_INTEGER}"
+        ));
+    }
+    Ok(Value::Number(value))
+}
+
+fn request_json_to_value(value: serde_json::Value) -> Result<Value, String> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(value) => Ok(Value::Bool(value)),
+        serde_json::Value::Number(value) => request_json_number_to_value(value),
+        serde_json::Value::String(value) => Ok(Value::String(value)),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(request_json_to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        serde_json::Value::Object(values) => values
+            .into_iter()
+            .map(|(key, value)| Ok((key, request_json_to_value(value)?)))
+            .collect::<Result<HashMap<_, _>, String>>()
+            .map(Value::Object),
+    }
+}
+
 fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
     headers
         .get(name)
@@ -764,7 +821,7 @@ fn request_body_values(raw: &[u8], content_type: Option<&str>) -> Result<(Value,
     } else if is_json_content_type(content_type) {
         let parsed = serde_json::from_str::<serde_json::Value>(&raw_body)
             .map_err(|error| format!("invalid JSON request body: {error}"))?;
-        json_to_value(parsed)
+        request_json_to_value(parsed)?
     } else {
         Value::String(raw_body.clone())
     };
@@ -799,6 +856,48 @@ mod request_body_snapshot_tests {
         assert!(matches!(values.get("enabled"), Some(Value::Bool(true))));
         assert!(matches!(values.get("count"), Some(Value::Number(value)) if *value == 7.0));
         assert_eq!(raw_body, r#"{"enabled":true,"count":7}"#);
+    }
+
+    #[test]
+    fn json_body_preserves_exact_integer_boundaries() {
+        for raw in [
+            b"9007199254740991".as_slice(),
+            b"-9007199254740991".as_slice(),
+        ] {
+            let (body, _) = request_body_values(raw, Some("application/json")).unwrap();
+            assert!(matches!(body, Value::Number(_)));
+        }
+    }
+
+    #[test]
+    fn json_body_rejects_lossy_integer_values() {
+        for raw in [
+            b"9007199254740992".as_slice(),
+            b"-9007199254740992".as_slice(),
+        ] {
+            let error = request_body_values(raw, Some("application/json")).unwrap_err();
+            assert!(
+                error.contains("cannot be represented exactly by REL"),
+                "{error}"
+            );
+            assert!(error.contains("9007199254740991"), "{error}");
+        }
+    }
+
+    #[test]
+    fn json_body_rejects_nested_lossy_integer_values() {
+        let raw = br#"{"items":[1,{"id":9007199254740993}]}"#;
+        let error = request_body_values(raw, Some("application/json")).unwrap_err();
+        assert!(
+            error.contains("cannot be represented exactly by REL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn json_body_keeps_finite_fractional_numbers() {
+        let (body, _) = request_body_values(b"0.125", Some("application/json")).unwrap();
+        assert!(matches!(body, Value::Number(value) if value == 0.125));
     }
 }
 
