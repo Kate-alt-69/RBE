@@ -65,16 +65,17 @@ pub fn verify_project_toolchain(project: &Path) -> Result<usize> {
     let path = project.join(".rbe").join(PROJECT_TOOLCHAIN_FILE);
     let input = fs::read_to_string(&path)
         .with_context(|| format!("managed RPX toolchain is missing: {}", path.display()))?;
-    let toolchain = parse_and_verify(&input)
-        .with_context(|| format!("managed RPX toolchain verification failed: {}", path.display()))?;
+    let toolchain = parse_and_verify(&input).with_context(|| {
+        format!(
+            "managed RPX toolchain verification failed: {}",
+            path.display()
+        )
+    })?;
     Ok(toolchain.tools.len())
 }
 
 pub fn project_toolchain_exists(project: &Path) -> bool {
-    project
-        .join(".rbe")
-        .join(PROJECT_TOOLCHAIN_FILE)
-        .is_file()
+    project.join(".rbe").join(PROJECT_TOOLCHAIN_FILE).is_file()
 }
 
 fn parse_and_verify(input: &str) -> Result<ManagedCompilerToolchain> {

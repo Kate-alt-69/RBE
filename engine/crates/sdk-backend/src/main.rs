@@ -72,13 +72,14 @@ fn run() -> Result<()> {
             "repair" | "update" => bootstrap_instruction(Path::new(&path), action)?,
             "status" => status(Path::new(&path))?,
             "toolchain" => {
-                let file = option(&args, "file")
-                    .context("`backend sdk toolchain` requires -file=<verified-rpx-toolchain.json>")?;
+                let file = option(&args, "file").context(
+                    "`backend sdk toolchain` requires -file=<verified-rpx-toolchain.json>",
+                )?;
                 install_toolchain(Path::new(&path), Path::new(&file))?;
             }
-            other => bail!(
-                "unknown SDK action {other:?}; expected status, repair, update, or toolchain"
-            ),
+            other => {
+                bail!("unknown SDK action {other:?}; expected status, repair, update, or toolchain")
+            }
         }
         return Ok(());
     }
