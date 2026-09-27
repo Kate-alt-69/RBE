@@ -88,9 +88,7 @@ pub use registry::{
 pub use target::{
     load_named_install_target, merge_named_install_target, InstallTargetError, NamedInstallTarget,
 };
-pub use verified_worker::{
-    read_verified_root_worker_identities, VerifiedPackageWorkerIdentity,
-};
+pub use verified_worker::{read_verified_root_worker_identities, VerifiedPackageWorkerIdentity};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallRuntimeError {

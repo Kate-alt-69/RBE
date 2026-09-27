@@ -52,12 +52,8 @@ pub fn read_verified_root_worker_identities(
         let policy = ArchivePolicy::default();
         let inspected = inspect_zip(File::open(&artifact_path)?, policy)?;
         let manifest_sha256 = hash_manifest(&artifact_path, policy.max_manifest_bytes)?;
-        let identity = identity_from_manifest(
-            package,
-            locked,
-            &inspected.manifest,
-            &manifest_sha256,
-        )?;
+        let identity =
+            identity_from_manifest(package, locked, &inspected.manifest, &manifest_sha256)?;
         if identities.insert(package.clone(), identity).is_some() {
             return Err(InstallRuntimeError::DuplicateVerifiedPackage {
                 root: package.clone(),
@@ -75,7 +71,12 @@ fn identity_from_manifest(
     manifest_sha256: &str,
 ) -> Result<VerifiedPackageWorkerIdentity, InstallRuntimeError> {
     require_verified_match(package, "package name", package, &manifest.name)?;
-    require_verified_match(package, "package version", &locked.version, &manifest.version)?;
+    require_verified_match(
+        package,
+        "package version",
+        &locked.version,
+        &manifest.version,
+    )?;
     require_verified_match(
         package,
         "manifest SHA-256",
@@ -91,13 +92,14 @@ fn identity_from_manifest(
         });
     }
 
-    let runtime = locked
-        .runtime
-        .as_ref()
-        .ok_or_else(|| InstallRuntimeError::MissingLockedToolchain {
-            package: package.to_string(),
-            toolchain: "runtime",
-        })?;
+    let runtime =
+        locked
+            .runtime
+            .as_ref()
+            .ok_or_else(|| InstallRuntimeError::MissingLockedToolchain {
+                package: package.to_string(),
+                toolchain: "runtime",
+            })?;
     let sdk = locked
         .sdk
         .as_ref()
@@ -166,10 +168,7 @@ fn require_verified_match(
     Ok(())
 }
 
-fn verify_locked_artifact(
-    path: &Path,
-    expected_sha256: &str,
-) -> Result<(), InstallRuntimeError> {
+fn verify_locked_artifact(path: &Path, expected_sha256: &str) -> Result<(), InstallRuntimeError> {
     ensure_no_symlink_components(path)?;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -286,13 +285,9 @@ entry = "src/index.js"
     fn verified_worker_identity_keeps_exact_resolved_toolchains() {
         let manifest = LibraryManifest::parse(MANIFEST).unwrap();
         let locked = locked();
-        let identity = identity_from_manifest(
-            "advancenet",
-            &locked,
-            &manifest,
-            &locked.manifest_sha256,
-        )
-        .unwrap();
+        let identity =
+            identity_from_manifest("advancenet", &locked, &manifest, &locked.manifest_sha256)
+                .unwrap();
         assert_eq!(identity.sdk_language, "bun");
         assert_eq!(identity.sdk_name, "@rbe/sdk");
         assert_eq!(identity.sdk_version, "0.1.9");
@@ -308,12 +303,7 @@ entry = "src/index.js"
         let mut locked = locked();
         locked.runtime.as_mut().unwrap().version = "2.0.0".into();
         assert!(matches!(
-            identity_from_manifest(
-                "advancenet",
-                &locked,
-                &manifest,
-                &locked.manifest_sha256
-            ),
+            identity_from_manifest("advancenet", &locked, &manifest, &locked.manifest_sha256),
             Err(InstallRuntimeError::ToolchainRequirementMismatch {
                 toolchain: "runtime",
                 ..

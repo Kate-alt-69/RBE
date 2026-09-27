@@ -225,13 +225,12 @@ async fn resolve_named_async(
             "prepare activation proofs for `{key}` failed: {error}"
         ))
     })?;
-    let activation = activate_project_target(project_root, &target, &graph.lock, &proofs).map_err(
-        |error| {
+    let activation =
+        activate_project_target(project_root, &target, &graph.lock, &proofs).map_err(|error| {
             InstallCliFailure::unavailable(format!(
                 "activate project package target for `{key}` failed: {error}"
             ))
-        },
-    )?;
+        })?;
 
     let root = target.lock.packages.get(key).ok_or_else(|| {
         InstallCliFailure::software(format!(

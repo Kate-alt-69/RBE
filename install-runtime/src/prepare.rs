@@ -52,12 +52,10 @@ pub fn prepare_prebuilt_activation_proofs(
                 package: package.clone(),
                 version: locked.version.clone(),
             })?;
-        let short_sha = verified
-            .stage
-            .verified
-            .sha256
-            .get(..16)
-            .ok_or_else(|| PrebuiltPreparationError::InvalidVerifiedArtifactSha(package.clone()))?;
+        let short_sha =
+            verified.stage.verified.sha256.get(..16).ok_or_else(|| {
+                PrebuiltPreparationError::InvalidVerifiedArtifactSha(package.clone())
+            })?;
 
         let input = PackageAttestationInput {
             package: package.clone(),
