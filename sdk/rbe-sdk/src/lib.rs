@@ -139,6 +139,32 @@ pub struct HostReply {
     pub payload: Vec<u8>,
 }
 
+/// Accepted-session metadata supplied by a newer RBE HostBridge.
+///
+/// This is observation only. `granted_capabilities` mirrors authority already
+/// admitted by RBE; it cannot grant anything. `features` describes host/protocol
+/// mechanisms independently from package capability grants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSessionInfo {
+    pub protocol: u32,
+    pub abi: u32,
+    pub capability_identity: String,
+    pub granted_capabilities: Vec<String>,
+    pub features: Vec<String>,
+}
+
+impl HostSessionInfo {
+    pub fn granted(&self, capability: &str) -> bool {
+        self.granted_capabilities
+            .iter()
+            .any(|granted| granted == capability)
+    }
+
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.iter().any(|available| available == feature)
+    }
+}
+
 /// Error returned by the host bridge. Codes are owned by RBE and are kept as
 /// strings so newer hosts can add errors without forcing an SDK enum bump.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +197,12 @@ impl Error for HostError {}
 /// through this boundary and are capability checked by the host.
 pub trait HostBridge: Send + Sync {
     fn call(&self, call: HostCall<'_>) -> Result<HostReply, HostError>;
+
+    /// Return metadata from the already-accepted worker handshake when the host
+    /// bridge supports it. Older bridges remain valid and report `None`.
+    fn session_info(&self) -> Option<HostSessionInfo> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +306,12 @@ impl<'a> RbeSdk<'a> {
         }
     }
 
+    pub const fn host(self) -> Host<'a> {
+        Host {
+            bridge: self.bridge,
+        }
+    }
+
     /// Create a generic capability client. The capability is also used as the
     /// default target, which matches RBE's built-in namespace convention.
     pub fn capability(self, capability: impl Into<String>) -> CapabilityClient<'a> {
@@ -367,8 +405,42 @@ impl<'a> AdvancedSdk<'a> {
         requests.iter().map(|request| self.send(request)).collect()
     }
 
+    pub const fn host(self) -> Host<'a> {
+        Host {
+            bridge: self.bridge,
+        }
+    }
+
     pub const fn host_bridge(self) -> &'a dyn HostBridge {
         self.bridge
+    }
+}
+
+/// Read-only view of the accepted host session.
+#[derive(Clone, Copy)]
+pub struct Host<'a> {
+    bridge: &'a dyn HostBridge,
+}
+
+impl Host<'_> {
+    pub fn session(&self) -> Option<HostSessionInfo> {
+        self.bridge.session_info()
+    }
+
+    pub fn selected_abi(&self) -> Option<u32> {
+        self.session().map(|session| session.abi)
+    }
+
+    pub fn capability_identity(&self) -> Option<String> {
+        self.session().map(|session| session.capability_identity)
+    }
+
+    pub fn granted(&self, capability: &str) -> Option<bool> {
+        self.session().map(|session| session.granted(capability))
+    }
+
+    pub fn supports(&self, feature: &str) -> Option<bool> {
+        self.session().map(|session| session.supports(feature))
     }
 }
 
@@ -542,6 +614,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingBridge {
         calls: Mutex<Vec<RecordedCall>>,
+        session: Option<HostSessionInfo>,
     }
 
     impl HostBridge for RecordingBridge {
@@ -555,6 +628,10 @@ mod tests {
             Ok(HostReply {
                 payload: b"ok".to_vec(),
             })
+        }
+
+        fn session_info(&self) -> Option<HostSessionInfo> {
+            self.session.clone()
         }
     }
 
@@ -646,5 +723,32 @@ mod tests {
         assert_eq!(calls[1].1, "peer:alpha");
         assert_eq!(calls[2].0, "custom:future");
         assert_eq!(calls[2].1, "thing:42");
+    }
+
+    #[test]
+    fn host_session_discovery_keeps_features_and_grants_separate() {
+        let bridge = RecordingBridge {
+            calls: Mutex::default(),
+            session: Some(HostSessionInfo {
+                protocol: 1,
+                abi: 1,
+                capability_identity: "session:cap-42".into(),
+                granted_capabilities: vec![capability::NET_HTTP.into()],
+                features: vec!["host.call:v1".into(), "channel:v1".into()],
+            }),
+        };
+        let sdk = RbeSdk::new(&bridge);
+        let host = sdk.host();
+
+        assert_eq!(host.selected_abi(), Some(1));
+        assert_eq!(host.capability_identity().as_deref(), Some("session:cap-42"));
+        assert_eq!(host.granted(capability::NET_HTTP), Some(true));
+        assert_eq!(host.granted(capability::STORAGE), Some(false));
+        assert_eq!(host.supports("channel:v1"), Some(true));
+        assert_eq!(host.supports(capability::NET_HTTP), Some(false));
+
+        let legacy = RecordingBridge::default();
+        assert_eq!(RbeSdk::new(&legacy).advanced().host().selected_abi(), None);
+        assert_eq!(RbeSdk::new(&legacy).host().granted(capability::NET_HTTP), None);
     }
 }

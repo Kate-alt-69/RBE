@@ -51,8 +51,38 @@ installed SDK, declared exports, and granted capabilities against the package
 manifest it admitted. A worker cannot broaden its manifest by announcing extra
 capabilities during this handshake.
 
-The host replies with an accept/reject frame containing the selected ABI and a
-session-scoped capability identity. Only an accepted session can issue calls.
+An accepted host session semantically exposes:
+
+```json
+{
+  "type": "library.accept",
+  "protocol": 1,
+  "abi": 1,
+  "capabilityIdentity": "session:opaque-capability-id",
+  "grantedCapabilities": [
+    "net:http",
+    "storage"
+  ],
+  "features": [
+    "host.call:v1"
+  ]
+}
+```
+
+`capabilityIdentity` is session-scoped and opaque. `grantedCapabilities` mirrors
+the authority RBE already admitted for the package; receiving or inspecting the
+list never grants additional authority. Every host call is still checked.
+
+`features` is a separate host/protocol mechanism namespace. It answers questions
+such as whether a future `channel:v1` transport exists. A feature being present
+does not grant a package capability, and a capability being granted does not
+imply that an unrelated optional host feature exists.
+
+Language SDKs may expose the accepted-session metadata through read-only host
+introspection. Older HostBridge implementations that do not surface the metadata
+remain valid and report it as unavailable rather than guessing.
+
+A rejected handshake returns a reject frame and cannot issue host calls.
 
 ## Host capability call
 

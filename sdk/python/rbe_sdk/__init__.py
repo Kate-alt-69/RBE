@@ -66,8 +66,46 @@ class BatchResult:
     error: BaseException | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class HostSessionInfo:
+    protocol: int
+    abi: int
+    capability_identity: str
+    granted_capabilities: tuple[str, ...] = ()
+    features: tuple[str, ...] = ()
+
+    def validate(self) -> "HostSessionInfo":
+        if self.protocol < 1 or self.abi < 1:
+            raise ValueError("RBE host session protocol and ABI must be positive integers")
+        if not self.capability_identity:
+            raise ValueError("RBE host session capability identity must be non-empty")
+        if any(not value for value in self.granted_capabilities):
+            raise ValueError("RBE host session capability IDs must be non-empty")
+        if any(not value for value in self.features):
+            raise ValueError("RBE host session feature IDs must be non-empty")
+        return self
+
+    def granted(self, capability: str) -> bool:
+        return capability in self.granted_capabilities
+
+    def supports(self, feature: str) -> bool:
+        return feature in self.features
+
+
 class HostBridge(Protocol):
     def call(self, request: HostCall) -> Any: ...
+
+
+def _session_info(bridge: HostBridge) -> HostSessionInfo | None:
+    provider = getattr(bridge, "session_info", None)
+    if not callable(provider):
+        return None
+    value = provider()
+    if value is None:
+        return None
+    if not isinstance(value, HostSessionInfo):
+        raise TypeError("RBE HostBridge session_info() must return HostSessionInfo or None")
+    return value.validate()
 
 
 class HostInterceptor:
@@ -102,6 +140,9 @@ class InterceptedBridge:
     def interceptors(self) -> tuple[HostInterceptor, ...]:
         return self._interceptors
 
+    def session_info(self) -> HostSessionInfo | None:
+        return _session_info(self._bridge)
+
     def call(self, request: HostCall) -> Any:
         current = request
         for interceptor in self._interceptors:
@@ -135,6 +176,30 @@ class InterceptedBridge:
             if callable(hook):
                 current_reply = hook(current, current_reply)
         return current_reply
+
+
+class HostClient:
+    def __init__(self, bridge: HostBridge) -> None:
+        self._bridge = bridge
+
+    def session(self) -> HostSessionInfo | None:
+        return _session_info(self._bridge)
+
+    def selected_abi(self) -> int | None:
+        session = self.session()
+        return session.abi if session else None
+
+    def capability_identity(self) -> str | None:
+        session = self.session()
+        return session.capability_identity if session else None
+
+    def granted(self, capability: str) -> bool | None:
+        session = self.session()
+        return session.granted(capability) if session else None
+
+    def supports(self, feature: str) -> bool | None:
+        session = self.session()
+        return session.supports(feature) if session else None
 
 
 class CapabilityClient:
@@ -218,6 +283,9 @@ class AdvancedClient:
                 results.append(BatchResult(ok=False, error=error))
         return results
 
+    def host(self) -> HostClient:
+        return HostClient(self._bridge)
+
     def intercept(self, *interceptors: HostInterceptor) -> "AdvancedClient":
         return AdvancedClient(InterceptedBridge(self._bridge, tuple(interceptors)))
 
@@ -242,6 +310,9 @@ class RbeSdk:
 
     def crypto(self) -> CapabilityClient:
         return CapabilityClient(self._bridge, CRYPTO, "crypto")
+
+    def host(self) -> HostClient:
+        return HostClient(self._bridge)
 
     def capability(self, capability: str, target: str | None = None) -> CapabilityClient:
         return CapabilityClient(self._bridge, capability, target)

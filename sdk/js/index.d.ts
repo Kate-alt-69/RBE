@@ -12,8 +12,17 @@ export type BatchResult<T = unknown> =
   | { ok: true; value: T }
   | { ok: false; error: unknown };
 
+export type HostSessionInfo = Readonly<{
+  protocol: number;
+  abi: number;
+  capabilityIdentity: string;
+  grantedCapabilities: readonly string[];
+  features: readonly string[];
+}>;
+
 export interface HostBridge {
   call(request: HostRequest): unknown | Promise<unknown>;
+  sessionInfo?(): HostSessionInfo | null;
 }
 
 export interface HostInterceptor {
@@ -42,7 +51,18 @@ export declare class InterceptedBridge implements HostBridge {
   constructor(bridge: HostBridge, interceptors?: readonly HostInterceptor[]);
   readonly bridge: HostBridge;
   readonly interceptors: readonly HostInterceptor[];
+  sessionInfo(): HostSessionInfo | null;
   call(request: HostRequest): unknown | Promise<unknown>;
+}
+
+export declare class HostClient {
+  constructor(bridge: HostBridge);
+  readonly bridge: HostBridge;
+  session(): HostSessionInfo | null;
+  selectedAbi(): number | null;
+  capabilityIdentity(): string | null;
+  granted(capabilityId: string): boolean | null;
+  supports(feature: string): boolean | null;
 }
 
 export declare class CapabilityClient {
@@ -62,6 +82,7 @@ export declare class AdvancedClient {
   request(capabilityId: string, target: string, operation: string, payload?: unknown): HostRequest;
   send(request: HostRequest): unknown | Promise<unknown>;
   batch(requests: readonly HostRequest[]): Promise<BatchResult[]>;
+  host(): HostClient;
   intercept(...interceptors: HostInterceptor[]): AdvancedClient;
   hostBridge(): HostBridge;
 }
@@ -71,6 +92,7 @@ export declare class RbeSdk {
   call(request: HostRequest): unknown | Promise<unknown>;
   capability(capabilityId: string, target?: string): CapabilityClient;
   advanced(): AdvancedClient;
+  host(): HostClient;
   intercept(...interceptors: HostInterceptor[]): RbeSdk;
   hostBridge(): HostBridge;
   net(): {

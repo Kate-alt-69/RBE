@@ -42,6 +42,47 @@ function syncHookResult(name, value) {
   return value;
 }
 
+function stringList(name, value) {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw new TypeError(`RBE HostBridge sessionInfo().${name} must be an array of non-empty strings`);
+  }
+  return Object.freeze([...new Set(value)]);
+}
+
+function normalizeSessionInfo(value) {
+  if (value == null) return null;
+  if (typeof value !== "object") {
+    throw new TypeError("RBE HostBridge sessionInfo() must return an object or null");
+  }
+  if (!Number.isInteger(value.protocol) || value.protocol < 1) {
+    throw new TypeError("RBE HostBridge sessionInfo().protocol must be a positive integer");
+  }
+  if (!Number.isInteger(value.abi) || value.abi < 1) {
+    throw new TypeError("RBE HostBridge sessionInfo().abi must be a positive integer");
+  }
+  if (typeof value.capabilityIdentity !== "string" || value.capabilityIdentity.length === 0) {
+    throw new TypeError("RBE HostBridge sessionInfo().capabilityIdentity must be a non-empty string");
+  }
+  return Object.freeze({
+    protocol: value.protocol,
+    abi: value.abi,
+    capabilityIdentity: value.capabilityIdentity,
+    grantedCapabilities: stringList("grantedCapabilities", value.grantedCapabilities),
+    features: stringList("features", value.features)
+  });
+}
+
+function bridgeSessionInfo(bridge) {
+  const sessionInfo = bridge?.sessionInfo;
+  if (typeof sessionInfo !== "function") return null;
+  const value = sessionInfo.call(bridge);
+  if (isPromiseLike(value)) {
+    throw new TypeError("RBE HostBridge sessionInfo() must be synchronous handshake metadata");
+  }
+  return normalizeSessionInfo(value);
+}
+
 export function libraryDescriptor({ name, version, abiMin = 1, abiMax = abiMin }) {
   if (!validComponent(name)) {
     throw new TypeError(`invalid RBE library name ${JSON.stringify(name)}`);
@@ -64,6 +105,10 @@ export class InterceptedBridge {
     }
     this.bridge = bridge;
     this.interceptors = Object.freeze([...interceptors]);
+  }
+
+  sessionInfo() {
+    return bridgeSessionInfo(this.bridge);
   }
 
   call(request) {
@@ -112,6 +157,35 @@ export class InterceptedBridge {
     } catch (error) {
       return onError(error);
     }
+  }
+}
+
+export class HostClient {
+  constructor(bridge) {
+    assertBridge(bridge);
+    this.bridge = bridge;
+  }
+
+  session() {
+    return bridgeSessionInfo(this.bridge);
+  }
+
+  selectedAbi() {
+    return this.session()?.abi ?? null;
+  }
+
+  capabilityIdentity() {
+    return this.session()?.capabilityIdentity ?? null;
+  }
+
+  granted(capabilityId) {
+    const session = this.session();
+    return session ? session.grantedCapabilities.includes(capabilityId) : null;
+  }
+
+  supports(feature) {
+    const session = this.session();
+    return session ? session.features.includes(feature) : null;
   }
 }
 
@@ -208,6 +282,10 @@ export class AdvancedClient {
     }));
   }
 
+  host() {
+    return new HostClient(this.bridge);
+  }
+
   intercept(...interceptors) {
     return new AdvancedClient(new InterceptedBridge(this.bridge, interceptors));
   }
@@ -227,6 +305,7 @@ export class RbeSdk {
   router() { return new RouterClient(this.bridge); }
   storage() { return new CapabilityClient(this.bridge, capability.STORAGE, "storage"); }
   crypto() { return new CapabilityClient(this.bridge, capability.CRYPTO, "crypto"); }
+  host() { return new HostClient(this.bridge); }
 
   capability(capabilityId, target = capabilityId) {
     return new CapabilityClient(this.bridge, capabilityId, target);

@@ -1,0 +1,102 @@
+name: SDK Session Contract
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'sdk/rbe-sdk/**'
+      - 'sdk/js/**'
+      - 'sdk/python/**'
+      - 'sdk/protocol/**'
+      - '.github/workflows/sdk-session-ci.yml'
+  pull_request:
+    paths:
+      - 'sdk/rbe-sdk/**'
+      - 'sdk/js/**'
+      - 'sdk/python/**'
+      - 'sdk/protocol/**'
+      - '.github/workflows/sdk-session-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  session-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify JavaScript accepted-session introspection
+        run: |
+          node --input-type=module <<'NODE'
+          import { RbeSdk } from './sdk/js/index.js';
+
+          const metadata = {
+            protocol: 1,
+            abi: 1,
+            capabilityIdentity: 'session:js-smoke',
+            grantedCapabilities: ['net:http'],
+            features: ['host.call:v1', 'channel:v1']
+          };
+          const bridge = {
+            call(request) { return request; },
+            sessionInfo() { return metadata; }
+          };
+          const sdk = new RbeSdk(bridge);
+          const host = sdk.host();
+          if (host.selectedAbi() !== 1) process.exit(2);
+          if (host.capabilityIdentity() !== 'session:js-smoke') process.exit(3);
+          if (host.granted('net:http') !== true || host.granted('storage') !== false) process.exit(4);
+          if (host.supports('channel:v1') !== true || host.supports('net:http') !== false) process.exit(5);
+
+          const intercepted = sdk.intercept({ before(request) { return request; } });
+          if (intercepted.host().supports('host.call:v1') !== true) process.exit(6);
+
+          const legacy = new RbeSdk({ call(request) { return request; } });
+          if (legacy.host().session() !== null || legacy.host().granted('net:http') !== null) process.exit(7);
+          NODE
+      - name: Verify Python accepted-session introspection
+        env:
+          PYTHONPATH: sdk/python
+        run: |
+          python3 <<'PY'
+          from rbe_sdk import HostSessionInfo, RbeSdk
+
+          class Bridge:
+              def call(self, request):
+                  return request
+
+              def session_info(self):
+                  return HostSessionInfo(
+                      protocol=1,
+                      abi=1,
+                      capability_identity='session:py-smoke',
+                      granted_capabilities=('net:http',),
+                      features=('host.call:v1', 'channel:v1'),
+                  )
+
+          sdk = RbeSdk(Bridge())
+          host = sdk.host()
+          assert host.selected_abi() == 1
+          assert host.capability_identity() == 'session:py-smoke'
+          assert host.granted('net:http') is True
+          assert host.granted('storage') is False
+          assert host.supports('channel:v1') is True
+          assert host.supports('net:http') is False
+
+          intercepted = sdk.intercept()
+          assert intercepted.host().supports('host.call:v1') is True
+
+          class LegacyBridge:
+              def call(self, request):
+                  return request
+
+          legacy = RbeSdk(LegacyBridge())
+          assert legacy.host().session() is None
+          assert legacy.host().granted('net:http') is None
+          PY
