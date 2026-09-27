@@ -5,7 +5,9 @@ edition = "2021"
 publish = false
 
 [dependencies]
+atomic-io = { path = "../atomic-io" }
 rbe-install-executor = { path = "../install-executor" }
+rbe-install-orchestrator = { path = "../install-orchestrator" }
 rbe-install-request = { path = "../install-request" }
 rbe-library-package = { path = "../library-package" }
 rbe-library-registry = { path = "../library-registry" }
@@ -18,3 +20,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
 url = "2"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+rbe-package-attestation = { path = "../package-attestation" }

@@ -55,6 +55,7 @@ mod test_tempdir {
 #[cfg(test)]
 pub use test_tempdir::{tempdir, TempDir};
 
+mod activation;
 mod artifact;
 mod cache;
 mod graph;
@@ -64,6 +65,10 @@ mod promotion;
 mod registry;
 mod target;
 
+pub use activation::{
+    activate_project_target, recover_project_activation, ActivationRuntimeError,
+    InstallActivationProof, ProjectActivationResult, ProjectInstallRecovery,
+};
 pub use artifact::ArtifactStage;
 pub use cache::stage_artifact_cached as stage_artifact;
 pub use graph::{stage_resolved_root, VerifiedRootGraph};

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, Context};
-use rbe_install_runtime::VerifiedRpxRootIndex;
+use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex};
 use route_engine::relc::{
     PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
 };
@@ -44,6 +44,15 @@ struct RpxPackageExport {
 /// only public `exports` into RELC. `private_dependencies` is parsed only to
 /// validate the index shape; it never creates a namespace.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
+    let recovery = rbe_install_runtime::recover_project_activation(project_root)
+        .context("recover interrupted project package activation before package linking")?;
+    if recovery != ProjectInstallRecovery::Clean {
+        tracing::warn!(
+            recovery = ?recovery,
+            "recovered interrupted project package activation before Runtime Image linking"
+        );
+    }
+
     let indexes = rbe_install_runtime::read_verified_rpx_root_indexes(project_root)
         .context("load verified RPX package indexes")?;
     from_verified_indexes(indexes)

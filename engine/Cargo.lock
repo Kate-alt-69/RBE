@@ -2480,6 +2480,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rbe-install-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "rbe-install-request",
+ "rbe-library-package",
+ "rbe-package-attestation",
+ "rbe-package-manager",
+ "rbe-project-package",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "rbe-install-request"
 version = "0.1.0"
 dependencies = [
@@ -2494,8 +2511,10 @@ dependencies = [
 name = "rbe-install-runtime"
 version = "0.1.0"
 dependencies = [
+ "atomic-io",
  "fs2",
  "rbe-install-executor",
+ "rbe-install-orchestrator",
  "rbe-install-request",
  "rbe-library-package",
  "rbe-library-registry",
@@ -2557,6 +2576,29 @@ dependencies = [
  "rbe-sdk",
  "semver",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rbe-package-attestation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
+name = "rbe-package-manager"
+version = "0.1.0"
+dependencies = [
+ "rbe-library-installer",
+ "rbe-library-lock",
+ "rbe-library-package",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "url",
 ]
 
 [[package]]
@@ -2692,6 +2734,7 @@ dependencies = [
  "core-lib",
  "execution-engine",
  "fancy-regex",
+ "form_urlencoded",
  "hex",
  "hmac",
  "rand 0.8.8",
