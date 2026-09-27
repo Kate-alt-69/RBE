@@ -741,7 +741,10 @@ mod tests {
         let host = sdk.host();
 
         assert_eq!(host.selected_abi(), Some(1));
-        assert_eq!(host.capability_identity().as_deref(), Some("session:cap-42"));
+        assert_eq!(
+            host.capability_identity().as_deref(),
+            Some("session:cap-42")
+        );
         assert_eq!(host.granted(capability::NET_HTTP), Some(true));
         assert_eq!(host.granted(capability::STORAGE), Some(false));
         assert_eq!(host.supports("channel:v1"), Some(true));
@@ -749,6 +752,9 @@ mod tests {
 
         let legacy = RecordingBridge::default();
         assert_eq!(RbeSdk::new(&legacy).advanced().host().selected_abi(), None);
-        assert_eq!(RbeSdk::new(&legacy).host().granted(capability::NET_HTTP), None);
+        assert_eq!(
+            RbeSdk::new(&legacy).host().granted(capability::NET_HTTP),
+            None
+        );
     }
 }
