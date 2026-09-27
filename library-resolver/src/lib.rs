@@ -9,6 +9,8 @@
 
 mod core;
 mod scoped;
+mod version;
 
 pub use core::*;
 pub use scoped::*;
+pub use version::*;
