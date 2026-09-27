@@ -1,6 +1,6 @@
 # RBE External Library & Project Package System
 
-Status: current package/install contracts on `main`, implemented through LIB-019 plus CLI-002. Named-package `backend install` now performs real pre-bootstrap registry hydration and root-scoped dependency resolution. Full durable installation is intentionally not reported as complete until verified artifact inspection, manifest hashing, promotion, session activation, and project-lock commit are connected end to end.
+Status: current package/install contracts in this change, implemented through LIB-023 plus CLI-003. Named-package `backend install` now performs real pre-bootstrap registry hydration, deterministic root-scoped resolution, verified artifact staging and inspection, durable content-addressed cache promotion, and safe project-target merging. The CLI still intentionally refuses to report installation success until package preparation/build and trusted attestation proofs are connected to the durable activation executor.
 
 This document is the authoritative overview for the current external-library and project-package architecture. It distinguishes implemented contract/runtime behavior from planned UX so old design text does not override code.
 
@@ -36,11 +36,12 @@ project/
 ├── server.server
 ├── package.rbe.yaml
 ├── package.lock.rbe.yaml
-├── library/                              # optional local package inputs
+├── package.rbe.yaml.next                    # only during prepared activation
+├── library/                                 # optional local package inputs
 └── .cache/
     ├── library/
-    │   ├── <artifact-sha256>/            # verified package/artifact cache
-    │   └── .staging/                     # resumable/incomplete install staging
+    │   ├── <artifact-sha256>/               # verified package/artifact cache
+    │   └── .staging/                        # resumable/incomplete install staging
     └── rbe/
         ├── sys/
         │   ├── python/<version>/<host>/
@@ -52,7 +53,8 @@ project/
         │       └── hydration.rbe.json
         └── install/
             ├── journal.rbe.json
-            └── install.lease
+            ├── install.lease
+            └── build/<session-id>/          # disposable session build state
 ```
 
 The package cache is reconstructible state, not trust. Presence under `.cache/` never proves integrity by itself.
@@ -71,7 +73,10 @@ Important invariants:
 - deleted bytes still have to be downloaded again;
 - cached bytes must be re-verified against the lock before use;
 - a partially prepared new graph does not become active merely because some packages finished building;
-- graph activation occurs only after all required packages have reached the verified/ready state;
+- graph activation occurs only after every package instance changed by the transaction has reached the verified/ready state;
+- unrelated already-active roots are preserved when one requested root/private graph is replaced;
+- the durable session pins the SHA-256 of the entire final target lock even when only one root/private graph is being prepared;
+- `package.rbe.yaml` intent is staged before activation and published as a recoverable pair with the lock;
 - the installer must not invent a manifest SHA-256 before the verified package artifact has been inspected.
 
 ## 4. RBE-owned system runtimes
@@ -134,7 +139,7 @@ Extraction is not a normal unzip into a trusted directory. The install path perf
 
 The current deterministic source-tree identity is `rbe-source-tree-sha256-v1`.
 
-## 6. Download, cache, and verified artifact ingress (LIB-014 / LIB-019)
+## 6. Download, inspection, cache, and verified artifact ingress (LIB-014 / LIB-019 / LIB-020 / LIB-021)
 
 Artifact acquisition is bounded and resumable rather than an unbounded download straight into the final cache.
 
@@ -151,6 +156,10 @@ The execution contracts include:
 - source-tree hashing before activation.
 
 LIB-019 adds the trusted host-side network executor for these contracts. `rbe-install-runtime::stage_artifact` performs bounded HTTPS retrieval into the installer staging path, re-hashes reusable partial bytes, validates Range/Content-Range behavior, validates pinned size when present, streams bytes through the verifier, and returns a verified download plus its promotion plan.
+
+LIB-020 moves verified registry artifacts through package inspection before lock construction. The installer validates `library.toml`, package identity/version/dependencies, and derives the real package-manifest SHA-256 from the verified artifact instead of inventing it from registry resolution metadata.
+
+LIB-021 adds durable content-addressed promotion after verification. Existing cache winners are re-verified before reuse, promotion races never silently bless altered bytes, and the verified root graph can be promoted without making the cache path itself an authority boundary.
 
 The network layer rejects credential-bearing/non-HTTPS URLs, non-public destinations, unsafe redirect behavior, oversized registry graphs/bodies, and unsafe staging filesystem state. Package-controlled code never receives raw sockets or a shell merely because installation requires network access.
 
@@ -170,6 +179,8 @@ Attestation can evaluate:
 Byte-for-byte reproducibility is not assumed for arbitrary builds. The shipped/rebuilt binary comparison is meaningful only when the package opts into an appropriate reproducible-build contract.
 
 A mismatch or failed trust gate is a quarantine condition, not an activation condition. Public-registry failures may support privacy-safe reporting; local/private package failures must not be silently reported as public telemetry.
+
+LIB-023 deliberately does not manufacture attestation results. Its durable activation executor accepts an exact set of already-trusted `InstallActivationProof` values; generating those proofs from preparation/build and registry trust metadata remains the next integration boundary.
 
 ## 8. Controlled build-dependency hydration (LIB-017)
 
@@ -249,7 +260,7 @@ RBE_BUILD_NETWORK = disabled
 
 Only explicitly managed tools are selected. There is no fallback to an arbitrary `cargo`, `npm`, `bun`, `python`, compiler, or shell discovered from the host PATH.
 
-## 9. Durable install sessions and atomic graph activation (LIB-016)
+## 9. Durable install sessions and paired project activation (LIB-016 / LIB-023)
 
 Project installation is treated as a graph transaction rather than a sequence of independently activated packages.
 
@@ -258,11 +269,52 @@ The durable session owns:
 ```text
 .cache/rbe/install/journal.rbe.json
 .cache/rbe/install/install.lease
+.cache/rbe/install/build/<session-id>/
+package.rbe.yaml.next
 ```
 
 The lease prevents concurrent project installers from racing the same activation boundary. The journal records durable progress so verified cache work can be reused after interruption.
 
-The intended end-to-end flow is:
+LIB-023 adds delta-session construction for incremental installs. Only package instances in the root/private graph being changed are journaled and advanced through the package state machine; unrelated already-active roots are not forced through verification/build again. The journal still pins the SHA-256 of the complete final target lock, and every changed instance must match that final lock byte-for-byte at session construction time.
+
+The host-side activation executor requires exactly one trusted proof for every changed package instance and rejects both missing and unrelated proofs. A changed package moves through:
+
+```text
+Pending
+→ ArtifactVerified
+→ Prepared
+→ Attested
+→ Ready
+```
+
+Only when the delta session reaches `ReadyToCommit` can project state be published.
+
+The paired activation order is:
+
+```text
+complete final target manifest + lock
+        |
+        v
+stage package.rbe.yaml.next
+        |
+        v
+persist ReadyToCommit journal
+        |
+        v
+atomic replace package.lock.rbe.yaml   <-- activation point
+        |
+        v
+atomic publish package.rbe.yaml
+        |
+        v
+mark session committed + clear journal/stage
+```
+
+The lock remains the runtime activation point. The human manifest is staged first but is not published before activation. If the process dies after the lock replacement and before manifest publication, boot recovery verifies the durable journal and staged-manifest hash and completes publication before RPX package linking reads the active lock. If the lock never reached the target, recovery discards the uncommitted manifest stage and stale journal instead.
+
+Boot package-link loading acquires the same install lease and runs this recovery path before reading verified RPX root indexes. A concurrent installer therefore cannot race Runtime Image linking through a half-published project package state.
+
+The intended complete installation pipeline remains:
 
 ```text
 package.rbe.yaml / CLI request
@@ -270,20 +322,21 @@ package.rbe.yaml / CLI request
 → fetch pinned artifacts
 → verify artifact bytes
 → inspect package manifest and obtain manifest SHA-256
-→ construct exact target lock
+→ construct + merge exact target lock
+→ durably promote verified artifacts
 → safe extract and source-hash
 → hydrate required rbe.sys tools
 → hydrate locked ecosystem dependencies
 → NETWORK OFF
-→ build
-→ source/binary attestation
-→ every graph member READY?
-→ write package.lock.rbe.yaml.next
-→ atomic replace package.lock.rbe.yaml
+→ build if required
+→ source/binary/publisher attestation
+→ produce exact activation proofs
+→ every changed graph member READY?
+→ paired manifest/lock activation
 → new graph becomes active
 ```
 
-If the process crashes halfway through a multi-package install, the previously active lock remains the activation boundary. Completed content-addressed cache work can be reused; incomplete staging/journal state is recovered or discarded according to the session contract.
+The transaction/recovery machinery in LIB-023 is implemented, but the current named-package CLI does not call it yet because package preparation/build and trustworthy proof generation are still gated.
 
 ## 10. `backend install` command surface and current boundary
 
@@ -327,9 +380,9 @@ The resolver does not know registry URLs, JSON structure, or artifact hashes. Co
 
 Registry-to-catalog ingestion is all-or-nothing. If any release cannot be represented by the resolver, the caller's existing resolver catalog remains unchanged rather than exposing a partially imported package index.
 
-### 10.2 Real pre-bootstrap named-package resolution (CLI-002)
+### 10.2 Real pre-bootstrap named-package verification (CLI-002 / CLI-003 / LIB-020–LIB-022)
 
-`backend.exe` now intercepts ordinary named-package `install` commands before normal Backend boot. The standalone `service` binary does not receive install authority.
+`backend.exe` intercepts ordinary named-package `install` commands before normal Backend boot. The standalone `service` binary does not receive install authority.
 
 Named-package installation requires an explicit trusted registry base:
 
@@ -346,14 +399,20 @@ canonical InstallCommand parse
 → hydrate dependency package indexes
 → transactional registry-to-catalog bridge
 → root-scoped deterministic semver resolution
-→ select pinned artifact metadata
+→ stage and SHA-256 verify every resolved artifact
+→ inspect verified library.toml/package metadata
+→ derive real manifest SHA-256 values
+→ construct exact root-scoped lock
+→ durably promote verified artifacts into content-addressed cache
+→ merge requested root/private graph with existing project state
+→ verify full merged target + report target hashes
 ```
 
-This path runs before settings/bootstrap/server startup. The install resolver uses a short-lived worker/runtime and returns before the normal server boot path can begin.
+This path runs before settings/bootstrap/server startup. It preserves unrelated existing roots and replaces only the requested root/private graph in the target state.
 
-CLI-002 deliberately stops after real resolution today. A successful resolution returns an unavailable/non-success outcome describing the selected package/artifact instead of printing `installed`, because verified artifact inspection and durable graph activation are not yet connected to `backend.exe`.
+The CLI deliberately stops after the merged target today. It returns an unavailable/non-success outcome instead of printing `installed`, and it does not mutate `package.rbe.yaml` or `package.lock.rbe.yaml`, because preparation/build and trusted attestation proofs have not yet been connected to `activate_project_target`.
 
-That is a correctness boundary, not a placeholder package-not-found response: registry/HTTP/requirement failures now surface from the real registry and resolver path.
+That is a correctness boundary, not a placeholder package-not-found response: registry, HTTP, requirement, artifact-verification, manifest-inspection, cache-promotion, and target-merge failures now surface from their real execution layers.
 
 Reserved SDK/runtime targets and external/local archive targets remain in their existing lanes until those execution paths are connected through the same trust model.
 
@@ -431,21 +490,26 @@ The current package-system foundation has advanced through these layers:
 4. **LIB-013** — project install orchestration gates.
 5. **LIB-014** — bounded/resumable acquisition and managed build execution contracts.
 6. **LIB-015** — safe source extraction and deterministic source-tree identity.
-7. **LIB-016** — durable project install session, exclusive lease, and atomic lockfile activation.
+7. **LIB-016** — durable project install session, exclusive lease, and atomic lockfile activation contract.
 8. **LIB-017** — controlled build-dependency hydration followed by network-dead package builds.
 9. **LIB-018** — typed package-registry metadata and a transactional source-only bridge into the deterministic resolver.
 10. **LIB-019** — trusted host-side registry/artifact network execution, bounded resumable staging, streaming verification, and promotion planning.
 11. **CLI-002** — real pre-bootstrap named-package registry hydration and root-scoped resolution in `backend.exe` without granting install authority to the standalone `service` binary.
+12. **CLI-003** — verify the complete resolved root/private graph before normal Backend boot.
+13. **LIB-020** — inspect verified registry artifacts and derive package-manifest identity before constructing the project lock.
+14. **LIB-021** — durable promotion and verified reuse of content-addressed package artifacts.
+15. **LIB-022** — preserve unrelated project roots while replacing only the requested root/private graph and build a non-mutating merged manifest/lock target.
+16. **LIB-023** — delta install sessions plus crash-recoverable paired manifest/lock activation and boot-time recovery before package linking.
 
 ## 16. Remaining integration work
 
-The major remaining work is not to redesign the package trust model again. It is to connect the already-implemented contracts across the last activation boundaries:
+The major remaining work is not to redesign the package trust model again. It is to connect the already-implemented contracts across the remaining preparation and admission boundaries:
 
-- connect CLI-002's selected artifact metadata to `rbe-install-runtime::stage_artifact`;
-- inspect the verified package artifact and derive/validate the package manifest SHA-256 required by `ProjectPackageLock`;
-- construct the exact root-scoped target lock only after that inspection;
-- connect extraction, source identity, managed runtime/dependency hydration, network-dead build, attestation, and quarantine decisions to the durable install session;
-- atomically promote verified cache entries and activate `package.lock.rbe.yaml` only after the complete graph is ready;
+- connect the verified root graph to safe extraction, deterministic source identity, managed runtime/dependency hydration, and network-dead build execution;
+- preserve publisher/signature/source/reproducibility trust metadata through the runtime bridge so real attestation inputs can be constructed without guessing;
+- generate one exact trusted `InstallActivationProof` for every changed root/private package instance;
+- call `activate_project_target` from named-package `backend install` only after all required preparation/build/attestation gates succeed;
+- keep source-build packages unavailable until their full build/attestation lane is connected rather than treating artifact verification as a build proof;
 - connect worker/Library Protocol admission to the activated project lock;
 - finish SDK/runtime/external/local-archive execution through the same trust model;
 - finish public registry publishing/artifact-distribution UX and external-index integrations;
