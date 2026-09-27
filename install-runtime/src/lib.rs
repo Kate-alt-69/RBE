@@ -63,6 +63,7 @@ mod http;
 mod package;
 mod promotion;
 mod registry;
+mod snapshot;
 mod target;
 mod verified_worker;
 
@@ -85,6 +86,9 @@ pub use promotion::{
 pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
     MAX_REGISTRY_INDEX_BYTES,
+};
+pub use snapshot::{
+    read_verified_rpx_root_snapshots, VerifiedRootSnapshotError, VerifiedRpxRootSnapshot,
 };
 pub use target::{
     load_named_install_target, merge_named_install_target, InstallTargetError, NamedInstallTarget,
