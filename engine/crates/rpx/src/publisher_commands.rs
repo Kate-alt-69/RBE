@@ -166,13 +166,7 @@ pub fn yank(
         println!("  reason: {}", reason.trim());
     }
 
-    let response = request_yank(
-        &client,
-        &credential.authorization,
-        package,
-        version,
-        reason,
-    )?;
+    let response = request_yank(&client, &credential.authorization, package, version, reason)?;
     println!("RPX YANK OK");
     println!("  revision: {}", response.revision);
     println!("  yanked: {}@{}", response.package, response.version);
