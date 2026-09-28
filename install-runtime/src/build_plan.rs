@@ -270,12 +270,12 @@ fn require_fresh_root_parent(root: &Path) -> Result<(), ManagedBuildPlanError> {
 }
 
 fn ensure_parent_directories(root: &Path, destination: &Path) -> Result<(), ManagedBuildPlanError> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| ManagedBuildPlanError::UnsafeExtractionDestination(destination.to_path_buf()))?;
-    let relative = parent
-        .strip_prefix(root)
-        .map_err(|_| ManagedBuildPlanError::UnsafeExtractionDestination(destination.to_path_buf()))?;
+    let parent = destination.parent().ok_or_else(|| {
+        ManagedBuildPlanError::UnsafeExtractionDestination(destination.to_path_buf())
+    })?;
+    let relative = parent.strip_prefix(root).map_err(|_| {
+        ManagedBuildPlanError::UnsafeExtractionDestination(destination.to_path_buf())
+    })?;
     let mut current = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(name) = component else {
@@ -319,7 +319,9 @@ fn ensure_directory(path: &Path) -> Result<(), ManagedBuildPlanError> {
 fn hash_file(path: &Path) -> Result<String, ManagedBuildPlanError> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(ManagedBuildPlanError::UnsafeArtifactFile(path.to_path_buf()));
+        return Err(ManagedBuildPlanError::UnsafeArtifactFile(
+            path.to_path_buf(),
+        ));
     }
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -380,7 +382,9 @@ pub enum ManagedBuildPlanError {
     UnsafeInvocation { package: String },
     #[error("duplicate managed build instance {0:?}")]
     DuplicateBuildInstance(String),
-    #[error("promoted artifact hash changed for package {package:?}: expected {expected}, got {actual}")]
+    #[error(
+        "promoted artifact hash changed for package {package:?}: expected {expected}, got {actual}"
+    )]
     ArtifactHashMismatch {
         package: String,
         expected: String,
@@ -617,7 +621,10 @@ args = ["build", "--release"]
         let digests = plan.materialize_source(&artifact).unwrap();
 
         assert_eq!(digests.len(), 2);
-        assert_eq!(std::fs::read_to_string(plan.source_root.join("src/main.rs")).unwrap(), "fn main() {}\n");
+        assert_eq!(
+            std::fs::read_to_string(plan.source_root.join("src/main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
         assert!(plan.source_root.join("library.toml").is_file());
         assert!(matches!(
             plan.materialize_source(&artifact),
