@@ -25,7 +25,10 @@ struct AuthFile {
 
 impl Default for AuthFile {
     fn default() -> Self {
-        Self { format: AUTH_FORMAT, registries: BTreeMap::new() }
+        Self {
+            format: AUTH_FORMAT,
+            registries: BTreeMap::new(),
+        }
     }
 }
 
@@ -63,13 +66,17 @@ impl CredentialStore {
     pub fn discover() -> Result<Self> {
         if let Ok(path) = std::env::var(AUTH_FILE_ENV) {
             if !path.trim().is_empty() {
-                return Ok(Self { path: PathBuf::from(path) });
+                return Ok(Self {
+                    path: PathBuf::from(path),
+                });
             }
         }
         let home = user_home().context(
             "could not determine user home directory; set RPX_AUTH_FILE to choose a credential file",
         )?;
-        Ok(Self { path: home.join(".rbe").join("rpx").join("auth.json") })
+        Ok(Self {
+            path: home.join(".rbe").join("rpx").join("auth.json"),
+        })
     }
 
     pub fn at(path: impl Into<PathBuf>) -> Self {
@@ -168,7 +175,8 @@ impl CredentialStore {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
             restrict_directory(parent)?;
         }
-        let bytes = serde_json::to_vec_pretty(file).context("failed to serialize RPX credentials")?;
+        let bytes =
+            serde_json::to_vec_pretty(file).context("failed to serialize RPX credentials")?;
         AtomicIo::new()
             .write_atomic(&self.path, &bytes)
             .with_context(|| format!("failed to atomically write {}", self.path.display()))?;
@@ -241,7 +249,9 @@ fn user_home() -> Option<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        std::env::var_os("HOME").filter(|value| !value.is_empty()).map(PathBuf::from)
+        std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
     }
 }
 
@@ -301,7 +311,10 @@ mod tests {
             expires_at: unix_now().saturating_add(60),
         };
         store.save("https://registry.example/", &token).unwrap();
-        assert!(store.resolve("https://registry.example/").unwrap().is_some());
+        assert!(store
+            .resolve("https://registry.example/")
+            .unwrap()
+            .is_some());
         assert!(store.resolve("https://other.example/").unwrap().is_none());
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("ownerKey"));
@@ -322,7 +335,10 @@ mod tests {
             expires_at: 1,
         };
         store.save("https://registry.example/", &token).unwrap();
-        assert!(store.resolve("https://registry.example/").unwrap().is_none());
+        assert!(store
+            .resolve("https://registry.example/")
+            .unwrap()
+            .is_none());
         let _ = fs::remove_file(path);
     }
 }
