@@ -4,9 +4,7 @@
 //! only the public read surface required by install/index operations; publisher
 //! authentication is a separate contract.
 
-use crate::registry_contract::{
-    IndexListResponse, PackageIndexResponse, ResolvedRegistryRelease,
-};
+use crate::registry_contract::{IndexListResponse, PackageIndexResponse, ResolvedRegistryRelease};
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
