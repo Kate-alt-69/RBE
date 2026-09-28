@@ -1,3 +1,4 @@
+#[path = "package_links/host.rs"]
 pub(crate) mod host;
 
 use std::collections::{BTreeMap, BTreeSet};
