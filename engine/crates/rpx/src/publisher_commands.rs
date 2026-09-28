@@ -2,6 +2,7 @@
 
 use crate::auth_store::{CredentialSource, CredentialStore, ResolvedCredential};
 use crate::publisher_client::{DevicePoll, PublishResponse, PublisherClient};
+use crate::publisher_management::{yank_package as request_yank, YankResponse};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -112,7 +113,7 @@ pub fn publish_archive(
     let client = PublisherClient::from_override_or_env(registry_override)?;
     let store = CredentialStore::discover()?;
     let credential = require_credential(&store, &client.registry_key())?;
-    require_publish_scope(&credential)?;
+    require_scope(&credential, "package.publish")?;
 
     println!("RPX PUBLISH");
     println!("  registry: {}", client.base_url());
@@ -147,22 +148,49 @@ pub fn publish_archive(
     Ok(published)
 }
 
+pub fn yank(
+    registry_override: Option<&str>,
+    package: &str,
+    version: &str,
+    reason: Option<&str>,
+) -> Result<YankResponse> {
+    let client = PublisherClient::from_override_or_env(registry_override)?;
+    let store = CredentialStore::discover()?;
+    let credential = require_credential(&store, &client.registry_key())?;
+    require_scope(&credential, "package.yank")?;
+
+    println!("RPX YANK");
+    println!("  registry: {}", client.base_url());
+    println!("  package: {package}@{version}");
+    if let Some(reason) = reason {
+        println!("  reason: {}", reason.trim());
+    }
+
+    let response = request_yank(
+        &client,
+        &credential.authorization,
+        package,
+        version,
+        reason,
+    )?;
+    println!("RPX YANK OK");
+    println!("  revision: {}", response.revision);
+    println!("  yanked: {}@{}", response.package, response.version);
+    Ok(response)
+}
+
 fn require_credential(store: &CredentialStore, registry_key: &str) -> Result<ResolvedCredential> {
     store
         .resolve(registry_key)?
         .context("RPX is not logged in for this registry; run `rpx login`")
 }
 
-fn require_publish_scope(credential: &ResolvedCredential) -> Result<()> {
+fn require_scope(credential: &ResolvedCredential, required: &str) -> Result<()> {
     if credential.source == CredentialSource::Environment || credential.scopes.is_empty() {
         return Ok(());
     }
-    if !credential
-        .scopes
-        .iter()
-        .any(|scope| scope == "package.publish")
-    {
-        bail!("stored RPX credential does not grant package.publish; run `rpx login` again");
+    if !credential.scopes.iter().any(|scope| scope == required) {
+        bail!("stored RPX credential does not grant {required}; run `rpx login` again");
     }
     Ok(())
 }
