@@ -19,11 +19,12 @@ mod legacy_cli {
         let version = package.manifest.package.version.clone();
         let root = package.root.clone();
         compile_package(target, allow_host_toolchain)?;
-        let archive = root
-            .join("dist")
-            .join(format!("{name}-{version}.rbe.zip"));
+        let archive = root.join("dist").join(format!("{name}-{version}.rbe.zip"));
         if !archive.is_file() {
-            bail!("RPX package build completed without expected artifact {}", archive.display());
+            bail!(
+                "RPX package build completed without expected artifact {}",
+                archive.display()
+            );
         }
         Ok((archive, name, version))
     }
@@ -85,12 +86,7 @@ fn run() -> Result<Option<ExitCode>> {
             let (archive, package, version) =
                 legacy_cli::build_package_for_publish(target, allow_host_toolchain)
                     .context("failed to build package for publication")?;
-            publisher_commands::publish_archive(
-                registry.as_deref(),
-                &package,
-                &version,
-                &archive,
-            )?;
+            publisher_commands::publish_archive(registry.as_deref(), &package, &version, &archive)?;
         }
         _ => unreachable!(),
     }
