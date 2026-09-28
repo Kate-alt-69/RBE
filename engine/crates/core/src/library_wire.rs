@@ -124,13 +124,13 @@ pub fn decode_worker_message(value: Value) -> Result<LibraryWorkerMessage, Libra
     }
 }
 
-pub fn read_worker_message<R: Read>(reader: &mut R) -> Result<LibraryWorkerMessage, LibraryHostError> {
+pub fn read_worker_message<R: Read>(
+    reader: &mut R,
+) -> Result<LibraryWorkerMessage, LibraryHostError> {
     decode_worker_message(read_json_message(reader)?)
 }
 
-pub fn package_invocation_value(
-    invocation: &PackageInvocation,
-) -> Result<Value, LibraryHostError> {
+pub fn package_invocation_value(invocation: &PackageInvocation) -> Result<Value, LibraryHostError> {
     with_type(LIBRARY_INVOKE_TYPE, invocation.to_value()?)
 }
 
@@ -182,7 +182,10 @@ fn with_type(kind: &str, value: Value) -> Result<Value, LibraryHostError> {
             "Library Protocol payload must serialize to a JSON object".into(),
         ));
     };
-    if object.insert("type".into(), Value::String(kind.into())).is_some() {
+    if object
+        .insert("type".into(), Value::String(kind.into()))
+        .is_some()
+    {
         return Err(LibraryHostError::InvalidMessage(
             "Library Protocol payload must not contain a type field".into(),
         ));
@@ -246,7 +249,9 @@ mod tests {
     #[test]
     fn unknown_worker_message_fails_closed() {
         let error = decode_worker_message(json!({"type": "library.magic"})).unwrap_err();
-        assert!(error.to_string().contains("unsupported worker message type"));
+        assert!(error
+            .to_string()
+            .contains("unsupported worker message type"));
     }
 
     #[test]
