@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use rpx::application_install::install_application;
 use rpx::compile_plan::{CompilerPlan, ResolvedCompilerPlan};
 use rpx::compiler_execution::{
     bun_build, node_check, python_compile, rust_check, typescript_check, CompilerInvocation,
@@ -64,6 +65,30 @@ fn run() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&package.index())?);
         }
         "index" => run_index_command(&args, registry_override.as_deref())?,
+        "install" => {
+            if args.len() > 1 {
+                bail!("usage: rpx install [project-path] [--registry <url>]");
+            }
+            let start = target_from(&args, 0)?;
+            let report = install_application(start, registry_override.as_deref())?;
+            println!("RPX INSTALL OK");
+            println!("  project: {}", report.project_root.display());
+            println!("  roots: {}", report.roots);
+            println!("  private packages: {}", report.private_packages);
+            println!(
+                "  index revision: {}",
+                report.index_revision.as_deref().unwrap_or("locked/offline")
+            );
+            println!(
+                "  mode: {}",
+                if report.reused_lock {
+                    "verified lock rehydration"
+                } else {
+                    "fresh frozen-index resolution"
+                }
+            );
+            println!("  lock: {}", report.lock_path.display());
+        }
         "run" => {
             let script = args
                 .first()
@@ -277,6 +302,8 @@ fn compile_package(target: PathBuf, allow_host_toolchain: bool) -> Result<()> {
     let mut archive = zip::ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     append_tree(&mut archive, &package.root, &package.root, options)?;
+    archive.start_file("package.rbe.yaml", options)?;
+    archive.write_all(serde_yaml::to_string(&package.manifest)?.as_bytes())?;
     archive.start_file(".rbe/package-index.json", options)?;
     archive.write_all(&serde_json::to_vec_pretty(&package.index())?)?;
     archive.finish()?;
@@ -284,6 +311,7 @@ fn compile_package(target: PathBuf, allow_host_toolchain: bool) -> Result<()> {
     print_check(&package);
     println!("\nPACKAGE OK");
     println!("  artifact: {}", archive_path.display());
+    println!("  archive manifest: package.rbe.yaml");
     println!("  scope: complete package");
     println!("  compiler checks: passed");
     println!("  transitive RBE dependencies: package-private graph");
@@ -397,7 +425,7 @@ fn compile_javascript(
             execute_invocation(bun_build(plan, &component.source, &out)?, component)?;
         }
         None => bail!(
-            "JavaScript component {:?} has no Node/Bun runtime in package.rbe.toml",
+            "JavaScript component {:?} has no Node/Bun runtime in the package authoring manifest",
             component.name
         ),
     }
@@ -646,6 +674,9 @@ fn append_tree(
 }
 
 fn should_skip(relative: &Path) -> bool {
+    if relative == Path::new("package.rbe.toml") {
+        return true;
+    }
     relative.components().next().is_some_and(|part| {
         matches!(
             part.as_os_str().to_string_lossy().as_ref(),
@@ -709,12 +740,14 @@ Usage:\n\
   rpx package [path] [--allow-host-toolchain]\n\
   rpx info [path]\n\
   rpx index update [project-path] [--registry <url>]\n\
+  rpx install [project-path] [--registry <url>]\n\
   rpx run <script>\n\n\
 Registry configuration:\n\
   --registry <url>       Override the RPX registry base for this invocation.\n\
   RPX_REGISTRY_URL       Default registry base URL. HTTPS is required except for localhost.\n\n\
-Package authoring paths default to the current directory and use the package archive authoring manifest.\n\
+Package authoring paths default to the current directory. `rpx compile.package` emits a canonical package.rbe.yaml inside the .rbe.zip and never publishes the local authoring manifest.\n\
 RBE applications use package.rbe.json and generated .cache/package.rbe.lock.json state. `rpx index update` caches the frozen Kastrick package/version index at .cache/library/index.rbe.json.\n\
+`rpx install` reuses matching locked graphs without registry resolution, otherwise refreshes one frozen index revision, resolves exact root/private versions, verifies package hashes/manifests/indexes, promotes content-addressed artifacts under .cache/library/<sha>/artifact.rbe, and writes the JSON lock only after the graph succeeds.\n\
 Application scripts are read from package.rbe.json and execute with the application root as their working directory. The directory containing the current RPX binary is prepended to child PATH so scripts may invoke project-local `rpx` again. RPX never runs application scripts implicitly during install/compile.\n\
 A path inside components/<name>/ checks/compiles only that component.\n\
 `check` validates RBE package/component structure. `compile` additionally invokes the selected language compiler/toolchain.\n\

@@ -1,5 +1,6 @@
 //! Reusable RPX authoring and project contracts.
 
+pub mod application_install;
 pub mod compile_plan;
 pub mod compiler_execution;
 pub mod install_plan;
