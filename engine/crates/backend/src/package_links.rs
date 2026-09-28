@@ -5,9 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, Context};
-use rbe_install_runtime::{
-    ProjectInstallRecovery, VerifiedRpxRootIndex, VerifiedRpxRootSnapshot,
-};
+use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex, VerifiedRpxRootSnapshot};
 use route_engine::relc::{
     PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
 };
