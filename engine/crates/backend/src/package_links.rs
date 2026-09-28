@@ -1,3 +1,5 @@
+pub(crate) mod host;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -38,11 +40,11 @@ struct RpxPackageExport {
 
 /// Build RELC's package namespace from SHA-verified explicit package roots.
 ///
-/// `read_verified_rpx_root_indexes` already walks only `package.lock.rbe.yaml`
-/// `packages`, never the root-scoped `private` graphs. This second boundary
-/// validates the RPX index identity against that trusted lock record and maps
-/// only public `exports` into RELC. `private_dependencies` is parsed only to
-/// validate the index shape; it never creates a namespace.
+/// `read_verified_rpx_root_snapshots` joins each public RPX export index with
+/// the independently verified worker identity for the same active package
+/// graph. This boundary then maps only public `exports` into RELC;
+/// `private_dependencies` is parsed only to validate index shape and never
+/// creates a namespace.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
     let recovery = rbe_install_runtime::recover_project_activation(project_root)
         .context("recover interrupted project package activation before package linking")?;
@@ -53,8 +55,17 @@ pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
         );
     }
 
-    let indexes = rbe_install_runtime::read_verified_rpx_root_indexes(project_root)
-        .context("load verified RPX package indexes")?;
+    let snapshots = rbe_install_runtime::read_verified_rpx_root_snapshots(project_root)
+        .context("load verified RPX package root snapshots")?;
+    let indexes = snapshots
+        .into_iter()
+        .map(|snapshot| VerifiedRpxRootIndex {
+            package: snapshot.package,
+            version: snapshot.version,
+            artifact_sha256: snapshot.artifact_sha256,
+            index_json: snapshot.index_json,
+        })
+        .collect();
     from_verified_indexes(indexes)
 }
 
