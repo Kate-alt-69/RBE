@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path as AxumPath, RawQuery, Request, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, uri::Authority, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::MethodRouter;
 use axum::Router;
@@ -438,6 +438,15 @@ fn singleton_header_string(
         .map_err(|_| format!("header {label:?} contains non-text bytes"))
 }
 
+fn host_value(headers: &HeaderMap) -> Result<Value, String> {
+    let Some(raw) = singleton_header_string(headers, header::HOST)? else {
+        return Ok(Value::Null);
+    };
+    raw.parse::<Authority>()
+        .map_err(|error| format!("Host header is not a valid HTTP authority: {error}"))?;
+    Ok(Value::String(raw))
+}
+
 fn content_length_value(headers: &HeaderMap) -> Result<Value, String> {
     let Some(raw) = singleton_header_string(headers, header::CONTENT_LENGTH)? else {
         return Ok(Value::Null);
@@ -660,6 +669,48 @@ mod header_snapshot_tests {
         let error = singleton_header_string(&headers, header::HOST).unwrap_err();
         assert!(error.contains("host"), "{error}");
         assert!(error.contains("may appear only once"), "{error}");
+    }
+
+    #[test]
+    fn host_snapshot_accepts_valid_http_authorities() {
+        for raw in ["example.test", "example.test:8443", "[2001:db8::1]:443"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::HOST,
+                HeaderValue::from_str(raw).expect("valid host test header"),
+            );
+            assert!(matches!(
+                host_value(&headers).unwrap(),
+                Value::String(value) if value == raw
+            ));
+        }
+    }
+
+    #[test]
+    fn host_snapshot_rejects_invalid_http_authorities() {
+        for raw in [
+            "",
+            "bad host",
+            "good.test, evil.test",
+            "http://example.test",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::HOST,
+                HeaderValue::from_str(raw)
+                    .expect("invalid authority should still be representable as a header"),
+            );
+            let error = host_value(&headers).unwrap_err();
+            assert!(error.contains("valid HTTP authority"), "{raw:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn missing_host_is_null() {
+        assert!(matches!(
+            host_value(&HeaderMap::new()).unwrap(),
+            Value::Null
+        ));
     }
 
     #[test]
@@ -1170,10 +1221,8 @@ async fn request_value(
     } else {
         "http".to_string()
     };
-    let host = singleton_header_string(&parts.headers, header::HOST)
-        .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?
-        .map(Value::String)
-        .unwrap_or(Value::Null);
+    let host = host_value(&parts.headers)
+        .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?;
     let user_agent = singleton_header_string(&parts.headers, header::USER_AGENT)
         .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?
         .map(Value::String)
