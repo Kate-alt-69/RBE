@@ -5,6 +5,7 @@
 //! generated `.cache/package.rbe.lock.json` state.
 
 use anyhow::{bail, Context, Result};
+use atomic_io::AtomicIo;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -233,15 +234,11 @@ impl ProjectLock {
     }
 
     pub fn write(&self, project_root: &Path) -> Result<PathBuf> {
-        let paths = ProjectPaths::new(project_root);
-        let path = paths.lock_path();
-        fs::create_dir_all(paths.cache_root())?;
-        let next = paths.cache_root().join("package.rbe.lock.json.next");
-        fs::write(&next, self.render_pretty()?)?;
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        fs::rename(&next, &path)?;
+        let path = ProjectPaths::new(project_root).lock_path();
+        let bytes = self.render_pretty()?;
+        AtomicIo::new()
+            .write_atomic(&path, &bytes)
+            .with_context(|| format!("failed to atomically write {}", path.display()))?;
         Ok(path)
     }
 }
