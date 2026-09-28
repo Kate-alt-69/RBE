@@ -56,7 +56,10 @@ fn run() -> Result<Option<ExitCode>> {
         return Ok(None);
     };
     let command = args[command_index].as_str();
-    if !matches!(command, "login" | "whoami" | "logout" | "publish" | "yank") {
+    if !matches!(
+        command,
+        "login" | "whoami" | "logout" | "publish" | "status" | "yank"
+    ) {
         return Ok(None);
     }
 
@@ -99,6 +102,12 @@ fn run() -> Result<Option<ExitCode>> {
                 legacy_cli::build_package_for_publish(target, allow_host_toolchain)
                     .context("failed to build package for publication")?;
             publisher_commands::publish_archive(registry.as_deref(), &package, &version, &archive)?;
+        }
+        "status" => {
+            if positional.len() != 1 {
+                bail!("usage: rpx status <package> [--registry <url>]");
+            }
+            publisher_commands::status(registry.as_deref(), &positional[0])?;
         }
         "yank" => {
             if positional.len() != 2 {
@@ -212,6 +221,8 @@ fn print_publisher_help() {
       Revoke the active credential and remove locally stored auth state.\n\
   rpx publish [path] [--registry <url>] [--allow-host-toolchain]\n\
       Build a canonical .rbe.zip, upload it through the signed publisher flow, and publish an immutable release.\n\
+  rpx status <package> [--registry <url>]\n\
+      Show public release state, downloads, version hashes, and complete publish/yank history.\n\
   rpx yank <package> <version> [--reason <text>] [--registry <url>]\n\
       Hide an immutable release from new installs while preserving its registry history.\n\n\
 Publisher environment:\n\
@@ -251,8 +262,28 @@ mod tests {
     }
 
     #[test]
+    fn status_parser_keeps_package_identity_positional() {
+        let args = strings(&[
+            "status",
+            "advancenet",
+            "--registry=https://registry.example",
+        ]);
+        assert_eq!(command_index(&args), Some(0));
+        assert_eq!(
+            publisher_positionals(&args, 0).unwrap(),
+            strings(&["advancenet"])
+        );
+    }
+
+    #[test]
     fn yank_parser_separates_reason_from_identity() {
-        let args = strings(&["yank", "advancenet", "1.4.2", "--reason", "broken release"]);
+        let args = strings(&[
+            "yank",
+            "advancenet",
+            "1.4.2",
+            "--reason",
+            "broken release",
+        ]);
         assert_eq!(command_index(&args), Some(0));
         assert_eq!(
             publisher_positionals(&args, 0).unwrap(),
