@@ -212,11 +212,7 @@ impl LibrarySessionBinding {
         let LibraryWorkerMessage::Hello(hello) = message else {
             self.close();
             let error = LibraryHostError::InvalidMessage(HANDSHAKE_REQUIRED_MESSAGE.into());
-            let _ = write_reject(
-                writer,
-                HANDSHAKE_REQUIRED_CODE,
-                HANDSHAKE_REQUIRED_MESSAGE,
-            );
+            let _ = write_reject(writer, HANDSHAKE_REQUIRED_CODE, HANDSHAKE_REQUIRED_MESSAGE);
             return Err(error);
         };
 
@@ -224,11 +220,7 @@ impl LibrarySessionBinding {
             Ok(accepted) => accepted.clone(),
             Err(error) => {
                 self.close();
-                let _ = write_reject(
-                    writer,
-                    HANDSHAKE_REJECTED_CODE,
-                    HANDSHAKE_REJECTED_MESSAGE,
-                );
+                let _ = write_reject(writer, HANDSHAKE_REJECTED_CODE, HANDSHAKE_REJECTED_MESSAGE);
                 return Err(error);
             }
         };
@@ -320,14 +312,10 @@ mod tests {
                 },
                 abi: LIBRARY_ABI_VERSION,
             },
-            [CapabilityGrant::new(
-                "net:http",
-                "net:http",
-                ["request".to_string()],
-                1024,
-                4096,
-            )
-            .unwrap()],
+            [
+                CapabilityGrant::new("net:http", "net:http", ["request".to_string()], 1024, 4096)
+                    .unwrap(),
+            ],
             "session:test-wire",
         )
         .unwrap()
