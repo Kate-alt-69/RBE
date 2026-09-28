@@ -35,13 +35,8 @@ pub fn read_verified_rpx_root_snapshots(
 
 fn join_verified_roots(
     indexes: Vec<VerifiedRpxRootIndex>,
-    workers: Vec<VerifiedPackageWorkerIdentity>,
+    mut workers: BTreeMap<String, VerifiedPackageWorkerIdentity>,
 ) -> Result<Vec<VerifiedRpxRootSnapshot>, VerifiedRootSnapshotError> {
-    let mut workers = workers
-        .into_iter()
-        .map(|worker| (worker.package.clone(), worker))
-        .collect::<BTreeMap<_, _>>();
-
     if indexes.len() != workers.len() {
         return Err(VerifiedRootSnapshotError::GraphChanged {
             detail: format!(
@@ -138,11 +133,18 @@ mod tests {
         }
     }
 
+    fn workers(items: Vec<VerifiedPackageWorkerIdentity>) -> BTreeMap<String, VerifiedPackageWorkerIdentity> {
+        items
+            .into_iter()
+            .map(|worker| (worker.package.clone(), worker))
+            .collect()
+    }
+
     #[test]
     fn joins_only_exact_root_version_and_artifact_identity() {
         let snapshots = join_verified_roots(
             vec![index("advancenet", "2.0.0", 'a')],
-            vec![worker("advancenet", "2.0.0", 'a')],
+            workers(vec![worker("advancenet", "2.0.0", 'a')]),
         )
         .unwrap();
         assert_eq!(snapshots.len(), 1);
@@ -154,21 +156,21 @@ mod tests {
         assert!(matches!(
             join_verified_roots(
                 vec![index("advancenet", "2.0.0", 'a')],
-                vec![worker("advancenet", "2.0.1", 'a')],
+                workers(vec![worker("advancenet", "2.0.1", 'a')]),
             ),
             Err(VerifiedRootSnapshotError::GraphChanged { .. })
         ));
         assert!(matches!(
             join_verified_roots(
                 vec![index("advancenet", "2.0.0", 'a')],
-                vec![worker("advancenet", "2.0.0", 'b')],
+                workers(vec![worker("advancenet", "2.0.0", 'b')]),
             ),
             Err(VerifiedRootSnapshotError::GraphChanged { .. })
         ));
         assert!(matches!(
             join_verified_roots(
                 vec![index("advancenet", "2.0.0", 'a')],
-                vec![worker("other", "2.0.0", 'a')],
+                workers(vec![worker("other", "2.0.0", 'a')]),
             ),
             Err(VerifiedRootSnapshotError::GraphChanged { .. })
         ));
