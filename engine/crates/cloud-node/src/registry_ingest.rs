@@ -55,9 +55,9 @@ pub fn ingest_registry_export(
 
     let mut result = RegistryIngestResult::default();
     for source in files {
-        let relative = source.strip_prefix(export_root).map_err(|_| {
-            anyhow::anyhow!("Cloud Node registry export path escaped its root")
-        })?;
+        let relative = source
+            .strip_prefix(export_root)
+            .map_err(|_| anyhow::anyhow!("Cloud Node registry export path escaped its root"))?;
         let normalized = validate_registry_relative_path(relative)?;
         let is_artifact = normalized.ends_with(".rbe.zip");
         let logical_path = format!("{REGISTRY_LOGICAL_ROOT}/{normalized}");
@@ -68,7 +68,9 @@ pub fn ingest_registry_export(
         } else {
             result.metadata_files += 1;
         }
-        result.stored.push(stored_registry_object(logical_path, stored));
+        result
+            .stored
+            .push(stored_registry_object(logical_path, stored));
     }
 
     Ok(result)
@@ -139,9 +141,7 @@ fn validate_registry_relative_path(path: &Path) -> anyhow::Result<String> {
     }
 
     if parts.len() < 2 {
-        anyhow::bail!(
-            "Cloud Node registry files must live below a recognized registry collection"
-        );
+        anyhow::bail!("Cloud Node registry files must live below a recognized registry collection");
     }
     if !ALLOWED_TOP_LEVEL.contains(&parts[0].as_str()) {
         anyhow::bail!(
@@ -165,9 +165,7 @@ fn validate_registry_relative_path(path: &Path) -> anyhow::Result<String> {
             );
         }
     } else if !is_json {
-        anyhow::bail!(
-            "Cloud Node registry metadata collections may contain only .json files"
-        );
+        anyhow::bail!("Cloud Node registry metadata collections may contain only .json files");
     }
 
     Ok(normalized)
@@ -213,7 +211,10 @@ mod tests {
             ("history/demo/publish-1.json", b"{}".as_slice()),
             ("analytics/demo/snapshot-1.json", b"{}".as_slice()),
             ("artifacts/demo/1.0.0/metadata.json", b"{}".as_slice()),
-            ("artifacts/demo/1.0.0/demo.rbe.zip", b"PK\x03\x04".as_slice()),
+            (
+                "artifacts/demo/1.0.0/demo.rbe.zip",
+                b"PK\x03\x04".as_slice(),
+            ),
         ];
         for (relative, bytes) in files {
             let path = export.join(relative);
@@ -242,13 +243,18 @@ mod tests {
     fn registry_ingest_rejects_project_manifest_and_unknown_collections() {
         assert!(validate_registry_relative_path(Path::new("packages/package.rbe.json")).is_err());
         assert!(validate_registry_relative_path(Path::new("other/demo.json")).is_err());
-        assert!(validate_registry_relative_path(Path::new("artifacts/demo/1.0.0/package.rbe.yaml")).is_err());
+        assert!(validate_registry_relative_path(Path::new(
+            "artifacts/demo/1.0.0/package.rbe.yaml"
+        ))
+        .is_err());
     }
 
     #[test]
     fn registry_ingest_rejects_non_json_metadata_and_non_rbe_artifacts() {
         assert!(validate_registry_relative_path(Path::new("packages/demo.yaml")).is_err());
-        assert!(validate_registry_relative_path(Path::new("artifacts/demo/1.0.0/demo.zip")).is_err());
+        assert!(
+            validate_registry_relative_path(Path::new("artifacts/demo/1.0.0/demo.zip")).is_err()
+        );
         validate_registry_relative_path(Path::new("artifacts/demo/1.0.0/demo.rbe.zip")).unwrap();
     }
 }
