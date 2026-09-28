@@ -30,7 +30,7 @@ pub fn read_verified_rpx_root_snapshots(
 ) -> Result<Vec<VerifiedRpxRootSnapshot>, VerifiedRootSnapshotError> {
     let indexes = read_verified_rpx_root_indexes(project_root)?;
     let workers = read_verified_root_worker_identities(project_root)?;
-    join_verified_roots(indexes, workers)
+    join_verified_roots(indexes, workers.into_values().collect())
 }
 
 fn join_verified_roots(
