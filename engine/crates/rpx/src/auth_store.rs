@@ -171,9 +171,12 @@ impl CredentialStore {
 
     fn write(&self, file: &AuthFile) -> Result<()> {
         if let Some(parent) = self.path.parent() {
+            let created_parent = !parent.exists();
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
-            restrict_directory(parent)?;
+            if created_parent {
+                restrict_directory(parent)?;
+            }
         }
         let bytes =
             serde_json::to_vec_pretty(file).context("failed to serialize RPX credentials")?;
@@ -291,11 +294,19 @@ mod tests {
     use super::*;
 
     fn temp_auth_file(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "rpx-auth-{name}-{}-{}.json",
-            std::process::id(),
-            unix_now()
-        ))
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("rpx-auth-{name}-{}-{nonce}", std::process::id()))
+            .join("auth.json")
+    }
+
+    fn cleanup_auth_file(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 
     #[test]
@@ -319,7 +330,7 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("ownerKey"));
         assert!(!text.contains("privateId"));
-        let _ = fs::remove_file(path);
+        cleanup_auth_file(&path);
     }
 
     #[test]
@@ -339,6 +350,34 @@ mod tests {
             .resolve("https://registry.example/")
             .unwrap()
             .is_none());
-        let _ = fs::remove_file(path);
+        cleanup_auth_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_external_parent_permissions_are_not_changed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_auth_file("external-parent");
+        let parent = path.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = CredentialStore::at(&path);
+        let token = AccessTokenResponse {
+            ok: true,
+            token_type: "Bearer".into(),
+            access_token: "c".repeat(64),
+            service_id: "rpx".into(),
+            scopes: vec!["publisher.read".into()],
+            expires_at: unix_now().saturating_add(60),
+        };
+        store.save("https://registry.example/", &token).unwrap();
+
+        let mode = fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+        cleanup_auth_file(&path);
     }
 }
