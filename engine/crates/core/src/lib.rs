@@ -5,6 +5,7 @@
 
 mod container_client;
 mod library_host;
+mod library_session;
 mod metrics;
 mod network_broker;
 mod video_language;
@@ -41,6 +42,9 @@ pub use library_host::{
     SessionState as LibrarySessionState, WorkerHello as LibraryWorkerHello, LIBRARY_ABI_VERSION,
     LIBRARY_PROTOCOL_VERSION, MAX_LIBRARY_NAME_BYTES, MAX_LIBRARY_OPERATION_BYTES,
     MAX_LIBRARY_PAYLOAD_BYTES, MAX_LIBRARY_TARGET_BYTES,
+};
+pub use library_session::{
+    AcceptedLibrarySessionInfo, LibrarySessionBinding, LIBRARY_HOST_CALL_FEATURE,
 };
 pub use metrics::{
     BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
