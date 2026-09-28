@@ -176,7 +176,10 @@ fn publisher_positionals(args: &[String], command_index: usize) -> Result<Vec<St
 
 fn publisher_help_requested(args: &[String]) -> bool {
     args.is_empty()
-        || matches!(args.first().map(String::as_str), Some("help" | "-h" | "--help"))
+        || matches!(
+            args.first().map(String::as_str),
+            Some("help" | "-h" | "--help")
+        )
 }
 
 fn print_publisher_help() {
@@ -219,10 +222,7 @@ mod tests {
     fn publisher_registry_option_can_follow_command() {
         let args = strings(&["publish", ".", "--registry=https://registry.example"]);
         assert_eq!(command_index(&args), Some(0));
-        assert_eq!(
-            publisher_positionals(&args, 0).unwrap(),
-            strings(&["."])
-        );
+        assert_eq!(publisher_positionals(&args, 0).unwrap(), strings(&["."]));
         assert_eq!(
             option_value(&args, "--registry").unwrap().as_deref(),
             Some("https://registry.example")
