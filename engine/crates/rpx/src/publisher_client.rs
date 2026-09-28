@@ -47,7 +47,7 @@ pub struct AccessTokenResponse {
     pub expires_at: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum DevicePoll {
     Pending,
     Authorized(AccessTokenResponse),
