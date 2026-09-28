@@ -134,10 +134,7 @@ pub fn yank_package(
     Ok(payload)
 }
 
-pub fn package_status(
-    publisher: &PublisherClient,
-    package: &str,
-) -> Result<PackageStatusResponse> {
+pub fn package_status(publisher: &PublisherClient, package: &str) -> Result<PackageStatusResponse> {
     validate_package_name(package)?;
     let mut url = publisher
         .base_url()
@@ -166,10 +163,7 @@ fn management_client() -> Result<Client> {
 }
 
 fn validate_status_response(payload: &PackageStatusResponse, expected_package: &str) -> Result<()> {
-    if !payload.ok
-        || payload.revision.trim().is_empty()
-        || payload.package.name != expected_package
-    {
+    if !payload.ok || payload.revision.trim().is_empty() || payload.package.name != expected_package {
         bail!("RPX registry returned inconsistent package status for {expected_package}");
     }
 
@@ -216,7 +210,11 @@ fn validate_status_response(payload: &PackageStatusResponse, expected_package: &
         bail!("RPX package status returned an incomplete version set for {expected_package}");
     }
 
-    let yanked = payload.versions.iter().filter(|version| version.yanked).count();
+    let yanked = payload
+        .versions
+        .iter()
+        .filter(|version| version.yanked)
+        .count();
     let active = payload.versions.len().saturating_sub(yanked);
     if payload.release_stats.published != payload.versions.len()
         || payload.release_stats.yanked != yanked
