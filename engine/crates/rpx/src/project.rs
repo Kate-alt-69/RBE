@@ -297,13 +297,7 @@ fn validate_root_private_graph(
     let graph = graph.unwrap_or(&empty);
     let mut visiting = BTreeSet::new();
     let mut reachable = BTreeSet::new();
-    validate_private_dependencies(
-        root,
-        root_package,
-        graph,
-        &mut visiting,
-        &mut reachable,
-    )?;
+    validate_private_dependencies(root, root_package, graph, &mut visiting, &mut reachable)?;
     if reachable.len() != graph.len() {
         let extra = graph
             .keys()
