@@ -249,9 +249,11 @@ mod tests {
                     artifact_url: "https://registry.example/artifacts/advancenet.rbe.zip".into(),
                     artifact_sha256,
                     manifest_sha256: "b".repeat(64),
+                    artifact_size: 22,
                     dependencies: BTreeMap::new(),
                 },
             )]),
+            private: BTreeMap::new(),
         }
     }
 

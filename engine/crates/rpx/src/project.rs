@@ -140,8 +140,14 @@ pub struct ProjectLock {
     pub manifest_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_revision: Option<String>,
+    /// Explicit application roots. Only these packages become directly visible
+    /// to the application's REL import surface.
     #[serde(default)]
     pub packages: BTreeMap<String, LockedPackage>,
+    /// Root-scoped transitive packages. Different roots may therefore resolve
+    /// different versions of the same private dependency without collision.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub private: BTreeMap<String, BTreeMap<String, LockedPackage>>,
 }
 
 impl ProjectLock {
@@ -151,6 +157,7 @@ impl ProjectLock {
             manifest_sha256: manifest.sha256()?,
             index_revision: None,
             packages: BTreeMap::new(),
+            private: BTreeMap::new(),
         })
     }
 
@@ -190,6 +197,19 @@ impl ProjectLock {
             validate_package_name(name)?;
             package.validate(name)?;
         }
+        for (root, graph) in &self.private {
+            validate_package_name(root)?;
+            if !self.packages.contains_key(root) {
+                bail!("private lock graph {root:?} has no matching application root");
+            }
+            for (name, package) in graph {
+                validate_package_name(name)?;
+                if name == root {
+                    bail!("private lock graph {root:?} repeats its root package");
+                }
+                package.validate(name)?;
+            }
+        }
         Ok(())
     }
 
@@ -197,6 +217,14 @@ impl ProjectLock {
         Ok(self
             .manifest_sha256
             .eq_ignore_ascii_case(&manifest.sha256()?))
+    }
+
+    pub fn locked_for_root(&self, root: &str, package: &str) -> Option<&LockedPackage> {
+        if root == package {
+            self.packages.get(root)
+        } else {
+            self.private.get(root).and_then(|graph| graph.get(package))
+        }
     }
 
     pub fn render_pretty(&self) -> Result<Vec<u8>> {
@@ -226,6 +254,7 @@ pub struct LockedPackage {
     pub artifact_url: String,
     pub artifact_sha256: String,
     pub manifest_sha256: String,
+    pub artifact_size: u64,
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
 }
@@ -246,6 +275,9 @@ impl LockedPackage {
         }
         validate_sha256("artifact_sha256", &self.artifact_sha256)?;
         validate_sha256("manifest_sha256", &self.manifest_sha256)?;
+        if self.artifact_size == 0 {
+            bail!("locked artifact size for {package:?} must be greater than zero");
+        }
         for (name, requirement) in &self.dependencies {
             validate_package_name(name)?;
             VersionReq::parse(requirement).with_context(|| {
@@ -389,12 +421,13 @@ impl ProjectPaths {
         self.library_root().join(LOCAL_INDEX)
     }
 
-    pub fn artifact_path(&self, sha256: &str) -> Result<PathBuf> {
+    pub fn artifact_dir(&self, sha256: &str) -> Result<PathBuf> {
         validate_sha256("artifact sha256", sha256)?;
-        Ok(self
-            .library_root()
-            .join("artifacts")
-            .join(format!("{}.rbe.zip", sha256.to_ascii_lowercase())))
+        Ok(self.library_root().join(sha256.to_ascii_lowercase()))
+    }
+
+    pub fn artifact_path(&self, sha256: &str) -> Result<PathBuf> {
+        Ok(self.artifact_dir(sha256)?.join("artifact.rbe"))
     }
 }
 
@@ -470,7 +503,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn application_manifest_is_json_not_archive_yaml() {
+    fn application_manifest_is_json_not_archive_manifest() {
         let manifest = ProjectManifest::parse(
             r#"{
   "name": "kastrick-backend",
@@ -508,6 +541,46 @@ mod tests {
             ProjectPaths::new("/app").local_index_path(),
             PathBuf::from("/app/.cache/library/index.rbe.json")
         );
+        assert_eq!(
+            ProjectPaths::new("/app").artifact_path(&"a".repeat(64)).unwrap(),
+            PathBuf::from(format!("/app/.cache/library/{}/artifact.rbe", "a".repeat(64)))
+        );
+    }
+
+    #[test]
+    fn private_lock_graphs_are_scoped_per_root() {
+        let manifest = ProjectManifest::parse(
+            r#"{"packages":{"alpha":"1.0.0","beta":"1.0.0"},"scripts":{}}"#,
+        )
+        .unwrap();
+        let mut lock = ProjectLock::new(&manifest).unwrap();
+        let root = |name: &str| LockedPackage {
+            requested: "1.0.0".into(),
+            version: "1.0.0".into(),
+            artifact_url: format!("https://registry.example/{name}.rbe"),
+            artifact_sha256: "a".repeat(64),
+            manifest_sha256: "b".repeat(64),
+            artifact_size: 10,
+            dependencies: BTreeMap::from([("shared".into(), "*".into())]),
+        };
+        lock.packages.insert("alpha".into(), root("alpha"));
+        lock.packages.insert("beta".into(), root("beta"));
+        let private = |version: &str| LockedPackage {
+            requested: "*".into(),
+            version: version.into(),
+            artifact_url: "https://registry.example/shared.rbe".into(),
+            artifact_sha256: "c".repeat(64),
+            manifest_sha256: "d".repeat(64),
+            artifact_size: 5,
+            dependencies: BTreeMap::new(),
+        };
+        lock.private
+            .insert("alpha".into(), BTreeMap::from([("shared".into(), private("1.0.0"))]));
+        lock.private
+            .insert("beta".into(), BTreeMap::from([("shared".into(), private("2.0.0"))]));
+        lock.validate().unwrap();
+        assert_eq!(lock.locked_for_root("alpha", "shared").unwrap().version, "1.0.0");
+        assert_eq!(lock.locked_for_root("beta", "shared").unwrap().version, "2.0.0");
     }
 
     #[test]
