@@ -152,9 +152,7 @@ mod tests {
     use std::io::Write;
 
     use rbe_install_executor::{PromotionPlan, VerifiedDownload};
-    use rbe_library_package::{
-        BuildSpec, BuildStep, Language, LibraryManifest, RuntimeSpec, SdkSpec,
-    };
+    use rbe_library_package::LibraryManifest;
     use rbe_project_package::{LockedProjectPackage, LockedToolchain, ProjectPackageLock};
     use zip::write::SimpleFileOptions;
 
@@ -162,54 +160,69 @@ mod tests {
     use crate::{ArtifactStage, VerifiedRegistryPackage};
 
     const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SOURCE_SHA: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const PREBUILT_MANIFEST: &str = r#"
+name = "demo"
+version = "1.0.0"
+language = "rust"
+rbe_abi_min = 1
+rbe_abi_max = 1
 
-    fn manifest(build: BuildSpec) -> LibraryManifest {
-        LibraryManifest {
-            name: "demo".into(),
-            version: "1.0.0".into(),
-            language: Language::Rust,
-            rbe_abi_min: 1,
-            rbe_abi_max: 1,
-            sdk: SdkSpec {
-                family: "rust".into(),
-                package: "rbe-sdk".into(),
-                version: "0.1".into(),
-            },
-            runtime: RuntimeSpec {
-                kind: "rust".into(),
-                version: "1.98".into(),
-                managed: true,
-                entry: "src/main.rs".into(),
-            },
-            exports: Default::default(),
-            capabilities: Default::default(),
-            build_capabilities: Default::default(),
-            dependencies: Default::default(),
-            build,
-        }
-    }
+[sdk]
+family = "rust"
+package = "rbe-sdk"
+version = "0.1"
 
-    fn write_package(path: &Path, manifest: &LibraryManifest) {
+[runtime]
+kind = "rust"
+version = "1.98"
+managed = true
+entry = "src/main.rs"
+"#;
+    const BUILD_MANIFEST: &str = r#"
+name = "demo"
+version = "1.0.0"
+language = "rust"
+rbe_abi_min = 1
+rbe_abi_max = 1
+
+[sdk]
+family = "rust"
+package = "rbe-sdk"
+version = "0.1"
+
+[runtime]
+kind = "rust"
+version = "1.98"
+managed = true
+entry = "src/main.rs"
+
+[[build.other]]
+program = "cargo"
+args = ["build", "--release"]
+"#;
+
+    fn write_package(path: &Path, manifest_source: &str) -> LibraryManifest {
+        let manifest = LibraryManifest::parse(manifest_source).unwrap();
         let file = File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         let options = SimpleFileOptions::default();
         zip.start_file("library.toml", options).unwrap();
-        zip.write_all(manifest.to_toml_pretty().unwrap().as_bytes())
-            .unwrap();
+        zip.write_all(manifest_source.as_bytes()).unwrap();
         zip.start_file("src/main.rs", options).unwrap();
         zip.write_all(b"fn main() {}\n").unwrap();
         zip.finish().unwrap();
+        manifest
     }
 
-    fn graph(artifact: PathBuf, build: BuildSpec) -> VerifiedRootGraph {
-        let manifest = manifest(build);
+    fn graph(artifact: PathBuf, manifest: LibraryManifest) -> VerifiedRootGraph {
         let locked = LockedProjectPackage {
             version: "1.0.0".into(),
             resolved_from: "registry:demo".into(),
             artifact_url: "https://example.com/demo.rbe".into(),
             artifact_sha256: SHA.into(),
             manifest_sha256: "b".repeat(64),
-            source_sha256: Some("c".repeat(64)),
+            source_sha256: Some(SOURCE_SHA.into()),
             dependencies: Default::default(),
             runtime: Some(LockedToolchain {
                 kind: "rust".into(),
@@ -256,16 +269,8 @@ mod tests {
     fn host_build_plan_uses_absolute_managed_tool_without_shell_or_network() {
         let temp = tempfile::tempdir().unwrap();
         let artifact = temp.path().join("demo.rbe");
-        let build = BuildSpec {
-            other: vec![BuildStep {
-                program: "cargo".into(),
-                args: vec!["build".into(), "--release".into()],
-            }],
-            ..Default::default()
-        };
-        let package_manifest = manifest(build.clone());
-        write_package(&artifact, &package_manifest);
-        let graph = graph(artifact, build);
+        let manifest = write_package(&artifact, BUILD_MANIFEST);
+        let graph = graph(artifact, manifest);
         let toolchain = ManagedToolchain::new(BTreeMap::from([(
             "cargo".into(),
             temp.path().join("managed/cargo"),
@@ -275,11 +280,9 @@ mod tests {
             prepare_managed_build_plans(&graph, &toolchain, temp.path().join("build-session"))
                 .unwrap();
         let plan = &plans["demo"];
-        assert_eq!(
-            plan.expected_source_sha256.as_deref(),
-            Some(&"c".repeat(64))
-        );
+        assert_eq!(plan.expected_source_sha256.as_deref(), Some(SOURCE_SHA));
         assert_eq!(plan.invocations.len(), 1);
+        assert_eq!(plan.invocations[0].args, ["build", "--release"]);
         assert!(plan.invocations[0].program.is_absolute());
         assert!(!plan.invocations[0].network_allowed);
         assert!(!plan.invocations[0].use_shell);
@@ -292,9 +295,8 @@ mod tests {
     fn prebuilt_package_needs_no_managed_build_plan() {
         let temp = tempfile::tempdir().unwrap();
         let artifact = temp.path().join("demo.rbe");
-        let package_manifest = manifest(BuildSpec::default());
-        write_package(&artifact, &package_manifest);
-        let graph = graph(artifact, BuildSpec::default());
+        let manifest = write_package(&artifact, PREBUILT_MANIFEST);
+        let graph = graph(artifact, manifest);
         let toolchain = ManagedToolchain::new(BTreeMap::from([(
             "cargo".into(),
             temp.path().join("managed/cargo"),
@@ -310,16 +312,8 @@ mod tests {
     fn unknown_build_tool_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let artifact = temp.path().join("demo.rbe");
-        let build = BuildSpec {
-            other: vec![BuildStep {
-                program: "cargo".into(),
-                args: vec!["build".into()],
-            }],
-            ..Default::default()
-        };
-        let package_manifest = manifest(build.clone());
-        write_package(&artifact, &package_manifest);
-        let graph = graph(artifact, build);
+        let manifest = write_package(&artifact, BUILD_MANIFEST);
+        let graph = graph(artifact, manifest);
         let toolchain = ManagedToolchain::new(BTreeMap::from([(
             "rustc".into(),
             temp.path().join("managed/rustc"),
