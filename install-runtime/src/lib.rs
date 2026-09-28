@@ -57,6 +57,7 @@ pub use test_tempdir::{tempdir, TempDir};
 
 mod activation;
 mod artifact;
+mod build_plan;
 mod cache;
 mod graph;
 mod http;
@@ -73,6 +74,9 @@ pub use activation::{
     InstallActivationProof, ProjectActivationResult, ProjectInstallRecovery,
 };
 pub use artifact::ArtifactStage;
+pub use build_plan::{
+    prepare_managed_build_plans, ManagedBuildPlanError, ManagedPackageBuildPlan,
+};
 pub use cache::stage_artifact_cached as stage_artifact;
 pub use graph::{stage_resolved_root, VerifiedRootGraph};
 pub use package::{
