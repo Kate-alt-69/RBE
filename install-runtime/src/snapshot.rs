@@ -133,7 +133,9 @@ mod tests {
         }
     }
 
-    fn workers(items: Vec<VerifiedPackageWorkerIdentity>) -> BTreeMap<String, VerifiedPackageWorkerIdentity> {
+    fn workers(
+        items: Vec<VerifiedPackageWorkerIdentity>,
+    ) -> BTreeMap<String, VerifiedPackageWorkerIdentity> {
         items
             .into_iter()
             .map(|worker| (worker.package.clone(), worker))
