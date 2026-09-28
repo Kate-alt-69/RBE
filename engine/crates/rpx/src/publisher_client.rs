@@ -146,7 +146,11 @@ impl PublisherClient {
             .user_agent(concat!("rpx/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to initialize RPX upload HTTP client")?;
-        Ok(Self { base, client, upload_client })
+        Ok(Self {
+            base,
+            client,
+            upload_client,
+        })
     }
 
     pub fn from_override_or_env(override_url: Option<&str>) -> Result<Self> {
@@ -277,7 +281,10 @@ impl PublisherClient {
         let metadata = fs::metadata(archive)
             .with_context(|| format!("failed to inspect package archive {}", archive.display()))?;
         if !metadata.is_file() {
-            bail!("package archive is not a regular file: {}", archive.display());
+            bail!(
+                "package archive is not a regular file: {}",
+                archive.display()
+            );
         }
         if metadata.len() == 0 || metadata.len() > prepared.max_archive_bytes as u64 {
             bail!(
@@ -298,8 +305,12 @@ impl PublisherClient {
             .with_context(|| format!("failed to upload package archive to {url}"))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = read_bounded(response, &url).unwrap_or_else(|_| "<body unavailable>".into());
-            bail!("package upload failed with HTTP {status}: {}", truncate_for_error(&body, 4096));
+            let body =
+                read_bounded(response, &url).unwrap_or_else(|_| "<body unavailable>".into());
+            bail!(
+                "package upload failed with HTTP {status}: {}",
+                truncate_for_error(&body, 4096)
+            );
         }
         Ok(())
     }
@@ -320,7 +331,10 @@ impl PublisherClient {
             .client
             .post(url.clone())
             .header(reqwest::header::AUTHORIZATION, authorization)
-            .json(&PublishAction { action: "publish", upload_id })
+            .json(&PublishAction {
+                action: "publish",
+                upload_id,
+            })
             .send()
             .with_context(|| format!("failed to finalize RPX package publication at {url}"))?;
         let payload: PublishResponse = decode_success(response, &url)?;
