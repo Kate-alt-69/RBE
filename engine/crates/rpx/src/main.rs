@@ -8,7 +8,6 @@ use rpx::project::{find_project_root, ProjectManifest};
 use rpx::toolchain::{verify_managed_program, CompilerResolver};
 use sdk_package::{
     check_package, check_target, CheckedComponent, CheckedPackage, JsRuntime, PackageLanguage,
-    PACKAGE_MANIFEST,
 };
 use std::fs;
 use std::io::{Read, Write};
