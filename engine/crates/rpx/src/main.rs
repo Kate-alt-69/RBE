@@ -31,9 +31,17 @@ mod legacy_cli {
 }
 
 fn main() -> ExitCode {
+    let startup_args = std::env::args().skip(1).collect::<Vec<_>>();
+    let show_publisher_help = publisher_help_requested(&startup_args);
     match run() {
         Ok(Some(code)) => code,
-        Ok(None) => legacy_cli::dispatch(),
+        Ok(None) => {
+            let code = legacy_cli::dispatch();
+            if show_publisher_help {
+                print_publisher_help();
+            }
+            code
+        }
         Err(error) => {
             eprintln!("ERROR : RPX publisher issue!\n\n{error:#}\n");
             eprintln!("HINT : use `rpx login` before publishing, and configure the registry with --registry or RPX_REGISTRY_URL.");
@@ -164,4 +172,79 @@ fn publisher_positionals(args: &[String], command_index: usize) -> Result<Vec<St
         index += 1;
     }
     Ok(output)
+}
+
+fn publisher_help_requested(args: &[String]) -> bool {
+    args.is_empty()
+        || matches!(args.first().map(String::as_str), Some("help" | "-h" | "--help"))
+}
+
+fn print_publisher_help() {
+    println!(
+        "\nPublisher commands:\n\
+  rpx login [--registry <url>]\n\
+      Authorize RPX in the browser and store a scoped registry credential.\n\
+  rpx whoami [--registry <url>]\n\
+      Validate the active credential and list packages owned by the publisher.\n\
+  rpx logout [--registry <url>]\n\
+      Revoke the active credential and remove locally stored auth state.\n\
+  rpx publish [path] [--registry <url>] [--allow-host-toolchain]\n\
+      Build a canonical .rbe.zip, upload it through the signed publisher flow, and publish an immutable release.\n\n\
+Publisher environment:\n\
+  RPX_TOKEN             Optional scoped 64-hex token for CI; never persisted.\n\
+  RPX_AUTH_FILE         Override ~/.rbe/rpx/auth.json.\n\
+  RPX_REGISTRY_URL      Default registry base URL."
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn publisher_command_can_follow_global_registry_option() {
+        let args = strings(&["--registry", "https://registry.example", "login"]);
+        assert_eq!(command_index(&args), Some(2));
+        assert_eq!(
+            option_value(&args, "--registry").unwrap().as_deref(),
+            Some("https://registry.example")
+        );
+    }
+
+    #[test]
+    fn publisher_registry_option_can_follow_command() {
+        let args = strings(&["publish", ".", "--registry=https://registry.example"]);
+        assert_eq!(command_index(&args), Some(0));
+        assert_eq!(
+            publisher_positionals(&args, 0).unwrap(),
+            strings(&["."])
+        );
+        assert_eq!(
+            option_value(&args, "--registry").unwrap().as_deref(),
+            Some("https://registry.example")
+        );
+    }
+
+    #[test]
+    fn duplicate_registry_options_are_rejected() {
+        let args = strings(&[
+            "login",
+            "--registry=https://one.example",
+            "--registry",
+            "https://two.example",
+        ]);
+        assert!(option_value(&args, "--registry").is_err());
+    }
+
+    #[test]
+    fn publisher_help_is_added_to_root_help() {
+        assert!(publisher_help_requested(&[]));
+        assert!(publisher_help_requested(&strings(&["help"])));
+        assert!(publisher_help_requested(&strings(&["--help"])));
+        assert!(!publisher_help_requested(&strings(&["install"])));
+    }
 }
