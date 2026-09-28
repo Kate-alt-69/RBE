@@ -172,7 +172,10 @@ mod tests {
 
     #[test]
     fn yank_reason_is_bounded_and_nonempty() {
-        assert_eq!(normalize_reason(Some(" broken build ")).unwrap(), Some("broken build"));
+        assert_eq!(
+            normalize_reason(Some(" broken build ")).unwrap(),
+            Some("broken build")
+        );
         assert!(normalize_reason(Some("   ")).is_err());
         let too_large = "x".repeat(MAX_YANK_REASON_BYTES + 1);
         assert!(normalize_reason(Some(&too_large)).is_err());
