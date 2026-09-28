@@ -513,7 +513,9 @@ mod tests {
 
     fn locked_fetch() -> LockedArtifactFetch {
         LockedArtifactFetch {
+            root: "advancenet".into(),
             package: "advancenet".into(),
+            private: false,
             version: "4.0.1".into(),
             artifact_url: Url::parse("https://cdn.kastrick.invalid/advancenet.zip").unwrap(),
             artifact_sha256: ABC_SHA256.into(),
