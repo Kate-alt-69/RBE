@@ -88,11 +88,8 @@ fn build_verified_host_sessions(
 ) -> anyhow::Result<BTreeMap<String, LibrarySessionBinding>> {
     let mut sessions = BTreeMap::new();
     for (package, snapshot) in roots {
-        let binding = host::bind_session(
-            snapshot,
-            std::iter::empty::<LibraryCapabilityGrant>(),
-        )
-        .with_context(|| format!("bind Library Host session for verified root {package:?}"))?;
+        let binding = host::bind_session(snapshot, std::iter::empty::<LibraryCapabilityGrant>())
+            .with_context(|| format!("bind Library Host session for verified root {package:?}"))?;
         if sessions.insert(package.clone(), binding).is_some() {
             bail!("duplicate Library Host session for verified root {package:?}");
         }
