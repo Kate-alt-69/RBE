@@ -6,6 +6,7 @@
 mod container_client;
 mod library_host;
 mod library_session;
+mod library_wire;
 mod metrics;
 mod network_broker;
 mod video_language;
@@ -45,6 +46,17 @@ pub use library_host::{
 };
 pub use library_session::{
     AcceptedLibrarySessionInfo, LibrarySessionBinding, LIBRARY_HOST_CALL_FEATURE,
+};
+pub use library_wire::{
+    decode_worker_message as decode_library_worker_message,
+    package_invocation_value as library_package_invocation_value,
+    read_worker_message as read_library_worker_message, reject_value as library_reject_value,
+    write_accept as write_library_accept, write_host_reply as write_library_host_reply,
+    write_package_invocation as write_library_package_invocation,
+    write_reject as write_library_reject, LibraryHostCallReply, LibraryWorkerMessage,
+    HOST_CALL_TYPE as LIBRARY_HOST_CALL_TYPE, HOST_REPLY_TYPE as LIBRARY_HOST_REPLY_TYPE,
+    LIBRARY_ACCEPT_TYPE, LIBRARY_HELLO_TYPE, LIBRARY_INVOKE_TYPE, LIBRARY_REJECT_TYPE,
+    LIBRARY_REPLY_TYPE,
 };
 pub use metrics::{
     BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
