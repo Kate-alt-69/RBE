@@ -68,12 +68,11 @@ pub fn prepare_managed_build_plans(
             });
         }
 
-        let short_sha = locked
-            .artifact_sha256
-            .get(..16)
-            .ok_or_else(|| ManagedBuildPlanError::InvalidArtifactSha256 {
+        let short_sha = locked.artifact_sha256.get(..16).ok_or_else(|| {
+            ManagedBuildPlanError::InvalidArtifactSha256 {
                 package: package.clone(),
-            })?;
+            }
+        })?;
         let source_root = build_root.join(format!("{position:04}-{short_sha}"));
         let extraction = ExtractionPlan::from_inspected(&inspected, &source_root)?;
         let invocations = build_invocations(build_steps, toolchain, &source_root)?;
@@ -272,14 +271,14 @@ mod tests {
             temp.path().join("managed/cargo"),
         )]))
         .unwrap();
-        let plans = prepare_managed_build_plans(
-            &graph,
-            &toolchain,
-            temp.path().join("build-session"),
-        )
-        .unwrap();
+        let plans =
+            prepare_managed_build_plans(&graph, &toolchain, temp.path().join("build-session"))
+                .unwrap();
         let plan = &plans["demo"];
-        assert_eq!(plan.expected_source_sha256.as_deref(), Some(&"c".repeat(64)));
+        assert_eq!(
+            plan.expected_source_sha256.as_deref(),
+            Some(&"c".repeat(64))
+        );
         assert_eq!(plan.invocations.len(), 1);
         assert!(plan.invocations[0].program.is_absolute());
         assert!(!plan.invocations[0].network_allowed);
@@ -301,12 +300,9 @@ mod tests {
             temp.path().join("managed/cargo"),
         )]))
         .unwrap();
-        let plans = prepare_managed_build_plans(
-            &graph,
-            &toolchain,
-            temp.path().join("build-session"),
-        )
-        .unwrap();
+        let plans =
+            prepare_managed_build_plans(&graph, &toolchain, temp.path().join("build-session"))
+                .unwrap();
         assert!(plans.is_empty());
     }
 
