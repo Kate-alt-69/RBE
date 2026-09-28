@@ -104,9 +104,7 @@ impl VerifiedWorkerSourcePlan {
         verify_snapshot_manifest(snapshot, &inspected.manifest)?;
         let fresh = ExtractionPlan::from_inspected(&inspected, &self.source_root)?;
         if fresh != self.extraction {
-            return Err(WorkerSourceError::ExtractionPlanDrift(
-                self.package.clone(),
-            ));
+            return Err(WorkerSourceError::ExtractionPlanDrift(self.package.clone()));
         }
         require_safe_extraction(&fresh, &self.source_root)?;
         require_safe_fresh_parent(&self.source_root)?;
@@ -352,7 +350,9 @@ pub enum WorkerSourceError {
     SnapshotDrift(String),
     #[error("worker package artifact is not a safe regular file: {0}")]
     UnsafeArtifact(PathBuf),
-    #[error("worker package artifact hash mismatch at {package}: expected {expected}, got {actual}")]
+    #[error(
+        "worker package artifact hash mismatch at {package}: expected {expected}, got {actual}"
+    )]
     ArtifactHashMismatch {
         package: String,
         expected: String,
@@ -470,7 +470,10 @@ entry = "src/index.js"
             std::fs::read_to_string(&materialized.entrypoint).unwrap(),
             "export default {};\n"
         );
-        assert!(materialized.files.iter().any(|file| file.path == "src/index.js"));
+        assert!(materialized
+            .files
+            .iter()
+            .any(|file| file.path == "src/index.js"));
     }
 
     #[test]
@@ -480,13 +483,13 @@ entry = "src/index.js"
         let snapshot = snapshot(&sha256);
         let parent = project.path().join(".cache/rbe/library-host");
         std::fs::create_dir_all(&parent).unwrap();
-        let error = prepare_verified_worker_source(
-            project.path(),
-            &snapshot,
-            parent.join("session-b"),
-        )
-        .unwrap_err();
-        assert!(matches!(error, WorkerSourceError::MissingRuntimeEntrypoint { .. }));
+        let error =
+            prepare_verified_worker_source(project.path(), &snapshot, parent.join("session-b"))
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkerSourceError::MissingRuntimeEntrypoint { .. }
+        ));
     }
 
     #[test]
@@ -501,7 +504,10 @@ entry = "src/index.js"
 
         std::fs::write(&artifact, b"tampered").unwrap();
         let error = plan.materialize(&snapshot).unwrap_err();
-        assert!(matches!(error, WorkerSourceError::ArtifactHashMismatch { .. }));
+        assert!(matches!(
+            error,
+            WorkerSourceError::ArtifactHashMismatch { .. }
+        ));
         assert!(!root.exists());
     }
 
@@ -517,6 +523,9 @@ entry = "src/index.js"
         std::fs::create_dir(&root).unwrap();
 
         let error = plan.materialize(&snapshot).unwrap_err();
-        assert!(matches!(error, WorkerSourceError::SourceRootAlreadyExists(_)));
+        assert!(matches!(
+            error,
+            WorkerSourceError::SourceRootAlreadyExists(_)
+        ));
     }
 }
