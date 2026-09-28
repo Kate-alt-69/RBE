@@ -21,6 +21,8 @@ use core_lib::{
     ContainerWorkCost, CONTAINER_MAX_EXECUTION_INPUT_BYTES, PUBLIC_HTTP_MAX_TIMEOUT_MS,
 };
 
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::analyzer::{analyze, Severity};
@@ -275,58 +277,144 @@ fn json_to_value(value: serde_json::Value) -> Value {
 const MAX_EXACT_JSON_INTEGER: i64 = 9_007_199_254_740_991;
 const MIN_EXACT_JSON_INTEGER: i64 = -MAX_EXACT_JSON_INTEGER;
 
-fn request_json_number_to_value(value: serde_json::Number) -> Result<Value, String> {
-    let rendered = value.to_string();
-    if let Some(value) = value.as_i64() {
-        if !(MIN_EXACT_JSON_INTEGER..=MAX_EXACT_JSON_INTEGER).contains(&value) {
-            return Err(format!(
-                "JSON integer {rendered} cannot be represented exactly by REL; supported exact integer range is {MIN_EXACT_JSON_INTEGER} through {MAX_EXACT_JSON_INTEGER}"
-            ));
-        }
-        return Ok(Value::Number(value as f64));
-    }
-    if let Some(value) = value.as_u64() {
-        if value > MAX_EXACT_JSON_INTEGER as u64 {
-            return Err(format!(
-                "JSON integer {rendered} cannot be represented exactly by REL; supported exact integer range is {MIN_EXACT_JSON_INTEGER} through {MAX_EXACT_JSON_INTEGER}"
-            ));
-        }
-        return Ok(Value::Number(value as f64));
-    }
+struct RequestJsonValue(Value);
 
-    let value = value
-        .as_f64()
-        .ok_or_else(|| format!("JSON number {rendered} cannot be represented by REL"))?;
-    if !value.is_finite() {
-        return Err(format!("JSON number {rendered} is not finite"));
-    }
-    if value.fract() == 0.0
-        && !(MIN_EXACT_JSON_INTEGER as f64..=MAX_EXACT_JSON_INTEGER as f64).contains(&value)
+struct RequestJsonVisitor;
+
+impl<'de> Deserialize<'de> for RequestJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
     {
-        return Err(format!(
-            "JSON integer {rendered} cannot be represented exactly by REL; supported exact integer range is {MIN_EXACT_JSON_INTEGER} through {MAX_EXACT_JSON_INTEGER}"
-        ));
+        deserializer.deserialize_any(RequestJsonVisitor)
     }
-    Ok(Value::Number(value))
 }
 
-fn request_json_to_value(value: serde_json::Value) -> Result<Value, String> {
-    match value {
-        serde_json::Value::Null => Ok(Value::Null),
-        serde_json::Value::Bool(value) => Ok(Value::Bool(value)),
-        serde_json::Value::Number(value) => request_json_number_to_value(value),
-        serde_json::Value::String(value) => Ok(Value::String(value)),
-        serde_json::Value::Array(values) => values
-            .into_iter()
-            .map(request_json_to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-        serde_json::Value::Object(values) => values
-            .into_iter()
-            .map(|(key, value)| Ok((key, request_json_to_value(value)?)))
-            .collect::<Result<HashMap<_, _>, String>>()
-            .map(Value::Object),
+impl<'de> Visitor<'de> for RequestJsonVisitor {
+    type Value = RequestJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value accepted by Route REL")
     }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(RequestJsonValue(Value::Null))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(RequestJsonValue(Value::Null))
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(RequestJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if !(MIN_EXACT_JSON_INTEGER..=MAX_EXACT_JSON_INTEGER).contains(&value) {
+            return Err(E::custom(format!(
+                "JSON integer {value} cannot be represented exactly by REL; supported exact integer range is {MIN_EXACT_JSON_INTEGER} through {MAX_EXACT_JSON_INTEGER}"
+            )));
+        }
+        Ok(RequestJsonValue(Value::Number(value as f64)))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value > MAX_EXACT_JSON_INTEGER as u64 {
+            return Err(E::custom(format!(
+                "JSON integer {value} cannot be represented exactly by REL; supported exact integer range is {MIN_EXACT_JSON_INTEGER} through {MAX_EXACT_JSON_INTEGER}"
+            )));
+        }
+        Ok(RequestJsonValue(Value::Number(value as f64)))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if !value.is_finite() {
+            return Err(E::custom("JSON number is not finite"));
+        }
+        if value.fract() == 0.0
+            && !(MIN_EXACT_JSON_INTEGER as f64..=MAX_EXACT_JSON_INTEGER as f64).contains(&value)
+        {
+            return Err(E::custom(format!(
+                "JSON integer {value} cannot be represented exactly by REL; supported exact integer range is {MIN_EXACT_JSON_INTEGER} through {MAX_EXACT_JSON_INTEGER}"
+            )));
+        }
+        Ok(RequestJsonValue(Value::Number(value)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(RequestJsonValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(RequestJsonValue(Value::String(value)))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        while let Some(RequestJsonValue(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(RequestJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+        while let Some(key) = map.next_key::<String>()? {
+            match values.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    return Err(de::Error::custom(format!(
+                        "duplicate JSON object key {:?} is ambiguous",
+                        entry.key()
+                    )));
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let RequestJsonValue(value) = map.next_value()?;
+                    entry.insert(value);
+                }
+            }
+        }
+        Ok(RequestJsonValue(Value::Object(values)))
+    }
+}
+
+fn request_json_value(raw: &str) -> Result<Value, String> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let RequestJsonValue(value) = RequestJsonValue::deserialize(&mut deserializer)
+        .map_err(|error| format!("invalid JSON request body: {error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| format!("invalid JSON request body: {error}"))?;
+    Ok(value)
 }
 
 fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
@@ -819,9 +907,7 @@ fn request_body_values(raw: &[u8], content_type: Option<&str>) -> Result<(Value,
     let body = if raw.is_empty() {
         Value::Null
     } else if is_json_content_type(content_type) {
-        let parsed = serde_json::from_str::<serde_json::Value>(&raw_body)
-            .map_err(|error| format!("invalid JSON request body: {error}"))?;
-        request_json_to_value(parsed)?
+        request_json_value(&raw_body)?
     } else {
         Value::String(raw_body.clone())
     };
@@ -898,6 +984,35 @@ mod request_body_snapshot_tests {
     fn json_body_keeps_finite_fractional_numbers() {
         let (body, _) = request_body_values(b"0.125", Some("application/json")).unwrap();
         assert!(matches!(body, Value::Number(value) if value == 0.125));
+    }
+
+    #[test]
+    fn json_body_rejects_duplicate_object_keys() {
+        let error = request_body_values(
+            br#"{"role":"user","role":"admin"}"#,
+            Some("application/json"),
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate JSON object key"), "{error}");
+        assert!(error.contains("role"), "{error}");
+    }
+
+    #[test]
+    fn json_body_rejects_nested_duplicate_object_keys() {
+        let error = request_body_values(br#"{"meta":{"id":1,"id":2}}"#, Some("application/json"))
+            .unwrap_err();
+        assert!(error.contains("duplicate JSON object key"), "{error}");
+        assert!(error.contains("id"), "{error}");
+    }
+
+    #[test]
+    fn json_body_allows_same_key_in_distinct_objects() {
+        let (body, _) = request_body_values(
+            br#"{"first":{"id":1},"second":{"id":2}}"#,
+            Some("application/json"),
+        )
+        .unwrap();
+        assert!(matches!(body, Value::Object(_)));
     }
 }
 
