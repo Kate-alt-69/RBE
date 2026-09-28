@@ -13,7 +13,7 @@ use crate::library_host::{
     read_json_message, write_json_message, HostCall, LibraryHostError, PackageInvocation,
     PackageReply, WorkerHello, MAX_LIBRARY_PAYLOAD_BYTES,
 };
-use crate::library_session::AcceptedLibrarySessionInfo;
+use crate::library_session::{AcceptedLibrarySessionInfo, LibrarySessionBinding};
 
 pub const LIBRARY_HELLO_TYPE: &str = "library.hello";
 pub const LIBRARY_ACCEPT_TYPE: &str = "library.accept";
@@ -24,6 +24,12 @@ pub const HOST_CALL_TYPE: &str = "host.call";
 pub const HOST_REPLY_TYPE: &str = "host.reply";
 
 const MAX_WIRE_ERROR_BYTES: usize = 64 * 1024;
+const HANDSHAKE_MALFORMED_CODE: &str = "MALFORMED_HELLO";
+const HANDSHAKE_REQUIRED_CODE: &str = "HELLO_REQUIRED";
+const HANDSHAKE_REJECTED_CODE: &str = "HELLO_REJECTED";
+const HANDSHAKE_MALFORMED_MESSAGE: &str = "worker handshake could not be decoded";
+const HANDSHAKE_REQUIRED_MESSAGE: &str = "first worker message must be library.hello";
+const HANDSHAKE_REJECTED_MESSAGE: &str = "worker identity or ABI was rejected";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibraryWorkerMessage {
@@ -176,6 +182,65 @@ pub fn write_host_reply<W: Write>(
     write_json_message(writer, &value).map_err(LibraryHostError::from)
 }
 
+impl LibrarySessionBinding {
+    /// Consume the first frame from a private worker channel and complete the
+    /// fail-closed Library Protocol handshake.
+    ///
+    /// The first worker frame must be `library.hello`. Identity/ABI details are
+    /// checked by the same `LibrarySession` that later authorizes host calls.
+    /// Rejected workers receive only a bounded generic reason so trusted lock,
+    /// SDK, runtime, and artifact expectations are not reflected back to an
+    /// untrusted process.
+    pub fn accept_wire_handshake<R: Read, W: Write>(
+        &mut self,
+        reader: &mut R,
+        writer: &mut W,
+    ) -> Result<AcceptedLibrarySessionInfo, LibraryHostError> {
+        let message = match read_worker_message(reader) {
+            Ok(message) => message,
+            Err(error) => {
+                self.close();
+                let _ = write_reject(
+                    writer,
+                    HANDSHAKE_MALFORMED_CODE,
+                    HANDSHAKE_MALFORMED_MESSAGE,
+                );
+                return Err(error);
+            }
+        };
+
+        let LibraryWorkerMessage::Hello(hello) = message else {
+            self.close();
+            let error = LibraryHostError::InvalidMessage(HANDSHAKE_REQUIRED_MESSAGE.into());
+            let _ = write_reject(
+                writer,
+                HANDSHAKE_REQUIRED_CODE,
+                HANDSHAKE_REQUIRED_MESSAGE,
+            );
+            return Err(error);
+        };
+
+        let accepted = match self.accept_hello(&hello) {
+            Ok(accepted) => accepted.clone(),
+            Err(error) => {
+                self.close();
+                let _ = write_reject(
+                    writer,
+                    HANDSHAKE_REJECTED_CODE,
+                    HANDSHAKE_REJECTED_MESSAGE,
+                );
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = write_accept(writer, &accepted) {
+            self.close();
+            return Err(error);
+        }
+        Ok(accepted)
+    }
+}
+
 fn with_type(kind: &str, value: Value) -> Result<Value, LibraryHostError> {
     let Value::Object(mut object) = value else {
         return Err(LibraryHostError::InvalidMessage(
@@ -209,8 +274,8 @@ mod tests {
 
     use super::*;
     use crate::library_host::{
-        PackageIdentity, RuntimeIdentity, SdkIdentity, LIBRARY_ABI_VERSION,
-        LIBRARY_PROTOCOL_VERSION,
+        CapabilityGrant, ExpectedWorkerIdentity, PackageIdentity, RuntimeIdentity, SdkIdentity,
+        SessionState, LIBRARY_ABI_VERSION, LIBRARY_PROTOCOL_VERSION,
     };
 
     fn hello_value() -> Value {
@@ -234,6 +299,48 @@ mod tests {
             "abi_min": LIBRARY_ABI_VERSION,
             "abi_max": LIBRARY_ABI_VERSION,
         })
+    }
+
+    fn binding() -> LibrarySessionBinding {
+        LibrarySessionBinding::new(
+            ExpectedWorkerIdentity {
+                package: PackageIdentity {
+                    name: "advancenet".into(),
+                    version: "1.0.0".into(),
+                    artifact_sha256: "a".repeat(64),
+                },
+                sdk: SdkIdentity {
+                    language: "typescript".into(),
+                    name: "@rbe/sdk".into(),
+                    version: "0.1.0".into(),
+                },
+                runtime: RuntimeIdentity {
+                    kind: "bun".into(),
+                    version: "1.3.0".into(),
+                },
+                abi: LIBRARY_ABI_VERSION,
+            },
+            [CapabilityGrant::new(
+                "net:http",
+                "net:http",
+                ["request".to_string()],
+                1024,
+                4096,
+            )
+            .unwrap()],
+            "session:test-wire",
+        )
+        .unwrap()
+    }
+
+    fn framed(value: &Value) -> Cursor<Vec<u8>> {
+        let mut bytes = Vec::new();
+        write_json_message(&mut bytes, value).unwrap();
+        Cursor::new(bytes)
+    }
+
+    fn written_value(bytes: Vec<u8>) -> Value {
+        read_json_message(&mut Cursor::new(bytes)).unwrap()
     }
 
     #[test]
@@ -319,5 +426,81 @@ mod tests {
                 version: "1.3.0".into(),
             }
         );
+    }
+
+    #[test]
+    fn wire_handshake_accepts_only_verified_hello_and_exposes_actual_grants() {
+        let mut binding = binding();
+        let mut input = framed(&hello_value());
+        let mut output = Vec::new();
+
+        let accepted = binding
+            .accept_wire_handshake(&mut input, &mut output)
+            .unwrap();
+        assert_eq!(binding.state(), SessionState::Accepted);
+        assert_eq!(
+            accepted.granted_capabilities,
+            std::collections::BTreeSet::from(["net:http".to_string()])
+        );
+
+        let response = written_value(output);
+        assert_eq!(response["type"], LIBRARY_ACCEPT_TYPE);
+        assert_eq!(response["capabilityIdentity"], "session:test-wire");
+    }
+
+    #[test]
+    fn wire_handshake_rejects_non_hello_first_frame_and_closes_session() {
+        let mut binding = binding();
+        let mut input = framed(&json!({
+            "type": HOST_CALL_TYPE,
+            "call_id": 1,
+            "capability": "net:http",
+            "target": "net:http",
+            "operation": "request",
+            "payload": [],
+        }));
+        let mut output = Vec::new();
+
+        assert!(binding
+            .accept_wire_handshake(&mut input, &mut output)
+            .is_err());
+        assert_eq!(binding.state(), SessionState::Closed);
+        let response = written_value(output);
+        assert_eq!(response["type"], LIBRARY_REJECT_TYPE);
+        assert_eq!(response["code"], HANDSHAKE_REQUIRED_CODE);
+    }
+
+    #[test]
+    fn wire_handshake_rejects_identity_drift_without_reflecting_expected_identity() {
+        let mut binding = binding();
+        let mut wrong = hello_value();
+        wrong["package"]["version"] = Value::String("9.9.9".into());
+        let mut input = framed(&wrong);
+        let mut output = Vec::new();
+
+        assert!(binding
+            .accept_wire_handshake(&mut input, &mut output)
+            .is_err());
+        assert_eq!(binding.state(), SessionState::Closed);
+        let response = written_value(output);
+        assert_eq!(response["type"], LIBRARY_REJECT_TYPE);
+        assert_eq!(response["code"], HANDSHAKE_REJECTED_CODE);
+        assert_eq!(response["message"], HANDSHAKE_REJECTED_MESSAGE);
+        assert!(!response.to_string().contains("1.0.0"));
+    }
+
+    #[test]
+    fn malformed_wire_handshake_is_rejected_and_closes_session() {
+        let mut binding = binding();
+        let mut input = Cursor::new(vec![0, 0, 0, 4, b'n', b'o', b'p', b'e']);
+        let mut output = Vec::new();
+
+        assert!(binding
+            .accept_wire_handshake(&mut input, &mut output)
+            .is_err());
+        assert_eq!(binding.state(), SessionState::Closed);
+        let response = written_value(output);
+        assert_eq!(response["type"], LIBRARY_REJECT_TYPE);
+        assert_eq!(response["code"], HANDSHAKE_MALFORMED_CODE);
     }
 }
