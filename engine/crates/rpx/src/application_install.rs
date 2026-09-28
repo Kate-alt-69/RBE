@@ -176,9 +176,9 @@ fn resolve_and_materialize(
         bail!("cyclic RBE package dependency under root {root:?} at {package:?}");
     }
 
-    let exact = index
-        .resolve(package, requirement)?
-        .with_context(|| format!("RPX index revision {revision:?} cannot satisfy {package:?} {requirement:?}"))?;
+    let exact = index.resolve(package, requirement)?.with_context(|| {
+        format!("RPX index revision {revision:?} cannot satisfy {package:?} {requirement:?}")
+    })?;
     let release = client.resolve_package(package, Some(&exact))?;
     if release.revision != revision {
         bail!(
@@ -414,9 +414,9 @@ fn inspect_staged_archive(
         .with_context(|| format!("invalid RBE package archive {}", path.display()))?;
 
     let manifest_bytes = {
-        let mut manifest = archive
-            .by_name(ARCHIVE_PACKAGE_MANIFEST)
-            .with_context(|| format!("RBE package archive is missing {ARCHIVE_PACKAGE_MANIFEST}"))?;
+        let mut manifest = archive.by_name(ARCHIVE_PACKAGE_MANIFEST).with_context(|| {
+            format!("RBE package archive is missing {ARCHIVE_PACKAGE_MANIFEST}")
+        })?;
         if manifest.is_dir() || manifest.size() > MAX_PACKAGE_MANIFEST_BYTES {
             bail!("RBE package manifest is not a bounded regular file");
         }
@@ -428,8 +428,8 @@ fn inspect_staged_archive(
             "RBE package manifest hash mismatch for {expected_package}@{expected_version}: expected {expected_manifest_sha256}, observed {observed_manifest_sha256}"
         );
     }
-    let manifest_text = std::str::from_utf8(&manifest_bytes)
-        .context("package.rbe.yaml is not valid UTF-8")?;
+    let manifest_text =
+        std::str::from_utf8(&manifest_bytes).context("package.rbe.yaml is not valid UTF-8")?;
     let manifest: ArchivePackageManifest =
         serde_yaml::from_str(manifest_text).context("invalid package.rbe.yaml")?;
     if manifest.package.name != expected_package || manifest.package.version != expected_version {
@@ -459,7 +459,11 @@ fn inspect_staged_archive(
     Ok(manifest.dependencies.rbe)
 }
 
-fn validate_package_index(bytes: &[u8], expected_package: &str, expected_version: &str) -> Result<()> {
+fn validate_package_index(
+    bytes: &[u8],
+    expected_package: &str,
+    expected_version: &str,
+) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).context("invalid .rbe/package-index.json")?;
     if value.get("format").and_then(serde_json::Value::as_u64) != Some(1) {

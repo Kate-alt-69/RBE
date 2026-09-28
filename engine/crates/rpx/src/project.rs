@@ -542,17 +542,21 @@ mod tests {
             PathBuf::from("/app/.cache/library/index.rbe.json")
         );
         assert_eq!(
-            ProjectPaths::new("/app").artifact_path(&"a".repeat(64)).unwrap(),
-            PathBuf::from(format!("/app/.cache/library/{}/artifact.rbe", "a".repeat(64)))
+            ProjectPaths::new("/app")
+                .artifact_path(&"a".repeat(64))
+                .unwrap(),
+            PathBuf::from(format!(
+                "/app/.cache/library/{}/artifact.rbe",
+                "a".repeat(64)
+            ))
         );
     }
 
     #[test]
     fn private_lock_graphs_are_scoped_per_root() {
-        let manifest = ProjectManifest::parse(
-            r#"{"packages":{"alpha":"1.0.0","beta":"1.0.0"},"scripts":{}}"#,
-        )
-        .unwrap();
+        let manifest =
+            ProjectManifest::parse(r#"{"packages":{"alpha":"1.0.0","beta":"1.0.0"},"scripts":{}}"#)
+                .unwrap();
         let mut lock = ProjectLock::new(&manifest).unwrap();
         let root = |name: &str| LockedPackage {
             requested: "1.0.0".into(),
@@ -574,13 +578,23 @@ mod tests {
             artifact_size: 5,
             dependencies: BTreeMap::new(),
         };
-        lock.private
-            .insert("alpha".into(), BTreeMap::from([("shared".into(), private("1.0.0"))]));
-        lock.private
-            .insert("beta".into(), BTreeMap::from([("shared".into(), private("2.0.0"))]));
+        lock.private.insert(
+            "alpha".into(),
+            BTreeMap::from([("shared".into(), private("1.0.0"))]),
+        );
+        lock.private.insert(
+            "beta".into(),
+            BTreeMap::from([("shared".into(), private("2.0.0"))]),
+        );
         lock.validate().unwrap();
-        assert_eq!(lock.locked_for_root("alpha", "shared").unwrap().version, "1.0.0");
-        assert_eq!(lock.locked_for_root("beta", "shared").unwrap().version, "2.0.0");
+        assert_eq!(
+            lock.locked_for_root("alpha", "shared").unwrap().version,
+            "1.0.0"
+        );
+        assert_eq!(
+            lock.locked_for_root("beta", "shared").unwrap().version,
+            "2.0.0"
+        );
     }
 
     #[test]
