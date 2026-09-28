@@ -674,7 +674,10 @@ fn append_tree(
 }
 
 fn should_skip(relative: &Path) -> bool {
-    if relative == Path::new("package.rbe.toml") {
+    if matches!(
+        relative.to_str(),
+        Some("package.rbe.toml" | "package.rbe.yaml" | "package.rbe.json")
+    ) {
         return true;
     }
     relative.components().next().is_some_and(|part| {
