@@ -194,7 +194,9 @@ impl ProjectLock {
     }
 
     pub fn matches_manifest(&self, manifest: &ProjectManifest) -> Result<bool> {
-        Ok(self.manifest_sha256.eq_ignore_ascii_case(&manifest.sha256()?))
+        Ok(self
+            .manifest_sha256
+            .eq_ignore_ascii_case(&manifest.sha256()?))
     }
 
     pub fn render_pretty(&self) -> Result<Vec<u8>> {
@@ -231,10 +233,14 @@ pub struct LockedPackage {
 impl LockedPackage {
     fn validate(&self, package: &str) -> Result<()> {
         VersionReq::parse(&self.requested).with_context(|| {
-            format!("invalid locked requirement {:?} for {package:?}", self.requested)
+            format!(
+                "invalid locked requirement {:?} for {package:?}",
+                self.requested
+            )
         })?;
-        Version::parse(&self.version)
-            .with_context(|| format!("invalid locked version {:?} for {package:?}", self.version))?;
+        Version::parse(&self.version).with_context(|| {
+            format!("invalid locked version {:?} for {package:?}", self.version)
+        })?;
         if !self.artifact_url.starts_with("https://") {
             bail!("locked artifact URL for {package:?} must use HTTPS");
         }
@@ -304,8 +310,9 @@ impl LocalIndex {
         };
         let mut best: Option<Version> = None;
         for raw in &entry.versions {
-            let version = Version::parse(raw)
-                .with_context(|| format!("index contains invalid version {raw:?} for {package:?}"))?;
+            let version = Version::parse(raw).with_context(|| {
+                format!("index contains invalid version {raw:?} for {package:?}")
+            })?;
             if !version.pre.is_empty() || !requirement.matches(&version) {
                 continue;
             }
@@ -414,11 +421,7 @@ pub fn find_project_root(start: &Path) -> Result<PathBuf> {
 }
 
 fn validate_project_name(value: &str) -> Result<()> {
-    if value.trim().is_empty()
-        || value.len() > 214
-        || value.contains('/')
-        || value.contains('\\')
-    {
+    if value.trim().is_empty() || value.len() > 214 || value.contains('/') || value.contains('\\') {
         bail!("invalid project name {value:?}");
     }
     Ok(())
@@ -443,9 +446,9 @@ fn validate_package_name(value: &str) -> Result<()> {
 fn validate_script(name: &str, command: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 128
-        || !name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.')
-        })
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
     {
         bail!("invalid RPX script name {name:?}");
     }
@@ -484,16 +487,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.packages.len(), 2);
-        assert_eq!(manifest.scripts["test"], "backend check --settings settings.template.json");
+        assert_eq!(
+            manifest.scripts["test"],
+            "backend check --settings settings.template.json"
+        );
         assert_eq!(manifest.packages["advancenet"].version(), Some("^1.4.0"));
     }
 
     #[test]
     fn generated_lock_lives_under_cache_and_tracks_manifest_hash() {
-        let manifest = ProjectManifest::parse(
-            r#"{"packages":{"advancenet":"^1.4.0"},"scripts":{}}"#,
-        )
-        .unwrap();
+        let manifest =
+            ProjectManifest::parse(r#"{"packages":{"advancenet":"^1.4.0"},"scripts":{}}"#).unwrap();
         let lock = ProjectLock::new(&manifest).unwrap();
         assert!(lock.matches_manifest(&manifest).unwrap());
         assert_eq!(

@@ -105,7 +105,12 @@ fn run_project_script(script: &str) -> Result<()> {
         let available = if manifest.scripts.is_empty() {
             "none".to_string()
         } else {
-            manifest.scripts.keys().cloned().collect::<Vec<_>>().join(", ")
+            manifest
+                .scripts
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         format!("script {script:?} is not defined in package.rbe.json (available: {available})")
     })?;
