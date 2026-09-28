@@ -13,6 +13,23 @@ pub struct PinnedManagedTool {
     pub sha256: String,
 }
 
+impl PinnedManagedTool {
+    /// Re-hash this exact managed executable and return its path only when the
+    /// bytes still match the identity captured at admission time.
+    pub fn verify(&self, name: &str) -> Result<&Path, PinnedToolchainError> {
+        let actual = hash_regular_file(&self.path)?;
+        if actual != self.sha256 {
+            return Err(PinnedToolchainError::ToolHashMismatch {
+                tool: name.to_string(),
+                path: self.path.clone(),
+                expected: self.sha256.clone(),
+                actual,
+            });
+        }
+        Ok(&self.path)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedManagedToolchain {
     pub tools: BTreeMap<String, PinnedManagedTool>,
@@ -44,20 +61,17 @@ impl PinnedManagedToolchain {
     /// Re-hash one pinned tool and return its exact path only when the bytes
     /// still match the identity captured at admission time.
     pub fn verify_tool(&self, name: &str) -> Result<&Path, PinnedToolchainError> {
+        self.verified_tool(name)?.verify(name)
+    }
+
+    /// Return one pinned identity only after its bytes have been re-verified.
+    pub fn verified_tool(&self, name: &str) -> Result<&PinnedManagedTool, PinnedToolchainError> {
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| PinnedToolchainError::UnknownTool(name.to_string()))?;
-        let actual = hash_regular_file(&tool.path)?;
-        if actual != tool.sha256 {
-            return Err(PinnedToolchainError::ToolHashMismatch {
-                tool: name.to_string(),
-                path: tool.path.clone(),
-                expected: tool.sha256.clone(),
-                actual,
-            });
-        }
-        Ok(&tool.path)
+        tool.verify(name)?;
+        Ok(tool)
     }
 
     /// Re-verify every pinned tool and reconstruct the path-only execution
@@ -190,6 +204,10 @@ mod tests {
         let pinned = PinnedManagedToolchain::pin(&managed_toolchain(tool.clone())).unwrap();
 
         assert_eq!(pinned.verify_tool("runtime").unwrap(), tool.as_path());
+        assert_eq!(
+            pinned.verified_tool("runtime").unwrap().path,
+            tool.as_path()
+        );
         let verified = pinned.verify_all().unwrap();
         assert_eq!(verified.tools.get("runtime"), Some(&tool));
     }
