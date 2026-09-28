@@ -7,6 +7,7 @@ pub mod compiler_execution;
 pub mod install_plan;
 pub mod project;
 pub mod publisher_client;
+pub mod publisher_commands;
 pub mod registry_client;
 pub mod registry_contract;
 pub mod toolchain;
