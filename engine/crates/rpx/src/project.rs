@@ -211,6 +211,9 @@ impl ProjectLock {
                 package.validate(name)?;
             }
         }
+        for (root, package) in &self.packages {
+            validate_root_private_graph(root, package, self.private.get(root))?;
+        }
         Ok(())
     }
 
@@ -283,6 +286,66 @@ impl LockedPackage {
         }
         Ok(())
     }
+}
+
+fn validate_root_private_graph(
+    root: &str,
+    root_package: &LockedPackage,
+    graph: Option<&BTreeMap<String, LockedPackage>>,
+) -> Result<()> {
+    let empty = BTreeMap::new();
+    let graph = graph.unwrap_or(&empty);
+    let mut visiting = BTreeSet::new();
+    let mut reachable = BTreeSet::new();
+    validate_private_dependencies(
+        root,
+        root_package,
+        graph,
+        &mut visiting,
+        &mut reachable,
+    )?;
+    if reachable.len() != graph.len() {
+        let extra = graph
+            .keys()
+            .find(|name| !reachable.contains(*name))
+            .cloned()
+            .unwrap_or_else(|| "<unknown>".to_string());
+        bail!("private lock graph {root:?} contains unreachable package {extra:?}");
+    }
+    Ok(())
+}
+
+fn validate_private_dependencies(
+    root: &str,
+    package: &LockedPackage,
+    graph: &BTreeMap<String, LockedPackage>,
+    visiting: &mut BTreeSet<String>,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    for (dependency, requirement) in &package.dependencies {
+        let locked = graph.get(dependency).with_context(|| {
+            format!("private lock graph {root:?} is missing dependency {dependency:?}")
+        })?;
+        let requirement = VersionReq::parse(requirement)?;
+        let version = Version::parse(&locked.version)?;
+        if !requirement.matches(&version) {
+            bail!(
+                "private lock graph {root:?} resolves {dependency:?} to {:?}, which does not satisfy {:?}",
+                locked.version,
+                requirement.to_string()
+            );
+        }
+        if reachable.contains(dependency) {
+            continue;
+        }
+        if !visiting.insert(dependency.clone()) {
+            bail!("private lock graph {root:?} contains a cycle at {dependency:?}");
+        }
+        validate_private_dependencies(root, locked, graph, visiting, reachable)?;
+        visiting.remove(dependency);
+        reachable.insert(dependency.clone());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,6 +562,18 @@ fn validate_sha256(field: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn locked(version: &str, dependencies: BTreeMap<String, String>) -> LockedPackage {
+        LockedPackage {
+            requested: "*".into(),
+            version: version.into(),
+            artifact_url: "https://registry.example/package.rbe".into(),
+            artifact_sha256: "a".repeat(64),
+            manifest_sha256: "b".repeat(64),
+            artifact_size: 10,
+            dependencies,
+        }
+    }
+
     #[test]
     fn application_manifest_is_json_not_archive_manifest() {
         let manifest = ProjectManifest::parse(
@@ -592,6 +667,49 @@ mod tests {
             lock.locked_for_root("beta", "shared").unwrap().version,
             "2.0.0"
         );
+    }
+
+    #[test]
+    fn private_lock_graph_rejects_unreachable_entries() {
+        let manifest =
+            ProjectManifest::parse(r#"{"packages":{"alpha":"1.0.0"},"scripts":{}}"#).unwrap();
+        let mut lock = ProjectLock::new(&manifest).unwrap();
+        lock.packages
+            .insert("alpha".into(), locked("1.0.0", BTreeMap::new()));
+        lock.private.insert(
+            "alpha".into(),
+            BTreeMap::from([("unused".into(), locked("1.0.0", BTreeMap::new()))]),
+        );
+        assert!(lock.validate().is_err());
+    }
+
+    #[test]
+    fn diamond_graph_checks_every_constraint_on_shared_dependency() {
+        let manifest =
+            ProjectManifest::parse(r#"{"packages":{"alpha":"1.0.0"},"scripts":{}}"#).unwrap();
+        let mut lock = ProjectLock::new(&manifest).unwrap();
+        lock.packages.insert(
+            "alpha".into(),
+            locked(
+                "1.0.0",
+                BTreeMap::from([("left".into(), "1".into()), ("right".into(), "1".into())]),
+            ),
+        );
+        lock.private.insert(
+            "alpha".into(),
+            BTreeMap::from([
+                (
+                    "left".into(),
+                    locked("1.0.0", BTreeMap::from([("shared".into(), "^1".into())])),
+                ),
+                (
+                    "right".into(),
+                    locked("1.0.0", BTreeMap::from([("shared".into(), "^2".into())])),
+                ),
+                ("shared".into(), locked("1.5.0", BTreeMap::new())),
+            ]),
+        );
+        assert!(lock.validate().is_err());
     }
 
     #[test]
