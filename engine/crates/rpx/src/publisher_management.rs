@@ -163,7 +163,8 @@ fn management_client() -> Result<Client> {
 }
 
 fn validate_status_response(payload: &PackageStatusResponse, expected_package: &str) -> Result<()> {
-    if !payload.ok || payload.revision.trim().is_empty() || payload.package.name != expected_package {
+    if !payload.ok || payload.revision.trim().is_empty() || payload.package.name != expected_package
+    {
         bail!("RPX registry returned inconsistent package status for {expected_package}");
     }
 
