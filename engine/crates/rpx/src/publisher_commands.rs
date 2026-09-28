@@ -121,11 +121,8 @@ pub fn publish_archive(
 
     let prepared = client.prepare_upload(&credential.authorization, version)?;
     client.upload_archive(&prepared, archive)?;
-    let published = client.finalize_publish(
-        &credential.authorization,
-        version,
-        &prepared.upload_id,
-    )?;
+    let published =
+        client.finalize_publish(&credential.authorization, version, &prepared.upload_id)?;
     if published.release.package != package || published.release.version != version {
         bail!(
             "RPX publisher returned a different package identity: expected {package}@{version}, got {}@{}",
@@ -160,7 +157,11 @@ fn require_publish_scope(credential: &ResolvedCredential) -> Result<()> {
     if credential.source == CredentialSource::Environment || credential.scopes.is_empty() {
         return Ok(());
     }
-    if !credential.scopes.iter().any(|scope| scope == "package.publish") {
+    if !credential
+        .scopes
+        .iter()
+        .any(|scope| scope == "package.publish")
+    {
         bail!("stored RPX credential does not grant package.publish; run `rpx login` again");
     }
     Ok(())
