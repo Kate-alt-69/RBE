@@ -68,6 +68,7 @@ mod registry;
 mod snapshot;
 mod target;
 mod verified_worker;
+mod worker_source;
 
 pub use activation::{
     activate_project_target, recover_project_activation, ActivationRuntimeError,
@@ -98,6 +99,10 @@ pub use target::{
     load_named_install_target, merge_named_install_target, InstallTargetError, NamedInstallTarget,
 };
 pub use verified_worker::{read_verified_root_worker_identities, VerifiedPackageWorkerIdentity};
+pub use worker_source::{
+    prepare_verified_worker_source, MaterializedWorkerSource, VerifiedWorkerSourcePlan,
+    WorkerSourceError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallRuntimeError {
