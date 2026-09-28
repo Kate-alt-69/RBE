@@ -277,13 +277,7 @@ mod tests {
 
     #[test]
     fn yank_parser_separates_reason_from_identity() {
-        let args = strings(&[
-            "yank",
-            "advancenet",
-            "1.4.2",
-            "--reason",
-            "broken release",
-        ]);
+        let args = strings(&["yank", "advancenet", "1.4.2", "--reason", "broken release"]);
         assert_eq!(command_index(&args), Some(0));
         assert_eq!(
             publisher_positionals(&args, 0).unwrap(),
