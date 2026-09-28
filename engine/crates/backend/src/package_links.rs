@@ -5,13 +5,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, Context};
-use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex};
+use rbe_install_runtime::{
+    ProjectInstallRecovery, VerifiedRpxRootIndex, VerifiedRpxRootSnapshot,
+};
 use route_engine::relc::{
     PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
 };
 use serde::Deserialize;
 
 const RPX_PACKAGE_INDEX_FORMAT: u32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct LoadedPackageRoots {
+    pub links: PackageLinkContext,
+    pub roots: BTreeMap<String, VerifiedRpxRootSnapshot>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,12 +49,21 @@ struct RpxPackageExport {
 
 /// Build RELC's package namespace from SHA-verified explicit package roots.
 ///
+/// Compatibility wrapper for callers that only need the public RELC namespace.
+/// Backend boot should prefer [`load_with_workers`] so the exact same verified
+/// root snapshot can also seed Library Host worker identity.
+pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
+    Ok(load_with_workers(project_root)?.links)
+}
+
+/// Read one fail-closed package-state snapshot and retain it for both RELC
+/// linking and Library Host execution.
+///
 /// `read_verified_rpx_root_snapshots` joins each public RPX export index with
 /// the independently verified worker identity for the same active package
-/// graph. This boundary then maps only public `exports` into RELC;
-/// `private_dependencies` is parsed only to validate index shape and never
-/// creates a namespace.
-pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
+/// graph. Keeping those snapshots beside the derived public link context avoids
+/// rebuilding worker identity from a later package-state read.
+pub fn load_with_workers(project_root: &Path) -> anyhow::Result<LoadedPackageRoots> {
     let recovery = rbe_install_runtime::recover_project_activation(project_root)
         .context("recover interrupted project package activation before package linking")?;
     if recovery != ProjectInstallRecovery::Clean {
@@ -58,16 +75,30 @@ pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
 
     let snapshots = rbe_install_runtime::read_verified_rpx_root_snapshots(project_root)
         .context("load verified RPX package root snapshots")?;
+    from_verified_snapshots(snapshots)
+}
+
+fn from_verified_snapshots(
+    snapshots: Vec<VerifiedRpxRootSnapshot>,
+) -> anyhow::Result<LoadedPackageRoots> {
     let indexes = snapshots
-        .into_iter()
+        .iter()
         .map(|snapshot| VerifiedRpxRootIndex {
-            package: snapshot.package,
-            version: snapshot.version,
-            artifact_sha256: snapshot.artifact_sha256,
-            index_json: snapshot.index_json,
+            package: snapshot.package.clone(),
+            version: snapshot.version.clone(),
+            artifact_sha256: snapshot.artifact_sha256.clone(),
+            index_json: snapshot.index_json.clone(),
         })
         .collect();
-    from_verified_indexes(indexes)
+    let links = from_verified_indexes(indexes)?;
+    let mut roots = BTreeMap::new();
+    for snapshot in snapshots {
+        let package = snapshot.package.clone();
+        if roots.insert(package.clone(), snapshot).is_some() {
+            bail!("duplicate verified RPX root package {package:?}");
+        }
+    }
+    Ok(LoadedPackageRoots { links, roots })
 }
 
 fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<PackageLinkContext> {
@@ -187,6 +218,8 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
 
 #[cfg(test)]
 mod tests {
+    use rbe_install_runtime::VerifiedPackageWorkerIdentity;
+
     use super::*;
 
     fn verified(index_json: &str) -> VerifiedRpxRootIndex {
@@ -195,6 +228,29 @@ mod tests {
             version: "2.0.0".into(),
             artifact_sha256: "a".repeat(64),
             index_json: index_json.into(),
+        }
+    }
+
+    fn snapshot(index_json: &str) -> VerifiedRpxRootSnapshot {
+        VerifiedRpxRootSnapshot {
+            package: "advancenet".into(),
+            version: "2.0.0".into(),
+            artifact_sha256: "a".repeat(64),
+            index_json: index_json.into(),
+            worker: VerifiedPackageWorkerIdentity {
+                package: "advancenet".into(),
+                version: "2.0.0".into(),
+                artifact_sha256: "a".repeat(64),
+                rbe_abi_min: 1,
+                rbe_abi_max: 1,
+                sdk_language: "bun".into(),
+                sdk_name: "@rbe/sdk".into(),
+                sdk_version: "0.1.9".into(),
+                runtime_kind: "bun".into(),
+                runtime_version: "1.3.7".into(),
+                runtime_entry: "src/index.js".into(),
+                runtime_managed: true,
+            },
         }
     }
 
@@ -224,6 +280,20 @@ mod tests {
         assert_eq!(request.entry, "components/request/request.ts");
         assert_eq!(request.language, "typescript");
         assert!(links.root("secret-parser").is_none());
+    }
+
+    #[test]
+    fn verified_snapshot_is_retained_beside_relc_links() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","source":"components/request/request.ts","language":"typescript"}]"#,
+        );
+        let loaded = from_verified_snapshots(vec![snapshot(&input)]).unwrap();
+        assert_eq!(loaded.links.roots.len(), 1);
+        let retained = loaded.roots.get("advancenet").unwrap();
+        assert_eq!(retained.worker.runtime_kind, "bun");
+        assert_eq!(retained.worker.runtime_version, "1.3.7");
+        assert_eq!(retained.artifact_sha256, "a".repeat(64));
     }
 
     #[test]
