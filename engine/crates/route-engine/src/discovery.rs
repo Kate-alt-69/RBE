@@ -445,6 +445,83 @@ fn singleton_header_string(
         .map_err(|_| format!("header {label:?} contains non-text bytes"))
 }
 
+fn content_length_value(headers: &HeaderMap) -> Result<Value, String> {
+    let Some(raw) = singleton_header_string(headers, header::CONTENT_LENGTH)? else {
+        return Ok(Value::Null);
+    };
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Content-Length must contain ASCII decimal digits only".into());
+    }
+    let parsed = raw.parse::<u64>().map_err(|_| {
+        "Content-Length is outside the supported unsigned integer range".to_string()
+    })?;
+    if parsed > MAX_EXACT_JSON_INTEGER as u64 {
+        return Err(format!(
+            "Content-Length {parsed} cannot be represented exactly by REL; maximum exact value is {MAX_EXACT_JSON_INTEGER}"
+        ));
+    }
+    Ok(Value::Number(parsed as f64))
+}
+
+#[cfg(test)]
+mod request_content_length_tests {
+    use super::*;
+
+    #[test]
+    fn content_length_preserves_exact_decimal_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("42"));
+        assert!(matches!(
+            content_length_value(&headers).unwrap(),
+            Value::Number(value) if value == 42.0
+        ));
+    }
+
+    #[test]
+    fn content_length_rejects_duplicate_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::CONTENT_LENGTH, HeaderValue::from_static("42"));
+        headers.append(header::CONTENT_LENGTH, HeaderValue::from_static("42"));
+        let error = content_length_value(&headers).unwrap_err();
+        assert!(error.contains("duplicate header"), "{error}");
+    }
+
+    #[test]
+    fn content_length_rejects_non_decimal_syntax() {
+        for raw in ["", "+1", "1.0", "1, 1", " 1"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(raw).expect("test header should be representable"),
+            );
+            let error = content_length_value(&headers).unwrap_err();
+            assert!(error.contains("ASCII decimal digits"), "{raw:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn content_length_rejects_lossy_rel_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_static("9007199254740992"),
+        );
+        let error = content_length_value(&headers).unwrap_err();
+        assert!(
+            error.contains("cannot be represented exactly by REL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn missing_content_length_is_null() {
+        assert!(matches!(
+            content_length_value(&HeaderMap::new()).unwrap(),
+            Value::Null
+        ));
+    }
+}
+
 fn comma_header_values(
     headers: &HeaderMap,
     name: header::HeaderName,
@@ -1075,10 +1152,8 @@ async fn request_value(
     let user_agent = header_string(&parts.headers, header::USER_AGENT)
         .map(Value::String)
         .unwrap_or(Value::Null);
-    let content_length = header_string(&parts.headers, header::CONTENT_LENGTH)
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|value| Value::Number(value as f64))
-        .unwrap_or(Value::Null);
+    let content_length = content_length_value(&parts.headers)
+        .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?;
     let headers = headers_value(&parts.headers)
         .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?;
     let cookies = cookies_value(&parts.headers)
