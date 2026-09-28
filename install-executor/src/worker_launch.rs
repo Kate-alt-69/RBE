@@ -113,7 +113,9 @@ fn validate_source_paths(source_root: &Path, entrypoint: &Path) -> Result<(), Wo
     ensure_no_symlink_components(entrypoint)?;
     let entry_metadata = std::fs::symlink_metadata(entrypoint)?;
     if entry_metadata.file_type().is_symlink() || !entry_metadata.is_file() {
-        return Err(WorkerLaunchError::UnsafeEntrypoint(entrypoint.to_path_buf()));
+        return Err(WorkerLaunchError::UnsafeEntrypoint(
+            entrypoint.to_path_buf(),
+        ));
     }
     Ok(())
 }
@@ -388,11 +390,8 @@ mod tests {
         let temp = TestDir::new();
         let runtime = temp.path().join("bun");
         std::fs::write(&runtime, b"managed-bun").unwrap();
-        let toolchain = ManagedToolchain::new(BTreeMap::from([(
-            "bun".to_string(),
-            runtime,
-        )]))
-        .unwrap();
+        let toolchain =
+            ManagedToolchain::new(BTreeMap::from([("bun".to_string(), runtime)])).unwrap();
         let pinned = PinnedManagedToolchain::pin(&toolchain).unwrap();
 
         let root = temp.path().join("worker");
@@ -411,14 +410,8 @@ mod tests {
     #[test]
     fn managed_worker_plan_is_fail_closed() {
         let (_temp, root, entrypoint, pinned, files) = fixture();
-        let plan = WorkerLaunchPlan::managed_interpreter(
-            "bun",
-            &pinned,
-            &root,
-            &entrypoint,
-            files,
-        )
-        .unwrap();
+        let plan = WorkerLaunchPlan::managed_interpreter("bun", &pinned, &root, &entrypoint, files)
+            .unwrap();
         let invocation = plan.verify_before_spawn().unwrap();
         assert_eq!(invocation.args, vec![entrypoint.into_os_string()]);
         assert_eq!(invocation.working_directory, root);
@@ -431,15 +424,13 @@ mod tests {
     #[test]
     fn source_mutation_after_planning_is_rejected() {
         let (_temp, root, entrypoint, pinned, files) = fixture();
-        let plan = WorkerLaunchPlan::managed_interpreter(
-            "bun",
-            &pinned,
-            &root,
-            &entrypoint,
-            files,
+        let plan = WorkerLaunchPlan::managed_interpreter("bun", &pinned, &root, &entrypoint, files)
+            .unwrap();
+        std::fs::write(
+            root.join("internal/helper.js"),
+            b"export const pwned = true;",
         )
         .unwrap();
-        std::fs::write(root.join("internal/helper.js"), b"export const pwned = true;").unwrap();
         assert!(matches!(
             plan.verify_before_spawn(),
             Err(WorkerLaunchError::SourceFileSizeMismatch { .. })
@@ -450,14 +441,8 @@ mod tests {
     #[test]
     fn unexpected_source_file_after_planning_is_rejected() {
         let (_temp, root, entrypoint, pinned, files) = fixture();
-        let plan = WorkerLaunchPlan::managed_interpreter(
-            "bun",
-            &pinned,
-            &root,
-            &entrypoint,
-            files,
-        )
-        .unwrap();
+        let plan = WorkerLaunchPlan::managed_interpreter("bun", &pinned, &root, &entrypoint, files)
+            .unwrap();
         std::fs::write(root.join("injected.js"), b"pwned").unwrap();
         assert!(matches!(
             plan.verify_before_spawn(),
@@ -468,14 +453,8 @@ mod tests {
     #[test]
     fn managed_runtime_replacement_after_planning_is_rejected() {
         let (temp, root, entrypoint, pinned, files) = fixture();
-        let plan = WorkerLaunchPlan::managed_interpreter(
-            "bun",
-            &pinned,
-            &root,
-            &entrypoint,
-            files,
-        )
-        .unwrap();
+        let plan = WorkerLaunchPlan::managed_interpreter("bun", &pinned, &root, &entrypoint, files)
+            .unwrap();
         std::fs::write(temp.path().join("bun"), b"replaced-bun").unwrap();
         assert!(matches!(
             plan.verify_before_spawn(),
