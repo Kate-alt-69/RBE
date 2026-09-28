@@ -1,150 +1,143 @@
 use anyhow::{bail, Context, Result};
-use rpx::application_install::install_application;
-use rpx::compile_plan::{CompilerPlan, ResolvedCompilerPlan};
-use rpx::compiler_execution::{
-    bun_build, node_check, python_compile, rust_check, typescript_check, CompilerInvocation,
-    CompilerProgram,
-};
-use rpx::project::{find_project_root, ProjectManifest};
-use rpx::registry_client::RegistryClient;
-use rpx::toolchain::{verify_managed_program, CompilerResolver};
-use sdk_package::{
-    check_package, check_target, CheckedComponent, CheckedPackage, JsRuntime, PackageLanguage,
-};
-use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Output};
-use zip::write::SimpleFileOptions;
+use rpx::publisher_commands;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+mod legacy_cli {
+    include!("legacy_main.rs");
+
+    pub fn dispatch() -> ExitCode {
+        main()
+    }
+
+    pub fn build_package_for_publish(
+        target: PathBuf,
+        allow_host_toolchain: bool,
+    ) -> Result<(PathBuf, String, String)> {
+        let package = check_package(&target)?;
+        let name = package.manifest.package.name.clone();
+        let version = package.manifest.package.version.clone();
+        let root = package.root.clone();
+        compile_package(target, allow_host_toolchain)?;
+        let archive = root
+            .join("dist")
+            .join(format!("{name}-{version}.rbe.zip"));
+        if !archive.is_file() {
+            bail!("RPX package build completed without expected artifact {}", archive.display());
+        }
+        Ok((archive, name, version))
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Some(code)) => code,
+        Ok(None) => legacy_cli::dispatch(),
         Err(error) => {
-            render_error(&error);
+            eprintln!("ERROR : RPX publisher issue!\n\n{error:#}\n");
+            eprintln!("HINT : use `rpx login` before publishing, and configure the registry with --registry or RPX_REGISTRY_URL.");
             ExitCode::from(1)
         }
     }
 }
 
-fn run() -> Result<()> {
-    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
-        print_help();
-        return Ok(());
+fn run() -> Result<Option<ExitCode>> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let Some(command_index) = command_index(&args) else {
+        return Ok(None);
+    };
+    let command = args[command_index].as_str();
+    if !matches!(command, "login" | "whoami" | "logout" | "publish") {
+        return Ok(None);
     }
 
-    let allow_host_toolchain = take_flag(&mut args, "--allow-host-toolchain");
-    let registry_override = take_option(&mut args, "--registry")?;
-    if args.is_empty() {
-        bail!("RPX command is missing");
-    }
-    let command = args.remove(0);
-    match command.as_str() {
-        "check" => {
-            let target = target_from(&args, 0)?;
-            let package = check_target(target)?;
-            print_check(&package);
-        }
-        "compile" => {
-            if args.first().is_some_and(|value| value == "package") {
-                let target = target_from(&args, 1)?;
-                compile_package(target, allow_host_toolchain)?;
-            } else {
-                let target = target_from(&args, 0)?;
-                compile(target, allow_host_toolchain)?;
+    let registry = option_value(&args, "--registry")?;
+    let allow_host_toolchain = args.iter().any(|arg| arg == "--allow-host-toolchain");
+    let positional = publisher_positionals(&args, command_index)?;
+
+    match command {
+        "login" => {
+            if !positional.is_empty() {
+                bail!("usage: rpx login [--registry <url>]");
             }
+            publisher_commands::login(registry.as_deref())?;
         }
-        "compile.package" | "package" => {
-            let target = target_from(&args, 0)?;
-            compile_package(target, allow_host_toolchain)?;
-        }
-        "info" => {
-            let target = target_from(&args, 0)?;
-            let package = check_target(target)?;
-            println!("{}", serde_json::to_string_pretty(&package.index())?);
-        }
-        "index" => run_index_command(&args, registry_override.as_deref())?,
-        "install" => {
-            if args.len() > 1 {
-                bail!("usage: rpx install [project-path] [--registry <url>]");
+        "whoami" => {
+            if !positional.is_empty() {
+                bail!("usage: rpx whoami [--registry <url>]");
             }
-            let start = target_from(&args, 0)?;
-            let report = install_application(start, registry_override.as_deref())?;
-            println!("RPX INSTALL OK");
-            println!("  project: {}", report.project_root.display());
-            println!("  roots: {}", report.roots);
-            println!("  private packages: {}", report.private_packages);
-            println!(
-                "  index revision: {}",
-                report.index_revision.as_deref().unwrap_or("locked/offline")
-            );
-            println!(
-                "  mode: {}",
-                if report.reused_lock {
-                    "verified lock rehydration"
-                } else {
-                    "fresh frozen-index resolution"
-                }
-            );
-            println!("  lock: {}", report.lock_path.display());
+            publisher_commands::whoami(registry.as_deref())?;
         }
-        "run" => {
-            let script = args
+        "logout" => {
+            if !positional.is_empty() {
+                bail!("usage: rpx logout [--registry <url>]");
+            }
+            publisher_commands::logout(registry.as_deref())?;
+        }
+        "publish" => {
+            if positional.len() > 1 {
+                bail!("usage: rpx publish [path] [--registry <url>] [--allow-host-toolchain]");
+            }
+            let target = positional
                 .first()
-                .context("rpx run requires a script name from package.rbe.json")?;
-            if args.len() != 1 {
-                bail!("rpx run currently accepts exactly one script name");
-            }
-            run_project_script(script)?;
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_dir()?);
+            let (archive, package, version) =
+                legacy_cli::build_package_for_publish(target, allow_host_toolchain)
+                    .context("failed to build package for publication")?;
+            publisher_commands::publish_archive(
+                registry.as_deref(),
+                &package,
+                &version,
+                &archive,
+            )?;
         }
-        unknown => bail!("unknown RPX command {unknown:?}"),
+        _ => unreachable!(),
     }
-    Ok(())
+    Ok(Some(ExitCode::SUCCESS))
 }
 
-fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
-    let mut found = false;
-    args.retain(|value| {
-        if value == flag {
-            found = true;
-            false
-        } else {
-            true
+fn command_index(args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--registry" {
+            index = index.saturating_add(2);
+            continue;
         }
-    });
-    found
+        if arg.starts_with("--registry=") || arg == "--allow-host-toolchain" {
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
 }
 
-fn take_option(args: &mut Vec<String>, option: &str) -> Result<Option<String>> {
+fn option_value(args: &[String], option: &str) -> Result<Option<String>> {
     let prefix = format!("{option}=");
     let mut value = None;
     let mut index = 0;
     while index < args.len() {
         if let Some(inline) = args[index].strip_prefix(&prefix) {
-            if value.is_some() {
-                bail!("{option} may only be supplied once");
-            }
             if inline.is_empty() {
                 bail!("{option} requires a value");
             }
-            value = Some(inline.to_string());
-            args.remove(index);
+            if value.replace(inline.to_owned()).is_some() {
+                bail!("{option} may only be supplied once");
+            }
+            index += 1;
             continue;
         }
         if args[index] == option {
-            if value.is_some() {
+            let candidate = args
+                .get(index + 1)
+                .filter(|candidate| !candidate.starts_with('-'))
+                .with_context(|| format!("{option} requires a value"))?;
+            if value.replace(candidate.clone()).is_some() {
                 bail!("{option} may only be supplied once");
             }
-            if index + 1 >= args.len() {
-                bail!("{option} requires a value");
-            }
-            let candidate = args.remove(index + 1);
-            args.remove(index);
-            if candidate.is_empty() || candidate.starts_with("--") {
-                bail!("{option} requires a value");
-            }
-            value = Some(candidate);
+            index += 2;
             continue;
         }
         index += 1;
@@ -152,608 +145,27 @@ fn take_option(args: &mut Vec<String>, option: &str) -> Result<Option<String>> {
     Ok(value)
 }
 
-fn target_from(args: &[String], index: usize) -> Result<PathBuf> {
-    if let Some(value) = args.get(index) {
-        if value.starts_with('-') {
-            bail!("expected a package path, found option {value:?}");
-        }
-        Ok(PathBuf::from(value))
-    } else {
-        Ok(std::env::current_dir()?)
-    }
-}
-
-fn run_index_command(args: &[String], registry_override: Option<&str>) -> Result<()> {
-    let subcommand = args
-        .first()
-        .context("rpx index requires a subcommand; use `rpx index update`")?;
-    match subcommand.as_str() {
-        "update" => {
-            if args.len() > 2 {
-                bail!("usage: rpx index update [project-path] [--registry <url>]");
+fn publisher_positionals(args: &[String], command_index: usize) -> Result<Vec<String>> {
+    let mut output = Vec::new();
+    let mut index = command_index + 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--registry" {
+            if args.get(index + 1).is_none() {
+                bail!("--registry requires a value");
             }
-            let start = match args.get(1) {
-                Some(path) => PathBuf::from(path),
-                None => std::env::current_dir()?,
-            };
-            let project_root = find_project_root(&start)?;
-            let client = RegistryClient::from_override_or_env(registry_override)?;
-            let response = client.fetch_index_list()?;
-            let revision = response.revision.clone();
-            let listed = response.packages.len();
-            let stable = response
-                .packages
-                .iter()
-                .filter(|package| package.latest_stable.is_some())
-                .count();
-            let path = response.persist_local_cache(&project_root)?;
-            println!("RPX INDEX UPDATED");
-            println!("  registry: {}", client.base_url());
-            println!("  revision: {revision}");
-            println!("  packages listed: {listed}");
-            println!("  installable stable packages: {stable}");
-            println!("  cache: {}", path.display());
-        }
-        unknown => bail!("unknown rpx index subcommand {unknown:?}; expected `update`"),
-    }
-    Ok(())
-}
-
-fn run_project_script(script: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let project_root = find_project_root(&cwd)?;
-    let manifest = ProjectManifest::load(&project_root)?;
-    let script_command = manifest.scripts.get(script).with_context(|| {
-        let available = if manifest.scripts.is_empty() {
-            "none".to_string()
-        } else {
-            manifest
-                .scripts
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        format!("script {script:?} is not defined in package.rbe.json (available: {available})")
-    })?;
-
-    println!("RPX RUN");
-    println!("  project: {}", project_root.display());
-    println!("  script: {script}");
-    println!("  command: {script_command}");
-
-    let mut command = if cfg!(windows) {
-        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-        let mut command = Command::new(shell);
-        command.args(["/D", "/S", "/C"]).arg(script_command);
-        command
-    } else {
-        let mut command = Command::new("/bin/sh");
-        command.arg("-c").arg(script_command);
-        command
-    };
-
-    command
-        .current_dir(&project_root)
-        .env("RPX_PROJECT_ROOT", &project_root)
-        .env("RPX_SCRIPT_NAME", script);
-
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            let mut paths = vec![directory.to_path_buf()];
-            if let Some(existing) = std::env::var_os("PATH") {
-                paths.extend(std::env::split_paths(&existing));
-            }
-            if let Ok(path) = std::env::join_paths(paths) {
-                command.env("PATH", path);
-            }
-        }
-    }
-
-    let status = command
-        .status()
-        .with_context(|| format!("failed to execute RPX script {script:?}"))?;
-    if !status.success() {
-        bail!("RPX script {script:?} exited with {status}");
-    }
-    Ok(())
-}
-
-fn compile(target: PathBuf, allow_host_toolchain: bool) -> Result<()> {
-    let package = check_target(&target)?;
-    compile_sources(&package, allow_host_toolchain)?;
-
-    let cache = package.root.join(".cache").join("rbe").join("build");
-    fs::create_dir_all(&cache)?;
-
-    let component_target = package.components.len() == 1 && is_component_target(&package, &target);
-    let index_name = if component_target {
-        format!("component-{}.json", package.components[0].name)
-    } else {
-        "package-index.json".to_string()
-    };
-    let index_path = cache.join(index_name);
-    fs::write(&index_path, serde_json::to_vec_pretty(&package.index())?)?;
-
-    print_check(&package);
-    println!("\nCOMPILE OK");
-    println!("  index: {}", index_path.display());
-    if component_target {
-        println!("  scope: component/{}", package.components[0].name);
-    } else {
-        println!("  scope: complete package");
-    }
-    println!("  compiler checks: passed");
-    Ok(())
-}
-
-fn compile_package(target: PathBuf, allow_host_toolchain: bool) -> Result<()> {
-    let package = check_package(&target)?;
-    compile_sources(&package, allow_host_toolchain)?;
-
-    let dist = package.root.join("dist");
-    fs::create_dir_all(&dist)?;
-    let archive_path = dist.join(format!(
-        "{}-{}.rbe.zip",
-        package.manifest.package.name, package.manifest.package.version
-    ));
-
-    let file = fs::File::create(&archive_path)?;
-    let mut archive = zip::ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    append_tree(&mut archive, &package.root, &package.root, options)?;
-    archive.start_file("package.rbe.yaml", options)?;
-    archive.write_all(serde_yaml::to_string(&package.manifest)?.as_bytes())?;
-    archive.start_file(".rbe/package-index.json", options)?;
-    archive.write_all(&serde_json::to_vec_pretty(&package.index())?)?;
-    archive.finish()?;
-
-    print_check(&package);
-    println!("\nPACKAGE OK");
-    println!("  artifact: {}", archive_path.display());
-    println!("  archive manifest: package.rbe.yaml");
-    println!("  scope: complete package");
-    println!("  compiler checks: passed");
-    println!("  transitive RBE dependencies: package-private graph");
-    Ok(())
-}
-
-fn compile_sources(package: &CheckedPackage, allow_host_toolchain: bool) -> Result<()> {
-    let build_root = package.root.join(".cache").join("rbe").join("compile");
-    fs::create_dir_all(&build_root)?;
-
-    let resolver = CompilerResolver::from_project(&package.root, allow_host_toolchain)
-        .context("failed to resolve RPX compiler toolchain")?;
-    println!(
-        "  compiler authority: {}",
-        if resolver.is_managed() {
-            "RBE-managed"
-        } else {
-            "explicit host authoring"
-        }
-    );
-
-    for component in &package.components {
-        println!(
-            "  compiler: {} ({})",
-            component.name,
-            language_name(component.language)
-        );
-        let plan =
-            CompilerPlan::for_component(component.language, package.manifest.package.runtime)
-                .with_context(|| {
-                    format!("could not plan compiler for component {:?}", component.name)
-                })?
-                .resolve(&resolver)
-                .with_context(|| {
-                    format!(
-                        "could not resolve compiler tools for component {:?}",
-                        component.name
-                    )
-                })?;
-
-        match component.language {
-            PackageLanguage::Rust => compile_rust(package, component, &build_root, &plan)?,
-            PackageLanguage::Javascript => {
-                compile_javascript(package, component, &build_root, &plan)?
-            }
-            PackageLanguage::Typescript => {
-                compile_typescript(package, component, &build_root, &plan)?
-            }
-            PackageLanguage::Python => compile_python(component, &build_root, &plan)?,
-            PackageLanguage::Global => {
-                bail!(
-                    "component {:?} resolved to global instead of a concrete SDK language",
-                    component.name
-                )
-            }
-        }
-    }
-    Ok(())
-}
-
-fn compile_rust(
-    package: &CheckedPackage,
-    component: &CheckedComponent,
-    build_root: &Path,
-    plan: &ResolvedCompilerPlan,
-) -> Result<()> {
-    let sdk = package.root.join(".rbe").join("sdk").join("rust");
-    require_sdk_binding(&sdk, "rust")?;
-
-    let work = build_root.join("rust").join(&component.name);
-    let src = work.join("src");
-    recreate_dir(&work)?;
-    fs::create_dir_all(&src)?;
-    let component_dir = component
-        .source
-        .parent()
-        .context("Rust component source has no parent directory")?;
-    copy_source_tree(component_dir, &src)?;
-    fs::copy(&component.source, src.join("lib.rs"))?;
-
-    let crate_name = format!("rbe_component_check_{}", component.name.replace('-', "_"));
-    let sdk_path = toml_path(&sdk.canonicalize()?);
-    let manifest = format!(
-        "[package]\nname = \"{crate_name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[dependencies]\nrbe-sdk = {{ path = \"{sdk_path}\" }}\n"
-    );
-    fs::write(work.join("Cargo.toml"), manifest)?;
-
-    let manifest_path = work.join("Cargo.toml");
-    let invocation = rust_check(plan, &manifest_path)?;
-    execute_invocation(invocation, component)?;
-    Ok(())
-}
-
-fn compile_javascript(
-    package: &CheckedPackage,
-    component: &CheckedComponent,
-    build_root: &Path,
-    plan: &ResolvedCompilerPlan,
-) -> Result<()> {
-    match package.manifest.package.runtime {
-        Some(JsRuntime::Node) => {
-            let out = build_root.join("javascript").join(&component.name);
-            recreate_dir(&out)?;
-            let staged = out.join(format!("{}.mjs", component.name));
-            fs::copy(&component.source, &staged)?;
-            execute_invocation(node_check(plan, &staged)?, component)?;
-        }
-        Some(JsRuntime::Bun) => {
-            let out = build_root.join("javascript").join(&component.name);
-            recreate_dir(&out)?;
-            execute_invocation(bun_build(plan, &component.source, &out)?, component)?;
-        }
-        None => bail!(
-            "JavaScript component {:?} has no Node/Bun runtime in the package authoring manifest",
-            component.name
-        ),
-    }
-    Ok(())
-}
-
-fn compile_typescript(
-    package: &CheckedPackage,
-    component: &CheckedComponent,
-    build_root: &Path,
-    plan: &ResolvedCompilerPlan,
-) -> Result<()> {
-    let sdk = package.root.join(".rbe").join("sdk").join("typescript");
-    require_sdk_binding(&sdk, "typescript")?;
-
-    let work = build_root.join("typescript").join(&component.name);
-    recreate_dir(&work)?;
-    let source = slash_path(&component.source.canonicalize()?);
-    let sdk_types = slash_path(&sdk.canonicalize()?.join("index.d.ts"));
-    let config = serde_json::json!({
-        "compilerOptions": {
-            "noEmit": true,
-            "target": "ES2022",
-            "module": "ESNext",
-            "moduleResolution": "Bundler",
-            "strict": true,
-            "skipLibCheck": true,
-            "baseUrl": slash_path(&package.root.canonicalize()?),
-            "paths": {
-                "@rbe/sdk": [sdk_types]
-            }
-        },
-        "files": [source]
-    });
-    let config_path = work.join("tsconfig.rbe.json");
-    fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
-
-    execute_invocation(typescript_check(plan, &config_path)?, component)?;
-    Ok(())
-}
-
-fn compile_python(
-    component: &CheckedComponent,
-    build_root: &Path,
-    plan: &ResolvedCompilerPlan,
-) -> Result<()> {
-    let pycache = build_root.join("python").join("pycache");
-    fs::create_dir_all(&pycache)?;
-    execute_invocation(
-        python_compile(plan, &component.source, &pycache)?,
-        component,
-    )?;
-    Ok(())
-}
-
-fn execute_invocation(invocation: CompilerInvocation, component: &CheckedComponent) -> Result<()> {
-    if invocation.network_allowed {
-        bail!("RPX refused compiler invocation with network authority");
-    }
-    if invocation.use_shell {
-        bail!("RPX refused compiler invocation with shell authority");
-    }
-
-    let (mut command, program_name) = match &invocation.program {
-        CompilerProgram::Managed { path, sha256 } => {
-            verify_managed_program(path, sha256).with_context(|| {
-                format!(
-                    "refused RBE-managed compiler {:?} because its pinned identity no longer matches",
-                    invocation.tool
-                )
-            })?;
-            (Command::new(path), path.to_string_lossy().into_owned())
-        }
-        CompilerProgram::HostAuthoring(name) => (Command::new(name), name.clone()),
-    };
-
-    for input in &invocation.managed_inputs {
-        verify_managed_program(&input.path, &input.sha256).with_context(|| {
-            format!(
-                "refused RBE-managed compiler input {:?} because its pinned identity no longer matches",
-                input.tool
-            )
-        })?;
-    }
-
-    command
-        .current_dir(&invocation.working_directory)
-        .args(&invocation.args);
-    if invocation.clear_environment {
-        command.env_clear();
-        if cfg!(windows) {
-            for key in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"] {
-                if let Some(value) = std::env::var_os(key) {
-                    command.env(key, value);
-                }
-            }
-        } else if let Some(value) = std::env::var_os("TMPDIR") {
-            command.env("TMPDIR", value);
-        }
-    }
-    command.envs(&invocation.environment);
-
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "compiler not found for component {:?}: resolved tool `{}` could not be launched",
-                component.name,
-                program_name
-            )
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to launch {program_name}"))
-        }
-    };
-    ensure_success(&program_name, component, output)
-}
-
-fn ensure_success(program: &str, component: &CheckedComponent, output: Output) -> Result<()> {
-    if output.status.success() {
-        return Ok(());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    bail!(
-        "{} compiler rejected component {:?} at {}\n{}{}",
-        program,
-        component.name,
-        component.source.display(),
-        if stdout.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\nstdout:\n{}", stdout.trim())
-        },
-        if stderr.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\nstderr:\n{}", stderr.trim())
-        }
-    )
-}
-
-fn require_sdk_binding(path: &Path, language: &str) -> Result<()> {
-    if path.is_dir() {
-        Ok(())
-    } else {
-        bail!(
-            "RBE {language} SDK binding is not installed at {}\nHINT: re-run the project-local RBE SDK installer with -Language {language} (or global).",
-            path.display()
-        )
-    }
-}
-
-fn recreate_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        fs::remove_dir_all(path)?;
-    }
-    fs::create_dir_all(path)?;
-    Ok(())
-}
-
-fn copy_source_tree(source: &Path, destination: &Path) -> Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let target = destination.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_source_tree(&entry.path(), &target)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), target)?;
-        }
-    }
-    Ok(())
-}
-
-fn toml_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "\\\\")
-}
-
-fn slash_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-fn is_component_target(package: &CheckedPackage, target: &Path) -> bool {
-    let target = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(target),
-            Err(_) => return false,
-        }
-    };
-    let Ok(target) = target.canonicalize() else {
-        return false;
-    };
-    let component_root = package.root.join(&package.manifest.components.root);
-    let Ok(component_root) = component_root.canonicalize() else {
-        return false;
-    };
-    target
-        .strip_prefix(component_root)
-        .ok()
-        .and_then(|relative| relative.components().next())
-        .is_some()
-}
-
-fn append_tree(
-    archive: &mut zip::ZipWriter<fs::File>,
-    root: &Path,
-    directory: &Path,
-    options: SimpleFileOptions,
-) -> Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        if should_skip(relative) {
+            index += 2;
             continue;
         }
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            append_tree(archive, root, &path, options)?;
+        if arg.starts_with("--registry=") || arg == "--allow-host-toolchain" {
+            index += 1;
             continue;
         }
-        if !file_type.is_file() {
-            continue;
+        if arg.starts_with('-') {
+            bail!("unsupported publisher option {arg:?}");
         }
-        let name = relative
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        archive.start_file(name, options)?;
-        let mut input = fs::File::open(&path)?;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let read = input.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            archive.write_all(&buffer[..read])?;
-        }
+        output.push(arg.clone());
+        index += 1;
     }
-    Ok(())
-}
-
-fn should_skip(relative: &Path) -> bool {
-    if matches!(
-        relative.to_str(),
-        Some("package.rbe.toml" | "package.rbe.yaml" | "package.rbe.json")
-    ) {
-        return true;
-    }
-    relative.components().next().is_some_and(|part| {
-        matches!(
-            part.as_os_str().to_string_lossy().as_ref(),
-            ".git" | ".cache" | ".rbe" | "target" | "dist"
-        )
-    })
-}
-
-fn print_check(package: &CheckedPackage) {
-    println!("RBE PACKAGE CHECK");
-    println!(
-        "  package: {}@{}",
-        package.manifest.package.name, package.manifest.package.version
-    );
-    println!("  manifest: {}", package.manifest_path.display());
-    println!(
-        "  language: {}",
-        language_name(package.manifest.package.language)
-    );
-    println!("  components checked: {}", package.components.len());
-    for component in &package.components {
-        println!("    ✓ {} -> {}", component.name, component.source.display());
-    }
-    if package.manifest.dependencies.rbe.is_empty() {
-        println!("  RBE dependencies: none");
-    } else {
-        println!("  RBE dependencies (package-private):");
-        for (name, version) in &package.manifest.dependencies.rbe {
-            println!("    ✓ {name} {version}");
-        }
-    }
-    println!("  export surface: components/* only");
-}
-
-fn language_name(language: PackageLanguage) -> &'static str {
-    match language {
-        PackageLanguage::Rust => "rust",
-        PackageLanguage::Javascript => "javascript",
-        PackageLanguage::Typescript => "typescript",
-        PackageLanguage::Python => "python",
-        PackageLanguage::Global => "global",
-    }
-}
-
-fn render_error(error: &anyhow::Error) {
-    eprintln!("ERROR : RPX issue!");
-    eprintln!();
-    eprintln!("{error:#}");
-    eprintln!();
-    eprintln!("HINT : RBE applications use package.rbe.json with `rpx index update`, `rpx install`, and `rpx run <script>`. Package authoring uses the archive package manifest with `rpx check` / `rpx compile`. Managed compilation reads .rbe/rpx-toolchain.json and verifies pinned compiler SHA-256 identities before execution; use --allow-host-toolchain only for explicit local authoring.");
-}
-
-fn print_help() {
-    println!(
-        "RPX — RBE package executor\n\n\
-Usage:\n\
-  rpx check [path]\n\
-  rpx compile [path] [--allow-host-toolchain]\n\
-  rpx compile.package [path] [--allow-host-toolchain]\n\
-  rpx compile package [path] [--allow-host-toolchain]\n\
-  rpx package [path] [--allow-host-toolchain]\n\
-  rpx info [path]\n\
-  rpx index update [project-path] [--registry <url>]\n\
-  rpx install [project-path] [--registry <url>]\n\
-  rpx run <script>\n\n\
-Registry configuration:\n\
-  --registry <url>       Override the RPX registry base for this invocation.\n\
-  RPX_REGISTRY_URL       Default registry base URL. HTTPS is required except for localhost.\n\n\
-Package authoring paths default to the current directory. `rpx compile.package` emits a canonical package.rbe.yaml inside the .rbe.zip and never publishes the local authoring manifest.\n\
-RBE applications use package.rbe.json and generated .cache/package.rbe.lock.json state. `rpx index update` caches the frozen Kastrick package/version index at .cache/library/index.rbe.json.\n\
-`rpx install` reuses matching locked graphs without registry resolution, otherwise refreshes one frozen index revision, resolves exact root/private versions, verifies package hashes/manifests/indexes, promotes content-addressed artifacts under .cache/library/<sha>/artifact.rbe, and writes the JSON lock only after the graph succeeds.\n\
-Application scripts are read from package.rbe.json and execute with the application root as their working directory. The directory containing the current RPX binary is prepended to child PATH so scripts may invoke project-local `rpx` again. RPX never runs application scripts implicitly during install/compile.\n\
-A path inside components/<name>/ checks/compiles only that component.\n\
-`check` validates RBE package/component structure. `compile` additionally invokes the selected language compiler/toolchain.\n\
-Compiler execution is RBE-managed by default through .rbe/rpx-toolchain.json. Managed compiler files are SHA-256 pinned and re-verified immediately before execution. --allow-host-toolchain is an explicit local-authoring escape hatch and is never an automatic fallback from a partial managed toolchain."
-    );
+    Ok(output)
 }
