@@ -4,6 +4,7 @@ use rpx::compiler_execution::{
     bun_build, node_check, python_compile, rust_check, typescript_check, CompilerInvocation,
     CompilerProgram,
 };
+use rpx::project::{find_project_root, ProjectManifest};
 use rpx::toolchain::{verify_managed_program, CompilerResolver};
 use sdk_package::{
     check_package, check_target, CheckedComponent, CheckedPackage, JsRuntime, PackageLanguage,
@@ -58,6 +59,15 @@ fn run() -> Result<()> {
             let package = check_target(target)?;
             println!("{}", serde_json::to_string_pretty(&package.index())?);
         }
+        "run" => {
+            let script = args
+                .first()
+                .context("rpx run requires a script name from package.rbe.json")?;
+            if args.len() != 1 {
+                bail!("rpx run currently accepts exactly one script name");
+            }
+            run_project_script(script)?;
+        }
         unknown => bail!("unknown RPX command {unknown:?}"),
     }
     Ok(())
@@ -85,6 +95,61 @@ fn target_from(args: &[String], index: usize) -> Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?)
     }
+}
+
+fn run_project_script(script: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let project_root = find_project_root(&cwd)?;
+    let manifest = ProjectManifest::load(&project_root)?;
+    let script_command = manifest.scripts.get(script).with_context(|| {
+        let available = if manifest.scripts.is_empty() {
+            "none".to_string()
+        } else {
+            manifest.scripts.keys().cloned().collect::<Vec<_>>().join(", ")
+        };
+        format!("script {script:?} is not defined in package.rbe.json (available: {available})")
+    })?;
+
+    println!("RPX RUN");
+    println!("  project: {}", project_root.display());
+    println!("  script: {script}");
+    println!("  command: {script_command}");
+
+    let mut command = if cfg!(windows) {
+        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+        let mut command = Command::new(shell);
+        command.args(["/D", "/S", "/C"]).arg(script_command);
+        command
+    } else {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script_command);
+        command
+    };
+
+    command
+        .current_dir(&project_root)
+        .env("RPX_PROJECT_ROOT", &project_root)
+        .env("RPX_SCRIPT_NAME", script);
+
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            let mut paths = vec![directory.to_path_buf()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(path) = std::env::join_paths(paths) {
+                command.env("PATH", path);
+            }
+        }
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to execute RPX script {script:?}"))?;
+    if !status.success() {
+        bail!("RPX script {script:?} exited with {status}");
+    }
+    Ok(())
 }
 
 fn compile(target: PathBuf, allow_host_toolchain: bool) -> Result<()> {
@@ -544,11 +609,11 @@ fn language_name(language: PackageLanguage) -> &'static str {
 }
 
 fn render_error(error: &anyhow::Error) {
-    eprintln!("ERROR : packaging issue!");
+    eprintln!("ERROR : RPX issue!");
     eprintln!();
     eprintln!("{error:#}");
     eprintln!();
-    eprintln!("HINT : run `rpx check .` for package structure or `rpx compile .` for real compiler checks. Managed compilation reads .rbe/rpx-toolchain.json and verifies pinned compiler SHA-256 identities before execution; use --allow-host-toolchain only for explicit local authoring. Use `rpx compile components/<name>` to compile only one exported component. Every exported component folder must contain <name>.<language-extension>, and the package root must contain {PACKAGE_MANIFEST}.");
+    eprintln!("HINT : package authors use package.rbe.toml with `rpx check` / `rpx compile`; RBE applications use package.rbe.json with `rpx run <script>`. Managed compilation reads .rbe/rpx-toolchain.json and verifies pinned compiler SHA-256 identities before execution; use --allow-host-toolchain only for explicit local authoring.");
 }
 
 fn print_help() {
@@ -560,8 +625,10 @@ Usage:\n\
   rpx compile.package [path] [--allow-host-toolchain]\n\
   rpx compile package [path] [--allow-host-toolchain]\n\
   rpx package [path] [--allow-host-toolchain]\n\
-  rpx info [path]\n\n\
-`path` defaults to the current directory. RPX walks upward until it finds package.rbe.toml.\n\
+  rpx info [path]\n\
+  rpx run <script>\n\n\
+Package authoring paths default to the current directory; RPX walks upward until it finds package.rbe.toml.\n\
+Application scripts are read from package.rbe.json and execute with the application root as their working directory. The directory containing the current RPX binary is prepended to child PATH so scripts may invoke project-local `rpx` again. RPX never runs application scripts implicitly during install/compile.\n\
 A path inside components/<name>/ checks/compiles only that component.\n\
 `check` validates RBE package/component structure. `compile` additionally invokes the selected language compiler/toolchain.\n\
 Compiler execution is RBE-managed by default through .rbe/rpx-toolchain.json. Managed compiler files are SHA-256 pinned and re-verified immediately before execution. --allow-host-toolchain is an explicit local-authoring escape hatch and is never an automatic fallback from a partial managed toolchain.\n\
