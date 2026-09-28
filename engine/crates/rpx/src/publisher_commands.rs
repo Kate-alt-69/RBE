@@ -2,7 +2,10 @@
 
 use crate::auth_store::{CredentialSource, CredentialStore, ResolvedCredential};
 use crate::publisher_client::{DevicePoll, PublishResponse, PublisherClient};
-use crate::publisher_management::{yank_package as request_yank, YankResponse};
+use crate::publisher_management::{
+    package_status as request_status, yank_package as request_yank, PackageStatusResponse,
+    YankResponse,
+};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -146,6 +149,71 @@ pub fn publish_archive(
     println!("  manifest sha256: {}", published.release.manifest_sha256);
     println!("  bytes: {}", published.release.size_bytes);
     Ok(published)
+}
+
+pub fn status(registry_override: Option<&str>, package: &str) -> Result<PackageStatusResponse> {
+    let client = PublisherClient::from_override_or_env(registry_override)?;
+    let response = request_status(&client, package)?;
+
+    println!("RPX PACKAGE STATUS");
+    println!("  registry: {}", client.base_url());
+    println!("  package: {}", response.package.name);
+    println!("  revision: {}", response.revision);
+    println!(
+        "  latest stable: {}",
+        response.package.latest_stable.as_deref().unwrap_or("none")
+    );
+    if let Some(description) = response.package.description.as_deref() {
+        println!("  description: {description}");
+    }
+    println!("  downloads: {}", response.analytics.downloads_total);
+    if let Some(last_download) = response.analytics.downloads_last_at {
+        println!("  last download: {last_download}");
+    }
+    println!(
+        "  releases: published={} active={} yanked={} stable-active={}",
+        response.release_stats.published,
+        response.release_stats.active,
+        response.release_stats.yanked,
+        response.release_stats.stable_active
+    );
+    println!(
+        "  history totals: publishes={} yanks={}",
+        response.release_stats.publishes_total, response.release_stats.yanks_total
+    );
+
+    println!("  versions:");
+    for version in &response.versions {
+        println!(
+            "    {}  state={}  downloads={}  bytes={}  published={}",
+            version.version,
+            if version.yanked { "yanked" } else { "active" },
+            version.downloads,
+            version.size_bytes,
+            version.published_at
+        );
+        if let Some(yanked_at) = version.yanked_at {
+            println!("      yanked-at: {yanked_at}");
+        }
+        println!("      archive-sha256: {}", version.archive_sha256);
+        println!("      manifest-sha256: {}", version.manifest_sha256);
+    }
+
+    println!("  history:");
+    if response.history.is_empty() {
+        println!("    none");
+    } else {
+        for event in &response.history {
+            match event.reason.as_deref() {
+                Some(reason) => println!(
+                    "    {}  {} {}  reason={}",
+                    event.at, event.action, event.version, reason
+                ),
+                None => println!("    {}  {} {}", event.at, event.action, event.version),
+            }
+        }
+    }
+    Ok(response)
 }
 
 pub fn yank(
