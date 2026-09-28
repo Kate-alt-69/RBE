@@ -102,9 +102,7 @@ fn run() -> Result<Option<ExitCode>> {
         }
         "yank" => {
             if positional.len() != 2 {
-                bail!(
-                    "usage: rpx yank <package> <version> [--reason <text>] [--registry <url>]"
-                );
+                bail!("usage: rpx yank <package> <version> [--reason <text>] [--registry <url>]");
             }
             publisher_commands::yank(
                 registry.as_deref(),
@@ -254,13 +252,7 @@ mod tests {
 
     #[test]
     fn yank_parser_separates_reason_from_identity() {
-        let args = strings(&[
-            "yank",
-            "advancenet",
-            "1.4.2",
-            "--reason",
-            "broken release",
-        ]);
+        let args = strings(&["yank", "advancenet", "1.4.2", "--reason", "broken release"]);
         assert_eq!(command_index(&args), Some(0));
         assert_eq!(
             publisher_positionals(&args, 0).unwrap(),
