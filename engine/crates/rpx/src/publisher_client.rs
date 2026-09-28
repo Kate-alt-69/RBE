@@ -305,8 +305,7 @@ impl PublisherClient {
             .with_context(|| format!("failed to upload package archive to {url}"))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body =
-                read_bounded(response, &url).unwrap_or_else(|_| "<body unavailable>".into());
+            let body = read_bounded(response, &url).unwrap_or_else(|_| "<body unavailable>".into());
             bail!(
                 "package upload failed with HTTP {status}: {}",
                 truncate_for_error(&body, 4096)
