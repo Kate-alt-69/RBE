@@ -1,0 +1,37 @@
+{
+  "formatVersion": 1,
+  "node": {
+    "id": "kastrick-registry",
+    "mode": "primary",
+    "storageRoot": "./.rbe-cloud-node",
+    "backupVersions": 5,
+    "preserveOriginal": true,
+    "videoChunkBytes": 4194304
+  },
+  "provider": {
+    "kind": "s3",
+    "namespace": "rpx-registry",
+    "bucket": "rbe-registry",
+    "endpoint": "https://project-ref.storage.supabase.co/storage/v1/s3",
+    "region": "project-region",
+    "auth": {
+      "mode": "aws-sig-v4",
+      "accessKeyEnv": "RBE_CN_PROV_SUPABASE_ACCESS_KEY",
+      "secretKeyEnv": "RBE_CN_PROV_SUPABASE_SECRET_KEY"
+    },
+    "prefix": "kastrick",
+    "conflictPolicy": "fail",
+    "autoReconnect": true,
+    "syncOnConnect": true,
+    "reconnectDelayMs": 2000,
+    "maxReconnectDelayMs": 60000,
+    "pollIntervalMs": 30000,
+    "connectTimeoutMs": 10000,
+    "readTimeoutMs": 60000
+  },
+  "replication": {
+    "requireBootRecovery": false,
+    "bootRecoveryTimeoutMs": 60000,
+    "targets": []
+  }
+}

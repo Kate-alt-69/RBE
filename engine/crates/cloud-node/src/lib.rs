@@ -17,6 +17,7 @@ mod provider;
 #[cfg(feature = "client")]
 mod provider_sync;
 mod recovery;
+mod registry_ingest;
 mod server;
 mod store;
 mod sync;
@@ -57,6 +58,9 @@ pub use provider_sync::{
     ProviderSyncResult, ProviderSyncStatus,
 };
 pub use recovery::{CloudNodeRecoveryReceiver, RecoveryReceipt};
+pub use registry_ingest::{
+    ingest_registry_export, RegistryIngestResult, RegistryStoredObject,
+};
 pub use server::{
     AcceptedKnock, AuthenticatedSession, CloudNodeAuthenticator, DEFAULT_SESSION_TTL_MS,
     MAX_AUTH_PROOF_BYTES,
