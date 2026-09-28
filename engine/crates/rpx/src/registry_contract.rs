@@ -40,7 +40,8 @@ pub struct IndexListPackage {
 
 impl IndexListResponse {
     pub fn parse(input: &str) -> Result<Self> {
-        let response: Self = serde_json::from_str(input).context("invalid RPX index-list response")?;
+        let response: Self =
+            serde_json::from_str(input).context("invalid RPX index-list response")?;
         response.validate()?;
         Ok(response)
     }
@@ -90,7 +91,10 @@ impl IndexListResponse {
             }
             if let Some(latest) = &package.latest_stable {
                 let latest_version = Version::parse(latest).with_context(|| {
-                    format!("invalid latestStable {latest:?} for package {:?}", package.name)
+                    format!(
+                        "invalid latestStable {latest:?} for package {:?}",
+                        package.name
+                    )
                 })?;
                 if !latest_version.pre.is_empty() {
                     bail!("latestStable for package {:?} must be stable", package.name);
@@ -196,10 +200,16 @@ impl PackageIndexResponse {
             bail!("RPX package index response was not successful");
         }
         if self.schema_version != REGISTRY_SCHEMA_VERSION {
-            bail!("unsupported RPX package index schema {}", self.schema_version);
+            bail!(
+                "unsupported RPX package index schema {}",
+                self.schema_version
+            );
         }
         if self.authority != REGISTRY_AUTHORITY {
-            bail!("unexpected RPX package index authority {:?}", self.authority);
+            bail!(
+                "unexpected RPX package index authority {:?}",
+                self.authority
+            );
         }
         if self.revision.trim().is_empty() || self.revision.len() > 256 {
             bail!("invalid RPX package index revision");
@@ -224,7 +234,10 @@ impl PackageIndexResponse {
             }
         }
         if self.resolved_from != "explicit" && self.resolved_from != "latest-stable" {
-            bail!("invalid RPX registry resolvedFrom value {:?}", self.resolved_from);
+            bail!(
+                "invalid RPX registry resolvedFrom value {:?}",
+                self.resolved_from
+            );
         }
 
         let release = self
@@ -415,10 +428,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "rpx-index-cache-{}-{nonce}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rpx-index-cache-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let path = response.persist_local_cache(&root).unwrap();
         assert_eq!(path, root.join(".cache/library/index.rbe.json"));

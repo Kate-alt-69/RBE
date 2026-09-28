@@ -154,9 +154,9 @@ impl ApplicationInstallPlan {
     }
 
     pub fn requires_network(&self) -> bool {
-        self.actions.iter().any(|action| {
-            !matches!(action, InstallPlanAction::UseCachedLocked { .. })
-        })
+        self.actions
+            .iter()
+            .any(|action| !matches!(action, InstallPlanAction::UseCachedLocked { .. }))
     }
 
     pub fn uses_only_verified_cache(&self) -> bool {
@@ -191,15 +191,16 @@ fn artifact_matches(path: &Path, expected_sha256: &str) -> Result<bool> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
-            return Err(error).with_context(|| format!("inspect cached artifact {}", path.display()))
+            return Err(error)
+                .with_context(|| format!("inspect cached artifact {}", path.display()))
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
 
-    let mut file = fs::File::open(path)
-        .with_context(|| format!("open cached artifact {}", path.display()))?;
+    let mut file =
+        fs::File::open(path).with_context(|| format!("open cached artifact {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -232,10 +233,7 @@ mod tests {
     }
 
     fn manifest() -> ProjectManifest {
-        ProjectManifest::parse(
-            r#"{"packages":{"advancenet":"^1.4.0"},"scripts":{}}"#,
-        )
-        .unwrap()
+        ProjectManifest::parse(r#"{"packages":{"advancenet":"^1.4.0"},"scripts":{}}"#).unwrap()
     }
 
     fn locked(manifest: &ProjectManifest, artifact_sha256: String) -> ProjectLock {
