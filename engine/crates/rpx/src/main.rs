@@ -44,7 +44,7 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             eprintln!("ERROR : RPX publisher issue!\n\n{error:#}\n");
-            eprintln!("HINT : use `rpx login` before publishing, and configure the registry with --registry or RPX_REGISTRY_URL.");
+            eprintln!("HINT : use `rpx login` before publishing or managing releases, and configure the registry with --registry or RPX_REGISTRY_URL.");
             ExitCode::from(1)
         }
     }
@@ -56,11 +56,15 @@ fn run() -> Result<Option<ExitCode>> {
         return Ok(None);
     };
     let command = args[command_index].as_str();
-    if !matches!(command, "login" | "whoami" | "logout" | "publish") {
+    if !matches!(command, "login" | "whoami" | "logout" | "publish" | "yank") {
         return Ok(None);
     }
 
     let registry = option_value(&args, "--registry")?;
+    let reason = option_value(&args, "--reason")?;
+    if command != "yank" && reason.is_some() {
+        bail!("--reason is supported only by `rpx yank`");
+    }
     let allow_host_toolchain = args.iter().any(|arg| arg == "--allow-host-toolchain");
     let positional = publisher_positionals(&args, command_index)?;
 
@@ -95,6 +99,19 @@ fn run() -> Result<Option<ExitCode>> {
                 legacy_cli::build_package_for_publish(target, allow_host_toolchain)
                     .context("failed to build package for publication")?;
             publisher_commands::publish_archive(registry.as_deref(), &package, &version, &archive)?;
+        }
+        "yank" => {
+            if positional.len() != 2 {
+                bail!(
+                    "usage: rpx yank <package> <version> [--reason <text>] [--registry <url>]"
+                );
+            }
+            publisher_commands::yank(
+                registry.as_deref(),
+                &positional[0],
+                &positional[1],
+                reason.as_deref(),
+            )?;
         }
         _ => unreachable!(),
     }
@@ -154,14 +171,18 @@ fn publisher_positionals(args: &[String], command_index: usize) -> Result<Vec<St
     let mut index = command_index + 1;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--registry" {
+        if matches!(arg.as_str(), "--registry" | "--reason") {
             if args.get(index + 1).is_none() {
-                bail!("--registry requires a value");
+                bail!("{arg} requires a value");
             }
             index += 2;
             continue;
         }
-        if arg.starts_with("--registry=") || arg == "--allow-host-toolchain" {
+        if arg.starts_with("--registry=") || arg.starts_with("--reason=") {
+            index += 1;
+            continue;
+        }
+        if arg == "--allow-host-toolchain" {
             index += 1;
             continue;
         }
@@ -192,7 +213,9 @@ fn print_publisher_help() {
   rpx logout [--registry <url>]\n\
       Revoke the active credential and remove locally stored auth state.\n\
   rpx publish [path] [--registry <url>] [--allow-host-toolchain]\n\
-      Build a canonical .rbe.zip, upload it through the signed publisher flow, and publish an immutable release.\n\n\
+      Build a canonical .rbe.zip, upload it through the signed publisher flow, and publish an immutable release.\n\
+  rpx yank <package> <version> [--reason <text>] [--registry <url>]\n\
+      Hide an immutable release from new installs while preserving its registry history.\n\n\
 Publisher environment:\n\
   RPX_TOKEN             Optional scoped 64-hex token for CI; never persisted.\n\
   RPX_AUTH_FILE         Override ~/.rbe/rpx/auth.json.\n\
@@ -226,6 +249,26 @@ mod tests {
         assert_eq!(
             option_value(&args, "--registry").unwrap().as_deref(),
             Some("https://registry.example")
+        );
+    }
+
+    #[test]
+    fn yank_parser_separates_reason_from_identity() {
+        let args = strings(&[
+            "yank",
+            "advancenet",
+            "1.4.2",
+            "--reason",
+            "broken release",
+        ]);
+        assert_eq!(command_index(&args), Some(0));
+        assert_eq!(
+            publisher_positionals(&args, 0).unwrap(),
+            strings(&["advancenet", "1.4.2"])
+        );
+        assert_eq!(
+            option_value(&args, "--reason").unwrap().as_deref(),
+            Some("broken release")
         );
     }
 
