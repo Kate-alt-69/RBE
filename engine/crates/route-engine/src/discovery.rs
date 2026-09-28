@@ -417,13 +417,6 @@ fn request_json_value(raw: &str) -> Result<Value, String> {
     Ok(value)
 }
 
-fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
-}
-
 fn singleton_header_string(
     headers: &HeaderMap,
     name: header::HeaderName,
@@ -667,6 +660,38 @@ mod header_snapshot_tests {
         let error = singleton_header_string(&headers, header::HOST).unwrap_err();
         assert!(error.contains("host"), "{error}");
         assert!(error.contains("may appear only once"), "{error}");
+    }
+
+    #[test]
+    fn singleton_user_agent_rejects_duplicate_field_lines() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::USER_AGENT, HeaderValue::from_static("client-one"));
+        headers.append(header::USER_AGENT, HeaderValue::from_static("client-two"));
+
+        let error = singleton_header_string(&headers, header::USER_AGENT).unwrap_err();
+        assert!(error.contains("user-agent"), "{error}");
+        assert!(error.contains("may appear only once"), "{error}");
+    }
+
+    #[test]
+    fn singleton_user_agent_rejects_non_text_bytes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_bytes(&[0x80]).expect("obs-text header should parse"),
+        );
+
+        let error = singleton_header_string(&headers, header::USER_AGENT).unwrap_err();
+        assert!(error.contains("user-agent"), "{error}");
+        assert!(error.contains("non-text bytes"), "{error}");
+    }
+
+    #[test]
+    fn singleton_user_agent_is_optional() {
+        assert_eq!(
+            singleton_header_string(&HeaderMap::new(), header::USER_AGENT).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1149,7 +1174,8 @@ async fn request_value(
         .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?
         .map(Value::String)
         .unwrap_or(Value::Null);
-    let user_agent = header_string(&parts.headers, header::USER_AGENT)
+    let user_agent = singleton_header_string(&parts.headers, header::USER_AGENT)
+        .map_err(|error| Box::new(request_error(StatusCode::BAD_REQUEST, error)))?
         .map(Value::String)
         .unwrap_or(Value::Null);
     let content_length = content_length_value(&parts.headers)
