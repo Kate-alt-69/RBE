@@ -3,8 +3,10 @@ pub(crate) mod host;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context};
+use core_lib::{LibraryCapabilityGrant, LibrarySessionBinding};
 use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex, VerifiedRpxRootSnapshot};
 use route_engine::relc::{
     PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
@@ -12,6 +14,9 @@ use route_engine::relc::{
 use serde::Deserialize;
 
 const RPX_PACKAGE_INDEX_FORMAT: u32 = 1;
+
+static LIBRARY_HOST_SESSIONS: OnceLock<Mutex<BTreeMap<String, LibrarySessionBinding>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct LoadedPackageRoots {
@@ -47,11 +52,13 @@ struct RpxPackageExport {
 
 /// Build RELC's package namespace from SHA-verified explicit package roots.
 ///
-/// Compatibility wrapper for callers that only need the public RELC namespace.
-/// Backend boot should prefer [`load_with_workers`] so the exact same verified
-/// root snapshot can also seed Library Host worker identity.
+/// The same verified root snapshot also seeds fail-closed Library Host sessions
+/// before the public export namespace is returned. Sessions deliberately start
+/// with zero admitted grants until capability admission persists explicit grants.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
-    Ok(load_with_workers(project_root)?.links)
+    let loaded = load_with_workers(project_root)?;
+    install_verified_host_sessions(&loaded.roots)?;
+    Ok(loaded.links)
 }
 
 /// Read one fail-closed package-state snapshot and retain it for both RELC
@@ -74,6 +81,45 @@ pub fn load_with_workers(project_root: &Path) -> anyhow::Result<LoadedPackageRoo
     let snapshots = rbe_install_runtime::read_verified_rpx_root_snapshots(project_root)
         .context("load verified RPX package root snapshots")?;
     from_verified_snapshots(snapshots)
+}
+
+fn build_verified_host_sessions(
+    roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
+) -> anyhow::Result<BTreeMap<String, LibrarySessionBinding>> {
+    let mut sessions = BTreeMap::new();
+    for (package, snapshot) in roots {
+        let binding = host::bind_session(
+            snapshot,
+            std::iter::empty::<LibraryCapabilityGrant>(),
+        )
+        .with_context(|| format!("bind Library Host session for verified root {package:?}"))?;
+        if sessions.insert(package.clone(), binding).is_some() {
+            bail!("duplicate Library Host session for verified root {package:?}");
+        }
+    }
+    Ok(sessions)
+}
+
+fn install_verified_host_sessions(
+    roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
+) -> anyhow::Result<()> {
+    let sessions = build_verified_host_sessions(roots)?;
+    let registry = LIBRARY_HOST_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut active = registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Library Host session registry lock is poisoned"))?;
+
+    for session in active.values_mut() {
+        session.close();
+    }
+    *active = sessions;
+
+    tracing::info!(
+        package_sessions = active.len(),
+        granted_capabilities = 0,
+        "prepared verified fail-closed Library Host sessions"
+    );
+    Ok(())
 }
 
 fn from_verified_snapshots(
@@ -292,6 +338,13 @@ mod tests {
         assert_eq!(retained.worker.runtime_kind, "bun");
         assert_eq!(retained.worker.runtime_version, "1.3.7");
         assert_eq!(retained.artifact_sha256, "a".repeat(64));
+
+        let sessions = build_verified_host_sessions(&loaded.roots).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions.get("advancenet").unwrap().state(),
+            core_lib::LibrarySessionState::AwaitHello
+        );
     }
 
     #[test]
