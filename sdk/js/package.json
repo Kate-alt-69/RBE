@@ -7,11 +7,17 @@
     ".": {
       "types": "./index.d.ts",
       "import": "./index.js"
+    },
+    "./worker": {
+      "types": "./worker.d.ts",
+      "import": "./worker.js"
     }
   },
   "files": [
     "index.js",
-    "index.d.ts"
+    "index.d.ts",
+    "worker.js",
+    "worker.d.ts"
   ],
   "engines": {
     "node": ">=20"
