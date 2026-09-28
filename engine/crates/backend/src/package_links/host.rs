@@ -1,8 +1,7 @@
 use anyhow::{bail, Context};
 use core_lib::{
     ExpectedWorkerIdentity, LibraryCapabilityGrant, LibraryPackageIdentity, LibraryRuntimeIdentity,
-    LibrarySdkIdentity, LibrarySessionBinding, LibraryWorkerHello, LIBRARY_ABI_VERSION,
-    LIBRARY_PROTOCOL_VERSION,
+    LibrarySdkIdentity, LibrarySessionBinding, LIBRARY_ABI_VERSION,
 };
 use rand::RngCore;
 use rbe_install_runtime::VerifiedRpxRootSnapshot;
@@ -78,6 +77,7 @@ pub fn bind_session(
 
 #[cfg(test)]
 mod tests {
+    use core_lib::{LibraryWorkerHello, LIBRARY_PROTOCOL_VERSION};
     use rbe_install_runtime::VerifiedPackageWorkerIdentity;
 
     use super::*;
