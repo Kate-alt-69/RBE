@@ -64,7 +64,7 @@ JSON bodies are decoded directly into REL values with strict object identity. Du
 
 Forwarded client/protocol data is trusted only when `trustedProxyHeaders` policy is enabled. Otherwise `request.ip` is derived from the socket peer. When proxy trust is enabled, every textual `X-Forwarded-For` field-line is consumed in `HeaderMap` order, comma-delimited entries are flattened in order, every token must be a valid IPv4/IPv6 literal, values are canonicalized, and `request.ip` uses the first resulting entry; malformed, empty-present, or non-text forwarding metadata fails with HTTP 400 instead of being ignored. `X-Forwarded-Proto` is handled across all field-lines with the same ordering rules: every supplied token must be `http` or `https` (ASCII case-insensitive), the first token becomes the canonical lowercase `request.protocol`, and malformed/empty present proxy metadata returns HTTP 400 instead of silently becoming `http`.
 
-Current transport behavior joins repeatable duplicate request headers, while semantic singleton headers such as `Content-Type` and `Host` are rejected when repeated so the structured snapshot cannot disagree with HTTP interpretation. There is no first-class binary-body value type.
+Current transport behavior joins repeatable duplicate request headers, while semantic singleton headers `Content-Type`, `Host`, and `Content-Length` are rejected when repeated so the structured snapshot cannot disagree with HTTP interpretation. `Content-Length`, when present, must be non-empty ASCII decimal digits and no greater than `9007199254740991`, the largest integer REL can represent exactly; malformed or lossy values return HTTP 400 instead of becoming `null` or a rounded number. There is no first-class binary-body value type.
 
 ## Responses
 
