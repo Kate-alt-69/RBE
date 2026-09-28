@@ -5,6 +5,7 @@ use rpx::compiler_execution::{
     CompilerProgram,
 };
 use rpx::project::{find_project_root, ProjectManifest};
+use rpx::registry_client::RegistryClient;
 use rpx::toolchain::{verify_managed_program, CompilerResolver};
 use sdk_package::{
     check_package, check_target, CheckedComponent, CheckedPackage, JsRuntime, PackageLanguage,
@@ -33,6 +34,10 @@ fn run() -> Result<()> {
     }
 
     let allow_host_toolchain = take_flag(&mut args, "--allow-host-toolchain");
+    let registry_override = take_option(&mut args, "--registry")?;
+    if args.is_empty() {
+        bail!("RPX command is missing");
+    }
     let command = args.remove(0);
     match command.as_str() {
         "check" => {
@@ -58,6 +63,7 @@ fn run() -> Result<()> {
             let package = check_target(target)?;
             println!("{}", serde_json::to_string_pretty(&package.index())?);
         }
+        "index" => run_index_command(&args, registry_override.as_deref())?,
         "run" => {
             let script = args
                 .first()
@@ -85,6 +91,42 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
     found
 }
 
+fn take_option(args: &mut Vec<String>, option: &str) -> Result<Option<String>> {
+    let prefix = format!("{option}=");
+    let mut value = None;
+    let mut index = 0;
+    while index < args.len() {
+        if let Some(inline) = args[index].strip_prefix(&prefix) {
+            if value.is_some() {
+                bail!("{option} may only be supplied once");
+            }
+            if inline.is_empty() {
+                bail!("{option} requires a value");
+            }
+            value = Some(inline.to_string());
+            args.remove(index);
+            continue;
+        }
+        if args[index] == option {
+            if value.is_some() {
+                bail!("{option} may only be supplied once");
+            }
+            if index + 1 >= args.len() {
+                bail!("{option} requires a value");
+            }
+            let candidate = args.remove(index + 1);
+            args.remove(index);
+            if candidate.is_empty() || candidate.starts_with("--") {
+                bail!("{option} requires a value");
+            }
+            value = Some(candidate);
+            continue;
+        }
+        index += 1;
+    }
+    Ok(value)
+}
+
 fn target_from(args: &[String], index: usize) -> Result<PathBuf> {
     if let Some(value) = args.get(index) {
         if value.starts_with('-') {
@@ -94,6 +136,42 @@ fn target_from(args: &[String], index: usize) -> Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?)
     }
+}
+
+fn run_index_command(args: &[String], registry_override: Option<&str>) -> Result<()> {
+    let subcommand = args
+        .first()
+        .context("rpx index requires a subcommand; use `rpx index update`")?;
+    match subcommand.as_str() {
+        "update" => {
+            if args.len() > 2 {
+                bail!("usage: rpx index update [project-path] [--registry <url>]");
+            }
+            let start = match args.get(1) {
+                Some(path) => PathBuf::from(path),
+                None => std::env::current_dir()?,
+            };
+            let project_root = find_project_root(&start)?;
+            let client = RegistryClient::from_override_or_env(registry_override)?;
+            let response = client.fetch_index_list()?;
+            let revision = response.revision.clone();
+            let listed = response.packages.len();
+            let stable = response
+                .packages
+                .iter()
+                .filter(|package| package.latest_stable.is_some())
+                .count();
+            let path = response.persist_local_cache(&project_root)?;
+            println!("RPX INDEX UPDATED");
+            println!("  registry: {}", client.base_url());
+            println!("  revision: {revision}");
+            println!("  packages listed: {listed}");
+            println!("  installable stable packages: {stable}");
+            println!("  cache: {}", path.display());
+        }
+        unknown => bail!("unknown rpx index subcommand {unknown:?}; expected `update`"),
+    }
+    Ok(())
 }
 
 fn run_project_script(script: &str) -> Result<()> {
@@ -617,7 +695,7 @@ fn render_error(error: &anyhow::Error) {
     eprintln!();
     eprintln!("{error:#}");
     eprintln!();
-    eprintln!("HINT : package authors use package.rbe.toml with `rpx check` / `rpx compile`; RBE applications use package.rbe.json with `rpx run <script>`. Managed compilation reads .rbe/rpx-toolchain.json and verifies pinned compiler SHA-256 identities before execution; use --allow-host-toolchain only for explicit local authoring.");
+    eprintln!("HINT : RBE applications use package.rbe.json with `rpx index update`, `rpx install`, and `rpx run <script>`. Package authoring uses the archive package manifest with `rpx check` / `rpx compile`. Managed compilation reads .rbe/rpx-toolchain.json and verifies pinned compiler SHA-256 identities before execution; use --allow-host-toolchain only for explicit local authoring.");
 }
 
 fn print_help() {
@@ -630,12 +708,16 @@ Usage:\n\
   rpx compile package [path] [--allow-host-toolchain]\n\
   rpx package [path] [--allow-host-toolchain]\n\
   rpx info [path]\n\
+  rpx index update [project-path] [--registry <url>]\n\
   rpx run <script>\n\n\
-Package authoring paths default to the current directory; RPX walks upward until it finds package.rbe.toml.\n\
+Registry configuration:\n\
+  --registry <url>       Override the RPX registry base for this invocation.\n\
+  RPX_REGISTRY_URL       Default registry base URL. HTTPS is required except for localhost.\n\n\
+Package authoring paths default to the current directory and use the package archive authoring manifest.\n\
+RBE applications use package.rbe.json and generated .cache/package.rbe.lock.json state. `rpx index update` caches the frozen Kastrick package/version index at .cache/library/index.rbe.json.\n\
 Application scripts are read from package.rbe.json and execute with the application root as their working directory. The directory containing the current RPX binary is prepended to child PATH so scripts may invoke project-local `rpx` again. RPX never runs application scripts implicitly during install/compile.\n\
 A path inside components/<name>/ checks/compiles only that component.\n\
 `check` validates RBE package/component structure. `compile` additionally invokes the selected language compiler/toolchain.\n\
-Compiler execution is RBE-managed by default through .rbe/rpx-toolchain.json. Managed compiler files are SHA-256 pinned and re-verified immediately before execution. --allow-host-toolchain is an explicit local-authoring escape hatch and is never an automatic fallback from a partial managed toolchain.\n\
-Package exports are discovered from components/<name>/<name>.<ext>."
+Compiler execution is RBE-managed by default through .rbe/rpx-toolchain.json. Managed compiler files are SHA-256 pinned and re-verified immediately before execution. --allow-host-toolchain is an explicit local-authoring escape hatch and is never an automatic fallback from a partial managed toolchain."
     );
 }
