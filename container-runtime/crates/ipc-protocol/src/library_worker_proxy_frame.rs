@@ -41,9 +41,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::{
-        LibraryWorkerProxySourceFile, LIBRARY_WORKER_PROXY_PROTOCOL_VERSION,
-    };
+    use crate::{LibraryWorkerProxySourceFile, LIBRARY_WORKER_PROXY_PROTOCOL_VERSION};
 
     fn absolute_program() -> String {
         #[cfg(windows)]
@@ -104,8 +102,7 @@ mod tests {
         let mut bytes = Vec::new();
         write_library_worker_proxy_bootstrap(&mut bytes, &expected).unwrap();
 
-        let decoded =
-            read_library_worker_proxy_bootstrap(&mut Cursor::new(bytes)).unwrap();
+        let decoded = read_library_worker_proxy_bootstrap(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded, expected);
     }
 
@@ -127,8 +124,7 @@ mod tests {
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &invalid).unwrap();
 
-        let error =
-            read_library_worker_proxy_bootstrap(&mut Cursor::new(bytes)).unwrap_err();
+        let error = read_library_worker_proxy_bootstrap(&mut Cursor::new(bytes)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -143,8 +139,7 @@ mod tests {
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &value).unwrap();
 
-        let error =
-            read_library_worker_proxy_bootstrap(&mut Cursor::new(bytes)).unwrap_err();
+        let error = read_library_worker_proxy_bootstrap(&mut Cursor::new(bytes)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
