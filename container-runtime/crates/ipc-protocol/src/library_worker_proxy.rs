@@ -50,7 +50,9 @@ impl LibraryWorkerProxyBootstrap {
         validate_absolute_path("working_directory", &self.working_directory)?;
 
         if self.args.len() != 1 {
-            return Err(LibraryWorkerProxyError::InvalidArgumentCount(self.args.len()));
+            return Err(LibraryWorkerProxyError::InvalidArgumentCount(
+                self.args.len(),
+            ));
         }
         let entrypoint = &self.args[0];
         validate_absolute_path("entrypoint", entrypoint)?;
@@ -97,9 +99,9 @@ impl LibraryWorkerProxyBootstrap {
 
         let entrypoint_relative = relative_source_path(root, entrypoint_path)?;
         if !paths.contains(&entrypoint_relative) {
-            return Err(LibraryWorkerProxyError::EntrypointMissingFromSourceManifest(
-                entrypoint_relative,
-            ));
+            return Err(
+                LibraryWorkerProxyError::EntrypointMissingFromSourceManifest(entrypoint_relative),
+            );
         }
         Ok(())
     }
@@ -187,20 +189,31 @@ impl fmt::Display for LibraryWorkerProxyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedProtocol(version) => {
-                write!(formatter, "unsupported Library Worker Proxy protocol {version}")
+                write!(
+                    formatter,
+                    "unsupported Library Worker Proxy protocol {version}"
+                )
             }
             Self::InvalidAbsolutePath(field) => {
-                write!(formatter, "Library Worker Proxy {field} must be a bounded absolute path")
+                write!(
+                    formatter,
+                    "Library Worker Proxy {field} must be a bounded absolute path"
+                )
             }
             Self::InvalidSha256(field) => {
-                write!(formatter, "Library Worker Proxy {field} must be a SHA-256 digest")
+                write!(
+                    formatter,
+                    "Library Worker Proxy {field} must be a SHA-256 digest"
+                )
             }
             Self::InvalidArgumentCount(count) => {
-                write!(formatter, "Library Worker Proxy v1 requires exactly one entrypoint argument, got {count}")
+                write!(
+                    formatter,
+                    "Library Worker Proxy v1 requires exactly one entrypoint argument, got {count}"
+                )
             }
-            Self::EntrypointOutsideSourceRoot => {
-                formatter.write_str("Library Worker Proxy entrypoint must be inside the source root")
-            }
+            Self::EntrypointOutsideSourceRoot => formatter
+                .write_str("Library Worker Proxy entrypoint must be inside the source root"),
             Self::EntrypointPathNotUtf8 => {
                 formatter.write_str("Library Worker Proxy entrypoint path must be valid UTF-8")
             }
@@ -210,21 +223,38 @@ impl fmt::Display for LibraryWorkerProxyError {
             Self::DirectNetworkForbidden => {
                 formatter.write_str("Library Worker Proxy forbids direct worker networking")
             }
-            Self::ShellForbidden => formatter.write_str("Library Worker Proxy forbids shell launch"),
+            Self::ShellForbidden => {
+                formatter.write_str("Library Worker Proxy forbids shell launch")
+            }
             Self::InvalidStartupTimeout(seconds) => {
-                write!(formatter, "invalid Library Worker Proxy startup timeout {seconds}s")
+                write!(
+                    formatter,
+                    "invalid Library Worker Proxy startup timeout {seconds}s"
+                )
             }
             Self::InvalidSourceFileCount(count) => {
-                write!(formatter, "invalid Library Worker Proxy source file count {count}")
+                write!(
+                    formatter,
+                    "invalid Library Worker Proxy source file count {count}"
+                )
             }
             Self::InvalidRelativeSourcePath(path) => {
-                write!(formatter, "invalid Library Worker Proxy source path {path:?}")
+                write!(
+                    formatter,
+                    "invalid Library Worker Proxy source path {path:?}"
+                )
             }
             Self::DuplicateSourceFile(path) => {
-                write!(formatter, "duplicate Library Worker Proxy source path {path:?}")
+                write!(
+                    formatter,
+                    "duplicate Library Worker Proxy source path {path:?}"
+                )
             }
             Self::EntrypointMissingFromSourceManifest(path) => {
-                write!(formatter, "Library Worker Proxy entrypoint {path:?} is absent from the source manifest")
+                write!(
+                    formatter,
+                    "Library Worker Proxy entrypoint {path:?} is absent from the source manifest"
+                )
             }
         }
     }
@@ -279,7 +309,10 @@ mod tests {
 
         let mut value = valid();
         value.use_shell = true;
-        assert_eq!(value.validate(), Err(LibraryWorkerProxyError::ShellForbidden));
+        assert_eq!(
+            value.validate(),
+            Err(LibraryWorkerProxyError::ShellForbidden)
+        );
 
         let mut value = valid();
         value.environment.insert("PATH".into(), "/tmp".into());
@@ -302,9 +335,7 @@ mod tests {
         missing.source_files.remove(0);
         assert_eq!(
             missing.validate(),
-            Err(LibraryWorkerProxyError::EntrypointMissingFromSourceManifest(
-                "worker.js".into()
-            ))
+            Err(LibraryWorkerProxyError::EntrypointMissingFromSourceManifest("worker.js".into()))
         );
     }
 
@@ -318,10 +349,14 @@ mod tests {
         );
 
         let mut duplicate = valid();
-        duplicate.source_files.push(duplicate.source_files[0].clone());
+        duplicate
+            .source_files
+            .push(duplicate.source_files[0].clone());
         assert_eq!(
             duplicate.validate(),
-            Err(LibraryWorkerProxyError::DuplicateSourceFile("worker.js".into()))
+            Err(LibraryWorkerProxyError::DuplicateSourceFile(
+                "worker.js".into()
+            ))
         );
     }
 
