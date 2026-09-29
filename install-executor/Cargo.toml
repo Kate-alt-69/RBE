@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+ipc-protocol = { path = "../container-runtime/crates/ipc-protocol" }
 rbe-install-request = { path = "../install-request" }
 rbe-library-package = { path = "../library-package" }
 rbe-project-package = { path = "../project-package" }
