@@ -30,11 +30,15 @@ pub struct WorkerLaunchPlan {
 ///
 /// Fields are intentionally private so downstream host code cannot construct or
 /// mutate a "verified" invocation without going through [`WorkerLaunchPlan`].
+/// Integrity evidence remains attached so the Container boundary can re-verify
+/// the exact interpreter and materialized source tree after handoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWorkerInvocation {
     program: PathBuf,
+    program_sha256: String,
     args: Vec<OsString>,
     working_directory: PathBuf,
+    source_files: Vec<SourceFileDigest>,
     clear_environment: bool,
     environment: BTreeMap<String, String>,
     direct_network_allowed: bool,
@@ -47,12 +51,20 @@ impl VerifiedWorkerInvocation {
         &self.program
     }
 
+    pub fn program_sha256(&self) -> &str {
+        &self.program_sha256
+    }
+
     pub fn args(&self) -> &[OsString] {
         &self.args
     }
 
     pub fn working_directory(&self) -> &Path {
         &self.working_directory
+    }
+
+    pub fn source_files(&self) -> &[SourceFileDigest] {
+        &self.source_files
     }
 
     pub const fn clear_environment(&self) -> bool {
@@ -118,8 +130,10 @@ impl WorkerLaunchPlan {
 
         Ok(VerifiedWorkerInvocation {
             program: self.program.path().to_path_buf(),
+            program_sha256: self.program.sha256().to_string(),
             args: vec![self.entrypoint.as_os_str().to_os_string()],
             working_directory: self.source_root.clone(),
+            source_files: self.source_files.clone(),
             clear_environment: true,
             environment: BTreeMap::new(),
             direct_network_allowed: false,
@@ -453,6 +467,7 @@ mod tests {
     #[test]
     fn managed_worker_plan_is_fail_closed() {
         let (_temp, root, entrypoint, pinned, files) = fixture();
+        let expected_files = files.clone();
         let plan = WorkerLaunchPlan::managed_interpreter("bun", &pinned, &root, &entrypoint, files)
             .unwrap();
         let invocation = plan.verify_before_spawn().unwrap();
@@ -463,6 +478,8 @@ mod tests {
         );
         assert_eq!(invocation.working_directory(), root.as_path());
         assert!(invocation.program().is_absolute());
+        assert_eq!(invocation.program_sha256().len(), 64);
+        assert_eq!(invocation.source_files(), expected_files.as_slice());
         assert!(invocation.clear_environment());
         assert!(invocation.environment().is_empty());
         assert!(!invocation.direct_network_allowed());
