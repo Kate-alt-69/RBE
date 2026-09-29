@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cloud_node::{
-    load_signing_key_from_env, negotiate_sync, probe_upstream, provider_status, public_key_hex,
-    synchronize_provider, synchronize_upstream, CloudNodeSettings, CloudNodeStore, ProviderClient,
-    SETTINGS_FILE_NAME,
+    ingest_registry_export, load_signing_key_from_env, negotiate_sync, probe_upstream,
+    provider_status, public_key_hex, synchronize_provider, synchronize_upstream, CloudNodeSettings,
+    CloudNodeStore, ProviderClient, SETTINGS_FILE_NAME,
 };
 
 #[tokio::main]
@@ -108,6 +108,22 @@ async fn run() -> anyhow::Result<()> {
             println!("action={:?}", result.action);
             println!("head={}", result.final_head);
             println!("root={}", result.final_root);
+        }
+        "ingest-registry" => {
+            if args.len() != 2 {
+                anyhow::bail!("ingest-registry requires <export-root>");
+            }
+            let export_root = Path::new(&args[1]);
+            let result = ingest_registry_export(&store, export_root)?;
+            println!("files={}", result.files);
+            println!("metadataFiles={}", result.metadata_files);
+            println!("artifactFiles={}", result.artifact_files);
+            for stored in result.stored {
+                println!(
+                    "{}\t{}\t{}",
+                    stored.logical_path, stored.object_key, stored.content_sha256
+                );
+            }
         }
         "run" => run_daemon(&settings, &store, &project_root).await?,
         "sync-plan" => {
@@ -343,6 +359,6 @@ fn default_config_path() -> PathBuf {
 
 fn print_help() {
     println!(
-        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
+        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|ingest-registry <export-root>|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
     );
 }

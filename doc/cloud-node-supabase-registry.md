@@ -1,6 +1,8 @@
 # Cloud Node: Kastrick RPX registry on Supabase Storage
 
-This profile mirrors Kastrick/RPX registry state through the existing Cloud Node provider-history engine and stores the provider copy in Supabase Storage using Supabase's S3-compatible endpoint.
+This profile mirrors a trusted Kastrick/RPX registry export through the existing Cloud Node provider-history engine and stores the Cloud Node copy in Supabase Storage using Supabase's S3-compatible endpoint.
+
+The live Kastrick publisher remains the registry authority. Cloud Node does not discover or scrape the publisher's private S3 namespace by itself: a trusted registry export must first be materialized and ingested into the Cloud Node store. Once ingested, the registry objects participate in normal Cloud Node provider history and synchronization.
 
 ## Why the S3 transport is used
 
@@ -41,7 +43,7 @@ Those are not substitutes for the S3 access-key pair. S3 access keys are server-
 
 ## Registry export contract
 
-`ingest_registry_export()` accepts a trusted registry export directory containing these top-level collections:
+`ingest_registry_export()` and the `cloud_node ingest-registry` command accept a trusted registry export directory containing these top-level collections:
 
 ```text
 index/
@@ -80,13 +82,21 @@ artifacts/
       demo.rbe.zip
 ```
 
-Cloud Node stores these under the logical `registry/` prefix in its normal content-addressed store. That means package metadata, index snapshots/revisions, ownership records, release history, analytics, artifact metadata, and `.rbe.zip` artifacts all participate in the same provider snapshot.
+Ingest a materialized export with:
+
+```text
+cloud_node --config=setting.node.cn.json ingest-registry <export-root>
+```
+
+The command reports the number of metadata and artifact files plus the resulting Cloud Node logical path, object key, and content SHA-256 for each stored object. Ingestion rejects symlinks, unsafe paths, unknown collections, non-JSON metadata, non-`.rbe.zip` artifact payloads, and `package.rbe.json`.
+
+Cloud Node stores accepted files under the logical `registry/` prefix in its normal content-addressed store. That means package metadata, index snapshots/revisions, ownership records, release history, analytics, artifact metadata, and `.rbe.zip` artifacts all participate in the same provider snapshot.
 
 `package.rbe.json` is deliberately not accepted as registry archive metadata. Published package archives are opaque to Cloud Node. The trusted Kastrick publisher must verify the `.rbe.zip` and its internal `package.rbe.yaml` before exporting a release artifact to Cloud Node.
 
 ## Revision behavior
 
-Registry data does not get a second synchronization algorithm. It uses Cloud Node's existing provider history:
+Registry data does not get a second synchronization algorithm. It uses Cloud Node's existing provider history after ingestion:
 
 - local and provider heads equal: no-op
 - provider head is an ancestor of local: local is ahead, push
@@ -94,3 +104,5 @@ Registry data does not get a second synchronization algorithm. It uses Cloud Nod
 - unrelated heads: divergence; apply the configured conflict policy
 
 Immutable release artifacts remain content-addressed in Cloud Node and are uploaded through provider synchronization. The registry's own release immutability/yank semantics remain enforced by the Kastrick registry backend; Cloud Node is the durable synchronization/storage layer.
+
+The trusted publisher-to-export materialization step is intentionally separate from Cloud Node's storage engine. That boundary prevents Cloud Node from becoming a second registry authority or requiring access to client-facing RPX credentials.
