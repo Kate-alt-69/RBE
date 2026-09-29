@@ -14,8 +14,8 @@ use std::path::{Component, Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BuildDependencyCacheLayout, BuildDependencyEcosystem, BuildDependencyLock,
-    PinnedManagedTool, PinnedManagedToolchain, PinnedToolchainError, SourceFileDigest,
+    BuildDependencyCacheLayout, BuildDependencyEcosystem, BuildDependencyLock, PinnedManagedTool,
+    PinnedManagedToolchain, PinnedToolchainError, SourceFileDigest,
 };
 
 pub const DEFAULT_WEB_LOCK_TIMEOUT_SECONDS: u64 = 10 * 60;
@@ -176,12 +176,18 @@ impl WebLockResolutionPlan {
 
         let cache = path_text(&self.cache_root)?;
         let mut environment = BTreeMap::from([
-            ("RBE_HYDRATION_NETWORK".to_string(), "restricted".to_string()),
+            (
+                "RBE_HYDRATION_NETWORK".to_string(),
+                "restricted".to_string(),
+            ),
             ("RBE_HYDRATION_CACHE_ROOT".to_string(), cache.clone()),
         ]);
         let args = match self.tool {
             ManagedWebTool::Bun => {
-                environment.insert("BUN_INSTALL_CACHE_DIR".to_string(), format!("{cache}/bun-cache"));
+                environment.insert(
+                    "BUN_INSTALL_CACHE_DIR".to_string(),
+                    format!("{cache}/bun-cache"),
+                );
                 vec![
                     "install".to_string(),
                     "--lockfile-only".to_string(),
@@ -355,7 +361,10 @@ impl WebBuildPlan {
         ]);
         match self.tool {
             ManagedWebTool::Bun => {
-                environment.insert("BUN_INSTALL_CACHE_DIR".to_string(), format!("{cache}/bun-cache"));
+                environment.insert(
+                    "BUN_INSTALL_CACHE_DIR".to_string(),
+                    format!("{cache}/bun-cache"),
+                );
             }
             ManagedWebTool::Npm => {
                 environment.insert("npm_config_cache".to_string(), format!("{cache}/npm-cache"));
@@ -459,7 +468,9 @@ fn verify_dependency_lock(lock: &BuildDependencyLock) -> Result<(), WebBuildErro
     let metadata = std::fs::symlink_metadata(&lock.absolute_path)
         .map_err(|_| WebBuildError::MissingDependencyLock(lock.absolute_path.clone()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(WebBuildError::UnsafeDependencyLock(lock.absolute_path.clone()));
+        return Err(WebBuildError::UnsafeDependencyLock(
+            lock.absolute_path.clone(),
+        ));
     }
     let bytes = std::fs::read(&lock.absolute_path)?;
     lock.verify_bytes(&bytes)?;
@@ -710,7 +721,9 @@ mod tests {
         std::fs::write(source.join("bun.lock"), b"lock-v2").unwrap();
         assert!(matches!(
             plan.verify_before_spawn(),
-            Err(WebBuildError::Hydration(crate::HydrationError::LockHashMismatch { .. }))
+            Err(WebBuildError::Hydration(
+                crate::HydrationError::LockHashMismatch { .. }
+            ))
         ));
     }
 
