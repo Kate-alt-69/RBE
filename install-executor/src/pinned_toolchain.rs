@@ -9,11 +9,19 @@ use crate::{ExecutorError, ManagedToolchain};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedManagedTool {
-    pub path: PathBuf,
-    pub sha256: String,
+    path: PathBuf,
+    sha256: String,
 }
 
 impl PinnedManagedTool {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
     /// Re-hash this exact managed executable and return its path only when the
     /// bytes still match the identity captured at admission time.
     pub fn verify(&self, name: &str) -> Result<&Path, PinnedToolchainError> {
@@ -32,7 +40,7 @@ impl PinnedManagedTool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedManagedToolchain {
-    pub tools: BTreeMap<String, PinnedManagedTool>,
+    tools: BTreeMap<String, PinnedManagedTool>,
 }
 
 impl PinnedManagedToolchain {
@@ -56,6 +64,14 @@ impl PinnedManagedToolchain {
             return Err(PinnedToolchainError::EmptyToolchain);
         }
         Ok(Self { tools })
+    }
+
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
     }
 
     /// Re-hash one pinned tool and return its exact path only when the bytes
@@ -204,10 +220,9 @@ mod tests {
         let pinned = PinnedManagedToolchain::pin(&managed_toolchain(tool.clone())).unwrap();
 
         assert_eq!(pinned.verify_tool("runtime").unwrap(), tool.as_path());
-        assert_eq!(
-            pinned.verified_tool("runtime").unwrap().path,
-            tool.as_path()
-        );
+        assert_eq!(pinned.verified_tool("runtime").unwrap().path(), tool.as_path());
+        assert_eq!(pinned.len(), 1);
+        assert!(!pinned.is_empty());
         let verified = pinned.verify_all().unwrap();
         assert_eq!(verified.tools.get("runtime"), Some(&tool));
     }

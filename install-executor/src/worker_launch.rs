@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -25,16 +25,59 @@ pub struct WorkerLaunchPlan {
     source_files: Vec<SourceFileDigest>,
 }
 
+/// Opaque proof that worker process inputs passed the final source-only
+/// verification boundary.
+///
+/// Fields are intentionally private so downstream host code cannot construct or
+/// mutate a "verified" invocation without going through [`WorkerLaunchPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWorkerInvocation {
-    pub program: PathBuf,
-    pub args: Vec<OsString>,
-    pub working_directory: PathBuf,
-    pub clear_environment: bool,
-    pub environment: BTreeMap<String, String>,
-    pub direct_network_allowed: bool,
-    pub use_shell: bool,
-    pub startup_timeout_seconds: u64,
+    program: PathBuf,
+    args: Vec<OsString>,
+    working_directory: PathBuf,
+    clear_environment: bool,
+    environment: BTreeMap<String, String>,
+    direct_network_allowed: bool,
+    use_shell: bool,
+    startup_timeout_seconds: u64,
+}
+
+impl VerifiedWorkerInvocation {
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    pub fn working_directory(&self) -> &Path {
+        &self.working_directory
+    }
+
+    pub const fn clear_environment(&self) -> bool {
+        self.clear_environment
+    }
+
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
+
+    pub const fn direct_network_allowed(&self) -> bool {
+        self.direct_network_allowed
+    }
+
+    pub const fn use_shell(&self) -> bool {
+        self.use_shell
+    }
+
+    pub const fn startup_timeout_seconds(&self) -> u64 {
+        self.startup_timeout_seconds
+    }
+
+    pub fn entrypoint_arg(&self) -> Option<&OsStr> {
+        self.args.first().map(OsString::as_os_str)
+    }
 }
 
 impl WorkerLaunchPlan {
@@ -74,7 +117,7 @@ impl WorkerLaunchPlan {
         verify_source_tree(&self.source_root, &self.source_files)?;
 
         Ok(VerifiedWorkerInvocation {
-            program: self.program.path.clone(),
+            program: self.program.path().to_path_buf(),
             args: vec![self.entrypoint.as_os_str().to_os_string()],
             working_directory: self.source_root.clone(),
             clear_environment: true,
@@ -413,12 +456,18 @@ mod tests {
         let plan = WorkerLaunchPlan::managed_interpreter("bun", &pinned, &root, &entrypoint, files)
             .unwrap();
         let invocation = plan.verify_before_spawn().unwrap();
-        assert_eq!(invocation.args, vec![entrypoint.into_os_string()]);
-        assert_eq!(invocation.working_directory, root);
-        assert!(invocation.clear_environment);
-        assert!(invocation.environment.is_empty());
-        assert!(!invocation.direct_network_allowed);
-        assert!(!invocation.use_shell);
+        assert_eq!(invocation.args(), [entrypoint.into_os_string()]);
+        assert_eq!(invocation.entrypoint_arg(), invocation.args().first().map(OsString::as_os_str));
+        assert_eq!(invocation.working_directory(), root.as_path());
+        assert!(invocation.program().is_absolute());
+        assert!(invocation.clear_environment());
+        assert!(invocation.environment().is_empty());
+        assert!(!invocation.direct_network_allowed());
+        assert!(!invocation.use_shell());
+        assert_eq!(
+            invocation.startup_timeout_seconds(),
+            DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS
+        );
     }
 
     #[test]
