@@ -2469,6 +2469,7 @@ dependencies = [
 name = "rbe-install-executor"
 version = "0.1.0"
 dependencies = [
+ "ipc-protocol",
  "rbe-install-request",
  "rbe-library-package",
  "rbe-project-package",
