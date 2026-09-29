@@ -7,6 +7,8 @@
 #[path = "lib.rs"]
 mod control_plane;
 mod library_worker_proxy;
+mod library_worker_proxy_frame;
 
 pub use control_plane::*;
 pub use library_worker_proxy::*;
+pub use library_worker_proxy_frame::*;
