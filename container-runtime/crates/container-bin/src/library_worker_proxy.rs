@@ -123,7 +123,9 @@ fn verify_proxy_filesystem(
     collect_source_files(root, root, &mut observed_paths)?;
     if observed_paths != expected_paths {
         if let Some(path) = observed_paths.difference(&expected_paths).next() {
-            return Err(ContainerWorkerProxyError::UnexpectedSourceFile(path.clone()));
+            return Err(ContainerWorkerProxyError::UnexpectedSourceFile(
+                path.clone(),
+            ));
         }
         if let Some(path) = expected_paths.difference(&observed_paths).next() {
             return Err(ContainerWorkerProxyError::MissingSourceFile(path.clone()));
@@ -334,9 +336,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use ipc_protocol::{
-        LibraryWorkerProxySourceFile, LIBRARY_WORKER_PROXY_PROTOCOL_VERSION,
-    };
+    use ipc_protocol::{LibraryWorkerProxySourceFile, LIBRARY_WORKER_PROXY_PROTOCOL_VERSION};
 
     use super::*;
 
