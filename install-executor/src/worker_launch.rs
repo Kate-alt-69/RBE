@@ -457,7 +457,10 @@ mod tests {
             .unwrap();
         let invocation = plan.verify_before_spawn().unwrap();
         assert_eq!(invocation.args(), [entrypoint.into_os_string()]);
-        assert_eq!(invocation.entrypoint_arg(), invocation.args().first().map(OsString::as_os_str));
+        assert_eq!(
+            invocation.entrypoint_arg(),
+            invocation.args().first().map(OsString::as_os_str)
+        );
         assert_eq!(invocation.working_directory(), root.as_path());
         assert!(invocation.program().is_absolute());
         assert!(invocation.clear_environment());

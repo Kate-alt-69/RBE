@@ -220,7 +220,10 @@ mod tests {
         let pinned = PinnedManagedToolchain::pin(&managed_toolchain(tool.clone())).unwrap();
 
         assert_eq!(pinned.verify_tool("runtime").unwrap(), tool.as_path());
-        assert_eq!(pinned.verified_tool("runtime").unwrap().path(), tool.as_path());
+        assert_eq!(
+            pinned.verified_tool("runtime").unwrap().path(),
+            tool.as_path()
+        );
         assert_eq!(pinned.len(), 1);
         assert!(!pinned.is_empty());
         let verified = pinned.verify_all().unwrap();
