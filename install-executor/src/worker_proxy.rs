@@ -87,9 +87,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::{
-        ManagedToolchain, PinnedManagedToolchain, SourceFileHasher, WorkerLaunchPlan,
-    };
+    use crate::{ManagedToolchain, PinnedManagedToolchain, SourceFileHasher, WorkerLaunchPlan};
 
     use super::*;
 
@@ -158,7 +156,10 @@ mod tests {
 
         assert_eq!(bootstrap.program, runtime.to_str().unwrap());
         assert_eq!(bootstrap.program_sha256, invocation.program_sha256());
-        assert_eq!(bootstrap.args, vec![entrypoint.to_str().unwrap().to_string()]);
+        assert_eq!(
+            bootstrap.args,
+            vec![entrypoint.to_str().unwrap().to_string()]
+        );
         assert_eq!(
             bootstrap.working_directory,
             source_root.to_str().unwrap().to_string()
