@@ -2,6 +2,7 @@ export const LIBRARY_ABI_VERSION = 1;
 export const SDK_VERSION = "0.1.0";
 
 export const capability = Object.freeze({
+  LOG: "log",
   NET_HTTP: "net:http",
   NET_COOKIES: "net:cookies",
   NET_HEADERS: "net:headers",
@@ -29,6 +30,13 @@ function assertBridge(bridge) {
 
 function validComponent(value) {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value);
+}
+
+function assertLibraryName(value) {
+  if (!validComponent(value)) {
+    throw new TypeError(`invalid RBE library name ${JSON.stringify(value)}`);
+  }
+  return value;
 }
 
 function isPromiseLike(value) {
@@ -84,9 +92,7 @@ function bridgeSessionInfo(bridge) {
 }
 
 export function libraryDescriptor({ name, version, abiMin = 1, abiMax = abiMin }) {
-  if (!validComponent(name)) {
-    throw new TypeError(`invalid RBE library name ${JSON.stringify(name)}`);
-  }
+  assertLibraryName(name);
   if (!Number.isInteger(abiMin) || !Number.isInteger(abiMax) || abiMin < 1 || abiMin > abiMax) {
     throw new TypeError(`invalid RBE ABI range ${abiMin}..=${abiMax}`);
   }
@@ -223,7 +229,40 @@ export class CapabilityClient {
   }
 }
 
-class NetClient {
+export class LoggerClient {
+  constructor(bridge, libraryName, scope = []) {
+    assertBridge(bridge);
+    this.bridge = bridge;
+    this.libraryName = assertLibraryName(libraryName);
+    this.scope = Object.freeze([...scope]);
+  }
+
+  target() {
+    return `lib/${this.libraryName}`;
+  }
+
+  child(name) {
+    if (!validComponent(name)) {
+      throw new TypeError(`invalid RBE logger child scope ${JSON.stringify(name)}`);
+    }
+    return new LoggerClient(this.bridge, this.libraryName, [...this.scope, name]);
+  }
+
+  emit(level, message) {
+    return new CapabilityClient(this.bridge, capability.LOG, this.target()).call(level, {
+      scope: this.scope,
+      message: String(message)
+    });
+  }
+
+  debug(message) { return this.emit("debug", message); }
+  info(message) { return this.emit("info", message); }
+  warn(message) { return this.emit("warn", message); }
+  error(message) { return this.emit("error", message); }
+  fatal(message) { return this.emit("fatal", message); }
+}
+
+export class NetClient {
   constructor(bridge) {
     this.bridge = bridge;
   }
@@ -236,6 +275,16 @@ class NetClient {
   }
 
   http() { return new CapabilityClient(this.bridge, capability.NET_HTTP); }
+  cookies() { return new CapabilityClient(this.bridge, capability.NET_COOKIES); }
+  headers() { return new CapabilityClient(this.bridge, capability.NET_HEADERS); }
+  url() { return new CapabilityClient(this.bridge, capability.NET_URL); }
+  dns() { return new CapabilityClient(this.bridge, capability.NET_DNS); }
+  ip() { return new CapabilityClient(this.bridge, capability.NET_IP); }
+  tcp() { return new CapabilityClient(this.bridge, capability.NET_TCP); }
+  udp() { return new CapabilityClient(this.bridge, capability.NET_UDP); }
+  quic() { return new CapabilityClient(this.bridge, capability.NET_QUIC); }
+  websocket() { return new CapabilityClient(this.bridge, capability.NET_WEBSOCKET); }
+  webtransport() { return new CapabilityClient(this.bridge, capability.NET_WEBTRANSPORT); }
   p2p() { return new CapabilityClient(this.bridge, capability.NET_P2P); }
   mask() { return new CapabilityClient(this.bridge, capability.NET_MASK); }
 }
@@ -296,9 +345,18 @@ export class AdvancedClient {
 }
 
 export class RbeSdk {
-  constructor(bridge) {
+  constructor(bridge, libraryName = null) {
     assertBridge(bridge);
+    if (libraryName !== null) assertLibraryName(libraryName);
     this.bridge = bridge;
+    this.libraryName = libraryName;
+  }
+
+  log() {
+    if (this.libraryName === null) {
+      throw new Error("RBE SDK logging requires the verified library name");
+    }
+    return new LoggerClient(this.bridge, this.libraryName);
   }
 
   net() { return new NetClient(this.bridge); }
@@ -316,7 +374,7 @@ export class RbeSdk {
   }
 
   intercept(...interceptors) {
-    return new RbeSdk(new InterceptedBridge(this.bridge, interceptors));
+    return new RbeSdk(new InterceptedBridge(this.bridge, interceptors), this.libraryName);
   }
 
   hostBridge() {
