@@ -1,0 +1,43 @@
+name: Format DNS one-shot
+
+on:
+  push:
+    paths:
+      - '.github/workflows/format-dns-one-shot.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format only DNS capability files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2021 engine/crates/backend/src/package_links/approval.rs
+          rustfmt --edition 2021 engine/crates/core/src/dns_broker.rs
+          git diff --check
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' \
+            engine/crates/backend/src/package_links/approval.rs \
+            engine/crates/core/src/dns_broker.rs | sort)"
+          if [ "$changed" != "$expected" ]; then
+            echo "Unexpected formatter diff:" >&2
+            printf '%s\n' "$changed" >&2
+            exit 1
+          fi
+          git rm .github/workflows/format-dns-one-shot.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add engine/crates/backend/src/package_links/approval.rs engine/crates/core/src/dns_broker.rs
+          git commit -m 'FIX | BUG-SDK-DNS-146 satisfy DNS rustfmt gate'
+          git pull --rebase origin main
+          git push origin HEAD:main
