@@ -96,11 +96,7 @@ fn package_http_grant() -> anyhow::Result<LibraryCapabilityGrant> {
     LibraryCapabilityGrant::new(
         LIBRARY_NET_HTTP_CAPABILITY,
         LIBRARY_NET_HTTP_CAPABILITY,
-        [
-            "get".to_string(),
-            "post".to_string(),
-            "request".to_string(),
-        ],
+        ["get".to_string(), "post".to_string(), "request".to_string()],
         MAX_LIBRARY_PAYLOAD_BYTES,
         MAX_LIBRARY_PAYLOAD_BYTES,
     )
@@ -156,8 +152,7 @@ pub async fn dispatch_authorized_host_call(
 }
 
 async fn dispatch_package_http_call(call: &LibraryHostCall) -> anyhow::Result<Vec<u8>> {
-    if call.capability != LIBRARY_NET_HTTP_CAPABILITY
-        || call.target != LIBRARY_NET_HTTP_CAPABILITY
+    if call.capability != LIBRARY_NET_HTTP_CAPABILITY || call.target != LIBRARY_NET_HTTP_CAPABILITY
     {
         bail!("package HTTP call does not match admitted net:http authority");
     }

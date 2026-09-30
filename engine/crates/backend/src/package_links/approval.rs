@@ -53,16 +53,19 @@ struct PackageApproval {
 /// Custom/package-private names intentionally do not appear here. Private
 /// dependencies also cannot widen root authority: the root package is the host
 /// security principal and must request any RBE-owned privilege it needs.
-pub(crate) fn install_requests(graph: &VerifiedRootGraph) -> anyhow::Result<Vec<HostPrivilegeRequest>> {
+pub(crate) fn install_requests(
+    graph: &VerifiedRootGraph,
+) -> anyhow::Result<Vec<HostPrivilegeRequest>> {
     let verified = graph
         .packages
         .get(&graph.root)
         .with_context(|| format!("verified graph is missing root package {:?}", graph.root))?;
-    let locked = graph
-        .lock
-        .packages
-        .get(&graph.root)
-        .with_context(|| format!("verified graph lock is missing root package {:?}", graph.root))?;
+    let locked = graph.lock.packages.get(&graph.root).with_context(|| {
+        format!(
+            "verified graph lock is missing root package {:?}",
+            graph.root
+        )
+    })?;
 
     let mut requests = Vec::new();
     for (capability, enabled) in &verified.manifest.capabilities {
@@ -154,11 +157,12 @@ pub(crate) fn persist_install_approval(
     approved_runtime: &[String],
 ) -> anyhow::Result<()> {
     validate_sha256(project_lock_sha256, "project lock")?;
-    let locked = graph
-        .lock
-        .packages
-        .get(&graph.root)
-        .with_context(|| format!("verified graph lock is missing root package {:?}", graph.root))?;
+    let locked = graph.lock.packages.get(&graph.root).with_context(|| {
+        format!(
+            "verified graph lock is missing root package {:?}",
+            graph.root
+        )
+    })?;
 
     let requested = graph
         .packages
@@ -206,9 +210,7 @@ pub(crate) fn persist_install_approval(
 
 pub(crate) fn explicit_host_privilege_description(capability: &str) -> Option<&'static str> {
     match capability {
-        "net:http" => Some(
-            "make public HTTP/HTTPS requests through RBE's hardened network broker",
-        ),
+        "net:http" => Some("make public HTTP/HTTPS requests through RBE's hardened network broker"),
         // `log` is an implicit package-scoped host capability and never needs a
         // privilege prompt. Unknown/custom names remain package-private until a
         // trusted RBE host provider explicitly registers them.
@@ -225,7 +227,10 @@ fn read_state(project_root: &Path) -> anyhow::Result<Option<ApprovalState>> {
     match fs::symlink_metadata(&path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                bail!("RBE package approval state is not a regular file: {}", path.display());
+                bail!(
+                    "RBE package approval state is not a regular file: {}",
+                    path.display()
+                );
             }
             let bytes = fs::read(&path)
                 .with_context(|| format!("read RBE package approval state: {}", path.display()))?;
@@ -242,23 +247,39 @@ fn read_state(project_root: &Path) -> anyhow::Result<Option<ApprovalState>> {
 fn write_state(project_root: &Path, state: &ApprovalState) -> anyhow::Result<()> {
     validate_state(state)?;
     let rbe = project_root.join(".rbe");
-    fs::create_dir_all(&rbe)
-        .with_context(|| format!("create project-local RBE state directory: {}", rbe.display()))?;
-    let metadata = fs::symlink_metadata(&rbe)
-        .with_context(|| format!("inspect project-local RBE state directory: {}", rbe.display()))?;
+    fs::create_dir_all(&rbe).with_context(|| {
+        format!(
+            "create project-local RBE state directory: {}",
+            rbe.display()
+        )
+    })?;
+    let metadata = fs::symlink_metadata(&rbe).with_context(|| {
+        format!(
+            "inspect project-local RBE state directory: {}",
+            rbe.display()
+        )
+    })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!("project-local RBE state path is not a regular directory: {}", rbe.display());
+        bail!(
+            "project-local RBE state path is not a regular directory: {}",
+            rbe.display()
+        );
     }
 
     let path = approval_path(project_root);
     let temporary = rbe.join(format!(".{APPROVAL_FILE}.tmp-{}", std::process::id()));
     let bytes = serde_json::to_vec_pretty(state).context("serialize RBE package approval state")?;
-    fs::write(&temporary, bytes)
-        .with_context(|| format!("write temporary RBE package approval state: {}", temporary.display()))?;
+    fs::write(&temporary, bytes).with_context(|| {
+        format!(
+            "write temporary RBE package approval state: {}",
+            temporary.display()
+        )
+    })?;
 
     if path.exists() {
-        fs::remove_file(&path)
-            .with_context(|| format!("replace old RBE package approval state: {}", path.display()))?;
+        fs::remove_file(&path).with_context(|| {
+            format!("replace old RBE package approval state: {}", path.display())
+        })?;
     }
     fs::rename(&temporary, &path).with_context(|| {
         format!(
@@ -304,7 +325,10 @@ fn current_project_lock_sha256(project_root: &Path) -> anyhow::Result<String> {
     let metadata = fs::symlink_metadata(&path)
         .with_context(|| format!("inspect active project package lock: {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("active project package lock is not a regular file: {}", path.display());
+        bail!(
+            "active project package lock is not a regular file: {}",
+            path.display()
+        );
     }
     let bytes = fs::read(&path)
         .with_context(|| format!("read active project package lock: {}", path.display()))?;
