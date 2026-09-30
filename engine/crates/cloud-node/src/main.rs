@@ -1,11 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Context;
 use cloud_node::{
     ingest_registry_export, load_signing_key_from_env, negotiate_sync, probe_upstream,
-    provider_status, public_key_hex, synchronize_provider, synchronize_upstream, CloudNodeSettings,
-    CloudNodeStore, ProviderClient, SETTINGS_FILE_NAME,
+    provider_status, public_key_hex, synchronize_provider, synchronize_registry_export,
+    synchronize_upstream, CloudNodeSettings, CloudNodeStore, ProviderClient, SETTINGS_FILE_NAME,
 };
 
 #[tokio::main]
@@ -131,23 +130,16 @@ async fn run() -> anyhow::Result<()> {
             if args.len() != 2 {
                 anyhow::bail!("sync-registry requires <export-root>");
             }
-            if settings.provider.is_none() {
-                anyhow::bail!("sync-registry requires Cloud Node provider mode");
-            }
             let export_root = Path::new(&args[1]);
-            let ingested = ingest_registry_export(&store, export_root)?;
-            println!("ingestFiles={}", ingested.files);
-            println!("ingestMetadataFiles={}", ingested.metadata_files);
-            println!("ingestArtifactFiles={}", ingested.artifact_files);
-            println!("ingestRemovedFiles={}", ingested.removed_files);
-
-            let result = synchronize_provider(&settings, &store)
-                .await
-                .context("registry export was ingested locally but provider synchronization failed")?;
-            println!("before={:?}", result.before.relation);
-            println!("action={:?}", result.action);
-            println!("head={}", result.final_head);
-            println!("root={}", result.final_root);
+            let result = synchronize_registry_export(&settings, &store, export_root).await?;
+            println!("ingestFiles={}", result.ingest.files);
+            println!("ingestMetadataFiles={}", result.ingest.metadata_files);
+            println!("ingestArtifactFiles={}", result.ingest.artifact_files);
+            println!("ingestRemovedFiles={}", result.ingest.removed_files);
+            println!("before={:?}", result.provider.before.relation);
+            println!("action={:?}", result.provider.action);
+            println!("head={}", result.provider.final_head);
+            println!("root={}", result.provider.final_root);
         }
         "run" => run_daemon(&settings, &store, &project_root).await?,
         "sync-plan" => {
