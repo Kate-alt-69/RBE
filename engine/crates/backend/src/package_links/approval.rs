@@ -202,7 +202,10 @@ fn write_state(project_root: &Path, state: &ApprovalState) -> anyhow::Result<()>
     let rbe = project_root.join(".rbe");
     match fs::symlink_metadata(&rbe) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            bail!("RBE project state root is not a regular directory: {}", rbe.display())
+            bail!(
+                "RBE project state root is not a regular directory: {}",
+                rbe.display()
+            )
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -224,7 +227,8 @@ fn write_state(project_root: &Path, state: &ApprovalState) -> anyhow::Result<()>
             );
         }
     }
-    let mut bytes = serde_json::to_vec_pretty(state).context("encode RBE package approval state")?;
+    let mut bytes =
+        serde_json::to_vec_pretty(state).context("encode RBE package approval state")?;
     bytes.push(b'\n');
     fs::write(&path, bytes)
         .with_context(|| format!("write RBE package approval state: {}", path.display()))
