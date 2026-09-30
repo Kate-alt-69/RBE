@@ -91,9 +91,9 @@ pub(crate) fn approved_runtime_capabilities(
 pub(crate) fn explicit_host_privilege_description(capability: &str) -> Option<&'static str> {
     match capability {
         "net:http" => Some("make public HTTP/HTTPS requests through RBE's hardened network broker"),
-        "net:dns" => Some(
-            "resolve public DNS address and MX records through RBE's bounded DNS broker",
-        ),
+        "net:dns" => {
+            Some("resolve public DNS address and MX records through RBE's bounded DNS broker")
+        }
         // `log` is an implicit package-scoped host capability and never needs a
         // privilege prompt. Unknown/custom names remain package-private until a
         // trusted RBE host provider explicitly registers them.

@@ -125,7 +125,10 @@ fn parse_query_name(payload: &[u8]) -> Result<String, PublicDnsError> {
         let candidate = match value {
             Value::String(value) => Some(value),
             Value::Array(values) => values.first().and_then(Value::as_str).map(str::to_string),
-            Value::Object(values) => values.get("name").and_then(Value::as_str).map(str::to_string),
+            Value::Object(values) => values
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             _ => None,
         };
         if let Some(candidate) = candidate {
@@ -152,12 +155,10 @@ fn normalize_dns_name(value: &str) -> Result<String, PublicDnsError> {
         ));
     }
     let lower = bare.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "localhost" | "localhost.localdomain"
-    ) || [".local", ".localhost", ".internal", ".home", ".lan"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
+    if matches!(lower.as_str(), "localhost" | "localhost.localdomain")
+        || [".local", ".localhost", ".internal", ".home", ".lan"]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
     {
         return Err(dns_error("DNS package query targets a local-only domain"));
     }
@@ -225,20 +226,40 @@ mod tests {
     #[test]
     fn query_names_are_forced_to_fqdn_form() {
         assert_eq!(normalize_dns_name("GMAIL.COM").unwrap(), "gmail.com.");
-        assert_eq!(normalize_dns_name("mx.example.com.").unwrap(), "mx.example.com.");
+        assert_eq!(
+            normalize_dns_name("mx.example.com.").unwrap(),
+            "mx.example.com."
+        );
     }
 
     #[test]
     fn local_and_single_label_names_fail_closed() {
-        for value in ["localhost", "printer", "smtp.local", "mx.internal", "mail.home"] {
-            assert!(normalize_dns_name(value).is_err(), "{value} should be rejected");
+        for value in [
+            "localhost",
+            "printer",
+            "smtp.local",
+            "mx.internal",
+            "mail.home",
+        ] {
+            assert!(
+                normalize_dns_name(value).is_err(),
+                "{value} should be rejected"
+            );
         }
     }
 
     #[test]
     fn malformed_labels_fail_closed() {
-        for value in ["-mail.example", "mail-.example", "mail..example", "mail_1.example"] {
-            assert!(normalize_dns_name(value).is_err(), "{value} should be rejected");
+        for value in [
+            "-mail.example",
+            "mail-.example",
+            "mail..example",
+            "mail_1.example",
+        ] {
+            assert!(
+                normalize_dns_name(value).is_err(),
+                "{value} should be rejected"
+            );
         }
     }
 
@@ -256,7 +277,10 @@ mod tests {
             "fe80::1",
             "2001:db8::1",
         ] {
-            assert!(forbidden_ip(ip.parse().unwrap()), "{ip} should be forbidden");
+            assert!(
+                forbidden_ip(ip.parse().unwrap()),
+                "{ip} should be forbidden"
+            );
         }
         assert!(!forbidden_ip("1.1.1.1".parse().unwrap()));
         assert!(!forbidden_ip("2606:4700:4700::1111".parse().unwrap()));
