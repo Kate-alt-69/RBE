@@ -352,11 +352,11 @@ export class RbeSdk {
     this.libraryName = libraryName;
   }
 
-  log() {
-    if (this.libraryName === null) {
-      throw new Error("RBE SDK logging requires the verified library name");
+  log(libraryName = this.libraryName) {
+    if (libraryName === null) {
+      throw new Error("RBE SDK logging requires an explicit library name");
     }
-    return new LoggerClient(this.bridge, this.libraryName);
+    return new LoggerClient(this.bridge, libraryName);
   }
 
   net() { return new NetClient(this.bridge); }
