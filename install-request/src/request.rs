@@ -297,7 +297,7 @@ fn split_named_version(
         {
             let key = parts[..split].join(".");
             validate_install_key(&key)?;
-            return Ok(Some((key, VersionSelector::parse(&suffix.join("."))?));
+            return Ok(Some((key, VersionSelector::parse(&suffix.join("."))?)));
         }
     }
     Ok(None)

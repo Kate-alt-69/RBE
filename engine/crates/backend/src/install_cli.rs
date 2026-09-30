@@ -4,10 +4,13 @@
 //! artifact, inspect package manifests, construct an exact root-scoped lock
 //! candidate, durably promote verified artifacts into the content-addressed
 //! project cache, merge with current project state, and atomically activate
-//! fully prebuilt graphs before normal Backend boot. Packages that require host
-//! compilation remain gated until the managed build executor is connected.
+//! fully prebuilt graphs before normal Backend boot. SDK installs bootstrap the
+//! separately built, verified project-local SDK bundle and then let that bundle
+//! own SDK installation/repair semantics.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rbe_install_request::{InstallCommand, InstallTarget};
 use rbe_install_runtime::{
@@ -17,6 +20,12 @@ use rbe_install_runtime::{
 use rbe_library_resolver::{resolve_scoped, ResolutionRequest};
 
 const REGISTRY_ENV: &str = "RBE_PACKAGE_REGISTRY";
+const DEFAULT_REGISTRY_BASE: &str = "https://kastrick-backend.onrender.com";
+#[cfg(windows)]
+const POWERSHELL_SDK_INSTALLER: &str =
+    "https://kastrick-backend.onrender.com/api/sdk/install.ps1";
+#[cfg(not(windows))]
+const SHELL_SDK_INSTALLER: &str = "https://kastrick-backend.onrender.com/api/sdk/install.sh";
 
 const HELP: &str = r#"RBE package installer
 
@@ -28,8 +37,15 @@ Named package examples:
   advancenet
   advancenet.4.0.1
 
+SDK bootstrap examples:
+  backend install sdk.latest -path=. -language=typescript
+  backend install sdk.0.1.0 --path . --language typescript
+
 Options:
   -version <version> | --version <version>
+  -path <project> | -path=<project>             SDK bootstrap
+  -language <language> | -language=<language>  SDK bootstrap
+  -toolchain <file> | -toolchain=<file>        SDK bootstrap
   -shared
   -force
   -no-cache
@@ -37,8 +53,12 @@ Options:
   -json
   -quiet
 
+SDK languages:
+  rust | javascript | typescript | python | global
+
 Registry configuration:
-  RBE_PACKAGE_REGISTRY=https://<trusted-registry-base>/
+  default: https://kastrick-backend.onrender.com
+  RBE_PACKAGE_REGISTRY=https://<trusted-registry-base>/  overrides the default
 
 Current execution boundary:
   Named-package registry hydration, deterministic dependency resolution,
@@ -46,8 +66,11 @@ Current execution boundary:
   construction, durable content-addressed artifact promotion, safe project
   state merge, attestation, crash-recoverable install sessions, and atomic
   project activation are active before Backend boot for package graphs that
-  require no host build steps. Packages that require compilation fail closed
-  until the managed build executor is connected."#;
+  require no host build steps. SDK bootstrap downloads the fixed Kastrick
+  installer over HTTPS; that installer verifies the selected SDK release
+  archive SHA-256 before the project-local SDK backend installs it. Packages
+  that require compilation still fail closed until the managed build executor
+  is connected."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCliFailure {
@@ -104,32 +127,192 @@ pub fn requested(args: &[String]) -> Option<Result<String, InstallCliFailure>> {
     };
 
     match &command.target {
-        InstallTarget::Named { key, .. } if key != "sdk" && !key.starts_with("runtime.") => {
+        InstallTarget::Named { key, .. } if key == "sdk" => Some(bootstrap_sdk(command)),
+        InstallTarget::Named { key, .. } if !key.starts_with("runtime.") => {
             Some(resolve_named(command))
         }
-        // SDK/runtime and external/local archive execution remain owned by
-        // their existing lanes. Let the legacy dispatcher preserve its current
-        // explicit unavailable behavior rather than stealing those commands.
+        // Runtime and external/local archive execution remain owned by their
+        // existing lanes. Let the legacy dispatcher preserve current behavior.
         InstallTarget::Named { .. }
         | InstallTarget::External { .. }
         | InstallTarget::LocalArchive(_) => None,
     }
 }
 
+fn bootstrap_sdk(command: InstallCommand) -> Result<String, InstallCliFailure> {
+    let InstallCommand { target, flags } = command;
+    let InstallTarget::Named { key, version } = target else {
+        return Err(InstallCliFailure::software(
+            "internal SDK installer dispatch selected a non-named target",
+        ));
+    };
+    if key != "sdk" {
+        return Err(InstallCliFailure::software(
+            "internal SDK installer dispatch selected a non-SDK target",
+        ));
+    }
+    if flags.shared
+        || flags.force
+        || flags.no_cache
+        || flags.refresh_index
+        || flags.json
+        || flags.quiet
+    {
+        return Err(InstallCliFailure::usage(
+            "SDK bootstrap accepts only -version, -path, -language, and -toolchain options",
+        ));
+    }
+
+    let project = flags.path.unwrap_or_else(|| PathBuf::from("."));
+    let language = flags.language.unwrap_or_else(|| "global".to_string());
+    let version = version
+        .map(|selector| selector.raw)
+        .unwrap_or_else(|| "latest".to_string());
+
+    run_sdk_bootstrap(
+        &project,
+        &language,
+        &version,
+        flags.toolchain.as_deref(),
+    )?;
+
+    Ok(format!(
+        "RBE SDK bootstrap completed for {} ({language}, {version}). No RBE server was started.",
+        project.display()
+    ))
+}
+
+#[cfg(windows)]
+fn run_sdk_bootstrap(
+    project: &Path,
+    language: &str,
+    version: &str,
+    toolchain: Option<&Path>,
+) -> Result<(), InstallCliFailure> {
+    let script = temporary_bootstrap_path("ps1")?;
+    let download = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Invoke-WebRequest -UseBasicParsing -Uri $env:RBE_SDK_BOOTSTRAP_URL -OutFile $env:RBE_SDK_BOOTSTRAP_FILE",
+        ])
+        .env("RBE_SDK_BOOTSTRAP_URL", POWERSHELL_SDK_INSTALLER)
+        .env("RBE_SDK_BOOTSTRAP_FILE", &script)
+        .status()
+        .map_err(|error| {
+            InstallCliFailure::unavailable(format!(
+                "start PowerShell SDK bootstrap download: {error}"
+            ))
+        })?;
+    if !download.success() {
+        let _ = std::fs::remove_file(&script);
+        return Err(InstallCliFailure::unavailable(format!(
+            "download SDK bootstrap from {POWERSHELL_SDK_INSTALLER} failed with status {download}"
+        )));
+    }
+
+    let mut process = Command::new("powershell.exe");
+    process
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Path")
+        .arg(project)
+        .arg("-Language")
+        .arg(language)
+        .arg("-Version")
+        .arg(version);
+    if let Some(toolchain) = toolchain {
+        process.arg("-Toolchain").arg(toolchain);
+    }
+    let status = process.status().map_err(|error| {
+        let _ = std::fs::remove_file(&script);
+        InstallCliFailure::unavailable(format!("start verified SDK bootstrap: {error}"))
+    })?;
+    let _ = std::fs::remove_file(&script);
+    if !status.success() {
+        return Err(InstallCliFailure::unavailable(format!(
+            "verified SDK bootstrap failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn run_sdk_bootstrap(
+    project: &Path,
+    language: &str,
+    version: &str,
+    toolchain: Option<&Path>,
+) -> Result<(), InstallCliFailure> {
+    let script = temporary_bootstrap_path("sh")?;
+    let download = Command::new("curl")
+        .args(["-fsSL", "--retry", "3", SHELL_SDK_INSTALLER, "-o"])
+        .arg(&script)
+        .status()
+        .map_err(|error| {
+            InstallCliFailure::unavailable(format!("start SDK bootstrap download with curl: {error}"))
+        })?;
+    if !download.success() {
+        let _ = std::fs::remove_file(&script);
+        return Err(InstallCliFailure::unavailable(format!(
+            "download SDK bootstrap from {SHELL_SDK_INSTALLER} failed with status {download}"
+        )));
+    }
+
+    let mut process = Command::new("sh");
+    process
+        .arg(&script)
+        .arg("--path")
+        .arg(project)
+        .arg("--language")
+        .arg(language)
+        .arg("--version")
+        .arg(version);
+    if let Some(toolchain) = toolchain {
+        process.arg("--toolchain").arg(toolchain);
+    }
+    let status = process.status().map_err(|error| {
+        let _ = std::fs::remove_file(&script);
+        InstallCliFailure::unavailable(format!("start verified SDK bootstrap: {error}"))
+    })?;
+    let _ = std::fs::remove_file(&script);
+    if !status.success() {
+        return Err(InstallCliFailure::unavailable(format!(
+            "verified SDK bootstrap failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+fn temporary_bootstrap_path(extension: &str) -> Result<PathBuf, InstallCliFailure> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| InstallCliFailure::software(format!("read system clock: {error}")))?
+        .as_nanos();
+    Ok(std::env::temp_dir().join(format!(
+        "rbe-sdk-bootstrap-{}-{nonce}.{extension}",
+        std::process::id()
+    )))
+}
+
 fn resolve_named(command: InstallCommand) -> Result<String, InstallCliFailure> {
-    let InstallTarget::Named { key, version } = command.target else {
+    let InstallCommand { target, flags } = command;
+    let InstallTarget::Named { key, version } = target else {
         return Err(InstallCliFailure::software(
             "internal installer dispatch selected a non-named target",
         ));
     };
+    if flags.path.is_some() || flags.language.is_some() || flags.toolchain.is_some() {
+        return Err(InstallCliFailure::usage(
+            "-path, -language, and -toolchain are SDK bootstrap options",
+        ));
+    }
     let requirement = version
         .map(|version| version.requirement)
         .unwrap_or_else(|| "*".to_string());
-    let registry = std::env::var(REGISTRY_ENV).map_err(|_| {
-        InstallCliFailure::config(format!(
-            "named package installation requires {REGISTRY_ENV}=https://<registry-base>/"
-        ))
-    })?;
+    let registry = std::env::var(REGISTRY_ENV).unwrap_or_else(|_| DEFAULT_REGISTRY_BASE.to_string());
     if registry.trim().is_empty() {
         return Err(InstallCliFailure::config(format!(
             "{REGISTRY_ENV} must not be empty"
@@ -139,8 +322,8 @@ fn resolve_named(command: InstallCommand) -> Result<String, InstallCliFailure> {
         InstallCliFailure::software(format!("resolve package project directory: {error}"))
     })?;
 
-    let json = command.flags.json;
-    let quiet = command.flags.quiet;
+    let json = flags.json;
+    let quiet = flags.quiet;
     let key_for_worker = key.clone();
     let requirement_for_worker = requirement.clone();
     let registry_for_worker = registry.clone();
@@ -412,9 +595,29 @@ mod tests {
     }
 
     #[test]
-    fn reserved_and_external_targets_remain_outside_this_lane() {
-        assert!(requested(&args(&["install", "sdk.0.1.0"])).is_none());
+    fn named_package_rejects_sdk_only_flags_before_network_work() {
+        let result = requested(&args(&[
+            "install",
+            "advancenet",
+            "-language=typescript",
+        ]))
+        .expect("named install must be intercepted")
+        .expect_err("SDK-only flag must fail");
+        assert_eq!(result.code, 2);
+        assert!(result.message.contains("SDK bootstrap options"));
+    }
+
+    #[test]
+    fn runtime_and_external_targets_remain_outside_this_lane() {
         assert!(requested(&args(&["install", "runtime.python.3.10"])).is_none());
         assert!(requested(&args(&["install", "https://example.com/package.rbe-pkg"])).is_none());
+    }
+
+    #[test]
+    fn temporary_bootstrap_names_are_process_scoped() {
+        let path = temporary_bootstrap_path("test").unwrap();
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(&format!("rbe-sdk-bootstrap-{}-", std::process::id())));
+        assert!(name.ends_with(".test"));
     }
 }
