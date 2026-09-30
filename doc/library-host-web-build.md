@@ -182,9 +182,11 @@ The live proxy relays stderr separately from the Library Protocol channel.
 
 ### 4.2 Current integration boundary
 
-`LIBHOST-046` implements the secure live Container relay itself. Backend still needs the final owner-side integration that selects the trusted packaged proxy executable, sends the sealed bootstrap, consumes `library.proxy.ready`, attaches the resulting channel to the retained `LibrarySessionBinding`, and requires the existing `library.hello` handshake before exposing the package worker as live.
+`LIBHOST-046` implements the secure live Container relay itself. Route Engine now also exposes a Runtime-Image-only package-export injection point: a trusted host can supply `PackageExportCaller`, and linked `X from Y` Module REL calls are forwarded through that logical package/export/operation bridge. The legacy filesystem router deliberately has no such package runtime because it has not passed the immutable `PackageLinkContext` gate.
 
-Until that owner path is connected, documentation must not claim that every installed package worker is already launched end-to-end through live proxy mode.
+Backend still needs the final owner-side worker integration that selects the trusted packaged proxy executable, sends the sealed bootstrap, consumes `library.proxy.ready`, attaches the resulting channel to the retained `LibrarySessionBinding`, requires the existing `library.hello` handshake, and implements `PackageExportCaller` on top of that accepted live worker channel.
+
+Until that owner path is connected, documentation must not claim that every installed package worker is already launched end-to-end through live proxy mode. A Runtime Image accepting a package caller is an execution injection boundary, not proof that Backend has started or accepted the corresponding worker.
 
 ## 5. Managed web build contracts
 

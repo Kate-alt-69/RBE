@@ -212,6 +212,24 @@ pub fn build_routes_from_image(
     discovery::build_routes_from_image(image, service_interfaces)
 }
 
+/// Build a Runtime Image router with a trusted package-export bridge.
+///
+/// Only the immutable Runtime Image path accepts this caller because RELC has
+/// already validated every `X from Y` import against the verified root-only
+/// `PackageLinkContext`. The legacy filesystem loader intentionally remains
+/// package-runtime-free.
+pub fn build_routes_from_image_with_package_exports(
+    image: &RuntimeImage,
+    service_interfaces: &ServiceInterfaces,
+    package_exports: std::sync::Arc<dyn PackageExportCaller>,
+) -> anyhow::Result<axum::Router<core_lib::AppState>> {
+    discovery::build_routes_from_image_with_package_exports(
+        image,
+        service_interfaces,
+        Some(package_exports),
+    )
+}
+
 /// Validate the immutable Runtime Image against native API namespaces and
 /// route/method collisions before backend boot launches any child processes.
 pub fn validate_runtime_image_routes(image: &RuntimeImage) -> anyhow::Result<()> {

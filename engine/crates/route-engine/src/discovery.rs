@@ -29,7 +29,7 @@ use crate::analyzer::{analyze, Severity};
 use crate::ast::{FunctionDef, ModuleFile, RouteFile, Value};
 use crate::field_manager::{FieldResolveError, FieldRoutePlan};
 use crate::lexer::Lexer;
-use crate::module_eval::ModuleExecutor;
+use crate::module_eval::{ModuleExecutor, PackageExportCaller};
 use crate::module_runtime::{ModuleProgram, ServiceInterfaces};
 use crate::modules::binding_name;
 use crate::parser::Parser;
@@ -1535,6 +1535,7 @@ struct RouteHandlerPlan {
     module_program: Arc<ModuleProgram>,
     native_plan: Option<Arc<NativeRoutePlan>>,
     field_plan: Arc<FieldRoutePlan>,
+    package_exports: Option<Arc<dyn PackageExportCaller>>,
     takes_request: bool,
 }
 
@@ -1550,6 +1551,7 @@ async fn execute(
         module_program,
         native_plan,
         field_plan,
+        package_exports,
         takes_request,
     } = plan;
     let path = request.uri().path().to_string();
@@ -1675,6 +1677,10 @@ async fn execute(
         state.services.clone(),
         Arc::new(host),
     );
+    let executor = match package_exports {
+        Some(package_exports) => executor.with_package_export_caller(package_exports),
+        None => executor,
+    };
     match executor
         .call_inline(inline_file, INLINE_ROUTE_HANDLER, args)
         .await
@@ -1706,6 +1712,7 @@ fn build_method_router(
     module_program: Arc<ModuleProgram>,
     native_plan: Option<Arc<NativeRoutePlan>>,
     field_plan: Arc<FieldRoutePlan>,
+    package_exports: Option<Arc<dyn PackageExportCaller>>,
 ) -> MethodRouter<AppState> {
     let mut router = MethodRouter::<AppState>::new();
     for method_def in &file.methods {
@@ -1725,6 +1732,7 @@ fn build_method_router(
             module_program: module_program.clone(),
             native_plan: native_plan.clone(),
             field_plan: field_plan.clone(),
+            package_exports: package_exports.clone(),
             takes_request: method_def.param_name.is_some(),
         };
         let verb = method_def.verb.clone();
@@ -2177,6 +2185,7 @@ pub fn build_routes(
                 module_program.clone(),
                 None,
                 Arc::new(FieldRoutePlan::default()),
+                None,
             ),
         );
     }
@@ -2189,6 +2198,14 @@ pub fn build_routes(
 pub fn build_routes_from_image(
     image: &RuntimeImage,
     service_interfaces: &ServiceInterfaces,
+) -> anyhow::Result<Router<AppState>> {
+    build_routes_from_image_with_package_exports(image, service_interfaces, None)
+}
+
+pub(crate) fn build_routes_from_image_with_package_exports(
+    image: &RuntimeImage,
+    service_interfaces: &ServiceInterfaces,
+    package_exports: Option<Arc<dyn PackageExportCaller>>,
 ) -> anyhow::Result<Router<AppState>> {
     crate::route_collision::validate_image(image)?;
     let module_program = Arc::new(ModuleProgram::from_runtime_image_with_services(
@@ -2240,6 +2257,7 @@ pub fn build_routes_from_image(
                 module_program.clone(),
                 native_plan,
                 field_plan,
+                package_exports.clone(),
             ),
         );
     }
