@@ -1,12 +1,15 @@
 use anyhow::{bail, Context};
 use core_lib::{
-    ExpectedWorkerIdentity, LibraryCapabilityGrant, LibraryPackageIdentity, LibraryRuntimeIdentity,
-    LibrarySdkIdentity, LibrarySessionBinding, LIBRARY_ABI_VERSION,
+    ExpectedWorkerIdentity, LibraryCapabilityGrant, LibraryHostCall, LibraryPackageIdentity,
+    LibraryRuntimeIdentity, LibrarySdkIdentity, LibrarySessionBinding, LIBRARY_ABI_VERSION,
 };
 use rand::RngCore;
 use rbe_install_runtime::VerifiedRpxRootSnapshot;
 
 const SESSION_ID_BYTES: usize = 32;
+const LIBRARY_LOG_CAPABILITY: &str = "log";
+const LIBRARY_LOG_MAX_REQUEST_BYTES: usize = 64 * 1024;
+const LIBRARY_LOG_MAX_RESPONSE_BYTES: usize = 1024;
 
 /// Convert one fail-closed verified RPX root snapshot into the exact identity
 /// Library Host expects the package worker to announce.
@@ -58,20 +61,44 @@ pub fn expected_worker(
     })
 }
 
+fn package_log_grant(package: &str) -> anyhow::Result<LibraryCapabilityGrant> {
+    LibraryCapabilityGrant::new(
+        LIBRARY_LOG_CAPABILITY,
+        format!("lib/{package}"),
+        [
+            "debug".to_string(),
+            "info".to_string(),
+            "warn".to_string(),
+            "error".to_string(),
+            "fatal".to_string(),
+        ],
+        LIBRARY_LOG_MAX_REQUEST_BYTES,
+        LIBRARY_LOG_MAX_RESPONSE_BYTES,
+    )
+    .context("build verified package logging capability grant")
+}
+
 /// Create one Library Host session from verified worker identity plus an already
 /// admitted capability set. Requested manifest capabilities are deliberately not
 /// accepted here: callers must provide trusted [`LibraryCapabilityGrant`]s.
+///
+/// Every verified package additionally receives the host-owned `log` capability
+/// for exactly `lib/<verified-package-name>`. Child logger scopes stay inside the
+/// log payload and therefore cannot retarget another package's log authority.
 pub fn bind_session(
     snapshot: &VerifiedRpxRootSnapshot,
     grants: impl IntoIterator<Item = LibraryCapabilityGrant>,
 ) -> anyhow::Result<LibrarySessionBinding> {
     let expected = expected_worker(snapshot)?;
+    let mut admitted = grants.into_iter().collect::<Vec<_>>();
+    admitted.push(package_log_grant(&expected.package.name)?);
+
     let mut nonce = [0u8; SESSION_ID_BYTES];
     let mut rng = rand::rngs::OsRng;
     rng.fill_bytes(&mut nonce);
     let capability_identity = format!("session:{}", hex::encode(nonce));
 
-    LibrarySessionBinding::new(expected, grants, capability_identity)
+    LibrarySessionBinding::new(expected, admitted, capability_identity)
         .context("bind verified package worker to Library Host session")
 }
 
@@ -133,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn session_uses_opaque_identity_and_only_supplied_grants() {
+    fn session_uses_opaque_identity_supplied_grants_and_verified_log_scope() {
         let snapshot = snapshot();
         let mut session = bind_session(
             &snapshot,
@@ -152,8 +179,27 @@ mod tests {
         assert_eq!(info.capability_identity.len(), "session:".len() + 64);
         assert_eq!(
             info.granted_capabilities,
-            std::collections::BTreeSet::from(["net:http".to_string()])
+            std::collections::BTreeSet::from(["log".to_string(), "net:http".to_string()])
         );
+
+        assert!(session
+            .authorize_host_call(&LibraryHostCall {
+                call_id: 1,
+                capability: "log".into(),
+                target: "lib/advancenet".into(),
+                operation: "info".into(),
+                payload: br#"{"scope":[],"message":"ready"}"#.to_vec(),
+            })
+            .is_ok());
+        assert!(session
+            .authorize_host_call(&LibraryHostCall {
+                call_id: 2,
+                capability: "log".into(),
+                target: "lib/other-package".into(),
+                operation: "info".into(),
+                payload: br#"{"scope":[],"message":"spoof"}"#.to_vec(),
+            })
+            .is_err());
     }
 
     #[test]
