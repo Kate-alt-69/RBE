@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 
 use std::error::Error;
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 /// First public RBE native-library ABI.
 pub const LIBRARY_ABI_VERSION: u32 = 1;
@@ -45,6 +45,7 @@ pub const SUPPORTED_ABI: AbiRange = AbiRange::exact(LIBRARY_ABI_VERSION);
 
 /// Canonical capability IDs understood by the RBE library host.
 pub mod capability {
+    pub const LOG: &str = "log";
     pub const NET_HTTP: &str = "net:http";
     pub const NET_COOKIES: &str = "net:cookies";
     pub const NET_HEADERS: &str = "net:headers";
@@ -208,6 +209,8 @@ pub trait HostBridge: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SdkError {
     InvalidLibraryName(String),
+    InvalidLogScope(String),
+    InvalidLogLevel(String),
     InvalidNetSublibrary(String),
     InvalidAbiRange(AbiRange),
     Host(HostError),
@@ -218,6 +221,12 @@ impl fmt::Display for SdkError {
         match self {
             Self::InvalidLibraryName(name) => {
                 write!(formatter, "invalid RBE library name {name:?}")
+            }
+            Self::InvalidLogScope(scope) => {
+                write!(formatter, "invalid RBE logger child scope {scope:?}")
+            }
+            Self::InvalidLogLevel(level) => {
+                write!(formatter, "invalid RBE log level {level:?}")
             }
             Self::InvalidNetSublibrary(name) => {
                 write!(formatter, "invalid net sub-library name {name:?}")
@@ -268,10 +277,10 @@ impl<'a> LibraryDescriptor<'a> {
 
 /// Entry point exposed to library code.
 ///
-/// Common helpers (`net`, `router`, `storage`, `crypto`) are the easy path. The
-/// generic `capability` and `advanced` surfaces intentionally remain open-ended
-/// so advanced packages can compose RBE features without the SDK policing their
-/// application design.
+/// Common helpers (`log`, `net`, `router`, `storage`, `crypto`) are the easy
+/// path. The generic `capability` and `advanced` surfaces intentionally remain
+/// open-ended so advanced packages can compose RBE features without the SDK
+/// policing their application design.
 #[derive(Clone, Copy)]
 pub struct RbeSdk<'a> {
     bridge: &'a dyn HostBridge,
@@ -280,6 +289,10 @@ pub struct RbeSdk<'a> {
 impl<'a> RbeSdk<'a> {
     pub const fn new(bridge: &'a dyn HostBridge) -> Self {
         Self { bridge }
+    }
+
+    pub fn log(self, library_name: &str) -> Result<Logger<'a>, SdkError> {
+        Logger::new(self.bridge, library_name)
     }
 
     pub const fn net(self) -> Net<'a> {
@@ -444,6 +457,77 @@ impl Host<'_> {
     }
 }
 
+pub struct Logger<'a> {
+    bridge: &'a dyn HostBridge,
+    library_name: String,
+    scope: Vec<String>,
+}
+
+impl<'a> Logger<'a> {
+    fn new(bridge: &'a dyn HostBridge, library_name: &str) -> Result<Self, SdkError> {
+        if !valid_component(library_name) {
+            return Err(SdkError::InvalidLibraryName(library_name.to_string()));
+        }
+        Ok(Self {
+            bridge,
+            library_name: library_name.to_string(),
+            scope: Vec::new(),
+        })
+    }
+
+    pub fn target(&self) -> String {
+        format!("lib/{}", self.library_name)
+    }
+
+    pub fn child(&self, name: &str) -> Result<Self, SdkError> {
+        if !valid_component(name) {
+            return Err(SdkError::InvalidLogScope(name.to_string()));
+        }
+        let mut scope = self.scope.clone();
+        scope.push(name.to_string());
+        Ok(Self {
+            bridge: self.bridge,
+            library_name: self.library_name.clone(),
+            scope,
+        })
+    }
+
+    pub fn emit(
+        &self,
+        level: &str,
+        message: impl fmt::Display,
+    ) -> Result<HostReply, SdkError> {
+        if !matches!(level, "debug" | "info" | "warn" | "error" | "fatal") {
+            return Err(SdkError::InvalidLogLevel(level.to_string()));
+        }
+        let payload = encode_log_record(&self.scope, &message.to_string());
+        let target = self.target();
+        self.bridge
+            .call(HostCall::new(capability::LOG, &target, level, &payload))
+            .map_err(Into::into)
+    }
+
+    pub fn debug(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("debug", message)
+    }
+
+    pub fn info(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("info", message)
+    }
+
+    pub fn warn(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("warn", message)
+    }
+
+    pub fn error(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("error", message)
+    }
+
+    pub fn fatal(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("fatal", message)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Net<'a> {
     bridge: &'a dyn HostBridge,
@@ -463,6 +547,46 @@ impl<'a> Net<'a> {
 
     pub fn http(self) -> NetLibrary<'a> {
         self.known(capability::NET_HTTP)
+    }
+
+    pub fn cookies(self) -> NetLibrary<'a> {
+        self.known(capability::NET_COOKIES)
+    }
+
+    pub fn headers(self) -> NetLibrary<'a> {
+        self.known(capability::NET_HEADERS)
+    }
+
+    pub fn url(self) -> NetLibrary<'a> {
+        self.known(capability::NET_URL)
+    }
+
+    pub fn dns(self) -> NetLibrary<'a> {
+        self.known(capability::NET_DNS)
+    }
+
+    pub fn ip(self) -> NetLibrary<'a> {
+        self.known(capability::NET_IP)
+    }
+
+    pub fn tcp(self) -> NetLibrary<'a> {
+        self.known(capability::NET_TCP)
+    }
+
+    pub fn udp(self) -> NetLibrary<'a> {
+        self.known(capability::NET_UDP)
+    }
+
+    pub fn quic(self) -> NetLibrary<'a> {
+        self.known(capability::NET_QUIC)
+    }
+
+    pub fn websocket(self) -> NetLibrary<'a> {
+        self.known(capability::NET_WEBSOCKET)
+    }
+
+    pub fn webtransport(self) -> NetLibrary<'a> {
+        self.known(capability::NET_WEBTRANSPORT)
     }
 
     pub fn p2p(self) -> NetLibrary<'a> {
@@ -595,6 +719,41 @@ impl Crypto<'_> {
     }
 }
 
+fn encode_log_record(scope: &[String], message: &str) -> Vec<u8> {
+    let mut output = String::from("{\"scope\":[");
+    for (index, component) in scope.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        push_json_string(&mut output, component);
+    }
+    output.push_str("],\"message\":");
+    push_json_string(&mut output, message);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn push_json_string(output: &mut String, value: &str) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            character if character <= '\u{1f}' => {
+                write!(output, "\\u{:04x}", character as u32)
+                    .expect("writing JSON escape to String cannot fail");
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+}
+
 fn valid_component(value: &str) -> bool {
     let mut bytes = value.bytes();
     let Some(first) = bytes.next() else {
@@ -661,6 +820,28 @@ mod tests {
     }
 
     #[test]
+    fn logger_uses_explicit_library_authority_and_structured_child_scope() {
+        let bridge = RecordingBridge::default();
+        let sdk = RbeSdk::new(&bridge);
+        sdk.log("mail")
+            .unwrap()
+            .child("smtp")
+            .unwrap()
+            .info("Listening on port 25")
+            .unwrap();
+
+        let calls = bridge.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, capability::LOG);
+        assert_eq!(calls[0].1, "lib/mail");
+        assert_eq!(calls[0].2, "info");
+        assert_eq!(
+            calls[0].3,
+            br#"{"scope":["smtp"],"message":"Listening on port 25"}"#
+        );
+    }
+
+    #[test]
     fn higher_level_library_can_call_builtin_net_through_host_bridge() {
         let bridge = RecordingBridge::default();
         let sdk = RbeSdk::new(&bridge);
@@ -671,11 +852,16 @@ mod tests {
             .unwrap();
         assert_eq!(reply.payload, b"ok");
 
+        sdk.net().dns().call("mx", b"gmail.com").unwrap();
+        sdk.net().tcp().call("connect", b"mail.example:25").unwrap();
+
         let calls = bridge.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].0, capability::NET_HTTP);
         assert_eq!(calls[0].1, capability::NET_HTTP);
         assert_eq!(calls[0].2, "request");
+        assert_eq!(calls[1].0, capability::NET_DNS);
+        assert_eq!(calls[2].0, capability::NET_TCP);
     }
 
     #[test]
