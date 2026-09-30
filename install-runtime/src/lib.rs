@@ -77,7 +77,7 @@ pub use activation::{
 pub use artifact::ArtifactStage;
 pub use build_plan::{prepare_managed_build_plans, ManagedBuildPlanError, ManagedPackageBuildPlan};
 pub use cache::stage_artifact_cached as stage_artifact;
-pub use graph::{stage_resolved_root, VerifiedRootGraph};
+pub use graph::{stage_resolved_root, VerifiedCapabilityInventory, VerifiedRootGraph};
 pub use package::{
     inspect_registry_stage, read_verified_rpx_root_indexes, registry_artifact_plan,
     stage_registry_package, VerifiedRegistryPackage, VerifiedRpxRootIndex,
