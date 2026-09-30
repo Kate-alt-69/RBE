@@ -35,6 +35,23 @@ jobs:
         run: bash -n build.sh build-select.sh build-release.sh build-core.sh
       - name: Verify Linux build prerequisites
         run: ./build.sh --check-tools --build-linux --arch-x64
+      - name: Verify shared Cargo cache selection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          explicit_cache="$RUNNER_TEMP/rbe-explicit-cache"
+          env -u CARGO_TARGET_DIR \
+            RBE_BUILD_CACHE_DIR="$explicit_cache" \
+            ./build.sh --check-tools --build-linux --arch-x64
+          test -d "$explicit_cache/cargo-target"
+
+          render_cache="$RUNNER_TEMP/rbe-render-xdg"
+          env -u CARGO_TARGET_DIR -u RBE_BUILD_CACHE_DIR \
+            RENDER=true \
+            XDG_CACHE_HOME="$render_cache" \
+            ./build.sh --check-tools --build-linux --arch-x64
+          test -d "$render_cache/rbe-build/cargo-target"
       - name: Simulate corrupt cached rustup toolchain recovery
         shell: bash
         run: |
