@@ -492,11 +492,7 @@ impl<'a> Logger<'a> {
         })
     }
 
-    pub fn emit(
-        &self,
-        level: &str,
-        message: impl fmt::Display,
-    ) -> Result<HostReply, SdkError> {
+    pub fn emit(&self, level: &str, message: impl fmt::Display) -> Result<HostReply, SdkError> {
         if !matches!(level, "debug" | "info" | "warn" | "error" | "fatal") {
             return Err(SdkError::InvalidLogLevel(level.to_string()));
         }
