@@ -2,6 +2,8 @@
 # RBE secure release builder.
 # Builds container-bin first, binds its exact bytes to backend.exe at build time,
 # and packages the same artifact as dist/<target>/dep/container(.exe).
+# The same container package build also emits the trusted Library Worker Proxy,
+# which is packaged beside Container for Backend-owned package sessions.
 # Packaged builds require RBE_CONTAINER_SIGNING_PRIVATE_KEY plus a derived
 # RBE_ADMIN_AUTH_* verifier. Prefer build.sh for interactive password entry.
 set -e
@@ -39,7 +41,7 @@ Architecture Flags:
 Configuration & Profile Flags:
   --musl                Linux targets: build against musl libc instead of glibc
   --no-embed            Do not embed container-bin into backend
-  --dev-content         Copy development api/module directories into dist
+  --dev-content         Copy development api/module content into dist
   --debug               Build with debug profile instead of release
   --target=<triple>     Specify an explicit Rust target triple
   --distro=<alias>      Specify target selection by Linux distribution alias
@@ -170,6 +172,10 @@ for target in "${targets[@]}"; do
     [ -f "$container_bin_path" ] || { echo "ERROR: container artifact missing: $container_bin_path" >&2; exit 1; }
     container_dest="$dep_dir/container"; [ "$(get_target_os "$target")" = windows ] && container_dest="$container_dest.exe"
     cp "$container_bin_path" "$container_dest"
+    library_proxy_path=$(get_built_binary_path "$CONTAINER_DIR" container-library-worker-proxy "$target" "$RELEASE")
+    [ -f "$library_proxy_path" ] || { echo "ERROR: Library Worker Proxy artifact missing: $library_proxy_path" >&2; exit 1; }
+    library_proxy_dest="$dep_dir/container-library-worker-proxy"; [ "$(get_target_os "$target")" = windows ] && library_proxy_dest="$library_proxy_dest.exe"
+    cp "$library_proxy_path" "$library_proxy_dest"
 
     export RBE_BUILD_ID="${RBE_BUILD_ID:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown-build)}"
 
