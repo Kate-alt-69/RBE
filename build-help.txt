@@ -4,6 +4,30 @@ Usage:
   ./build.ps1 [release flags]
   ./build.sh  [release flags]
 
+Linux prerequisite preflight:
+  ./build.sh --check-tools --build-linux --arch-x64
+
+  Linux builds verify that rustup, rustc, cargo, and cc are actually usable
+  before dispatching into the release/selective builders. Full release builds
+  also require git and OpenSSL.
+
+  RBE does not treat a rustup shim existing in PATH as proof that the selected
+  toolchain is healthy. The preflight executes rustc/cargo and asks rustup for
+  the installed target list. If a cached toolchain is incomplete/corrupt (for
+  example rustup reports "missing manifest in toolchain"), RBE automatically
+  removes/reinstalls the selected toolchain once before continuing.
+
+  Environment controls:
+    RBE_RUST_TOOLCHAIN=<toolchain>
+                           Select the rustup toolchain used by Linux builds.
+                           Default: stable
+    RBE_BUILD_AUTO_REPAIR_RUST=0
+                           Disable automatic repair of a broken cached Rust
+                           toolchain and fail immediately instead.
+
+  Debian/Ubuntu hosts normally need:
+    build-essential git openssl rustup
+
 Selective builds:
   ./build.ps1 --only-<component> [platform/arch flags]
   ./build.sh  --only-<component> [platform/arch flags]
@@ -55,6 +79,7 @@ Architecture flags:
   --arch-armv7             Target armv7
 
 Configuration:
+  --check-tools            Linux: run prerequisite/toolchain verification and exit
   --musl                   Linux: use musl targets
   --no-embed               Full release: do not embed container-bin into backend
   --dev-content            Full release: copy development api/module content
@@ -62,6 +87,7 @@ Configuration:
   --target=<triple>        Build one exact Rust target triple
 
 Examples:
+  ./build.sh --check-tools --build-linux --arch-x64
   ./build.ps1 --only-backend --build-windows --arch-x64
   ./build.ps1 -only-cloud-node --build-linux --arch-arm64
   ./build.ps1 --build-sdk --only-rpx --build-linux --arch-x64
