@@ -2,13 +2,13 @@
 pub(crate) mod host;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context};
-use core_lib::{
-    LibraryCapabilityGrant, LibraryHostCall, LibraryHostCallReply, LibrarySessionBinding,
-};
+use core_lib::{LibraryHostCall, LibraryHostCallReply, LibrarySessionBinding};
 use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex, VerifiedRpxRootSnapshot};
 use route_engine::relc::{
     PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
@@ -17,8 +17,21 @@ use serde::Deserialize;
 
 const RPX_PACKAGE_INDEX_FORMAT: u32 = 1;
 
-type LibraryHostDispatcher =
-    fn(&str, &LibrarySessionBinding, &LibraryHostCall) -> anyhow::Result<LibraryHostCallReply>;
+type LibraryHostDispatchFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<LibraryHostCallReply>> + 'a>>;
+type LibraryHostDispatcher = for<'a> fn(
+    &'a str,
+    &'a LibrarySessionBinding,
+    &'a LibraryHostCall,
+) -> LibraryHostDispatchFuture<'a>;
+
+fn dispatch_verified_host_call<'a>(
+    package: &'a str,
+    binding: &'a LibrarySessionBinding,
+    call: &'a LibraryHostCall,
+) -> LibraryHostDispatchFuture<'a> {
+    Box::pin(host::dispatch_authorized_host_call(package, binding, call))
+}
 
 struct LibraryHostSessionEntry {
     binding: LibrarySessionBinding,
@@ -63,12 +76,12 @@ struct RpxPackageExport {
 /// Build RELC's package namespace from SHA-verified explicit package roots.
 ///
 /// The same verified root snapshot also seeds fail-closed Library Host sessions
-/// before the public export namespace is returned. Sessions deliberately start
-/// with only host-owned implicit authority until capability admission persists
-/// explicit package grants.
+/// before the public export namespace is returned. Runtime privilege requests
+/// are re-read from the exact SHA-pinned package artifact before Backend maps
+/// the supported RBE-owned subset into host grants.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
     let loaded = load_with_workers(project_root)?;
-    install_verified_host_sessions(&loaded.roots)?;
+    install_verified_host_sessions(project_root, &loaded.roots)?;
     Ok(loaded.links)
 }
 
@@ -94,16 +107,24 @@ pub fn load_with_workers(project_root: &Path) -> anyhow::Result<LoadedPackageRoo
     from_verified_snapshots(snapshots)
 }
 
-fn build_verified_host_sessions(
+fn build_verified_host_sessions<F>(
     roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
-) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>> {
+    mut requests_for: F,
+) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>>
+where
+    F: FnMut(&str, &VerifiedRpxRootSnapshot) -> anyhow::Result<Vec<String>>,
+{
     let mut sessions = BTreeMap::new();
     for (package, snapshot) in roots {
-        let binding = host::bind_session(snapshot, std::iter::empty::<LibraryCapabilityGrant>())
+        let requests = requests_for(package, snapshot)?;
+        let grants = host::grants_for_verified_requests(&requests).with_context(|| {
+            format!("admit verified RBE privilege requests for root {package:?}")
+        })?;
+        let binding = host::bind_session(snapshot, grants)
             .with_context(|| format!("bind Library Host session for verified root {package:?}"))?;
         let entry = LibraryHostSessionEntry {
             binding,
-            dispatcher: host::dispatch_authorized_host_call,
+            dispatcher: dispatch_verified_host_call,
         };
         if sessions.insert(package.clone(), entry).is_some() {
             bail!("duplicate Library Host session for verified root {package:?}");
@@ -113,9 +134,17 @@ fn build_verified_host_sessions(
 }
 
 fn install_verified_host_sessions(
+    project_root: &Path,
     roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
 ) -> anyhow::Result<()> {
-    let sessions = build_verified_host_sessions(roots)?;
+    let sessions = build_verified_host_sessions(roots, |package, snapshot| {
+        snapshot
+            .worker
+            .read_requested_capabilities(project_root)
+            .with_context(|| {
+                format!("re-read verified package privilege requests for root {package:?}")
+            })
+    })?;
     let registry = LIBRARY_HOST_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut active = registry
         .lock()
@@ -131,7 +160,7 @@ fn install_verified_host_sessions(
         .filter(|session| {
             std::ptr::fn_addr_eq(
                 session.dispatcher,
-                host::dispatch_authorized_host_call as LibraryHostDispatcher,
+                dispatch_verified_host_call as LibraryHostDispatcher,
             )
         })
         .count();
@@ -146,7 +175,7 @@ fn install_verified_host_sessions(
     tracing::info!(
         package_sessions = active.len(),
         trusted_dispatchers,
-        "prepared verified fail-closed Library Host sessions with trusted dispatchers"
+        "prepared verified Library Host sessions with artifact-proven RBE privilege grants"
     );
     Ok(())
 }
@@ -368,7 +397,10 @@ mod tests {
         assert_eq!(retained.worker.runtime_version, "1.3.7");
         assert_eq!(retained.artifact_sha256, "a".repeat(64));
 
-        let sessions = build_verified_host_sessions(&loaded.roots).unwrap();
+        let sessions = build_verified_host_sessions(&loaded.roots, |_package, _snapshot| {
+            Ok(vec!["mail:queue".into(), "net:http".into()])
+        })
+        .unwrap();
         assert_eq!(sessions.len(), 1);
         let session = sessions.get("advancenet").unwrap();
         assert_eq!(
@@ -377,7 +409,7 @@ mod tests {
         );
         assert!(std::ptr::fn_addr_eq(
             session.dispatcher,
-            host::dispatch_authorized_host_call as LibraryHostDispatcher,
+            dispatch_verified_host_call as LibraryHostDispatcher,
         ));
     }
 
