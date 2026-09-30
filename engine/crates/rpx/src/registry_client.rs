@@ -11,6 +11,7 @@ use reqwest::redirect::Policy;
 use std::time::Duration;
 use url::Url;
 
+pub const DEFAULT_REGISTRY_URL: &str = "https://kastrick-backend.onrender.com";
 pub const REGISTRY_URL_ENV: &str = "RPX_REGISTRY_URL";
 pub const LEGACY_REGISTRY_URL_ENV: &str = "RBE_RPX_REGISTRY_URL";
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
@@ -57,9 +58,7 @@ impl RegistryClient {
                 return Self::new(&value);
             }
         }
-        bail!(
-            "RPX registry URL is not configured; pass --registry <https://host> or set {REGISTRY_URL_ENV}"
-        )
+        Self::new(DEFAULT_REGISTRY_URL)
     }
 
     pub fn base_url(&self) -> &Url {
@@ -158,6 +157,12 @@ fn truncate_for_error(input: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_registry_is_valid_production_https() {
+        let client = RegistryClient::new(DEFAULT_REGISTRY_URL).unwrap();
+        assert_eq!(client.base_url().as_str(), "https://kastrick-backend.onrender.com/");
+    }
 
     #[test]
     fn production_registry_requires_https() {
