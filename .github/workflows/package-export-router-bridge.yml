@@ -27,6 +27,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           discovery_path = Path('engine/crates/route-engine/src/discovery.rs')
           lib_path = Path('engine/crates/route-engine/src/lib.rs')
@@ -36,233 +37,120 @@ jobs:
           lib = lib_path.read_text(encoding='utf-8')
           doc = doc_path.read_text(encoding='utf-8')
 
-          discovery = discovery.replace(
+          def once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label} anchor count={count}, expected 1')
+              return text.replace(old, new, 1)
+
+          discovery = once(
+              discovery,
               'use crate::module_eval::ModuleExecutor;',
               'use crate::module_eval::{ModuleExecutor, PackageExportCaller};',
-              1,
+              'module evaluator import',
           )
 
-          old_plan = '''#[derive(Clone)]
-          struct RouteHandlerPlan {
-              inline_file: Arc<ModuleFile>,
-              module_program: Arc<ModuleProgram>,
-              native_plan: Option<Arc<NativeRoutePlan>>,
-              field_plan: Arc<FieldRoutePlan>,
-              takes_request: bool,
-          }
-          '''
-          new_plan = '''#[derive(Clone)]
-          struct RouteHandlerPlan {
-              inline_file: Arc<ModuleFile>,
-              module_program: Arc<ModuleProgram>,
-              native_plan: Option<Arc<NativeRoutePlan>>,
-              field_plan: Arc<FieldRoutePlan>,
-              package_exports: Option<Arc<dyn PackageExportCaller>>,
-              takes_request: bool,
-          }
-          '''
-          if old_plan not in discovery:
-              raise SystemExit('RouteHandlerPlan anchor drifted')
-          discovery = discovery.replace(old_plan, new_plan, 1)
+          discovery = once(
+              discovery,
+              '    field_plan: Arc<FieldRoutePlan>,\n    takes_request: bool,\n}\n\nasync fn execute(',
+              '    field_plan: Arc<FieldRoutePlan>,\n    package_exports: Option<Arc<dyn PackageExportCaller>>,\n    takes_request: bool,\n}\n\nasync fn execute(',
+              'RouteHandlerPlan field',
+          )
 
-          old_destructure = '''    let RouteHandlerPlan {
-              inline_file,
-              module_program,
-              native_plan,
-              field_plan,
-              takes_request,
-          } = plan;
-          '''
-          new_destructure = '''    let RouteHandlerPlan {
-              inline_file,
-              module_program,
-              native_plan,
-              field_plan,
-              package_exports,
-              takes_request,
-          } = plan;
-          '''
-          if old_destructure not in discovery:
-              raise SystemExit('execute destructure anchor drifted')
-          discovery = discovery.replace(old_destructure, new_destructure, 1)
+          execute_start = discovery.index('async fn execute(')
+          execute_end = discovery.index('\nfn build_method_router(', execute_start)
+          execute = discovery[execute_start:execute_end]
+          execute = once(
+              execute,
+              '        field_plan,\n        takes_request,\n    } = plan;',
+              '        field_plan,\n        package_exports,\n        takes_request,\n    } = plan;',
+              'execute RouteHandlerPlan destructure',
+          )
+          execute = once(
+              execute,
+              '    let executor = ModuleExecutor::with_services_and_host_capabilities(\n        module_program.as_ref(),\n        state.services.clone(),\n        Arc::new(host),\n    );\n',
+              '    let executor = ModuleExecutor::with_services_and_host_capabilities(\n        module_program.as_ref(),\n        state.services.clone(),\n        Arc::new(host),\n    );\n    let executor = match package_exports {\n        Some(package_exports) => executor.with_package_export_caller(package_exports),\n        None => executor,\n    };\n',
+              'ModuleExecutor package bridge',
+          )
+          discovery = discovery[:execute_start] + execute + discovery[execute_end:]
 
-          old_executor = '''    let executor = ModuleExecutor::with_services_and_host_capabilities(
-              module_program.as_ref(),
-              state.services.clone(),
-              Arc::new(host),
-          );
-          match executor
-          '''
-          new_executor = '''    let executor = ModuleExecutor::with_services_and_host_capabilities(
-              module_program.as_ref(),
-              state.services.clone(),
-              Arc::new(host),
-          );
-          let executor = match package_exports {
-              Some(package_exports) => executor.with_package_export_caller(package_exports),
-              None => executor,
-          };
-          match executor
-          '''
-          if old_executor not in discovery:
-              raise SystemExit('ModuleExecutor anchor drifted')
-          discovery = discovery.replace(old_executor, new_executor, 1)
+          discovery = once(
+              discovery,
+              'fn build_method_router(\n    file: &RouteFile,\n    module_program: Arc<ModuleProgram>,\n    native_plan: Option<Arc<NativeRoutePlan>>,\n    field_plan: Arc<FieldRoutePlan>,\n) -> MethodRouter<AppState> {',
+              'fn build_method_router(\n    file: &RouteFile,\n    module_program: Arc<ModuleProgram>,\n    native_plan: Option<Arc<NativeRoutePlan>>,\n    field_plan: Arc<FieldRoutePlan>,\n    package_exports: Option<Arc<dyn PackageExportCaller>>,\n) -> MethodRouter<AppState> {',
+              'build_method_router signature',
+          )
+          discovery = once(
+              discovery,
+              '            field_plan: field_plan.clone(),\n            takes_request: method_def.param_name.is_some(),',
+              '            field_plan: field_plan.clone(),\n            package_exports: package_exports.clone(),\n            takes_request: method_def.param_name.is_some(),',
+              'RouteHandlerPlan construction',
+          )
+          discovery = once(
+              discovery,
+              '                Arc::new(FieldRoutePlan::default()),\n            ),',
+              '                Arc::new(FieldRoutePlan::default()),\n                None,\n            ),',
+              'legacy route package caller',
+          )
 
-          old_method_sig = '''fn build_method_router(
-              file: &RouteFile,
-              module_program: Arc<ModuleProgram>,
-              native_plan: Option<Arc<NativeRoutePlan>>,
-              field_plan: Arc<FieldRoutePlan>,
-          ) -> MethodRouter<AppState> {
-          '''
-          new_method_sig = '''fn build_method_router(
-              file: &RouteFile,
-              module_program: Arc<ModuleProgram>,
-              native_plan: Option<Arc<NativeRoutePlan>>,
-              field_plan: Arc<FieldRoutePlan>,
-              package_exports: Option<Arc<dyn PackageExportCaller>>,
-          ) -> MethodRouter<AppState> {
-          '''
-          if old_method_sig not in discovery:
-              raise SystemExit('build_method_router signature anchor drifted')
-          discovery = discovery.replace(old_method_sig, new_method_sig, 1)
+          image_start = discovery.index('pub fn build_routes_from_image(\n')
+          image_header_end = discovery.index('    crate::route_collision::validate_image(image)?;', image_start)
+          old_header = discovery[image_start:image_header_end + len('    crate::route_collision::validate_image(image)?;')]
+          expected_prefix = (
+              'pub fn build_routes_from_image(\n'
+              '    image: &RuntimeImage,\n'
+              '    service_interfaces: &ServiceInterfaces,\n'
+              ') -> anyhow::Result<Router<AppState>> {\n'
+              '    crate::route_collision::validate_image(image)?;'
+          )
+          if old_header != expected_prefix:
+              raise SystemExit('Runtime Image router header drifted')
+          new_header = (
+              'pub fn build_routes_from_image(\n'
+              '    image: &RuntimeImage,\n'
+              '    service_interfaces: &ServiceInterfaces,\n'
+              ') -> anyhow::Result<Router<AppState>> {\n'
+              '    build_routes_from_image_with_package_exports(image, service_interfaces, None)\n'
+              '}\n\n'
+              'pub(crate) fn build_routes_from_image_with_package_exports(\n'
+              '    image: &RuntimeImage,\n'
+              '    service_interfaces: &ServiceInterfaces,\n'
+              '    package_exports: Option<Arc<dyn PackageExportCaller>>,\n'
+              ') -> anyhow::Result<Router<AppState>> {\n'
+              '    crate::route_collision::validate_image(image)?;'
+          )
+          discovery = discovery[:image_start] + new_header + discovery[image_header_end + len('    crate::route_collision::validate_image(image)?;'):]
 
-          old_handler_plan = '''        let handler_plan = RouteHandlerPlan {
-                  inline_file,
-                  module_program: module_program.clone(),
-                  native_plan: native_plan.clone(),
-                  field_plan: field_plan.clone(),
-                  takes_request: method_def.param_name.is_some(),
-              };
-          '''
-          new_handler_plan = '''        let handler_plan = RouteHandlerPlan {
-                  inline_file,
-                  module_program: module_program.clone(),
-                  native_plan: native_plan.clone(),
-                  field_plan: field_plan.clone(),
-                  package_exports: package_exports.clone(),
-                  takes_request: method_def.param_name.is_some(),
-              };
-          '''
-          if old_handler_plan not in discovery:
-              raise SystemExit('handler plan construction anchor drifted')
-          discovery = discovery.replace(old_handler_plan, new_handler_plan, 1)
+          image_fn_start = discovery.index('pub(crate) fn build_routes_from_image_with_package_exports(')
+          image_fn_end = discovery.index('\n#[cfg(test)]', image_fn_start)
+          image_fn = discovery[image_fn_start:image_fn_end]
+          image_fn = once(
+              image_fn,
+              '                native_plan,\n                field_plan,\n            ),',
+              '                native_plan,\n                field_plan,\n                package_exports.clone(),\n            ),',
+              'Runtime Image route package caller',
+          )
+          discovery = discovery[:image_fn_start] + image_fn + discovery[image_fn_end:]
 
-          legacy_call = '''            build_method_router(
-                          &route_file,
-                          module_program.clone(),
-                          None,
-                          Arc::new(FieldRoutePlan::default()),
-                      ),
-          '''
-          legacy_new = '''            build_method_router(
-                          &route_file,
-                          module_program.clone(),
-                          None,
-                          Arc::new(FieldRoutePlan::default()),
-                          None,
-                      ),
-          '''
-          if legacy_call not in discovery:
-              raise SystemExit('legacy build_method_router call anchor drifted')
-          discovery = discovery.replace(legacy_call, legacy_new, 1)
+          lib = once(
+              lib,
+              'pub fn build_routes_from_image(\n    image: &RuntimeImage,\n    service_interfaces: &ServiceInterfaces,\n) -> anyhow::Result<axum::Router<core_lib::AppState>> {\n    discovery::build_routes_from_image(image, service_interfaces)\n}\n',
+              'pub fn build_routes_from_image(\n    image: &RuntimeImage,\n    service_interfaces: &ServiceInterfaces,\n) -> anyhow::Result<axum::Router<core_lib::AppState>> {\n    discovery::build_routes_from_image(image, service_interfaces)\n}\n\n/// Build a Runtime Image router with a trusted package-export bridge.\n///\n/// Only the immutable Runtime Image path accepts this caller because RELC has\n/// already validated every `X from Y` import against the verified root-only\n/// `PackageLinkContext`. The legacy filesystem loader intentionally remains\n/// package-runtime-free.\npub fn build_routes_from_image_with_package_exports(\n    image: &RuntimeImage,\n    service_interfaces: &ServiceInterfaces,\n    package_exports: std::sync::Arc<dyn PackageExportCaller>,\n) -> anyhow::Result<axum::Router<core_lib::AppState>> {\n    discovery::build_routes_from_image_with_package_exports(\n        image,\n        service_interfaces,\n        Some(package_exports),\n    )\n}\n',
+              'public Runtime Image router API',
+          )
 
-          old_image_fn = '''pub fn build_routes_from_image(
-              image: &RuntimeImage,
-              service_interfaces: &ServiceInterfaces,
-          ) -> anyhow::Result<Router<AppState>> {
-              crate::route_collision::validate_image(image)?;
-          '''
-          new_image_fn = '''pub fn build_routes_from_image(
-              image: &RuntimeImage,
-              service_interfaces: &ServiceInterfaces,
-          ) -> anyhow::Result<Router<AppState>> {
-              build_routes_from_image_with_package_exports(image, service_interfaces, None)
-          }
-
-          pub(crate) fn build_routes_from_image_with_package_exports(
-              image: &RuntimeImage,
-              service_interfaces: &ServiceInterfaces,
-              package_exports: Option<Arc<dyn PackageExportCaller>>,
-          ) -> anyhow::Result<Router<AppState>> {
-              crate::route_collision::validate_image(image)?;
-          '''
-          if old_image_fn not in discovery:
-              raise SystemExit('Runtime Image router function anchor drifted')
-          discovery = discovery.replace(old_image_fn, new_image_fn, 1)
-
-          image_call = '''            build_method_router(
-                          route_file.as_ref(),
-                          module_program.clone(),
-                          native_plan,
-                          field_plan,
-                      ),
-          '''
-          image_new = '''            build_method_router(
-                          route_file.as_ref(),
-                          module_program.clone(),
-                          native_plan,
-                          field_plan,
-                          package_exports.clone(),
-                      ),
-          '''
-          if image_call not in discovery:
-              raise SystemExit('Runtime Image build_method_router call anchor drifted')
-          discovery = discovery.replace(image_call, image_new, 1)
-
-          old_public = '''pub fn build_routes_from_image(
-              image: &RuntimeImage,
-              service_interfaces: &ServiceInterfaces,
-          ) -> anyhow::Result<axum::Router<core_lib::AppState>> {
-              discovery::build_routes_from_image(image, service_interfaces)
-          }
-          '''
-          new_public = '''pub fn build_routes_from_image(
-              image: &RuntimeImage,
-              service_interfaces: &ServiceInterfaces,
-          ) -> anyhow::Result<axum::Router<core_lib::AppState>> {
-              discovery::build_routes_from_image(image, service_interfaces)
-          }
-
-          /// Build a Runtime Image router with a trusted package-export bridge.
-          ///
-          /// Only the immutable Runtime Image path accepts this caller because RELC has
-          /// already validated every `X from Y` import against the verified root-only
-          /// PackageLinkContext. The legacy filesystem loader intentionally remains
-          /// package-runtime-free.
-          pub fn build_routes_from_image_with_package_exports(
-              image: &RuntimeImage,
-              service_interfaces: &ServiceInterfaces,
-              package_exports: std::sync::Arc<dyn PackageExportCaller>,
-          ) -> anyhow::Result<axum::Router<core_lib::AppState>> {
-              discovery::build_routes_from_image_with_package_exports(
-                  image,
-                  service_interfaces,
-                  Some(package_exports),
-              )
-          }
-          '''
-          if old_public not in lib:
-              raise SystemExit('public Runtime Image route builder anchor drifted')
-          lib = lib.replace(old_public, new_public, 1)
-
-          old_doc = '''### 4.2 Current integration boundary
-
-          `LIBHOST-046` implements the secure live Container relay itself. Backend still needs the final owner-side integration that selects the trusted packaged proxy executable, sends the sealed bootstrap, consumes `library.proxy.ready`, attaches the resulting channel to the retained `LibrarySessionBinding`, and requires the existing `library.hello` handshake before exposing the package worker as live.
-
-          Until that owner path is connected, documentation must not claim that every installed package worker is already launched end-to-end through live proxy mode.
-          '''
-          new_doc = '''### 4.2 Current integration boundary
-
-          `LIBHOST-046` implements the secure live Container relay itself. Route Engine now also exposes a Runtime-Image-only package-export injection point: a trusted host can supply `PackageExportCaller`, and linked `X from Y` Module REL calls are forwarded through that logical package/export/operation bridge. The legacy filesystem router deliberately has no such package runtime because it has not passed the immutable `PackageLinkContext` gate.
-
-          Backend still needs the final owner-side worker integration that selects the trusted packaged proxy executable, sends the sealed bootstrap, consumes `library.proxy.ready`, attaches the resulting channel to the retained `LibrarySessionBinding`, requires the existing `library.hello` handshake, and implements `PackageExportCaller` on top of that accepted live worker channel.
-
-          Until that owner path is connected, documentation must not claim that every installed package worker is already launched end-to-end through live proxy mode. A Runtime Image accepting a package caller is an execution injection boundary, not proof that Backend has started or accepted the corresponding worker.
-          '''
-          if old_doc not in doc:
-              raise SystemExit('Library Host integration-boundary doc anchor drifted')
-          doc = doc.replace(old_doc, new_doc, 1)
+          old_boundary = (
+              '### 4.2 Current integration boundary\n\n'
+              '`LIBHOST-046` implements the secure live Container relay itself. Backend still needs the final owner-side integration that selects the trusted packaged proxy executable, sends the sealed bootstrap, consumes `library.proxy.ready`, attaches the resulting channel to the retained `LibrarySessionBinding`, and requires the existing `library.hello` handshake before exposing the package worker as live.\n\n'
+              'Until that owner path is connected, documentation must not claim that every installed package worker is already launched end-to-end through live proxy mode.\n'
+          )
+          new_boundary = (
+              '### 4.2 Current integration boundary\n\n'
+              '`LIBHOST-046` implements the secure live Container relay itself. Route Engine now also exposes a Runtime-Image-only package-export injection point: a trusted host can supply `PackageExportCaller`, and linked `X from Y` Module REL calls are forwarded through that logical package/export/operation bridge. The legacy filesystem router deliberately has no such package runtime because it has not passed the immutable `PackageLinkContext` gate.\n\n'
+              'Backend still needs the final owner-side worker integration that selects the trusted packaged proxy executable, sends the sealed bootstrap, consumes `library.proxy.ready`, attaches the resulting channel to the retained `LibrarySessionBinding`, requires the existing `library.hello` handshake, and implements `PackageExportCaller` on top of that accepted live worker channel.\n\n'
+              'Until that owner path is connected, documentation must not claim that every installed package worker is already launched end-to-end through live proxy mode. A Runtime Image accepting a package caller is an execution injection boundary, not proof that Backend has started or accepted the corresponding worker.\n'
+          )
+          doc = once(doc, old_boundary, new_boundary, 'Library Host integration boundary docs')
 
           discovery_path.write_text(discovery, encoding='utf-8')
           lib_path.write_text(lib, encoding='utf-8')
