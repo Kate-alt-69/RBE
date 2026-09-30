@@ -1,3 +1,4 @@
+mod activation;
 mod toolchain_install;
 
 use anyhow::{bail, Context, Result};
@@ -168,6 +169,7 @@ fn install(
         managed_toolchain: toolchain_count.is_some(),
     };
     write_lock(&project, &lock)?;
+    let activation_path = activation::install(&project)?;
 
     println!("RBE SDK installed");
     println!("  project: {}", project.display());
@@ -175,6 +177,7 @@ fn install(
     println!("  language: {language}");
     println!("  bindings: {}", languages.join(", "));
     println!("  RPX: {}", rpx_dest.display());
+    println!("  activation: {}", activation_path.display());
     match toolchain_count {
         Some(count) => println!(
             "  managed toolchain: VERIFIED ({count} pinned tool{})",
@@ -222,6 +225,8 @@ fn status(project: &Path) -> Result<()> {
     }
     let backend_ok = project.join(".rbe").join(&lock.backend).is_file();
     let rpx_ok = project.join(".rbe").join(&lock.rpx).is_file();
+    let activation_path = activation::expected_path(&project);
+    let activation_ok = activation_path.is_file();
     let bindings = requested_languages(&lock.language);
     let missing_bindings = bindings
         .iter()
@@ -241,6 +246,11 @@ fn status(project: &Path) -> Result<()> {
     println!("  language: {}", lock.language);
     println!("  backend: {}", if backend_ok { "OK" } else { "MISSING" });
     println!("  rpx: {}", if rpx_ok { "OK" } else { "MISSING" });
+    println!(
+        "  activation: {} ({})",
+        activation_path.display(),
+        if activation_ok { "OK" } else { "MISSING" }
+    );
     for language in &bindings {
         let present = !missing_bindings.contains(language);
         println!(
@@ -258,7 +268,7 @@ fn status(project: &Path) -> Result<()> {
         ),
         None => println!("  managed toolchain: NOT CONFIGURED"),
     }
-    if !backend_ok || !rpx_ok || !missing_bindings.is_empty() {
+    if !backend_ok || !rpx_ok || !activation_ok || !missing_bindings.is_empty() {
         bail!(
             "SDK installation is incomplete.\n{}",
             installer_hint(&project)
@@ -408,11 +418,15 @@ Install from a freshly verified complete SDK bundle:\n\
   backend install sdk.<version> -path=<project> [-language=typescript] [-toolchain=<verified-rpx-toolchain.json>]\n\n\
 Status:\n\
   backend sdk status -path=<project>\n\n\
+Project command activation:\n\
+  Windows PowerShell: & .\\.rbe\\activate.ps1\n\
+  Linux/macOS shell:  . ./.rbe/activate.sh\n\n\
 Managed compiler handoff:\n\
   backend sdk toolchain -path=<project> -file=<verified-rpx-toolchain.json>\n\n\
+The activation files expose backend/rpx only to the current shell and only while the working directory remains inside the owning project tree. They never modify User or Machine PATH.\n\n\
 The toolchain descriptor must be RPX format 2 and every absolute compiler/entry path must still match its pinned SHA-256. The SDK backend never discovers host compilers through PATH.\n\n\
 Update/repair:\n\
-  Re-run the official Kastrick SDK installer so backend, RPX, language bindings, and managed compiler state are restored from a fresh verified bundle/handoff.\n\
+  Re-run the official Kastrick SDK installer so backend, RPX, language bindings, activation files, and managed compiler state are restored from a fresh verified bundle/handoff.\n\
   `backend sdk update -path=<project>` and `backend sdk repair -path=<project>` print that bootstrap command.\n\n\
 The SDK backend never performs a machine-wide install."
     );
