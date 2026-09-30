@@ -25,11 +25,58 @@ pub struct VerifiedPackageWorkerIdentity {
     pub runtime_version: String,
     pub runtime_entry: String,
     pub runtime_managed: bool,
-    /// Runtime authority requested by the SHA-pinned package manifest.
+}
+
+impl VerifiedPackageWorkerIdentity {
+    /// Re-read runtime capability requests from this worker's SHA-pinned package
+    /// artifact and reject any identity drift before returning them.
     ///
-    /// These are requests, not grants. Backend still maps only capabilities it
-    /// explicitly implements into trusted Library Host grants.
-    pub requested_capabilities: Vec<String>,
+    /// The returned strings are verified requests, not grants. Backend remains
+    /// responsible for mapping only implemented capabilities into host grants.
+    pub fn read_requested_capabilities(
+        &self,
+        project_root: &Path,
+    ) -> Result<Vec<String>, InstallRuntimeError> {
+        let layout = ProjectCacheLayout::new(project_root);
+        let lock_path = layout.lock_path();
+        if !lock_path.try_exists()? {
+            return Err(InstallRuntimeError::VerifiedRootMissing(self.package.clone()));
+        }
+        let lock = ProjectPackageLock::parse_yaml(&std::fs::read_to_string(&lock_path)?)?;
+        let locked = lock
+            .packages
+            .get(&self.package)
+            .ok_or_else(|| InstallRuntimeError::VerifiedRootMissing(self.package.clone()))?;
+
+        let artifact_dir = layout.library_artifact_dir(&locked.artifact_sha256)?;
+        let artifact_path = artifact_dir.join("artifact.rbe");
+        verify_locked_artifact(&artifact_path, &locked.artifact_sha256)?;
+        let policy = ArchivePolicy::default();
+        let inspected = inspect_zip(File::open(&artifact_path)?, policy)?;
+        let manifest_sha256 = hash_manifest(&artifact_path, policy.max_manifest_bytes)?;
+        let reconstructed = identity_from_manifest(
+            &self.package,
+            locked,
+            &inspected.manifest,
+            &manifest_sha256,
+        )?;
+        if reconstructed != *self {
+            return Err(InstallRuntimeError::VerifiedPackageMetadataMismatch {
+                package: self.package.clone(),
+                field: "worker identity",
+                locked: format!("{self:?}"),
+                artifact: format!("{reconstructed:?}"),
+            });
+        }
+
+        Ok(inspected
+            .manifest
+            .capabilities
+            .iter()
+            .filter(|(_, enabled)| **enabled)
+            .map(|(capability, _)| capability.clone())
+            .collect())
+    }
 }
 
 /// Reconstruct the executable identity of every explicit project root from the
@@ -138,13 +185,6 @@ fn identity_from_manifest(
         });
     }
 
-    let requested_capabilities = manifest
-        .capabilities
-        .iter()
-        .filter(|(_, enabled)| **enabled)
-        .map(|(capability, _)| capability.clone())
-        .collect();
-
     Ok(VerifiedPackageWorkerIdentity {
         package: package.to_string(),
         version: locked.version.clone(),
@@ -160,7 +200,6 @@ fn identity_from_manifest(
         runtime_version: runtime.version.clone(),
         runtime_entry: manifest.runtime.entry.clone(),
         runtime_managed: manifest.runtime.managed,
-        requested_capabilities,
     })
 }
 
@@ -272,10 +311,6 @@ kind = "bun"
 version = "^1.3"
 managed = true
 entry = "src/index.js"
-
-[capabilities]
-"net:http" = true
-"net:tcp" = false
 "#;
 
     fn locked() -> LockedProjectPackage {
@@ -299,7 +334,7 @@ entry = "src/index.js"
     }
 
     #[test]
-    fn verified_worker_identity_keeps_exact_resolved_toolchains_and_capability_requests() {
+    fn verified_worker_identity_keeps_exact_resolved_toolchains() {
         let manifest = LibraryManifest::parse(MANIFEST).unwrap();
         let locked = locked();
         let identity =
@@ -312,7 +347,6 @@ entry = "src/index.js"
         assert_eq!(identity.runtime_version, "1.3.7");
         assert_eq!(identity.runtime_entry, "src/index.js");
         assert_eq!((identity.rbe_abi_min, identity.rbe_abi_max), (1, 2));
-        assert_eq!(identity.requested_capabilities, ["net:http"]);
     }
 
     #[test]
