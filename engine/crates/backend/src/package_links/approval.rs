@@ -1,17 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use rbe_install_runtime::VerifiedRpxRootSnapshot;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const APPROVAL_FORMAT: u32 = 1;
 const APPROVAL_FILE: &str = "package-capabilities.json";
 const PROJECT_LOCK: &str = "package.lock.rbe.yaml";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApprovalState {
     format: u32,
@@ -19,7 +19,16 @@ struct ApprovalState {
     packages: BTreeMap<String, PackageApproval>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl Default for ApprovalState {
+    fn default() -> Self {
+        Self {
+            format: APPROVAL_FORMAT,
+            packages: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackageApproval {
     version: String,
@@ -58,16 +67,7 @@ pub(crate) fn approved_runtime_capabilities(
         return Ok(Vec::new());
     }
 
-    let requested = snapshot
-        .worker
-        .read_requested_capabilities(project_root)
-        .with_context(|| {
-            format!(
-                "re-verify capability requests for approved package {:?}",
-                snapshot.package
-            )
-        })?;
-
+    let requested = requested_runtime_capabilities(project_root, snapshot)?;
     for capability in &approval.runtime {
         if !requested.iter().any(|request| request == capability) {
             bail!(
@@ -86,6 +86,76 @@ pub(crate) fn approved_runtime_capabilities(
     }
 
     Ok(approval.runtime.clone())
+}
+
+pub(crate) fn requested_runtime_capabilities(
+    project_root: &Path,
+    snapshot: &VerifiedRpxRootSnapshot,
+) -> anyhow::Result<Vec<String>> {
+    let mut requested = snapshot
+        .worker
+        .read_requested_capabilities(project_root)
+        .with_context(|| {
+            format!(
+                "re-verify capability requests for package {:?}",
+                snapshot.package
+            )
+        })?;
+    requested.sort();
+    requested.dedup();
+    Ok(requested)
+}
+
+/// Replace the explicit host privileges approved for one exact installed root.
+///
+/// The approval is bound to the verified package version, artifact SHA-256 and
+/// current project-lock SHA-256. Package upgrades or lock changes therefore
+/// invalidate old authority automatically. Passing an empty list revokes all
+/// explicit host privileges for this package. The implicit package-scoped `log`
+/// capability is not stored here and cannot be widened through this API.
+pub(crate) fn replace_runtime_approval(
+    project_root: &Path,
+    snapshot: &VerifiedRpxRootSnapshot,
+    capabilities: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let requested = requested_runtime_capabilities(project_root, snapshot)?;
+    let requested = requested.into_iter().collect::<BTreeSet<_>>();
+    let mut approved = BTreeSet::new();
+
+    for capability in capabilities {
+        if !requested.contains(capability) {
+            bail!(
+                "package {:?} does not request host capability {:?}",
+                snapshot.package,
+                capability
+            );
+        }
+        if explicit_host_privilege_description(capability).is_none() {
+            bail!(
+                "capability {:?} is not an explicitly approvable RBE host privilege",
+                capability
+            );
+        }
+        approved.insert(capability.clone());
+    }
+
+    let mut state = read_state(project_root)?.unwrap_or_default();
+    validate_state(&state)?;
+    if approved.is_empty() {
+        state.packages.remove(&snapshot.package);
+    } else {
+        state.packages.insert(
+            snapshot.package.clone(),
+            PackageApproval {
+                version: snapshot.version.clone(),
+                artifact_sha256: snapshot.artifact_sha256.to_ascii_lowercase(),
+                project_lock_sha256: current_project_lock_sha256(project_root)?,
+                runtime: approved.iter().cloned().collect(),
+            },
+        );
+    }
+    write_state(project_root, &state)?;
+    Ok(approved.into_iter().collect())
 }
 
 pub(crate) fn explicit_host_privilege_description(capability: &str) -> Option<&'static str> {
@@ -125,6 +195,39 @@ fn read_state(project_root: &Path) -> anyhow::Result<Option<ApprovalState>> {
         Err(error) => Err(error)
             .with_context(|| format!("inspect RBE package approval state: {}", path.display())),
     }
+}
+
+fn write_state(project_root: &Path, state: &ApprovalState) -> anyhow::Result<()> {
+    validate_state(state)?;
+    let rbe = project_root.join(".rbe");
+    match fs::symlink_metadata(&rbe) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("RBE project state root is not a regular directory: {}", rbe.display())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&rbe)
+                .with_context(|| format!("create RBE project state root: {}", rbe.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect RBE project state root: {}", rbe.display()))
+        }
+    }
+
+    let path = approval_path(project_root);
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "RBE package approval state is not a regular file: {}",
+                path.display()
+            );
+        }
+    }
+    let mut bytes = serde_json::to_vec_pretty(state).context("encode RBE package approval state")?;
+    bytes.push(b'\n');
+    fs::write(&path, bytes)
+        .with_context(|| format!("write RBE package approval state: {}", path.display()))
 }
 
 fn validate_state(state: &ApprovalState) -> anyhow::Result<()> {
