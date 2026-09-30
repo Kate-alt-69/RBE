@@ -40,7 +40,9 @@ impl VerifiedPackageWorkerIdentity {
         let layout = ProjectCacheLayout::new(project_root);
         let lock_path = layout.lock_path();
         if !lock_path.try_exists()? {
-            return Err(InstallRuntimeError::VerifiedRootMissing(self.package.clone()));
+            return Err(InstallRuntimeError::VerifiedRootMissing(
+                self.package.clone(),
+            ));
         }
         let lock = ProjectPackageLock::parse_yaml(&std::fs::read_to_string(&lock_path)?)?;
         let locked = lock
@@ -54,12 +56,8 @@ impl VerifiedPackageWorkerIdentity {
         let policy = ArchivePolicy::default();
         let inspected = inspect_zip(File::open(&artifact_path)?, policy)?;
         let manifest_sha256 = hash_manifest(&artifact_path, policy.max_manifest_bytes)?;
-        let reconstructed = identity_from_manifest(
-            &self.package,
-            locked,
-            &inspected.manifest,
-            &manifest_sha256,
-        )?;
+        let reconstructed =
+            identity_from_manifest(&self.package, locked, &inspected.manifest, &manifest_sha256)?;
         if reconstructed != *self {
             return Err(InstallRuntimeError::VerifiedPackageMetadataMismatch {
                 package: self.package.clone(),
