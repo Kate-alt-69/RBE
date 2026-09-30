@@ -97,7 +97,9 @@ pub async fn dispatch_authorized_call(
     let owner = binding
         .accepted_info()
         .map(|info| info.capability_identity.clone())
-        .ok_or_else(|| anyhow::anyhow!("package TCP call arrived before Library Host acceptance"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("package TCP call arrived before Library Host acceptance")
+        })?;
 
     let payload = match call.operation.as_str() {
         "connect" => connect(package, &owner, &call.payload).await?,
@@ -303,7 +305,11 @@ fn connection_for(package: &str, owner: &str, handle: &str) -> anyhow::Result<Ma
     Ok(connection.clone())
 }
 
-fn remove_connection(package: &str, owner: &str, handle: &str) -> anyhow::Result<ManagedConnection> {
+fn remove_connection(
+    package: &str,
+    owner: &str,
+    handle: &str,
+) -> anyhow::Result<ManagedConnection> {
     validate_handle(handle)?;
     let mut connections = lock_registry()?;
     let connection = connections
@@ -321,7 +327,8 @@ fn validate_handle(handle: &str) -> anyhow::Result<()> {
     let Some(value) = handle.strip_prefix("tcp:") else {
         bail!("invalid package TCP handle");
     };
-    if value.len() != HANDLE_RANDOM_BYTES * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() != HANDLE_RANDOM_BYTES * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         bail!("invalid package TCP handle");
     }
     Ok(())
@@ -367,7 +374,9 @@ async fn resolve_public_addresses(host: &str, port: u16) -> anyhow::Result<Vec<S
 fn validate_host(host: &str) -> anyhow::Result<()> {
     if host.is_empty()
         || host.len() > 253
-        || host.chars().any(|character| character.is_control() || character.is_whitespace())
+        || host
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
     {
         bail!("package net:tcp host is invalid");
     }
@@ -478,7 +487,14 @@ mod tests {
 
     #[test]
     fn host_validation_rejects_local_and_ambiguous_names() {
-        for host in ["", "localhost", "printer", "mail.local", "-bad.example", "bad-.example"] {
+        for host in [
+            "",
+            "localhost",
+            "printer",
+            "mail.local",
+            "-bad.example",
+            "bad-.example",
+        ] {
             assert!(validate_host(host).is_err(), "{host:?} must be rejected");
         }
         assert!(validate_host("smtp.example.com").is_ok());
