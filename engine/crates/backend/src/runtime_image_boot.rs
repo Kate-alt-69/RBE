@@ -119,7 +119,11 @@ pub fn render_compile_error(error: &ServerCompileError) -> String {
 pub fn render_relc_error(error: &RelcError) -> String {
     match error {
         RelcError::Parse(parse) => {
-            format!("{}\nhelp: {}", parse.render_with_source(), RUNTIME_IMAGE_COMPILE_HELP)
+            format!(
+                "{}\nhelp: {}",
+                parse.render_with_source(),
+                RUNTIME_IMAGE_COMPILE_HELP
+            )
         }
         RelcError::Link(message) => format!("{message}\nhelp: {RUNTIME_IMAGE_COMPILE_HELP}"),
     }
