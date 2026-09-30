@@ -112,8 +112,8 @@ pub(crate) fn dispatch_package_log_call(
         bail!("unsupported package log operation {:?}", call.operation);
     }
 
-    let record: LibraryLogRecord = serde_json::from_slice(&call.payload)
-        .context("decode structured package log record")?;
+    let record: LibraryLogRecord =
+        serde_json::from_slice(&call.payload).context("decode structured package log record")?;
     if record.scope.len() > LIBRARY_LOG_MAX_SCOPE_DEPTH {
         bail!(
             "package log scope exceeds maximum depth {}",
