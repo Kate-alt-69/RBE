@@ -8,7 +8,9 @@ use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context};
-use core_lib::{LibraryHostCall, LibraryHostCallReply, LibrarySessionBinding};
+use core_lib::{
+    LibraryCapabilityGrant, LibraryHostCall, LibraryHostCallReply, LibrarySessionBinding,
+};
 use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex, VerifiedRpxRootSnapshot};
 use route_engine::relc::{
     PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
@@ -76,9 +78,8 @@ struct RpxPackageExport {
 /// Build RELC's package namespace from SHA-verified explicit package roots.
 ///
 /// The same verified root snapshot also seeds fail-closed Library Host sessions
-/// before the public export namespace is returned. Runtime privilege evidence
-/// was already recovered from the exact SHA-pinned artifact while constructing
-/// each snapshot; Backend maps only the supported RBE-owned subset into grants.
+/// before the public export namespace is returned. Explicit RBE-owned package
+/// authority remains empty until trusted project-local approval is admitted.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
     let loaded = load_with_workers(project_root)?;
     install_verified_host_sessions(&loaded.roots)?;
@@ -105,9 +106,7 @@ fn build_verified_host_sessions(
 ) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>> {
     let mut sessions = BTreeMap::new();
     for (package, snapshot) in roots {
-        let grants = host::grants_for_verified_requests(&snapshot.requested_capabilities)
-            .with_context(|| format!("admit verified RBE privilege requests for root {package:?}"))?;
-        let binding = host::bind_session(snapshot, grants)
+        let binding = host::bind_session(snapshot, std::iter::empty::<LibraryCapabilityGrant>())
             .with_context(|| format!("bind Library Host session for verified root {package:?}"))?;
         let entry = LibraryHostSessionEntry {
             binding,
@@ -154,7 +153,7 @@ fn install_verified_host_sessions(
     tracing::info!(
         package_sessions = active.len(),
         trusted_dispatchers,
-        "prepared verified Library Host sessions with artifact-proven RBE privilege grants"
+        "prepared verified fail-closed Library Host sessions pending explicit privilege approval"
     );
     Ok(())
 }
@@ -329,7 +328,6 @@ mod tests {
                 runtime_entry: "src/index.js".into(),
                 runtime_managed: true,
             },
-            requested_capabilities: vec!["mail:queue".into(), "net:http".into()],
         }
     }
 
@@ -373,10 +371,6 @@ mod tests {
         assert_eq!(retained.worker.runtime_kind, "bun");
         assert_eq!(retained.worker.runtime_version, "1.3.7");
         assert_eq!(retained.artifact_sha256, "a".repeat(64));
-        assert_eq!(
-            retained.requested_capabilities,
-            vec!["mail:queue".to_string(), "net:http".to_string()]
-        );
 
         let sessions = build_verified_host_sessions(&loaded.roots).unwrap();
         assert_eq!(sessions.len(), 1);
