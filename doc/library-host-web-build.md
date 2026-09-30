@@ -1,12 +1,12 @@
 # Library Host & Managed Web Build Security
 
-Status: implemented RBE contracts through `LIBHOST-044` and `WEBBUILD-009` on `main`. This document covers the verified external-library worker launch path, the Container worker proxy, managed Bun/npm web-build plans, and the trust rules that external coordinators must preserve when they schedule RBE-backed work.
+Status: implemented RBE contracts through `LIBHOST-046` and `WEBBUILD-009` on `main`. This document covers the verified external-library worker launch path, the Container worker proxy, the live sandboxed Library Protocol relay, managed Bun/npm web-build plans, and the trust rules that external coordinators must preserve when they schedule RBE-backed work.
 
 This document complements [`library-system.md`](library-system.md). The package lock and verified package graph remain the package activation authority; an external queue, preview service, scheduler, or build coordinator is not allowed to widen that authority.
 
 ## 1. Current trust chain
 
-RBE does not launch an external library worker from a package name, mutable cache path, or host `PATH` lookup alone. The current worker path is built from verified package state and carries integrity evidence forward until immediately before process execution.
+RBE does not launch an external library worker from a package name, mutable cache path, or host `PATH` lookup alone. The current worker contracts are built from verified package state and carry integrity evidence forward until immediately before process execution.
 
 ```text
 package.rbe.yaml + package.lock.rbe.yaml
@@ -15,7 +15,7 @@ package.rbe.yaml + package.lock.rbe.yaml
 verified RPX root snapshot
                  |
                  v
-Library Host accepted session
+Library Host accepted session identity
                  |
                  v
 sealed worker launch proof
@@ -35,16 +35,27 @@ re-verify executable + source bytes
 Container Library Worker Proxy
                  |
                  v
-bounded sandbox process
+namespace/cgroup/no_new_privs/Landlock/seccomp
                  |
                  v
 library.proxy.ready
                  |
                  v
-library.hello / Library Protocol
+raw Library Protocol relay
+                 |
+                 v
+library.hello
+                 |
+                 v
+package identity + ABI validation
+                 |
+                 v
+library.accept
 ```
 
 The important rule is that each boundary re-validates the identity it is about to trust. A previously verified path is not permanently trusted merely because it still exists at the same location.
+
+`library.proxy.ready` is not package/session acceptance. It says only that the trusted Container-side sandbox boundary has been established for the expected child. Package identity, ABI compatibility, and admitted host capabilities remain Library Host decisions at the later `library.hello` / `library.accept` boundary.
 
 ## 2. Sealed worker launch authority
 
@@ -68,24 +79,66 @@ External workers never receive raw Backend router pointers or mutable internal m
 
 `container-library-worker-proxy` is the trusted process boundary used for verified external library workers on the currently supported Unix/Linux path.
 
-Before executing the worker, the proxy verifies the bootstrap and launch inputs again. The executor then applies a bounded Container sandbox with the following properties:
+Before executing the worker, the proxy verifies the bootstrap and launch inputs again. The executor then applies the Container sandbox with the following properties:
 
 - environment cleared before the child is executed;
 - direct network policy set to deny-all for the worker execution path;
 - no shell-mediated launch;
-- cgroup-v2 resource accounting/limits;
-- bounded wall time;
-- bounded process count and memory policy;
-- bounded stdout and stderr capture;
-- cgroup-wide termination on timeout/output overflow;
+- cgroup-v2 process/memory/CPU enforcement;
 - `no_new_privileges` before the final worker exec;
 - workspace Landlock restrictions on the supported Linux path;
 - restricted seccomp policy before the final worker exec;
 - executable/source verification repeated after sandbox setup and before exec.
 
-The proxy execution child currently has an explicit unsupported-platform failure outside the Unix path. Do not describe the cgroup/Landlock/seccomp worker execution path as a portable Windows/macOS implementation until equivalent platform enforcement is actually wired.
+The proxy now has two deliberately different execution shapes.
 
-## 4. Proxy startup status before Library Protocol
+### 3.1 One-shot proxy execution
+
+The existing one-shot execution path remains available for bounded command-style execution. It captures bounded stdout/stderr, enforces a wall-time limit, terminates the cgroup on timeout/output overflow, waits for process completion, and returns a validated `LibraryWorkerProxyResult`.
+
+That mode is not the long-lived Library Host transport.
+
+### 3.2 Live Library Protocol relay (`LIBHOST-046`)
+
+The live proxy mode uses `startup_timeout_seconds` only for establishment of the secure worker boundary. Once the child has completed sandbox setup and emitted `library.proxy.ready`, stdin/stdout become a transparent long-lived Library Protocol channel.
+
+The live path:
+
+```text
+Backend-side proxy stdin
+        |
+        v
+strict verified bootstrap
+        |
+        v
+Container verification
+        |
+        v
+sandbox child
+  - cgroup
+  - private network namespace / deny-all direct network
+  - no_new_privs
+  - Landlock
+  - seccomp
+  - final executable/source re-verification
+        |
+        v
+library.proxy.ready
+        |
+        v
+exec managed Bun / Node / Python worker
+        |
+        v
+raw framed Library Protocol over stdin/stdout
+```
+
+The proxy parent validates that the ready PID is the exact child it launched. The internal sandbox child keeps the same PID across the final Unix `exec`, so a forged/mismatched ready identity is rejected before protocol forwarding begins.
+
+If the controlling stdin closes, the live proxy treats that as loss of host authority and kills the worker cgroup instead of intentionally leaving an orphaned package process behind.
+
+The proxy execution child has an explicit unsupported-platform failure outside the currently implemented Unix/Linux path. Do not describe the cgroup/Landlock/seccomp worker execution path as a portable Windows/macOS implementation until equivalent platform enforcement is actually wired.
+
+## 4. Proxy startup status and Library Host handshake
 
 The Container proxy emits exactly one framed startup status before raw Library Protocol traffic may begin:
 
@@ -101,7 +154,37 @@ library.proxy.reject
 
 `ready` carries the proxy protocol version and a non-zero process ID. `reject` carries a bounded machine-readable code and printable bounded message. Unknown fields, unsupported protocol versions, invalid IDs, invalid codes, and invalid messages are rejected.
 
+The complete intended live transition is:
+
+```text
+verified bootstrap
+→ Container byte verification
+→ sandbox establishment
+→ library.proxy.ready
+→ raw Library Protocol relay
+→ library.hello
+→ expected package/runtime/SDK/ABI identity validation
+→ library.accept
+→ package invocation + authorized host calls
+```
+
 Backend must not proceed to `library.hello` until it has consumed a valid `library.proxy.ready` frame. A failed/rejected proxy startup is not equivalent to a worker handshake failure after readiness; keeping these states separate prevents ambiguous partial startup.
+
+Likewise, a valid `library.proxy.ready` does **not** imply that the worker has any host capability grants. Those grants are derived from the actual trusted `CapabilityGrant` set installed into the matching Library Host session and are exposed only after a successful worker hello.
+
+### 4.1 Stdout is protocol-owned
+
+After `library.proxy.ready`, worker stdout is reserved exclusively for framed Library Protocol bytes. Package/SDK diagnostics and normal logging must use stderr.
+
+This separation is a protocol invariant, not merely a style preference: writing arbitrary log text to stdout can corrupt the framed channel and must never be interpreted as trusted proxy/session state.
+
+The live proxy relays stderr separately from the Library Protocol channel.
+
+### 4.2 Current integration boundary
+
+`LIBHOST-046` implements the secure live Container relay itself. Backend still needs the final owner-side integration that selects the trusted packaged proxy executable, sends the sealed bootstrap, consumes `library.proxy.ready`, attaches the resulting channel to the retained `LibrarySessionBinding`, and requires the existing `library.hello` handshake before exposing the package worker as live.
+
+Until that owner path is connected, documentation must not claim that every installed package worker is already launched end-to-end through live proxy mode.
 
 ## 5. Managed web build contracts
 
@@ -215,8 +298,11 @@ For RBE worker launch:
 - altered executable/source bytes invalidate the launch;
 - invalid proxy bootstrap/status invalidates startup;
 - sandbox setup failure invalidates startup;
-- timeout/output overflow terminates the cgroup and reports a bounded result;
-- Library Protocol begins only after a valid proxy-ready status.
+- one-shot proxy timeout/output overflow terminates the cgroup and reports a bounded result;
+- live-proxy startup timeout terminates the cgroup before Library Protocol begins;
+- live controlling-stdin EOF kills the worker cgroup;
+- Library Protocol begins only after a valid proxy-ready status;
+- package authority still begins only after a valid `library.hello` / `library.accept` handshake.
 
 For an external multi-instance build coordinator:
 
@@ -240,8 +326,9 @@ The current implementation is primarily split across:
 - `engine/crates/backend/` — verified package-root loading, Library Host sessions, launch proof construction and worker/proxy coordination;
 - `engine/crates/core/src/library_session.rs` — Library session metadata/authority contracts;
 - `install-runtime/` — verified package snapshots and worker identity evidence;
+- `install-executor/src/worker_launch.rs` and `install-executor/src/worker_proxy.rs` — sealed worker launch inputs and strict Container proxy bootstrap bridging;
 - `install-executor/src/web_build.rs` — managed Bun/npm lock-resolution and final-build contracts;
 - `container-runtime/crates/ipc-protocol/` — worker proxy bootstrap/result/status framing;
-- `container-runtime/crates/container/` — proxy verification and bounded sandbox execution.
+- `container-runtime/crates/container-bin/src/library_worker_proxy*.rs` — Container-side independent verification, one-shot execution, live sandbox setup, startup status, and raw Library Protocol relay.
 
 When these boundaries change, update this document in the same RBE change so external hosts do not accidentally depend on an older trust model.
