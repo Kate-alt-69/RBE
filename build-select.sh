@@ -7,6 +7,33 @@ SDK_SOURCE_DIR="$REPO_ROOT/sdk"
 DIST_ROOT="$REPO_ROOT/dist"
 BUILD_SDK=false; ONLY=""; RELEASE=true; BUILD_WIN=false; BUILD_LINUX=false; BUILD_MACOS=false; BUILD_ALL=false; MUSL=false; CUSTOM_TARGET=""
 ARCHES=()
+
+ensure_shared_cargo_target() {
+  local cache_root=""
+  if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    case "$CARGO_TARGET_DIR" in
+      /*) ;;
+      *) CARGO_TARGET_DIR="$REPO_ROOT/$CARGO_TARGET_DIR" ;;
+    esac
+  else
+    if [ -n "${RBE_BUILD_CACHE_DIR:-}" ]; then
+      cache_root="$RBE_BUILD_CACHE_DIR"
+    elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+      cache_root="$XDG_CACHE_HOME/rbe-build"
+    else
+      cache_root="$REPO_ROOT/.cache/rbe-build"
+    fi
+    case "$cache_root" in
+      /*) ;;
+      *) cache_root="$REPO_ROOT/$cache_root" ;;
+    esac
+    export RBE_BUILD_CACHE_DIR="$cache_root"
+    CARGO_TARGET_DIR="$cache_root/cargo-target"
+  fi
+  mkdir -p "$CARGO_TARGET_DIR"
+  export CARGO_TARGET_DIR
+}
+
 for arg in "$@"; do
   case "$arg" in
     --build-sdk) BUILD_SDK=true ;;
@@ -35,6 +62,9 @@ EOF
   esac
 done
 $BUILD_SDK || [ -n "$ONLY" ] || { echo 'ERROR: selective builder requires --build-sdk and/or --only-<binary>' >&2; exit 2; }
+
+ensure_shared_cargo_target
+
 HOST_OS=$(case "$(uname -s)" in Linux*) echo linux;; Darwin*) echo macos;; MINGW*|MSYS*|CYGWIN*) echo windows;; *) echo linux;; esac)
 HOST_ARCH=$(case "$(uname -m)" in x86_64|amd64) echo x64;; i?86) echo x86;; aarch64|arm64) echo arm64;; armv7*) echo armv7;; *) echo x64;; esac)
 [ ${#ARCHES[@]} -gt 0 ] || ARCHES=("$HOST_ARCH")
@@ -46,11 +76,12 @@ elif $BUILD_ALL; then targets+=(x86_64-pc-windows-msvc x86_64-unknown-linux-gnu 
 else
   $BUILD_WIN && for a in "${ARCHES[@]}"; do targets+=("$(resolve_target windows "$a" false)"); done
   $BUILD_LINUX && for a in "${ARCHES[@]}"; do targets+=("$(resolve_target linux "$a" "$MUSL")"); done
-  $BUILD_MACOS && for a in "${ARCHES[@]}"; do targets+=("$(resolve_target macos "$a" false)"); done
+  $BUILD_MACOS && for a in "${ARCHES[@]}"; do targets+=("$(resolve_target macos "$a" "$MUSL")"); done
   if ! $BUILD_WIN && ! $BUILD_LINUX && ! $BUILD_MACOS; then for a in "${ARCHES[@]}"; do targets+=("$(resolve_target "$HOST_OS" "$a" "$MUSL")"); done; fi
 fi
 profile=debug; $RELEASE && profile=release
 cargo_build() { local cwd="$1" target="$2"; shift 2; rustup target list --installed | grep -qx "$target" || rustup target add "$target"; local tool=cargo; if [ "$(target_os "$target")" != "$HOST_OS" ] && command -v cross >/dev/null 2>&1; then tool=cross; elif [ "$(target_os "$target")" != "$HOST_OS" ]; then echo "WARNING: cross-OS target $target requested without cross; linker may fail" >&2; fi; (cd "$cwd" && "$tool" "$@"); }
+built_binary_path() { local workspace="$1" target="$2" profile="$3" binary="$4"; local root="$workspace/target"; [ -n "${CARGO_TARGET_DIR:-}" ] && root="$CARGO_TARGET_DIR"; local path="$root/$target/$profile/$binary"; [ "$(target_os "$target")" = windows ] && path="$path.exe"; printf '%s\n' "$path"; }
 copy_bin() { local source="$1" base="$2" target="$3"; local dest="$base"; [ "$(target_os "$target")" = windows ] && dest="$dest.exe"; cp "$source" "$dest"; echo "  -> $dest" >&2; }
 copy_clean_tree() { local source="$1" dest="$2"; [ -d "$source" ] || { echo "ERROR: SDK binding source is missing: $source" >&2; exit 2; }; rm -rf "$dest"; mkdir -p "$dest"; cp -R "$source"/. "$dest"/; rm -rf "$dest/target" "$dest/node_modules" "$dest/__pycache__" "$dest/.pytest_cache"; find "$dest" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true; }
 copy_sdk_bindings() { local out="$1" bindings="$1/bindings"; mkdir -p "$bindings"; copy_clean_tree "$SDK_SOURCE_DIR/rbe-sdk" "$bindings/rust"; copy_clean_tree "$SDK_SOURCE_DIR/js" "$bindings/javascript"; copy_clean_tree "$SDK_SOURCE_DIR/js" "$bindings/typescript"; copy_clean_tree "$SDK_SOURCE_DIR/python" "$bindings/python"; echo "  -> $bindings" >&2; }
@@ -61,8 +92,8 @@ for target in "${targets[@]}"; do
   if $BUILD_SDK; then
     case "$ONLY" in ''|backend|rpx|sdk-backend) ;; *) echo "ERROR: --build-sdk only supports --only-backend or --only-rpx" >&2; exit 2;; esac
     out="$DIST_ROOT/$target/sdk"; mkdir -p "$out"
-    if [ -z "$ONLY" ] || [ "$ONLY" = backend ] || [ "$ONLY" = sdk-backend ]; then cargo_build "$REPO_ROOT" "$target" build --manifest-path "$ENGINE_DIR/crates/sdk-backend/Cargo.toml" --bin sdk-backend --target "$target" "${rel[@]}"; p="$ENGINE_DIR/crates/sdk-backend/target/$target/$profile/sdk-backend"; [ "$(target_os "$target")" = windows ] && p="$p.exe"; copy_bin "$p" "$out/backend" "$target"; fi
-    if [ -z "$ONLY" ] || [ "$ONLY" = rpx ]; then cargo_build "$REPO_ROOT" "$target" build --manifest-path "$ENGINE_DIR/crates/rpx/Cargo.toml" --bin rpx --target "$target" "${rel[@]}"; p="$ENGINE_DIR/crates/rpx/target/$target/$profile/rpx"; [ "$(target_os "$target")" = windows ] && p="$p.exe"; copy_bin "$p" "$out/rpx" "$target"; fi
+    if [ -z "$ONLY" ] || [ "$ONLY" = backend ] || [ "$ONLY" = sdk-backend ]; then cargo_build "$REPO_ROOT" "$target" build --manifest-path "$ENGINE_DIR/crates/sdk-backend/Cargo.toml" --bin sdk-backend --target "$target" "${rel[@]}"; p="$(built_binary_path "$ENGINE_DIR/crates/sdk-backend" "$target" "$profile" sdk-backend)"; copy_bin "$p" "$out/backend" "$target"; fi
+    if [ -z "$ONLY" ] || [ "$ONLY" = rpx ]; then cargo_build "$REPO_ROOT" "$target" build --manifest-path "$ENGINE_DIR/crates/rpx/Cargo.toml" --bin rpx --target "$target" "${rel[@]}"; p="$(built_binary_path "$ENGINE_DIR/crates/rpx" "$target" "$profile" rpx)"; copy_bin "$p" "$out/rpx" "$target"; fi
     if [ -z "$ONLY" ]; then echo '-- Language SDK bindings --' >&2; copy_sdk_bindings "$out"; fi
     has_backend=false; has_rpx=false; has_bindings=false
     if [ -z "$ONLY" ] || [ "$ONLY" = backend ] || [ "$ONLY" = sdk-backend ]; then has_backend=true; fi
@@ -73,11 +104,11 @@ for target in "${targets[@]}"; do
   fi
   out="$DIST_ROOT/$target"; mkdir -p "$out"
   case "$ONLY" in
-    backend|service) cargo_build "$ENGINE_DIR" "$target" build -p backend --bin "$ONLY" --target "$target" "${rel[@]}"; p="$ENGINE_DIR/target/$target/$profile/$ONLY"; [ "$(target_os "$target")" = windows ] && p="$p.exe"; copy_bin "$p" "$out/$ONLY" "$target" ;;
-    cloud-node|cloud_node) cargo_build "$ENGINE_DIR" "$target" build -p cloud-node --bin cloud_node --target "$target" "${rel[@]}"; p="$ENGINE_DIR/target/$target/$profile/cloud_node"; [ "$(target_os "$target")" = windows ] && p="$p.exe"; copy_bin "$p" "$out/cloud_node" "$target" ;;
-    container|container-bin|container_bin) cargo_build "$CONTAINER_DIR" "$target" build -p container-bin --bin container-bin --target "$target" "${rel[@]}"; p="$CONTAINER_DIR/target/$target/$profile/container-bin"; [ "$(target_os "$target")" = windows ] && p="$p.exe"; copy_bin "$p" "$out/container" "$target" ;;
-    rpx) cargo_build "$REPO_ROOT" "$target" build --manifest-path "$ENGINE_DIR/crates/rpx/Cargo.toml" --bin rpx --target "$target" "${rel[@]}"; p="$ENGINE_DIR/crates/rpx/target/$target/$profile/rpx"; [ "$(target_os "$target")" = windows ] && p="$p.exe"; copy_bin "$p" "$out/rpx" "$target" ;;
-    *) cargo_build "$ENGINE_DIR" "$target" build -p "$ONLY" --bin "$ONLY" --target "$target" "${rel[@]}"; p="$ENGINE_DIR/target/$target/$profile/$ONLY"; [ "$(target_os "$target")" = windows ] && p="$p.exe"; copy_bin "$p" "$out/$ONLY" "$target" ;;
+    backend|service) cargo_build "$ENGINE_DIR" "$target" build -p backend --bin "$ONLY" --target "$target" "${rel[@]}"; p="$(built_binary_path "$ENGINE_DIR" "$target" "$profile" "$ONLY")"; copy_bin "$p" "$out/$ONLY" "$target" ;;
+    cloud-node|cloud_node) cargo_build "$ENGINE_DIR" "$target" build -p cloud-node --bin cloud_node --target "$target" "${rel[@]}"; p="$(built_binary_path "$ENGINE_DIR" "$target" "$profile" cloud_node)"; copy_bin "$p" "$out/cloud_node" "$target" ;;
+    container|container-bin|container_bin) cargo_build "$CONTAINER_DIR" "$target" build -p container-bin --bin container-bin --target "$target" "${rel[@]}"; p="$(built_binary_path "$CONTAINER_DIR" "$target" "$profile" container-bin)"; copy_bin "$p" "$out/container" "$target" ;;
+    rpx) cargo_build "$REPO_ROOT" "$target" build --manifest-path "$ENGINE_DIR/crates/rpx/Cargo.toml" --bin rpx --target "$target" "${rel[@]}"; p="$(built_binary_path "$ENGINE_DIR/crates/rpx" "$target" "$profile" rpx)"; copy_bin "$p" "$out/rpx" "$target" ;;
+    *) cargo_build "$ENGINE_DIR" "$target" build -p "$ONLY" --bin "$ONLY" --target "$target" "${rel[@]}"; p="$(built_binary_path "$ENGINE_DIR" "$target" "$profile" "$ONLY")"; copy_bin "$p" "$out/$ONLY" "$target" ;;
   esac
 done
 echo "Done. Output in $DIST_ROOT" >&2
