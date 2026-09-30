@@ -43,7 +43,7 @@ Those are not substitutes for the S3 access-key pair. S3 access keys are server-
 
 ## Registry export contract
 
-`ingest_registry_export()` and the `cloud_node ingest-registry` command accept a trusted registry export directory containing these top-level collections:
+`ingest_registry_export()` and the `cloud_node ingest-registry` command accept a **complete frozen registry snapshot**, not an incremental patch. The export may contain these top-level collections:
 
 ```text
 index/
@@ -55,7 +55,7 @@ analytics/
 artifacts/
 ```
 
-Metadata collections contain JSON only. `artifacts/` may contain JSON metadata and published `.rbe.zip` payloads.
+`index/snapshot.json` is mandatory. Cloud Node validates the complete export before changing active registry state. Metadata collections contain JSON only. `artifacts/` may contain JSON metadata and published `.rbe.zip` payloads.
 
 A typical export is:
 
@@ -88,9 +88,15 @@ Ingest a materialized export without contacting the provider with:
 cloud_node --config=setting.node.cn.json ingest-registry <export-root>
 ```
 
-The command reports the number of metadata and artifact files plus the resulting Cloud Node logical path, object key, and content SHA-256 for each stored object. Ingestion rejects symlinks, unsafe paths, unknown collections, non-JSON metadata, non-`.rbe.zip` artifact payloads, and `package.rbe.json`.
+The command reports `files`, `metadataFiles`, `artifactFiles`, and `removedFiles`, followed by the resulting Cloud Node logical path, object key, and content SHA-256 for each stored object.
 
-Cloud Node stores accepted files under the logical `registry/` prefix in its normal content-addressed store. That means package metadata, index snapshots/revisions, ownership records, release history, analytics, artifact metadata, and `.rbe.zip` artifacts all participate in the same provider snapshot.
+Ingestion rejects missing `index/snapshot.json`, symlinks, unsafe paths, duplicate logical paths, unknown collections, non-JSON metadata, non-`.rbe.zip` artifact payloads, and `package.rbe.json` before snapshot replacement begins.
+
+Cloud Node stores accepted files under the logical `registry/` prefix in its normal content-addressed store. After every file in the new export has been stored successfully, active `registry/` file objects absent from the validated snapshot are removed from the active storage tree. Non-registry Cloud Node objects are never touched by this replacement step.
+
+Removal affects only the active registry view used to calculate the next sync root. Cloud Node's `backup/` history for a removed registry object is deliberately retained, so accepting a newer complete registry snapshot does not destroy the node's local historical copies.
+
+That replacement behavior is important: registry ingestion is not an overlay. If a path existed in the previous complete export but is absent from the next one, the next Cloud Node provider snapshot must not continue advertising that stale path.
 
 `package.rbe.json` is deliberately not accepted as registry archive metadata. Published package archives are opaque to Cloud Node. The trusted Kastrick publisher must verify the `.rbe.zip` and its internal `package.rbe.yaml` before exporting a release artifact to Cloud Node.
 
@@ -105,13 +111,14 @@ cloud_node --config=setting.node.cn.json sync-registry <export-root>
 `sync-registry` is intentionally a composition of existing Cloud Node behavior, not a second registry protocol. It performs these steps in order:
 
 1. verify that provider mode is configured before changing local registry state;
-2. validate and ingest the frozen export through the same `ingest_registry_export()` path used by `ingest-registry`;
-3. run the normal `synchronize_provider()` transaction, including provider-history locking, ancestry checks, conflict policy, immutable object uploads, and provider HEAD compare-and-swap behavior;
-4. report ingest counts followed by the normal provider sync relation, action, final head, and final root.
+2. validate the complete frozen export through the same path used by `ingest-registry`;
+3. store the new snapshot and remove stale active `registry/` paths that are absent from it;
+4. run the normal `synchronize_provider()` transaction, including provider-history locking, ancestry checks, conflict policy, immutable object uploads, and provider HEAD compare-and-swap behavior;
+5. report `ingestFiles`, `ingestMetadataFiles`, `ingestArtifactFiles`, `ingestRemovedFiles`, then the normal provider sync relation, action, final head, and final root.
 
 Package publishing must not depend synchronously on this command. A publisher can materialize a frozen export and schedule `sync-registry` independently so a temporary object-provider outage does not make package publication itself unavailable.
 
-If provider synchronization fails after ingestion, the accepted registry objects remain in the local Cloud Node store and the command returns an error that states the local ingest completed. Re-running the same frozen export is safe with respect to snapshot identity: Cloud Node's sync root is derived from object kind, logical path, content SHA-256, and logical size rather than manifest timestamps. Replaying byte-identical registry files therefore keeps the same sync root; changing any exported object content changes the root and produces the expected new provider snapshot.
+If provider synchronization fails after ingestion, the accepted registry snapshot remains in the local Cloud Node store and the command returns an error that states the local ingest completed. Re-running the same frozen export is safe with respect to snapshot identity: Cloud Node's sync root is derived from object kind, logical path, content SHA-256, and logical size rather than manifest timestamps. Replaying byte-identical registry files therefore keeps the same sync root; changing object content or the active path set changes the root and produces the expected new provider snapshot.
 
 Because `sync-registry` uses the configured provider conflict policy, a diverged remote does not get silently overwritten. The default `fail` policy still fails. `prefer-local` and `prefer-remote` retain their existing explicit meanings.
 
