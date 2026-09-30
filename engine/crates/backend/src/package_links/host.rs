@@ -1,15 +1,19 @@
+use std::collections::BTreeSet;
+
 use anyhow::{bail, Context};
 use core_lib::{
-    ExpectedWorkerIdentity, LibraryCapabilityGrant, LibraryHostCall, LibraryHostCallReply,
-    LibraryPackageIdentity, LibraryRuntimeIdentity, LibrarySdkIdentity, LibrarySessionBinding,
-    LIBRARY_ABI_VERSION,
+    call_public_http, ExpectedWorkerIdentity, LibraryCapabilityGrant, LibraryHostCall,
+    LibraryHostCallReply, LibraryPackageIdentity, LibraryRuntimeIdentity, LibrarySdkIdentity,
+    LibrarySessionBinding, LIBRARY_ABI_VERSION, MAX_LIBRARY_PAYLOAD_BYTES,
 };
 use rand::RngCore;
 use rbe_install_runtime::VerifiedRpxRootSnapshot;
 use serde::Deserialize;
+use serde_json::Value;
 
 const SESSION_ID_BYTES: usize = 32;
 const LIBRARY_LOG_CAPABILITY: &str = "log";
+const LIBRARY_NET_HTTP_CAPABILITY: &str = "net:http";
 const LIBRARY_LOG_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const LIBRARY_LOG_MAX_RESPONSE_BYTES: usize = 1024;
 const LIBRARY_LOG_MAX_SCOPE_DEPTH: usize = 16;
@@ -90,6 +94,48 @@ fn package_log_grant(package: &str) -> anyhow::Result<LibraryCapabilityGrant> {
     .context("build verified package logging capability grant")
 }
 
+fn package_http_grant() -> anyhow::Result<LibraryCapabilityGrant> {
+    LibraryCapabilityGrant::new(
+        LIBRARY_NET_HTTP_CAPABILITY,
+        LIBRARY_NET_HTTP_CAPABILITY,
+        [
+            "get".to_string(),
+            "post".to_string(),
+            "request".to_string(),
+        ],
+        MAX_LIBRARY_PAYLOAD_BYTES,
+        MAX_LIBRARY_PAYLOAD_BYTES,
+    )
+    .context("build verified package public HTTP capability grant")
+}
+
+/// Convert verified manifest requests into the subset of capabilities that
+/// Backend actually implements for external package workers.
+///
+/// Requests are never treated as authority by themselves. `log` is host-owned
+/// and implicit; `net:http` is currently the only explicit package capability
+/// with a trusted Backend dispatcher. Any other enabled request fails closed so
+/// packages never start under the illusion that requested authority was granted.
+pub fn grants_for_verified_requests(
+    requests: &[String],
+) -> anyhow::Result<Vec<LibraryCapabilityGrant>> {
+    let mut grants = Vec::new();
+    let mut seen = BTreeSet::new();
+    for request in requests {
+        if !seen.insert(request.as_str()) {
+            continue;
+        }
+        match request.as_str() {
+            LIBRARY_LOG_CAPABILITY => {}
+            LIBRARY_NET_HTTP_CAPABILITY => grants.push(package_http_grant()?),
+            unsupported => bail!(
+                "verified package requested unsupported runtime capability {unsupported:?}"
+            ),
+        }
+    }
+    Ok(grants)
+}
+
 /// Authorize and dispatch one package host call through the same retained
 /// Library Host binding that accepted the worker handshake.
 ///
@@ -97,7 +143,7 @@ fn package_log_grant(package: &str) -> anyhow::Result<LibraryCapabilityGrant> {
 /// This prevents a package from reaching a Backend host primitive merely by
 /// spelling a known capability name. Dispatchers are intentionally explicit;
 /// capabilities without a Backend-owned implementation fail closed.
-pub fn dispatch_authorized_host_call(
+pub async fn dispatch_authorized_host_call(
     package: &str,
     binding: &LibrarySessionBinding,
     call: &LibraryHostCall,
@@ -108,6 +154,7 @@ pub fn dispatch_authorized_host_call(
 
     let payload = match call.capability.as_str() {
         LIBRARY_LOG_CAPABILITY => dispatch_package_log_call(package, call)?,
+        LIBRARY_NET_HTTP_CAPABILITY => dispatch_package_http_call(call).await?,
         capability => bail!(
             "trusted Backend dispatcher for package capability {capability:?} is not installed"
         ),
@@ -124,6 +171,23 @@ pub fn dispatch_authorized_host_call(
 
     LibraryHostCallReply::success(call.call_id, payload)
         .context("encode successful package host-call reply")
+}
+
+async fn dispatch_package_http_call(call: &LibraryHostCall) -> anyhow::Result<Vec<u8>> {
+    if call.capability != LIBRARY_NET_HTTP_CAPABILITY
+        || call.target != LIBRARY_NET_HTTP_CAPABILITY
+    {
+        bail!("package HTTP call does not match admitted net:http authority");
+    }
+    if !matches!(call.operation.as_str(), "get" | "post" | "request") {
+        bail!("unsupported package HTTP operation {:?}", call.operation);
+    }
+    let args: Vec<Value> = serde_json::from_slice(&call.payload)
+        .context("package net:http payload must be a JSON argument array")?;
+    let value = call_public_http(&call.operation, &args)
+        .await
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+    serde_json::to_vec(&value).context("encode package net:http response")
 }
 
 /// Dispatch one already-authorized package `log` host call into RBE's normal
@@ -292,6 +356,23 @@ mod tests {
     }
 
     #[test]
+    fn verified_requests_admit_only_implemented_capabilities() {
+        let grants = grants_for_verified_requests(&["log".into(), "net:http".into()]).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].capability, "net:http");
+        assert_eq!(grants[0].target, "net:http");
+        assert!(grants[0].operations.contains("get"));
+        assert!(grants[0].operations.contains("post"));
+        assert!(grants[0].operations.contains("request"));
+    }
+
+    #[test]
+    fn unsupported_verified_request_fails_closed() {
+        let error = grants_for_verified_requests(&["net:tcp".into()]).unwrap_err();
+        assert!(error.to_string().contains("unsupported runtime capability"));
+    }
+
+    #[test]
     fn session_uses_opaque_identity_supplied_grants_and_verified_log_scope() {
         let snapshot = snapshot();
         let mut session = bind_session(
@@ -349,8 +430,8 @@ mod tests {
         assert!(error.to_string().contains("host-owned"));
     }
 
-    #[test]
-    fn authorized_log_call_dispatches_and_returns_typed_reply() {
+    #[tokio::test]
+    async fn authorized_log_call_dispatches_and_returns_typed_reply() {
         let snapshot = snapshot();
         let mut session = bind_session(&snapshot, std::iter::empty()).unwrap();
         session.accept_hello(&hello(&snapshot)).unwrap();
@@ -359,22 +440,24 @@ mod tests {
             "info",
             br#"{"scope":["smtp"],"message":"ready"}"#,
         );
-        let reply = dispatch_authorized_host_call("advancenet", &session, &call).unwrap();
+        let reply = dispatch_authorized_host_call("advancenet", &session, &call)
+            .await
+            .unwrap();
         assert_eq!(reply.call_id, call.call_id);
         assert!(reply.ok);
         assert!(reply.payload.is_empty());
         assert!(reply.error.is_none());
     }
 
-    #[test]
-    fn admitted_but_unimplemented_capability_fails_closed() {
+    #[tokio::test]
+    async fn admitted_but_unimplemented_capability_fails_closed() {
         let snapshot = snapshot();
         let mut session = bind_session(
             &snapshot,
             [LibraryCapabilityGrant::new(
-                "net:http",
-                "net:http",
-                ["request".to_string()],
+                "net:tcp",
+                "net:tcp",
+                ["connect".to_string()],
                 1024,
                 4096,
             )
@@ -384,13 +467,33 @@ mod tests {
         session.accept_hello(&hello(&snapshot)).unwrap();
         let call = LibraryHostCall {
             call_id: 9,
+            capability: "net:tcp".into(),
+            target: "net:tcp".into(),
+            operation: "connect".into(),
+            payload: b"[]".to_vec(),
+        };
+        let error = dispatch_authorized_host_call("advancenet", &session, &call)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("dispatcher"));
+    }
+
+    #[tokio::test]
+    async fn package_http_dispatch_requires_json_argument_array_before_network() {
+        let snapshot = snapshot();
+        let mut session = bind_session(&snapshot, [package_http_grant().unwrap()]).unwrap();
+        session.accept_hello(&hello(&snapshot)).unwrap();
+        let call = LibraryHostCall {
+            call_id: 10,
             capability: "net:http".into(),
             target: "net:http".into(),
             operation: "request".into(),
             payload: b"{}".to_vec(),
         };
-        let error = dispatch_authorized_host_call("advancenet", &session, &call).unwrap_err();
-        assert!(error.to_string().contains("dispatcher"));
+        let error = dispatch_authorized_host_call("advancenet", &session, &call)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("JSON argument array"));
     }
 
     #[test]
