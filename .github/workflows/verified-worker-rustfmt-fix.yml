@@ -1,0 +1,44 @@
+name: Repair Verified Worker Rustfmt
+
+on:
+  push:
+    paths:
+      - ".github/workflows/verified-worker-rustfmt-fix.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format verified worker source
+        run: rustfmt --edition 2021 install-runtime/src/verified_worker.rs
+      - name: Commit exact formatter repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add install-runtime/src/verified_worker.rs
+          git rm .github/workflows/verified-worker-rustfmt-fix.yml
+          python3 - <<'PY'
+          import subprocess
+          allowed = {
+              'D  .github/workflows/verified-worker-rustfmt-fix.yml',
+              'M  install-runtime/src/verified_worker.rs',
+          }
+          actual = set(subprocess.check_output(['git', 'status', '--porcelain'], text=True).splitlines())
+          if actual != allowed:
+              raise SystemExit(f'unexpected rustfmt working tree: {sorted(actual)}')
+          PY
+          git commit -m 'FIX | BUG-SDK-CAP-143 format verified worker checks'
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
