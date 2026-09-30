@@ -9,6 +9,8 @@
 mod core;
 #[path = "install_cli.rs"]
 mod install_cli;
+#[path = "package_approval.rs"]
+mod package_approval;
 #[path = "package_cli.rs"]
 mod package_cli;
 

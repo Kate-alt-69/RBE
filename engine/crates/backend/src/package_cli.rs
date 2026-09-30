@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use rbe_install_runtime::{read_verified_rpx_root_snapshots, VerifiedRpxRootSnapshot};
 
-use crate::runtime_image_boot::package_links::approval;
+use super::package_approval as approval;
 
 const HELP: &str = r#"RBE package permissions
 
