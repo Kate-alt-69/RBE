@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::format::{BlobBody, BlobKind, BlobManifest};
+use crate::registry_ingest::ensure_registry_ingest_committed;
 use crate::store::CloudNodeStore;
 
 const SYNC_HEADER_MAGIC: &[u8; 8] = b"RBECNSY1";
@@ -43,6 +44,12 @@ pub struct SyncPlanHeader {
 
 impl SyncPlan {
     pub fn scan(store: &CloudNodeStore) -> anyhow::Result<Self> {
+        // A crashed registry replacement can leave a valid-but-mixed active
+        // object set. Refuse every normal synchronization plan until a trusted
+        // complete registry ingest repairs the snapshot and clears its durable
+        // pending marker.
+        ensure_registry_ingest_committed(store)?;
+
         let storage = store.summary().storage;
         let mut plan = Self::scan_storage(&storage)?;
         for object in &mut plan.folders {
