@@ -107,14 +107,6 @@ fn package_http_grant() -> anyhow::Result<LibraryCapabilityGrant> {
     .context("build verified package public HTTP capability grant")
 }
 
-/// Convert verified package requests into the subset of RBE-owned host
-/// privileges that Backend currently implements.
-///
-/// Package capabilities remain open-ended: unknown/package-specific requests
-/// are not host grants and do not prevent the worker from starting. Packages may
-/// implement arbitrary internal APIs, services, backends, queues, adapters, and
-/// abstractions inside their worker. Only supported RBE-owned surfaces returned
-/// here cross the trusted Library Host authority boundary.
 pub fn grants_for_verified_requests(
     requests: &[String],
 ) -> anyhow::Result<Vec<LibraryCapabilityGrant>> {
@@ -290,6 +282,7 @@ mod tests {
                 runtime_entry: "src/index.js".into(),
                 runtime_managed: true,
             },
+            requested_capabilities: vec!["mail:queue".into(), "net:http".into()],
         }
     }
 
