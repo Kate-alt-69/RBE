@@ -6,7 +6,9 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context};
-use core_lib::{LibraryCapabilityGrant, LibrarySessionBinding};
+use core_lib::{
+    LibraryCapabilityGrant, LibraryHostCall, LibraryHostCallReply, LibrarySessionBinding,
+};
 use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex, VerifiedRpxRootSnapshot};
 use route_engine::relc::{
     PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
@@ -15,7 +17,18 @@ use serde::Deserialize;
 
 const RPX_PACKAGE_INDEX_FORMAT: u32 = 1;
 
-static LIBRARY_HOST_SESSIONS: OnceLock<Mutex<BTreeMap<String, LibrarySessionBinding>>> =
+type LibraryHostDispatcher = fn(
+    &str,
+    &LibrarySessionBinding,
+    &LibraryHostCall,
+) -> anyhow::Result<LibraryHostCallReply>;
+
+struct LibraryHostSessionEntry {
+    binding: LibrarySessionBinding,
+    dispatcher: LibraryHostDispatcher,
+}
+
+static LIBRARY_HOST_SESSIONS: OnceLock<Mutex<BTreeMap<String, LibraryHostSessionEntry>>> =
     OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -54,7 +67,8 @@ struct RpxPackageExport {
 ///
 /// The same verified root snapshot also seeds fail-closed Library Host sessions
 /// before the public export namespace is returned. Sessions deliberately start
-/// with zero admitted grants until capability admission persists explicit grants.
+/// with only host-owned implicit authority until capability admission persists
+/// explicit package grants.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
     let loaded = load_with_workers(project_root)?;
     install_verified_host_sessions(&loaded.roots)?;
@@ -85,12 +99,16 @@ pub fn load_with_workers(project_root: &Path) -> anyhow::Result<LoadedPackageRoo
 
 fn build_verified_host_sessions(
     roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
-) -> anyhow::Result<BTreeMap<String, LibrarySessionBinding>> {
+) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>> {
     let mut sessions = BTreeMap::new();
     for (package, snapshot) in roots {
         let binding = host::bind_session(snapshot, std::iter::empty::<LibraryCapabilityGrant>())
             .with_context(|| format!("bind Library Host session for verified root {package:?}"))?;
-        if sessions.insert(package.clone(), binding).is_some() {
+        let entry = LibraryHostSessionEntry {
+            binding,
+            dispatcher: host::dispatch_authorized_host_call,
+        };
+        if sessions.insert(package.clone(), entry).is_some() {
             bail!("duplicate Library Host session for verified root {package:?}");
         }
     }
@@ -107,14 +125,13 @@ fn install_verified_host_sessions(
         .map_err(|_| anyhow::anyhow!("Library Host session registry lock is poisoned"))?;
 
     for session in active.values_mut() {
-        session.close();
+        session.binding.close();
     }
     *active = sessions;
 
     tracing::info!(
         package_sessions = active.len(),
-        granted_capabilities = 0,
-        "prepared verified fail-closed Library Host sessions"
+        "prepared verified fail-closed Library Host sessions with trusted dispatchers"
     );
     Ok(())
 }
@@ -338,9 +355,14 @@ mod tests {
 
         let sessions = build_verified_host_sessions(&loaded.roots).unwrap();
         assert_eq!(sessions.len(), 1);
+        let session = sessions.get("advancenet").unwrap();
         assert_eq!(
-            sessions.get("advancenet").unwrap().state(),
+            session.binding.state(),
             core_lib::LibrarySessionState::AwaitHello
+        );
+        assert_eq!(
+            session.dispatcher as usize,
+            host::dispatch_authorized_host_call as usize
         );
     }
 
