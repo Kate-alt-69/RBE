@@ -487,7 +487,10 @@ mod tests {
     #[test]
     fn publisher_default_matches_registry_default() {
         let client = PublisherClient::new(DEFAULT_REGISTRY_URL).unwrap();
-        assert_eq!(client.base_url().as_str(), "https://kastrick-backend.onrender.com/");
+        assert_eq!(
+            client.base_url().as_str(),
+            "https://kastrick-backend.onrender.com/"
+        );
     }
 
     #[test]
