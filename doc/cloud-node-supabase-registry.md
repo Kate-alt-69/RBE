@@ -98,6 +98,8 @@ Removal affects only the active registry view used to calculate the next sync ro
 
 That replacement behavior is important: registry ingestion is not an overlay. If a path existed in the previous complete export but is absent from the next one, the next Cloud Node provider snapshot must not continue advertising that stale path.
 
+Only one local registry replacement transaction may run at a time. Cloud Node holds an OS-backed exclusive lock at `<storageRoot>/rbe/.registry-ingest.lock`; a second local `ingest-registry` or `sync-registry` operation fails fast instead of interleaving two snapshots. The operating system releases the lock automatically if the owning process exits or crashes.
+
 `package.rbe.json` is deliberately not accepted as registry archive metadata. Published package archives are opaque to Cloud Node. The trusted Kastrick publisher must verify the `.rbe.zip` and its internal `package.rbe.yaml` before exporting a release artifact to Cloud Node.
 
 ## One-shot registry provider synchronization
@@ -111,10 +113,13 @@ cloud_node --config=setting.node.cn.json sync-registry <export-root>
 `sync-registry` is intentionally a composition of existing Cloud Node behavior, not a second registry protocol. It performs these steps in order:
 
 1. verify that provider mode is configured before changing local registry state;
-2. validate the complete frozen export through the same path used by `ingest-registry`;
-3. store the new snapshot and remove stale active `registry/` paths that are absent from it;
-4. run the normal `synchronize_provider()` transaction, including provider-history locking, ancestry checks, conflict policy, immutable object uploads, and provider HEAD compare-and-swap behavior;
-5. report `ingestFiles`, `ingestMetadataFiles`, `ingestArtifactFiles`, `ingestRemovedFiles`, then the normal provider sync relation, action, final head, and final root.
+2. acquire the local registry replacement lock;
+3. validate the complete frozen export through the same path used by `ingest-registry`;
+4. store the new snapshot and remove stale active `registry/` paths that are absent from it;
+5. while still holding the registry lock, run the normal `synchronize_provider()` transaction, including its provider-history namespace lock, ancestry checks, conflict policy, immutable object uploads, and provider HEAD compare-and-swap behavior;
+6. report `ingestFiles`, `ingestMetadataFiles`, `ingestArtifactFiles`, `ingestRemovedFiles`, then the normal provider sync relation, action, final head, and final root.
+
+Holding the registry lock through provider synchronization prevents another local registry revision from replacing the active `registry/` tree between ingest and provider snapshot creation. The provider lock remains independently responsible for serializing remote history changes for the configured namespace.
 
 Package publishing must not depend synchronously on this command. A publisher can materialize a frozen export and schedule `sync-registry` independently so a temporary object-provider outage does not make package publication itself unavailable.
 
