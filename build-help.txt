@@ -24,6 +24,28 @@ Linux prerequisite preflight:
     RBE_BUILD_AUTO_REPAIR_RUST=0
                            Disable automatic repair of a broken cached Rust
                            toolchain and fail immediately instead.
+    RBE_BUILD_CACHE_DIR=<path>
+                           Root for RBE's reusable build cache. Cargo artifacts
+                           are stored under <path>/cargo-target.
+    CARGO_TARGET_DIR=<path>
+                           Explicit Cargo artifact cache override. When set,
+                           RBE respects this path directly.
+
+  Shared Cargo cache precedence:
+    1. CARGO_TARGET_DIR
+    2. RBE_BUILD_CACHE_DIR/cargo-target
+    3. XDG_CACHE_HOME/rbe-build/cargo-target
+    4. <RBE>/.cache/rbe-build/cargo-target
+
+  RBE uses one shared Cargo target directory across Container, Engine, service,
+  cloud_node, backend, RPX, and SDK builds. This lets Cargo reuse unchanged
+  crate artifacts across RBE's separate workspaces instead of recompiling the
+  same dependencies for each sub-build. Cargo remains responsible for all
+  fingerprint/target/profile/feature validity checks.
+
+  On Render, XDG_CACHE_HOME is persisted between builds, so the shared Cargo
+  target directory is restored on later deploys unless the Render build cache
+  is explicitly cleared.
 
   Debian/Ubuntu hosts normally need:
     build-essential git openssl rustup
