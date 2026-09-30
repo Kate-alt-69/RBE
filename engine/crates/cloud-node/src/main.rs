@@ -119,6 +119,7 @@ async fn run() -> anyhow::Result<()> {
             println!("files={}", result.files);
             println!("metadataFiles={}", result.metadata_files);
             println!("artifactFiles={}", result.artifact_files);
+            println!("removedFiles={}", result.removed_files);
             for stored in result.stored {
                 println!(
                     "{}\t{}\t{}",
@@ -138,6 +139,7 @@ async fn run() -> anyhow::Result<()> {
             println!("ingestFiles={}", ingested.files);
             println!("ingestMetadataFiles={}", ingested.metadata_files);
             println!("ingestArtifactFiles={}", ingested.artifact_files);
+            println!("ingestRemovedFiles={}", ingested.removed_files);
 
             let result = synchronize_provider(&settings, &store)
                 .await
