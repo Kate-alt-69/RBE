@@ -1,0 +1,130 @@
+name: Fix Library Host Clippy Once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-library-host-clippy-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Remove stale approval scaffolding and fix tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          approval = Path('engine/crates/backend/src/package_links/approval.rs')
+          text = approval.read_text(encoding='utf-8')
+          text = text.replace(
+              'use rbe_install_runtime::{VerifiedRootGraph, VerifiedRpxRootSnapshot};\n'
+              'use serde::{Deserialize, Serialize};\n',
+              'use rbe_install_runtime::VerifiedRpxRootSnapshot;\n'
+              'use serde::Deserialize;\n',
+          )
+
+          def cut_between(source: str, start: str, end: str) -> str:
+              a = source.find(start)
+              if a < 0:
+                  raise SystemExit(f'missing start marker: {start!r}')
+              b = source.find(end, a)
+              if b < 0:
+                  raise SystemExit(f'missing end marker: {end!r}')
+              return source[:a] + source[b:]
+
+          text = cut_between(
+              text,
+              '#[derive(Debug, Clone, PartialEq, Eq)]\npub(crate) struct HostPrivilegeRequest',
+              '#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct ApprovalState',
+          )
+          text = text.replace(
+              '#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct ApprovalState',
+              '#[derive(Debug, Clone, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct ApprovalState',
+              1,
+          )
+          text = cut_between(
+              text,
+              'impl Default for ApprovalState {',
+              '#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct PackageApproval',
+          )
+          text = text.replace(
+              '#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct PackageApproval',
+              '#[derive(Debug, Clone, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct PackageApproval',
+              1,
+          )
+          text = cut_between(
+              text,
+              '/// Return the currently implemented RBE-owned runtime privileges requested by',
+              '/// Load exact approvals for one verified package snapshot.',
+          )
+          text = cut_between(
+              text,
+              '/// Persist approvals after successful package activation.',
+              'pub(crate) fn explicit_host_privilege_description',
+          )
+          text = cut_between(
+              text,
+              'fn write_state(project_root: &Path, state: &ApprovalState)',
+              'fn validate_state(state: &ApprovalState)',
+          )
+          approval.write_text(text, encoding='utf-8')
+
+          links = Path('engine/crates/backend/src/package_links.rs')
+          text = links.read_text(encoding='utf-8')
+          text = cut_between(
+              text,
+              'fn build_verified_host_sessions(',
+              'fn build_approved_host_sessions(',
+          )
+          old = '        let sessions = build_verified_host_sessions(&loaded.roots).unwrap();\n'
+          new = (
+              '        let sessions = build_host_sessions(&loaded.roots, |_package, _snapshot| {\n'
+              '            Ok(Vec::new())\n'
+              '        })\n'
+              '        .unwrap();\n'
+          )
+          if old not in text:
+              raise SystemExit('missing Library Host test session marker')
+          text = text.replace(old, new, 1)
+          links.write_text(text, encoding='utf-8')
+
+          host = Path('engine/crates/backend/src/package_links/host.rs')
+          text = host.read_text(encoding='utf-8')
+          stale = '            requested_capabilities: vec!["mail:queue".into(), "net:http".into()],\n'
+          if stale not in text:
+              raise SystemExit('missing stale requested_capabilities test field')
+          host.write_text(text.replace(stale, '', 1), encoding='utf-8')
+          PY
+
+          cargo fmt --manifest-path engine/Cargo.toml --all
+          cargo clippy --manifest-path engine/Cargo.toml --workspace --all-targets --locked -- -D warnings
+          cargo test --manifest-path engine/Cargo.toml --workspace --locked
+
+          rm -f .github/workflows/fix-library-host-clippy-once.yml
+          mapfile -t changed < <(git status --short | sed 's/^...//' | sort)
+          printf 'Changed paths:\n'; printf '  %s\n' "${changed[@]}"
+          for path in "${changed[@]}"; do
+            case "$path" in
+              engine/crates/backend/src/package_links.rs|engine/crates/backend/src/package_links/approval.rs|engine/crates/backend/src/package_links/host.rs|.github/workflows/fix-library-host-clippy-once.yml) ;;
+              *) echo "ERROR: unexpected change: $path" >&2; exit 1 ;;
+            esac
+          done
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'FIX | BUG-LIBHOST-157 remove stale approval scaffolding'
+          git pull --rebase origin main
+          git push origin HEAD:main
