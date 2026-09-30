@@ -15,6 +15,43 @@ pub struct VerifiedRootGraph {
     pub packages: BTreeMap<String, VerifiedRegistryPackage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VerifiedCapabilityInventory {
+    pub runtime: BTreeMap<String, Vec<String>>,
+    pub build: BTreeMap<String, Vec<String>>,
+}
+
+impl VerifiedRootGraph {
+    /// Return enabled capability requests from every SHA-verified package
+    /// manifest in this staged root graph.
+    ///
+    /// This is disclosure/admission evidence only. Capability names remain
+    /// open-ended and this function intentionally does not decide which names
+    /// map to RBE-owned host privileges or whether the user approved them.
+    pub fn capability_inventory(&self) -> VerifiedCapabilityInventory {
+        let mut inventory = VerifiedCapabilityInventory::default();
+        for (package, verified) in &self.packages {
+            let runtime = enabled_capabilities(&verified.manifest.capabilities);
+            if !runtime.is_empty() {
+                inventory.runtime.insert(package.clone(), runtime);
+            }
+            let build = enabled_capabilities(&verified.manifest.build_capabilities);
+            if !build.is_empty() {
+                inventory.build.insert(package.clone(), build);
+            }
+        }
+        inventory
+    }
+}
+
+fn enabled_capabilities(values: &BTreeMap<String, bool>) -> Vec<String> {
+    values
+        .iter()
+        .filter(|(_, enabled)| **enabled)
+        .map(|(capability, _)| capability.clone())
+        .collect()
+}
+
 /// Execute the registry-artifact trust boundary for one resolver root graph.
 ///
 /// Packages are staged in the resolver's dependency-first install order. The
@@ -232,6 +269,19 @@ entry = "src/index.js"
         std::fs::write(plan.partial_path, bytes).unwrap();
     }
 
+    #[test]
+    fn enabled_capability_inventory_preserves_open_ended_names() {
+        let values = BTreeMap::from([
+            ("mail:smtp".to_string(), true),
+            ("net:http".to_string(), true),
+            ("mail:disabled".to_string(), false),
+        ]);
+        assert_eq!(
+            enabled_capabilities(&values),
+            vec!["mail:smtp".to_string(), "net:http".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn verified_graph_keeps_transitives_private_to_root() {
         let dependency_map = BTreeMap::from([("rbe-core".into(), "^1".into())]);
@@ -286,6 +336,7 @@ entry = "src/index.js"
             .contains_key("rbe-core"));
         assert!(graph.lock.root_graph_complete("advancenet"));
         assert_eq!(graph.packages.len(), 2);
+        assert_eq!(graph.capability_inventory(), VerifiedCapabilityInventory::default());
     }
 
     #[tokio::test]
