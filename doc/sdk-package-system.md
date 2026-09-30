@@ -89,12 +89,19 @@ rpx logout [--registry <url>]
 
 `rpx whoami` validates the active token against the publisher service and lists packages currently owned by that publisher. `rpx logout` revokes the server-side credential when possible and removes the locally stored registry credential. Credentials supplied through `RPX_TOKEN` are never persisted; CI is expected to unset or rotate that environment value itself.
 
-Registry selection and credential overrides:
+The built-in RPX/DI registry default is:
+
+```text
+https://kastrick-backend.onrender.com
+```
+
+An explicit CLI/configuration override still wins. Environment overrides are:
 
 ```text
 RPX_REGISTRY_URL=https://registry.example
+RBE_PACKAGE_REGISTRY=https://registry.example
 RPX_AUTH_FILE=/private/path/rpx-auth.json
-RPX_TOKEN=<64-hex-scoped-token>
+RPX_TOKEN=<scoped-token>
 ```
 
 Production registry URLs require HTTPS. Loopback HTTP remains available for local authoring and contract tests.
@@ -153,13 +160,41 @@ That flag is an explicit authoring escape hatch, not the production/default comp
 
 ## SDK bootstrap
 
-The SDK-specific backend is intentionally separate from the production backend. It installs only into a project:
+The production RBE `backend` and the project-local SDK backend have separate jobs:
+
+1. The normal production `backend` recognizes `install sdk.*`, downloads the fixed Kastrick HTTPS bootstrap script, and invokes it with argument-safe process arguments.
+2. The bootstrap script selects the requested `sdk-v*` RBE release, downloads the platform SDK archive and its `.sha256`, and verifies the archive before extraction.
+3. The verified archive contains the dedicated SDK backend, RPX, and the Rust/JavaScript/TypeScript/Python SDK bindings.
+4. That SDK backend installs the selected language binding(s) into the project under `.rbe/`, writes `sdk.lock.json`, and owns later SDK status/toolchain operations.
+
+This keeps SDK payload/install logic out of the production backend while making the public command work directly:
 
 ```text
 backend install sdk.latest -path=. -language=typescript
-backend sdk repair -path=.
-backend sdk update -path=.
-backend sdk status -path=.
+backend install sdk.0.1.0 --path . --language typescript
+```
+
+On Windows PowerShell, an executable in the current directory must be invoked explicitly:
+
+```powershell
+.\backend.exe install sdk.latest -path=. -language=typescript
+```
+
+After installation, the project-local tools are under:
+
+```text
+.rbe/bin/backend[.exe]
+.rbe/bin/rpx[.exe]
+.rbe/sdk/<language>/
+.rbe/sdk.lock.json
+```
+
+The installed project-local SDK backend then supports:
+
+```text
+.rbe/bin/backend sdk status -path=.
+.rbe/bin/backend sdk repair -path=.
+.rbe/bin/backend sdk update -path=.
 ```
 
 A `global` SDK install explicitly installs all language bindings; mixed-language packages are only valid when `language = "global"` is deliberately selected in `package.rbe.toml`.
@@ -180,7 +215,7 @@ backend install sdk.latest \
 An already installed SDK can admit a freshly verified handoff without replacing the SDK bundle:
 
 ```text
-backend sdk toolchain \
+.rbe/bin/backend sdk toolchain \
   -path=. \
   -file=/trusted/staging/rpx-toolchain.json
 ```
