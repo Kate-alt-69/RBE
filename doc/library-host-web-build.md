@@ -287,7 +287,70 @@ Required invariants:
 - expiry is part of the authority check, not only UI/status metadata;
 - a crashed claimant leaves an expiring immutable attempt record rather than requiring unsafe distributed lock deletion.
 
-The queue itself may remain mutable/advisory. If the queue index is updated by multiple instances, its mutation path still needs a separate compare-and-swap/ETag-style lost-update solution; safe leasing prevents double execution but does not by itself make a mutable read-modify-write queue index linearizable.
+### 7.1 Mutable queue/index updates require CAS
+
+Safe attempt leasing prevents two workers from owning the same attempt, but it does not prevent two backend instances from losing each other's changes to a shared mutable queue or index.
+
+A multi-instance coordinator should therefore mutate shared indexes with a storage-level compare-and-swap contract:
+
+```text
+GET queue/index + version token (ETag)
+        |
+        v
+apply local add/remove cleanup
+        |
+        v
+conditional replace: If-Match <ETag>
+        |
+   +----+----+
+   |         |
+updated    stale
+   |         |
+ done       re-read + retry (bounded)
+```
+
+The first creation of a shared index should remain create-if-absent. Existing-index replacement should require the exact version token returned by the same read. An unconditional `GET -> modify -> PUT` is not safe merely because each process holds its own local mutex.
+
+CAS retries must be bounded. Exhausting the retry budget is an error, not permission to fall back to an unconditional write.
+
+### 7.2 Terminal result publication requires attempt fencing
+
+Lease validation only at the beginning of a long completion request is insufficient. A worker may validate attempt `N`, spend time verifying or materializing immutable output, then outlive its lease while another instance advances the mutable job to attempt `N+1`.
+
+Before a worker publishes externally visible terminal state, the coordinator should therefore perform a final generation fence:
+
+```text
+verified immutable output
+        |
+        v
+re-read mutable BuildJob + ETag
+        |
+        v
+re-validate immutable attempt-N lease
+        |
+        v
+verify attempt/source/output identity still matches
+        |
+        v
+CAS terminal BuildJob state with If-Match
+        |
+   +----+----+
+   |         |
+updated    stale
+   |         |
+ winner     reject stale worker
+   |
+   v
+publish externally visible record/result state
+```
+
+The terminal mutable job transition is the fence. A stale worker must not publish a public/live result after its generation has been replaced.
+
+Output-upload preparation should use the same principle: read the mutable job with a version token, validate the current attempt lease, then CAS the output metadata instead of performing an unconditional mutable write.
+
+Failure publication also needs ordering. A safe pattern is to publish the mutable error state while retaining the current lease as a short fence, update the externally visible error state, and only then release the mutable lease fields. While that active lease is retained, another retry attempt must remain busy. If the process crashes, the immutable lease expiry still provides eventual recovery instead of requiring unsafe lock deletion.
+
+Cross-object publication is not automatically transactional merely because every individual object uses CAS. Coordinators should preserve ordering so that the object which authorizes the generation is fenced before dependent public/result records are published, and dependent record updates should themselves use CAS so concurrent user changes are preserved rather than overwritten.
 
 ## 8. Failure and restart behavior
 
@@ -309,6 +372,9 @@ For an external multi-instance build coordinator:
 - an unexpired immutable lease blocks a second owner;
 - an expired attempt may advance to a new attempt/slot;
 - stale workers must fail output-prepare/completion authority checks;
+- mutable queue add/remove paths use bounded CAS rather than unconditional read-modify-write replacement;
+- terminal result publication re-reads the current generation, re-validates lease authority, and CASes the terminal job state before exposing dependent result state;
+- stale CAS/version mismatches fail closed rather than overwriting a newer attempt;
 - queue cleanup failure should not transfer ownership to another worker while the durable lease remains active.
 
 ## 9. What this document does not claim
