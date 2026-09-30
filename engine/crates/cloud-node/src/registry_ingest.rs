@@ -2,10 +2,17 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use fs2::FileExt;
+
+#[cfg(feature = "client")]
+use crate::provider_sync::{synchronize_provider, ProviderSyncResult};
+#[cfg(feature = "client")]
+use crate::CloudNodeSettings;
 use crate::{durable, CloudNodeStore, StoredObject, SyncObject};
 
 const REGISTRY_LOGICAL_ROOT: &str = "registry";
 const REQUIRED_INDEX_SNAPSHOT: &str = "index/snapshot.json";
+const REGISTRY_INGEST_LOCK: &str = ".registry-ingest.lock";
 const ALLOWED_TOP_LEVEL: &[&str] = &[
     "index",
     "packages",
@@ -32,11 +39,52 @@ pub struct RegistryStoredObject {
     pub content_sha256: String,
 }
 
+#[cfg(feature = "client")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrySyncResult {
+    pub ingest: RegistryIngestResult,
+    pub provider: ProviderSyncResult,
+}
+
 #[derive(Debug)]
 struct ValidatedRegistryFile {
     source: PathBuf,
     logical_path: String,
     is_artifact: bool,
+}
+
+struct RegistryIngestLock {
+    file: fs::File,
+}
+
+impl RegistryIngestLock {
+    fn acquire(store: &CloudNodeStore) -> anyhow::Result<Self> {
+        let path = store.summary().root.join(REGISTRY_INGEST_LOCK);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to open Cloud Node registry ingest lock {}: {error}",
+                    path.display()
+                )
+            })?;
+        file.try_lock_exclusive().map_err(|error| {
+            anyhow::anyhow!(
+                "Cloud Node registry ingest is already active, or its lock is unavailable: {error}"
+            )
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for RegistryIngestLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 /// Ingest a complete trusted Kastrick/RPX registry export into Cloud Node's
@@ -47,6 +95,9 @@ struct ValidatedRegistryFile {
 /// removed after all replacement files have been stored. Cloud Node backup
 /// history is intentionally retained.
 ///
+/// Only one local registry replacement transaction may run at a time. The OS
+/// releases the lock automatically if the owning process exits or crashes.
+///
 /// The resulting objects participate in the existing provider snapshot and
 /// revision-history model, so registry state gets the same local-ahead/push,
 /// remote-ahead/pull, and equal/no-op behavior as every other Cloud Node
@@ -54,6 +105,36 @@ struct ValidatedRegistryFile {
 /// bytes here; package archive and `package.rbe.yaml` verification belongs to
 /// the trusted registry publisher before the export reaches Cloud Node.
 pub fn ingest_registry_export(
+    store: &CloudNodeStore,
+    export_root: &Path,
+) -> anyhow::Result<RegistryIngestResult> {
+    let _lock = RegistryIngestLock::acquire(store)?;
+    ingest_registry_export_locked(store, export_root)
+}
+
+/// Replace the local registry snapshot and synchronize it through the normal
+/// provider-history transaction while holding the registry ingest lock for the
+/// complete operation. Package semantics remain outside Cloud Node.
+#[cfg(feature = "client")]
+pub async fn synchronize_registry_export(
+    settings: &CloudNodeSettings,
+    store: &CloudNodeStore,
+    export_root: &Path,
+) -> anyhow::Result<RegistrySyncResult> {
+    if settings.provider.is_none() {
+        anyhow::bail!("registry synchronization requires Cloud Node provider mode");
+    }
+    let _lock = RegistryIngestLock::acquire(store)?;
+    let ingest = ingest_registry_export_locked(store, export_root)?;
+    let provider = synchronize_provider(settings, store).await.map_err(|error| {
+        anyhow::anyhow!(
+            "registry export was ingested locally but provider synchronization failed: {error:#}"
+        )
+    })?;
+    Ok(RegistrySyncResult { ingest, provider })
+}
+
+fn ingest_registry_export_locked(
     store: &CloudNodeStore,
     export_root: &Path,
 ) -> anyhow::Result<RegistryIngestResult> {
@@ -84,7 +165,9 @@ pub fn ingest_registry_export(
         }
         let logical_path = format!("{REGISTRY_LOGICAL_ROOT}/{normalized}");
         if !expected_logical_paths.insert(logical_path.clone()) {
-            anyhow::bail!("Cloud Node registry export contains duplicate logical path {logical_path:?}");
+            anyhow::bail!(
+                "Cloud Node registry export contains duplicate logical path {logical_path:?}"
+            );
         }
         validated.push(ValidatedRegistryFile {
             source,
@@ -329,6 +412,17 @@ mod tests {
             .iter()
             .any(|stored| stored.logical_path.ends_with("demo.rbe.zip")));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn registry_ingest_lock_rejects_second_local_writer() {
+        let root = temp_root("lock");
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+        let first = RegistryIngestLock::acquire(&store).unwrap();
+        assert!(RegistryIngestLock::acquire(&store).is_err());
+        drop(first);
+        assert!(RegistryIngestLock::acquire(&store).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 
