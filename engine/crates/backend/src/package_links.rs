@@ -17,11 +17,8 @@ use serde::Deserialize;
 
 const RPX_PACKAGE_INDEX_FORMAT: u32 = 1;
 
-type LibraryHostDispatcher = fn(
-    &str,
-    &LibrarySessionBinding,
-    &LibraryHostCall,
-) -> anyhow::Result<LibraryHostCallReply>;
+type LibraryHostDispatcher =
+    fn(&str, &LibrarySessionBinding, &LibraryHostCall) -> anyhow::Result<LibraryHostCallReply>;
 
 struct LibraryHostSessionEntry {
     binding: LibrarySessionBinding,

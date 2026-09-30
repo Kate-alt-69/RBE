@@ -403,15 +403,14 @@ mod tests {
     #[test]
     fn sdk_bootstrap_flags_reject_invalid_language_and_duplicates() {
         let invalid = InstallCommand::parse(&["sdk.latest", "-language=ruby"]).unwrap_err();
-        assert!(matches!(invalid, InstallRequestError::InvalidSdkLanguage(_)));
+        assert!(matches!(
+            invalid,
+            InstallRequestError::InvalidSdkLanguage(_)
+        ));
 
-        let duplicate = InstallCommand::parse(&[
-            "sdk.latest",
-            "-language=typescript",
-            "--language",
-            "rust",
-        ])
-        .unwrap_err();
+        let duplicate =
+            InstallCommand::parse(&["sdk.latest", "-language=typescript", "--language", "rust"])
+                .unwrap_err();
         assert!(matches!(
             duplicate,
             InstallRequestError::DuplicateFlag("language")

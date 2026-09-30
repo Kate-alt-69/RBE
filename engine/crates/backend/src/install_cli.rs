@@ -22,8 +22,7 @@ use rbe_library_resolver::{resolve_scoped, ResolutionRequest};
 const REGISTRY_ENV: &str = "RBE_PACKAGE_REGISTRY";
 const DEFAULT_REGISTRY_BASE: &str = "https://kastrick-backend.onrender.com";
 #[cfg(windows)]
-const POWERSHELL_SDK_INSTALLER: &str =
-    "https://kastrick-backend.onrender.com/api/sdk/install.ps1";
+const POWERSHELL_SDK_INSTALLER: &str = "https://kastrick-backend.onrender.com/api/sdk/install.ps1";
 #[cfg(not(windows))]
 const SHELL_SDK_INSTALLER: &str = "https://kastrick-backend.onrender.com/api/sdk/install.sh";
 
@@ -169,12 +168,7 @@ fn bootstrap_sdk(command: InstallCommand) -> Result<String, InstallCliFailure> {
         .map(|selector| selector.raw)
         .unwrap_or_else(|| "latest".to_string());
 
-    run_sdk_bootstrap(
-        &project,
-        &language,
-        &version,
-        flags.toolchain.as_deref(),
-    )?;
+    run_sdk_bootstrap(&project, &language, &version, flags.toolchain.as_deref())?;
 
     Ok(format!(
         "RBE SDK bootstrap completed for {} ({language}, {version}). No RBE server was started.",
@@ -252,7 +246,9 @@ fn run_sdk_bootstrap(
         .arg(&script)
         .status()
         .map_err(|error| {
-            InstallCliFailure::unavailable(format!("start SDK bootstrap download with curl: {error}"))
+            InstallCliFailure::unavailable(format!(
+                "start SDK bootstrap download with curl: {error}"
+            ))
         })?;
     if !download.success() {
         let _ = std::fs::remove_file(&script);
@@ -312,7 +308,8 @@ fn resolve_named(command: InstallCommand) -> Result<String, InstallCliFailure> {
     let requirement = version
         .map(|version| version.requirement)
         .unwrap_or_else(|| "*".to_string());
-    let registry = std::env::var(REGISTRY_ENV).unwrap_or_else(|_| DEFAULT_REGISTRY_BASE.to_string());
+    let registry =
+        std::env::var(REGISTRY_ENV).unwrap_or_else(|_| DEFAULT_REGISTRY_BASE.to_string());
     if registry.trim().is_empty() {
         return Err(InstallCliFailure::config(format!(
             "{REGISTRY_ENV} must not be empty"
@@ -596,13 +593,9 @@ mod tests {
 
     #[test]
     fn named_package_rejects_sdk_only_flags_before_network_work() {
-        let result = requested(&args(&[
-            "install",
-            "advancenet",
-            "-language=typescript",
-        ]))
-        .expect("named install must be intercepted")
-        .expect_err("SDK-only flag must fail");
+        let result = requested(&args(&["install", "advancenet", "-language=typescript"]))
+            .expect("named install must be intercepted")
+            .expect_err("SDK-only flag must fail");
         assert_eq!(result.code, 2);
         assert!(result.message.contains("SDK bootstrap options"));
     }

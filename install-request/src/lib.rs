@@ -41,7 +41,9 @@ pub enum InstallRequestError {
     DuplicateVersionFlag,
     #[error("install flag -{0} was specified more than once")]
     DuplicateFlag(&'static str),
-    #[error("unsupported SDK language {0:?}; expected rust, javascript, typescript, python, or global")]
+    #[error(
+        "unsupported SDK language {0:?}; expected rust, javascript, typescript, python, or global"
+    )]
     InvalidSdkLanguage(String),
     #[error("version {inline:?} conflicts with -version={flag}")]
     ConflictingVersion { inline: String, flag: String },
