@@ -113,6 +113,7 @@ pub(crate) fn requested_runtime_capabilities(
 /// invalidate old authority automatically. Passing an empty list revokes all
 /// explicit host privileges for this package. The implicit package-scoped `log`
 /// capability is not stored here and cannot be widened through this API.
+#[allow(dead_code)]
 pub(crate) fn replace_runtime_approval(
     project_root: &Path,
     snapshot: &VerifiedRpxRootSnapshot,
@@ -197,6 +198,7 @@ fn read_state(project_root: &Path) -> anyhow::Result<Option<ApprovalState>> {
     }
 }
 
+#[allow(dead_code)]
 fn write_state(project_root: &Path, state: &ApprovalState) -> anyhow::Result<()> {
     validate_state(state)?;
     let rbe = project_root.join(".rbe");
