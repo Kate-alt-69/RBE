@@ -161,7 +161,10 @@ mod tests {
     #[test]
     fn default_registry_is_valid_production_https() {
         let client = RegistryClient::new(DEFAULT_REGISTRY_URL).unwrap();
-        assert_eq!(client.base_url().as_str(), "https://kastrick-backend.onrender.com/");
+        assert_eq!(
+            client.base_url().as_str(),
+            "https://kastrick-backend.onrender.com/"
+        );
     }
 
     #[test]
