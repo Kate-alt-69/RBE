@@ -382,11 +382,8 @@ class RbeSdk:
         self._bridge = bridge
         self._library_name = library_name
 
-    def log(self, library_name: str | None = None) -> LoggerClient:
-        library_name = library_name or self._library_name
-        if library_name is None:
-            raise RuntimeError("RBE SDK logging requires an explicit library name")
-        return LoggerClient(self._bridge, library_name)
+    def log(self, library_name: str) -> LoggerClient:
+        return LoggerClient(self._bridge, _assert_library_name(library_name))
 
     def net(self) -> NetClient:
         return NetClient(self._bridge)
