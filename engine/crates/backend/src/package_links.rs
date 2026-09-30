@@ -76,22 +76,15 @@ struct RpxPackageExport {
 /// Build RELC's package namespace from SHA-verified explicit package roots.
 ///
 /// The same verified root snapshot also seeds fail-closed Library Host sessions
-/// before the public export namespace is returned. Runtime privilege requests
-/// are re-read from the exact SHA-pinned package artifact before Backend maps
-/// the supported RBE-owned subset into host grants.
+/// before the public export namespace is returned. Runtime privilege evidence
+/// was already recovered from the exact SHA-pinned artifact while constructing
+/// each snapshot; Backend maps only the supported RBE-owned subset into grants.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
     let loaded = load_with_workers(project_root)?;
-    install_verified_host_sessions(project_root, &loaded.roots)?;
+    install_verified_host_sessions(&loaded.roots)?;
     Ok(loaded.links)
 }
 
-/// Read one fail-closed package-state snapshot and retain it for both RELC
-/// linking and Library Host execution.
-///
-/// `read_verified_rpx_root_snapshots` joins each public RPX export index with
-/// the independently verified worker identity for the same active package
-/// graph. Keeping those snapshots beside the derived public link context avoids
-/// rebuilding worker identity from a later package-state read.
 pub fn load_with_workers(project_root: &Path) -> anyhow::Result<LoadedPackageRoots> {
     let recovery = rbe_install_runtime::recover_project_activation(project_root)
         .context("recover interrupted project package activation before package linking")?;
@@ -107,19 +100,13 @@ pub fn load_with_workers(project_root: &Path) -> anyhow::Result<LoadedPackageRoo
     from_verified_snapshots(snapshots)
 }
 
-fn build_verified_host_sessions<F>(
+fn build_verified_host_sessions(
     roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
-    mut requests_for: F,
-) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>>
-where
-    F: FnMut(&str, &VerifiedRpxRootSnapshot) -> anyhow::Result<Vec<String>>,
-{
+) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>> {
     let mut sessions = BTreeMap::new();
     for (package, snapshot) in roots {
-        let requests = requests_for(package, snapshot)?;
-        let grants = host::grants_for_verified_requests(&requests).with_context(|| {
-            format!("admit verified RBE privilege requests for root {package:?}")
-        })?;
+        let grants = host::grants_for_verified_requests(&snapshot.requested_capabilities)
+            .with_context(|| format!("admit verified RBE privilege requests for root {package:?}"))?;
         let binding = host::bind_session(snapshot, grants)
             .with_context(|| format!("bind Library Host session for verified root {package:?}"))?;
         let entry = LibraryHostSessionEntry {
@@ -134,17 +121,9 @@ where
 }
 
 fn install_verified_host_sessions(
-    project_root: &Path,
     roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
 ) -> anyhow::Result<()> {
-    let sessions = build_verified_host_sessions(roots, |package, snapshot| {
-        snapshot
-            .worker
-            .read_requested_capabilities(project_root)
-            .with_context(|| {
-                format!("re-read verified package privilege requests for root {package:?}")
-            })
-    })?;
+    let sessions = build_verified_host_sessions(roots)?;
     let registry = LIBRARY_HOST_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut active = registry
         .lock()
@@ -248,9 +227,6 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
             );
         }
 
-        // Parsed deliberately, never linked. This keeps malformed indexes from
-        // slipping through while making the visibility rule impossible to
-        // accidentally widen through iteration over transitive dependency data.
         let _private_dependency_names = index.private_dependencies.keys().collect::<BTreeSet<_>>();
 
         let mut exports = BTreeMap::new();
@@ -353,6 +329,7 @@ mod tests {
                 runtime_entry: "src/index.js".into(),
                 runtime_managed: true,
             },
+            requested_capabilities: vec!["mail:queue".into(), "net:http".into()],
         }
     }
 
@@ -396,11 +373,12 @@ mod tests {
         assert_eq!(retained.worker.runtime_kind, "bun");
         assert_eq!(retained.worker.runtime_version, "1.3.7");
         assert_eq!(retained.artifact_sha256, "a".repeat(64));
+        assert_eq!(
+            retained.requested_capabilities,
+            vec!["mail:queue".to_string(), "net:http".to_string()]
+        );
 
-        let sessions = build_verified_host_sessions(&loaded.roots, |_package, _snapshot| {
-            Ok(vec!["mail:queue".into(), "net:http".into()])
-        })
-        .unwrap();
+        let sessions = build_verified_host_sessions(&loaded.roots).unwrap();
         assert_eq!(sessions.len(), 1);
         let session = sessions.get("advancenet").unwrap();
         assert_eq!(
