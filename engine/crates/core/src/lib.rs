@@ -4,6 +4,7 @@
 //! backend/container/service/video state without owning those runtimes.
 
 mod container_client;
+mod dns_broker;
 mod library_host;
 mod library_session;
 mod library_wire;
@@ -24,6 +25,10 @@ use video_manager::VideoManager;
 pub use container_client::{
     ContainerAuthorizedExecution, ContainerCapabilityBinding, ContainerClient,
     ContainerEndpointSnapshot, ContainerExecutionIdentity,
+};
+pub use dns_broker::{
+    call_public_dns, PublicDnsError, PUBLIC_DNS_MAX_QUERY_BYTES, PUBLIC_DNS_MAX_RESULTS,
+    PUBLIC_DNS_TARGET,
 };
 pub use ipc_protocol::{
     CapabilityGrant as ContainerCapabilityGrant, CapabilityKind as ContainerCapabilityKind,
