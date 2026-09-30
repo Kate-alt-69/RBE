@@ -1,3 +1,5 @@
+#[path = "package_links/approval.rs"]
+pub(crate) mod approval;
 #[path = "package_links/host.rs"]
 pub(crate) mod host;
 
@@ -79,10 +81,11 @@ struct RpxPackageExport {
 ///
 /// The same verified root snapshot also seeds fail-closed Library Host sessions
 /// before the public export namespace is returned. Explicit RBE-owned package
-/// authority remains empty until trusted project-local approval is admitted.
+/// authority is loaded only from the project-local approval record and is
+/// rechecked against the active lock and SHA-verified artifact request list.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
     let loaded = load_with_workers(project_root)?;
-    install_verified_host_sessions(&loaded.roots)?;
+    install_verified_host_sessions(project_root, &loaded.roots)?;
     Ok(loaded.links)
 }
 
@@ -101,12 +104,17 @@ pub fn load_with_workers(project_root: &Path) -> anyhow::Result<LoadedPackageRoo
     from_verified_snapshots(snapshots)
 }
 
-fn build_verified_host_sessions(
+fn build_host_sessions<F>(
     roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
-) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>> {
+    mut grants_for: F,
+) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>>
+where
+    F: FnMut(&str, &VerifiedRpxRootSnapshot) -> anyhow::Result<Vec<LibraryCapabilityGrant>>,
+{
     let mut sessions = BTreeMap::new();
     for (package, snapshot) in roots {
-        let binding = host::bind_session(snapshot, std::iter::empty::<LibraryCapabilityGrant>())
+        let grants = grants_for(package, snapshot)?;
+        let binding = host::bind_session(snapshot, grants)
             .with_context(|| format!("bind Library Host session for verified root {package:?}"))?;
         let entry = LibraryHostSessionEntry {
             binding,
@@ -119,10 +127,29 @@ fn build_verified_host_sessions(
     Ok(sessions)
 }
 
+fn build_verified_host_sessions(
+    roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
+) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>> {
+    build_host_sessions(roots, |_package, _snapshot| Ok(Vec::new()))
+}
+
+fn build_approved_host_sessions(
+    project_root: &Path,
+    roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
+) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>> {
+    build_host_sessions(roots, |package, snapshot| {
+        let approved = approval::approved_runtime_capabilities(project_root, snapshot)
+            .with_context(|| format!("load approved RBE privileges for root {package:?}"))?;
+        host::grants_for_verified_requests(&approved)
+            .with_context(|| format!("materialize approved RBE privileges for root {package:?}"))
+    })
+}
+
 fn install_verified_host_sessions(
+    project_root: &Path,
     roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
 ) -> anyhow::Result<()> {
-    let sessions = build_verified_host_sessions(roots)?;
+    let sessions = build_approved_host_sessions(project_root, roots)?;
     let registry = LIBRARY_HOST_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut active = registry
         .lock()
@@ -153,7 +180,7 @@ fn install_verified_host_sessions(
     tracing::info!(
         package_sessions = active.len(),
         trusted_dispatchers,
-        "prepared verified fail-closed Library Host sessions pending explicit privilege approval"
+        "prepared verified Library Host sessions from project-local approved privileges"
     );
     Ok(())
 }
