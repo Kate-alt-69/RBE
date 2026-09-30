@@ -11,6 +11,8 @@ RBE does **not** add these binaries to the user PATH or machine PATH. A package 
 
 The project-local SDK backend owns activation-file generation. Any successful SDK install writes the activation file for the current platform, regardless of whether the SDK bundle was reached through the Kastrick bootstrap or another verified SDK-bundle path.
 
+Activation prepends `<project>/.rbe/bin` to the **current shell/process PATH only**. It also installs guarded `backend` and `rpx` command functions so normal command names fail closed once the shell moves outside the owning project tree.
+
 ## Windows PowerShell
 
 The SDK backend writes:
@@ -33,15 +35,17 @@ rpx check .
 rpx compile .
 ```
 
-The activation exposes project-local `backend` and `rpx` commands only for the owning project tree. If the current directory is moved outside that project, those commands fail closed instead of accidentally using that project's binaries elsewhere.
+The activation changes only the current PowerShell process. It removes a previously active RBE project bin from that process PATH before prepending this project's `.rbe\bin`, then installs guarded `backend` and `rpx` functions. If the current directory is moved outside that project, the guarded commands refuse execution instead of silently using the previous project's binaries.
 
-The activation is process-local. It does not write User PATH, Machine PATH, the Windows registry, or the PowerShell profile. A new terminal must activate the project again.
+The activation does not write User PATH, Machine PATH, the Windows registry, or the PowerShell profile. A new terminal must activate the project again.
 
 Deactivate explicitly with:
 
 ```powershell
 Deactivate-RbeProject
 ```
+
+Deactivation removes the active `.rbe\bin` entry from the current process PATH and removes the project command functions.
 
 ## Linux and macOS
 
@@ -65,13 +69,15 @@ rpx check .
 rpx compile .
 ```
 
-The shell functions verify that the current working directory remains inside the owning project tree. Moving outside that tree makes the project commands fail closed.
+The activation removes any previously active RBE project bin from the current shell PATH, prepends the new project's `.rbe/bin`, exports the project identity for that shell, and defines guarded `backend` / `rpx` functions. The guard verifies that the current working directory remains inside the owning project tree.
 
 Deactivate with:
 
 ```sh
 rbe_deactivate
 ```
+
+Deactivation removes the active project bin from the current shell PATH and removes the activation functions/variables.
 
 ## Why activation is required
 
@@ -81,16 +87,16 @@ A child executable cannot modify the environment of its parent shell. Therefore 
 .\backend.exe install sdk.latest -path=. -language=typescript
 ```
 
-can install `.rbe/bin/backend.exe` and `.rbe/bin/rpx.exe`, but it cannot inject project commands into the already-running parent PowerShell process without either a global environment mutation or a shell activation step.
+can install `.rbe/bin/backend.exe` and `.rbe/bin/rpx.exe`, but it cannot permanently or globally register project commands in the parent environment without an explicit shell activation step.
 
-RBE deliberately chooses the activation step because it preserves project isolation.
+RBE deliberately chooses a project activation file instead of User/Machine PATH mutation because it preserves project isolation.
 
-The generated activation does **not** permanently append `.rbe/bin` to any PATH. It creates current-shell command wrappers bound to the owning project and those wrappers verify the current working directory before every invocation. This prevents an activated `mail` project from accidentally supplying `backend` or `rpx` to an unrelated project after `cd`.
+The process-local PATH entry is a developer-experience convenience, not package authority. Library/package authority still comes from verified artifacts, project locks, explicit capability approval, and Library Host session grants.
 
 ## Official bootstrap behavior
 
-The official Kastrick SDK bootstrap downloads and verifies the SDK release, then invokes the SDK backend. The SDK backend writes the activation file as part of the SDK installation itself.
+The official Kastrick SDK bootstrap downloads and verifies the SDK release, then invokes the SDK backend. New SDK bundles write the canonical activation file as part of SDK installation. The bootstrap preserves that file; for older SDK releases it may generate a compatibility activation with the same process-local PATH and project-scope rules.
 
-When the PowerShell bootstrap is invoked directly in the current shell, the bootstrap may activate the newly created project command wrapper for convenience. When the bootstrap is launched as a child by production `backend.exe`, activate `.rbe/activate.ps1` in the parent PowerShell session afterward.
+When the PowerShell bootstrap is invoked directly in the current shell, it activates the newly created project commands for convenience. When the bootstrap is launched as a child by production `backend.exe`, activate `.rbe/activate.ps1` in the parent PowerShell session afterward.
 
-This behavior applies equally to `backend` and `rpx`; neither tool is intended to become machine-global merely because an SDK was installed into one package project.
+This behavior applies equally to `backend` and `rpx`; neither tool becomes machine-global merely because an SDK was installed into one package project.
