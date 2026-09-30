@@ -2,6 +2,8 @@
 pub(crate) mod approval;
 #[path = "package_links/host.rs"]
 pub(crate) mod host;
+#[path = "package_links/tcp.rs"]
+pub(crate) mod tcp;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -34,7 +36,11 @@ fn dispatch_verified_host_call<'a>(
     binding: &'a LibrarySessionBinding,
     call: &'a LibraryHostCall,
 ) -> LibraryHostDispatchFuture<'a> {
-    Box::pin(host::dispatch_authorized_host_call(package, binding, call))
+    if call.capability == tcp::CAPABILITY {
+        Box::pin(tcp::dispatch_authorized_call(package, binding, call))
+    } else {
+        Box::pin(host::dispatch_authorized_host_call(package, binding, call))
+    }
 }
 
 struct LibraryHostSessionEntry {
@@ -134,8 +140,15 @@ fn build_approved_host_sessions(
     build_host_sessions(roots, |package, snapshot| {
         let approved = approval::approved_runtime_capabilities(project_root, snapshot)
             .with_context(|| format!("load approved RBE privileges for root {package:?}"))?;
-        host::grants_for_verified_requests(&approved)
-            .with_context(|| format!("materialize approved RBE privileges for root {package:?}"))
+        let mut grants = host::grants_for_verified_requests(&approved)
+            .with_context(|| format!("materialize approved RBE privileges for root {package:?}"))?;
+        if approved.iter().any(|capability| capability == tcp::CAPABILITY) {
+            grants.push(
+                tcp::grant()
+                    .with_context(|| format!("materialize approved TCP privilege for root {package:?}"))?,
+            );
+        }
+        Ok(grants)
     })
 }
 
@@ -149,6 +162,7 @@ fn install_verified_host_sessions(
         .lock()
         .map_err(|_| anyhow::anyhow!("Library Host session registry lock is poisoned"))?;
 
+    tcp::clear_all();
     for session in active.values_mut() {
         session.binding.close();
     }
