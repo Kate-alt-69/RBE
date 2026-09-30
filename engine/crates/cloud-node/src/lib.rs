@@ -59,6 +59,8 @@ pub use provider_sync::{
 };
 pub use recovery::{CloudNodeRecoveryReceiver, RecoveryReceipt};
 pub use registry_ingest::{ingest_registry_export, RegistryIngestResult, RegistryStoredObject};
+#[cfg(feature = "client")]
+pub use registry_ingest::{synchronize_registry_export, RegistrySyncResult};
 pub use server::{
     AcceptedKnock, AuthenticatedSession, CloudNodeAuthenticator, DEFAULT_SESSION_TTL_MS,
     MAX_AUTH_PROOF_BYTES,
