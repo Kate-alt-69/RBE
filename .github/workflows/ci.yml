@@ -233,6 +233,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: SDK parity
+        run: python3 sdk/verify-parity.py
       - name: Node SDK syntax
         run: node --check sdk/js/index.js
       - name: Node SDK import
