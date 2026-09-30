@@ -130,6 +130,7 @@ mod tests {
             runtime_version: "1.3.7".into(),
             runtime_entry: "src/index.js".into(),
             runtime_managed: true,
+            requested_capabilities: Vec::new(),
         }
     }
 
