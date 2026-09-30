@@ -167,9 +167,7 @@ fn add_path_rule(ruleset: &RawFd, path: &Path, rights: u64, writable: bool) -> i
         return Ok(());
     }
     let metadata = std::fs::metadata(path)?;
-    let allowed_access = if writable {
-        rights
-    } else if metadata.is_dir() {
+    let allowed_access = if writable || metadata.is_dir() {
         rights
     } else {
         rights
