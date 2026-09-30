@@ -5,11 +5,22 @@ use core_lib::{
 };
 use rand::RngCore;
 use rbe_install_runtime::VerifiedRpxRootSnapshot;
+use serde::Deserialize;
 
 const SESSION_ID_BYTES: usize = 32;
 const LIBRARY_LOG_CAPABILITY: &str = "log";
 const LIBRARY_LOG_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const LIBRARY_LOG_MAX_RESPONSE_BYTES: usize = 1024;
+const LIBRARY_LOG_MAX_SCOPE_DEPTH: usize = 16;
+const LIBRARY_LOG_MAX_MESSAGE_BYTES: usize = 48 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryLogRecord {
+    #[serde(default)]
+    scope: Vec<String>,
+    message: String,
+}
 
 /// Convert one fail-closed verified RPX root snapshot into the exact identity
 /// Library Host expects the package worker to announce.
@@ -78,6 +89,77 @@ fn package_log_grant(package: &str) -> anyhow::Result<LibraryCapabilityGrant> {
     .context("build verified package logging capability grant")
 }
 
+/// Dispatch one already-authorized package `log` host call into RBE's normal
+/// tracing pipeline.
+///
+/// This helper deliberately re-checks the verified package target as defense in
+/// depth. Child scope is structured payload data and can only extend the module
+/// below `lib/<verified-package-name>`; it never changes host-call authority.
+/// Package messages and child names reject control characters so untrusted
+/// workers cannot forge terminal lines or inject escape sequences.
+pub(crate) fn dispatch_package_log_call(
+    package: &str,
+    call: &LibraryHostCall,
+) -> anyhow::Result<Vec<u8>> {
+    let expected_target = format!("lib/{package}");
+    if call.capability != LIBRARY_LOG_CAPABILITY || call.target != expected_target {
+        bail!("package log call does not match verified library authority");
+    }
+    if !matches!(
+        call.operation.as_str(),
+        "debug" | "info" | "warn" | "error" | "fatal"
+    ) {
+        bail!("unsupported package log operation {:?}", call.operation);
+    }
+
+    let record: LibraryLogRecord = serde_json::from_slice(&call.payload)
+        .context("decode structured package log record")?;
+    if record.scope.len() > LIBRARY_LOG_MAX_SCOPE_DEPTH {
+        bail!(
+            "package log scope exceeds maximum depth {}",
+            LIBRARY_LOG_MAX_SCOPE_DEPTH
+        );
+    }
+    if record.message.len() > LIBRARY_LOG_MAX_MESSAGE_BYTES {
+        bail!(
+            "package log message exceeds maximum size {} bytes",
+            LIBRARY_LOG_MAX_MESSAGE_BYTES
+        );
+    }
+    if record.message.chars().any(char::is_control) {
+        bail!("package log message cannot contain control characters");
+    }
+
+    let mut module = expected_target;
+    for scope in &record.scope {
+        if !valid_log_component(scope) {
+            bail!("package log scope contains an invalid component");
+        }
+        module.push('/');
+        module.push_str(scope);
+    }
+
+    match call.operation.as_str() {
+        "debug" => tracing::debug!(module = %module, "{}", record.message),
+        "info" => tracing::info!(module = %module, "{}", record.message),
+        "warn" => tracing::warn!(module = %module, "{}", record.message),
+        "error" => tracing::error!(module = %module, "{}", record.message),
+        "fatal" => tracing::error!(module = %module, fatal = true, "{}", record.message),
+        _ => unreachable!("log operation validated above"),
+    }
+
+    Ok(Vec::new())
+}
+
+fn valid_log_component(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 /// Create one Library Host session from verified worker identity plus an already
 /// admitted capability set. Requested manifest capabilities are deliberately not
 /// accepted here: callers must provide trusted [`LibraryCapabilityGrant`]s.
@@ -144,6 +226,16 @@ mod tests {
         }
     }
 
+    fn log_call(target: &str, operation: &str, payload: &[u8]) -> LibraryHostCall {
+        LibraryHostCall {
+            call_id: 1,
+            capability: "log".into(),
+            target: target.into(),
+            operation: operation.into(),
+            payload: payload.to_vec(),
+        }
+    }
+
     #[test]
     fn verified_snapshot_becomes_exact_expected_worker_identity() {
         let snapshot = snapshot();
@@ -183,23 +275,52 @@ mod tests {
         );
 
         assert!(session
-            .authorize_host_call(&LibraryHostCall {
-                call_id: 1,
-                capability: "log".into(),
-                target: "lib/advancenet".into(),
-                operation: "info".into(),
-                payload: br#"{"scope":[],"message":"ready"}"#.to_vec(),
-            })
+            .authorize_host_call(&log_call(
+                "lib/advancenet",
+                "info",
+                br#"{"scope":[],"message":"ready"}"#,
+            ))
             .is_ok());
         assert!(session
-            .authorize_host_call(&LibraryHostCall {
-                call_id: 2,
-                capability: "log".into(),
-                target: "lib/other-package".into(),
-                operation: "info".into(),
-                payload: br#"{"scope":[],"message":"spoof"}"#.to_vec(),
-            })
+            .authorize_host_call(&log_call(
+                "lib/other-package",
+                "info",
+                br#"{"scope":[],"message":"spoof"}"#,
+            ))
             .is_err());
+    }
+
+    #[test]
+    fn package_log_dispatch_keeps_child_scope_below_verified_library() {
+        let call = log_call(
+            "lib/mail",
+            "info",
+            br#"{"scope":["smtp","delivery"],"message":"queued"}"#,
+        );
+        assert!(dispatch_package_log_call("mail", &call).is_ok());
+        assert!(dispatch_package_log_call("other", &call).is_err());
+    }
+
+    #[test]
+    fn package_log_dispatch_rejects_control_and_scope_injection() {
+        assert!(dispatch_package_log_call(
+            "mail",
+            &log_call(
+                "lib/mail",
+                "warn",
+                b"{\"scope\":[\"../backend\"],\"message\":\"nope\"}",
+            ),
+        )
+        .is_err());
+        assert!(dispatch_package_log_call(
+            "mail",
+            &log_call(
+                "lib/mail",
+                "warn",
+                b"{\"scope\":[],\"message\":\"fake\\nline\"}",
+            ),
+        )
+        .is_err());
     }
 
     #[test]
