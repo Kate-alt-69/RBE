@@ -144,11 +144,13 @@ pub async fn synchronize_registry_export(
     }
     let _lock = RegistryIngestLock::acquire(store)?;
     let ingest = ingest_registry_export_locked(store, export_root)?;
-    let provider = synchronize_provider(settings, store).await.map_err(|error| {
-        anyhow::anyhow!(
-            "registry export was ingested locally but provider synchronization failed: {error:#}"
-        )
-    })?;
+    let provider = synchronize_provider(settings, store)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "registry export was ingested locally but provider synchronization failed: {error:#}"
+            )
+        })?;
     Ok(RegistrySyncResult { ingest, provider })
 }
 
@@ -311,7 +313,10 @@ fn stored_registry_object(logical_path: String, stored: StoredObject) -> Registr
     }
 }
 
-fn remove_active_registry_object(store: &CloudNodeStore, object: &SyncObject) -> anyhow::Result<()> {
+fn remove_active_registry_object(
+    store: &CloudNodeStore,
+    object: &SyncObject,
+) -> anyhow::Result<()> {
     if !object.logical_path.starts_with("registry/") {
         anyhow::bail!(
             "refusing to remove non-registry Cloud Node object {:?}",
@@ -541,7 +546,11 @@ mod tests {
         let root = temp_root("replay");
         let export = root.join("export");
         let snapshot = export.join(REQUIRED_INDEX_SNAPSHOT);
-        write_export_file(&export, REQUIRED_INDEX_SNAPSHOT, b"{\"revision\":\"sha256:one\"}");
+        write_export_file(
+            &export,
+            REQUIRED_INDEX_SNAPSHOT,
+            b"{\"revision\":\"sha256:one\"}",
+        );
 
         let store = CloudNodeStore::open(&settings(&root)).unwrap();
         ingest_registry_export(&store, &export).unwrap();
