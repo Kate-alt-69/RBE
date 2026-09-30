@@ -277,7 +277,6 @@ mod tests {
                 runtime_entry: "src/index.js".into(),
                 runtime_managed: true,
             },
-            requested_capabilities: vec!["mail:queue".into(), "net:http".into()],
         }
     }
 

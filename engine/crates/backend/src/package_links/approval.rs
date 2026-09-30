@@ -3,24 +3,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use rbe_install_runtime::{VerifiedRootGraph, VerifiedRpxRootSnapshot};
-use serde::{Deserialize, Serialize};
+use rbe_install_runtime::VerifiedRpxRootSnapshot;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const APPROVAL_FORMAT: u32 = 1;
 const APPROVAL_FILE: &str = "package-capabilities.json";
 const PROJECT_LOCK: &str = "package.lock.rbe.yaml";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HostPrivilegeRequest {
-    pub package: String,
-    pub version: String,
-    pub artifact_sha256: String,
-    pub capability: String,
-    pub description: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApprovalState {
     format: u32,
@@ -28,16 +19,7 @@ struct ApprovalState {
     packages: BTreeMap<String, PackageApproval>,
 }
 
-impl Default for ApprovalState {
-    fn default() -> Self {
-        Self {
-            format: APPROVAL_FORMAT,
-            packages: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackageApproval {
     version: String,
@@ -45,45 +27,6 @@ struct PackageApproval {
     project_lock_sha256: String,
     #[serde(default)]
     runtime: Vec<String>,
-}
-
-/// Return the currently implemented RBE-owned runtime privileges requested by
-/// the verified root package.
-///
-/// Custom/package-private names intentionally do not appear here. Private
-/// dependencies also cannot widen root authority: the root package is the host
-/// security principal and must request any RBE-owned privilege it needs.
-pub(crate) fn install_requests(
-    graph: &VerifiedRootGraph,
-) -> anyhow::Result<Vec<HostPrivilegeRequest>> {
-    let verified = graph
-        .packages
-        .get(&graph.root)
-        .with_context(|| format!("verified graph is missing root package {:?}", graph.root))?;
-    let locked = graph.lock.packages.get(&graph.root).with_context(|| {
-        format!(
-            "verified graph lock is missing root package {:?}",
-            graph.root
-        )
-    })?;
-
-    let mut requests = Vec::new();
-    for (capability, enabled) in &verified.manifest.capabilities {
-        if !enabled {
-            continue;
-        }
-        let Some(description) = explicit_host_privilege_description(capability) else {
-            continue;
-        };
-        requests.push(HostPrivilegeRequest {
-            package: graph.root.clone(),
-            version: locked.version.clone(),
-            artifact_sha256: locked.artifact_sha256.to_ascii_lowercase(),
-            capability: capability.clone(),
-            description,
-        });
-    }
-    Ok(requests)
 }
 
 /// Load exact approvals for one verified package snapshot.
@@ -145,69 +88,6 @@ pub(crate) fn approved_runtime_capabilities(
     Ok(approval.runtime.clone())
 }
 
-/// Persist approvals after successful package activation.
-///
-/// The approval is bound to the exact target lock hash as well as the root
-/// package version/artifact identity. Any root or private dependency graph
-/// change therefore invalidates the record on the next Backend boot.
-pub(crate) fn persist_install_approval(
-    project_root: &Path,
-    graph: &VerifiedRootGraph,
-    project_lock_sha256: &str,
-    approved_runtime: &[String],
-) -> anyhow::Result<()> {
-    validate_sha256(project_lock_sha256, "project lock")?;
-    let locked = graph.lock.packages.get(&graph.root).with_context(|| {
-        format!(
-            "verified graph lock is missing root package {:?}",
-            graph.root
-        )
-    })?;
-
-    let requested = graph
-        .packages
-        .get(&graph.root)
-        .with_context(|| format!("verified graph is missing root package {:?}", graph.root))?
-        .manifest
-        .capabilities
-        .iter()
-        .filter(|(_, enabled)| **enabled)
-        .map(|(capability, _)| capability.as_str())
-        .collect::<Vec<_>>();
-
-    let mut runtime = approved_runtime.to_vec();
-    runtime.sort();
-    runtime.dedup();
-    for capability in &runtime {
-        if !requested.iter().any(|request| *request == capability) {
-            bail!(
-                "cannot persist unrequested host privilege {:?} for package {:?}",
-                capability,
-                graph.root
-            );
-        }
-        if explicit_host_privilege_description(capability).is_none() {
-            bail!(
-                "cannot persist unsupported or package-private privilege {:?} as RBE host authority",
-                capability
-            );
-        }
-    }
-
-    let mut state = read_state(project_root)?.unwrap_or_default();
-    validate_state(&state)?;
-    state.packages.insert(
-        graph.root.clone(),
-        PackageApproval {
-            version: locked.version.clone(),
-            artifact_sha256: locked.artifact_sha256.to_ascii_lowercase(),
-            project_lock_sha256: project_lock_sha256.to_ascii_lowercase(),
-            runtime,
-        },
-    );
-    write_state(project_root, &state)
-}
-
 pub(crate) fn explicit_host_privilege_description(capability: &str) -> Option<&'static str> {
     match capability {
         "net:http" => Some("make public HTTP/HTTPS requests through RBE's hardened network broker"),
@@ -242,52 +122,6 @@ fn read_state(project_root: &Path) -> anyhow::Result<Option<ApprovalState>> {
         Err(error) => Err(error)
             .with_context(|| format!("inspect RBE package approval state: {}", path.display())),
     }
-}
-
-fn write_state(project_root: &Path, state: &ApprovalState) -> anyhow::Result<()> {
-    validate_state(state)?;
-    let rbe = project_root.join(".rbe");
-    fs::create_dir_all(&rbe).with_context(|| {
-        format!(
-            "create project-local RBE state directory: {}",
-            rbe.display()
-        )
-    })?;
-    let metadata = fs::symlink_metadata(&rbe).with_context(|| {
-        format!(
-            "inspect project-local RBE state directory: {}",
-            rbe.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!(
-            "project-local RBE state path is not a regular directory: {}",
-            rbe.display()
-        );
-    }
-
-    let path = approval_path(project_root);
-    let temporary = rbe.join(format!(".{APPROVAL_FILE}.tmp-{}", std::process::id()));
-    let bytes = serde_json::to_vec_pretty(state).context("serialize RBE package approval state")?;
-    fs::write(&temporary, bytes).with_context(|| {
-        format!(
-            "write temporary RBE package approval state: {}",
-            temporary.display()
-        )
-    })?;
-
-    if path.exists() {
-        fs::remove_file(&path).with_context(|| {
-            format!("replace old RBE package approval state: {}", path.display())
-        })?;
-    }
-    fs::rename(&temporary, &path).with_context(|| {
-        format!(
-            "commit project-local RBE package approval state: {}",
-            path.display()
-        )
-    })?;
-    Ok(())
 }
 
 fn validate_state(state: &ApprovalState) -> anyhow::Result<()> {

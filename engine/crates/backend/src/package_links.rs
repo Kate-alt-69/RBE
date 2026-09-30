@@ -127,12 +127,6 @@ where
     Ok(sessions)
 }
 
-fn build_verified_host_sessions(
-    roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
-) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>> {
-    build_host_sessions(roots, |_package, _snapshot| Ok(Vec::new()))
-}
-
 fn build_approved_host_sessions(
     project_root: &Path,
     roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
@@ -399,7 +393,8 @@ mod tests {
         assert_eq!(retained.worker.runtime_version, "1.3.7");
         assert_eq!(retained.artifact_sha256, "a".repeat(64));
 
-        let sessions = build_verified_host_sessions(&loaded.roots).unwrap();
+        let sessions =
+            build_host_sessions(&loaded.roots, |_package, _snapshot| Ok(Vec::new())).unwrap();
         assert_eq!(sessions.len(), 1);
         let session = sessions.get("advancenet").unwrap();
         assert_eq!(
