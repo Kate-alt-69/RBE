@@ -8,6 +8,7 @@ on:
       - 'build-release.sh'
       - 'build-core.sh'
       - 'build-help.txt'
+      - 'doc/linux-builds.md'
       - '.github/workflows/build-tools-ci.yml'
   pull_request:
     paths:
@@ -16,6 +17,7 @@ on:
       - 'build-release.sh'
       - 'build-core.sh'
       - 'build-help.txt'
+      - 'doc/linux-builds.md'
       - '.github/workflows/build-tools-ci.yml'
   workflow_dispatch:
 
@@ -33,3 +35,76 @@ jobs:
         run: bash -n build.sh build-select.sh build-release.sh build-core.sh
       - name: Verify Linux build prerequisites
         run: ./build.sh --check-tools --build-linux --arch-x64
+      - name: Simulate corrupt cached rustup toolchain recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          fake_bin="$RUNNER_TEMP/rbe-fake-rust/bin"
+          state="$RUNNER_TEMP/rbe-fake-rust/repaired"
+          mkdir -p "$fake_bin"
+
+          cat > "$fake_bin/rustc" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [ -f "${RBE_FAKE_RUST_STATE:?}" ] || { echo "error: missing manifest in toolchain 'stable-x86_64-unknown-linux-gnu'" >&2; exit 1; }
+          echo 'rustc 1.98.1 (simulated repaired toolchain)'
+          SH
+
+          cat > "$fake_bin/cargo" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [ -f "${RBE_FAKE_RUST_STATE:?}" ] || { echo "error: missing manifest in toolchain 'stable-x86_64-unknown-linux-gnu'" >&2; exit 1; }
+          echo 'cargo 1.98.1 (simulated repaired toolchain)'
+          SH
+
+          cat > "$fake_bin/rustup" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          state="${RBE_FAKE_RUST_STATE:?}"
+          case "${1:-}" in
+            --version)
+              echo 'rustup 1.28.0 (simulated)'
+              ;;
+            toolchain)
+              case "${2:-}" in
+                list)
+                  echo 'stable-x86_64-unknown-linux-gnu (active, default)'
+                  ;;
+                uninstall)
+                  rm -f "$state"
+                  ;;
+                install)
+                  touch "$state"
+                  ;;
+                *) exit 2 ;;
+              esac
+              ;;
+            target)
+              if [ "${2:-}" = list ] && [ "${3:-}" = --installed ]; then
+                [ -f "$state" ] || exit 1
+                echo 'x86_64-unknown-linux-gnu'
+              else
+                exit 2
+              fi
+              ;;
+            show)
+              if [ "${2:-}" = home ]; then
+                echo "${RUNNER_TEMP:-/tmp}/fake-rustup-home"
+              else
+                exit 2
+              fi
+              ;;
+            *) exit 2 ;;
+          esac
+          SH
+
+          chmod +x "$fake_bin/rustc" "$fake_bin/cargo" "$fake_bin/rustup"
+          rm -f "$state"
+
+          PATH="$fake_bin:$PATH" \
+          RBE_FAKE_RUST_STATE="$state" \
+          RBE_RUST_TOOLCHAIN=stable \
+          ./build.sh --check-tools --build-linux --arch-x64
+
+          test -f "$state"
+          PATH="$fake_bin:$PATH" RBE_FAKE_RUST_STATE="$state" rustc --version | grep -q 'simulated repaired toolchain'
