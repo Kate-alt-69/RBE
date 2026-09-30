@@ -1,0 +1,89 @@
+name: Land Coordinator Record CAS Documentation
+
+on:
+  push:
+    paths:
+      - ".github/workflows/doc-coordinator-record-cas-patch.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Update coordinator trust-boundary documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('doc/library-host-web-build.md')
+          text = path.read_text(encoding='utf-8')
+          if '### 7.4 Mutable records and deterministic jobs need distinct authority' in text:
+              raise SystemExit('coordinator record-CAS documentation already present')
+          anchor = (
+              'This keeps uploaded source bytes stable while allowing the progress record to remain a small mutable state machine. '
+              'A process-local mutex may still reduce contention, but it is not the cross-instance authority.\n\n'
+              '## 8. Failure and restart behavior\n'
+          )
+          if anchor not in text:
+              raise SystemExit('source-upload documentation anchor not found')
+          section = (
+              'This keeps uploaded source bytes stable while allowing the progress record to remain a small mutable state machine. '
+              'A process-local mutex may still reduce contention, but it is not the cross-instance authority.\n\n'
+              '### 7.4 Mutable records and deterministic jobs need distinct authority\n\n'
+              'An externally visible project/preview record is mutable authority and should be updated with ETag/version CAS. '
+              'A writer must re-read and merge against the newest record instead of replacing fields it does not own. '
+              'For example, publishing a new source revision should preserve a concurrently changed visibility value, while a visibility change should preserve the newest source/build state.\n\n'
+              'A public/discovery index is different when its mapping is immutable. If the public identity and project always map to the same authoritative record key, '
+              'the index can be a create-once derived pointer. Visibility/security decisions must then be made from the authoritative record after following that pointer. '
+              'This avoids delete/recreate races where one instance removes an index while another instance publishes a newer allowed state.\n\n'
+              'Deterministic build-job identities should follow the same create-once principle. If a job ID is derived from owner/project/source identity, creation should use '
+              'create-if-absent. When the object already exists, the coordinator must verify its immutable identity fields and reuse it; an unconditional replacement could roll a '
+              'claimed job back to `queued`, clear its attempt/lease state, or erase output metadata. Terminal `live`/`superseded` jobs should not be requeued.\n\n'
+              'Queue/status publication that depends on the mutable authoritative record should also use CAS and must not downgrade a newer state. In particular, a late queue writer '
+              'must not replace `building` with `queued`, and it must not replace a clean `live` record for the same source with a dirty queued state.\n\n'
+              'The resulting ownership split is:\n\n'
+              '```text\n'
+              'immutable source/chunk/job identity   -> create-if-absent + identity verification\n'
+              'mutable progress/result/visibility   -> ETag CAS + bounded retry + field-aware merge\n'
+              'derived discovery pointer            -> create-once mapping; never security authority\n'
+              '```\n\n'
+              '## 8. Failure and restart behavior\n'
+          )
+          text = text.replace(anchor, section, 1)
+
+          failure_anchor = (
+              '- descriptor CAS lets an upload recover after a chunk was durably stored but progress publication was interrupted;\n'
+              '- queue cleanup failure should not transfer ownership to another worker while the durable lease remains active.\n'
+          )
+          if failure_anchor not in text:
+              raise SystemExit('failure/restart bullet anchor not found')
+          failure_replacement = (
+              '- descriptor CAS lets an upload recover after a chunk was durably stored but progress publication was interrupted;\n'
+              '- mutable public/result records are merged with CAS so source, visibility, and build-state writers cannot blindly overwrite one another;\n'
+              '- deterministic BuildJob creation is create-if-absent, and an existing claimed/terminal job is never reset by a later queue request;\n'
+              '- queue cleanup failure should not transfer ownership to another worker while the durable lease remains active.\n'
+          )
+          text = text.replace(failure_anchor, failure_replacement, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+          grep -q '### 7.4 Mutable records and deterministic jobs need distinct authority' doc/library-host-web-build.md
+          grep -q 'deterministic BuildJob creation is create-if-absent' doc/library-host-web-build.md
+      - name: Commit documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add doc/library-host-web-build.md
+          git rm .github/workflows/doc-coordinator-record-cas-patch.yml
+          git commit -m 'DOC | LIBHOST-WEBBUILD document record and job CAS authority'
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
