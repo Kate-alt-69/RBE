@@ -117,14 +117,13 @@ impl fmt::Display for LibraryWorkerProxyStatusError {
                     "unsupported Library Worker Proxy status protocol {protocol}"
                 )
             }
-            Self::InvalidPid => formatter
-                .write_str("Library Worker Proxy ready status requires a non-zero pid"),
-            Self::InvalidCode => formatter.write_str(
-                "Library Worker Proxy reject code must be bounded ASCII A-Z/0-9/_",
-            ),
-            Self::InvalidMessage => formatter.write_str(
-                "Library Worker Proxy reject message must be bounded printable text",
-            ),
+            Self::InvalidPid => {
+                formatter.write_str("Library Worker Proxy ready status requires a non-zero pid")
+            }
+            Self::InvalidCode => formatter
+                .write_str("Library Worker Proxy reject code must be bounded ASCII A-Z/0-9/_"),
+            Self::InvalidMessage => formatter
+                .write_str("Library Worker Proxy reject message must be bounded printable text"),
         }
     }
 }
