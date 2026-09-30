@@ -77,6 +77,42 @@ export RBE_BUILD_AUTO_REPAIR_RUST=0
 
 `false`, `no`, and `off` are also accepted disable values.
 
+## Shared Cargo artifact cache
+
+RBE uses one shared Cargo target directory for release, selective, SDK, Engine, and Container builds launched through `build.sh`. This is intentional because the repository contains multiple Cargo workspaces. Without a shared target directory, the Container workspace and Engine workspace can independently rebuild the same third-party crates even when the compiler inputs are identical.
+
+The cache location is selected in this order:
+
+1. an explicit `CARGO_TARGET_DIR` supplied by the caller;
+2. `<RBE_BUILD_CACHE_DIR>/cargo-target` when `RBE_BUILD_CACHE_DIR` is set;
+3. `<XDG_CACHE_HOME>/rbe-build/cargo-target` when `XDG_CACHE_HOME` is available;
+4. `<RBE>/.cache/rbe-build/cargo-target` as the local fallback.
+
+For example, to place the reusable cache somewhere explicit:
+
+```bash
+export RBE_BUILD_CACHE_DIR=/var/cache/rbe-build
+./build.sh --build-linux --arch-x64
+```
+
+or provide Cargo's target directory directly:
+
+```bash
+export CARGO_TARGET_DIR=/var/cache/rbe-cargo-target
+./build.sh --build-linux --arch-x64
+```
+
+RBE only chooses and shares the cache location. Cargo remains the cache-validity authority. Target triple, profile, crate features, compiler/build-script inputs, package identity, and other Cargo fingerprints still determine whether an existing artifact is reusable. RBE does not load an arbitrary cached `.rlib`, object, or binary merely because a file with the expected name exists.
+
+A shared target directory provides two useful forms of reuse:
+
+- **same-build reuse** — `container-bin`, `service`, `cloud_node`, `backend`, RPX, and SDK builds can reuse matching dependency artifacts rather than recompiling common crates in isolated workspace `target/` directories;
+- **cross-build reuse** — deployment hosts that persist the selected cache directory can restore unchanged Cargo artifacts on the next build.
+
+Render exposes a persistent build cache through `XDG_CACHE_HOME`, so RBE automatically chooses that location when it is available. A Render deploy that explicitly clears its build cache intentionally removes this acceleration state; the following build repopulates it normally.
+
+The shared cache is an optimization only. Deleting it must never affect project/package correctness; it only makes the next compilation slower.
+
 ## Normal builds
 
 The same preflight runs automatically for normal Linux builds, so a separate `--check-tools` invocation is optional:
