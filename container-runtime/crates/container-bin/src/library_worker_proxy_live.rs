@@ -9,8 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ipc_protocol::{
     read_library_worker_proxy_bootstrap, read_library_worker_proxy_status,
     write_library_worker_proxy_bootstrap, write_library_worker_proxy_status,
-    LibraryWorkerProxyBootstrap, LibraryWorkerProxyStatus,
-    MAX_LIBRARY_WORKER_PROXY_MESSAGE_BYTES,
+    LibraryWorkerProxyBootstrap, LibraryWorkerProxyStatus, MAX_LIBRARY_WORKER_PROXY_MESSAGE_BYTES,
 };
 use resource_limits::{attach_current_process_to_cgroup, CgroupHandle, ResourceLimits};
 use sandbox_primitives::{
@@ -108,15 +107,14 @@ pub fn run_live_library_worker_proxy(
             let _ = status_tx.send((status, stdout));
         })?;
 
-    let (status, mut child_stdout) = match status_rx
-        .recv_timeout(Duration::from_millis(startup_timeout_ms))
-    {
-        Ok(value) => value,
-        Err(error) => {
-            terminate(&cgroup, &mut child);
-            bail!("live Library Worker Proxy startup timed out: {error}");
-        }
-    };
+    let (status, mut child_stdout) =
+        match status_rx.recv_timeout(Duration::from_millis(startup_timeout_ms)) {
+            Ok(value) => value,
+            Err(error) => {
+                terminate(&cgroup, &mut child);
+                bail!("live Library Worker Proxy startup timed out: {error}");
+            }
+        };
     let status = match status {
         Ok(status) => status,
         Err(error) => {
@@ -162,8 +160,7 @@ pub fn run_live_library_worker_proxy(
 
     let relay_result = {
         let mut backend_stdout = std::io::stdout().lock();
-        io::copy(&mut child_stdout, &mut backend_stdout)
-            .and_then(|_| backend_stdout.flush())
+        io::copy(&mut child_stdout, &mut backend_stdout).and_then(|_| backend_stdout.flush())
     };
     if let Err(error) = relay_result {
         terminate(&cgroup, &mut child);
@@ -266,7 +263,13 @@ fn terminate(cgroup: &CgroupHandle, child: &mut std::process::Child) {
 fn bounded_status_message(value: &str) -> String {
     let mut output = value
         .chars()
-        .map(|character| if character.is_control() { '?' } else { character })
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
         .collect::<String>();
     if output.is_empty() {
         output = "Container could not start the isolated package worker".into();
