@@ -9,9 +9,10 @@ This directory is the authoritative user-facing documentation for the current RB
 - [`runtime-image.md`](runtime-image.md) — the Runtime Image data contract, cryptographic identity, capability binding, and atomic activation model.
 - [`rel.md`](rel.md) — REL (Runtime Engine Language), shared grammar, capabilities, ENV, embedded sources, and recursion rules.
 - [`relc.md`](relc.md) — the implemented RELC compilation/link pipeline and Runtime Image format.
-- [`library-system.md`](library-system.md) — external libraries and the current project package/install architecture, including `package.rbe.yaml`, lockfile activation, managed `rbe.sys.*` tools, package attestation, durable install sessions, and controlled dependency hydration through LIB-017.
+- [`library-system.md`](library-system.md) — external libraries and the current project package/install architecture, including `package.rbe.yaml`, lockfile activation, managed `rbe.sys.*` tools, package attestation, durable install sessions, and controlled dependency hydration.
+- [`library-host-web-build.md`](library-host-web-build.md) — verified Library Host worker launch, sealed launch proofs, Container worker proxy/sandbox behavior, managed Bun/npm web builds, and the required authority boundary for external multi-instance build coordinators.
 - [`../project-package/README.md`](../project-package/README.md) — concise project package state, cache layout, lockfile activation boundary, and build-dependency cache locations.
-- [`../install-executor/README.md`](../install-executor/README.md) — package acquisition/build execution security contracts, managed tool boundary, LIB-017 hydration rules, receipts, and offline build transition.
+- [`../install-executor/README.md`](../install-executor/README.md) — package acquisition/build execution security contracts, managed tool boundary, dependency hydration rules, receipts, and offline build transition.
 - [`error-codes/`](error-codes/) — RBE Error Code Book: stable diagnostic namespaces, long-form explanations, repair guidance, and machine-readable lookup catalog.
 - [`source-security.md`](source-security.md) — source integrity, Runtime ENV hardening, process/capability boundaries, and sealed deployment.
 - [`compatibility.md`](compatibility.md) — current cross-file capability/runtime matrix.
@@ -86,7 +87,7 @@ package.lock.rbe.yaml.next
 atomic lockfile swap = graph activation
 ```
 
-The package-system contracts through LIB-017 are implemented, but documentation must still distinguish those source/planning/execution contracts from final Backend CLI/worker integration that has not yet been fully wired end-to-end. See [`library-system.md`](library-system.md) for that boundary.
+The base package/install contracts remain documented in [`library-system.md`](library-system.md). Verified Library Host launch and managed web-build execution now have an implemented path through the current sealed worker proof + Container proxy/sandbox work; external product schedulers/preview queues remain separate coordination systems and do not become package trust authority. See [`library-host-web-build.md`](library-host-web-build.md) for the current boundary.
 
 ## Documentation rules
 
@@ -100,6 +101,7 @@ The package-system contracts through LIB-017 are implemented, but documentation 
 8. **Stable error codes are part of the public diagnostic contract.** Add/update the Error Code Book in the same change that introduces a new code; released codes are never recycled for a different meaning.
 9. **Caches are never authority by location alone.** Package, runtime, and dependency caches remain reconstructible/untrusted state until the relevant pinned identity and policy checks succeed.
 10. **Activation boundaries must be explicit.** For the project package graph, `package.lock.rbe.yaml` is the active lock; candidate preparation does not silently activate a partial graph.
+11. **Scheduling authority is not package authority.** External queues, leases, preview services, and CI dispatchers may choose when work is attempted, but they do not replace verified package roots, sealed worker proofs, tool/source identity checks, or activation gates.
 
 ## Naming
 
@@ -115,3 +117,5 @@ The package-system contracts through LIB-017 are implemented, but documentation 
 - **Project package lock** — `package.lock.rbe.yaml`, the exact resolved package graph and activation boundary.
 - **RBE system runtime** — an internal managed tool such as `rbe.sys.python`, `rbe.sys.nodejs`, `rbe.sys.bunjs`, or `rbe.sys.rust`; it is not a PATH/global installation.
 - **Hydration receipt** — `hydration.rbe.json`, evidence that dependency hydration used the pinned lock, managed tool, bounded policy, and restricted network contract before the package build transitioned back to network-dead execution.
+- **Library Worker Proxy** — the trusted Container-side proxy that re-verifies sealed library worker launch inputs, establishes the bounded sandbox, and emits proxy readiness before Library Protocol traffic begins.
+- **External build coordinator** — a host/application scheduler that may queue/lease build attempts but does not gain RBE package/runtime/source trust authority.
