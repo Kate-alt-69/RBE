@@ -298,11 +298,13 @@ mod tests {
 
     #[test]
     fn network_allowlist_requires_real_rules() {
-        let mut policy = SandboxPolicy::default();
-        policy.network = NetworkPolicy::AllowList(vec![HostRule {
-            host: String::new(),
-            ports: vec![443],
-        }]);
+        let policy = SandboxPolicy {
+            network: NetworkPolicy::AllowList(vec![HostRule {
+                host: String::new(),
+                ports: vec![443],
+            }]),
+            ..Default::default()
+        };
         assert!(policy.validate().is_err());
     }
 }
