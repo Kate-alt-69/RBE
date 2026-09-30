@@ -38,7 +38,20 @@ Custom `source` entries are parsed but fresh installation currently fails closed
 
 ## Registry configuration
 
-RPX reads the frozen Kastrick registry API. Configure its base URL with either:
+RPX reads the frozen Kastrick registry API. If no registry override is supplied, RBE uses:
+
+```text
+https://kastrick-backend.onrender.com
+```
+
+Override precedence is:
+
+1. `--registry <url>` for the current invocation;
+2. `RPX_REGISTRY_URL`;
+3. legacy `RBE_RPX_REGISTRY_URL`;
+4. the built-in Kastrick Render registry above.
+
+For example:
 
 ```text
 RPX_REGISTRY_URL=https://registry.example
@@ -50,6 +63,8 @@ or for one invocation:
 rpx --registry https://registry.example index update
 rpx install --registry https://registry.example
 ```
+
+The same default/override chain is shared by public registry reads, installs, publisher/device-login flows, package status, and publication commands.
 
 Production registry URLs must use HTTPS. Plain HTTP is accepted only for loopback development hosts.
 
