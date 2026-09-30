@@ -1,7 +1,8 @@
 use anyhow::{bail, Context};
 use core_lib::{
-    ExpectedWorkerIdentity, LibraryCapabilityGrant, LibraryHostCall, LibraryPackageIdentity,
-    LibraryRuntimeIdentity, LibrarySdkIdentity, LibrarySessionBinding, LIBRARY_ABI_VERSION,
+    ExpectedWorkerIdentity, LibraryCapabilityGrant, LibraryHostCall, LibraryHostCallReply,
+    LibraryPackageIdentity, LibraryRuntimeIdentity, LibrarySdkIdentity, LibrarySessionBinding,
+    LIBRARY_ABI_VERSION,
 };
 use rand::RngCore;
 use rbe_install_runtime::VerifiedRpxRootSnapshot;
@@ -89,6 +90,42 @@ fn package_log_grant(package: &str) -> anyhow::Result<LibraryCapabilityGrant> {
     .context("build verified package logging capability grant")
 }
 
+/// Authorize and dispatch one package host call through the same retained
+/// Library Host binding that accepted the worker handshake.
+///
+/// Capability admission always happens before selecting a trusted dispatcher.
+/// This prevents a package from reaching a Backend host primitive merely by
+/// spelling a known capability name. Dispatchers are intentionally explicit;
+/// capabilities without a Backend-owned implementation fail closed.
+pub fn dispatch_authorized_host_call(
+    package: &str,
+    binding: &LibrarySessionBinding,
+    call: &LibraryHostCall,
+) -> anyhow::Result<LibraryHostCallReply> {
+    let grant = binding
+        .authorize_host_call(call)
+        .context("authorize package host call against accepted Library Host session")?;
+
+    let payload = match call.capability.as_str() {
+        LIBRARY_LOG_CAPABILITY => dispatch_package_log_call(package, call)?,
+        capability => bail!(
+            "trusted Backend dispatcher for package capability {capability:?} is not installed"
+        ),
+    };
+
+    if payload.len() > grant.max_response_bytes {
+        bail!(
+            "package host call response exceeded admitted capability limit: capability={:?}, limit={}, observed={}",
+            grant.capability,
+            grant.max_response_bytes,
+            payload.len()
+        );
+    }
+
+    LibraryHostCallReply::success(call.call_id, payload)
+        .context("encode successful package host-call reply")
+}
+
 /// Dispatch one already-authorized package `log` host call into RBE's normal
 /// tracing pipeline.
 ///
@@ -97,10 +134,7 @@ fn package_log_grant(package: &str) -> anyhow::Result<LibraryCapabilityGrant> {
 /// below `lib/<verified-package-name>`; it never changes host-call authority.
 /// Package messages and child names reject control characters so untrusted
 /// workers cannot forge terminal lines or inject escape sequences.
-pub(crate) fn dispatch_package_log_call(
-    package: &str,
-    call: &LibraryHostCall,
-) -> anyhow::Result<Vec<u8>> {
+fn dispatch_package_log_call(package: &str, call: &LibraryHostCall) -> anyhow::Result<Vec<u8>> {
     let expected_target = format!("lib/{package}");
     if call.capability != LIBRARY_LOG_CAPABILITY || call.target != expected_target {
         bail!("package log call does not match verified library authority");
@@ -172,7 +206,13 @@ pub fn bind_session(
     grants: impl IntoIterator<Item = LibraryCapabilityGrant>,
 ) -> anyhow::Result<LibrarySessionBinding> {
     let expected = expected_worker(snapshot)?;
-    let mut admitted = grants.into_iter().collect::<Vec<_>>();
+    let mut admitted = Vec::new();
+    for grant in grants {
+        if grant.capability == LIBRARY_LOG_CAPABILITY {
+            bail!("package log capability is host-owned and cannot be supplied by callers");
+        }
+        admitted.push(grant);
+    }
     admitted.push(package_log_grant(&expected.package.name)?);
 
     let mut nonce = [0u8; SESSION_ID_BYTES];
@@ -288,6 +328,68 @@ mod tests {
                 br#"{"scope":[],"message":"spoof"}"#,
             ))
             .is_err());
+    }
+
+    #[test]
+    fn host_owned_log_capability_cannot_be_replaced_or_widened() {
+        let snapshot = snapshot();
+        let error = bind_session(
+            &snapshot,
+            [LibraryCapabilityGrant::new(
+                "log",
+                "lib/other-package",
+                ["info".to_string()],
+                1024,
+                1024,
+            )
+            .unwrap()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("host-owned"));
+    }
+
+    #[test]
+    fn authorized_log_call_dispatches_and_returns_typed_reply() {
+        let snapshot = snapshot();
+        let mut session = bind_session(&snapshot, std::iter::empty()).unwrap();
+        session.accept_hello(&hello(&snapshot)).unwrap();
+        let call = log_call(
+            "lib/advancenet",
+            "info",
+            br#"{"scope":["smtp"],"message":"ready"}"#,
+        );
+        let reply = dispatch_authorized_host_call("advancenet", &session, &call).unwrap();
+        assert_eq!(reply.call_id, call.call_id);
+        assert!(reply.ok);
+        assert!(reply.payload.is_empty());
+        assert!(reply.error.is_none());
+    }
+
+    #[test]
+    fn admitted_but_unimplemented_capability_fails_closed() {
+        let snapshot = snapshot();
+        let mut session = bind_session(
+            &snapshot,
+            [LibraryCapabilityGrant::new(
+                "net:http",
+                "net:http",
+                ["request".to_string()],
+                1024,
+                4096,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        session.accept_hello(&hello(&snapshot)).unwrap();
+        let call = LibraryHostCall {
+            call_id: 9,
+            capability: "net:http".into(),
+            target: "net:http".into(),
+            operation: "request".into(),
+            payload: b"{}".to_vec(),
+        };
+        let error = dispatch_authorized_host_call("advancenet", &session, &call).unwrap_err();
+        assert!(error.to_string().contains("dispatcher"));
     }
 
     #[test]
