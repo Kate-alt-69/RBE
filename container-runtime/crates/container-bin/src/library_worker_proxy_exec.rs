@@ -77,19 +77,14 @@ pub fn execute_library_worker_proxy(
         return Err(LibraryWorkerProxyExecutionError::InvalidLimits);
     }
 
-    let cgroup = CgroupHandle::create(
-        &options.cgroup_root,
-        &execution_id(),
-        options.limits,
-    )?;
+    let cgroup = CgroupHandle::create(&options.cgroup_root, &execution_id(), options.limits)?;
     let current_exe = std::env::current_exe()?;
     let current_exe_text = current_exe
         .to_str()
         .ok_or_else(|| LibraryWorkerProxyExecutionError::NonUtf8Path(current_exe.clone()))?;
-    let cgroup_path_text = cgroup
-        .path()
-        .to_str()
-        .ok_or_else(|| LibraryWorkerProxyExecutionError::NonUtf8Path(cgroup.path().to_path_buf()))?;
+    let cgroup_path_text = cgroup.path().to_str().ok_or_else(|| {
+        LibraryWorkerProxyExecutionError::NonUtf8Path(cgroup.path().to_path_buf())
+    })?;
 
     let mut policy = SandboxPolicy::default();
     policy.network = NetworkPolicy::DenyAll;
@@ -133,8 +128,10 @@ pub fn execute_library_worker_proxy(
         .take()
         .ok_or(LibraryWorkerProxyExecutionError::MissingChildPipe("stderr"))?;
     let overflow = Arc::new(AtomicBool::new(false));
-    let stdout_reader = spawn_bounded_reader(stdout, options.max_stdout_bytes, Arc::clone(&overflow));
-    let stderr_reader = spawn_bounded_reader(stderr, options.max_stderr_bytes, Arc::clone(&overflow));
+    let stdout_reader =
+        spawn_bounded_reader(stdout, options.max_stdout_bytes, Arc::clone(&overflow));
+    let stderr_reader =
+        spawn_bounded_reader(stderr, options.max_stderr_bytes, Arc::clone(&overflow));
 
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
@@ -178,7 +175,9 @@ pub fn execute_library_worker_proxy(
     Ok(result)
 }
 
-pub fn run_library_worker_proxy_exec_child(cgroup_path: &Path) -> Result<(), LibraryWorkerProxyExecutionError> {
+pub fn run_library_worker_proxy_exec_child(
+    cgroup_path: &Path,
+) -> Result<(), LibraryWorkerProxyExecutionError> {
     if !cgroup_path.is_absolute() {
         return Err(LibraryWorkerProxyExecutionError::InvalidCgroupRoot(
             cgroup_path.to_path_buf(),
@@ -288,16 +287,40 @@ impl fmt::Display for LibraryWorkerProxyExecutionError {
                 "Library Worker Proxy requires a delegated absolute cgroup-v2 root: {}",
                 path.display()
             ),
-            Self::InvalidLimits => formatter.write_str("Library Worker Proxy execution limits are invalid"),
-            Self::NonUtf8Path(path) => write!(formatter, "Library Worker Proxy path is not UTF-8: {}", path.display()),
-            Self::MissingChildPipe(name) => write!(formatter, "Library Worker Proxy child {name} pipe is unavailable"),
-            Self::CaptureThreadPanicked => formatter.write_str("Library Worker Proxy output capture thread panicked"),
-            Self::Sandbox(message) => write!(formatter, "Library Worker Proxy sandbox launch failed: {message}"),
-            Self::InvalidResult(message) => write!(formatter, "Library Worker Proxy produced an invalid result: {message}"),
-            Self::CgroupKill(error) => write!(formatter, "Library Worker Proxy failed to kill its cgroup: {error}"),
-            Self::Proxy(error) => write!(formatter, "Library Worker Proxy verification failed: {error}"),
+            Self::InvalidLimits => {
+                formatter.write_str("Library Worker Proxy execution limits are invalid")
+            }
+            Self::NonUtf8Path(path) => write!(
+                formatter,
+                "Library Worker Proxy path is not UTF-8: {}",
+                path.display()
+            ),
+            Self::MissingChildPipe(name) => write!(
+                formatter,
+                "Library Worker Proxy child {name} pipe is unavailable"
+            ),
+            Self::CaptureThreadPanicked => {
+                formatter.write_str("Library Worker Proxy output capture thread panicked")
+            }
+            Self::Sandbox(message) => write!(
+                formatter,
+                "Library Worker Proxy sandbox launch failed: {message}"
+            ),
+            Self::InvalidResult(message) => write!(
+                formatter,
+                "Library Worker Proxy produced an invalid result: {message}"
+            ),
+            Self::CgroupKill(error) => write!(
+                formatter,
+                "Library Worker Proxy failed to kill its cgroup: {error}"
+            ),
+            Self::Proxy(error) => write!(
+                formatter,
+                "Library Worker Proxy verification failed: {error}"
+            ),
             Self::Io(error) => write!(formatter, "Library Worker Proxy I/O failed: {error}"),
-            Self::UnsupportedPlatform => formatter.write_str("Library Worker Proxy execution is unsupported on this platform"),
+            Self::UnsupportedPlatform => formatter
+                .write_str("Library Worker Proxy execution is unsupported on this platform"),
         }
     }
 }
@@ -354,6 +377,9 @@ mod tests {
             &bootstrap,
         );
         assert_eq!(options.limits.wall_time_ms, 42_000);
-        assert_eq!(options.max_stdout_bytes, MAX_LIBRARY_WORKER_PROXY_STDOUT_BYTES);
+        assert_eq!(
+            options.max_stdout_bytes,
+            MAX_LIBRARY_WORKER_PROXY_STDOUT_BYTES
+        );
     }
 }

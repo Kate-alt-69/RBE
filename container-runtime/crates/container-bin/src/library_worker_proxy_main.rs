@@ -14,7 +14,9 @@ fn main() -> anyhow::Result<()> {
     if args.iter().any(|arg| arg == "--library-worker-exec-child") {
         let cgroup_path = value_after(&args, "--cgroup-path")
             .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("--cgroup-path is required for the internal proxy child"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("--cgroup-path is required for the internal proxy child")
+            })?;
         return run_library_worker_proxy_exec_child(&cgroup_path).map_err(Into::into);
     }
 

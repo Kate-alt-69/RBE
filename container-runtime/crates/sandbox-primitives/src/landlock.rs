@@ -93,7 +93,12 @@ pub fn install_workspace_landlock(workspace: &Path, program: &Path) -> io::Resul
         if let Some(parent) = program.parent() {
             add_path_rule(&ruleset, parent, READ_ONLY_RIGHTS & handled, false)?;
         }
-        add_path_rule(&ruleset, &program, (ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE) & handled, false)?;
+        add_path_rule(
+            &ruleset,
+            &program,
+            (ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE) & handled,
+            false,
+        )?;
 
         for path in standard_runtime_read_paths() {
             if path.exists() {
@@ -151,7 +156,9 @@ fn create_ruleset(handled_access_fs: u64) -> io::Result<RawFd> {
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(RawFd(i32::try_from(rc).map_err(|_| io::Error::other("invalid Landlock ruleset fd"))?))
+    Ok(RawFd(i32::try_from(rc).map_err(|_| {
+        io::Error::other("invalid Landlock ruleset fd")
+    })?))
 }
 
 #[cfg(target_arch = "x86_64")]
