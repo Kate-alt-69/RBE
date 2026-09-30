@@ -5,8 +5,23 @@
 //! control or create a second sandbox. cgroup-v2 resource enforcement lives in
 //! `resource-limits`.
 
+#[cfg(not(target_os = "linux"))]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+
+#[cfg(target_os = "linux")]
+mod landlock;
+#[cfg(target_os = "linux")]
+pub use landlock::install_workspace_landlock;
+
+#[cfg(not(target_os = "linux"))]
+pub fn install_workspace_landlock(_workspace: &Path, _program: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Landlock filesystem isolation is Linux-only",
+    ))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
@@ -99,9 +114,13 @@ impl SandboxLauncher {
         policy.validate().map_err(str::to_string)?;
         #[cfg(target_os = "linux")]
         {
-            let mut command = Command::new("unshare");
+            let unshare = unshare_program()?;
+            let mut command = Command::new(unshare);
             command.args([
+                "--user",
+                "--map-root-user",
                 "--fork",
+                "--kill-child=KILL",
                 "--pid",
                 "--mount",
                 "--ipc",
@@ -121,6 +140,17 @@ impl SandboxLauncher {
             Err("OS sandbox backend is not implemented on this platform".to_string())
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn unshare_program() -> Result<PathBuf, String> {
+    for candidate in ["/usr/bin/unshare", "/bin/unshare"] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err("Linux sandbox requires an absolute util-linux unshare binary".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -260,9 +290,19 @@ mod tests {
     fn defaults_are_deny_first() {
         let policy = SandboxPolicy::default();
         assert_eq!(policy.network, NetworkPolicy::DenyAll);
+        assert_eq!(policy.filesystem, FilesystemPolicy::WorkspaceOnly);
         assert_eq!(policy.privileges, PrivilegePolicy::NoExtraCapabilities);
         assert_eq!(policy.namespaces, NamespacePolicy::FullyIsolated);
         assert_eq!(policy.syscalls, SyscallPolicy::Restricted);
-        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn network_allowlist_requires_real_rules() {
+        let mut policy = SandboxPolicy::default();
+        policy.network = NetworkPolicy::AllowList(vec![HostRule {
+            host: String::new(),
+            ports: vec![443],
+        }]);
+        assert!(policy.validate().is_err());
     }
 }

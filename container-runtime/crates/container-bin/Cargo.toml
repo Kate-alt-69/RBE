@@ -12,6 +12,10 @@ path = "src/security_root.rs"
 name = "container-bin"
 path = "src/main.rs"
 
+[[bin]]
+name = "container-library-worker-proxy"
+path = "src/library_worker_proxy_main.rs"
+
 [dependencies]
 container-runtime-core = { path = "../container-runtime-core" }
 environments = { path = "../environments" }

@@ -122,8 +122,37 @@ impl CgroupHandle {
         }
     }
 
+    pub fn kill_all(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            write_file(&self.path, "cgroup.kill", "1")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cgroup-v2 enforcement is Linux-only",
+            ))
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+pub fn attach_current_process_to_cgroup(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        write_file(path, "cgroup.procs", "0")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cgroup-v2 enforcement is Linux-only",
+        ))
     }
 }
 
