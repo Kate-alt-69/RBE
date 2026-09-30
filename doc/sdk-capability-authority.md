@@ -54,6 +54,14 @@ A denied privilege must stay denied even if package code is hidden behind anothe
 
 Headless/non-interactive installation must fail closed for new RBE-owned privileges unless an explicit trusted approval policy is supplied.
 
+### Current implementation boundary
+
+Backend currently consumes only exact project-local approval state that matches the active project lock plus the verified package version/artifact identity. Capability requests are re-read from the SHA-pinned package evidence before an approved capability is converted into a host-session grant.
+
+The ordinary `backend install` command does **not** yet create new privilege approvals or reinterpret `--force` as consent. Until a trusted interactive/UI/policy approval surface is connected, a newly installed package that requests an RBE-owned privilege receives no such grant by default. This is intentional fail-closed behavior, not an implicit approval mechanism.
+
+Approval persistence/consent UX is therefore a separate feature boundary. It must not be implemented by package-rendered UI or by accepting an untrusted worker's runtime capability strings.
+
 ## Package-private capability names
 
 Examples such as:
