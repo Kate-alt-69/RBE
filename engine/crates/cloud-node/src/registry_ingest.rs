@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::{CloudNodeStore, StoredObject};
+use crate::{durable, CloudNodeStore, StoredObject, SyncObject};
 
 const REGISTRY_LOGICAL_ROOT: &str = "registry";
+const REQUIRED_INDEX_SNAPSHOT: &str = "index/snapshot.json";
 const ALLOWED_TOP_LEVEL: &[&str] = &[
     "index",
     "packages",
@@ -19,6 +21,7 @@ pub struct RegistryIngestResult {
     pub files: usize,
     pub metadata_files: usize,
     pub artifact_files: usize,
+    pub removed_files: usize,
     pub stored: Vec<RegistryStoredObject>,
 }
 
@@ -29,8 +32,20 @@ pub struct RegistryStoredObject {
     pub content_sha256: String,
 }
 
-/// Ingest a trusted Kastrick/RPX registry export into Cloud Node's normal
-/// content-addressed store.
+#[derive(Debug)]
+struct ValidatedRegistryFile {
+    source: PathBuf,
+    logical_path: String,
+    is_artifact: bool,
+}
+
+/// Ingest a complete trusted Kastrick/RPX registry export into Cloud Node's
+/// normal content-addressed store.
+///
+/// The export is treated as a frozen snapshot, not an overlay: active
+/// `registry/` file objects that are absent from the validated export are
+/// removed after all replacement files have been stored. Cloud Node backup
+/// history is intentionally retained.
 ///
 /// The resulting objects participate in the existing provider snapshot and
 /// revision-history model, so registry state gets the same local-ahead/push,
@@ -53,24 +68,62 @@ pub fn ingest_registry_export(
     collect_registry_files(export_root, export_root, &mut files)?;
     files.sort();
 
-    let mut result = RegistryIngestResult::default();
+    // Validate the complete export before mutating Cloud Node state. This
+    // prevents a malformed trailing path from leaving a partially replaced
+    // registry snapshot behind.
+    let mut validated = Vec::with_capacity(files.len());
+    let mut expected_logical_paths = BTreeSet::new();
+    let mut has_index_snapshot = false;
     for source in files {
         let relative = source
             .strip_prefix(export_root)
             .map_err(|_| anyhow::anyhow!("Cloud Node registry export path escaped its root"))?;
         let normalized = validate_registry_relative_path(relative)?;
-        let is_artifact = normalized.ends_with(".rbe.zip");
+        if normalized == REQUIRED_INDEX_SNAPSHOT {
+            has_index_snapshot = true;
+        }
         let logical_path = format!("{REGISTRY_LOGICAL_ROOT}/{normalized}");
-        let stored = store.store_file(&source, &logical_path)?;
+        if !expected_logical_paths.insert(logical_path.clone()) {
+            anyhow::bail!("Cloud Node registry export contains duplicate logical path {logical_path:?}");
+        }
+        validated.push(ValidatedRegistryFile {
+            source,
+            logical_path,
+            is_artifact: normalized.ends_with(".rbe.zip"),
+        });
+    }
+    if !has_index_snapshot {
+        anyhow::bail!(
+            "Cloud Node registry export is incomplete: required {REQUIRED_INDEX_SNAPSHOT} is missing"
+        );
+    }
+
+    let mut result = RegistryIngestResult::default();
+    for file in validated {
+        let stored = store.store_file(&file.source, &file.logical_path)?;
         result.files += 1;
-        if is_artifact {
+        if file.is_artifact {
             result.artifact_files += 1;
         } else {
             result.metadata_files += 1;
         }
         result
             .stored
-            .push(stored_registry_object(logical_path, stored));
+            .push(stored_registry_object(file.logical_path, stored));
+    }
+
+    let stale = store
+        .sync_plan()?
+        .files
+        .into_iter()
+        .filter(|object| {
+            object.logical_path.starts_with("registry/")
+                && !expected_logical_paths.contains(&object.logical_path)
+        })
+        .collect::<Vec<_>>();
+    for object in stale {
+        remove_active_registry_object(store, &object)?;
+        result.removed_files += 1;
     }
 
     Ok(result)
@@ -82,6 +135,41 @@ fn stored_registry_object(logical_path: String, stored: StoredObject) -> Registr
         object_key: stored.object_key,
         content_sha256: stored.content_sha256,
     }
+}
+
+fn remove_active_registry_object(store: &CloudNodeStore, object: &SyncObject) -> anyhow::Result<()> {
+    if !object.logical_path.starts_with("registry/") {
+        anyhow::bail!(
+            "refusing to remove non-registry Cloud Node object {:?}",
+            object.logical_path
+        );
+    }
+    let summary = store.summary();
+    let object_dir = object
+        .manifest_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("registry object manifest has no parent directory"))?;
+    if object_dir.parent() != Some(summary.storage.as_path()) {
+        anyhow::bail!(
+            "registry object directory escaped Cloud Node storage root: {}",
+            object_dir.display()
+        );
+    }
+
+    // Removing the active object makes it disappear from the next sync root.
+    // The backup tree is deliberately preserved so retained local history is
+    // not destroyed merely because a later complete registry snapshot no
+    // longer exposes this path.
+    durable::remove_dir_all(object_dir)?;
+
+    let priority = summary
+        .root
+        .join("priority")
+        .join(format!("{}.level", hex::encode(object.object_key)));
+    if priority.exists() {
+        durable::remove_file(priority)?;
+    }
+    Ok(())
 }
 
 fn collect_registry_files(
@@ -199,6 +287,12 @@ mod tests {
         .unwrap()
     }
 
+    fn write_export_file(export: &Path, relative: &str, bytes: &[u8]) {
+        let path = export.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn registry_ingest_accepts_all_frozen_server_collections() {
         let root = temp_root("layout");
@@ -217,9 +311,7 @@ mod tests {
             ),
         ];
         for (relative, bytes) in files {
-            let path = export.join(relative);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, bytes).unwrap();
+            write_export_file(&export, relative, bytes);
         }
 
         let store = CloudNodeStore::open(&settings(&root)).unwrap();
@@ -227,6 +319,7 @@ mod tests {
         assert_eq!(result.files, 8);
         assert_eq!(result.metadata_files, 7);
         assert_eq!(result.artifact_files, 1);
+        assert_eq!(result.removed_files, 0);
         assert!(result
             .stored
             .iter()
@@ -243,9 +336,8 @@ mod tests {
     fn replaying_same_registry_export_keeps_sync_root_identity() {
         let root = temp_root("replay");
         let export = root.join("export");
-        let snapshot = export.join("index/snapshot.json");
-        fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
-        fs::write(&snapshot, br#"{"revision":"sha256:one"}"#).unwrap();
+        let snapshot = export.join(REQUIRED_INDEX_SNAPSHOT);
+        write_export_file(&export, REQUIRED_INDEX_SNAPSHOT, b"{\"revision\":\"sha256:one\"}");
 
         let store = CloudNodeStore::open(&settings(&root)).unwrap();
         ingest_registry_export(&store, &export).unwrap();
@@ -255,9 +347,69 @@ mod tests {
         let replay_root = store.sync_plan().unwrap().root_sha256;
         assert_eq!(replay_root, first_root);
 
-        fs::write(&snapshot, br#"{"revision":"sha256:two"}"#).unwrap();
+        fs::write(&snapshot, b"{\"revision\":\"sha256:two\"}").unwrap();
         ingest_registry_export(&store, &export).unwrap();
         assert_ne!(store.sync_plan().unwrap().root_sha256, first_root);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_registry_snapshot_removes_stale_active_paths_only() {
+        let root = temp_root("replace");
+        let export = root.join("export");
+        write_export_file(&export, REQUIRED_INDEX_SNAPSHOT, b"{\"revision\":1}");
+        write_export_file(&export, "packages/old.json", b"{\"name\":\"old\"}");
+
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+        let unrelated = root.join("outside.txt");
+        fs::write(&unrelated, b"keep me").unwrap();
+        store.store_file(&unrelated, "app/outside.txt").unwrap();
+
+        let first = ingest_registry_export(&store, &export).unwrap();
+        let old = first
+            .stored
+            .iter()
+            .find(|stored| stored.logical_path == "registry/packages/old.json")
+            .unwrap();
+        let old_backup = store.summary().backup.join(&old.object_key);
+        assert!(old_backup.is_dir());
+
+        fs::remove_file(export.join("packages/old.json")).unwrap();
+        fs::write(export.join(REQUIRED_INDEX_SNAPSHOT), b"{\"revision\":2}").unwrap();
+        let second = ingest_registry_export(&store, &export).unwrap();
+        assert_eq!(second.removed_files, 1);
+
+        let paths = store
+            .sync_plan()
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|object| object.logical_path)
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("registry/index/snapshot.json"));
+        assert!(!paths.contains("registry/packages/old.json"));
+        assert!(paths.contains("app/outside.txt"));
+        assert!(old_backup.is_dir());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_snapshot_is_rejected_before_existing_registry_state_changes() {
+        let root = temp_root("incomplete");
+        let complete = root.join("complete");
+        write_export_file(&complete, REQUIRED_INDEX_SNAPSHOT, b"{}");
+        write_export_file(&complete, "packages/keep.json", b"{\"name\":\"keep\"}");
+
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+        ingest_registry_export(&store, &complete).unwrap();
+        let before = store.sync_plan().unwrap().root_sha256;
+
+        let incomplete = root.join("incomplete");
+        write_export_file(&incomplete, "packages/new.json", b"{\"name\":\"new\"}");
+        assert!(ingest_registry_export(&store, &incomplete).is_err());
+        assert_eq!(store.sync_plan().unwrap().root_sha256, before);
 
         fs::remove_dir_all(root).unwrap();
     }
