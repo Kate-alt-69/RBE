@@ -352,6 +352,51 @@ Failure publication also needs ordering. A safe pattern is to publish the mutabl
 
 Cross-object publication is not automatically transactional merely because every individual object uses CAS. Coordinators should preserve ordering so that the object which authorizes the generation is fenced before dependent public/result records are published, and dependent record updates should themselves use CAS so concurrent user changes are preserved rather than overwritten.
 
+### 7.3 Chunked source uploads require immutable slots and CAS progress
+
+A chunked source upload has two different kinds of state: the chunk payloads themselves and the mutable upload-progress descriptor. They should not have the same write semantics.
+
+The safe multi-instance pattern is:
+
+```text
+begin upload
+   |
+   v
+create descriptor if absent
+(or validate/resume matching existing descriptor)
+   |
+   v
+GET descriptor + ETag
+   |
+   v
+create exact chunk slot if absent
+   |
+   +--> existing identical chunk = idempotent retry
+   |
+   +--> existing different chunk = conflict / fail closed
+   |
+   v
+advance uploadedChunks/uploadedBytes
+   |
+   v
+CAS descriptor with If-Match <ETag>
+   |
+   +--> stale = re-read + bounded retry
+```
+
+Required invariants:
+
+- beginning the same upload must not reset an already-progressed descriptor back to zero;
+- the deterministic descriptor identity is create-if-absent, and an existing descriptor must match the expected owner/project/source/artifact configuration before it is resumed;
+- chunk slots are immutable create-if-absent objects rather than mutable overwrite targets;
+- an already-present chunk is accepted only when its index, declared size, and bytes/encoded payload match the retried request exactly;
+- a different payload for an occupied chunk slot is a conflict, never an overwrite;
+- descriptor progress is advanced with ETag/version CAS and bounded retries;
+- future/out-of-order chunk slots remain rejected even though a repeated already-committed chunk may be treated idempotently;
+- storing the chunk before CASing descriptor progress makes a crash between those two operations recoverable: retry observes the identical immutable chunk and can safely retry only the descriptor transition.
+
+This keeps uploaded source bytes stable while allowing the progress record to remain a small mutable state machine. A process-local mutex may still reduce contention, but it is not the cross-instance authority.
+
 ## 8. Failure and restart behavior
 
 RBE and external coordinators should prefer fail-closed recovery over guessing ownership after a crash.
@@ -375,6 +420,8 @@ For an external multi-instance build coordinator:
 - mutable queue add/remove paths use bounded CAS rather than unconditional read-modify-write replacement;
 - terminal result publication re-reads the current generation, re-validates lease authority, and CASes the terminal job state before exposing dependent result state;
 - stale CAS/version mismatches fail closed rather than overwriting a newer attempt;
+- repeated identical source chunks are idempotent, while conflicting bytes for an occupied slot fail closed;
+- descriptor CAS lets an upload recover after a chunk was durably stored but progress publication was interrupted;
 - queue cleanup failure should not transfer ownership to another worker while the durable lease remains active.
 
 ## 9. What this document does not claim
