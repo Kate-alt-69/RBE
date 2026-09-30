@@ -76,6 +76,39 @@ export declare class CapabilityClient {
   intercept(...interceptors: HostInterceptor[]): CapabilityClient;
 }
 
+export declare class LoggerClient {
+  constructor(bridge: HostBridge, libraryName: string, scope?: readonly string[]);
+  readonly bridge: HostBridge;
+  readonly libraryName: string;
+  readonly scope: readonly string[];
+  target(): string;
+  child(name: string): LoggerClient;
+  emit(level: "debug" | "info" | "warn" | "error" | "fatal", message: unknown): unknown | Promise<unknown>;
+  debug(message: unknown): unknown | Promise<unknown>;
+  info(message: unknown): unknown | Promise<unknown>;
+  warn(message: unknown): unknown | Promise<unknown>;
+  error(message: unknown): unknown | Promise<unknown>;
+  fatal(message: unknown): unknown | Promise<unknown>;
+}
+
+export declare class NetClient {
+  constructor(bridge: HostBridge);
+  sublibrary(name: string): CapabilityClient;
+  http(): CapabilityClient;
+  cookies(): CapabilityClient;
+  headers(): CapabilityClient;
+  url(): CapabilityClient;
+  dns(): CapabilityClient;
+  ip(): CapabilityClient;
+  tcp(): CapabilityClient;
+  udp(): CapabilityClient;
+  quic(): CapabilityClient;
+  websocket(): CapabilityClient;
+  webtransport(): CapabilityClient;
+  p2p(): CapabilityClient;
+  mask(): CapabilityClient;
+}
+
 export declare class AdvancedClient {
   constructor(bridge: HostBridge);
   capability(capabilityId: string, target?: string): CapabilityClient;
@@ -88,19 +121,15 @@ export declare class AdvancedClient {
 }
 
 export declare class RbeSdk {
-  constructor(bridge: HostBridge);
+  constructor(bridge: HostBridge, libraryName?: string | null);
   call(request: HostRequest): unknown | Promise<unknown>;
   capability(capabilityId: string, target?: string): CapabilityClient;
   advanced(): AdvancedClient;
+  log(): LoggerClient;
   host(): HostClient;
   intercept(...interceptors: HostInterceptor[]): RbeSdk;
   hostBridge(): HostBridge;
-  net(): {
-    sublibrary(name: string): CapabilityClient;
-    http(): CapabilityClient;
-    p2p(): CapabilityClient;
-    mask(): CapabilityClient;
-  };
+  net(): NetClient;
   router(): {
     inspect(operation: string, payload?: unknown): unknown | Promise<unknown>;
     register(operation: string, payload?: unknown): unknown | Promise<unknown>;
