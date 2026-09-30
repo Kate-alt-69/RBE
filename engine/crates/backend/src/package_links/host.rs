@@ -27,8 +27,6 @@ struct LibraryLogRecord {
     message: String,
 }
 
-/// Convert one fail-closed verified RPX root snapshot into the exact identity
-/// Library Host expects the package worker to announce.
 pub fn expected_worker(
     snapshot: &VerifiedRpxRootSnapshot,
 ) -> anyhow::Result<ExpectedWorkerIdentity> {
@@ -109,13 +107,14 @@ fn package_http_grant() -> anyhow::Result<LibraryCapabilityGrant> {
     .context("build verified package public HTTP capability grant")
 }
 
-/// Convert verified manifest requests into the subset of capabilities that
-/// Backend actually implements for external package workers.
+/// Convert verified package requests into the subset of RBE-owned host
+/// privileges that Backend currently implements.
 ///
-/// Requests are never treated as authority by themselves. `log` is host-owned
-/// and implicit; `net:http` is currently the only explicit package capability
-/// with a trusted Backend dispatcher. Any other enabled request fails closed so
-/// packages never start under the illusion that requested authority was granted.
+/// Package capabilities remain open-ended: unknown/package-specific requests
+/// are not host grants and do not prevent the worker from starting. Packages may
+/// implement arbitrary internal APIs, services, backends, queues, adapters, and
+/// abstractions inside their worker. Only supported RBE-owned surfaces returned
+/// here cross the trusted Library Host authority boundary.
 pub fn grants_for_verified_requests(
     requests: &[String],
 ) -> anyhow::Result<Vec<LibraryCapabilityGrant>> {
@@ -128,21 +127,12 @@ pub fn grants_for_verified_requests(
         match request.as_str() {
             LIBRARY_LOG_CAPABILITY => {}
             LIBRARY_NET_HTTP_CAPABILITY => grants.push(package_http_grant()?),
-            unsupported => bail!(
-                "verified package requested unsupported runtime capability {unsupported:?}"
-            ),
+            _ => {}
         }
     }
     Ok(grants)
 }
 
-/// Authorize and dispatch one package host call through the same retained
-/// Library Host binding that accepted the worker handshake.
-///
-/// Capability admission always happens before selecting a trusted dispatcher.
-/// This prevents a package from reaching a Backend host primitive merely by
-/// spelling a known capability name. Dispatchers are intentionally explicit;
-/// capabilities without a Backend-owned implementation fail closed.
 pub async fn dispatch_authorized_host_call(
     package: &str,
     binding: &LibrarySessionBinding,
@@ -190,14 +180,6 @@ async fn dispatch_package_http_call(call: &LibraryHostCall) -> anyhow::Result<Ve
     serde_json::to_vec(&value).context("encode package net:http response")
 }
 
-/// Dispatch one already-authorized package `log` host call into RBE's normal
-/// tracing pipeline.
-///
-/// This helper deliberately re-checks the verified package target as defense in
-/// depth. Child scope is structured payload data and can only extend the module
-/// below `lib/<verified-package-name>`; it never changes host-call authority.
-/// Package messages and child names reject control characters so untrusted
-/// workers cannot forge terminal lines or inject escape sequences.
 fn dispatch_package_log_call(package: &str, call: &LibraryHostCall) -> anyhow::Result<Vec<u8>> {
     let expected_target = format!("lib/{package}");
     if call.capability != LIBRARY_LOG_CAPABILITY || call.target != expected_target {
@@ -258,13 +240,6 @@ fn valid_log_component(value: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// Create one Library Host session from verified worker identity plus an already
-/// admitted capability set. Requested manifest capabilities are deliberately not
-/// accepted here: callers must provide trusted [`LibraryCapabilityGrant`]s.
-///
-/// Every verified package additionally receives the host-owned `log` capability
-/// for exactly `lib/<verified-package-name>`. Child logger scopes stay inside the
-/// log payload and therefore cannot retarget another package's log authority.
 pub fn bind_session(
     snapshot: &VerifiedRpxRootSnapshot,
     grants: impl IntoIterator<Item = LibraryCapabilityGrant>,
@@ -356,20 +331,27 @@ mod tests {
     }
 
     #[test]
-    fn verified_requests_admit_only_implemented_capabilities() {
-        let grants = grants_for_verified_requests(&["log".into(), "net:http".into()]).unwrap();
+    fn verified_requests_admit_only_implemented_rbe_privileges() {
+        let grants = grants_for_verified_requests(&[
+            "log".into(),
+            "mail:queue".into(),
+            "net:http".into(),
+            "mail:smtp".into(),
+        ])
+        .unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].capability, "net:http");
-        assert_eq!(grants[0].target, "net:http");
-        assert!(grants[0].operations.contains("get"));
-        assert!(grants[0].operations.contains("post"));
-        assert!(grants[0].operations.contains("request"));
     }
 
     #[test]
-    fn unsupported_verified_request_fails_closed() {
-        let error = grants_for_verified_requests(&["net:tcp".into()]).unwrap_err();
-        assert!(error.to_string().contains("unsupported runtime capability"));
+    fn package_specific_and_unavailable_requests_do_not_block_worker_start() {
+        let grants = grants_for_verified_requests(&[
+            "mail:smtp".into(),
+            "mail:provider:resend".into(),
+            "net:tcp".into(),
+        ])
+        .unwrap();
+        assert!(grants.is_empty());
     }
 
     #[test]
@@ -450,32 +432,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_but_unimplemented_capability_fails_closed() {
+    async fn ungranted_custom_host_call_fails_at_authority_boundary() {
         let snapshot = snapshot();
-        let mut session = bind_session(
-            &snapshot,
-            [LibraryCapabilityGrant::new(
-                "net:tcp",
-                "net:tcp",
-                ["connect".to_string()],
-                1024,
-                4096,
-            )
-            .unwrap()],
-        )
-        .unwrap();
+        let mut session = bind_session(&snapshot, std::iter::empty()).unwrap();
         session.accept_hello(&hello(&snapshot)).unwrap();
         let call = LibraryHostCall {
             call_id: 9,
-            capability: "net:tcp".into(),
-            target: "net:tcp".into(),
-            operation: "connect".into(),
+            capability: "mail:smtp".into(),
+            target: "mail:smtp".into(),
+            operation: "send".into(),
             payload: b"[]".to_vec(),
         };
         let error = dispatch_authorized_host_call("advancenet", &session, &call)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("dispatcher"));
+        assert!(error.to_string().contains("authorize package host call"));
     }
 
     #[tokio::test]
