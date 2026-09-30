@@ -34,6 +34,9 @@ package manifest capability declarations
 verified capability requests
         |
         v
+project-local explicit approval for promptable RBE privileges
+        |
+        v
 Backend recognizes the RBE-owned subset it implements
         |
         v
@@ -67,6 +70,57 @@ A package cannot retarget logging to another package identity.
 `net:dns` is also an explicit verified runtime request. Approved package workers may request only the bounded `lookup`, `ip`, and `mx` operations through RBE's DNS broker. The broker normalizes names, rejects local-only/single-label/private targets, and never gives the package a raw resolver or socket. The trusted Backend dispatcher accepts the call only when the retained Library Host session contains the matching `net:dns` grant.
 
 Other package-defined capabilities remain package-owned unless and until RBE deliberately implements a privileged host surface for them.
+
+## Project-local approval commands
+
+Explicit host privileges are approved per project. RBE stores the approval state at:
+
+```text
+.rbe/package-capabilities.json
+```
+
+The file is project-local and is not a machine-wide permission database.
+
+Inspect the exact verified package requests and current approvals with:
+
+```text
+backend package permissions mail
+```
+
+Approve the explicit RBE host privileges needed by the package:
+
+```text
+backend package approve mail net:http net:dns
+```
+
+The approval command **replaces** the explicit host privilege set for that package. Passing no capabilities revokes all explicit privileges:
+
+```text
+backend package approve mail
+```
+
+`log` never appears in the explicit approval file because it is implicit, package-scoped, and host-owned.
+
+Each approval is bound to all three of these identities:
+
+```text
+package version
+artifact SHA-256
+current package.lock.rbe.yaml SHA-256
+```
+
+A package upgrade, artifact replacement, or project-lock change therefore invalidates the old approval automatically. Backend also re-opens the SHA-pinned package artifact and verifies that every approved capability is still requested by the package before constructing the Library Host session.
+
+For a package such as `mail`, a normal authoring flow is therefore:
+
+```text
+backend install mail
+backend package permissions mail
+backend package approve mail net:http net:dns
+backend
+```
+
+A future GUI/Studio permission prompt should call the same verified approval model instead of maintaining a separate permission database.
 
 ## Capability evidence is not worker identity
 
@@ -118,7 +172,7 @@ return enabled manifest capability requests
 
 If the artifact, manifest, resolved runtime/SDK, package version, or reconstructed worker identity has drifted, RBE fails instead of returning capability evidence from that package.
 
-Backend performs this re-read while constructing the retained Library Host session. It then maps only the supported RBE-owned requests into grants.
+Backend performs this re-read while constructing the retained Library Host session. It then maps only the supported RBE-owned requests that also have an active project-local approval into grants.
 
 ## Cache location is never authority
 
@@ -165,8 +219,11 @@ package manifest
 install/runtime verification
     -> proves which exact package bytes made the request
 
+project-local approval
+    -> explicitly admits supported RBE-owned privileges for this exact lock/artifact
+
 Backend
-    -> maps only supported RBE-owned requests into trusted grants
+    -> maps only supported + approved RBE-owned requests into trusted grants
 
 Library Host session
     -> owns the actual CapabilityGrant set
@@ -184,4 +241,4 @@ The separation protects against two classes of mistakes:
 1. **stale copied authority** — a capability list captured earlier is not silently treated as valid forever;
 2. **identity/evidence confusion** — adding or removing a requested capability does not redefine the executable identity object or turn a request into a grant.
 
-When RBE needs capability evidence, it proves the current SHA-pinned package and reconstructed worker identity first, then reads the current verified manifest requests.
+When RBE needs capability evidence, it proves the current SHA-pinned package and reconstructed worker identity first, then reads the current verified manifest requests and applies only the still-valid project-local approvals.
