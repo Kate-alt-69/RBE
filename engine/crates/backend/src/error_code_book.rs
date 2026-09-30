@@ -1,17 +1,22 @@
 //! Pre-bootstrap backend CLI coordinator and Error Code Book facade.
 //!
 //! The long-standing Error Code Book/router implementation remains isolated in
-//! `error_code_book_core.rs`. Named package installation is intercepted here
-//! before that compatibility router so backend.exe can execute real registry
-//! resolution without granting the standalone `service` binary install authority.
+//! `error_code_book_core.rs`. Named package installation and project-local
+//! package permission commands are intercepted here before that compatibility
+//! router so backend.exe can execute them without starting the server.
 
 #[path = "error_code_book_core.rs"]
 mod core;
 #[path = "install_cli.rs"]
 mod install_cli;
+#[path = "package_cli.rs"]
+mod package_cli;
 
 pub fn requested(args: &[String]) -> Option<anyhow::Result<String>> {
     if backend_install_authority() {
+        if let Some(result) = package_cli::requested(args) {
+            return Some(result);
+        }
         if let Some(result) = install_cli::requested(args) {
             match result {
                 Ok(rendered) => return Some(Ok(rendered)),
