@@ -1,0 +1,41 @@
+name: Repair DNS Cargo lock one-shot
+
+on:
+  push:
+    paths:
+      - '.github/workflows/repair-dns-lock-one-shot.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Repair only engine Cargo.lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd engine
+          cargo metadata --format-version 1 >/dev/null
+          cargo metadata --locked --format-version 1 >/dev/null
+          cd ..
+          git diff --check
+          changed="$(git diff --name-only)"
+          if [ "$changed" != "engine/Cargo.lock" ]; then
+            echo "Unexpected lock repair diff:" >&2
+            printf '%s\n' "$changed" >&2
+            exit 1
+          fi
+          grep -q 'name = "hickory-resolver"' engine/Cargo.lock
+          git rm .github/workflows/repair-dns-lock-one-shot.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add engine/Cargo.lock
+          git commit -m 'FIX | BUG-SDK-DNS-147 refresh Engine DNS lock state'
+          git pull --rebase origin main
+          git push origin HEAD:main
