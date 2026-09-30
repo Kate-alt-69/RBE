@@ -59,6 +59,12 @@ impl InstallTarget {
         if looks_like_local_path(value) {
             return Ok(Self::LocalArchive(PathBuf::from(value)));
         }
+        if value == "sdk.latest" {
+            return Ok(Self::Named {
+                key: "sdk".to_string(),
+                version: None,
+            });
+        }
         if let Some((key, version)) = split_named_version(value)? {
             return Ok(Self::Named {
                 key,
@@ -146,6 +152,9 @@ impl VersionSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InstallFlags {
     pub version: Option<VersionSelector>,
+    pub path: Option<PathBuf>,
+    pub language: Option<String>,
+    pub toolchain: Option<PathBuf>,
     pub shared: bool,
     pub force: bool,
     pub no_cache: bool,
@@ -172,6 +181,42 @@ impl InstallFlags {
                     .copied()
                     .ok_or(InstallRequestError::MissingFlagValue("version"))?;
                 set_version_flag(&mut flags, value)?;
+            } else if let Some(value) = flag
+                .strip_prefix("-path=")
+                .or_else(|| flag.strip_prefix("--path="))
+            {
+                set_path_flag(&mut flags, value)?;
+            } else if matches!(flag, "-path" | "--path") {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .copied()
+                    .ok_or(InstallRequestError::MissingFlagValue("path"))?;
+                set_path_flag(&mut flags, value)?;
+            } else if let Some(value) = flag
+                .strip_prefix("-language=")
+                .or_else(|| flag.strip_prefix("--language="))
+            {
+                set_language_flag(&mut flags, value)?;
+            } else if matches!(flag, "-language" | "--language") {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .copied()
+                    .ok_or(InstallRequestError::MissingFlagValue("language"))?;
+                set_language_flag(&mut flags, value)?;
+            } else if let Some(value) = flag
+                .strip_prefix("-toolchain=")
+                .or_else(|| flag.strip_prefix("--toolchain="))
+            {
+                set_toolchain_flag(&mut flags, value)?;
+            } else if matches!(flag, "-toolchain" | "--toolchain") {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .copied()
+                    .ok_or(InstallRequestError::MissingFlagValue("toolchain"))?;
+                set_toolchain_flag(&mut flags, value)?;
             } else {
                 match flag {
                     "-shared" | "--shared" => flags.shared = true,
@@ -197,6 +242,42 @@ fn set_version_flag(flags: &mut InstallFlags, value: &str) -> Result<(), Install
     Ok(())
 }
 
+fn set_path_flag(flags: &mut InstallFlags, value: &str) -> Result<(), InstallRequestError> {
+    if flags.path.is_some() {
+        return Err(InstallRequestError::DuplicateFlag("path"));
+    }
+    if value.trim().is_empty() {
+        return Err(InstallRequestError::MissingFlagValue("path"));
+    }
+    flags.path = Some(PathBuf::from(value));
+    Ok(())
+}
+
+fn set_language_flag(flags: &mut InstallFlags, value: &str) -> Result<(), InstallRequestError> {
+    if flags.language.is_some() {
+        return Err(InstallRequestError::DuplicateFlag("language"));
+    }
+    if !matches!(
+        value,
+        "rust" | "javascript" | "typescript" | "python" | "global"
+    ) {
+        return Err(InstallRequestError::InvalidSdkLanguage(value.to_string()));
+    }
+    flags.language = Some(value.to_string());
+    Ok(())
+}
+
+fn set_toolchain_flag(flags: &mut InstallFlags, value: &str) -> Result<(), InstallRequestError> {
+    if flags.toolchain.is_some() {
+        return Err(InstallRequestError::DuplicateFlag("toolchain"));
+    }
+    if value.trim().is_empty() {
+        return Err(InstallRequestError::MissingFlagValue("toolchain"));
+    }
+    flags.toolchain = Some(PathBuf::from(value));
+    Ok(())
+}
+
 fn split_named_version(
     value: &str,
 ) -> Result<Option<(String, VersionSelector)>, InstallRequestError> {
@@ -216,7 +297,7 @@ fn split_named_version(
         {
             let key = parts[..split].join(".");
             validate_install_key(&key)?;
-            return Ok(Some((key, VersionSelector::parse(&suffix.join("."))?)));
+            return Ok(Some((key, VersionSelector::parse(&suffix.join("."))?));
         }
     }
     Ok(None)
@@ -292,6 +373,49 @@ mod tests {
         let sdk = InstallCommand::parse(&["sdk.0.1.0", "-shared"]).unwrap();
         assert!(matches!(sdk.target, InstallTarget::Named { ref key, .. } if key == "sdk"));
         assert!(sdk.flags.shared);
+    }
+
+    #[test]
+    fn sdk_latest_and_bootstrap_flags_parse() {
+        let sdk = InstallCommand::parse(&[
+            "sdk.latest",
+            "-path=.",
+            "-language=typescript",
+            "--toolchain",
+            "./toolchain.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            sdk.target,
+            InstallTarget::Named {
+                ref key,
+                version: None
+            } if key == "sdk"
+        ));
+        assert_eq!(sdk.flags.path.as_deref(), Some(std::path::Path::new(".")));
+        assert_eq!(sdk.flags.language.as_deref(), Some("typescript"));
+        assert_eq!(
+            sdk.flags.toolchain.as_deref(),
+            Some(std::path::Path::new("./toolchain.json"))
+        );
+    }
+
+    #[test]
+    fn sdk_bootstrap_flags_reject_invalid_language_and_duplicates() {
+        let invalid = InstallCommand::parse(&["sdk.latest", "-language=ruby"]).unwrap_err();
+        assert!(matches!(invalid, InstallRequestError::InvalidSdkLanguage(_)));
+
+        let duplicate = InstallCommand::parse(&[
+            "sdk.latest",
+            "-language=typescript",
+            "--language",
+            "rust",
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            duplicate,
+            InstallRequestError::DuplicateFlag("language")
+        ));
     }
 
     #[test]
