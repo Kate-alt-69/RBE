@@ -1,0 +1,76 @@
+name: Land Library Host Clippy Compatibility Fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/library-host-clippy-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Patch retained dispatcher compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('engine/crates/backend/src/package_links.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '''struct LibraryHostSessionEntry {
+              binding: LibrarySessionBinding,
+              dispatcher: LibraryHostDispatcher,
+          }'''
+          new = '''struct LibraryHostSessionEntry {
+              binding: LibrarySessionBinding,
+              _dispatcher: LibraryHostDispatcher,
+          }'''
+          if old not in text:
+              raise SystemExit('LibraryHostSessionEntry anchor changed')
+          text = text.replace(old, new, 1)
+          text = text.replace(
+              '            dispatcher: host::dispatch_authorized_host_call,',
+              '            _dispatcher: host::dispatch_authorized_host_call,',
+              1,
+          )
+          old_test = '''        assert_eq!(
+              session.dispatcher as usize,
+              host::dispatch_authorized_host_call as usize
+          );'''
+          new_test = '''        assert_eq!(
+              session._dispatcher as *const () as usize,
+              host::dispatch_authorized_host_call as *const () as usize
+          );'''
+          if old_test not in text:
+              raise SystemExit('dispatcher identity test anchor changed')
+          text = text.replace(old_test, new_test, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+          rustfmt --edition 2021 engine/crates/backend/src/package_links.rs
+      - name: Clippy backend
+        working-directory: engine
+        run: cargo clippy -p backend --all-targets --locked -- -D warnings
+      - name: Test backend package links
+        working-directory: engine
+        run: cargo test -p backend package_links --locked
+      - name: Commit validated fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add engine/crates/backend/src/package_links.rs
+          git rm .github/workflows/library-host-clippy-fix.yml
+          git commit -m 'FIX | BUG-LIBHOST-045 satisfy Rust 1.98 dispatcher lints'
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
