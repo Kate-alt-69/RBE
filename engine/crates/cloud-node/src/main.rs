@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context;
 use cloud_node::{
     ingest_registry_export, load_signing_key_from_env, negotiate_sync, probe_upstream,
     provider_status, public_key_hex, synchronize_provider, synchronize_upstream, CloudNodeSettings,
@@ -124,6 +125,27 @@ async fn run() -> anyhow::Result<()> {
                     stored.logical_path, stored.object_key, stored.content_sha256
                 );
             }
+        }
+        "sync-registry" => {
+            if args.len() != 2 {
+                anyhow::bail!("sync-registry requires <export-root>");
+            }
+            if settings.provider.is_none() {
+                anyhow::bail!("sync-registry requires Cloud Node provider mode");
+            }
+            let export_root = Path::new(&args[1]);
+            let ingested = ingest_registry_export(&store, export_root)?;
+            println!("ingestFiles={}", ingested.files);
+            println!("ingestMetadataFiles={}", ingested.metadata_files);
+            println!("ingestArtifactFiles={}", ingested.artifact_files);
+
+            let result = synchronize_provider(&settings, &store)
+                .await
+                .context("registry export was ingested locally but provider synchronization failed")?;
+            println!("before={:?}", result.before.relation);
+            println!("action={:?}", result.action);
+            println!("head={}", result.final_head);
+            println!("root={}", result.final_root);
         }
         "run" => run_daemon(&settings, &store, &project_root).await?,
         "sync-plan" => {
@@ -359,6 +381,6 @@ fn default_config_path() -> PathBuf {
 
 fn print_help() {
     println!(
-        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|ingest-registry <export-root>|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
+        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|ingest-registry <export-root>|sync-registry <export-root>|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
     );
 }
