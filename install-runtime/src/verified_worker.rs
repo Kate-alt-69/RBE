@@ -25,6 +25,11 @@ pub struct VerifiedPackageWorkerIdentity {
     pub runtime_version: String,
     pub runtime_entry: String,
     pub runtime_managed: bool,
+    /// Runtime authority requested by the SHA-pinned package manifest.
+    ///
+    /// These are requests, not grants. Backend still maps only capabilities it
+    /// explicitly implements into trusted Library Host grants.
+    pub requested_capabilities: Vec<String>,
 }
 
 /// Reconstruct the executable identity of every explicit project root from the
@@ -133,6 +138,13 @@ fn identity_from_manifest(
         });
     }
 
+    let requested_capabilities = manifest
+        .capabilities
+        .iter()
+        .filter(|(_, enabled)| **enabled)
+        .map(|(capability, _)| capability.clone())
+        .collect();
+
     Ok(VerifiedPackageWorkerIdentity {
         package: package.to_string(),
         version: locked.version.clone(),
@@ -148,6 +160,7 @@ fn identity_from_manifest(
         runtime_version: runtime.version.clone(),
         runtime_entry: manifest.runtime.entry.clone(),
         runtime_managed: manifest.runtime.managed,
+        requested_capabilities,
     })
 }
 
@@ -259,6 +272,10 @@ kind = "bun"
 version = "^1.3"
 managed = true
 entry = "src/index.js"
+
+[capabilities]
+"net:http" = true
+"net:tcp" = false
 "#;
 
     fn locked() -> LockedProjectPackage {
@@ -282,7 +299,7 @@ entry = "src/index.js"
     }
 
     #[test]
-    fn verified_worker_identity_keeps_exact_resolved_toolchains() {
+    fn verified_worker_identity_keeps_exact_resolved_toolchains_and_capability_requests() {
         let manifest = LibraryManifest::parse(MANIFEST).unwrap();
         let locked = locked();
         let identity =
@@ -295,6 +312,7 @@ entry = "src/index.js"
         assert_eq!(identity.runtime_version, "1.3.7");
         assert_eq!(identity.runtime_entry, "src/index.js");
         assert_eq!((identity.rbe_abi_min, identity.rbe_abi_max), (1, 2));
+        assert_eq!(identity.requested_capabilities, ["net:http"]);
     }
 
     #[test]
