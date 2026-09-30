@@ -344,7 +344,8 @@ mod tests {
             )
             .unwrap()],
         )
-        .unwrap_err();
+        .err()
+        .expect("host-owned log grant must be rejected");
         assert!(error.to_string().contains("host-owned"));
     }
 
