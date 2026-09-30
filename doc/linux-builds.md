@@ -109,7 +109,9 @@ A shared target directory provides two useful forms of reuse:
 - **same-build reuse** — `container-bin`, `service`, `cloud_node`, `backend`, RPX, and SDK builds can reuse matching dependency artifacts rather than recompiling common crates in isolated workspace `target/` directories;
 - **cross-build reuse** — deployment hosts that persist the selected cache directory can restore unchanged Cargo artifacts on the next build.
 
-Render exposes a persistent build cache through `XDG_CACHE_HOME`, so RBE automatically chooses that location when it is available. A Render deploy that explicitly clears its build cache intentionally removes this acceleration state; the following build repopulates it normally.
+This is specifically intended to prevent expensive dependencies from being rebuilt just because RBE moved from one binary/workspace to another. If Cargo determines that the fingerprint still matches, heavy crates such as `wasmtime`, `tokio`, `serde`, `syn`, `ring`, and their transitive dependencies are reused from the shared target directory instead of starting again from `Compiling ...` for each RBE component. A changed feature set, target, compiler version, build script input, or other Cargo fingerprint can still require a rebuild, which is correct.
+
+Render exposes a persistent build cache through `XDG_CACHE_HOME`, so RBE automatically chooses that location when it is available. The first cache-aware Render build populates the shared target directory; later deploys can reuse unchanged artifacts from that same location. A Render deploy that explicitly clears its build cache intentionally removes this acceleration state; the following build repopulates it normally.
 
 The shared cache is an optimization only. Deleting it must never affect project/package correctness; it only makes the next compilation slower.
 
