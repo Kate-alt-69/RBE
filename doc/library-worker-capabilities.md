@@ -62,7 +62,9 @@ lib/mail/smtp/delivery
 
 A package cannot retarget logging to another package identity.
 
-`net:http` is the first explicit verified runtime request currently mapped into an RBE host grant. It is dispatched through RBE's existing hardened public-HTTP broker rather than giving package code a raw socket or unrestricted host network handle.
+`net:http` is an explicit verified runtime request mapped into an RBE host grant. It is dispatched through RBE's hardened public-HTTP broker rather than giving package code a raw socket or unrestricted host network handle.
+
+`net:dns` is also an explicit verified runtime request. Approved package workers may request only the bounded `lookup`, `ip`, and `mx` operations through RBE's DNS broker. The broker normalizes names, rejects local-only/single-label/private targets, and never gives the package a raw resolver or socket. The trusted Backend dispatcher accepts the call only when the retained Library Host session contains the matching `net:dns` grant.
 
 Other package-defined capabilities remain package-owned unless and until RBE deliberately implements a privileged host surface for them.
 
