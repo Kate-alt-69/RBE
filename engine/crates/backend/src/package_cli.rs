@@ -44,8 +44,8 @@ fn permissions(args: &[String]) -> anyhow::Result<String> {
     }
     let project_root = std::env::current_dir().context("resolve package project directory")?;
     let snapshot = installed_snapshot(&project_root, &args[0])?;
-    let requested = approval::requested_runtime_capabilities(&project_root, snapshot)?;
-    let approved = approval::approved_runtime_capabilities(&project_root, snapshot)?;
+    let requested = approval::requested_runtime_capabilities(&project_root, &snapshot)?;
+    let approved = approval::approved_runtime_capabilities(&project_root, &snapshot)?;
 
     let mut output = String::new();
     output.push_str(&format!(
@@ -94,7 +94,7 @@ fn approve(args: &[String]) -> anyhow::Result<String> {
     };
     let project_root = std::env::current_dir().context("resolve package project directory")?;
     let snapshot = installed_snapshot(&project_root, package)?;
-    let approved = approval::replace_runtime_approval(&project_root, snapshot, &args[1..])?;
+    let approved = approval::replace_runtime_approval(&project_root, &snapshot, &args[1..])?;
 
     if approved.is_empty() {
         Ok(format!(
@@ -112,17 +112,10 @@ fn approve(args: &[String]) -> anyhow::Result<String> {
     }
 }
 
-fn installed_snapshot<'a>(
+fn installed_snapshot(
     project_root: &Path,
     package: &str,
-) -> anyhow::Result<&'a VerifiedRpxRootSnapshot> {
-    // This function cannot return a reference into a local Vec. Keep the actual
-    // lookup in `owned_snapshot` and leak nothing across the command boundary.
-    let _ = (project_root, package);
-    unreachable!()
-}
-
-fn owned_snapshot(project_root: &Path, package: &str) -> anyhow::Result<VerifiedRpxRootSnapshot> {
+) -> anyhow::Result<VerifiedRpxRootSnapshot> {
     let snapshots = read_verified_rpx_root_snapshots(project_root)
         .context("load verified installed package roots")?;
     snapshots
