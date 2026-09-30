@@ -31,8 +31,10 @@ pub struct LibraryWorkerProxyExecutionOptions {
 
 impl LibraryWorkerProxyExecutionOptions {
     pub fn for_bootstrap(cgroup_root: PathBuf, bootstrap: &LibraryWorkerProxyBootstrap) -> Self {
-        let mut limits = ResourceLimits::default();
-        limits.wall_time_ms = bootstrap.startup_timeout_seconds.saturating_mul(1_000);
+        let limits = ResourceLimits {
+            wall_time_ms: bootstrap.startup_timeout_seconds.saturating_mul(1_000),
+            ..Default::default()
+        };
         Self {
             cgroup_root,
             limits,
@@ -86,12 +88,14 @@ pub fn execute_library_worker_proxy(
         LibraryWorkerProxyExecutionError::NonUtf8Path(cgroup.path().to_path_buf())
     })?;
 
-    let mut policy = SandboxPolicy::default();
-    policy.network = NetworkPolicy::DenyAll;
-    policy.max_processes = u64::from(options.limits.max_processes);
-    policy.max_memory_bytes = options.limits.memory_bytes;
-    policy.max_cpu_micros = options.limits.cpu_millis.saturating_mul(1_000);
-    policy.timeout_ms = timeout_ms;
+    let policy = SandboxPolicy {
+        network: NetworkPolicy::DenyAll,
+        max_processes: u64::from(options.limits.max_processes),
+        max_memory_bytes: options.limits.memory_bytes,
+        max_cpu_micros: options.limits.cpu_millis.saturating_mul(1_000),
+        timeout_ms,
+        ..Default::default()
+    };
 
     let args = vec![
         "--library-worker-exec-child".to_string(),
@@ -238,10 +242,7 @@ fn spawn_bounded_reader<R: Read + Send + 'static>(
     thread::spawn(move || {
         let mut stored = Vec::with_capacity(limit.min(64 * 1024));
         let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            let Ok(read) = reader.read(&mut buffer) else {
-                break;
-            };
+        while let Ok(read) = reader.read(&mut buffer) {
             if read == 0 {
                 break;
             }
