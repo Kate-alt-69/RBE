@@ -69,6 +69,33 @@ A package cannot retarget logging to another package identity.
 
 `net:dns` is also an explicit verified runtime request. Approved package workers may request only the bounded `lookup`, `ip`, and `mx` operations through RBE's DNS broker. The broker normalizes names, rejects local-only/single-label/private targets, and never gives the package a raw resolver or socket. The trusted Backend dispatcher accepts the call only when the retained Library Host session contains the matching `net:dns` grant.
 
+`net:tcp` is an explicit verified runtime request for packages that need a stateful public TCP conversation, such as a future self-hosted SMTP adapter. The package never receives a host `TcpStream` or raw socket object. Backend keeps the connection and returns an opaque `tcp:<random>` handle that is bound to the accepted package and its session-scoped capability identity.
+
+The current `net:tcp` broker admits only these operations:
+
+```text
+connect
+write
+read
+close
+```
+
+Its current hard bounds are:
+
+```text
+maximum connections per accepted package session: 8
+maximum connections across the Backend process: 256
+maximum resolved addresses per destination: 16
+maximum write payload per operation: 64 KiB
+maximum read payload per operation: 16 KiB
+default operation timeout: 5 seconds
+maximum operation timeout: 10 seconds
+```
+
+TCP destinations must be publicly routable. RBE rejects loopback, private, link-local, multicast, unspecified, CGNAT, documentation/special-purpose ranges, single-label names, `localhost`, and `.local` names. DNS names are resolved by trusted Backend code and the resolved set is rejected if any address is non-public. Handles cannot be used by another package/session, and all retained TCP handles are discarded when the verified Library Host sessions are rebuilt.
+
+`net:tcp` does **not** currently imply TLS or STARTTLS. TLS upgrade is a separate trusted-host capability step because certificate validation and server-name verification must stay inside RBE rather than being delegated to package code.
+
 Other package-defined capabilities remain package-owned unless and until RBE deliberately implements a privileged host surface for them.
 
 ## Project-local approval commands
@@ -90,7 +117,7 @@ backend package permissions mail
 Approve the explicit RBE host privileges needed by the package:
 
 ```text
-backend package approve mail net:http net:dns
+backend package approve mail net:http net:dns net:tcp
 ```
 
 The approval command **replaces** the explicit host privilege set for that package. Passing no capabilities revokes all explicit privileges:
@@ -116,7 +143,7 @@ For a package such as `mail`, a normal authoring flow is therefore:
 ```text
 backend install mail
 backend package permissions mail
-backend package approve mail net:http net:dns
+backend package approve mail net:http net:dns net:tcp
 backend
 ```
 
