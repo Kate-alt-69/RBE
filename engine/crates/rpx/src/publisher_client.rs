@@ -4,7 +4,7 @@
 //! only the scoped RPX bearer token returned by device authorization; UAC
 //! private IDs and registry owner keys never cross this boundary.
 
-use crate::registry_client::{LEGACY_REGISTRY_URL_ENV, REGISTRY_URL_ENV};
+use crate::registry_client::{DEFAULT_REGISTRY_URL, LEGACY_REGISTRY_URL_ENV, REGISTRY_URL_ENV};
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::{Body, Client, Response};
 use reqwest::redirect::Policy;
@@ -167,9 +167,7 @@ impl PublisherClient {
                 return Self::new(&value);
             }
         }
-        bail!(
-            "RPX registry URL is not configured; pass --registry <https://host> or set {REGISTRY_URL_ENV}"
-        )
+        Self::new(DEFAULT_REGISTRY_URL)
     }
 
     pub fn base_url(&self) -> &Url {
@@ -485,6 +483,12 @@ fn truncate_for_error(input: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publisher_default_matches_registry_default() {
+        let client = PublisherClient::new(DEFAULT_REGISTRY_URL).unwrap();
+        assert_eq!(client.base_url().as_str(), "https://kastrick-backend.onrender.com/");
+    }
 
     #[test]
     fn publisher_base_requires_https_outside_loopback() {
