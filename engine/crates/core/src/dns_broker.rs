@@ -81,7 +81,7 @@ pub async fn call_public_dns(operation: &str, payload: &[u8]) -> Result<Value, P
             let mut records = lookup
                 .answers()
                 .iter()
-                .filter_map(|record| match record.data() {
+                .filter_map(|record| match &record.data {
                     RData::MX(mx) => Some((mx.preference, mx.exchange.to_string())),
                     _ => None,
                 })
