@@ -82,7 +82,7 @@ artifacts/
       demo.rbe.zip
 ```
 
-Ingest a materialized export with:
+Ingest a materialized export without contacting the provider with:
 
 ```text
 cloud_node --config=setting.node.cn.json ingest-registry <export-root>
@@ -93,6 +93,27 @@ The command reports the number of metadata and artifact files plus the resulting
 Cloud Node stores accepted files under the logical `registry/` prefix in its normal content-addressed store. That means package metadata, index snapshots/revisions, ownership records, release history, analytics, artifact metadata, and `.rbe.zip` artifacts all participate in the same provider snapshot.
 
 `package.rbe.json` is deliberately not accepted as registry archive metadata. Published package archives are opaque to Cloud Node. The trusted Kastrick publisher must verify the `.rbe.zip` and its internal `package.rbe.yaml` before exporting a release artifact to Cloud Node.
+
+## One-shot registry provider synchronization
+
+Provider-backed nodes can ingest a trusted export and immediately run normal provider-history synchronization in one command:
+
+```text
+cloud_node --config=setting.node.cn.json sync-registry <export-root>
+```
+
+`sync-registry` is intentionally a composition of existing Cloud Node behavior, not a second registry protocol. It performs these steps in order:
+
+1. verify that provider mode is configured before changing local registry state;
+2. validate and ingest the frozen export through the same `ingest_registry_export()` path used by `ingest-registry`;
+3. run the normal `synchronize_provider()` transaction, including provider-history locking, ancestry checks, conflict policy, immutable object uploads, and provider HEAD compare-and-swap behavior;
+4. report ingest counts followed by the normal provider sync relation, action, final head, and final root.
+
+Package publishing must not depend synchronously on this command. A publisher can materialize a frozen export and schedule `sync-registry` independently so a temporary object-provider outage does not make package publication itself unavailable.
+
+If provider synchronization fails after ingestion, the accepted registry objects remain in the local Cloud Node store and the command returns an error that states the local ingest completed. Re-running the same frozen export is safe with respect to snapshot identity: Cloud Node's sync root is derived from object kind, logical path, content SHA-256, and logical size rather than manifest timestamps. Replaying byte-identical registry files therefore keeps the same sync root; changing any exported object content changes the root and produces the expected new provider snapshot.
+
+Because `sync-registry` uses the configured provider conflict policy, a diverged remote does not get silently overwritten. The default `fail` policy still fails. `prefer-local` and `prefer-remote` retain their existing explicit meanings.
 
 ## Revision behavior
 
