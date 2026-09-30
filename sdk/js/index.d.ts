@@ -125,7 +125,7 @@ export declare class RbeSdk {
   call(request: HostRequest): unknown | Promise<unknown>;
   capability(capabilityId: string, target?: string): CapabilityClient;
   advanced(): AdvancedClient;
-  log(libraryName?: string): LoggerClient;
+  log(libraryName: string): LoggerClient;
   host(): HostClient;
   intercept(...interceptors: HostInterceptor[]): RbeSdk;
   hostBridge(): HostBridge;
