@@ -240,6 +240,29 @@ mod tests {
     }
 
     #[test]
+    fn replaying_same_registry_export_keeps_sync_root_identity() {
+        let root = temp_root("replay");
+        let export = root.join("export");
+        let snapshot = export.join("index/snapshot.json");
+        fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        fs::write(&snapshot, br#"{"revision":"sha256:one"}"#).unwrap();
+
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+        ingest_registry_export(&store, &export).unwrap();
+        let first_root = store.sync_plan().unwrap().root_sha256;
+
+        ingest_registry_export(&store, &export).unwrap();
+        let replay_root = store.sync_plan().unwrap().root_sha256;
+        assert_eq!(replay_root, first_root);
+
+        fs::write(&snapshot, br#"{"revision":"sha256:two"}"#).unwrap();
+        ingest_registry_export(&store, &export).unwrap();
+        assert_ne!(store.sync_plan().unwrap().root_sha256, first_root);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn registry_ingest_rejects_project_manifest_and_unknown_collections() {
         assert!(validate_registry_relative_path(Path::new("packages/package.rbe.json")).is_err());
         assert!(validate_registry_relative_path(Path::new("other/demo.json")).is_err());
