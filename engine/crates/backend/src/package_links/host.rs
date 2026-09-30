@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 
 use anyhow::{bail, Context};
 use core_lib::{
-    call_public_http, ExpectedWorkerIdentity, LibraryCapabilityGrant, LibraryHostCall,
-    LibraryHostCallReply, LibraryPackageIdentity, LibraryRuntimeIdentity, LibrarySdkIdentity,
-    LibrarySessionBinding, LIBRARY_ABI_VERSION, MAX_LIBRARY_PAYLOAD_BYTES,
+    call_public_dns, call_public_http, ExpectedWorkerIdentity, LibraryCapabilityGrant,
+    LibraryHostCall, LibraryHostCallReply, LibraryPackageIdentity, LibraryRuntimeIdentity,
+    LibrarySdkIdentity, LibrarySessionBinding, LIBRARY_ABI_VERSION, MAX_LIBRARY_PAYLOAD_BYTES,
 };
 use rand::RngCore;
 use rbe_install_runtime::VerifiedRpxRootSnapshot;
@@ -14,6 +14,7 @@ use serde_json::Value;
 const SESSION_ID_BYTES: usize = 32;
 const LIBRARY_LOG_CAPABILITY: &str = "log";
 const LIBRARY_NET_HTTP_CAPABILITY: &str = "net:http";
+const LIBRARY_NET_DNS_CAPABILITY: &str = "net:dns";
 const LIBRARY_LOG_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const LIBRARY_LOG_MAX_RESPONSE_BYTES: usize = 1024;
 const LIBRARY_LOG_MAX_SCOPE_DEPTH: usize = 16;
@@ -103,6 +104,17 @@ fn package_http_grant() -> anyhow::Result<LibraryCapabilityGrant> {
     .context("build verified package public HTTP capability grant")
 }
 
+fn package_dns_grant() -> anyhow::Result<LibraryCapabilityGrant> {
+    LibraryCapabilityGrant::new(
+        LIBRARY_NET_DNS_CAPABILITY,
+        LIBRARY_NET_DNS_CAPABILITY,
+        ["lookup".to_string(), "ip".to_string(), "mx".to_string()],
+        MAX_LIBRARY_PAYLOAD_BYTES,
+        MAX_LIBRARY_PAYLOAD_BYTES,
+    )
+    .context("build verified package public DNS capability grant")
+}
+
 pub fn grants_for_verified_requests(
     requests: &[String],
 ) -> anyhow::Result<Vec<LibraryCapabilityGrant>> {
@@ -115,6 +127,7 @@ pub fn grants_for_verified_requests(
         match request.as_str() {
             LIBRARY_LOG_CAPABILITY => {}
             LIBRARY_NET_HTTP_CAPABILITY => grants.push(package_http_grant()?),
+            LIBRARY_NET_DNS_CAPABILITY => grants.push(package_dns_grant()?),
             _ => {}
         }
     }
@@ -133,6 +146,7 @@ pub async fn dispatch_authorized_host_call(
     let payload = match call.capability.as_str() {
         LIBRARY_LOG_CAPABILITY => dispatch_package_log_call(package, call)?,
         LIBRARY_NET_HTTP_CAPABILITY => dispatch_package_http_call(call).await?,
+        LIBRARY_NET_DNS_CAPABILITY => dispatch_package_dns_call(call).await?,
         capability => bail!(
             "trusted Backend dispatcher for package capability {capability:?} is not installed"
         ),
@@ -165,6 +179,19 @@ async fn dispatch_package_http_call(call: &LibraryHostCall) -> anyhow::Result<Ve
         .await
         .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
     serde_json::to_vec(&value).context("encode package net:http response")
+}
+
+async fn dispatch_package_dns_call(call: &LibraryHostCall) -> anyhow::Result<Vec<u8>> {
+    if call.capability != LIBRARY_NET_DNS_CAPABILITY || call.target != LIBRARY_NET_DNS_CAPABILITY {
+        bail!("package DNS call does not match admitted net:dns authority");
+    }
+    if !matches!(call.operation.as_str(), "lookup" | "ip" | "mx") {
+        bail!("unsupported package DNS operation {:?}", call.operation);
+    }
+    let value = call_public_dns(&call.operation, &call.payload)
+        .await
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+    serde_json::to_vec(&value).context("encode package net:dns response")
 }
 
 fn dispatch_package_log_call(package: &str, call: &LibraryHostCall) -> anyhow::Result<Vec<u8>> {
@@ -323,11 +350,13 @@ mod tests {
             "log".into(),
             "mail:queue".into(),
             "net:http".into(),
+            "net:dns".into(),
             "mail:smtp".into(),
         ])
         .unwrap();
-        assert_eq!(grants.len(), 1);
+        assert_eq!(grants.len(), 2);
         assert_eq!(grants[0].capability, "net:http");
+        assert_eq!(grants[1].capability, "net:dns");
     }
 
     #[test]
@@ -452,6 +481,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("JSON argument array"));
+    }
+
+    #[tokio::test]
+    async fn package_dns_dispatch_rejects_local_name_before_network() {
+        let snapshot = snapshot();
+        let mut session = bind_session(&snapshot, [package_dns_grant().unwrap()]).unwrap();
+        session.accept_hello(&hello(&snapshot)).unwrap();
+        let call = LibraryHostCall {
+            call_id: 11,
+            capability: "net:dns".into(),
+            target: "net:dns".into(),
+            operation: "mx".into(),
+            payload: b"localhost".to_vec(),
+        };
+        let error = dispatch_authorized_host_call("advancenet", &session, &call)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("DNS3000"));
     }
 
     #[test]
