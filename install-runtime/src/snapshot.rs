@@ -16,12 +16,6 @@ pub struct VerifiedRpxRootSnapshot {
     pub artifact_sha256: String,
     pub index_json: String,
     pub worker: VerifiedPackageWorkerIdentity,
-    /// Capability names requested by the SHA-verified package manifest.
-    ///
-    /// These are disclosure/admission inputs, not authority. Backend must still
-    /// obtain trusted approval and create exact Library Host grants before a
-    /// package can call any RBE-owned privileged host surface.
-    pub requested_capabilities: Vec<String>,
 }
 
 /// Read and cross-check the public export index and worker contract for every
@@ -36,13 +30,7 @@ pub fn read_verified_rpx_root_snapshots(
 ) -> Result<Vec<VerifiedRpxRootSnapshot>, VerifiedRootSnapshotError> {
     let indexes = read_verified_rpx_root_indexes(project_root)?;
     let workers = read_verified_root_worker_identities(project_root)?;
-    let mut snapshots = join_verified_roots(indexes, workers)?;
-    for snapshot in &mut snapshots {
-        snapshot.requested_capabilities = snapshot
-            .worker
-            .read_requested_capabilities(project_root)?;
-    }
-    Ok(snapshots)
+    join_verified_roots(indexes, workers)
 }
 
 fn join_verified_roots(
@@ -94,7 +82,6 @@ fn join_verified_roots(
             artifact_sha256: index.artifact_sha256.to_ascii_lowercase(),
             index_json: index.index_json,
             worker,
-            requested_capabilities: Vec::new(),
         });
     }
 
@@ -164,7 +151,6 @@ mod tests {
         .unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].worker.runtime_version, "1.3.7");
-        assert!(snapshots[0].requested_capabilities.is_empty());
     }
 
     #[test]
