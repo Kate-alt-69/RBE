@@ -352,11 +352,8 @@ export class RbeSdk {
     this.libraryName = libraryName;
   }
 
-  log(libraryName = this.libraryName) {
-    if (libraryName === null) {
-      throw new Error("RBE SDK logging requires an explicit library name");
-    }
-    return new LoggerClient(this.bridge, libraryName);
+  log(libraryName) {
+    return new LoggerClient(this.bridge, assertLibraryName(libraryName));
   }
 
   net() { return new NetClient(this.bridge); }
