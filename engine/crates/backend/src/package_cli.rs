@@ -50,10 +50,7 @@ fn permissions(args: &[String]) -> anyhow::Result<String> {
     let mut output = String::new();
     output.push_str(&format!(
         "RBE PACKAGE PERMISSIONS\n  package: {} {}\n  artifact: {}\n  implicit: log (lib/{})\n",
-        snapshot.package,
-        snapshot.version,
-        snapshot.artifact_sha256,
-        snapshot.package
+        snapshot.package, snapshot.version, snapshot.artifact_sha256, snapshot.package
     ));
 
     let mut explicit = 0usize;
@@ -121,5 +118,7 @@ fn installed_snapshot(
     snapshots
         .into_iter()
         .find(|snapshot| snapshot.package == package)
-        .ok_or_else(|| anyhow::anyhow!("package {package:?} is not an installed explicit project root"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("package {package:?} is not an installed explicit project root")
+        })
 }
