@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use container_bin_security::{
     execute_library_worker_proxy, run_library_worker_proxy_exec_child,
+    run_library_worker_proxy_live_child, run_live_library_worker_proxy,
     LibraryWorkerProxyExecutionOptions,
 };
 use ipc_protocol::{
@@ -12,12 +13,15 @@ use ipc_protocol::{
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--library-worker-exec-child") {
-        let cgroup_path = value_after(&args, "--cgroup-path")
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                anyhow::anyhow!("--cgroup-path is required for the internal proxy child")
-            })?;
+        let cgroup_path = required_cgroup_path(&args)?;
         return run_library_worker_proxy_exec_child(&cgroup_path).map_err(Into::into);
+    }
+    if args.iter().any(|arg| arg == "--library-worker-live-child") {
+        let cgroup_path = required_cgroup_path(&args)?;
+        return run_library_worker_proxy_live_child(&cgroup_path).map_err(Into::into);
+    }
+    if args.iter().any(|arg| arg == "--live") {
+        return run_live_parent(&args);
     }
 
     let result = match run_parent(&args) {
@@ -33,20 +37,38 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_parent(args: &[String]) -> anyhow::Result<LibraryWorkerProxyResult> {
-    let bootstrap = {
-        let mut stdin = std::io::stdin().lock();
-        read_library_worker_proxy_bootstrap(&mut stdin)?
-    };
-    let cgroup_root = value_after(args, "--cgroup-root")
+    let bootstrap = read_bootstrap()?;
+    let cgroup_root = cgroup_root(args)?;
+    let options = LibraryWorkerProxyExecutionOptions::for_bootstrap(cgroup_root, &bootstrap);
+    execute_library_worker_proxy(bootstrap, options).map_err(Into::into)
+}
+
+fn run_live_parent(args: &[String]) -> anyhow::Result<()> {
+    let bootstrap = read_bootstrap()?;
+    let cgroup_root = cgroup_root(args)?;
+    run_live_library_worker_proxy(bootstrap, cgroup_root).map_err(Into::into)
+}
+
+fn read_bootstrap() -> anyhow::Result<ipc_protocol::LibraryWorkerProxyBootstrap> {
+    let mut stdin = std::io::stdin().lock();
+    read_library_worker_proxy_bootstrap(&mut stdin).map_err(Into::into)
+}
+
+fn required_cgroup_path(args: &[String]) -> anyhow::Result<PathBuf> {
+    value_after(args, "--cgroup-path")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("--cgroup-path is required for the internal proxy child"))
+}
+
+fn cgroup_root(args: &[String]) -> anyhow::Result<PathBuf> {
+    value_after(args, "--cgroup-root")
         .or_else(|| std::env::var("RBE_CONTAINER_CGROUP_ROOT").ok())
         .map(PathBuf::from)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Library Worker Proxy requires --cgroup-root or RBE_CONTAINER_CGROUP_ROOT"
             )
-        })?;
-    let options = LibraryWorkerProxyExecutionOptions::for_bootstrap(cgroup_root, &bootstrap);
-    execute_library_worker_proxy(bootstrap, options).map_err(Into::into)
+        })
 }
 
 fn value_after(args: &[String], key: &str) -> Option<String> {
