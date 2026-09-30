@@ -126,8 +126,26 @@ fn install_verified_host_sessions(
     }
     *active = sessions;
 
+    let trusted_dispatchers = active
+        .values()
+        .filter(|session| {
+            std::ptr::fn_addr_eq(
+                session.dispatcher,
+                host::dispatch_authorized_host_call as LibraryHostDispatcher,
+            )
+        })
+        .count();
+    if trusted_dispatchers != active.len() {
+        bail!(
+            "Library Host session registry contains an untrusted dispatcher: expected {}, verified {}",
+            active.len(),
+            trusted_dispatchers
+        );
+    }
+
     tracing::info!(
         package_sessions = active.len(),
+        trusted_dispatchers,
         "prepared verified fail-closed Library Host sessions with trusted dispatchers"
     );
     Ok(())
@@ -357,10 +375,10 @@ mod tests {
             session.binding.state(),
             core_lib::LibrarySessionState::AwaitHello
         );
-        assert_eq!(
-            session.dispatcher as usize,
-            host::dispatch_authorized_host_call as usize
-        );
+        assert!(std::ptr::fn_addr_eq(
+            session.dispatcher,
+            host::dispatch_authorized_host_call as LibraryHostDispatcher,
+        ));
     }
 
     #[test]
