@@ -397,6 +397,24 @@ Required invariants:
 
 This keeps uploaded source bytes stable while allowing the progress record to remain a small mutable state machine. A process-local mutex may still reduce contention, but it is not the cross-instance authority.
 
+### 7.4 Mutable records and deterministic jobs need distinct authority
+
+An externally visible project/preview record is mutable authority and should be updated with ETag/version CAS. A writer must re-read and merge against the newest record instead of replacing fields it does not own. For example, publishing a new source revision should preserve a concurrently changed visibility value, while a visibility change should preserve the newest source/build state.
+
+A public/discovery index is different when its mapping is immutable. If the public identity and project always map to the same authoritative record key, the index can be a create-once derived pointer. Visibility/security decisions must then be made from the authoritative record after following that pointer. This avoids delete/recreate races where one instance removes an index while another instance publishes a newer allowed state.
+
+Deterministic build-job identities should follow the same create-once principle. If a job ID is derived from owner/project/source identity, creation should use create-if-absent. When the object already exists, the coordinator must verify its immutable identity fields and reuse it; an unconditional replacement could roll a claimed job back to `queued`, clear its attempt/lease state, or erase output metadata. Terminal `live`/`superseded` jobs should not be requeued.
+
+Queue/status publication that depends on the mutable authoritative record should also use CAS and must not downgrade a newer state. In particular, a late queue writer must not replace `building` with `queued`, and it must not replace a clean `live` record for the same source with a dirty queued state.
+
+The resulting ownership split is:
+
+```text
+immutable source/chunk/job identity   -> create-if-absent + identity verification
+mutable progress/result/visibility   -> ETag CAS + bounded retry + field-aware merge
+derived discovery pointer            -> create-once mapping; never security authority
+```
+
 ## 8. Failure and restart behavior
 
 RBE and external coordinators should prefer fail-closed recovery over guessing ownership after a crash.
@@ -422,6 +440,8 @@ For an external multi-instance build coordinator:
 - stale CAS/version mismatches fail closed rather than overwriting a newer attempt;
 - repeated identical source chunks are idempotent, while conflicting bytes for an occupied slot fail closed;
 - descriptor CAS lets an upload recover after a chunk was durably stored but progress publication was interrupted;
+- mutable public/result records are merged with CAS so source, visibility, and build-state writers cannot blindly overwrite one another;
+- deterministic BuildJob creation is create-if-absent, and an existing claimed/terminal job is never reset by a later queue request;
 - queue cleanup failure should not transfer ownership to another worker while the durable lease remains active.
 
 ## 9. What this document does not claim
