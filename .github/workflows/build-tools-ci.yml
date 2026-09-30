@@ -1,0 +1,35 @@
+name: Build Tools CI
+
+on:
+  push:
+    paths:
+      - 'build.sh'
+      - 'build-select.sh'
+      - 'build-release.sh'
+      - 'build-core.sh'
+      - 'build-help.txt'
+      - '.github/workflows/build-tools-ci.yml'
+  pull_request:
+    paths:
+      - 'build.sh'
+      - 'build-select.sh'
+      - 'build-release.sh'
+      - 'build-core.sh'
+      - 'build-help.txt'
+      - '.github/workflows/build-tools-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate shell builder syntax
+        run: bash -n build.sh build-select.sh build-release.sh build-core.sh
+      - name: Verify Linux build prerequisites
+        run: ./build.sh --check-tools --build-linux --arch-x64
