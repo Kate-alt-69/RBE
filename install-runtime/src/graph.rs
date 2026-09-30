@@ -336,7 +336,10 @@ entry = "src/index.js"
             .contains_key("rbe-core"));
         assert!(graph.lock.root_graph_complete("advancenet"));
         assert_eq!(graph.packages.len(), 2);
-        assert_eq!(graph.capability_inventory(), VerifiedCapabilityInventory::default());
+        assert_eq!(
+            graph.capability_inventory(),
+            VerifiedCapabilityInventory::default()
+        );
     }
 
     #[tokio::test]
