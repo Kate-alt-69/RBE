@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use fs2::FileExt;
@@ -8,11 +9,13 @@ use fs2::FileExt;
 use crate::provider_sync::{synchronize_provider, ProviderSyncResult};
 #[cfg(feature = "client")]
 use crate::CloudNodeSettings;
-use crate::{durable, CloudNodeStore, StoredObject, SyncObject};
+use crate::{durable, BlobKind, CloudNodeStore, StoredObject, SyncObject, SyncPlan};
 
 const REGISTRY_LOGICAL_ROOT: &str = "registry";
 const REQUIRED_INDEX_SNAPSHOT: &str = "index/snapshot.json";
 const REGISTRY_INGEST_LOCK: &str = ".registry-ingest.lock";
+const REGISTRY_INGEST_PENDING: &str = ".registry-ingest.pending";
+const REGISTRY_INGEST_MARKER: &[u8] = b"RBE-CN-REGISTRY-INGEST/1\n";
 const ALLOWED_TOP_LEVEL: &[&str] = &[
     "index",
     "packages",
@@ -87,16 +90,31 @@ impl Drop for RegistryIngestLock {
     }
 }
 
+/// Refuse to publish or negotiate a Cloud Node snapshot while a previous
+/// registry replacement is known to have stopped before its commit point.
+pub(crate) fn ensure_registry_ingest_committed(store: &CloudNodeStore) -> anyhow::Result<()> {
+    let marker = registry_pending_path(store);
+    if marker.exists() {
+        anyhow::bail!(
+            "Cloud Node registry replacement is incomplete at {}; run ingest-registry or sync-registry again with a complete trusted export before synchronization",
+            marker.display()
+        );
+    }
+    Ok(())
+}
+
 /// Ingest a complete trusted Kastrick/RPX registry export into Cloud Node's
 /// normal content-addressed store.
 ///
 /// The export is treated as a frozen snapshot, not an overlay: active
-/// `registry/` file objects that are absent from the validated export are
-/// removed after all replacement files have been stored. Cloud Node backup
-/// history is intentionally retained.
+/// `registry/` objects that are absent from the validated export are removed
+/// after all replacement files have been stored. Cloud Node backup history is
+/// intentionally retained.
 ///
 /// Only one local registry replacement transaction may run at a time. The OS
-/// releases the lock automatically if the owning process exits or crashes.
+/// releases the lock automatically if the owning process exits or crashes. A
+/// durable pending marker is written before active storage mutation and is
+/// removed only after the final active registry path set has been verified.
 ///
 /// The resulting objects participate in the existing provider snapshot and
 /// revision-history model, so registry state gets the same local-ahead/push,
@@ -181,6 +199,13 @@ fn ingest_registry_export_locked(
         );
     }
 
+    begin_registry_transaction(store)?;
+
+    // A previous process may have died with a pending marker. Scan the active
+    // storage directly while repairing it; public sync-plan generation remains
+    // fail-closed until this transaction reaches its commit point.
+    let before = SyncPlan::scan_storage(&store.summary().storage)?;
+
     let mut result = RegistryIngestResult::default();
     for file in validated {
         let stored = store.store_file(&file.source, &file.logical_path)?;
@@ -195,13 +220,15 @@ fn ingest_registry_export_locked(
             .push(stored_registry_object(file.logical_path, stored));
     }
 
-    let stale = store
-        .sync_plan()?
-        .files
+    let stale = before
+        .folders
         .into_iter()
+        .chain(before.videos)
+        .chain(before.files)
         .filter(|object| {
             object.logical_path.starts_with("registry/")
-                && !expected_logical_paths.contains(&object.logical_path)
+                && (object.kind != BlobKind::File
+                    || !expected_logical_paths.contains(&object.logical_path))
         })
         .collect::<Vec<_>>();
     for object in stale {
@@ -209,7 +236,71 @@ fn ingest_registry_export_locked(
         result.removed_files += 1;
     }
 
+    verify_active_registry_paths(store, &expected_logical_paths)?;
+    finish_registry_transaction(store)?;
     Ok(result)
+}
+
+fn begin_registry_transaction(store: &CloudNodeStore) -> anyhow::Result<()> {
+    let marker = registry_pending_path(store);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&marker)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to create Cloud Node registry transaction marker {}: {error}",
+                marker.display()
+            )
+        })?;
+    file.write_all(REGISTRY_INGEST_MARKER)?;
+    file.sync_all()?;
+    durable::sync_parent(&marker)?;
+    Ok(())
+}
+
+fn finish_registry_transaction(store: &CloudNodeStore) -> anyhow::Result<()> {
+    let marker = registry_pending_path(store);
+    if marker.exists() {
+        durable::remove_file(&marker)?;
+    }
+    Ok(())
+}
+
+fn registry_pending_path(store: &CloudNodeStore) -> PathBuf {
+    store.summary().root.join(REGISTRY_INGEST_PENDING)
+}
+
+fn verify_active_registry_paths(
+    store: &CloudNodeStore,
+    expected: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let plan = SyncPlan::scan_storage(&store.summary().storage)?;
+    let mut actual = BTreeSet::new();
+    for object in plan
+        .folders
+        .into_iter()
+        .chain(plan.videos)
+        .chain(plan.files)
+        .filter(|object| object.logical_path.starts_with("registry/"))
+    {
+        if object.kind != BlobKind::File {
+            anyhow::bail!(
+                "Cloud Node registry snapshot contains non-file active object {:?}",
+                object.logical_path
+            );
+        }
+        actual.insert(object.logical_path);
+    }
+    if &actual != expected {
+        anyhow::bail!(
+            "Cloud Node registry snapshot path verification failed: expected {} active paths, found {}",
+            expected.len(),
+            actual.len()
+        );
+    }
+    Ok(())
 }
 
 fn stored_registry_object(logical_path: String, stored: StoredObject) -> RegistryStoredObject {
@@ -403,6 +494,7 @@ mod tests {
         assert_eq!(result.metadata_files, 7);
         assert_eq!(result.artifact_files, 1);
         assert_eq!(result.removed_files, 0);
+        assert!(!registry_pending_path(&store).exists());
         assert!(result
             .stored
             .iter()
@@ -423,6 +515,24 @@ mod tests {
         assert!(RegistryIngestLock::acquire(&store).is_err());
         drop(first);
         assert!(RegistryIngestLock::acquire(&store).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_registry_transaction_is_repaired_by_next_complete_ingest() {
+        let root = temp_root("pending");
+        let export = root.join("export");
+        write_export_file(&export, REQUIRED_INDEX_SNAPSHOT, b"{}");
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+
+        begin_registry_transaction(&store).unwrap();
+        assert!(ensure_registry_ingest_committed(&store).is_err());
+        assert!(registry_pending_path(&store).is_file());
+
+        ingest_registry_export(&store, &export).unwrap();
+        assert!(!registry_pending_path(&store).exists());
+        assert!(ensure_registry_ingest_committed(&store).is_ok());
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -485,6 +595,28 @@ mod tests {
         assert!(!paths.contains("registry/packages/old.json"));
         assert!(paths.contains("app/outside.txt"));
         assert!(old_backup.is_dir());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_registry_snapshot_removes_non_file_registry_objects() {
+        let root = temp_root("wrong-kind");
+        let export = root.join("export");
+        write_export_file(&export, REQUIRED_INDEX_SNAPSHOT, b"{}");
+        let store = CloudNodeStore::open(&settings(&root)).unwrap();
+
+        let video = root.join("stale.mp4");
+        fs::write(&video, b"not really video").unwrap();
+        store.store_video(&video, "registry/stale.mp4").unwrap();
+
+        let result = ingest_registry_export(&store, &export).unwrap();
+        assert_eq!(result.removed_files, 1);
+        assert!(store
+            .sync_plan()
+            .unwrap()
+            .ordered()
+            .all(|object| object.logical_path != "registry/stale.mp4"));
 
         fs::remove_dir_all(root).unwrap();
     }
