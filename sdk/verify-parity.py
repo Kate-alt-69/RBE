@@ -76,9 +76,9 @@ for method in NET_METHODS:
     require(PY, f"def {method}(self) -> CapabilityClient:", f"Python net.{method}")
 
 require(RUST, "pub fn log(self, library_name: &str)", "Rust log")
-require(JS, "log(libraryName = this.libraryName)", "JS log")
-require(TS, "log(libraryName?: string): LoggerClient;", "TypeScript log")
-require(PY, "def log(self, library_name: str | None = None) -> LoggerClient:", "Python log")
+require(JS, "log(libraryName) {", "JS explicit log identity")
+require(TS, "log(libraryName: string): LoggerClient;", "TypeScript explicit log identity")
+require(PY, "def log(self, library_name: str) -> LoggerClient:", "Python explicit log identity")
 
 for method in LOG_METHODS:
     require(RUST, f"pub fn {method}(&self, message:", f"Rust logger.{method}")
