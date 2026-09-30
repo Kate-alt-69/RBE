@@ -92,13 +92,29 @@ The command reports `files`, `metadataFiles`, `artifactFiles`, and `removedFiles
 
 Ingestion rejects missing `index/snapshot.json`, symlinks, unsafe paths, duplicate logical paths, unknown collections, non-JSON metadata, non-`.rbe.zip` artifact payloads, and `package.rbe.json` before snapshot replacement begins.
 
-Cloud Node stores accepted files under the logical `registry/` prefix in its normal content-addressed store. After every file in the new export has been stored successfully, active `registry/` file objects absent from the validated snapshot are removed from the active storage tree. Non-registry Cloud Node objects are never touched by this replacement step.
+Cloud Node stores accepted files under the logical `registry/` prefix in its normal content-addressed store. After every file in the new export has been stored successfully, active `registry/` objects absent from the validated snapshot are removed from the active storage tree. Registry objects with the wrong Cloud Node BlobKind are removed as well: the accepted registry view is made only from normal file objects. Non-registry Cloud Node objects are never touched by this replacement step.
 
 Removal affects only the active registry view used to calculate the next sync root. Cloud Node's `backup/` history for a removed registry object is deliberately retained, so accepting a newer complete registry snapshot does not destroy the node's local historical copies.
 
 That replacement behavior is important: registry ingestion is not an overlay. If a path existed in the previous complete export but is absent from the next one, the next Cloud Node provider snapshot must not continue advertising that stale path.
 
 Only one local registry replacement transaction may run at a time. Cloud Node holds an OS-backed exclusive lock at `<storageRoot>/rbe/.registry-ingest.lock`; a second local `ingest-registry` or `sync-registry` operation fails fast instead of interleaving two snapshots. The operating system releases the lock automatically if the owning process exits or crashes.
+
+### Interrupted replacement recovery
+
+The OS lock prevents two live writers from interleaving, but it intentionally disappears when a process dies. Cloud Node therefore also keeps a durable transaction marker at:
+
+```text
+<storageRoot>/rbe/.registry-ingest.pending
+```
+
+The marker is written and durably synced **before** the first active registry object is changed. It is removed only after the replacement has finished, stale active registry objects have been removed, and the final active `registry/` path set exactly matches the validated export.
+
+If the process exits, the machine loses power, or an I/O error interrupts replacement after the marker is written, the marker remains. Normal `SyncPlan` generation then fails closed. As a result, `sync-plan`, provider synchronization, peer synchronization/negotiation, and provider/peer daemon synchronization cannot publish a mixed pre/post-replacement registry view.
+
+Recovery is intentionally simple: rerun `ingest-registry` or `sync-registry` with a complete trusted export. Registry ingest is allowed to inspect and repair local storage while the pending marker exists. Once the repaired active registry path set verifies successfully, Cloud Node removes the marker and normal synchronization becomes available again.
+
+Do not manually delete `.registry-ingest.pending` to bypass recovery. The marker is the evidence that the active registry view may be incomplete.
 
 `package.rbe.json` is deliberately not accepted as registry archive metadata. Published package archives are opaque to Cloud Node. The trusted Kastrick publisher must verify the `.rbe.zip` and its internal `package.rbe.yaml` before exporting a release artifact to Cloud Node.
 
@@ -115,9 +131,11 @@ cloud_node --config=setting.node.cn.json sync-registry <export-root>
 1. verify that provider mode is configured before changing local registry state;
 2. acquire the local registry replacement lock;
 3. validate the complete frozen export through the same path used by `ingest-registry`;
-4. store the new snapshot and remove stale active `registry/` paths that are absent from it;
-5. while still holding the registry lock, run the normal `synchronize_provider()` transaction, including its provider-history namespace lock, ancestry checks, conflict policy, immutable object uploads, and provider HEAD compare-and-swap behavior;
-6. report `ingestFiles`, `ingestMetadataFiles`, `ingestArtifactFiles`, `ingestRemovedFiles`, then the normal provider sync relation, action, final head, and final root.
+4. durably mark the local registry replacement as pending;
+5. store the new snapshot and remove stale or wrong-kind active `registry/` objects that are absent from it;
+6. verify the final active registry path set and clear the durable pending marker;
+7. while still holding the registry lock, run the normal `synchronize_provider()` transaction, including its provider-history namespace lock, ancestry checks, conflict policy, immutable object uploads, and provider HEAD compare-and-swap behavior;
+8. report `ingestFiles`, `ingestMetadataFiles`, `ingestArtifactFiles`, `ingestRemovedFiles`, then the normal provider sync relation, action, final head, and final root.
 
 Holding the registry lock through provider synchronization prevents another local registry revision from replacing the active `registry/` tree between ingest and provider snapshot creation. The provider lock remains independently responsible for serializing remote history changes for the configured namespace.
 
