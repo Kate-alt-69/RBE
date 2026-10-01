@@ -82,7 +82,7 @@ The provider remains authoritative for remote history during initial recovery. A
 
 After a pull, Cloud Node verifies its content-addressed store before materializing the working directory. File payloads are copied through verified temporary files before activation. A failed provider transfer never makes an unverified remote object become working-directory state.
 
-### Empty working directory during boot
+### Missing or partial working directory during boot
 
 Backend bootstrap uses a recovery-only form of the sync command:
 
@@ -90,9 +90,20 @@ Backend bootstrap uses a recovery-only form of the sync command:
 cloud_node sync --bootstrap
 ```
 
-This protects a second fresh-host case: the Cloud Node CAS/history may already contain valid backed-up objects while `localSync.directory` is completely empty because the application working directory was recreated or lost. During bootstrap only, an empty working directory plus existing managed Cloud Node objects is treated as a missing checkout and is restored from the verified current CAS before the local scanner can interpret that emptiness as a mass deletion.
+This protects fresh-host and interrupted-checkout cases where Cloud Node CAS/history already contains valid backed-up objects but `localSync.directory` is empty or only partially materialized. During bootstrap, a managed file that is missing from the working directory is treated as missing checkout state rather than an intentional deletion. Cloud Node fills that missing file from the verified current CAS before the normal scanner can turn it into deletion history.
 
-This behavior is deliberately limited to bootstrap. Normal `cloud_node sync` and the continuously supervised `cloud_node run` retain ordinary deletion semantics, so deleting files while the node is operating still creates a new snapshot/history state instead of silently restoring those files.
+Bootstrap repair is intentionally additive. Existing files are never overwritten by this missing-file repair, even when an existing managed file has local edits, and untracked files are not removed. A partially restored checkout can therefore resume after a process or machine interruption without destroying work that already exists locally.
+
+The distinction is important:
+
+```text
+managed file missing during bootstrap  -> restore it from verified CAS
+managed file present but edited        -> preserve it as a real local change
+untracked local file                    -> preserve it as a real local change
+normal run-time deletion                -> keep ordinary deletion semantics
+```
+
+This recovery behavior is deliberately limited to bootstrap. Normal `cloud_node sync` and the continuously supervised `cloud_node run` retain ordinary deletion semantics, so deleting files while the node is operating still creates a new snapshot/history state instead of silently restoring those files.
 
 If both the local CAS and working directory are empty but the provider has history, the existing remote-first rule still applies: Cloud Node pulls the provider snapshot, verifies it, imports provider history, and then materializes `localSync.directory`.
 
@@ -109,14 +120,15 @@ backend starts
        wait for `cloud_node sync --bootstrap`
        -> inspect remote history before local mutation
        -> recover/adopt remote state when required
-       -> restore an empty checkout from the verified CAS when required
+       -> repair missing files in an empty/partial checkout from verified CAS
+       -> preserve existing edits and untracked local files
        -> reconcile local working-directory state
   -> continue normal backend boot
   -> provider + autoReconnect=true:
        supervise `cloud_node run`
 ```
 
-The initial `cloud_node sync --bootstrap` is blocking on purpose. If provider recovery was requested but fails, backend startup fails instead of allowing the application to boot against stale or empty state. This is especially important on ephemeral deployment hosts.
+The initial `cloud_node sync --bootstrap` is blocking on purpose. If provider recovery was requested but fails, backend startup fails instead of allowing the application to boot against stale, empty, or partially recovered state. This is especially important on ephemeral deployment hosts.
 
 The supervised `cloud_node run` child is restarted with bounded exponential backoff if it exits unexpectedly. A provider daemon that remains healthy for at least 60 seconds resets the restart failure count.
 
@@ -128,11 +140,11 @@ The backend does not auto-start peer mode from this path. Provider mode is the n
 
 `conflictPolicy` remains the explicit conflict authority:
 
-- `fail` (default): when REMOTE advanced while `localSync.directory` contains uncommitted directory changes, Cloud Node refuses to overwrite either side.
+- `fail` (default): when REMOTE advanced while `localSync.directory` contains material uncommitted local changes, Cloud Node refuses to overwrite either side.
 - `prefer-local`: local working-directory changes may intentionally become the winning provider history.
 - `prefer-remote`: the provider history may intentionally replace local working-directory changes.
 
-A completely empty working directory handled by `sync --bootstrap` is not classified as an uncommitted mass deletion when the local CAS still has managed objects. Partial/non-empty local edits remain normal local changes and still participate in the conflict policy.
+During `sync --bootstrap`, missing managed files by themselves are checkout-recovery state and are not classified as local deletion changes. Existing managed files whose content changed and untracked local files remain material local changes and still participate in the conflict policy. This lets a partial checkout resume without weakening protection for actual edits.
 
 The default is deliberately conservative. Cloud Node does not silently choose one branch after both sides changed.
 
@@ -154,7 +166,7 @@ With a peer it scans local inputs and performs the existing authenticated peer s
 cloud_node sync --bootstrap
 ```
 
-This is the provider-only recovery-safe boot variant. In addition to remote-first synchronization it restores a completely empty watched directory from already-managed CAS objects before the scanner can turn an empty checkout into deletions. RBE backend startup invokes this automatically when provider `syncOnConnect` is enabled.
+This is the provider-only recovery-safe boot variant. In addition to remote-first synchronization, it repairs missing managed files in an empty or partially restored working directory from verified CAS objects before the scanner can turn incomplete checkout state into deletions. Existing edits and untracked files are preserved. RBE backend startup invokes this automatically when provider `syncOnConnect` is enabled.
 
 ### Continuous mode
 
@@ -162,7 +174,7 @@ This is the provider-only recovery-safe boot variant. In addition to remote-firs
 cloud_node run
 ```
 
-When provider `syncOnConnect` is `true`, every provider poll performs the normal full cycle. Healthy provider polling uses `pollIntervalMs`; failures use the existing capped exponential reconnect backoff. Continuous mode does not use the bootstrap-only empty-checkout exception.
+When provider `syncOnConnect` is `true`, every provider poll performs the normal full cycle. Healthy provider polling uses `pollIntervalMs`; failures use the existing capped exponential reconnect backoff. Continuous mode does not use the bootstrap-only missing-checkout repair behavior.
 
 ### Provider-only reconciliation
 
@@ -180,7 +192,7 @@ cloud_node provider-status
 cloud_node sync-plan
 ```
 
-`evaluate` reports the configured watched directory, logical prefix, whether it differs from the local Cloud Node CAS, and the managed/scanned object counts.
+`evaluate` reports the configured watched directory, logical prefix, whether it differs from the local Cloud Node CAS, and the managed/scanned object counts. It also reports `localSyncMissing`, `localSyncChanged`, and `localSyncUntracked` so incomplete checkout state can be distinguished from actual local edits.
 
 ## Supabase S3
 
@@ -203,4 +215,4 @@ node.storageRoot     = local Cloud Node CAS, backup versions, provider history
 provider bucket      = remote immutable snapshots/history
 ```
 
-That separation lets a fresh process rebuild local Cloud Node state from the provider, then safely rebuild the watched directory from the verified local CAS.
+That separation lets a fresh process rebuild local Cloud Node state from the provider, then safely rebuild or resume the watched directory from the verified local CAS.
