@@ -160,24 +160,29 @@ That flag is an explicit authoring escape hatch, not the production/default comp
 
 ## SDK bootstrap
 
+RBE uses one **generic rolling SDK channel**. SDK installation is deliberately not tied to GitHub Releases or SDK version tags. `sdk` and `sdk.latest` both mean "install the current verified SDK build from `main`".
+
 The production RBE `backend` and the project-local SDK backend have separate jobs:
 
-1. The normal production `backend` recognizes `install sdk.*`, downloads the fixed Kastrick HTTPS bootstrap script, and invokes it with argument-safe process arguments.
-2. The bootstrap script selects the requested `sdk-v*` RBE release, downloads the platform SDK archive and its `.sha256`, and verifies the archive before extraction.
-3. The verified archive contains the dedicated SDK backend, RPX, and the Rust/JavaScript/TypeScript/Python SDK bindings.
-4. That SDK backend installs the selected language binding(s) into the project under `.rbe/`, writes `sdk.lock.json`, and owns later SDK status/toolchain operations.
+1. The normal production `backend` recognizes `install sdk` and `install sdk.latest`, downloads the fixed Kastrick HTTPS bootstrap script, and invokes it with argument-safe process arguments.
+2. RBE's `SDK Toolchain` workflow builds the current SDK for supported platforms whenever relevant SDK/toolchain code changes on `main`.
+3. The bootstrap resolves the newest non-expired SDK artifact built from `main`, downloads the platform artifact, verifies the inner SDK archive against its published SHA-256, and only then extracts it.
+4. The verified SDK archive contains the dedicated SDK backend, RPX, and the Rust/JavaScript/TypeScript/Python SDK bindings.
+5. That SDK backend installs the selected language binding(s) into the project under `.rbe/`, writes `sdk.lock.json`, and owns later SDK status/toolchain operations.
 
-This keeps SDK payload/install logic out of the production backend while making the public command work directly:
+There is intentionally no GitHub Release step in this channel. A pinned `sdk.<version>` distribution contract is not currently provided; requests for a specific SDK version fail closed until RBE deliberately adds a pinned SDK channel.
+
+Public install examples:
 
 ```text
+backend install sdk -path=. -language=typescript
 backend install sdk.latest -path=. -language=typescript
-backend install sdk.0.1.0 --path . --language typescript
 ```
 
-On Windows PowerShell, an executable in the current directory must be invoked explicitly:
+On Windows PowerShell, a bootstrap `backend.exe` that only exists in the current directory must initially be invoked explicitly:
 
 ```powershell
-.\backend.exe install sdk.latest -path=. -language=typescript
+.\backend.exe install sdk -path=. -language=typescript
 ```
 
 After installation, the project-local tools are under:
@@ -189,13 +194,37 @@ After installation, the project-local tools are under:
 .rbe/sdk.lock.json
 ```
 
-The installed project-local SDK backend then supports:
+### Project-local command activation
+
+SDK installation does **not** write to the User PATH or Machine PATH. Each project owns its own command binaries and activation file.
+
+On PowerShell:
+
+```powershell
+& .\.rbe\activate.ps1
+backend sdk status -path=.
+rpx check .
+```
+
+On POSIX shells:
+
+```sh
+. ./.rbe/activate.sh
+backend sdk status -path=.
+rpx check .
+```
+
+Activation affects only the current shell process. The activated `backend` and `rpx` commands are bound to that project's `.rbe/bin` and fail closed when the current working directory is outside the owning project tree. This prevents one project's SDK/RPX binaries from silently becoming another project's toolchain. A fresh terminal must activate the project again.
+
+The installed project-local SDK backend also supports:
 
 ```text
-.rbe/bin/backend sdk status -path=.
-.rbe/bin/backend sdk repair -path=.
-.rbe/bin/backend sdk update -path=.
+backend sdk status -path=.
+backend sdk repair -path=.
+backend sdk update -path=.
 ```
+
+`repair` and `update` deliberately re-enter the verified bootstrap path rather than keeping a second complete SDK payload inside the project-local backend.
 
 A `global` SDK install explicitly installs all language bindings; mixed-language packages are only valid when `language = "global"` is deliberately selected in `package.rbe.toml`.
 
@@ -215,7 +244,7 @@ backend install sdk.latest \
 An already installed SDK can admit a freshly verified handoff without replacing the SDK bundle:
 
 ```text
-.rbe/bin/backend sdk toolchain \
+backend sdk toolchain \
   -path=. \
   -file=/trusted/staging/rpx-toolchain.json
 ```
