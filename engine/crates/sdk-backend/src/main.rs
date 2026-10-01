@@ -7,8 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use toolchain_install::{
-    install_verified_toolchain, project_toolchain_exists, verify_project_toolchain,
-    PROJECT_TOOLCHAIN_FILE,
+    install_host_authoring_toolchain, install_verified_toolchain, project_toolchain_exists,
+    verify_project_toolchain, PROJECT_TOOLCHAIN_FILE,
 };
 
 const LOCK_FILE: &str = "sdk.lock.json";
@@ -72,9 +72,13 @@ fn run() -> Result<()> {
         match action {
             "repair" | "update" => bootstrap_instruction(Path::new(&path), action)?,
             "status" => status(Path::new(&path))?,
+            "toolchain" if args.get(2).is_some_and(|value| value == "host") => {
+                let language = option(&args, "language");
+                install_host_toolchain(Path::new(&path), language.as_deref())?;
+            }
             "toolchain" => {
                 let file = option(&args, "file").context(
-                    "`backend sdk toolchain` requires -file=<verified-rpx-toolchain.json>",
+                    "`backend sdk toolchain` requires -file=<verified-rpx-toolchain.json>, or use `backend sdk toolchain host` for explicit local Rust authoring admission",
                 )?;
                 install_toolchain(Path::new(&path), Path::new(&file))?;
             }
@@ -153,8 +157,6 @@ fn install(
     let toolchain_count = if let Some(source) = toolchain_source {
         Some(install_verified_toolchain(&project, source)?)
     } else if project_toolchain_exists(&project) {
-        // Reinstalls preserve an already-admitted toolchain only after checking
-        // that every currently installed compiler still matches its pin.
         Some(verify_project_toolchain(&project)?)
     } else {
         None
@@ -178,13 +180,14 @@ fn install(
     println!("  bindings: {}", languages.join(", "));
     println!("  RPX: {}", rpx_dest.display());
     println!("  activation: {}", activation_path.display());
+    println!("  activate now: {}", activation_command(&activation_path));
     match toolchain_count {
         Some(count) => println!(
             "  managed toolchain: VERIFIED ({count} pinned tool{})",
             if count == 1 { "" } else { "s" }
         ),
         None => println!(
-            "  managed toolchain: NOT CONFIGURED (RPX compile remains fail-closed unless explicit local --allow-host-toolchain is used)"
+            "  managed toolchain: NOT CONFIGURED (use `backend sdk toolchain host -path=. -language=rust` for explicit local Rust admission, or RPX --allow-host-toolchain per invocation)"
         ),
     }
     println!("  scope: project-local only");
@@ -209,6 +212,33 @@ fn install_toolchain(project: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
+fn install_host_toolchain(project: &Path, language: Option<&str>) -> Result<()> {
+    let project = absolute(project)?;
+    let mut lock = load_lock(&project)?;
+    let selected = language.unwrap_or(&lock.language).to_string();
+    validate_language(&selected)?;
+    if selected == "global" {
+        bail!(
+            "global SDK installs require an explicit -language=<language> for host toolchain admission; Rust authoring uses -language=rust"
+        );
+    }
+
+    let count = install_host_authoring_toolchain(&project, &selected)?;
+    lock.format = 2;
+    lock.managed_toolchain = true;
+    write_lock(&project, &lock)?;
+    println!("RBE SDK host toolchain admitted for local authoring");
+    println!("  project: {}", project.display());
+    println!("  language: {selected}");
+    println!("  file: .rbe/{PROJECT_TOOLCHAIN_FILE}");
+    println!(
+        "  tools: {count} exact compiler{} SHA-256 pinned",
+        if count == 1 { "" } else { "s" }
+    );
+    println!("  scope: explicit local authoring; this does not mutate User or Machine PATH");
+    Ok(())
+}
+
 fn bootstrap_instruction(project: &Path, action: &str) -> Result<()> {
     let project = absolute(project)?;
     bail!(
@@ -227,6 +257,7 @@ fn status(project: &Path) -> Result<()> {
     let rpx_ok = project.join(".rbe").join(&lock.rpx).is_file();
     let activation_path = activation::expected_path(&project);
     let activation_ok = activation_path.is_file();
+    let activation_active = activation_is_active(&project);
     let bindings = requested_languages(&lock.language);
     let missing_bindings = bindings
         .iter()
@@ -251,6 +282,13 @@ fn status(project: &Path) -> Result<()> {
         activation_path.display(),
         if activation_ok { "OK" } else { "MISSING" }
     );
+    println!(
+        "  current shell: {}",
+        if activation_active { "ACTIVE" } else { "INACTIVE" }
+    );
+    if activation_ok && !activation_active {
+        println!("  activate now: {}", activation_command(&activation_path));
+    }
     for language in &bindings {
         let present = !missing_bindings.contains(language);
         println!(
@@ -315,14 +353,22 @@ fn installer_hint(project: &Path) -> String {
 }
 
 fn option(args: &[String], name: &str) -> Option<String> {
-    let single = format!("-{name}=");
-    let double = format!("--{name}=");
-    args.iter().find_map(|argument| {
-        argument
-            .strip_prefix(&single)
-            .or_else(|| argument.strip_prefix(&double))
-            .map(ToOwned::to_owned)
-    })
+    let single_equals = format!("-{name}=");
+    let double_equals = format!("--{name}=");
+    let single = format!("-{name}");
+    let double = format!("--{name}");
+    for (index, argument) in args.iter().enumerate() {
+        if let Some(value) = argument
+            .strip_prefix(&single_equals)
+            .or_else(|| argument.strip_prefix(&double_equals))
+        {
+            return Some(value.to_string());
+        }
+        if argument == &single || argument == &double {
+            return args.get(index + 1).cloned();
+        }
+    }
+    None
 }
 
 fn resolve_version(value: &str) -> String {
@@ -349,6 +395,31 @@ fn absolute(path: &Path) -> Result<PathBuf> {
         Ok(path.to_path_buf())
     } else {
         Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn activation_is_active(project: &Path) -> bool {
+    let Some(active_os) = std::env::var_os("RBE_PROJECT_BIN") else {
+        return false;
+    };
+    let active_path = PathBuf::from(active_os);
+    let expected = project.join(".rbe").join("bin");
+    let active = active_path.canonicalize().unwrap_or(active_path);
+    let expected = expected.canonicalize().unwrap_or(expected);
+    if cfg!(windows) {
+        active
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.to_string_lossy())
+    } else {
+        active == expected
+    }
+}
+
+fn activation_command(path: &Path) -> String {
+    if cfg!(windows) {
+        format!("& \"{}\"", path.display())
+    } else {
+        format!(". \"{}\"", path.display())
     }
 }
 
@@ -423,8 +494,10 @@ Project command activation:\n\
   Linux/macOS shell:  . ./.rbe/activate.sh\n\n\
 Managed compiler handoff:\n\
   backend sdk toolchain -path=<project> -file=<verified-rpx-toolchain.json>\n\n\
-The activation files expose backend/rpx only to the current shell and only while the working directory remains inside the owning project tree. They never modify User or Machine PATH.\n\n\
-The toolchain descriptor must be RPX format 2 and every absolute compiler/entry path must still match its pinned SHA-256. The SDK backend never discovers host compilers through PATH.\n\n\
+Explicit local Rust authoring admission:\n\
+  backend sdk toolchain host -path=<project> -language=rust\n\n\
+The activation files expose backend/rpx only to the current shell and only while the working directory remains inside the owning project tree. They never modify User or Machine PATH. A child backend process cannot modify its parent shell, so activation is intentionally explicit.\n\n\
+Normal SDK installation never discovers host compilers through PATH. `sdk toolchain host` is an explicit local-authoring bridge: it asks rustup for the concrete cargo/rustc binaries, SHA-256 pins those exact files into .rbe/rpx-toolchain.json, and then RPX continues using its normal managed-toolchain checks. Fully managed rbe.sys runtime hydration remains the production direction.\n\n\
 Update/repair:\n\
   Re-run the official Kastrick SDK installer so backend, RPX, language bindings, activation files, and managed compiler state are restored from a fresh verified bundle/handoff.\n\
   `backend sdk update -path=<project>` and `backend sdk repair -path=<project>` print that bootstrap command.\n\n\
