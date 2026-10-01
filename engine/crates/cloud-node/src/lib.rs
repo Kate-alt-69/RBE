@@ -17,6 +17,8 @@ mod protocol;
 mod provider;
 #[cfg(feature = "client")]
 mod provider_sync;
+#[cfg(feature = "client")]
+mod provider_sync_guard;
 mod recovery;
 mod registry_ingest;
 mod server;
@@ -59,9 +61,10 @@ pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
 pub use provider::ProviderClient;
 #[cfg(feature = "client")]
 pub use provider_sync::{
-    provider_status, synchronize_provider, ProviderSyncAction, ProviderSyncRelation,
-    ProviderSyncResult, ProviderSyncStatus,
+    provider_status, ProviderSyncAction, ProviderSyncRelation, ProviderSyncResult, ProviderSyncStatus,
 };
+#[cfg(feature = "client")]
+pub use provider_sync_guard::synchronize_provider;
 pub use recovery::{CloudNodeRecoveryReceiver, RecoveryReceipt};
 pub use registry_ingest::{ingest_registry_export, RegistryIngestResult, RegistryStoredObject};
 #[cfg(feature = "client")]
