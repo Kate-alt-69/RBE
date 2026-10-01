@@ -355,6 +355,7 @@ fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
         }
     }
     validate_legacy_provider_auth(provider)?;
+    validate_provider_auth_fields(provider)?;
 
     for env_name in [
         provider.credential_env.as_deref(),
@@ -473,6 +474,86 @@ fn validate_legacy_provider_auth(provider: &ProviderSettings) -> anyhow::Result<
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_provider_auth_fields(provider: &ProviderSettings) -> anyhow::Result<()> {
+    let auth = &provider.auth;
+    let mut unused = Vec::new();
+    let mut reject = |label: &'static str, present: bool| {
+        if present {
+            unused.push(label);
+        }
+    };
+
+    match provider.kind {
+        ProviderKind::AmazonS3 => {
+            reject("apiKeyEnv", auth.api_key_env.is_some());
+            reject("bearerTokenEnv", auth.bearer_token_env.is_some());
+            reject("usernameEnv", auth.username_env.is_some());
+            reject("passwordEnv", auth.password_env.is_some());
+            reject("headerName", auth.header_name.is_some());
+            reject("headerValueEnv", auth.header_value_env.is_some());
+            reject("sasTokenEnv", auth.sas_token_env.is_some());
+            reject("oauthTokenEnv", auth.oauth_token_env.is_some());
+        }
+        ProviderKind::Supabase => {
+            reject("usernameEnv", auth.username_env.is_some());
+            reject("passwordEnv", auth.password_env.is_some());
+            reject("accessKeyEnv", auth.access_key_env.is_some());
+            reject("secretKeyEnv", auth.secret_key_env.is_some());
+            reject("sessionTokenEnv", auth.session_token_env.is_some());
+            reject("sasTokenEnv", auth.sas_token_env.is_some());
+            reject("oauthTokenEnv", auth.oauth_token_env.is_some());
+        }
+        ProviderKind::AzureBlob => {
+            reject("apiKeyEnv", auth.api_key_env.is_some());
+            reject("bearerTokenEnv", auth.bearer_token_env.is_some());
+            reject("usernameEnv", auth.username_env.is_some());
+            reject("passwordEnv", auth.password_env.is_some());
+            reject("headerName", auth.header_name.is_some());
+            reject("headerValueEnv", auth.header_value_env.is_some());
+            reject("accessKeyEnv", auth.access_key_env.is_some());
+            reject("secretKeyEnv", auth.secret_key_env.is_some());
+            reject("sessionTokenEnv", auth.session_token_env.is_some());
+            reject("oauthTokenEnv", auth.oauth_token_env.is_some());
+        }
+        ProviderKind::GoogleCloudStorage => {
+            reject("apiKeyEnv", auth.api_key_env.is_some());
+            reject("usernameEnv", auth.username_env.is_some());
+            reject("passwordEnv", auth.password_env.is_some());
+            reject("headerName", auth.header_name.is_some());
+            reject("headerValueEnv", auth.header_value_env.is_some());
+            reject("accessKeyEnv", auth.access_key_env.is_some());
+            reject("secretKeyEnv", auth.secret_key_env.is_some());
+            reject("sessionTokenEnv", auth.session_token_env.is_some());
+            reject("sasTokenEnv", auth.sas_token_env.is_some());
+        }
+        ProviderKind::Http => {
+            reject("accessKeyEnv", auth.access_key_env.is_some());
+            reject("secretKeyEnv", auth.secret_key_env.is_some());
+            reject("sessionTokenEnv", auth.session_token_env.is_some());
+            reject("sasTokenEnv", auth.sas_token_env.is_some());
+            if let (Some(bearer), Some(oauth)) = (
+                auth.bearer_token_env.as_deref(),
+                auth.oauth_token_env.as_deref(),
+            ) {
+                if bearer != oauth {
+                    anyhow::bail!(
+                        "Cloud Node HTTP provider config names two different token environments in provider.auth.bearerTokenEnv ({bearer:?}) and provider.auth.oauthTokenEnv ({oauth:?}); configure one token source or use the same environment name"
+                    );
+                }
+            }
+        }
+    }
+
+    if !unused.is_empty() {
+        anyhow::bail!(
+            "Cloud Node {:?} provider does not use provider.auth field(s): {}",
+            provider.kind,
+            unused.join(", ")
+        );
     }
     Ok(())
 }
@@ -949,6 +1030,76 @@ mod tests {
     }
 
     #[test]
+    fn provider_auth_rejects_fields_the_transport_never_reads() {
+        let mut s3: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"s3",
+            "namespace":"prod",
+            "bucket":"rbe-backups",
+            "region":"ap-south-1"
+        }))
+        .unwrap();
+        s3.auth.api_key_env = Some("IGNORED".into());
+        assert!(validate_provider(&s3).is_err());
+
+        let mut supabase: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"supabase",
+            "namespace":"prod",
+            "bucket":"rbe-backups",
+            "endpoint":"https://project.supabase.co"
+        }))
+        .unwrap();
+        supabase.auth.oauth_token_env = Some("IGNORED".into());
+        assert!(validate_provider(&supabase).is_err());
+
+        let mut azure: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"azure",
+            "namespace":"prod",
+            "bucket":"rbe-backups",
+            "account":"account"
+        }))
+        .unwrap();
+        azure.auth.bearer_token_env = Some("IGNORED".into());
+        assert!(validate_provider(&azure).is_err());
+
+        let mut gcs: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"gcs",
+            "namespace":"prod",
+            "bucket":"rbe-backups"
+        }))
+        .unwrap();
+        gcs.auth.access_key_env = Some("IGNORED".into());
+        assert!(validate_provider(&gcs).is_err());
+
+        let mut http: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"http",
+            "namespace":"prod",
+            "bucket":"rbe-backups",
+            "endpoint":"https://objects.example.test"
+        }))
+        .unwrap();
+        http.auth.sas_token_env = Some("IGNORED".into());
+        assert!(validate_provider(&http).is_err());
+    }
+
+    #[test]
+    fn http_provider_rejects_conflicting_bearer_token_sources() {
+        let mut http: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"http",
+            "namespace":"prod",
+            "bucket":"rbe-backups",
+            "endpoint":"https://objects.example.test",
+            "auth":{"mode":"oauth-bearer"}
+        }))
+        .unwrap();
+        http.auth.bearer_token_env = Some("HTTP_BEARER_A".into());
+        http.auth.oauth_token_env = Some("HTTP_BEARER_B".into());
+        assert!(validate_provider(&http).is_err());
+
+        http.auth.oauth_token_env = Some("HTTP_BEARER_A".into());
+        validate_provider(&http).unwrap();
+    }
+
+    #[test]
     fn provider_endpoint_uses_parsed_exact_loopback_rules() {
         validate_provider_endpoint("http://localhost:9000/api").unwrap();
         validate_provider_endpoint("http://127.0.0.1:9000").unwrap();
@@ -1044,7 +1195,10 @@ mod tests {
             }))
             .unwrap();
             let error = settings.validate().unwrap_err().to_string();
-            assert!(error.contains("does not support"), "unexpected error: {error}");
+            assert!(
+                error.contains("does not support"),
+                "unexpected error: {error}"
+            );
         }
     }
 }
