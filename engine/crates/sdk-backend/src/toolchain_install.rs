@@ -1,7 +1,9 @@
 use anyhow::{bail, Context, Result};
-use rpx::toolchain::{verify_managed_program, ManagedCompilerToolchain};
+use rpx::toolchain::{sha256_file, verify_managed_program, ManagedCompilerToolchain};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub const PROJECT_TOOLCHAIN_FILE: &str = "rpx-toolchain.json";
 
@@ -16,13 +18,55 @@ pub fn install_verified_toolchain(project: &Path, source: &Path) -> Result<usize
         )
     })?;
 
-    let rbe = project.join(".rbe");
-    fs::create_dir_all(&rbe)?;
-    let destination = rbe.join(PROJECT_TOOLCHAIN_FILE);
+    let destination = project.join(".rbe").join(PROJECT_TOOLCHAIN_FILE);
     if source.canonicalize().ok() == destination.canonicalize().ok() {
         return Ok(toolchain.tools.len());
     }
 
+    publish_verified_toolchain(project, &input)
+}
+
+/// Explicit local-authoring bridge from a host Rust toolchain into RPX's
+/// fail-closed managed compiler map.
+///
+/// This is intentionally opt-in. Normal SDK installation never scans PATH for
+/// compilers. Rust admission asks rustup for the concrete cargo/rustc binaries,
+/// hashes those exact files, and writes only the verified absolute identities.
+pub fn install_host_authoring_toolchain(project: &Path, language: &str) -> Result<usize> {
+    if language != "rust" {
+        bail!(
+            "host toolchain admission currently supports `rust` only; use an explicit verified -file=<rpx-toolchain.json> handoff for {language:?}"
+        );
+    }
+
+    let cargo = rustup_which("cargo")?;
+    let rustc = rustup_which("rustc")?;
+    let input = render_pinned_toolchain(&[("cargo", cargo), ("rustc", rustc)])?;
+    publish_verified_toolchain(project, &input)
+}
+
+pub fn verify_project_toolchain(project: &Path) -> Result<usize> {
+    let path = project.join(".rbe").join(PROJECT_TOOLCHAIN_FILE);
+    let input = fs::read_to_string(&path)
+        .with_context(|| format!("managed RPX toolchain is missing: {}", path.display()))?;
+    let toolchain = parse_and_verify(&input).with_context(|| {
+        format!(
+            "managed RPX toolchain verification failed: {}",
+            path.display()
+        )
+    })?;
+    Ok(toolchain.tools.len())
+}
+
+pub fn project_toolchain_exists(project: &Path) -> bool {
+    project.join(".rbe").join(PROJECT_TOOLCHAIN_FILE).is_file()
+}
+
+fn publish_verified_toolchain(project: &Path, input: &str) -> Result<usize> {
+    let toolchain = parse_and_verify(input)?;
+    let rbe = project.join(".rbe");
+    fs::create_dir_all(&rbe)?;
+    let destination = rbe.join(PROJECT_TOOLCHAIN_FILE);
     let temporary = rbe.join(format!("{PROJECT_TOOLCHAIN_FILE}.new"));
     fs::write(&temporary, input.as_bytes()).with_context(|| {
         format!(
@@ -61,21 +105,76 @@ pub fn install_verified_toolchain(project: &Path, source: &Path) -> Result<usize
     Ok(toolchain.tools.len())
 }
 
-pub fn verify_project_toolchain(project: &Path) -> Result<usize> {
-    let path = project.join(".rbe").join(PROJECT_TOOLCHAIN_FILE);
-    let input = fs::read_to_string(&path)
-        .with_context(|| format!("managed RPX toolchain is missing: {}", path.display()))?;
-    let toolchain = parse_and_verify(&input).with_context(|| {
+fn rustup_which(tool: &str) -> Result<PathBuf> {
+    let output = Command::new("rustup")
+        .args(["which", tool])
+        .output()
+        .with_context(|| {
+            format!(
+                "start `rustup which {tool}` for explicit host Rust toolchain admission; install rustup or use -file=<verified-rpx-toolchain.json> instead"
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "`rustup which {tool}` failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("`rustup which {tool}` returned non-UTF-8 output"))?;
+    let raw = stdout.trim();
+    if raw.is_empty() {
+        bail!("`rustup which {tool}` returned an empty path");
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        bail!(
+            "`rustup which {tool}` returned a non-absolute compiler path: {}",
+            path.display()
+        );
+    }
+    let canonical = path.canonicalize().with_context(|| {
         format!(
-            "managed RPX toolchain verification failed: {}",
+            "canonicalize rustup-selected {tool} compiler at {}",
             path.display()
         )
     })?;
-    Ok(toolchain.tools.len())
+    if !canonical.is_file() {
+        bail!(
+            "rustup-selected {tool} compiler is not a regular file: {}",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
 }
 
-pub fn project_toolchain_exists(project: &Path) -> bool {
-    project.join(".rbe").join(PROJECT_TOOLCHAIN_FILE).is_file()
+fn render_pinned_toolchain(tools: &[(&str, PathBuf)]) -> Result<String> {
+    let mut rendered = BTreeMap::new();
+    for (name, path) in tools {
+        if !path.is_absolute() || !path.is_file() {
+            bail!(
+                "host compiler {name:?} is not an absolute regular file: {}",
+                path.display()
+            );
+        }
+        rendered.insert(
+            (*name).to_string(),
+            serde_json::json!({
+                "path": path,
+                "sha256": sha256_file(path)?,
+            }),
+        );
+    }
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "format": 2,
+        "tools": rendered,
+    }))?)
 }
 
 fn parse_and_verify(input: &str) -> Result<ManagedCompilerToolchain> {
@@ -105,7 +204,6 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpx::toolchain::sha256_file;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_project(label: &str) -> PathBuf {
@@ -194,6 +292,24 @@ mod tests {
         .unwrap();
         assert!(install_verified_toolchain(&project, &bad).is_err());
         assert_eq!(fs::read(&installed).unwrap(), before);
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn rendered_host_toolchain_pins_exact_file_bytes() {
+        let project = temp_project("host-render");
+        let cargo = project.join("cargo.bin");
+        let rustc = project.join("rustc.bin");
+        fs::write(&cargo, b"cargo bytes").unwrap();
+        fs::write(&rustc, b"rustc bytes").unwrap();
+        let input = render_pinned_toolchain(&[
+            ("cargo", cargo.canonicalize().unwrap()),
+            ("rustc", rustc.canonicalize().unwrap()),
+        ])
+        .unwrap();
+        let parsed = ManagedCompilerToolchain::parse_json(&input).unwrap();
+        assert_eq!(parsed.tools["cargo"].sha256, sha256_file(&cargo).unwrap());
+        assert_eq!(parsed.tools["rustc"].sha256, sha256_file(&rustc).unwrap());
         fs::remove_dir_all(project).unwrap();
     }
 }
