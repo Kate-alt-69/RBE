@@ -60,8 +60,9 @@ struct ScannedEntry {
 pub fn load_local_sync_settings(path: &Path) -> anyhow::Result<Option<LocalSyncSettings>> {
     let source = fs::read_to_string(path)
         .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
-    let envelope: SettingsEnvelope = serde_json::from_str(&source)
-        .map_err(|error| anyhow::anyhow!("invalid {} localSync settings: {error}", path.display()))?;
+    let envelope: SettingsEnvelope = serde_json::from_str(&source).map_err(|error| {
+        anyhow::anyhow!("invalid {} localSync settings: {error}", path.display())
+    })?;
     if let Some(settings) = &envelope.local_sync {
         settings.validate()?;
     }
@@ -150,7 +151,9 @@ impl CloudNodeStore {
                 BlobKind::Video => {
                     self.store_video(&entry.source, logical_path)?;
                 }
-                BlobKind::Folder => unreachable!("local directory scans do not emit folder objects"),
+                BlobKind::Folder => {
+                    unreachable!("local directory scans do not emit folder objects")
+                }
             }
             result.stored = result.stored.saturating_add(1);
         }
@@ -187,7 +190,10 @@ impl CloudNodeStore {
             if object.kind == BlobKind::Folder {
                 continue;
             }
-            if desired.insert(object.logical_path.clone(), object).is_some() {
+            if desired
+                .insert(object.logical_path.clone(), object)
+                .is_some()
+            {
                 anyhow::bail!("Cloud Node localSync snapshot contains duplicate logical paths");
             }
         }
@@ -236,10 +242,7 @@ fn managed_objects(store: &CloudNodeStore, prefix: &str) -> anyhow::Result<Vec<S
         .collect())
 }
 
-fn local_directory_dirty(
-    scanned: &BTreeMap<String, ScannedEntry>,
-    managed: &[SyncObject],
-) -> bool {
+fn local_directory_dirty(scanned: &BTreeMap<String, ScannedEntry>, managed: &[SyncObject]) -> bool {
     if scanned.len() != managed.len() {
         return true;
     }
@@ -479,8 +482,15 @@ fn relative_to_logical(path: &Path) -> anyhow::Result<String> {
                         path.display()
                     )
                 })?;
-                if value.is_empty() || value == "." || value == ".." || value.chars().any(char::is_control) {
-                    anyhow::bail!("Cloud Node localSync path is not canonical: {}", path.display());
+                if value.is_empty()
+                    || value == "."
+                    || value == ".."
+                    || value.chars().any(char::is_control)
+                {
+                    anyhow::bail!(
+                        "Cloud Node localSync path is not canonical: {}",
+                        path.display()
+                    );
                 }
                 parts.push(value);
             }
@@ -572,16 +582,18 @@ mod tests {
         fs::write(watched.join("a.txt"), b"one").unwrap();
         let store = store(&root);
 
-        assert!(store
+        let dirty_before = store
             .local_directory_status(&watched, "workspace")
             .unwrap()
-            .dirty);
+            .dirty;
+        assert!(dirty_before);
         let first = store.sync_local_directory(&watched, "workspace").unwrap();
         assert_eq!(first.stored, 1);
-        assert!(!store
+        let dirty_after = store
             .local_directory_status(&watched, "workspace")
             .unwrap()
-            .dirty);
+            .dirty;
+        assert!(!dirty_after);
 
         fs::write(watched.join("a.txt"), b"two").unwrap();
         let second = store.sync_local_directory(&watched, "workspace").unwrap();
@@ -609,7 +621,9 @@ mod tests {
         let watched = root.join("watched");
         fs::create_dir_all(&watched).unwrap();
         let store = store(&root);
-        store.store_file(&source, "workspace/nested/state.txt").unwrap();
+        store
+            .store_file(&source, "workspace/nested/state.txt")
+            .unwrap();
 
         let restored = store
             .restore_local_directory(&watched, "workspace")
@@ -619,10 +633,11 @@ mod tests {
             fs::read(watched.join("nested/state.txt")).unwrap(),
             b"remote state"
         );
-        assert!(!store
+        let dirty = store
             .local_directory_status(&watched, "workspace")
             .unwrap()
-            .dirty);
+            .dirty;
+        assert!(!dirty);
         let _ = fs::remove_dir_all(root);
     }
 

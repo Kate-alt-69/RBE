@@ -5,7 +5,7 @@ use cloud_node::{
     ingest_registry_export, load_local_sync_settings, load_signing_key_from_env, negotiate_sync,
     probe_upstream, provider_status, public_key_hex, synchronize_provider,
     synchronize_registry_export, synchronize_upstream, CloudNodeSettings, CloudNodeStore,
-    LocalSyncSettings, ProviderConflictPolicy, ProviderClient, ProviderSyncAction,
+    LocalSyncSettings, ProviderClient, ProviderConflictPolicy, ProviderSyncAction,
     ProviderSyncRelation, ProviderSyncResult, SETTINGS_FILE_NAME,
 };
 
@@ -60,10 +60,8 @@ async fn run() -> anyhow::Result<()> {
             println!("syncRoot={}", plan.root_hex());
             println!("syncObjects={}", plan.object_count());
             if let Some(local) = &local_sync {
-                let status = store.local_directory_status(
-                    &local.directory,
-                    &local.settings.logical_prefix,
-                )?;
+                let status = store
+                    .local_directory_status(&local.directory, &local.settings.logical_prefix)?;
                 println!("localSyncDirectory={}", local.directory.display());
                 println!("localSyncPrefix={}", local.settings.logical_prefix);
                 println!("localSyncDirty={}", status.dirty);
@@ -136,13 +134,9 @@ async fn run() -> anyhow::Result<()> {
         }
         "sync" => {
             if settings.provider.is_some() {
-                let result = sync_provider_cycle(
-                    &settings,
-                    &store,
-                    &project_root,
-                    local_sync.as_ref(),
-                )
-                .await?;
+                let result =
+                    sync_provider_cycle(&settings, &store, &project_root, local_sync.as_ref())
+                        .await?;
                 print_provider_result(&result);
             } else if settings.upstream.is_some() {
                 sync_local_inputs(&store, &project_root, local_sync.as_ref())?;
@@ -188,15 +182,7 @@ async fn run() -> anyhow::Result<()> {
             println!("head={}", result.provider.final_head);
             println!("root={}", result.provider.final_root);
         }
-        "run" => {
-            run_daemon(
-                &settings,
-                &store,
-                &project_root,
-                local_sync.as_ref(),
-            )
-            .await?
-        }
+        "run" => run_daemon(&settings, &store, &project_root, local_sync.as_ref()).await?,
         "sync-plan" => {
             let plan = store.sync_plan()?;
             println!("root={}", plan.root_hex());
@@ -255,7 +241,8 @@ fn sync_local_inputs(
 ) -> anyhow::Result<()> {
     ingest_project_writes(store, project_root)?;
     if let Some(local) = local_sync {
-        let result = store.sync_local_directory(&local.directory, &local.settings.logical_prefix)?;
+        let result =
+            store.sync_local_directory(&local.directory, &local.settings.logical_prefix)?;
         if result.stored > 0 || result.removed > 0 {
             eprintln!(
                 "cloud_node: localSync scanned={} stored={} removed={} unchanged={} directory={}",
@@ -275,7 +262,10 @@ fn restore_local_after_pull(
     local_sync: Option<&LocalSyncRuntime>,
     action: ProviderSyncAction,
 ) -> anyhow::Result<()> {
-    if !matches!(action, ProviderSyncAction::Pull | ProviderSyncAction::ForcedPull) {
+    if !matches!(
+        action,
+        ProviderSyncAction::Pull | ProviderSyncAction::ForcedPull
+    ) {
         return Ok(());
     }
     let Some(local) = local_sync else {

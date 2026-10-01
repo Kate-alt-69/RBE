@@ -1,0 +1,43 @@
+name: Cloud Node Contract
+
+on:
+  push:
+    paths:
+      - "engine/crates/cloud-node/**"
+      - "doc/cloud-node*.md"
+      - ".github/workflows/cloud-node-ci.yml"
+  pull_request:
+    paths:
+      - "engine/crates/cloud-node/**"
+      - "doc/cloud-node*.md"
+      - ".github/workflows/cloud-node-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-node-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cloud-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Cloud Node format
+        run: cargo fmt -p cloud-node -- --check
+      - name: Cloud Node clippy
+        run: cargo clippy -p cloud-node --all-targets --locked -- -D warnings
+      - name: Cloud Node tests
+        run: cargo test -p cloud-node --locked
