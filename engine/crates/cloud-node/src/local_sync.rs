@@ -699,7 +699,14 @@ fn prepare_restore_target(target: &Path, mode: RestoreMode) -> anyhow::Result<()
 fn path_entry_exists(path: &Path) -> anyhow::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
         Err(error) => Err(error.into()),
     }
 }
