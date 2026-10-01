@@ -160,17 +160,18 @@ That flag is an explicit authoring escape hatch, not the production/default comp
 
 ## SDK bootstrap
 
-RBE uses one **generic rolling SDK channel**. SDK installation is deliberately not tied to GitHub Releases or SDK version tags. `sdk` and `sdk.latest` both mean "install the current verified SDK build from `main`".
+RBE uses one **generic rolling SDK channel**. `sdk` and `sdk.latest` both mean "install the current verified SDK development build from `main`".
 
 The production RBE `backend` and the project-local SDK backend have separate jobs:
 
 1. The normal production `backend` recognizes `install sdk` and `install sdk.latest`, downloads the fixed Kastrick HTTPS bootstrap script, and invokes it with argument-safe process arguments.
 2. RBE's `SDK Toolchain` workflow builds the current SDK for supported platforms whenever relevant SDK/toolchain code changes on `main`.
-3. The bootstrap resolves the newest non-expired SDK artifact built from `main`, downloads the platform artifact, verifies the inner SDK archive against its published SHA-256, and only then extracts it.
-4. The verified SDK archive contains the dedicated SDK backend, RPX, and the Rust/JavaScript/TypeScript/Python SDK bindings.
-5. That SDK backend installs the selected language binding(s) into the project under `.rbe/`, writes `sdk.lock.json`, and owns later SDK status/toolchain operations.
+3. After all platform bundles and their checksum files are validated, the workflow publishes a historical development prerelease and atomically replaces the deterministic moving alias `sdk-v0.0.0-dev.latest`.
+4. The bootstrap resolves that exact moving alias, downloads the platform archive and `.sha256`, verifies the archive before extraction, and rejects missing/incomplete release metadata.
+5. The verified SDK archive contains the dedicated SDK backend, RPX, and the Rust/JavaScript/TypeScript/Python SDK bindings.
+6. That SDK backend installs the selected language binding(s) into the project under `.rbe/`, writes `sdk.lock.json`, generates the project-local activation file, and owns later SDK status/toolchain operations.
 
-There is intentionally no GitHub Release step in this channel. A pinned `sdk.<version>` distribution contract is not currently provided; requests for a specific SDK version fail closed until RBE deliberately adds a pinned SDK channel.
+The rolling alias is intentionally a prerelease rather than a stable semantic SDK version. Historical development releases keep unique `sdk-v0.0.0-dev.<run>.<attempt>` tags for traceability. A pinned stable `sdk.<version>` distribution contract is not currently provided; requests for a specific SDK version fail closed until RBE deliberately adds a stable SDK channel.
 
 Public install examples:
 
