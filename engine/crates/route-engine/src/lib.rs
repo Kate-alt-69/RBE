@@ -118,8 +118,12 @@ mod module_runtime;
 mod modules;
 mod parser;
 mod paths;
+mod rel_host_builtins;
+mod rel_host_runtime;
 mod route_collision;
+mod runtime_roots;
 mod service_eval;
+mod temp_path;
 mod terminal;
 
 pub mod archive;
@@ -162,11 +166,18 @@ pub use module_runtime::{
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
+pub use rel_host_builtins::{
+    allowed_for_role as host_builtin_allowed_for_role,
+    function_exists as host_builtin_function_exists, is_host_builtin,
+    ARCHIVE_BUILTIN, SCRIPT_BUILTIN, WORKSPACE_BUILTIN,
+};
+pub use rel_host_runtime::{RelHostOutput, RelHostRequest};
 pub use relc::{
     compile_runtime_image, discover_physical_rel_sources, PhysicalRelSource, RelcError,
 };
 pub use runtime_env::{RuntimeEnv, RuntimeEnvError, RuntimeEnvOrigin};
 pub use runtime_image::{RuntimeExecutable, RuntimeImage, RuntimeImageSlot, RuntimeSourceManifest};
+pub use runtime_roots::RuntimeRootAuthority;
 pub use script::{ScriptLanguage, ScriptPath, ScriptPlan, ScriptPlanError};
 pub use server_policy::{
     PolicyOrigin, RecursionPolicy, ResolvedPolicyValue, ServerPolicy, ServerPolicyError,
@@ -180,6 +191,7 @@ pub use service_eval::ServiceProgramExecutor;
 pub use source_registry::{
     RelSource, RelSourceKind, RelSourceRegistry, SourceId, SourceOrigin, SourceRegistryError,
 };
+pub use temp_path::{is_project_path, is_temp_path, validate_symbolic_path};
 pub use wasm_compiler::{
     compile_route as compile_route_wasm, RouteWasmArtifact, RouteWasmCompilation,
     ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
