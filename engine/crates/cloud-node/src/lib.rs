@@ -27,6 +27,7 @@ mod provider_sync_raw;
 mod recovery;
 mod registry_ingest;
 mod server;
+mod settings_path;
 mod store;
 mod sync;
 mod transfer;
@@ -76,6 +77,9 @@ pub use registry_ingest::{synchronize_registry_export, RegistrySyncResult};
 pub use server::{
     AcceptedKnock, AuthenticatedSession, CloudNodeAuthenticator, DEFAULT_SESSION_TTL_MS,
     MAX_AUTH_PROOF_BYTES,
+};
+pub use settings_path::{
+    discover_settings_path, LEGACY_SETTINGS_FILE_NAME, PREFERRED_SETTINGS_FILE_NAME,
 };
 pub use store::{CloudNodeStore, StoreSummary, StoredObject};
 pub use sync::{SyncObject, SyncPlan, SyncPlanHeader};
