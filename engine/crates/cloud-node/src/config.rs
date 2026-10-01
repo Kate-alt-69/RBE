@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const SETTINGS_FILE_NAME: &str = "setting.node.cn.json";
 
@@ -54,7 +54,7 @@ pub enum ProviderAuthMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderAuthSettings {
     #[serde(default)]
     pub mode: ProviderAuthMode,
@@ -82,7 +82,7 @@ pub struct ProviderAuthSettings {
     pub oauth_token_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudNodeSettings {
     #[serde(default = "default_format_version")]
@@ -96,8 +96,51 @@ pub struct CloudNodeSettings {
     pub replication: ReplicationSettings,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CloudNodeSettingsEnvelope {
+    #[serde(default = "default_format_version")]
+    format_version: u16,
+    node: NodeSettings,
+    #[serde(default)]
+    upstream: Option<UpstreamSettings>,
+    #[serde(default)]
+    provider: Option<ProviderSettings>,
+    #[serde(default)]
+    replication: ReplicationSettings,
+    #[serde(default)]
+    local_sync: Option<LocalSyncSettingsShape>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LocalSyncSettingsShape {
+    directory: PathBuf,
+    #[serde(default)]
+    logical_prefix: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for CloudNodeSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let envelope = CloudNodeSettingsEnvelope::deserialize(deserializer)?;
+        if let Some(local_sync) = envelope.local_sync {
+            let _ = (local_sync.directory, local_sync.logical_prefix);
+        }
+        Ok(Self {
+            format_version: envelope.format_version,
+            node: envelope.node,
+            upstream: envelope.upstream,
+            provider: envelope.provider,
+            replication: envelope.replication,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NodeSettings {
     pub id: String,
     #[serde(default)]
@@ -112,7 +155,7 @@ pub struct NodeSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UpstreamSettings {
     pub url: String,
     pub node_id: String,
@@ -130,7 +173,7 @@ pub struct UpstreamSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderSettings {
     pub kind: ProviderKind,
     pub namespace: String,
@@ -176,7 +219,7 @@ pub struct ProviderSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReplicationSettings {
     #[serde(default)]
     pub require_boot_recovery: bool,
@@ -197,7 +240,7 @@ impl Default for ReplicationSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReplicationTarget {
     pub node_id: String,
     pub url: String,
@@ -844,6 +887,46 @@ const fn default_boot_recovery_timeout_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_reject_unknown_fields_but_accept_local_sync() {
+        let accepted: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+            "localSync":{"directory":"./data","logicalPrefix":"local"}
+        }))
+        .unwrap();
+        accepted.validate().unwrap();
+
+        for invalid in [
+            serde_json::json!({
+                "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+                "provder":{}
+            }),
+            serde_json::json!({
+                "node":{"id":"nas-main","storageRoot":"/srv/nas","backupVerisons":5}
+            }),
+            serde_json::json!({
+                "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+                "provider":{
+                    "kind":"s3",
+                    "namespace":"prod",
+                    "bucket":"rbe-backups",
+                    "region":"ap-south-1",
+                    "syncOnConect":true
+                }
+            }),
+            serde_json::json!({
+                "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+                "localSyncc":{"directory":"./data"}
+            }),
+            serde_json::json!({
+                "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+                "localSync":{"directory":"./data","logicalPrefx":"local"}
+            }),
+        ] {
+            assert!(serde_json::from_value::<CloudNodeSettings>(invalid).is_err());
+        }
+    }
 
     #[test]
     fn node_ids_and_provider_namespaces_reject_filesystem_aliases() {
