@@ -42,17 +42,17 @@ struct PublishedSnapshotResource {
     key: String,
 }
 
-/// Run the stabilized provider transaction and, for transports that cannot
-/// cryptographically prove the uploaded body at write time, read back the
-/// published immutable snapshot before reporting a successful push.
+/// Run the stabilized provider transaction and prove the published snapshot
+/// index still describes the exact local sync plan before reporting success.
 ///
 /// The Amazon S3 path signs the exact payload SHA-256 in SigV4
 /// (`x-amz-content-sha256`), so S3 and S3-compatible endpoints do not need to
 /// download every freshly uploaded object again. Direct Supabase, Azure Blob,
 /// Google Cloud Storage, and generic HTTP uploads do not currently expose the
 /// same SHA-256 write proof through this provider interface, so a mutating push
-/// gets one bounded byte-for-byte readback here. The immutable snapshot index is
-/// also re-read and compared to the exact resource metadata that was verified.
+/// additionally gets one bounded byte-for-byte readback of every immutable
+/// resource. Every stable sync re-reads the immutable snapshot index and then
+/// confirms HEAD/root did not move during that audit.
 pub async fn synchronize_provider(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
@@ -63,22 +63,23 @@ pub async fn synchronize_provider(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
 
-    if !provider_push_requires_readback(provider.kind, result.action) {
-        return Ok(result);
-    }
+    let audit = if provider_push_requires_readback(provider.kind, result.action) {
+        verify_published_provider_snapshot(settings, store, &result.final_root).await
+    } else {
+        verify_published_provider_index(settings, store, &result.final_root).await
+    };
 
-    let audit = verify_published_provider_snapshot(settings, store, &result.final_root).await;
     let observed = provider_sync_guard::provider_status(settings, store)
         .await
         .map_err(|status_error| {
             anyhow::anyhow!(
-                "Cloud Node post-push provider readback finished but the stabilization status check failed: {status_error:#}"
+                "Cloud Node provider integrity audit finished but the stabilization status check failed: {status_error:#}"
             )
         })?;
 
     if !same_published_state(&result, &observed) {
         anyhow::bail!(
-            "Cloud Node provider state changed during post-push byte verification; retry synchronization (expectedHead={} observedLocalHead={} observedRemoteHead={} expectedRoot={} observedLocalRoot={} observedRemoteRoot={} relation={:?})",
+            "Cloud Node provider state changed during final integrity verification; retry synchronization (expectedHead={} observedLocalHead={} observedRemoteHead={} expectedRoot={} observedLocalRoot={} observedRemoteRoot={} relation={:?})",
             result.final_head,
             observed.local_head,
             observed.remote_head.as_deref().unwrap_or("<empty>"),
@@ -91,7 +92,7 @@ pub async fn synchronize_provider(
 
     audit.map_err(|error| {
         anyhow::anyhow!(
-            "Cloud Node provider accepted a push but the immutable snapshot failed post-publish byte verification while HEAD remained stable: {error:#}"
+            "Cloud Node provider immutable snapshot failed final integrity verification while HEAD remained stable: {error:#}"
         )
     })?;
     Ok(result)
@@ -121,32 +122,79 @@ async fn verify_published_provider_snapshot(
         .provider
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
+    let plan = verified_plan_for_audit(store, expected_root)?;
+    let expected_resources = collect_snapshot_index_resources(&plan, expected_root).await?;
+    let client = ProviderClient::new(provider)?;
+
+    for resource in &expected_resources {
+        verify_provider_resource(
+            &client,
+            &resource.key,
+            decode_resource_hash(&resource.resource_sha256)?,
+            resource.size,
+        )
+        .await?;
+    }
+    verify_snapshot_index_object(&client, &plan, expected_root, &expected_resources).await?;
+    verify_local_root_unchanged(store, expected_root)
+}
+
+async fn verify_published_provider_index(
+    settings: &CloudNodeSettings,
+    store: &CloudNodeStore,
+    expected_root: &str,
+) -> anyhow::Result<()> {
+    let provider = settings
+        .provider
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
+    let plan = verified_plan_for_audit(store, expected_root)?;
+    let expected_resources = collect_snapshot_index_resources(&plan, expected_root).await?;
+    let client = ProviderClient::new(provider)?;
+    verify_snapshot_index_object(&client, &plan, expected_root, &expected_resources).await?;
+    verify_local_root_unchanged(store, expected_root)
+}
+
+fn verified_plan_for_audit(store: &CloudNodeStore, expected_root: &str) -> anyhow::Result<SyncPlan> {
     let plan = store.sync_plan()?;
     if plan.root_hex() != expected_root {
         anyhow::bail!(
-            "Cloud Node local snapshot changed before post-push verification: expected root {expected_root}, found {}",
+            "Cloud Node local snapshot changed before provider integrity verification: expected root {expected_root}, found {}",
             plan.root_hex()
         );
     }
+    Ok(plan)
+}
 
-    let client = ProviderClient::new(provider)?;
-    let mut expected_resources = Vec::new();
+fn verify_local_root_unchanged(store: &CloudNodeStore, expected_root: &str) -> anyhow::Result<()> {
+    let after = store.sync_plan()?.root_hex();
+    if after != expected_root {
+        anyhow::bail!(
+            "Cloud Node local snapshot changed during provider integrity verification: expected root {expected_root}, found {after}"
+        );
+    }
+    Ok(())
+}
+
+async fn collect_snapshot_index_resources(
+    plan: &SyncPlan,
+    expected_root: &str,
+) -> anyhow::Result<Vec<PublishedSnapshotResource>> {
+    let mut resources = Vec::new();
     for object in plan.ordered() {
         let object_hex = hex::encode(object.object_key);
         let content_hex = hex::encode(object.content_sha256);
         let base = format!("snapshots/{expected_root}/objects/{object_hex}/{content_hex}");
 
         let (manifest_sha, manifest_size) = hash_and_size(&object.manifest_path).await?;
-        let manifest_key = format!("{base}/{}", object.kind.manifest_name());
-        verify_provider_resource(&client, &manifest_key, manifest_sha, manifest_size).await?;
-        expected_resources.push(snapshot_resource(
+        resources.push(snapshot_resource(
             object.kind,
             TransferResource::Manifest,
             &object_hex,
             &content_hex,
             manifest_sha,
             manifest_size,
-            manifest_key,
+            format!("{base}/{}", object.kind.manifest_name()),
         ));
 
         match object.kind {
@@ -154,65 +202,55 @@ async fn verify_published_provider_snapshot(
             BlobKind::File => {
                 let payload = object.payload_path.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Cloud Node file sync object has no payload during post-push verification"
+                        "Cloud Node file sync object has no payload during provider integrity verification"
                     )
                 })?;
                 let payload_size = tokio::fs::metadata(payload)
                     .await
                     .map_err(|error| {
                         anyhow::anyhow!(
-                            "failed to stat Cloud Node post-push payload {}: {error}",
+                            "failed to stat Cloud Node provider audit payload {}: {error}",
                             payload.display()
                         )
                     })?
                     .len();
-                let payload_key = format!("{base}/payload");
-                verify_provider_resource(
-                    &client,
-                    &payload_key,
-                    object.content_sha256,
-                    payload_size,
-                )
-                .await?;
-                expected_resources.push(snapshot_resource(
+                resources.push(snapshot_resource(
                     object.kind,
                     TransferResource::FilePayload,
                     &object_hex,
                     &content_hex,
                     object.content_sha256,
                     payload_size,
-                    payload_key,
+                    format!("{base}/payload"),
                 ));
             }
             BlobKind::Video => {
                 for chunk_path in &object.chunk_paths {
-                    let (chunk_sha, chunk_size) = hash_and_size(chunk_path).await?;
+                    let chunk_sha = chunk_hash_from_path(chunk_path)?;
+                    let chunk_size = tokio::fs::metadata(chunk_path)
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "failed to stat Cloud Node provider audit chunk {}: {error}",
+                                chunk_path.display()
+                            )
+                        })?
+                        .len();
                     let chunk_hex = hex::encode(chunk_sha);
-                    let chunk_key = format!("{base}/chunks/{chunk_hex}.chunk");
-                    verify_provider_resource(&client, &chunk_key, chunk_sha, chunk_size).await?;
-                    expected_resources.push(snapshot_resource(
+                    resources.push(snapshot_resource(
                         object.kind,
                         TransferResource::VideoChunk,
                         &object_hex,
                         &content_hex,
                         chunk_sha,
                         chunk_size,
-                        chunk_key,
+                        format!("{base}/chunks/{chunk_hex}.chunk"),
                     ));
                 }
             }
         }
     }
-
-    verify_provider_snapshot_index(&client, &plan, expected_root, &expected_resources).await?;
-
-    let after = store.sync_plan()?.root_hex();
-    if after != expected_root {
-        anyhow::bail!(
-            "Cloud Node local snapshot changed during post-push verification: expected root {expected_root}, found {after}"
-        );
-    }
-    Ok(())
+    Ok(resources)
 }
 
 fn snapshot_resource(
@@ -235,7 +273,7 @@ fn snapshot_resource(
     }
 }
 
-async fn verify_provider_snapshot_index(
+async fn verify_snapshot_index_object(
     client: &ProviderClient,
     plan: &SyncPlan,
     expected_root: &str,
@@ -299,6 +337,35 @@ fn resource_map(
     Ok(map)
 }
 
+fn chunk_hash_from_path(path: &Path) -> anyhow::Result<[u8; 32]> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".chunk"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node provider audit video chunk has invalid file name: {}",
+                path.display()
+            )
+        })?;
+    decode_resource_hash(name).map_err(|error| {
+        anyhow::anyhow!(
+            "Cloud Node provider audit video chunk name is not a SHA-256 hash ({}): {error:#}",
+            path.display()
+        )
+    })
+}
+
+fn decode_resource_hash(value: &str) -> anyhow::Result<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("provider resource hash must be a 32-byte hexadecimal SHA-256 value");
+    }
+    let bytes = hex::decode(value)?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("provider resource hash decoded to the wrong length"))
+}
+
 async fn verify_provider_resource(
     client: &ProviderClient,
     key: &str,
@@ -318,7 +385,7 @@ async fn verify_provider_resource(
 async fn hash_and_size(path: &Path) -> anyhow::Result<([u8; 32], u64)> {
     let mut file = tokio::fs::File::open(path).await.map_err(|error| {
         anyhow::anyhow!(
-            "failed to open Cloud Node post-push verification source {}: {error}",
+            "failed to open Cloud Node provider verification source {}: {error}",
             path.display()
         )
     })?;
@@ -328,7 +395,7 @@ async fn hash_and_size(path: &Path) -> anyhow::Result<([u8; 32], u64)> {
     loop {
         let read = file.read(&mut buffer).await.map_err(|error| {
             anyhow::anyhow!(
-                "failed to read Cloud Node post-push verification source {}: {error}",
+                "failed to read Cloud Node provider verification source {}: {error}",
                 path.display()
             )
         })?;
@@ -339,9 +406,9 @@ async fn hash_and_size(path: &Path) -> anyhow::Result<([u8; 32], u64)> {
         size = size
             .checked_add(
                 u64::try_from(read)
-                    .map_err(|_| anyhow::anyhow!("post-push verification read exceeds u64"))?,
+                    .map_err(|_| anyhow::anyhow!("provider verification read exceeds u64"))?,
             )
-            .ok_or_else(|| anyhow::anyhow!("post-push verification size overflow"))?;
+            .ok_or_else(|| anyhow::anyhow!("provider verification size overflow"))?;
     }
     Ok((digest.finalize().into(), size))
 }
@@ -397,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn post_push_confirmation_requires_exact_head_and_root() {
+    fn post_sync_confirmation_requires_exact_head_and_root() {
         let result = ProviderSyncResult {
             action: ProviderSyncAction::Push,
             before: ProviderSyncStatus {
@@ -463,5 +530,12 @@ mod tests {
         let mut duplicate = index;
         duplicate.resources.push(expected[0].clone());
         assert!(verify_snapshot_index_metadata(&duplicate, &root, header, &expected).is_err());
+    }
+
+    #[test]
+    fn resource_hash_decoder_is_strict() {
+        assert_eq!(decode_resource_hash(&"ab".repeat(32)).unwrap(), [0xab; 32]);
+        assert!(decode_resource_hash("ab").is_err());
+        assert!(decode_resource_hash(&format!("{}zz", "ab".repeat(31))).is_err());
     }
 }
