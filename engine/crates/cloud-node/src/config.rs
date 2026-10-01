@@ -122,6 +122,10 @@ pub struct UpstreamSettings {
     pub sync_on_connect: bool,
     #[serde(default = "default_reconnect_delay_ms")]
     pub reconnect_delay_ms: u64,
+    #[serde(default = "default_provider_max_reconnect_delay_ms")]
+    pub max_reconnect_delay_ms: u64,
+    #[serde(default = "default_provider_poll_interval_ms")]
+    pub poll_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +242,11 @@ impl CloudNodeSettings {
             validate_node_id(&upstream.node_id)?;
             validate_public_key(&upstream.public_key)?;
             validate_reconnect_delay(upstream.reconnect_delay_ms)?;
+            validate_upstream_max_reconnect_delay(
+                upstream.reconnect_delay_ms,
+                upstream.max_reconnect_delay_ms,
+            )?;
+            validate_upstream_poll_interval(upstream.poll_interval_ms)?;
         }
         if let Some(provider) = &self.provider {
             validate_provider(provider)?;
@@ -464,6 +473,25 @@ fn validate_reconnect_delay(value: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_upstream_max_reconnect_delay(initial: u64, maximum: u64) -> anyhow::Result<()> {
+    if !(250..=3_600_000).contains(&maximum) {
+        anyhow::bail!("Cloud Node upstream maxReconnectDelayMs must be between 250 and 3600000");
+    }
+    if maximum < initial {
+        anyhow::bail!(
+            "Cloud Node upstream maxReconnectDelayMs cannot be smaller than reconnectDelayMs"
+        );
+    }
+    Ok(())
+}
+
+fn validate_upstream_poll_interval(value: u64) -> anyhow::Result<()> {
+    if !(1_000..=3_600_000).contains(&value) {
+        anyhow::bail!("Cloud Node upstream pollIntervalMs must be between 1000 and 3600000");
+    }
+    Ok(())
+}
+
 fn validate_provider_max_reconnect_delay(initial: u64, maximum: u64) -> anyhow::Result<()> {
     if !(250..=3_600_000).contains(&maximum) {
         anyhow::bail!("Cloud Node provider maxReconnectDelayMs must be between 250 and 3600000");
@@ -663,6 +691,29 @@ mod tests {
         assert!(validate_peer_url("https://user:pass@cloud.example.test").is_err());
         assert!(validate_peer_url("https://cloud.example.test?token=nope").is_err());
         assert!(validate_peer_url("https://cloud.example.test/#fragment").is_err());
+    }
+
+    #[test]
+    fn upstream_polling_has_separate_success_and_failure_cadence() {
+        let upstream: UpstreamSettings = serde_json::from_value(serde_json::json!({
+            "url":"https://peer.example.test",
+            "nodeId":"peer-main",
+            "publicKey":"0000000000000000000000000000000000000000000000000000000000000000"
+        }))
+        .unwrap();
+        assert_eq!(upstream.reconnect_delay_ms, 2_000);
+        assert_eq!(upstream.max_reconnect_delay_ms, 60_000);
+        assert_eq!(upstream.poll_interval_ms, 30_000);
+        validate_reconnect_delay(upstream.reconnect_delay_ms).unwrap();
+        validate_upstream_max_reconnect_delay(
+            upstream.reconnect_delay_ms,
+            upstream.max_reconnect_delay_ms,
+        )
+        .unwrap();
+        validate_upstream_poll_interval(upstream.poll_interval_ms).unwrap();
+
+        assert!(validate_upstream_max_reconnect_delay(2_000, 1_999).is_err());
+        assert!(validate_upstream_poll_interval(999).is_err());
     }
 
     #[test]
