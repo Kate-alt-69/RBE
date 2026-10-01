@@ -39,6 +39,42 @@ function assertLibraryName(value) {
   return value;
 }
 
+function assertNonEmptyString(value, label) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function assertPort(value) {
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new RangeError("TCP port must be an integer in 1..=65535");
+  }
+  return value;
+}
+
+function assertPositiveInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function optionalTimeout(payload, timeoutMs) {
+  if (timeoutMs !== null && timeoutMs !== undefined) {
+    payload.timeout_ms = assertPositiveInteger(timeoutMs, "timeoutMs");
+  }
+  return payload;
+}
+
+function byteArray(data) {
+  if (data instanceof Uint8Array) return Array.from(data);
+  if (Array.isArray(data) && data.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+    return [...data];
+  }
+  throw new TypeError("TCP write data must be Uint8Array or an array of byte values");
+}
+
 function isPromiseLike(value) {
   return value && typeof value.then === "function";
 }
@@ -262,6 +298,47 @@ export class LoggerClient {
   fatal(message) { return this.emit("fatal", message); }
 }
 
+export class DnsClient extends CapabilityClient {
+  constructor(bridge) {
+    super(bridge, capability.NET_DNS);
+  }
+
+  lookup(name) { return this.call("lookup", { name: assertNonEmptyString(name, "DNS name") }); }
+  ip(name) { return this.call("ip", { name: assertNonEmptyString(name, "DNS name") }); }
+  mx(name) { return this.call("mx", { name: assertNonEmptyString(name, "DNS name") }); }
+}
+
+export class TcpClient extends CapabilityClient {
+  constructor(bridge) {
+    super(bridge, capability.NET_TCP);
+  }
+
+  connect(host, port, timeoutMs = null) {
+    return this.call("connect", optionalTimeout({
+      host: assertNonEmptyString(host, "TCP host"),
+      port: assertPort(port)
+    }, timeoutMs));
+  }
+
+  write(handle, data, timeoutMs = null) {
+    return this.call("write", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TCP handle"),
+      data: byteArray(data)
+    }, timeoutMs));
+  }
+
+  read(handle, maxBytes, timeoutMs = null) {
+    return this.call("read", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TCP handle"),
+      max_bytes: assertPositiveInteger(maxBytes, "maxBytes")
+    }, timeoutMs));
+  }
+
+  close(handle) {
+    return this.call("close", { handle: assertNonEmptyString(handle, "TCP handle") });
+  }
+}
+
 export class NetClient {
   constructor(bridge) {
     this.bridge = bridge;
@@ -278,9 +355,9 @@ export class NetClient {
   cookies() { return new CapabilityClient(this.bridge, capability.NET_COOKIES); }
   headers() { return new CapabilityClient(this.bridge, capability.NET_HEADERS); }
   url() { return new CapabilityClient(this.bridge, capability.NET_URL); }
-  dns() { return new CapabilityClient(this.bridge, capability.NET_DNS); }
+  dns() { return new DnsClient(this.bridge); }
   ip() { return new CapabilityClient(this.bridge, capability.NET_IP); }
-  tcp() { return new CapabilityClient(this.bridge, capability.NET_TCP); }
+  tcp() { return new TcpClient(this.bridge); }
   udp() { return new CapabilityClient(this.bridge, capability.NET_UDP); }
   quic() { return new CapabilityClient(this.bridge, capability.NET_QUIC); }
   websocket() { return new CapabilityClient(this.bridge, capability.NET_WEBSOCKET); }
