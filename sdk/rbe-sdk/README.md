@@ -140,23 +140,28 @@ shape blindly.
 
 ## Self-hosted distribution
 
-RBE's central package service is designed to expose a Cargo **sparse registry**
-for SDK/tooling crates in addition to RBE's own package index. SDKs and runtimes
-use the same user-facing install namespace as ordinary packages; there is no
-separate `backend sdk ...` command family.
-
-Target flow:
+RBE's SDK is a **generic rolling authoring toolchain**, not a separately maintained
+GitHub Release stream. The public install names are:
 
 ```text
-./backend install sdk.0.1.0
-./backend library new advancenet
-./backend install advancenet
+backend install sdk
+backend install sdk.latest
 ```
 
-A normal package consumer does not need to install its SDK manually. The package
-manifest declares the SDK requirement and `backend install` resolves the exact
-compatible SDK automatically. Explicit `backend install sdk.<version>` is mainly
-for authors preparing a local RBE library-development environment.
+Both select the current verified SDK build from RBE `main`. Relevant SDK/toolchain
+changes trigger the `SDK Toolchain` workflow, which rebuilds the platform bundles.
+The Kastrick bootstrap resolves the current bundle, verifies its SHA-256, and
+installs the project-local SDK backend, RPX and selected language bindings under
+`.rbe/`.
+
+A pinned `sdk.<version>` install channel is intentionally not part of the current
+contract. If RBE later needs reproducible pinned SDK distribution, that should be
+added as a separate explicit channel rather than turning routine SDK development
+into release-management work.
+
+A normal package consumer does not need a machine-global SDK install. Library
+authoring remains project-local, with `.rbe/activate.ps1` or `.rbe/activate.sh`
+exposing that project's `backend` and `rpx` only to the active shell.
 
 For manual Cargo use, a project can configure the same registry directly:
 
@@ -173,12 +178,12 @@ and then depend on the SDK normally:
 rbe-sdk = { version = "0.1", registry = "rbe" }
 ```
 
-The package index and SDK registry are separate protocol surfaces backed by the
-same central service. RBE packages are source ZIPs/native-library packages;
+The package index and SDK Cargo registry are separate protocol surfaces backed by
+the same central service. RBE packages are source ZIPs/native-library packages;
 Cargo only needs the sparse registry for Rust SDK/tooling crates.
 
 ## ABI policy
 
-`LIBRARY_ABI_VERSION` is independent from the SDK crate version. An SDK release
-can add convenience helpers without forcing an ABI bump. Breaking changes to
-the host/library wire contract require a new RBE library ABI.
+`LIBRARY_ABI_VERSION` is independent from the Rust SDK crate version. SDK helper
+changes can evolve without forcing an ABI bump. Breaking changes to the
+host/library wire contract require a new RBE library ABI.
