@@ -674,6 +674,7 @@ fn ensure_expected_peer(
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(REQUEST_TIMEOUT)
         .build()?)
@@ -787,6 +788,35 @@ mod tests {
         assert!(peer_root.is_file());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_http_client_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let response = http_client()
+            .unwrap()
+            .get(format!("http://{address}/start"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.join().unwrap();
     }
 
     #[test]
