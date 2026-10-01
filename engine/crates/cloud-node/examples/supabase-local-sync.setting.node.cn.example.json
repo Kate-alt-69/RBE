@@ -30,6 +30,7 @@
     "reconnectDelayMs": 2000,
     "maxReconnectDelayMs": 60000,
     "pollIntervalMs": 30000,
+    "integrityAuditIntervalMs": 900000,
     "connectTimeoutMs": 10000,
     "readTimeoutMs": 60000
   },
