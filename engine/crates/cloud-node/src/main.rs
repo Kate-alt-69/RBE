@@ -75,6 +75,11 @@ async fn run() -> anyhow::Result<()> {
                 println!("transport=peer");
                 println!("upstream={}", upstream.url);
                 println!("upstreamNode={}", upstream.node_id);
+                println!("upstreamPollIntervalMs={}", upstream.poll_interval_ms);
+                println!(
+                    "upstreamMaxReconnectDelayMs={}",
+                    upstream.max_reconnect_delay_ms
+                );
             }
             if let Some(provider) = &settings.provider {
                 let client = ProviderClient::new(provider)?;
@@ -432,48 +437,50 @@ async fn run_peer_daemon(
         .upstream
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node run mode requires an upstream or provider"))?;
+    let mut retry_delay_ms = upstream.reconnect_delay_ms;
     loop {
-        sync_local_inputs(store, project_root, local_sync)?;
-        match probe_upstream(settings).await {
-            Ok(peer) => {
+        let result: anyhow::Result<()> = async {
+            sync_local_inputs(store, project_root, local_sync)?;
+            let peer = probe_upstream(settings).await?;
+            println!(
+                "Cloud Node authenticated upstream {} session={}",
+                peer.node_id,
+                hex::encode(peer.session)
+            );
+            if upstream.sync_on_connect {
+                let negotiation = synchronize_upstream(settings, store, &peer).await?;
                 println!(
-                    "Cloud Node authenticated upstream {} session={}",
-                    peer.node_id,
-                    hex::encode(peer.session)
+                    "Cloud Node sync roots local={} remote={} match={}",
+                    hex::encode(negotiation.local.root_sha256),
+                    hex::encode(negotiation.remote.root_sha256),
+                    negotiation.roots_match()
                 );
-                if upstream.sync_on_connect {
-                    match synchronize_upstream(settings, store, &peer).await {
-                        Ok(negotiation) => {
-                            println!(
-                                "Cloud Node sync roots local={} remote={} match={}",
-                                hex::encode(negotiation.local.root_sha256),
-                                hex::encode(negotiation.remote.root_sha256),
-                                negotiation.roots_match()
-                            );
-                        }
-                        Err(error) => {
-                            eprintln!("Cloud Node synchronization failed: {error}");
-                            if !upstream.auto_reconnect {
-                                return Err(error);
-                            }
-                            tokio::time::sleep(Duration::from_millis(upstream.reconnect_delay_ms))
-                                .await;
-                            continue;
-                        }
-                    }
-                }
-                if !upstream.auto_reconnect {
-                    return Ok(());
-                }
             }
+            Ok(())
+        }
+        .await;
+
+        let delay_ms = match result {
             Err(error) => {
-                eprintln!("Cloud Node upstream unavailable: {error}");
+                eprintln!("Cloud Node upstream cycle failed: {error}");
                 if !upstream.auto_reconnect {
                     return Err(error);
                 }
+                let delay = retry_delay_ms;
+                retry_delay_ms = retry_delay_ms
+                    .saturating_mul(2)
+                    .min(upstream.max_reconnect_delay_ms);
+                delay
             }
-        }
-        tokio::time::sleep(Duration::from_millis(upstream.reconnect_delay_ms)).await;
+            Ok(()) => {
+                retry_delay_ms = upstream.reconnect_delay_ms;
+                if !upstream.auto_reconnect {
+                    return Ok(());
+                }
+                upstream.poll_interval_ms
+            }
+        };
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 
