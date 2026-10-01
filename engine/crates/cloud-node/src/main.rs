@@ -620,8 +620,10 @@ mod tests {
     fn sync_bootstrap_flag_is_explicit_and_bounded() {
         assert!(!sync_bootstrap_requested(&["sync".into()]).unwrap());
         assert!(sync_bootstrap_requested(&["sync".into(), "--bootstrap".into()]).unwrap());
-        assert!(sync_bootstrap_requested(&["sync".into(), "--bootstrap".into(), "oops".into()])
-            .is_err());
+        assert!(
+            sync_bootstrap_requested(&["sync".into(), "--bootstrap".into(), "oops".into()])
+                .is_err()
+        );
         assert!(sync_bootstrap_requested(&["sync".into(), "unexpected".into()]).is_err());
     }
 }
