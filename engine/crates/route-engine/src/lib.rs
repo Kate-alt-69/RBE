@@ -10,14 +10,8 @@
 //! `server.server` front-end. Final ServerPolicy/Runtime Image lowering remains
 //! a later RELC pass.
 
-// The route cache and direct parser helpers are retained as internal building
-// blocks for the AOT/diagnostic pipeline even when a particular build path does
-// not currently call them directly.
 #![allow(dead_code)]
 
-// `discovery` only needs the parser half of application/x-www-form-urlencoded.
-// Keep that tiny surface in-tree so request decoding does not add another direct
-// dependency edge to Route Engine's locked workspace graph.
 extern crate self as form_urlencoded;
 
 mod form_urlencoded_compat {
@@ -73,7 +67,7 @@ mod form_urlencoded_compat {
             let mut parts = sequence.splitn(2, |byte| *byte == b'=');
             let name = parts.next().unwrap_or_default();
             let value = parts.next().unwrap_or_default();
-            pairs.push((Cow::Owned(decode(name)), Cow::Owned(decode(value))));
+            pairs.push((Cow::Owned(decode(name)), Cow::Owned(decode(value)));
         }
         pairs.into_iter()
     }
@@ -128,11 +122,13 @@ mod route_collision;
 mod service_eval;
 mod terminal;
 
+pub mod archive;
 pub mod cache;
 pub mod middleware_plan;
 pub mod relc;
 pub mod runtime_env;
 pub mod runtime_image;
+pub mod script;
 pub mod server_policy;
 pub mod server_rel;
 pub mod source_registry;
@@ -140,8 +136,10 @@ pub mod transpiled_support;
 pub mod transpiler;
 mod video_host;
 pub mod wasm_compiler;
+pub mod workspace;
 
 pub use analyzer::{analyze, Diagnostic, Severity};
+pub use archive::{ArchiveFormat, ArchivePath, ArchivePlan, ArchivePlanError, ArchiveWarmingKey};
 pub use ast::{
     BinaryOp, Expr, FieldBinding, FieldBindingMode, FieldDirective, FieldFile, FieldValueType,
     FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram, Statement, Value,
@@ -169,6 +167,7 @@ pub use relc::{
 };
 pub use runtime_env::{RuntimeEnv, RuntimeEnvError, RuntimeEnvOrigin};
 pub use runtime_image::{RuntimeExecutable, RuntimeImage, RuntimeImageSlot, RuntimeSourceManifest};
+pub use script::{ScriptLanguage, ScriptPath, ScriptPlan, ScriptPlanError};
 pub use server_policy::{
     PolicyOrigin, RecursionPolicy, ResolvedPolicyValue, ServerPolicy, ServerPolicyError,
     ServerStatus,
@@ -185,6 +184,7 @@ pub use wasm_compiler::{
     compile_route as compile_route_wasm, RouteWasmArtifact, RouteWasmCompilation,
     ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
 };
+pub use workspace::{WorkspaceOperation, WorkspacePlan, WorkspacePlanError, WorkspacePath, WorkspaceRoot};
 
 pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
     let tokens = lexer::Lexer::new(source)
@@ -212,12 +212,6 @@ pub fn build_routes_from_image(
     discovery::build_routes_from_image(image, service_interfaces)
 }
 
-/// Build a Runtime Image router with a trusted package-export bridge.
-///
-/// Only the immutable Runtime Image path accepts this caller because RELC has
-/// already validated every `X from Y` import against the verified root-only
-/// `PackageLinkContext`. The legacy filesystem loader intentionally remains
-/// package-runtime-free.
 pub fn build_routes_from_image_with_package_exports(
     image: &RuntimeImage,
     service_interfaces: &ServiceInterfaces,
@@ -230,15 +224,10 @@ pub fn build_routes_from_image_with_package_exports(
     )
 }
 
-/// Validate the immutable Runtime Image against native API namespaces and
-/// route/method collisions before backend boot launches any child processes.
 pub fn validate_runtime_image_routes(image: &RuntimeImage) -> anyhow::Result<()> {
     route_collision::validate_image(image)
 }
 
-/// Reserve one additional runtime-configured native namespace before the HTTP
-/// router is assembled. This is used by optional control-plane surfaces whose
-/// path is not known when RELC performs its static native-route validation.
 pub fn validate_runtime_image_reserved_namespace(
     image: &RuntimeImage,
     prefix: &str,
