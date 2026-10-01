@@ -16,6 +16,7 @@ pub use request::*;
 pub use system_runtime::*;
 
 pub const RBE_SYSTEM_PYTHON: &str = "rbe.sys.python";
+pub const RBE_SYSTEM_PYPY: &str = "rbe.sys.pypy";
 pub const RBE_SYSTEM_NODEJS: &str = "rbe.sys.nodejs";
 pub const RBE_SYSTEM_BUNJS: &str = "rbe.sys.bunjs";
 pub const RBE_SYSTEM_RUST: &str = "rbe.sys.rust";
