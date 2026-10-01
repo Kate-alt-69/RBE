@@ -66,6 +66,34 @@ impl PinnedManagedToolchain {
         Ok(Self { tools })
     }
 
+    /// Rehydrate a previously admitted toolchain from exact path/SHA-256 pins.
+    ///
+    /// Unlike [`Self::pin`], this does not trust the bytes currently found at
+    /// each path as the new identity. The caller supplies the already-admitted
+    /// digest, and construction fails unless every file still matches it. This
+    /// is the runtime-side counterpart to `.rbe/rpx-toolchain.json` admission.
+    pub fn from_pins(
+        pins: impl IntoIterator<Item = (String, PathBuf, String)>,
+    ) -> Result<Self, PinnedToolchainError> {
+        let mut tools = BTreeMap::new();
+        for (name, path, sha256) in pins {
+            if name.is_empty() {
+                return Err(PinnedToolchainError::InvalidToolName(name));
+            }
+            let sha256 = sha256.to_ascii_lowercase();
+            validate_sha256(&sha256)?;
+            let tool = PinnedManagedTool { path, sha256 };
+            tool.verify(&name)?;
+            if tools.insert(name.clone(), tool).is_some() {
+                return Err(PinnedToolchainError::DuplicateTool(name));
+            }
+        }
+        if tools.is_empty() {
+            return Err(PinnedToolchainError::EmptyToolchain);
+        }
+        Ok(Self { tools })
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }
@@ -102,6 +130,13 @@ impl PinnedManagedToolchain {
         }
         ManagedToolchain::new(tools).map_err(PinnedToolchainError::Executor)
     }
+}
+
+fn validate_sha256(value: &str) -> Result<(), PinnedToolchainError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PinnedToolchainError::InvalidToolSha256(value.to_string()));
+    }
+    Ok(())
 }
 
 fn hash_regular_file(path: &Path) -> Result<String, PinnedToolchainError> {
@@ -148,6 +183,12 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), PinnedToolchainError>
 pub enum PinnedToolchainError {
     #[error("managed toolchain must contain at least one tool")]
     EmptyToolchain,
+    #[error("managed tool name must be non-empty")]
+    InvalidToolName(String),
+    #[error("managed toolchain contains duplicate tool {0:?}")]
+    DuplicateTool(String),
+    #[error("invalid managed tool SHA-256 {0:?}")]
+    InvalidToolSha256(String),
     #[error("unknown pinned managed tool {0:?}")]
     UnknownTool(String),
     #[error("managed tool path must be absolute: {0}")]
@@ -228,6 +269,27 @@ mod tests {
         assert!(!pinned.is_empty());
         let verified = pinned.verify_all().unwrap();
         assert_eq!(verified.tools.get("runtime"), Some(&tool));
+    }
+
+    #[test]
+    fn exact_pins_are_rehydrated_without_redefining_identity() {
+        let temp = TestDir::new();
+        let tool = temp.path().join("runtime.bin");
+        std::fs::write(&tool, b"verified-runtime-v1").unwrap();
+        let expected = hash_regular_file(&tool).unwrap();
+        let pinned = PinnedManagedToolchain::from_pins([(
+            "runtime".to_string(),
+            tool.clone(),
+            expected.clone(),
+        )])
+        .unwrap();
+        assert_eq!(pinned.verified_tool("runtime").unwrap().sha256(), expected);
+
+        std::fs::write(&tool, b"replaced-runtime-v2").unwrap();
+        assert!(matches!(
+            PinnedManagedToolchain::from_pins([("runtime".to_string(), tool, expected)]),
+            Err(PinnedToolchainError::ToolHashMismatch { .. })
+        ));
     }
 
     #[test]
