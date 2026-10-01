@@ -155,7 +155,10 @@ async fn verify_published_provider_index(
     verify_local_root_unchanged(store, expected_root)
 }
 
-fn verified_plan_for_audit(store: &CloudNodeStore, expected_root: &str) -> anyhow::Result<SyncPlan> {
+fn verified_plan_for_audit(
+    store: &CloudNodeStore,
+    expected_root: &str,
+) -> anyhow::Result<SyncPlan> {
     let plan = store.sync_plan()?;
     if plan.root_hex() != expected_root {
         anyhow::bail!(
