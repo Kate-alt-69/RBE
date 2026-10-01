@@ -82,6 +82,33 @@ The provider remains authoritative for remote history during initial recovery. A
 
 After a pull, Cloud Node verifies its content-addressed store before materializing the working directory. File payloads are copied through verified temporary files before activation. A failed provider transfer never makes an unverified remote object become working-directory state.
 
+## Backend-owned provider boot
+
+A packaged RBE backend automatically owns the provider-mode Cloud Node lifecycle when a Cloud Node settings file is present beside the backend, or when `RBE_CN_SETTINGS` explicitly points at one.
+
+For normal backend launches the order is:
+
+```text
+backend starts
+  -> validate setting.node.cn.json
+  -> provider + syncOnConnect=true:
+       wait for `cloud_node sync`
+       -> remote history recovery
+       -> verified local CAS recovery
+       -> localSync working-directory restore/reconciliation
+  -> continue normal backend boot
+  -> provider + autoReconnect=true:
+       supervise `cloud_node run`
+```
+
+The initial `cloud_node sync` is blocking on purpose. If provider recovery was requested but fails, backend startup fails instead of allowing the application to boot against stale or empty state. This is especially important on ephemeral deployment hosts.
+
+The supervised `cloud_node run` child is restarted with bounded exponential backoff if it exits unexpectedly. A provider daemon that remains healthy for at least 60 seconds resets the restart failure count.
+
+`backend check`, help/validation invocations, and the separate Vault process do not auto-start provider synchronization. These commands must remain usable during build/preflight without requiring live provider credentials or network access.
+
+The backend does not auto-start peer mode from this path. Provider mode is the no-second-node persistence path; the authenticated peer topology remains a separate Cloud Node deployment mode.
+
 ## Conflict behavior
 
 `conflictPolicy` remains the explicit conflict authority:

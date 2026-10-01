@@ -4,11 +4,13 @@ on:
   push:
     paths:
       - "engine/crates/cloud-node/**"
+      - "engine/crates/backend/src/host_bootstrap.rs"
       - "doc/cloud-node*.md"
       - ".github/workflows/cloud-node-ci.yml"
   pull_request:
     paths:
       - "engine/crates/cloud-node/**"
+      - "engine/crates/backend/src/host_bootstrap.rs"
       - "doc/cloud-node*.md"
       - ".github/workflows/cloud-node-ci.yml"
   workflow_dispatch:
@@ -41,3 +43,24 @@ jobs:
         run: cargo clippy -p cloud-node --all-targets --locked -- -D warnings
       - name: Cloud Node tests
         run: cargo test -p cloud-node --locked
+
+  backend-provider-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Backend format
+        run: cargo fmt -p backend -- --check
+      - name: Backend Cloud Node lifecycle clippy
+        run: cargo clippy -p backend --all-targets --locked -- -D warnings
+      - name: Backend Cloud Node lifecycle tests
+        run: cargo test -p backend --locked host_bootstrap::tests

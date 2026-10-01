@@ -1,12 +1,18 @@
-#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
+use cloud_node::{CloudNodeSettings, SETTINGS_FILE_NAME};
 use rand::RngCore;
 #[cfg(target_os = "linux")]
 use tokio::io::AsyncWriteExt;
 
 const FALLBACK_MASTER_KEY_ENV: &str = "RBE_VAULT_FALLBACK_MASTER_KEY";
+const CLOUD_NODE_SETTINGS_ENV: &str = "RBE_CN_SETTINGS";
+const CLOUD_NODE_STABLE_WINDOW: Duration = Duration::from_secs(60);
+const CLOUD_NODE_RESTART_BASE: Duration = Duration::from_millis(500);
+const CLOUD_NODE_RESTART_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct HostBootstrapReady {
@@ -70,17 +76,220 @@ pub fn verbose_debug(args: &[String]) -> bool {
 }
 
 pub async fn evaluate(args: &[String]) -> anyhow::Result<HostBootstrapReady> {
-    #[cfg(target_os = "linux")]
-    {
-        evaluate_linux(args).await
+    let ready = {
+        #[cfg(target_os = "linux")]
+        {
+            evaluate_linux(args).await?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            HostBootstrapReady {
+                secure_credentials: true,
+            }
+        }
+    };
+
+    if cloud_node_backend_autostart_allowed(args) {
+        start_provider_cloud_node(args).await?;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = args;
-        Ok(HostBootstrapReady {
-            secure_credentials: true,
-        })
+    Ok(ready)
+}
+
+fn cloud_node_backend_autostart_allowed(args: &[String]) -> bool {
+    !args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--vault" | "check" | "--help" | "-h" | "help"))
+}
+
+async fn start_provider_cloud_node(args: &[String]) -> anyhow::Result<()> {
+    let Some(config_path) = resolve_cloud_node_settings_path()? else {
+        return Ok(());
+    };
+    let settings = CloudNodeSettings::load(&config_path).map_err(|error| {
+        anyhow::anyhow!(
+            "Cloud Node settings {} failed backend boot validation: {error:#}",
+            config_path.display()
+        )
+    })?;
+    let Some(provider) = settings.provider.as_ref() else {
+        return Ok(());
+    };
+    if !provider.sync_on_connect && !provider.auto_reconnect {
+        return Ok(());
     }
+
+    let executable = sibling_cloud_node_executable()?;
+    if !executable.is_file() {
+        anyhow::bail!(
+            "Cloud Node provider mode is configured in {}, but the packaged Cloud Node binary is missing at {}",
+            config_path.display(),
+            executable.display()
+        );
+    }
+    let project_root = std::env::current_dir()
+        .map_err(|error| anyhow::anyhow!("resolve backend project root for Cloud Node: {error}"))?
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("canonicalize backend project root for Cloud Node: {error}"))?;
+    let verbose = verbose_debug(args);
+
+    if provider.sync_on_connect {
+        if verbose {
+            eprintln!(
+                "[HostBootstrap/CloudNode] boot synchronization starting config={} project={}",
+                config_path.display(),
+                project_root.display()
+            );
+        }
+        run_cloud_node_boot_sync(&executable, &config_path, &project_root).await?;
+        if verbose {
+            eprintln!("[HostBootstrap/CloudNode] boot synchronization completed");
+        }
+    }
+
+    if provider.auto_reconnect {
+        spawn_cloud_node_supervisor(executable, config_path, project_root, verbose);
+    }
+    Ok(())
+}
+
+fn resolve_cloud_node_settings_path() -> anyhow::Result<Option<PathBuf>> {
+    if let Some(explicit) = std::env::var_os(CLOUD_NODE_SETTINGS_ENV) {
+        let path = PathBuf::from(explicit);
+        if !path.is_file() {
+            anyhow::bail!(
+                "{CLOUD_NODE_SETTINGS_ENV} points to a missing Cloud Node settings file: {}",
+                path.display()
+            );
+        }
+        return Ok(Some(path));
+    }
+
+    let executable = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("resolve backend executable for Cloud Node: {error}"))?;
+    let parent = executable.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "backend executable has no parent directory while resolving {SETTINGS_FILE_NAME}"
+        )
+    })?;
+    let sibling = parent.join(SETTINGS_FILE_NAME);
+    Ok(sibling.is_file().then_some(sibling))
+}
+
+fn sibling_cloud_node_executable() -> anyhow::Result<PathBuf> {
+    let executable = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("resolve backend executable for Cloud Node: {error}"))?;
+    let parent = executable.parent().ok_or_else(|| {
+        anyhow::anyhow!("backend executable has no parent directory for Cloud Node binary")
+    })?;
+    let name = if cfg!(windows) {
+        "cloud_node.exe"
+    } else {
+        "cloud_node"
+    };
+    Ok(parent.join(name))
+}
+
+async fn run_cloud_node_boot_sync(
+    executable: &Path,
+    config_path: &Path,
+    project_root: &Path,
+) -> anyhow::Result<()> {
+    let status = tokio::process::Command::new(executable)
+        .arg(format!("--config={}", config_path.display()))
+        .arg("sync")
+        .env("RBE_PROJECT_ROOT", project_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .status()
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to launch Cloud Node boot synchronization {}: {error}",
+                executable.display()
+            )
+        })?;
+    if !status.success() {
+        anyhow::bail!(
+            "Cloud Node boot synchronization failed with status {status}; backend startup is blocked so recovered/provider state cannot be bypassed"
+        );
+    }
+    Ok(())
+}
+
+fn spawn_cloud_node_supervisor(
+    executable: PathBuf,
+    config_path: PathBuf,
+    project_root: PathBuf,
+    verbose: bool,
+) {
+    let _ = tokio::spawn(async move {
+        let mut consecutive_failures = 0u32;
+        loop {
+            let mut command = tokio::process::Command::new(&executable);
+            command
+                .arg(format!("--config={}", config_path.display()))
+                .arg("run")
+                .env("RBE_PROJECT_ROOT", &project_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true);
+
+            let started = tokio::time::Instant::now();
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let delay = cloud_node_restart_delay(consecutive_failures);
+                    eprintln!(
+                        "[HostBootstrap/CloudNode] daemon spawn failed: {error}; retrying in {}ms",
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+            if verbose {
+                eprintln!(
+                    "[HostBootstrap/CloudNode] provider daemon started pid={:?} config={}",
+                    child.id(),
+                    config_path.display()
+                );
+            }
+
+            let observed = child.wait().await;
+            let uptime = started.elapsed();
+            if uptime >= CLOUD_NODE_STABLE_WINDOW {
+                consecutive_failures = 0;
+            }
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            let delay = cloud_node_restart_delay(consecutive_failures);
+            match observed {
+                Ok(status) => eprintln!(
+                    "[HostBootstrap/CloudNode] daemon exited unexpectedly status={status} uptime_ms={} retry_ms={}",
+                    uptime.as_millis(),
+                    delay.as_millis()
+                ),
+                Err(error) => eprintln!(
+                    "[HostBootstrap/CloudNode] daemon wait failed error={error} uptime_ms={} retry_ms={}",
+                    uptime.as_millis(),
+                    delay.as_millis()
+                ),
+            }
+            tokio::time::sleep(delay).await;
+        }
+    });
+}
+
+fn cloud_node_restart_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(31);
+    let factor = 1u64 << shift;
+    let millis = CLOUD_NODE_RESTART_BASE
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    Duration::from_millis(millis.saturating_mul(factor)).min(CLOUD_NODE_RESTART_MAX)
 }
 
 #[cfg(target_os = "linux")]
@@ -288,5 +497,20 @@ mod tests {
         assert!(validate_fallback_master_key(&"a5".repeat(31)).is_err());
         assert!(validate_fallback_master_key(&"a5".repeat(33)).is_err());
         assert!(validate_fallback_master_key(&format!("{}zz", "a5".repeat(31))).is_err());
+    }
+
+    #[test]
+    fn cloud_node_autostart_skips_auxiliary_modes() {
+        assert!(!cloud_node_backend_autostart_allowed(&["--vault".into()]));
+        assert!(!cloud_node_backend_autostart_allowed(&["check".into()]));
+        assert!(!cloud_node_backend_autostart_allowed(&["--help".into()]));
+        assert!(cloud_node_backend_autostart_allowed(&["-debug".into()]));
+    }
+
+    #[test]
+    fn cloud_node_restart_backoff_is_bounded() {
+        assert_eq!(cloud_node_restart_delay(1), Duration::from_millis(500));
+        assert_eq!(cloud_node_restart_delay(2), Duration::from_secs(1));
+        assert_eq!(cloud_node_restart_delay(32), CLOUD_NODE_RESTART_MAX);
     }
 }
