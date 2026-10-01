@@ -329,6 +329,33 @@ fn restore_missing_bootstrap_checkout(
     Ok(())
 }
 
+fn provider_local_change_policy(
+    relation: ProviderSyncRelation,
+    policy: ProviderConflictPolicy,
+    local_sync_dirty: bool,
+    pending_storage_writes: usize,
+) -> anyhow::Result<bool> {
+    let remote_changed = matches!(
+        relation,
+        ProviderSyncRelation::RemoteAhead | ProviderSyncRelation::Diverged
+    );
+    let has_local_changes = local_sync_dirty || pending_storage_writes > 0;
+    if !remote_changed || !has_local_changes {
+        return Ok(false);
+    }
+
+    match policy {
+        ProviderConflictPolicy::Fail => anyhow::bail!(
+            "Cloud Node provider changed remotely while local state has uncommitted changes (localSyncDirty={local_sync_dirty}, pendingStorageWrites={pending_storage_writes}); refusing to overwrite either side. Synchronize/resolve one side first or explicitly choose conflictPolicy prefer-local/prefer-remote"
+        ),
+        ProviderConflictPolicy::PreferLocal => Ok(true),
+        ProviderConflictPolicy::PreferRemote if pending_storage_writes > 0 => anyhow::bail!(
+            "Cloud Node conflictPolicy prefer-remote cannot silently discard {pending_storage_writes} durable project Storage write intent(s); ingest/resolve those writes first or explicitly choose prefer-local"
+        ),
+        ProviderConflictPolicy::PreferRemote => Ok(false),
+    }
+}
+
 async fn sync_provider_cycle(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
@@ -342,6 +369,7 @@ async fn sync_provider_cycle(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
     let remote = provider_status(settings, store).await?;
+    let pending_storage_writes = storage_sync_journal::ready_intents(project_root)?.len();
     let (local_dirty, restore_missing_checkout) = local_sync
         .map(|local| {
             let status =
@@ -359,24 +387,12 @@ async fn sync_provider_cycle(
         .transpose()?
         .unwrap_or((false, false));
 
-    if local_dirty
-        && matches!(
-            remote.relation,
-            ProviderSyncRelation::RemoteAhead | ProviderSyncRelation::Diverged
-        )
-        && provider.conflict_policy == ProviderConflictPolicy::Fail
-    {
-        anyhow::bail!(
-            "Cloud Node provider changed remotely while localSync has uncommitted directory changes; refusing to overwrite either side. Commit/sync one side first or explicitly choose conflictPolicy prefer-local/prefer-remote"
-        );
-    }
-
-    let prefer_local_dirty = local_dirty
-        && provider.conflict_policy == ProviderConflictPolicy::PreferLocal
-        && matches!(
-            remote.relation,
-            ProviderSyncRelation::RemoteAhead | ProviderSyncRelation::Diverged
-        );
+    let prefer_local_dirty = provider_local_change_policy(
+        remote.relation,
+        provider.conflict_policy,
+        local_dirty,
+        pending_storage_writes,
+    )?;
 
     if matches!(
         remote.relation,
@@ -674,5 +690,44 @@ mod tests {
             Some(Duration::from_millis(900_000)),
             900_000
         ));
+    }
+
+    #[test]
+    fn provider_conflict_policy_includes_pending_storage_journal_writes() {
+        assert!(provider_local_change_policy(
+            ProviderSyncRelation::RemoteAhead,
+            ProviderConflictPolicy::Fail,
+            false,
+            1
+        )
+        .is_err());
+        assert!(provider_local_change_policy(
+            ProviderSyncRelation::Diverged,
+            ProviderConflictPolicy::PreferLocal,
+            false,
+            2
+        )
+        .unwrap());
+        assert!(provider_local_change_policy(
+            ProviderSyncRelation::RemoteAhead,
+            ProviderConflictPolicy::PreferRemote,
+            false,
+            1
+        )
+        .is_err());
+        assert!(!provider_local_change_policy(
+            ProviderSyncRelation::RemoteAhead,
+            ProviderConflictPolicy::PreferRemote,
+            true,
+            0
+        )
+        .unwrap());
+        assert!(!provider_local_change_policy(
+            ProviderSyncRelation::InSync,
+            ProviderConflictPolicy::Fail,
+            false,
+            1
+        )
+        .unwrap());
     }
 }
