@@ -62,7 +62,8 @@ pub async fn synchronize_provider(
 
         if provider_sync_stable(&status) && last_mutating_action.is_none() {
             let expected = status.clone();
-            match verify_stable_provider_snapshot_bytes(settings, store, &expected.local_root).await {
+            match verify_stable_provider_snapshot_bytes(settings, store, &expected.local_root).await
+            {
                 Ok(ProviderSnapshotAudit::Verified) => {
                     status = provider_sync_raw::provider_status(settings, store)
                         .await
@@ -166,9 +167,7 @@ async fn verify_stable_provider_snapshot_bytes(
     for object in plan.ordered() {
         let object_hex = hex::encode(object.object_key);
         let content_hex = hex::encode(object.content_sha256);
-        let base = format!(
-            "snapshots/{expected_root}/objects/{object_hex}/{content_hex}"
-        );
+        let base = format!("snapshots/{expected_root}/objects/{object_hex}/{content_hex}");
 
         let (manifest_sha, manifest_size) = hash_and_size(&object.manifest_path).await?;
         verify_provider_resource(
@@ -183,7 +182,9 @@ async fn verify_stable_provider_snapshot_bytes(
             BlobKind::Folder => {}
             BlobKind::File => {
                 let payload = object.payload_path.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("Cloud Node file sync object has no payload during provider audit")
+                    anyhow::anyhow!(
+                        "Cloud Node file sync object has no payload during provider audit"
+                    )
                 })?;
                 let payload_size = tokio::fs::metadata(payload).await?.len();
                 verify_provider_resource(
@@ -226,9 +227,7 @@ async fn verify_provider_resource(
         .verify_object(key, expected_sha256, expected_size)
         .await
         .map_err(|error| {
-            anyhow::anyhow!(
-                "provider resource {key:?} failed integrity verification: {error:#}"
-            )
+            anyhow::anyhow!("provider resource {key:?} failed integrity verification: {error:#}")
         })
 }
 
