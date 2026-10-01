@@ -76,6 +76,9 @@ pub async fn synchronize_provider(
                         if pass < MAX_PROVIDER_STABILIZATION_PASSES {
                             continue;
                         }
+                        anyhow::bail!(
+                            "Cloud Node provider state changed during the final integrity audit pass; refusing to report an unaudited synchronized state"
+                        );
                     }
                 }
                 Ok(ProviderSnapshotAudit::LocalChanged) => {
@@ -89,6 +92,12 @@ pub async fn synchronize_provider(
                     if pass < MAX_PROVIDER_STABILIZATION_PASSES {
                         continue;
                     }
+                    anyhow::bail!(
+                        "Cloud Node local snapshot changed during the final provider integrity audit pass; refusing to report an unaudited synchronized state (relation={:?}, localHead={}, remoteHead={})",
+                        status.relation,
+                        status.local_head,
+                        status.remote_head.as_deref().unwrap_or("<empty>")
+                    );
                 }
                 Err(audit_error) => {
                     let observed = provider_sync_raw::provider_status(settings, store)
@@ -103,6 +112,12 @@ pub async fn synchronize_provider(
                         if pass < MAX_PROVIDER_STABILIZATION_PASSES {
                             continue;
                         }
+                        anyhow::bail!(
+                            "Cloud Node provider state changed while the final integrity audit was failing; refusing to classify the moved state as corrupted or synchronized (relation={:?}, localHead={}, remoteHead={})",
+                            status.relation,
+                            status.local_head,
+                            status.remote_head.as_deref().unwrap_or("<empty>")
+                        );
                     } else {
                         store.verify().map_err(|local_error| {
                             anyhow::anyhow!(
