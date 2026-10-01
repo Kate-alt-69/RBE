@@ -245,8 +245,9 @@ pub async fn synchronize_upstream(
         );
     }
 
-    // Only remove the durable spool after REMOTE proves the exact root
-    // was committed. Network/protocol failures return earlier and keep it.
+    // REMOTE has already proved the exact root was committed. Outbound cache
+    // removal is post-commit garbage collection and must not turn a successful
+    // synchronization into a reported failure.
     cleanup_outbound_cache(store, &peer.node_id).await?;
     Ok(SyncNegotiation { local, remote })
 }
@@ -453,7 +454,13 @@ pub(crate) async fn cleanup_outbound_cache(
     match durable::remove_dir_all_async(root).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Err(_error) => {
+            // Once a peer has proved activation, or a provider HEAD has been
+            // published, this cache is only disposable local garbage. Leave it
+            // in place for a later matching-root cleanup instead of changing the
+            // already-committed synchronization result into a failure.
+            Ok(())
+        }
     }
 }
 
@@ -726,6 +733,21 @@ mod tests {
 
         cleanup_outbound_cache(&store, "remote-test").await.unwrap();
         assert!(!outbound_peer_cache_root(&store, "remote-test").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_cache_cleanup_failure_is_non_fatal() {
+        let root = cache_test_root("cleanup-non-fatal");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = CloudNodeStore::open(&cache_test_settings(&root)).unwrap();
+        let peer_root = outbound_peer_cache_root(&store, "remote-test");
+        std::fs::create_dir_all(peer_root.parent().unwrap()).unwrap();
+        std::fs::write(&peer_root, b"not-a-directory").unwrap();
+
+        cleanup_outbound_cache(&store, "remote-test").await.unwrap();
+        assert!(peer_root.is_file());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
