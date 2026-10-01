@@ -20,6 +20,35 @@ export type HostSessionInfo = Readonly<{
   features: readonly string[];
 }>;
 
+export type DnsAddressReply = Readonly<{
+  name: string;
+  addresses: readonly string[];
+}>;
+
+export type DnsMxRecord = Readonly<{
+  preference: number;
+  exchange: string;
+}>;
+
+export type DnsMxReply = Readonly<{
+  name: string;
+  records: readonly DnsMxRecord[];
+}>;
+
+export type TcpConnectReply = Readonly<{
+  handle: string;
+  peer: string;
+}>;
+
+export type TcpWriteReply = Readonly<{
+  written: number;
+}>;
+
+export type TcpReadReply = Readonly<{
+  data: readonly number[];
+  eof: boolean;
+}>;
+
 export interface HostBridge {
   call(request: HostRequest): unknown | Promise<unknown>;
   sessionInfo?(): HostSessionInfo | null;
@@ -91,6 +120,21 @@ export declare class LoggerClient {
   fatal(message: unknown): unknown | Promise<unknown>;
 }
 
+export declare class DnsClient extends CapabilityClient {
+  constructor(bridge: HostBridge);
+  lookup(name: string): DnsAddressReply | Promise<DnsAddressReply>;
+  ip(name: string): DnsAddressReply | Promise<DnsAddressReply>;
+  mx(name: string): DnsMxReply | Promise<DnsMxReply>;
+}
+
+export declare class TcpClient extends CapabilityClient {
+  constructor(bridge: HostBridge);
+  connect(host: string, port: number, timeoutMs?: number | null): TcpConnectReply | Promise<TcpConnectReply>;
+  write(handle: string, data: Uint8Array | readonly number[], timeoutMs?: number | null): TcpWriteReply | Promise<TcpWriteReply>;
+  read(handle: string, maxBytes: number, timeoutMs?: number | null): TcpReadReply | Promise<TcpReadReply>;
+  close(handle: string): null | Promise<null>;
+}
+
 export declare class NetClient {
   constructor(bridge: HostBridge);
   sublibrary(name: string): CapabilityClient;
@@ -98,9 +142,9 @@ export declare class NetClient {
   cookies(): CapabilityClient;
   headers(): CapabilityClient;
   url(): CapabilityClient;
-  dns(): CapabilityClient;
+  dns(): DnsClient;
   ip(): CapabilityClient;
-  tcp(): CapabilityClient;
+  tcp(): TcpClient;
   udp(): CapabilityClient;
   quic(): CapabilityClient;
   websocket(): CapabilityClient;
