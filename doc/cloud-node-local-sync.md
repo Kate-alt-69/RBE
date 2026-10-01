@@ -82,6 +82,20 @@ The provider remains authoritative for remote history during initial recovery. A
 
 After a pull, Cloud Node verifies its content-addressed store before materializing the working directory. File payloads are copied through verified temporary files before activation. A failed provider transfer never makes an unverified remote object become working-directory state.
 
+### Empty working directory during boot
+
+Backend bootstrap uses a recovery-only form of the sync command:
+
+```text
+cloud_node sync --bootstrap
+```
+
+This protects a second fresh-host case: the Cloud Node CAS/history may already contain valid backed-up objects while `localSync.directory` is completely empty because the application working directory was recreated or lost. During bootstrap only, an empty working directory plus existing managed Cloud Node objects is treated as a missing checkout and is restored from the verified current CAS before the local scanner can interpret that emptiness as a mass deletion.
+
+This behavior is deliberately limited to bootstrap. Normal `cloud_node sync` and the continuously supervised `cloud_node run` retain ordinary deletion semantics, so deleting files while the node is operating still creates a new snapshot/history state instead of silently restoring those files.
+
+If both the local CAS and working directory are empty but the provider has history, the existing remote-first rule still applies: Cloud Node pulls the provider snapshot, verifies it, imports provider history, and then materializes `localSync.directory`.
+
 ## Backend-owned provider boot
 
 A packaged RBE backend automatically owns the provider-mode Cloud Node lifecycle when a Cloud Node settings file is present beside the backend, or when `RBE_CN_SETTINGS` explicitly points at one.
@@ -92,16 +106,17 @@ For normal backend launches the order is:
 backend starts
   -> validate setting.node.cn.json
   -> provider + syncOnConnect=true:
-       wait for `cloud_node sync`
-       -> remote history recovery
-       -> verified local CAS recovery
-       -> localSync working-directory restore/reconciliation
+       wait for `cloud_node sync --bootstrap`
+       -> inspect remote history before local mutation
+       -> recover/adopt remote state when required
+       -> restore an empty checkout from the verified CAS when required
+       -> reconcile local working-directory state
   -> continue normal backend boot
   -> provider + autoReconnect=true:
        supervise `cloud_node run`
 ```
 
-The initial `cloud_node sync` is blocking on purpose. If provider recovery was requested but fails, backend startup fails instead of allowing the application to boot against stale or empty state. This is especially important on ephemeral deployment hosts.
+The initial `cloud_node sync --bootstrap` is blocking on purpose. If provider recovery was requested but fails, backend startup fails instead of allowing the application to boot against stale or empty state. This is especially important on ephemeral deployment hosts.
 
 The supervised `cloud_node run` child is restarted with bounded exponential backoff if it exits unexpectedly. A provider daemon that remains healthy for at least 60 seconds resets the restart failure count.
 
@@ -113,9 +128,11 @@ The backend does not auto-start peer mode from this path. Provider mode is the n
 
 `conflictPolicy` remains the explicit conflict authority:
 
-- `fail` (default): when REMOTE advanced while `localSync.directory` contains uncommitted local changes, Cloud Node refuses to overwrite either side.
+- `fail` (default): when REMOTE advanced while `localSync.directory` contains uncommitted directory changes, Cloud Node refuses to overwrite either side.
 - `prefer-local`: local working-directory changes may intentionally become the winning provider history.
 - `prefer-remote`: the provider history may intentionally replace local working-directory changes.
+
+A completely empty working directory handled by `sync --bootstrap` is not classified as an uncommitted mass deletion when the local CAS still has managed objects. Partial/non-empty local edits remain normal local changes and still participate in the conflict policy.
 
 The default is deliberately conservative. Cloud Node does not silently choose one branch after both sides changed.
 
@@ -131,13 +148,21 @@ With a provider this performs remote-first recovery, watched-directory reconcili
 
 With a peer it scans local inputs and performs the existing authenticated peer synchronization behavior.
 
+### Backend bootstrap recovery cycle
+
+```text
+cloud_node sync --bootstrap
+```
+
+This is the provider-only recovery-safe boot variant. In addition to remote-first synchronization it restores a completely empty watched directory from already-managed CAS objects before the scanner can turn an empty checkout into deletions. RBE backend startup invokes this automatically when provider `syncOnConnect` is enabled.
+
 ### Continuous mode
 
 ```text
 cloud_node run
 ```
 
-When provider `syncOnConnect` is `true`, every provider poll performs the same full cycle as `sync`. Healthy provider polling uses `pollIntervalMs`; failures use the existing capped exponential reconnect backoff.
+When provider `syncOnConnect` is `true`, every provider poll performs the normal full cycle. Healthy provider polling uses `pollIntervalMs`; failures use the existing capped exponential reconnect backoff. Continuous mode does not use the bootstrap-only empty-checkout exception.
 
 ### Provider-only reconciliation
 
