@@ -45,6 +45,17 @@ fn value_string<'a>(value: Option<&'a Value>, label: &str) -> Result<&'a str, Pu
     }
 }
 
+fn positive_timeout_ms(value: &serde_json::Number) -> Option<u64> {
+    if let Some(value) = value.as_u64() {
+        return (value >= 1).then_some(value.min(PUBLIC_HTTP_MAX_TIMEOUT_MS));
+    }
+
+    value.as_f64().and_then(|value| {
+        (value.is_finite() && value >= 1.0 && value.fract() == 0.0)
+            .then(|| (value as u64).min(PUBLIC_HTTP_MAX_TIMEOUT_MS))
+    })
+}
+
 fn forbidden_ipv4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     ip.is_private()
@@ -183,12 +194,8 @@ fn parse_http_call(operation: &str, args: &[Value]) -> Result<HttpCall, PublicHt
             let url = value_string(options.get("url"), "HTTP URL")?.to_string();
             let timeout_ms = match options.get("timeoutMs") {
                 None => PUBLIC_HTTP_DEFAULT_TIMEOUT_MS,
-                Some(Value::Number(value)) if value.as_u64().is_some_and(|value| value >= 1) => {
-                    value
-                        .as_u64()
-                        .unwrap_or(PUBLIC_HTTP_DEFAULT_TIMEOUT_MS)
-                        .min(PUBLIC_HTTP_MAX_TIMEOUT_MS)
-                }
+                Some(Value::Number(value)) => positive_timeout_ms(value)
+                    .ok_or_else(|| http_error("HTTP timeoutMs must be a positive integer"))?,
                 Some(_) => return Err(http_error("HTTP timeoutMs must be a positive integer")),
             };
             (
@@ -393,6 +400,22 @@ mod tests {
             "headers": {"Host": "evil.example"}
         });
         assert!(parse_http_call("request", &[request]).is_err());
+    }
+
+    #[test]
+    fn parser_accepts_integral_float_timeout_from_rel_numbers() {
+        let request = serde_json::json!({
+            "url": "https://example.com/",
+            "timeoutMs": 10_000.0
+        });
+        let call = parse_http_call("request", &[request]).expect("integral REL timeout must work");
+        assert_eq!(call.timeout, Duration::from_millis(10_000));
+
+        let fractional = serde_json::json!({
+            "url": "https://example.com/",
+            "timeoutMs": 1_000.5
+        });
+        assert!(parse_http_call("request", &[fractional]).is_err());
     }
 
     #[test]
