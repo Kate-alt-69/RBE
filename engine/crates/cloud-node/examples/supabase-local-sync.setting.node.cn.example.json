@@ -1,0 +1,41 @@
+{
+  "formatVersion": 1,
+  "node": {
+    "id": "render-main",
+    "mode": "primary",
+    "storageRoot": "./.rbe-cloud-node",
+    "backupVersions": 5,
+    "preserveOriginal": true,
+    "videoChunkBytes": 4194304
+  },
+  "localSync": {
+    "directory": "./data",
+    "logicalPrefix": "workspace"
+  },
+  "provider": {
+    "kind": "s3",
+    "namespace": "production",
+    "bucket": "kastrick-backend-storage",
+    "endpoint": "https://PROJECT_REF.storage.supabase.co/storage/v1/s3",
+    "region": "PROJECT_REGION",
+    "auth": {
+      "mode": "aws-sig-v4",
+      "accessKeyEnv": "RBE_CN_PROV_SUPABASE_ACCESS_KEY",
+      "secretKeyEnv": "RBE_CN_PROV_SUPABASE_SECRET_KEY"
+    },
+    "prefix": "rbe-cloud-node",
+    "conflictPolicy": "fail",
+    "autoReconnect": true,
+    "syncOnConnect": true,
+    "reconnectDelayMs": 2000,
+    "maxReconnectDelayMs": 60000,
+    "pollIntervalMs": 30000,
+    "connectTimeoutMs": 10000,
+    "readTimeoutMs": 60000
+  },
+  "replication": {
+    "requireBootRecovery": false,
+    "bootRecoveryTimeoutMs": 60000,
+    "targets": []
+  }
+}

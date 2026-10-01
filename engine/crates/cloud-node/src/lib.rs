@@ -11,6 +11,7 @@ mod crypto;
 mod durable;
 mod format;
 mod ingest;
+mod local_sync;
 mod protocol;
 #[cfg(feature = "client")]
 mod provider;
@@ -48,6 +49,10 @@ pub use crypto::{
 };
 pub use format::{
     BlobKind, BlobManifest, ByteRangeChange, ChunkRef, FolderEntry, BLOB_FORMAT_VERSION,
+};
+pub use local_sync::{
+    load_local_sync_settings, LocalDirectoryRestoreResult, LocalDirectoryStatus,
+    LocalDirectorySyncResult, LocalSyncSettings,
 };
 pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
 #[cfg(feature = "client")]

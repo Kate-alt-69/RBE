@@ -2,10 +2,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cloud_node::{
-    ingest_registry_export, load_signing_key_from_env, negotiate_sync, probe_upstream,
-    provider_status, public_key_hex, synchronize_provider, synchronize_registry_export,
-    synchronize_upstream, CloudNodeSettings, CloudNodeStore, ProviderClient, SETTINGS_FILE_NAME,
+    ingest_registry_export, load_local_sync_settings, load_signing_key_from_env, negotiate_sync,
+    probe_upstream, provider_status, public_key_hex, synchronize_provider,
+    synchronize_registry_export, synchronize_upstream, CloudNodeSettings, CloudNodeStore,
+    LocalSyncSettings, ProviderConflictPolicy, ProviderClient, ProviderSyncAction,
+    ProviderSyncRelation, ProviderSyncResult, SETTINGS_FILE_NAME,
 };
+
+struct LocalSyncRuntime {
+    settings: LocalSyncSettings,
+    directory: PathBuf,
+}
 
 #[tokio::main]
 async fn main() {
@@ -33,7 +40,16 @@ async fn run() -> anyhow::Result<()> {
     let settings = CloudNodeSettings::load(&config_path)?;
     let store = CloudNodeStore::open(&settings)?;
     let project_root = cloud_node_project_root(&config_path)?;
-    ingest_project_writes(&store, &project_root)?;
+    let local_sync = load_local_sync_settings(&config_path)?
+        .map(|local_settings| {
+            let directory = local_settings.resolve_directory(&config_path)?;
+            Ok::<_, anyhow::Error>(LocalSyncRuntime {
+                settings: local_settings,
+                directory,
+            })
+        })
+        .transpose()?;
+
     match command {
         "evaluate" => {
             let summary = store.summary();
@@ -43,6 +59,17 @@ async fn run() -> anyhow::Result<()> {
             println!("backup={}", summary.backup.display());
             println!("syncRoot={}", plan.root_hex());
             println!("syncObjects={}", plan.object_count());
+            if let Some(local) = &local_sync {
+                let status = store.local_directory_status(
+                    &local.directory,
+                    &local.settings.logical_prefix,
+                )?;
+                println!("localSyncDirectory={}", local.directory.display());
+                println!("localSyncPrefix={}", local.settings.logical_prefix);
+                println!("localSyncDirty={}", status.dirty);
+                println!("localSyncFiles={}", status.scanned_files);
+                println!("localSyncObjects={}", status.managed_objects);
+            }
             if let Some(upstream) = &settings.upstream {
                 println!("transport=peer");
                 println!("upstream={}", upstream.url);
@@ -70,6 +97,7 @@ async fn run() -> anyhow::Result<()> {
             println!("rootsMatch={}", negotiation.roots_match());
         }
         "sync-upstream" => {
+            sync_local_inputs(&store, &project_root, local_sync.as_ref())?;
             let peer = probe_upstream(&settings).await?;
             let negotiation = synchronize_upstream(&settings, &store, &peer).await?;
             println!("authenticated={}", peer.node_id);
@@ -104,10 +132,29 @@ async fn run() -> anyhow::Result<()> {
         }
         "sync-provider" => {
             let result = synchronize_provider(&settings, &store).await?;
-            println!("before={:?}", result.before.relation);
-            println!("action={:?}", result.action);
-            println!("head={}", result.final_head);
-            println!("root={}", result.final_root);
+            print_provider_result(&result);
+        }
+        "sync" => {
+            if settings.provider.is_some() {
+                let result = sync_provider_cycle(
+                    &settings,
+                    &store,
+                    &project_root,
+                    local_sync.as_ref(),
+                )
+                .await?;
+                print_provider_result(&result);
+            } else if settings.upstream.is_some() {
+                sync_local_inputs(&store, &project_root, local_sync.as_ref())?;
+                let peer = probe_upstream(&settings).await?;
+                let negotiation = synchronize_upstream(&settings, &store, &peer).await?;
+                println!("authenticated={}", peer.node_id);
+                println!("localRoot={}", hex::encode(negotiation.local.root_sha256));
+                println!("remoteRoot={}", hex::encode(negotiation.remote.root_sha256));
+                println!("rootsMatch={}", negotiation.roots_match());
+            } else {
+                anyhow::bail!("Cloud Node sync requires an upstream or provider configuration");
+            }
         }
         "ingest-registry" => {
             if args.len() != 2 {
@@ -141,7 +188,15 @@ async fn run() -> anyhow::Result<()> {
             println!("head={}", result.provider.final_head);
             println!("root={}", result.provider.final_root);
         }
-        "run" => run_daemon(&settings, &store, &project_root).await?,
+        "run" => {
+            run_daemon(
+                &settings,
+                &store,
+                &project_root,
+                local_sync.as_ref(),
+            )
+            .await?
+        }
         "sync-plan" => {
             let plan = store.sync_plan()?;
             println!("root={}", plan.root_hex());
@@ -193,28 +248,131 @@ fn ingest_project_writes(store: &CloudNodeStore, project_root: &Path) -> anyhow:
     Ok(())
 }
 
+fn sync_local_inputs(
+    store: &CloudNodeStore,
+    project_root: &Path,
+    local_sync: Option<&LocalSyncRuntime>,
+) -> anyhow::Result<()> {
+    ingest_project_writes(store, project_root)?;
+    if let Some(local) = local_sync {
+        let result = store.sync_local_directory(&local.directory, &local.settings.logical_prefix)?;
+        if result.stored > 0 || result.removed > 0 {
+            eprintln!(
+                "cloud_node: localSync scanned={} stored={} removed={} unchanged={} directory={}",
+                result.scanned_files,
+                result.stored,
+                result.removed,
+                result.unchanged,
+                local.directory.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn restore_local_after_pull(
+    store: &CloudNodeStore,
+    local_sync: Option<&LocalSyncRuntime>,
+    action: ProviderSyncAction,
+) -> anyhow::Result<()> {
+    if !matches!(action, ProviderSyncAction::Pull | ProviderSyncAction::ForcedPull) {
+        return Ok(());
+    }
+    let Some(local) = local_sync else {
+        return Ok(());
+    };
+    let result = store.restore_local_directory(&local.directory, &local.settings.logical_prefix)?;
+    eprintln!(
+        "cloud_node: provider pull restored localSync restored={} removed={} unchanged={} directory={}",
+        result.restored,
+        result.removed,
+        result.unchanged,
+        local.directory.display()
+    );
+    Ok(())
+}
+
+async fn sync_provider_cycle(
+    settings: &CloudNodeSettings,
+    store: &CloudNodeStore,
+    project_root: &Path,
+    local_sync: Option<&LocalSyncRuntime>,
+) -> anyhow::Result<ProviderSyncResult> {
+    let provider = settings
+        .provider
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
+    let remote = provider_status(settings, store).await?;
+    let local_dirty = local_sync
+        .map(|local| {
+            store
+                .local_directory_status(&local.directory, &local.settings.logical_prefix)
+                .map(|status| status.dirty)
+        })
+        .transpose()?
+        .unwrap_or(false);
+
+    if local_dirty
+        && matches!(
+            remote.relation,
+            ProviderSyncRelation::RemoteAhead | ProviderSyncRelation::Diverged
+        )
+        && provider.conflict_policy == ProviderConflictPolicy::Fail
+    {
+        anyhow::bail!(
+            "Cloud Node provider changed remotely while localSync has uncommitted directory changes; refusing to overwrite either side. Commit/sync one side first or explicitly choose conflictPolicy prefer-local/prefer-remote"
+        );
+    }
+
+    let prefer_local_dirty = local_dirty
+        && provider.conflict_policy == ProviderConflictPolicy::PreferLocal
+        && matches!(
+            remote.relation,
+            ProviderSyncRelation::RemoteAhead | ProviderSyncRelation::Diverged
+        );
+
+    if matches!(
+        remote.relation,
+        ProviderSyncRelation::RemoteAhead | ProviderSyncRelation::Diverged
+    ) && !prefer_local_dirty
+    {
+        // Git-like recovery rule: reconcile the provider history before any
+        // working-tree/project mutation. An empty local store therefore adopts
+        // the provider head instead of manufacturing a conflicting root.
+        let recovered = synchronize_provider(settings, store).await?;
+        restore_local_after_pull(store, local_sync, recovered.action)?;
+    }
+
+    sync_local_inputs(store, project_root, local_sync)?;
+    let result = synchronize_provider(settings, store).await?;
+    restore_local_after_pull(store, local_sync, result.action)?;
+    Ok(result)
+}
+
 async fn run_daemon(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
     project_root: &Path,
+    local_sync: Option<&LocalSyncRuntime>,
 ) -> anyhow::Result<()> {
     if settings.provider.is_some() {
-        return run_provider_daemon(settings, store, project_root).await;
+        return run_provider_daemon(settings, store, project_root, local_sync).await;
     }
-    run_peer_daemon(settings, store, project_root).await
+    run_peer_daemon(settings, store, project_root, local_sync).await
 }
 
 async fn run_peer_daemon(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
     project_root: &Path,
+    local_sync: Option<&LocalSyncRuntime>,
 ) -> anyhow::Result<()> {
     let upstream = settings
         .upstream
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node run mode requires an upstream or provider"))?;
     loop {
-        ingest_project_writes(store, project_root)?;
+        sync_local_inputs(store, project_root, local_sync)?;
         match probe_upstream(settings).await {
             Ok(peer) => {
                 println!(
@@ -262,6 +420,7 @@ async fn run_provider_daemon(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
     project_root: &Path,
+    local_sync: Option<&LocalSyncRuntime>,
 ) -> anyhow::Result<()> {
     let provider = settings
         .provider
@@ -271,19 +430,21 @@ async fn run_provider_daemon(
     let mut retry_delay_ms = provider.reconnect_delay_ms;
     let mut write_probe_verified = false;
     loop {
-        ingest_project_writes(store, project_root)?;
         let result = if provider.sync_on_connect {
-            synchronize_provider(settings, store).await.map(|sync| {
-                println!(
-                    "Cloud Node provider sync target={} before={:?} action={:?} head={} root={}",
-                    client.target_description(),
-                    sync.before.relation,
-                    sync.action,
-                    sync.final_head,
-                    sync.final_root
-                );
-            })
+            sync_provider_cycle(settings, store, project_root, local_sync)
+                .await
+                .map(|sync| {
+                    println!(
+                        "Cloud Node provider sync target={} before={:?} action={:?} head={} root={}",
+                        client.target_description(),
+                        sync.before.relation,
+                        sync.action,
+                        sync.final_head,
+                        sync.final_root
+                    );
+                })
         } else {
+            sync_local_inputs(store, project_root, local_sync)?;
             let probe = if write_probe_verified {
                 client.probe_read_only().await
             } else {
@@ -323,6 +484,13 @@ async fn run_provider_daemon(
         };
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
+}
+
+fn print_provider_result(result: &ProviderSyncResult) {
+    println!("before={:?}", result.before.relation);
+    println!("action={:?}", result.action);
+    println!("head={}", result.final_head);
+    println!("root={}", result.final_root);
 }
 
 fn take_config_arg(args: &mut Vec<String>) -> anyhow::Result<Option<PathBuf>> {
@@ -375,6 +543,6 @@ fn default_config_path() -> PathBuf {
 
 fn print_help() {
     println!(
-        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|ingest-registry <export-root>|sync-registry <export-root>|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
+        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|sync|ingest-registry <export-root>|sync-registry <export-root>|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
     );
 }
