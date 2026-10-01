@@ -2,11 +2,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cloud_node::{
-    ingest_registry_export, load_local_sync_settings, load_signing_key_from_env, negotiate_sync,
-    probe_upstream, provider_status, public_key_hex, synchronize_provider,
-    synchronize_registry_export, synchronize_upstream, CloudNodeSettings, CloudNodeStore,
-    LocalSyncSettings, ProviderClient, ProviderConflictPolicy, ProviderSyncAction,
-    ProviderSyncRelation, ProviderSyncResult, SETTINGS_FILE_NAME,
+    discover_settings_path, ingest_registry_export, load_local_sync_settings,
+    load_signing_key_from_env, negotiate_sync, probe_upstream, provider_status, public_key_hex,
+    synchronize_provider, synchronize_registry_export, synchronize_upstream, CloudNodeSettings,
+    CloudNodeStore, LocalSyncSettings, ProviderClient, ProviderConflictPolicy, ProviderSyncAction,
+    ProviderSyncRelation, ProviderSyncResult, PREFERRED_SETTINGS_FILE_NAME,
 };
 
 struct LocalSyncRuntime {
@@ -24,7 +24,10 @@ async fn main() {
 
 async fn run() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    let config_path = take_config_arg(&mut args)?.unwrap_or_else(default_config_path);
+    let config_path = match take_config_arg(&mut args)? {
+        Some(path) => path,
+        None => default_config_path()?,
+    };
     let command = args.first().map(String::as_str).unwrap_or("evaluate");
 
     if matches!(command, "--help" | "-h") {
@@ -647,20 +650,24 @@ fn cloud_node_project_root(config_path: &Path) -> anyhow::Result<PathBuf> {
     Ok(root)
 }
 
-fn default_config_path() -> PathBuf {
-    std::env::var_os("RBE_CN_SETTINGS")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(|parent| parent.join(SETTINGS_FILE_NAME)))
-        })
-        .unwrap_or_else(|| PathBuf::from(SETTINGS_FILE_NAME))
+fn default_config_path() -> anyhow::Result<PathBuf> {
+    if let Some(explicit) = std::env::var_os("RBE_CN_SETTINGS") {
+        return Ok(PathBuf::from(explicit));
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("resolve cloud_node executable for settings: {error}"))?;
+    if let Some(discovered) = discover_settings_path(&executable)? {
+        return Ok(discovered);
+    }
+    let parent = executable.parent().ok_or_else(|| {
+        anyhow::anyhow!("cloud_node executable has no parent directory for settings")
+    })?;
+    Ok(parent.join(PREFERRED_SETTINGS_FILE_NAME))
 }
 
 fn print_help() {
     println!(
-        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|sync [--bootstrap]|ingest-registry <export-root>|sync-registry <export-root>|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
+        "cloud_node [--config=<setting.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|sync [--bootstrap]|ingest-registry <export-root>|sync-registry <export-root>|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
     );
 }
 
