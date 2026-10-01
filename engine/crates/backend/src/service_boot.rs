@@ -96,6 +96,7 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
             );
         }
     }
+    prefer_kernel_parent_liveness_on_linux()?;
     let program = route_engine::parse_service_source(&source).map_err(|error| {
         anyhow::anyhow!(
             "service host failed to parse {}:{}:{}: {}",
@@ -111,8 +112,7 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     }
     .map_err(|errors| {
         anyhow::anyhow!(
-            "service host module compilation failed:
-{}",
+            "service host module compilation failed:\n{}",
             errors.render()
         )
     })?;
@@ -132,6 +132,53 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         Arc::new(executor),
     )
     .await
+}
+
+#[cfg(target_os = "linux")]
+fn prefer_kernel_parent_liveness_on_linux() -> anyhow::Result<()> {
+    if std::env::var_os("RBE_PARENT_LIVENESS_PIPE").is_none() {
+        return Ok(());
+    }
+
+    use std::os::raw::{c_int, c_ulong};
+
+    const PR_SET_PDEATHSIG: c_int = 1;
+    const SIGTERM: c_ulong = 15;
+
+    unsafe extern "C" {
+        fn getppid() -> c_int;
+        fn prctl(option: c_int, ...) -> c_int;
+    }
+
+    let parent_pid = unsafe { getppid() };
+    if parent_pid <= 1 {
+        anyhow::bail!("service parent disappeared before Linux parent-death guard could be armed");
+    }
+
+    let armed = unsafe { prctl(PR_SET_PDEATHSIG, SIGTERM) };
+    if armed != 0 {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(
+            error = %error,
+            "failed to arm Linux parent-death signal; retaining pipe watcher fallback"
+        );
+        return Ok(());
+    }
+
+    if unsafe { getppid() } != parent_pid {
+        anyhow::bail!("service parent exited while Linux parent-death guard was being armed");
+    }
+
+    // All inherited bootstrap frames have already been consumed and verified.
+    // From here Linux relies on PR_SET_PDEATHSIG instead of allocating one
+    // dedicated blocking thread per service merely to wait for stdin EOF.
+    std::env::remove_var("RBE_PARENT_LIVENESS_PIPE");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prefer_kernel_parent_liveness_on_linux() -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn canonical_runtime_root(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
