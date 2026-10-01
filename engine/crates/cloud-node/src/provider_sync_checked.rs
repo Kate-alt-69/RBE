@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
@@ -12,6 +14,33 @@ pub use crate::provider_sync_guard::{
     ProviderSyncStatus,
 };
 use crate::store::CloudNodeStore;
+use crate::sync::{SyncPlan, SyncPlanHeader};
+use crate::transfer::TransferResource;
+
+const SNAPSHOT_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublishedSnapshotIndex {
+    format_version: u16,
+    root_sha256: String,
+    folder_count: u32,
+    video_count: u32,
+    file_count: u32,
+    resources: Vec<PublishedSnapshotResource>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublishedSnapshotResource {
+    kind: u8,
+    resource: u8,
+    object_key: String,
+    content_sha256: String,
+    resource_sha256: String,
+    size: u64,
+    key: String,
+}
 
 /// Run the stabilized provider transaction and, for transports that cannot
 /// cryptographically prove the uploaded body at write time, read back the
@@ -22,7 +51,8 @@ use crate::store::CloudNodeStore;
 /// download every freshly uploaded object again. Direct Supabase, Azure Blob,
 /// Google Cloud Storage, and generic HTTP uploads do not currently expose the
 /// same SHA-256 write proof through this provider interface, so a mutating push
-/// gets one bounded byte-for-byte readback here.
+/// gets one bounded byte-for-byte readback here. The immutable snapshot index is
+/// also re-read and compared to the exact resource metadata that was verified.
 pub async fn synchronize_provider(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
@@ -100,19 +130,24 @@ async fn verify_published_provider_snapshot(
     }
 
     let client = ProviderClient::new(provider)?;
+    let mut expected_resources = Vec::new();
     for object in plan.ordered() {
         let object_hex = hex::encode(object.object_key);
         let content_hex = hex::encode(object.content_sha256);
         let base = format!("snapshots/{expected_root}/objects/{object_hex}/{content_hex}");
 
         let (manifest_sha, manifest_size) = hash_and_size(&object.manifest_path).await?;
-        verify_provider_resource(
-            &client,
-            &format!("{base}/{}", object.kind.manifest_name()),
+        let manifest_key = format!("{base}/{}", object.kind.manifest_name());
+        verify_provider_resource(&client, &manifest_key, manifest_sha, manifest_size).await?;
+        expected_resources.push(snapshot_resource(
+            object.kind,
+            TransferResource::Manifest,
+            &object_hex,
+            &content_hex,
             manifest_sha,
             manifest_size,
-        )
-        .await?;
+            manifest_key,
+        ));
 
         match object.kind {
             BlobKind::Folder => {}
@@ -131,29 +166,45 @@ async fn verify_published_provider_snapshot(
                         )
                     })?
                     .len();
+                let payload_key = format!("{base}/payload");
                 verify_provider_resource(
                     &client,
-                    &format!("{base}/payload"),
+                    &payload_key,
                     object.content_sha256,
                     payload_size,
                 )
                 .await?;
+                expected_resources.push(snapshot_resource(
+                    object.kind,
+                    TransferResource::FilePayload,
+                    &object_hex,
+                    &content_hex,
+                    object.content_sha256,
+                    payload_size,
+                    payload_key,
+                ));
             }
             BlobKind::Video => {
                 for chunk_path in &object.chunk_paths {
                     let (chunk_sha, chunk_size) = hash_and_size(chunk_path).await?;
                     let chunk_hex = hex::encode(chunk_sha);
-                    verify_provider_resource(
-                        &client,
-                        &format!("{base}/chunks/{chunk_hex}.chunk"),
+                    let chunk_key = format!("{base}/chunks/{chunk_hex}.chunk");
+                    verify_provider_resource(&client, &chunk_key, chunk_sha, chunk_size).await?;
+                    expected_resources.push(snapshot_resource(
+                        object.kind,
+                        TransferResource::VideoChunk,
+                        &object_hex,
+                        &content_hex,
                         chunk_sha,
                         chunk_size,
-                    )
-                    .await?;
+                        chunk_key,
+                    ));
                 }
             }
         }
     }
+
+    verify_provider_snapshot_index(&client, &plan, expected_root, &expected_resources).await?;
 
     let after = store.sync_plan()?.root_hex();
     if after != expected_root {
@@ -162,6 +213,90 @@ async fn verify_published_provider_snapshot(
         );
     }
     Ok(())
+}
+
+fn snapshot_resource(
+    kind: BlobKind,
+    resource: TransferResource,
+    object_key: &str,
+    content_sha256: &str,
+    resource_sha256: [u8; 32],
+    size: u64,
+    key: String,
+) -> PublishedSnapshotResource {
+    PublishedSnapshotResource {
+        kind: kind as u8,
+        resource: resource as u8,
+        object_key: object_key.to_owned(),
+        content_sha256: content_sha256.to_owned(),
+        resource_sha256: hex::encode(resource_sha256),
+        size,
+        key,
+    }
+}
+
+async fn verify_provider_snapshot_index(
+    client: &ProviderClient,
+    plan: &SyncPlan,
+    expected_root: &str,
+    expected_resources: &[PublishedSnapshotResource],
+) -> anyhow::Result<()> {
+    let key = format!("snapshots/{expected_root}/index.json");
+    let bytes = client.get(&key).await?.ok_or_else(|| {
+        anyhow::anyhow!("Cloud Node published provider snapshot index {key:?} is missing")
+    })?;
+    let index: PublishedSnapshotIndex = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!("Cloud Node published provider snapshot index {key:?} is invalid: {error}")
+    })?;
+    verify_snapshot_index_metadata(&index, expected_root, plan.header()?, expected_resources)
+}
+
+fn verify_snapshot_index_metadata(
+    index: &PublishedSnapshotIndex,
+    expected_root: &str,
+    header: SyncPlanHeader,
+    expected_resources: &[PublishedSnapshotResource],
+) -> anyhow::Result<()> {
+    if index.format_version != SNAPSHOT_VERSION {
+        anyhow::bail!(
+            "Cloud Node published provider snapshot index has unsupported format version {}",
+            index.format_version
+        );
+    }
+    if index.root_sha256 != expected_root
+        || index.folder_count != header.folder_count
+        || index.video_count != header.video_count
+        || index.file_count != header.file_count
+    {
+        anyhow::bail!(
+            "Cloud Node published provider snapshot index metadata does not match the verified local sync plan"
+        );
+    }
+
+    let expected = resource_map(expected_resources, "expected")?;
+    let observed = resource_map(&index.resources, "published")?;
+    if observed != expected {
+        anyhow::bail!(
+            "Cloud Node published provider snapshot index resources do not match the verified immutable provider objects"
+        );
+    }
+    Ok(())
+}
+
+fn resource_map(
+    resources: &[PublishedSnapshotResource],
+    label: &str,
+) -> anyhow::Result<BTreeMap<String, PublishedSnapshotResource>> {
+    let mut map = BTreeMap::new();
+    for resource in resources {
+        if map.insert(resource.key.clone(), resource.clone()).is_some() {
+            anyhow::bail!(
+                "Cloud Node {label} provider snapshot index contains duplicate resource key {:?}",
+                resource.key
+            );
+        }
+    }
+    Ok(map)
 }
 
 async fn verify_provider_resource(
@@ -214,6 +349,18 @@ async fn hash_and_size(path: &Path) -> anyhow::Result<([u8; 32], u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource(key: &str) -> PublishedSnapshotResource {
+        PublishedSnapshotResource {
+            kind: BlobKind::File as u8,
+            resource: TransferResource::FilePayload as u8,
+            object_key: "11".repeat(32),
+            content_sha256: "22".repeat(32),
+            resource_sha256: "22".repeat(32),
+            size: 7,
+            key: key.to_owned(),
+        }
+    }
 
     #[test]
     fn only_non_s3_provider_pushes_require_readback() {
@@ -283,5 +430,38 @@ mod tests {
         moved = stable;
         moved.relation = ProviderSyncRelation::RemoteAhead;
         assert!(!same_published_state(&result, &moved));
+    }
+
+    #[test]
+    fn published_index_requires_exact_metadata_and_resource_set() {
+        let root = "aa".repeat(32);
+        let header = SyncPlanHeader {
+            root_sha256: [0xaa; 32],
+            folder_count: 0,
+            video_count: 0,
+            file_count: 1,
+        };
+        let expected = vec![resource("snapshots/root/object/payload")];
+        let index = PublishedSnapshotIndex {
+            format_version: SNAPSHOT_VERSION,
+            root_sha256: root.clone(),
+            folder_count: 0,
+            video_count: 0,
+            file_count: 1,
+            resources: expected.clone(),
+        };
+        assert!(verify_snapshot_index_metadata(&index, &root, header, &expected).is_ok());
+
+        let mut wrong_root = index.clone();
+        wrong_root.root_sha256 = "bb".repeat(32);
+        assert!(verify_snapshot_index_metadata(&wrong_root, &root, header, &expected).is_err());
+
+        let mut missing = index.clone();
+        missing.resources.clear();
+        assert!(verify_snapshot_index_metadata(&missing, &root, header, &expected).is_err());
+
+        let mut duplicate = index;
+        duplicate.resources.push(expected[0].clone());
+        assert!(verify_snapshot_index_metadata(&duplicate, &root, header, &expected).is_err());
     }
 }
