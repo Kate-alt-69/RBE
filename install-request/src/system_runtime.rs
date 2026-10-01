@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::{
     InstallRequestError, KASTRICK_SYSTEM_RUNTIME_MANIFEST_PREFIX, RBE_SYSTEM_BUNJS,
-    RBE_SYSTEM_NODEJS, RBE_SYSTEM_PYTHON, RBE_SYSTEM_RUST,
+    RBE_SYSTEM_NODEJS, RBE_SYSTEM_PYPY, RBE_SYSTEM_PYTHON, RBE_SYSTEM_RUST,
 };
 
 pub const SYSTEM_RUNTIME_MANIFEST_FORMAT: u32 = 1;
@@ -14,6 +14,7 @@ pub const SYSTEM_RUNTIME_MANIFEST_FORMAT: u32 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum SystemRuntimeKind {
     Python,
+    PyPy,
     Nodejs,
     Bunjs,
     Rust,
@@ -23,6 +24,7 @@ impl SystemRuntimeKind {
     pub const fn key(self) -> &'static str {
         match self {
             Self::Python => RBE_SYSTEM_PYTHON,
+            Self::PyPy => RBE_SYSTEM_PYPY,
             Self::Nodejs => RBE_SYSTEM_NODEJS,
             Self::Bunjs => RBE_SYSTEM_BUNJS,
             Self::Rust => RBE_SYSTEM_RUST,
@@ -32,6 +34,7 @@ impl SystemRuntimeKind {
     pub const fn cache_component(self) -> &'static str {
         match self {
             Self::Python => "python",
+            Self::PyPy => "pypy",
             Self::Nodejs => "nodejs",
             Self::Bunjs => "bunjs",
             Self::Rust => "rust",
@@ -41,6 +44,7 @@ impl SystemRuntimeKind {
     pub fn from_key(value: &str) -> Result<Self, InstallRequestError> {
         match value {
             RBE_SYSTEM_PYTHON => Ok(Self::Python),
+            RBE_SYSTEM_PYPY => Ok(Self::PyPy),
             RBE_SYSTEM_NODEJS => Ok(Self::Nodejs),
             RBE_SYSTEM_BUNJS => Ok(Self::Bunjs),
             RBE_SYSTEM_RUST => Ok(Self::Rust),
@@ -333,6 +337,7 @@ mod tests {
     fn manifests_are_remote_and_system_runtimes_share_the_cache_model() {
         for runtime in [
             SystemRuntimeKind::Python,
+            SystemRuntimeKind::PyPy,
             SystemRuntimeKind::Nodejs,
             SystemRuntimeKind::Bunjs,
             SystemRuntimeKind::Rust,
@@ -355,6 +360,16 @@ mod tests {
     }
 
     #[test]
+    fn pypy_has_its_own_managed_identity_and_cache_component() {
+        assert_eq!(SystemRuntimeKind::PyPy.key(), "rbe.sys.pypy");
+        assert_eq!(SystemRuntimeKind::PyPy.cache_component(), "pypy");
+        assert_eq!(
+            SystemRuntimeKind::from_key("rbe.sys.pypy").unwrap(),
+            SystemRuntimeKind::PyPy
+        );
+    }
+
+    #[test]
     fn manifest_request_is_derived_from_endpoint_not_embedded_payload() {
         let request = SystemRuntimeManifestRequest::new(
             "https://registry.kastrick.invalid/",
@@ -365,6 +380,20 @@ mod tests {
         assert_eq!(
             request.endpoint.as_str(),
             "https://registry.kastrick.invalid/registry/v1/system-runtime/rbe.sys.python/linux-x86_64/manifest.json"
+        );
+    }
+
+    #[test]
+    fn pypy_manifest_request_uses_the_same_registry_path() {
+        let request = SystemRuntimeManifestRequest::new(
+            "https://registry.kastrick.invalid/",
+            SystemRuntimeKind::PyPy,
+            "linux-x86_64",
+        )
+        .unwrap();
+        assert_eq!(
+            request.endpoint.as_str(),
+            "https://registry.kastrick.invalid/registry/v1/system-runtime/rbe.sys.pypy/linux-x86_64/manifest.json"
         );
     }
 
