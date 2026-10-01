@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -314,30 +313,12 @@ fn verify_snapshot_index_metadata(
         );
     }
 
-    let expected = resource_map(expected_resources, "expected")?;
-    let observed = resource_map(&index.resources, "published")?;
-    if observed != expected {
+    if index.resources != expected_resources {
         anyhow::bail!(
-            "Cloud Node published provider snapshot index resources do not match the verified immutable provider objects"
+            "Cloud Node published provider snapshot index resources do not exactly match the canonical ordered verified resource list"
         );
     }
     Ok(())
-}
-
-fn resource_map(
-    resources: &[PublishedSnapshotResource],
-    label: &str,
-) -> anyhow::Result<BTreeMap<String, PublishedSnapshotResource>> {
-    let mut map = BTreeMap::new();
-    for resource in resources {
-        if map.insert(resource.key.clone(), resource.clone()).is_some() {
-            anyhow::bail!(
-                "Cloud Node {label} provider snapshot index contains duplicate resource key {:?}",
-                resource.key
-            );
-        }
-    }
-    Ok(map)
 }
 
 fn chunk_hash_from_path(path: &Path) -> anyhow::Result<[u8; 32]> {
@@ -503,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn published_index_requires_exact_metadata_and_resource_set() {
+    fn published_index_requires_exact_metadata_and_resource_order() {
         let root = "aa".repeat(32);
         let header = SyncPlanHeader {
             root_sha256: [0xaa; 32],
@@ -511,7 +492,10 @@ mod tests {
             video_count: 0,
             file_count: 1,
         };
-        let expected = vec![resource("snapshots/root/object/payload")];
+        let expected = vec![
+            resource("snapshots/root/object/manifest"),
+            resource("snapshots/root/object/payload"),
+        ];
         let index = PublishedSnapshotIndex {
             format_version: SNAPSHOT_VERSION,
             root_sha256: root.clone(),
@@ -527,12 +511,16 @@ mod tests {
         assert!(verify_snapshot_index_metadata(&wrong_root, &root, header, &expected).is_err());
 
         let mut missing = index.clone();
-        missing.resources.clear();
+        missing.resources.pop();
         assert!(verify_snapshot_index_metadata(&missing, &root, header, &expected).is_err());
 
-        let mut duplicate = index;
-        duplicate.resources.push(expected[0].clone());
+        let mut duplicate = index.clone();
+        duplicate.resources.push(expected[1].clone());
         assert!(verify_snapshot_index_metadata(&duplicate, &root, header, &expected).is_err());
+
+        let mut reordered = index;
+        reordered.resources.reverse();
+        assert!(verify_snapshot_index_metadata(&reordered, &root, header, &expected).is_err());
     }
 
     #[test]
