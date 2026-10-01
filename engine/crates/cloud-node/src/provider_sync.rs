@@ -897,6 +897,11 @@ async fn upload_snapshot(
                 "Cloud Node provider snapshot index for root {root} does not match the local sync plan"
             );
         }
+        if !snapshot_manifest_metadata_matches_plan(&snapshot, plan).await? {
+            anyhow::bail!(
+                "Cloud Node provider snapshot index for root {root} has manifest metadata that does not match the local sync plan"
+            );
+        }
         if snapshot_resources_available(client, &snapshot).await? {
             return Ok(());
         }
@@ -1047,6 +1052,33 @@ async fn upload_snapshot(
         );
     }
     Ok(())
+}
+
+async fn snapshot_manifest_metadata_matches_plan(
+    snapshot: &ProviderSnapshot,
+    plan: &SyncPlan,
+) -> anyhow::Result<bool> {
+    let root = plan.root_hex();
+    for object in plan.ordered() {
+        let object_hex = hex::encode(object.object_key);
+        let content_hex = hex::encode(object.content_sha256);
+        let key = format!(
+            "snapshots/{root}/objects/{object_hex}/{content_hex}/{}",
+            object.kind.manifest_name()
+        );
+        let Some(resource) = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.key == key)
+        else {
+            return Ok(false);
+        };
+        let (sha256, size) = hash_and_size(&object.manifest_path).await?;
+        if resource.resource_sha256 != hex::encode(sha256) || resource.size != size {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn snapshot_resources_available(
@@ -1763,6 +1795,30 @@ mod tests {
         }
         validate_snapshot(&poisoned).unwrap();
         assert!(!snapshot_matches_plan(&poisoned, &plan).unwrap());
+    }
+
+    #[tokio::test]
+    async fn existing_provider_snapshot_manifest_metadata_must_match_local_manifest() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("file.blob.cn");
+        fs::write(&manifest, b"authoritative-manifest").unwrap();
+        let mut plan = matching_file_sync_plan();
+        plan.files[0].manifest_path = manifest.clone();
+
+        let (manifest_sha, manifest_size) = hash_and_size(&manifest).await.unwrap();
+        let mut snapshot = valid_file_provider_snapshot();
+        snapshot.resources[0].resource_sha256 = hex::encode(manifest_sha);
+        snapshot.resources[0].size = manifest_size;
+        assert!(snapshot_manifest_metadata_matches_plan(&snapshot, &plan)
+            .await
+            .unwrap());
+
+        snapshot.resources[0].resource_sha256 = "55".repeat(32);
+        assert!(!snapshot_manifest_metadata_matches_plan(&snapshot, &plan)
+            .await
+            .unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
