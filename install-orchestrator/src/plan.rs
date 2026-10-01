@@ -220,6 +220,7 @@ pub fn system_toolchain_for_manifest(
     manifest.validate()?;
     let runtime = match manifest.language {
         Language::Rust => SystemRuntimeKind::Rust,
+        Language::Python if manifest.runtime.kind == "pypy" => SystemRuntimeKind::PyPy,
         Language::Python => SystemRuntimeKind::Python,
         Language::Javascript if manifest.runtime.kind == "bun" => SystemRuntimeKind::Bunjs,
         Language::Javascript if manifest.runtime.kind == "node" => SystemRuntimeKind::Nodejs,
@@ -431,6 +432,44 @@ entry = "worker.py"
             .endpoint
             .as_str()
             .contains("rbe.sys.python/windows-x86_64/manifest.json"));
+    }
+
+    #[test]
+    fn pypy_toolchain_uses_first_class_system_runtime_identity() {
+        let manifest = LibraryManifest::parse(
+            r#"
+name = "fastpy"
+version = "1.0.0"
+language = "python"
+rbe_abi_min = 1
+rbe_abi_max = 1
+
+[sdk]
+family = "python"
+package = "rbe-sdk"
+version = "0.1"
+
+[runtime]
+kind = "pypy"
+version = "7.3"
+entry = "worker.py"
+"#,
+        )
+        .unwrap();
+        let need = system_toolchain_for_manifest(
+            &manifest,
+            "/project",
+            "https://registry.kastrick.invalid/",
+            "linux-x86_64",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(need.runtime, SystemRuntimeKind::PyPy);
+        assert!(need
+            .manifest_request
+            .endpoint
+            .as_str()
+            .contains("rbe.sys.pypy/linux-x86_64/manifest.json"));
     }
 
     #[test]
