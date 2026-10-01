@@ -45,6 +45,8 @@ hex = "0.4"
 rand = "0.8"
 keyring = "2"
 ed25519-dalek = "2"
+tokio-rustls = "0.26"
+webpki-roots = "1"
 
 [build-dependencies]
 sha2 = "0.10"
