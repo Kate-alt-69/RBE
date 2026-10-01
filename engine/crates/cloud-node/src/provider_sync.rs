@@ -829,7 +829,7 @@ async fn upload_head(
         format_version: HISTORY_VERSION,
         commit: commit.id.clone(),
     };
-    client
+    let atomic = client
         .put_if_unchanged(
             "history/HEAD.json",
             serde_json::to_vec(&pointer)?,
@@ -837,8 +837,38 @@ async fn upload_head(
             expected_version,
             expected_exists,
         )
-        .await
-        .map(|_| ())
+        .await?;
+    if atomic {
+        return Ok(());
+    }
+
+    // Supabase's native object API and the generic HTTP provider do not expose
+    // a portable compare-and-swap primitive through this provider interface.
+    // Their publication is therefore guarded before the write and verified
+    // immediately afterwards. This cannot provide CAS against a writer that
+    // races after the readback, but it prevents Cloud Node from reporting a
+    // publication as successful when the just-written HEAD was already lost.
+    let observed = remote_head_state(client).await?;
+    verify_non_atomic_head_readback(commit, observed.as_ref().map(|state| &state.commit))
+}
+
+fn verify_non_atomic_head_readback(
+    expected: &HistoryCommit,
+    observed: Option<&HistoryCommit>,
+) -> anyhow::Result<()> {
+    let Some(observed) = observed else {
+        anyhow::bail!(
+            "Cloud Node non-atomic provider HEAD disappeared immediately after publication; retry synchronization"
+        );
+    };
+    if observed != expected {
+        anyhow::bail!(
+            "Cloud Node non-atomic provider HEAD changed immediately after publication: expected {} but found {}; retry synchronization",
+            expected.id,
+            observed.id
+        );
+    }
+    Ok(())
 }
 
 async fn upload_snapshot(
@@ -1678,6 +1708,16 @@ mod tests {
         let mut missing = valid_file_provider_snapshot();
         missing.resources.pop();
         assert!(validate_snapshot(&missing).is_err());
+    }
+
+    #[test]
+    fn non_atomic_head_publish_requires_exact_readback() {
+        let expected = new_commit("local-node", None, &"11".repeat(32)).unwrap();
+        let other = new_commit("remote-node", None, &"22".repeat(32)).unwrap();
+
+        verify_non_atomic_head_readback(&expected, Some(&expected)).unwrap();
+        assert!(verify_non_atomic_head_readback(&expected, None).is_err());
+        assert!(verify_non_atomic_head_readback(&expected, Some(&other)).is_err());
     }
 
     #[tokio::test]
