@@ -49,6 +49,7 @@ pub enum ProviderAuthMode {
     Header,
     AwsSigV4,
     AzureSas,
+    #[serde(rename = "oauth-bearer", alias = "o-auth-bearer")]
     OAuthBearer,
 }
 
@@ -1097,6 +1098,22 @@ mod tests {
 
         http.auth.oauth_token_env = Some("HTTP_BEARER_A".into());
         validate_provider(&http).unwrap();
+    }
+
+    #[test]
+    fn oauth_bearer_auth_mode_uses_canonical_spelling_and_accepts_legacy_alias() {
+        assert_eq!(
+            serde_json::from_str::<ProviderAuthMode>("\"oauth-bearer\"").unwrap(),
+            ProviderAuthMode::OAuthBearer
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderAuthMode>("\"o-auth-bearer\"").unwrap(),
+            ProviderAuthMode::OAuthBearer
+        );
+        assert_eq!(
+            serde_json::to_string(&ProviderAuthMode::OAuthBearer).unwrap(),
+            "\"oauth-bearer\""
+        );
     }
 
     #[test]
