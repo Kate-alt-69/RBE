@@ -395,7 +395,8 @@ fn prepare_local_root(store: &CloudNodeStore, directory: &Path) -> anyhow::Resul
     if root == store_root || root.starts_with(&store_root) {
         anyhow::bail!(
             "Cloud Node localSync.directory {} cannot be the Cloud Node store or one of its children",
-            root.display()
+            root.display(),
+            store_root.display()
         );
     }
     Ok(root)
@@ -447,7 +448,7 @@ fn walk_directory(
             anyhow::bail!("Cloud Node localSync produced duplicate path {logical_path:?}");
         }
     }
-    Ok(scanned)
+    Ok(())
 }
 
 fn remove_active_object(store: &CloudNodeStore, object: &SyncObject) -> anyhow::Result<()> {
