@@ -66,6 +66,7 @@ mod prepare;
 mod promotion;
 mod registry;
 mod snapshot;
+mod system_runtime;
 mod target;
 mod verified_worker;
 mod worker_source;
@@ -94,6 +95,10 @@ pub use registry::{
 };
 pub use snapshot::{
     read_verified_rpx_root_snapshots, VerifiedRootSnapshotError, VerifiedRpxRootSnapshot,
+};
+pub use system_runtime::{
+    current_system_runtime_host, load_admitted_system_runtime, AdmittedSystemRuntime,
+    SystemRuntimeAdmissionError, SYSTEM_RUNTIME_ADMISSION_FILE, SYSTEM_RUNTIME_ADMISSION_FORMAT,
 };
 pub use target::{
     load_named_install_target, merge_named_install_target, InstallTargetError, NamedInstallTarget,
@@ -126,7 +131,7 @@ pub enum InstallRuntimeError {
         #[source]
         source: url::ParseError,
     },
-    #[error("install-runtime network URL must be credential-free HTTPS without a fragment: {0:?}")]
+    #[error("install-runtime network URL must use credential-free HTTPS without a fragment: {0:?}")]
     UnsafeUrl(String),
     #[error("install-runtime destination is not publicly routable: {0}")]
     NonPublicDestination(String),
