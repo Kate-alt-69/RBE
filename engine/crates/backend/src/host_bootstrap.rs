@@ -105,6 +105,9 @@ async fn start_provider_cloud_node(args: &[String]) -> anyhow::Result<()> {
     let Some(config_path) = resolve_cloud_node_settings_path()? else {
         return Ok(());
     };
+    if std::env::var_os(CLOUD_NODE_SETTINGS_ENV).is_none() {
+        std::env::set_var(CLOUD_NODE_SETTINGS_ENV, &config_path);
+    }
     let settings = CloudNodeSettings::load(&config_path).map_err(|error| {
         anyhow::anyhow!(
             "Cloud Node settings {} failed backend boot validation: {error:#}",
