@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cloud_node::{
     ingest_registry_export, load_local_sync_settings, load_signing_key_from_env, negotiate_sync,
@@ -82,6 +82,10 @@ async fn run() -> anyhow::Result<()> {
                 println!("provider={:?}", provider.kind);
                 println!("providerTarget={}", client.target_description());
                 println!("providerConflictPolicy={:?}", provider.conflict_policy);
+                println!(
+                    "providerIntegrityAuditIntervalMs={}",
+                    provider.integrity_audit_interval_ms
+                );
             }
         }
         "probe-upstream" => {
@@ -144,6 +148,7 @@ async fn run() -> anyhow::Result<()> {
                     &project_root,
                     local_sync.as_ref(),
                     bootstrap_recovery,
+                    true,
                 )
                 .await?;
                 print_provider_result(&result);
@@ -325,6 +330,7 @@ async fn sync_provider_cycle(
     project_root: &Path,
     local_sync: Option<&LocalSyncRuntime>,
     bootstrap_recovery: bool,
+    deep_in_sync_audit: bool,
 ) -> anyhow::Result<ProviderSyncResult> {
     let provider = settings
         .provider
@@ -386,6 +392,19 @@ async fn sync_provider_cycle(
     restore_missing_bootstrap_checkout(store, local_sync, restore_missing_checkout)?;
 
     sync_local_inputs(store, project_root, local_sync)?;
+
+    if !deep_in_sync_audit {
+        let status = provider_status(settings, store).await?;
+        if status.relation == ProviderSyncRelation::InSync {
+            return Ok(ProviderSyncResult {
+                action: ProviderSyncAction::None,
+                final_root: status.local_root.clone(),
+                final_head: status.local_head.clone(),
+                before: status,
+            });
+        }
+    }
+
     let result = synchronize_provider(settings, store).await?;
     restore_local_after_pull(store, local_sync, result.action)?;
     Ok(result)
@@ -471,20 +490,36 @@ async fn run_provider_daemon(
     let client = ProviderClient::new(provider)?;
     let mut retry_delay_ms = provider.reconnect_delay_ms;
     let mut write_probe_verified = false;
+    let mut last_integrity_audit = None::<Instant>;
     loop {
         let result = if provider.sync_on_connect {
-            sync_provider_cycle(settings, store, project_root, local_sync, false)
-                .await
-                .map(|sync| {
-                    println!(
-                        "Cloud Node provider sync target={} before={:?} action={:?} head={} root={}",
-                        client.target_description(),
-                        sync.before.relation,
-                        sync.action,
-                        sync.final_head,
-                        sync.final_root
-                    );
-                })
+            let integrity_audit_due = provider_integrity_audit_due(
+                last_integrity_audit.map(|last| last.elapsed()),
+                provider.integrity_audit_interval_ms,
+            );
+            sync_provider_cycle(
+                settings,
+                store,
+                project_root,
+                local_sync,
+                false,
+                integrity_audit_due,
+            )
+            .await
+            .map(|sync| {
+                if integrity_audit_due || sync.action != ProviderSyncAction::None {
+                    last_integrity_audit = Some(Instant::now());
+                }
+                println!(
+                    "Cloud Node provider sync target={} before={:?} action={:?} head={} root={} integrityAudit={}",
+                    client.target_description(),
+                    sync.before.relation,
+                    sync.action,
+                    sync.final_head,
+                    sync.final_root,
+                    integrity_audit_due
+                );
+            })
         } else {
             sync_local_inputs(store, project_root, local_sync)?;
             let probe = if write_probe_verified {
@@ -526,6 +561,10 @@ async fn run_provider_daemon(
         };
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
+}
+
+fn provider_integrity_audit_due(elapsed: Option<Duration>, interval_ms: u64) -> bool {
+    elapsed.is_none_or(|elapsed| elapsed >= Duration::from_millis(interval_ms))
 }
 
 fn print_provider_result(result: &ProviderSyncResult) {
@@ -615,5 +654,18 @@ mod tests {
                 .is_err()
         );
         assert!(sync_bootstrap_requested(&["sync".into(), "unexpected".into()]).is_err());
+    }
+
+    #[test]
+    fn provider_integrity_audit_runs_first_and_then_on_interval() {
+        assert!(provider_integrity_audit_due(None, 900_000));
+        assert!(!provider_integrity_audit_due(
+            Some(Duration::from_millis(899_999)),
+            900_000
+        ));
+        assert!(provider_integrity_audit_due(
+            Some(Duration::from_millis(900_000)),
+            900_000
+        ));
     }
 }
