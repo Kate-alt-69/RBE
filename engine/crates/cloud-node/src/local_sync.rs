@@ -223,7 +223,7 @@ impl CloudNodeStore {
                     object.logical_path
                 )
             })?;
-            restore_payload_atomic(payload, &target, object.content_sha256)?;
+            restore_payload_atomic(&root, payload, &target, object.content_sha256)?;
             result.restored = result.restored.saturating_add(1);
         }
 
@@ -286,7 +286,7 @@ impl CloudNodeStore {
                     object.logical_path
                 )
             })?;
-            restore_payload_atomic(payload, &target, object.content_sha256)?;
+            restore_payload_atomic(&root, payload, &target, object.content_sha256)?;
             restored = restored.saturating_add(1);
         }
         Ok(restored)
@@ -469,6 +469,7 @@ fn remove_active_object(store: &CloudNodeStore, object: &SyncObject) -> anyhow::
 }
 
 fn restore_payload_atomic(
+    root: &Path,
     source: &Path,
     target: &Path,
     expected_sha256: [u8; 32],
@@ -476,8 +477,8 @@ fn restore_payload_atomic(
     let parent = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    durable::create_dir_all(parent)?;
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node localSync restore target has no parent"))?;
+    prepare_restore_parent(root, parent)?;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -493,7 +494,10 @@ fn restore_payload_atomic(
 
     let copied = (|| -> anyhow::Result<()> {
         let mut input = File::open(source)?;
-        let mut output = File::create(&temporary)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         std::io::copy(&mut input, &mut output)?;
         output.flush()?;
         output.sync_all()?;
@@ -503,6 +507,11 @@ fn restore_payload_atomic(
                 target.display()
             );
         }
+
+        // Revalidate immediately before activation. This catches an ancestor
+        // replaced with a symlink while the payload was being copied and keeps
+        // restore writes confined to the canonical localSync checkout root.
+        prepare_restore_parent(root, parent)?;
 
         #[cfg(windows)]
         if target.exists() {
@@ -522,6 +531,77 @@ fn restore_payload_atomic(
         let _ = fs::remove_file(&temporary);
     }
     copied
+}
+
+fn prepare_restore_parent(root: &Path, parent: &Path) -> anyhow::Result<()> {
+    let relative = parent.strip_prefix(root).map_err(|_| {
+        anyhow::anyhow!(
+            "Cloud Node localSync restore parent escaped checkout root: {}",
+            parent.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            anyhow::bail!(
+                "Cloud Node localSync restore parent is not canonical: {}",
+                parent.display()
+            );
+        };
+        current.push(part);
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => validate_restore_directory(&current, &metadata)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let metadata = fs::symlink_metadata(&current)?;
+                validate_restore_directory(&current, &metadata)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let canonical = current.canonicalize()?;
+        if !canonical.starts_with(root) {
+            anyhow::bail!(
+                "Cloud Node localSync restore directory escaped checkout root: {}",
+                current.display()
+            );
+        }
+    }
+
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "Cloud Node localSync restore parent {} could not be canonicalized: {error}",
+            parent.display()
+        )
+    })?;
+    if !canonical_parent.starts_with(root) {
+        anyhow::bail!(
+            "Cloud Node localSync restore parent escaped checkout root: {}",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_restore_directory(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<()> {
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "Cloud Node localSync restore refuses symlinked directory component: {}",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!(
+            "Cloud Node localSync restore parent component is not a directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn normalize_logical_prefix(value: &str) -> anyhow::Result<String> {
@@ -768,6 +848,38 @@ mod tests {
         assert_eq!(after.missing_managed_objects, 0);
         assert_eq!(after.changed_managed_objects, 1);
         assert_eq!(after.untracked_files, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_symlinked_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = root("symlink-parent");
+        let watched = root.join("watched");
+        let outside = root.join("outside");
+        fs::create_dir_all(&watched).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let source = root.join("source.txt");
+        fs::write(&source, b"remote state").unwrap();
+        let store = store(&root);
+        store
+            .store_file(&source, "workspace/nested/state.txt")
+            .unwrap();
+        symlink(&outside, watched.join("nested")).unwrap();
+
+        let bootstrap_error = store
+            .restore_missing_local_directory(&watched, "workspace")
+            .unwrap_err();
+        assert!(bootstrap_error.to_string().contains("symlinked directory"));
+        assert!(!outside.join("state.txt").exists());
+
+        let full_error = store
+            .restore_local_directory(&watched, "workspace")
+            .unwrap_err();
+        assert!(full_error.to_string().contains("symlinked directory"));
+        assert!(!outside.join("state.txt").exists());
         let _ = fs::remove_dir_all(root);
     }
 
