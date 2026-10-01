@@ -620,12 +620,9 @@ impl ProviderClient {
         let mut digest = Sha256::new();
         let mut size = 0u64;
         while let Some(chunk) = response.chunk().await.map_err(provider_transport_error)? {
+            let next_size = checked_verification_size(size, chunk.len(), expected_size)?;
             digest.update(&chunk);
-            size = size
-                .checked_add(u64::try_from(chunk.len()).map_err(|_| {
-                    anyhow::anyhow!("Cloud Node provider verification chunk exceeds u64")
-                })?)
-                .ok_or_else(|| anyhow::anyhow!("Cloud Node provider verification size overflow"))?;
+            size = next_size;
         }
         let actual_sha256: [u8; 32] = digest.finalize().into();
         if size != expected_size || actual_sha256 != expected_sha256 {
@@ -1339,6 +1336,20 @@ fn append_bounded_bytes(
     Ok(())
 }
 
+fn checked_verification_size(current: u64, chunk_len: usize, expected: u64) -> anyhow::Result<u64> {
+    let chunk_len = u64::try_from(chunk_len)
+        .map_err(|_| anyhow::anyhow!("Cloud Node provider verification chunk exceeds u64"))?;
+    let next = current
+        .checked_add(chunk_len)
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider verification size overflow"))?;
+    if next > expected {
+        anyhow::bail!(
+            "Cloud Node immutable provider object exceeds expected size {expected} bytes"
+        );
+    }
+    Ok(next)
+}
+
 async fn provider_error_parts(mut response: reqwest::Response) -> (StatusCode, Vec<u8>) {
     let status = response.status();
     let mut detail = Vec::new();
@@ -1807,6 +1818,12 @@ mod tests {
         assert_eq!(bytes, b"1234");
         assert!(append_bounded_bytes(&mut bytes, b"56", 5, "test metadata").is_err());
         assert_eq!(bytes, b"1234");
+    }
+
+    #[test]
+    fn provider_verification_size_rejects_oversize_stream_before_eof() {
+        assert_eq!(checked_verification_size(3, 2, 5).unwrap(), 5);
+        assert!(checked_verification_size(3, 3, 5).is_err());
     }
 
     #[test]
