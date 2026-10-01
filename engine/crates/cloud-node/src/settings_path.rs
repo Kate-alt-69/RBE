@@ -68,7 +68,10 @@ mod tests {
 
         let legacy = root.join(LEGACY_SETTINGS_FILE_NAME);
         fs::write(&legacy, b"{}").unwrap();
-        assert_eq!(discover_settings_path(&executable).unwrap(), Some(legacy.clone()));
+        assert_eq!(
+            discover_settings_path(&executable).unwrap(),
+            Some(legacy.clone())
+        );
 
         let preferred = root.join(PREFERRED_SETTINGS_FILE_NAME);
         fs::write(&preferred, b"{}").unwrap();
