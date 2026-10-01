@@ -37,7 +37,7 @@ pub struct ScriptPath {
 
 impl ScriptPath {
     pub fn infer(path: &str) -> Result<Self, ScriptPlanError> {
-        let workspace = WorkspacePath::parse(path).map_err(ScriptPlanError::Workspace)?;
+        let workspace = parse_script_workspace(path)?;
         let lower = workspace.relative().to_ascii_lowercase();
         let language = if lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".cjs") {
             ScriptLanguage::JavaScript
@@ -52,7 +52,7 @@ impl ScriptPath {
     }
 
     pub fn explicit(path: &str, language: ScriptLanguage) -> Result<Self, ScriptPlanError> {
-        let workspace = WorkspacePath::parse(path).map_err(ScriptPlanError::Workspace)?;
+        let workspace = parse_script_workspace(path)?;
         Ok(Self { workspace, language })
     }
 
@@ -67,6 +67,19 @@ impl ScriptPath {
     pub fn runtime_identity(&self) -> &'static str {
         self.language.runtime_identity()
     }
+}
+
+/// Script helpers accept `/path/to/file` as a project-relative DX shorthand.
+/// It is deliberately normalized into the symbolic `$$/` namespace before the
+/// host sees it; a leading slash here is never an OS-root path. Canonical
+/// `$$/` and `??/` paths remain accepted unchanged.
+fn parse_script_workspace(path: &str) -> Result<WorkspacePath, ScriptPlanError> {
+    let workspace = if let Some(relative) = path.strip_prefix('/') {
+        WorkspacePath::project(relative)
+    } else {
+        WorkspacePath::parse(path)
+    };
+    workspace.map_err(ScriptPlanError::Workspace)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +172,7 @@ impl std::error::Error for ScriptPlanError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WorkspaceRoot;
 
     #[test]
     fn infers_managed_runtime_from_extension() {
@@ -178,6 +192,16 @@ mod tests {
             ScriptPath::infer("??/job.py").unwrap().runtime_identity(),
             "rbe.sys.python"
         );
+    }
+
+    #[test]
+    fn leading_slash_is_project_relative_not_host_absolute() {
+        let script = ScriptPath::infer("/mycool/script.js").unwrap();
+        assert_eq!(script.workspace().root(), WorkspaceRoot::Project);
+        assert_eq!(script.workspace().relative(), "mycool/script.js");
+        assert_eq!(script.workspace().symbolic(), "$$/mycool/script.js");
+        assert!(ScriptPath::infer("//host/escape.js").is_err());
+        assert!(ScriptPath::infer(r"C:\\host\\escape.js").is_err());
     }
 
     #[test]
