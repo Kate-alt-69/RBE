@@ -997,10 +997,12 @@ mod tests {
             b"remote nested"
         );
         assert_eq!(fs::read(watched.join("leaf.txt")).unwrap(), b"remote leaf");
-        assert!(!store
-            .local_directory_status(&watched, "workspace")
-            .unwrap()
-            .dirty);
+        assert!(
+            !store
+                .local_directory_status(&watched, "workspace")
+                .unwrap()
+                .dirty
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1035,9 +1037,7 @@ mod tests {
         let watched = root.join("watched");
         fs::create_dir_all(&watched).unwrap();
         let store = store(&root);
-        store
-            .store_file(&parent_source, "workspace/node")
-            .unwrap();
+        store.store_file(&parent_source, "workspace/node").unwrap();
         store
             .store_file(&child_source, "workspace/node/child.txt")
             .unwrap();
