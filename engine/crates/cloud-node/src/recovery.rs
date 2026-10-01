@@ -12,6 +12,8 @@ use crate::sync::{SyncPlan, SyncPlanHeader};
 use crate::transfer::{TransferChunk, TransferResource};
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_RECOVERY_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECOVERY_VIDEO_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryReceipt {
@@ -116,6 +118,7 @@ impl CloudNodeRecoveryReceiver {
         // current phase so reconnects can cheaply replay/skip earlier objects.
         let target = self.resource_target(chunk);
         if target.is_file() && verify_resource(&target, chunk.resource_sha256, chunk.total_size)? {
+            self.enforce_resource_admission(chunk)?;
             let part = transfer_part_path(&target)?;
             if part.exists() {
                 durable::remove_file(part)?;
@@ -130,9 +133,12 @@ impl CloudNodeRecoveryReceiver {
         }
 
         self.enforce_recovery_order(chunk)?;
-        self.enforce_resource_dependency(chunk)?;
         let identity = ResourceIdentity::from(chunk);
         if self.active.is_none() {
+            // Validate dependency, identity and declared size before creating or
+            // extending a durable partial. Continuation chunks inherit this
+            // admission through the exact ActiveResource identity below.
+            self.enforce_resource_admission(chunk)?;
             if chunk.offset != 0 {
                 anyhow::bail!("Cloud Node recovery resource did not begin at offset zero");
             }
@@ -322,16 +328,62 @@ impl CloudNodeRecoveryReceiver {
         Ok(())
     }
 
-    fn enforce_resource_dependency(&self, chunk: &TransferChunk) -> anyhow::Result<()> {
+    fn enforce_resource_admission(&self, chunk: &TransferChunk) -> anyhow::Result<()> {
         if chunk.resource == TransferResource::Manifest {
+            if chunk.total_size > MAX_RECOVERY_MANIFEST_BYTES {
+                anyhow::bail!(
+                    "Cloud Node recovery manifest exceeds {MAX_RECOVERY_MANIFEST_BYTES} bytes"
+                );
+            }
             return Ok(());
         }
-        let manifest = self
+
+        let manifest_path = self
             .staging_storage
             .join(hex::encode(chunk.object_key))
             .join(chunk.kind.manifest_name());
-        if !manifest.is_file() {
+        if !manifest_path.is_file() {
             anyhow::bail!("Cloud Node recovery payload arrived before its manifest");
+        }
+        let manifest = load_staged_manifest(&self.staging_storage, chunk)?;
+
+        match chunk.resource {
+            TransferResource::Manifest => unreachable!("manifest admission returned above"),
+            TransferResource::FilePayload => {
+                if manifest.kind != BlobKind::File
+                    || manifest.content_sha256 != chunk.content_sha256
+                    || chunk.resource_sha256 != chunk.content_sha256
+                    || manifest.logical_size != chunk.total_size
+                {
+                    anyhow::bail!(
+                        "Cloud Node recovery file payload is not declared by its manifest"
+                    );
+                }
+            }
+            TransferResource::VideoChunk => {
+                if manifest.kind != BlobKind::Video
+                    || manifest.content_sha256 != chunk.content_sha256
+                {
+                    anyhow::bail!(
+                        "Cloud Node recovery video chunk identity does not match its manifest"
+                    );
+                }
+                let BlobBody::Video { chunks, .. } = &manifest.body else {
+                    anyhow::bail!(
+                        "Cloud Node recovery video chunk does not have a video manifest"
+                    );
+                };
+                if chunk.total_size > MAX_RECOVERY_VIDEO_CHUNK_BYTES
+                    || !chunks.iter().any(|entry| {
+                        entry.sha256 == chunk.resource_sha256
+                            && u64::from(entry.len) == chunk.total_size
+                    })
+                {
+                    anyhow::bail!(
+                        "Cloud Node recovery video chunk is not declared by its manifest"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -662,6 +714,7 @@ fn validate_staged_resource(
             let manifest = load_staged_manifest(staging_storage, chunk)?;
             if manifest.kind != BlobKind::File
                 || manifest.content_sha256 != chunk.content_sha256
+                || chunk.resource_sha256 != chunk.content_sha256
                 || manifest.logical_size != chunk.total_size
             {
                 anyhow::bail!("Cloud Node recovery file payload does not match its manifest");
@@ -669,12 +722,20 @@ fn validate_staged_resource(
         }
         TransferResource::VideoChunk => {
             let manifest = load_staged_manifest(staging_storage, chunk)?;
+            if manifest.kind != BlobKind::Video
+                || manifest.content_sha256 != chunk.content_sha256
+            {
+                anyhow::bail!("Cloud Node recovery video chunk identity does not match its manifest");
+            }
             let BlobBody::Video { chunks, .. } = manifest.body else {
                 anyhow::bail!("Cloud Node recovery video chunk does not have a video manifest");
             };
-            if !chunks.iter().any(|entry| {
-                entry.sha256 == chunk.resource_sha256 && u64::from(entry.len) == chunk.total_size
-            }) {
+            if chunk.total_size > MAX_RECOVERY_VIDEO_CHUNK_BYTES
+                || !chunks.iter().any(|entry| {
+                    entry.sha256 == chunk.resource_sha256
+                        && u64::from(entry.len) == chunk.total_size
+                })
+            {
                 anyhow::bail!("Cloud Node recovery video chunk is not declared by its manifest");
             }
         }
@@ -716,8 +777,10 @@ fn validate_manifest(manifest: &BlobManifest) -> anyhow::Result<()> {
             chunk_bytes,
             chunks,
         } => {
-            if *chunk_bytes == 0 && !chunks.is_empty() {
-                anyhow::bail!("Cloud Node video manifest uses zero-sized chunks");
+            if (*chunk_bytes == 0 && !chunks.is_empty())
+                || u64::from(*chunk_bytes) > MAX_RECOVERY_VIDEO_CHUNK_BYTES
+            {
+                anyhow::bail!("Cloud Node video manifest uses an invalid chunk size");
             }
             let mut expected_offset = 0u64;
             for chunk in chunks {
@@ -843,6 +906,7 @@ mod tests {
 
     use super::*;
     use crate::config::CloudNodeSettings;
+    use crate::format::ChunkRef;
     use crate::sync::SyncObject;
 
     fn test_root(label: &str) -> PathBuf {
@@ -1276,6 +1340,112 @@ mod tests {
         )
         .unwrap();
         assert!(receiver.accept_chunk(&folder_chunk).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_undeclared_video_chunk_before_staging() {
+        let root = test_root("undeclared-video-chunk");
+        fs::create_dir_all(&root).unwrap();
+        let store = CloudNodeStore::open(&settings(&root, "undeclared-video-chunk")).unwrap();
+        let expected = SyncPlanHeader {
+            root_sha256: [10u8; 32],
+            folder_count: 0,
+            video_count: 1,
+            file_count: 0,
+        };
+        let mut receiver =
+            CloudNodeRecoveryReceiver::open(&store, "undeclared-peer", expected).unwrap();
+
+        let declared = b"good";
+        let declared_sha: [u8; 32] = Sha256::digest(declared).into();
+        let content_sha: [u8; 32] = Sha256::digest(declared).into();
+        let manifest = BlobManifest {
+            kind: BlobKind::Video,
+            object_key: object_key(BlobKind::Video, "video/a.mp4"),
+            content_sha256: content_sha,
+            parent_content_sha256: None,
+            logical_path: "video/a.mp4".into(),
+            logical_size: declared.len() as u64,
+            created_unix_ms: 1,
+            body: BlobBody::Video {
+                chunk_bytes: 1024,
+                chunks: vec![ChunkRef {
+                    offset: 0,
+                    len: declared.len() as u32,
+                    sha256: declared_sha,
+                }],
+            },
+        };
+        let manifest_bytes = manifest.encode().unwrap();
+        let manifest_sha: [u8; 32] = Sha256::digest(&manifest_bytes).into();
+        let manifest_chunk = TransferChunk::new(
+            BlobKind::Video,
+            TransferResource::Manifest,
+            manifest.object_key,
+            manifest.content_sha256,
+            manifest_sha,
+            0,
+            manifest_bytes.len() as u64,
+            manifest_bytes,
+        )
+        .unwrap();
+        receiver.accept_chunk(&manifest_chunk).unwrap();
+
+        let junk = b"junk";
+        let junk_sha: [u8; 32] = Sha256::digest(junk).into();
+        let junk_chunk = TransferChunk::new(
+            BlobKind::Video,
+            TransferResource::VideoChunk,
+            manifest.object_key,
+            manifest.content_sha256,
+            junk_sha,
+            0,
+            junk.len() as u64,
+            junk.to_vec(),
+        )
+        .unwrap();
+        let target = receiver.resource_target(&junk_chunk);
+        let part = transfer_part_path(&target).unwrap();
+        assert!(receiver.accept_chunk(&junk_chunk).is_err());
+        assert!(!target.exists());
+        assert!(!part.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_oversized_manifest_before_staging() {
+        let root = test_root("oversized-manifest");
+        fs::create_dir_all(&root).unwrap();
+        let store = CloudNodeStore::open(&settings(&root, "oversized-manifest")).unwrap();
+        let expected = SyncPlanHeader {
+            root_sha256: [11u8; 32],
+            folder_count: 0,
+            video_count: 0,
+            file_count: 1,
+        };
+        let mut receiver =
+            CloudNodeRecoveryReceiver::open(&store, "oversized-peer", expected).unwrap();
+        let data = vec![7u8; 1];
+        let resource_sha: [u8; 32] = Sha256::digest(&data).into();
+        let chunk = TransferChunk::new(
+            BlobKind::File,
+            TransferResource::Manifest,
+            object_key(BlobKind::File, "db/huge.db"),
+            [3u8; 32],
+            resource_sha,
+            0,
+            MAX_RECOVERY_MANIFEST_BYTES + 1,
+            data,
+        )
+        .unwrap();
+        let target = receiver.resource_target(&chunk);
+        let part = transfer_part_path(&target).unwrap();
+        assert!(receiver.accept_chunk(&chunk).is_err());
+        assert!(!target.exists());
+        assert!(!part.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
