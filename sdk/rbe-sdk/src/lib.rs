@@ -212,6 +212,8 @@ pub enum SdkError {
     InvalidLogScope(String),
     InvalidLogLevel(String),
     InvalidNetSublibrary(String),
+    InvalidTcpPort(u16),
+    InvalidTcpArgument(String),
     InvalidAbiRange(AbiRange),
     Host(HostError),
 }
@@ -231,6 +233,10 @@ impl fmt::Display for SdkError {
             Self::InvalidNetSublibrary(name) => {
                 write!(formatter, "invalid net sub-library name {name:?}")
             }
+            Self::InvalidTcpPort(port) => {
+                write!(formatter, "invalid RBE TCP port {port}; expected 1..=65535")
+            }
+            Self::InvalidTcpArgument(message) => formatter.write_str(message),
             Self::InvalidAbiRange(range) => {
                 write!(
                     formatter,
@@ -557,16 +563,20 @@ impl<'a> Net<'a> {
         self.known(capability::NET_URL)
     }
 
-    pub fn dns(self) -> NetLibrary<'a> {
-        self.known(capability::NET_DNS)
+    pub fn dns(self) -> Dns<'a> {
+        Dns {
+            client: self.known(capability::NET_DNS),
+        }
     }
 
     pub fn ip(self) -> NetLibrary<'a> {
         self.known(capability::NET_IP)
     }
 
-    pub fn tcp(self) -> NetLibrary<'a> {
-        self.known(capability::NET_TCP)
+    pub fn tcp(self) -> Tcp<'a> {
+        Tcp {
+            client: self.known(capability::NET_TCP),
+        }
     }
 
     pub fn udp(self) -> NetLibrary<'a> {
@@ -599,6 +609,107 @@ impl<'a> Net<'a> {
             capability: target.to_string(),
             target: target.to_string(),
         }
+    }
+}
+
+/// Typed public DNS client. RBE still owns resolution policy and authority.
+pub struct Dns<'a> {
+    client: CapabilityClient<'a>,
+}
+
+impl<'a> Dns<'a> {
+    pub fn raw(&self) -> &CapabilityClient<'a> {
+        &self.client
+    }
+
+    pub fn lookup(&self, name: &str) -> Result<HostReply, SdkError> {
+        self.client.call("lookup", name.as_bytes())
+    }
+
+    pub fn ip(&self, name: &str) -> Result<HostReply, SdkError> {
+        self.client.call("ip", name.as_bytes())
+    }
+
+    pub fn mx(&self, name: &str) -> Result<HostReply, SdkError> {
+        self.client.call("mx", name.as_bytes())
+    }
+}
+
+/// Typed stateful TCP client. Handles remain opaque and session-scoped in RBE.
+pub struct Tcp<'a> {
+    client: CapabilityClient<'a>,
+}
+
+impl<'a> Tcp<'a> {
+    pub fn raw(&self) -> &CapabilityClient<'a> {
+        &self.client
+    }
+
+    pub fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        if host.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP host must be non-empty".to_string(),
+            ));
+        }
+        if port == 0 {
+            return Err(SdkError::InvalidTcpPort(port));
+        }
+        self.client
+            .call("connect", &encode_tcp_connect(host, port, timeout_ms))
+    }
+
+    pub fn write(
+        &self,
+        handle: &str,
+        data: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        if handle.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP handle must be non-empty".to_string(),
+            ));
+        }
+        if data.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP write data must be non-empty".to_string(),
+            ));
+        }
+        self.client
+            .call("write", &encode_tcp_write(handle, data, timeout_ms))
+    }
+
+    pub fn read(
+        &self,
+        handle: &str,
+        max_bytes: usize,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        if handle.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP handle must be non-empty".to_string(),
+            ));
+        }
+        if max_bytes == 0 {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP max_bytes must be positive".to_string(),
+            ));
+        }
+        self.client
+            .call("read", &encode_tcp_read(handle, max_bytes, timeout_ms))
+    }
+
+    pub fn close(&self, handle: &str) -> Result<HostReply, SdkError> {
+        if handle.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP handle must be non-empty".to_string(),
+            ));
+        }
+        self.client.call("close", &encode_tcp_close(handle))
     }
 }
 
@@ -729,6 +840,55 @@ fn encode_log_record(scope: &[String], message: &str) -> Vec<u8> {
     output.into_bytes()
 }
 
+fn encode_tcp_connect(host: &str, port: u16, timeout_ms: Option<u64>) -> Vec<u8> {
+    let mut output = String::from("{\"host\":");
+    push_json_string(&mut output, host);
+    write!(output, ",\"port\":{port}").expect("writing TCP JSON to String cannot fail");
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_write(handle: &str, data: &[u8], timeout_ms: Option<u64>) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    output.push_str(",\"data\":[");
+    for (index, byte) in data.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "{byte}").expect("writing TCP byte to String cannot fail");
+    }
+    output.push(']');
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_read(handle: &str, max_bytes: usize, timeout_ms: Option<u64>) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    write!(output, ",\"max_bytes\":{max_bytes}")
+        .expect("writing TCP JSON to String cannot fail");
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_close(handle: &str) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn push_timeout(output: &mut String, timeout_ms: Option<u64>) {
+    if let Some(timeout_ms) = timeout_ms {
+        write!(output, ",\"timeout_ms\":{timeout_ms}")
+            .expect("writing TCP timeout to String cannot fail");
+    }
+}
+
 fn push_json_string(output: &mut String, value: &str) {
     output.push('"');
     for character in value.chars() {
@@ -838,6 +998,48 @@ mod tests {
     }
 
     #[test]
+    fn typed_dns_and_tcp_clients_encode_live_host_operations() {
+        let bridge = RecordingBridge::default();
+        let sdk = RbeSdk::new(&bridge);
+
+        sdk.net().dns().mx("gmail.com").unwrap();
+        sdk.net()
+            .tcp()
+            .connect("gmail-smtp-in.l.google.com", 25, Some(2500))
+            .unwrap();
+        sdk.net()
+            .tcp()
+            .write("tcp:abc", b"EHLO example.com\r\n", None)
+            .unwrap();
+        sdk.net().tcp().read("tcp:abc", 1024, Some(1000)).unwrap();
+        sdk.net().tcp().close("tcp:abc").unwrap();
+
+        let calls = bridge.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0].0, capability::NET_DNS);
+        assert_eq!(calls[0].2, "mx");
+        assert_eq!(calls[0].3, b"gmail.com");
+        assert_eq!(calls[1].0, capability::NET_TCP);
+        assert_eq!(calls[1].2, "connect");
+        assert_eq!(
+            calls[1].3,
+            br#"{"host":"gmail-smtp-in.l.google.com","port":25,"timeout_ms":2500}"#
+        );
+        assert_eq!(calls[2].2, "write");
+        assert_eq!(
+            calls[2].3,
+            br#"{"handle":"tcp:abc","data":[69,72,76,79,32,101,120,97,109,112,108,101,46,99,111,109,13,10]}"#
+        );
+        assert_eq!(calls[3].2, "read");
+        assert_eq!(
+            calls[3].3,
+            br#"{"handle":"tcp:abc","max_bytes":1024,"timeout_ms":1000}"#
+        );
+        assert_eq!(calls[4].2, "close");
+        assert_eq!(calls[4].3, br#"{"handle":"tcp:abc"}"#);
+    }
+
+    #[test]
     fn higher_level_library_can_call_builtin_net_through_host_bridge() {
         let bridge = RecordingBridge::default();
         let sdk = RbeSdk::new(&bridge);
@@ -848,8 +1050,12 @@ mod tests {
             .unwrap();
         assert_eq!(reply.payload, b"ok");
 
-        sdk.net().dns().call("mx", b"gmail.com").unwrap();
-        sdk.net().tcp().call("connect", b"mail.example:25").unwrap();
+        sdk.net().dns().raw().call("mx", b"gmail.com").unwrap();
+        sdk.net()
+            .tcp()
+            .raw()
+            .call("connect", br#"{"host":"mail.example","port":25}"#)
+            .unwrap();
 
         let calls = bridge.calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
