@@ -64,14 +64,12 @@ pub async fn probe_upstream(settings: &CloudNodeSettings) -> anyhow::Result<Auth
     if response.status() != reqwest::StatusCode::OK {
         anyhow::bail!("Cloud Node upstream did not accept authentication");
     }
-    let advertised = response.content_length().unwrap_or(0);
-    if advertised > MAX_PROOF_RESPONSE_BYTES as u64 {
-        anyhow::bail!("Cloud Node upstream authentication response is oversized");
-    }
-    let body = response.bytes().await?;
-    if body.len() > MAX_PROOF_RESPONSE_BYTES {
-        anyhow::bail!("Cloud Node upstream authentication response is oversized");
-    }
+    let body = read_limited_response(
+        response,
+        MAX_PROOF_RESPONSE_BYTES,
+        "Cloud Node upstream authentication response",
+    )
+    .await?;
     let accept = NodeProof::decode(&body)?;
     accept.verify_accepts(&knock)?;
     accept.verify_freshness(now_ms()?, DEFAULT_AUTH_SKEW_MS)?;
@@ -606,18 +604,58 @@ async fn post_authenticated_frame(
             response.status()
         );
     }
-    if response.content_length().unwrap_or(0) > maximum_response_bytes as u64 {
-        anyhow::bail!("Cloud Node authenticated response is oversized");
-    }
-    let body = response.bytes().await?;
-    if body.len() > maximum_response_bytes {
-        anyhow::bail!("Cloud Node authenticated response is oversized");
-    }
+    let body = read_limited_response(
+        response,
+        maximum_response_bytes,
+        "Cloud Node authenticated response",
+    )
+    .await?;
     let response = Frame::decode(&body)?;
     if response.session != peer.session {
         anyhow::bail!("Cloud Node upstream response uses a different authenticated session");
     }
     Ok(response)
+}
+
+async fn read_limited_response(
+    mut response: reqwest::Response,
+    maximum_bytes: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let maximum_u64 = u64::try_from(maximum_bytes).unwrap_or(u64::MAX);
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum_u64)
+    {
+        anyhow::bail!("{label} is oversized");
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(maximum_bytes);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        append_limited_response_chunk(&mut body, &chunk, maximum_bytes, label)?;
+    }
+    Ok(body)
+}
+
+fn append_limited_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    maximum_bytes: usize,
+    label: &str,
+) -> anyhow::Result<()> {
+    let next_len = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| anyhow::anyhow!("{label} size overflow"))?;
+    if next_len > maximum_bytes {
+        anyhow::bail!("{label} is oversized");
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn ensure_expected_peer(
@@ -749,6 +787,18 @@ mod tests {
         assert!(peer_root.is_file());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_response_accumulator_rejects_oversize_before_append() {
+        let mut body = vec![1u8; 4];
+        append_limited_response_chunk(&mut body, &[2u8; 2], 6, "test response").unwrap();
+        assert_eq!(body.len(), 6);
+
+        let error = append_limited_response_chunk(&mut body, &[3], 6, "test response")
+            .unwrap_err();
+        assert!(error.to_string().contains("oversized"));
+        assert_eq!(body.len(), 6);
     }
 
     #[test]
