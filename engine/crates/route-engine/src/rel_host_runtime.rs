@@ -16,6 +16,10 @@ pub enum RelHostRequest {
     Workspace(WorkspacePlan),
     Script(ScriptPlan),
     Archive(ArchivePlan),
+    /// Execute one already-validated host operation with an execution-scoped
+    /// `??/` root. The host allocates and cleans the workspace; Route Engine
+    /// never resolves the OS temporary directory itself.
+    Temp(Box<RelHostRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
