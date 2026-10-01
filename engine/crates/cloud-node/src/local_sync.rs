@@ -26,6 +26,9 @@ pub struct LocalDirectoryStatus {
     pub dirty: bool,
     pub scanned_files: usize,
     pub managed_objects: usize,
+    pub missing_managed_objects: usize,
+    pub changed_managed_objects: usize,
+    pub untracked_files: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,10 +117,15 @@ impl CloudNodeStore {
         let scanned = scan_local_directory(self, directory, &prefix)?;
         let managed = managed_objects(self, &prefix)?;
         let dirty = local_directory_dirty(&scanned, &managed);
+        let (missing_managed_objects, changed_managed_objects, untracked_files) =
+            local_directory_change_counts(&scanned, &managed);
         Ok(LocalDirectoryStatus {
             dirty,
             scanned_files: scanned.len(),
             managed_objects: managed.len(),
+            missing_managed_objects,
+            changed_managed_objects,
+            untracked_files,
         })
     }
 
@@ -231,6 +239,58 @@ impl CloudNodeStore {
 
         Ok(result)
     }
+
+    /// Restore only managed files that are absent from a bootstrap working tree.
+    /// Existing files are never overwritten and untracked files are never removed.
+    /// This lets an interrupted/fresh checkout resume without converting missing
+    /// checkout files into intentional deletion history.
+    pub fn restore_missing_local_directory(
+        &self,
+        directory: &Path,
+        logical_prefix: &str,
+    ) -> anyhow::Result<usize> {
+        self.verify()?;
+        let prefix = normalize_logical_prefix(logical_prefix)?;
+        let root = prepare_local_root(self, directory)?;
+        let scanned = scan_local_directory_from_root(self, &root, &prefix)?;
+        let managed = managed_objects(self, &prefix)?;
+        let mut desired = BTreeMap::<String, SyncObject>::new();
+        for object in managed {
+            if object.kind == BlobKind::Folder {
+                continue;
+            }
+            if desired
+                .insert(object.logical_path.clone(), object)
+                .is_some()
+            {
+                anyhow::bail!("Cloud Node localSync snapshot contains duplicate logical paths");
+            }
+        }
+
+        let mut restored = 0usize;
+        for (logical_path, object) in &desired {
+            if scanned.contains_key(logical_path) {
+                continue;
+            }
+            let relative = logical_relative_path(logical_path, &prefix)?;
+            let target = join_relative_logical_path(&root, relative)?;
+            if target.exists() {
+                anyhow::bail!(
+                    "Cloud Node bootstrap checkout cannot restore managed file over non-file path: {}",
+                    target.display()
+                );
+            }
+            let payload = object.payload_path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cloud Node managed object {:?} has no restorable payload",
+                    object.logical_path
+                )
+            })?;
+            restore_payload_atomic(payload, &target, object.content_sha256)?;
+            restored = restored.saturating_add(1);
+        }
+        Ok(restored)
+    }
 }
 
 fn managed_objects(store: &CloudNodeStore, prefix: &str) -> anyhow::Result<Vec<SyncObject>> {
@@ -253,6 +313,37 @@ fn local_directory_dirty(scanned: &BTreeMap<String, ScannedEntry>, managed: &[Sy
                 && object.content_sha256 == entry.content_sha256
         })
     })
+}
+
+fn local_directory_change_counts(
+    scanned: &BTreeMap<String, ScannedEntry>,
+    managed: &[SyncObject],
+) -> (usize, usize, usize) {
+    let mut missing_managed = 0usize;
+    let mut changed_managed = 0usize;
+
+    for object in managed {
+        if object.kind == BlobKind::Folder {
+            continue;
+        }
+        match scanned.get(&object.logical_path) {
+            None => missing_managed = missing_managed.saturating_add(1),
+            Some(entry)
+                if entry.kind == object.kind && entry.content_sha256 == object.content_sha256 => {}
+            Some(_) => changed_managed = changed_managed.saturating_add(1),
+        }
+    }
+
+    let untracked_files = scanned
+        .iter()
+        .filter(|(logical_path, _)| {
+            !managed.iter().any(|object| {
+                object.kind != BlobKind::Folder && object.logical_path == **logical_path
+            })
+        })
+        .count();
+
+    (missing_managed, changed_managed, untracked_files)
 }
 
 fn scan_local_directory(
@@ -356,7 +447,7 @@ fn walk_directory(
             anyhow::bail!("Cloud Node localSync produced duplicate path {logical_path:?}");
         }
     }
-    Ok(())
+    Ok(scanned)
 }
 
 fn remove_active_object(store: &CloudNodeStore, object: &SyncObject) -> anyhow::Result<()> {
@@ -625,6 +716,13 @@ mod tests {
             .store_file(&source, "workspace/nested/state.txt")
             .unwrap();
 
+        let status = store
+            .local_directory_status(&watched, "workspace")
+            .unwrap();
+        assert_eq!(status.missing_managed_objects, 1);
+        assert_eq!(status.changed_managed_objects, 0);
+        assert_eq!(status.untracked_files, 0);
+
         let restored = store
             .restore_local_directory(&watched, "workspace")
             .unwrap();
@@ -638,6 +736,43 @@ mod tests {
             .unwrap()
             .dirty;
         assert!(!dirty);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bootstrap_missing_restore_preserves_existing_edits() {
+        let root = root("partial-restore");
+        let source_a = root.join("source-a.txt");
+        let source_b = root.join("source-b.txt");
+        fs::write(&source_a, b"remote a").unwrap();
+        fs::write(&source_b, b"remote b").unwrap();
+        let watched = root.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let store = store(&root);
+        store.store_file(&source_a, "workspace/a.txt").unwrap();
+        store.store_file(&source_b, "workspace/b.txt").unwrap();
+        fs::write(watched.join("a.txt"), b"local edit").unwrap();
+
+        let before = store
+            .local_directory_status(&watched, "workspace")
+            .unwrap();
+        assert_eq!(before.missing_managed_objects, 1);
+        assert_eq!(before.changed_managed_objects, 1);
+        assert_eq!(before.untracked_files, 0);
+
+        let restored = store
+            .restore_missing_local_directory(&watched, "workspace")
+            .unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(fs::read(watched.join("a.txt")).unwrap(), b"local edit");
+        assert_eq!(fs::read(watched.join("b.txt")).unwrap(), b"remote b");
+
+        let after = store
+            .local_directory_status(&watched, "workspace")
+            .unwrap();
+        assert_eq!(after.missing_managed_objects, 0);
+        assert_eq!(after.changed_managed_objects, 1);
+        assert_eq!(after.untracked_files, 0);
         let _ = fs::remove_dir_all(root);
     }
 
