@@ -16,11 +16,11 @@ mod protocol;
 #[cfg(feature = "client")]
 mod provider;
 #[cfg(feature = "client")]
-#[path = "provider_sync.rs"]
-mod provider_sync_raw;
-#[cfg(feature = "client")]
 #[path = "provider_sync_guard.rs"]
 mod provider_sync;
+#[cfg(feature = "client")]
+#[path = "provider_sync.rs"]
+mod provider_sync_raw;
 mod recovery;
 mod registry_ingest;
 mod server;
