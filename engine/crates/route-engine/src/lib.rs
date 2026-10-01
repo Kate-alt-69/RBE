@@ -171,7 +171,9 @@ pub use rel_host_builtins::{
     function_exists as host_builtin_function_exists, is_host_builtin,
     ARCHIVE_BUILTIN, SCRIPT_BUILTIN, WORKSPACE_BUILTIN,
 };
-pub use rel_host_runtime::{RelHostOutput, RelHostRequest};
+pub use rel_host_runtime::{
+    RelHostExecutionFuture, RelHostExecutor, RelHostOutput, RelHostRequest,
+};
 pub use relc::{
     compile_runtime_image, discover_physical_rel_sources, PhysicalRelSource, RelcError,
 };
