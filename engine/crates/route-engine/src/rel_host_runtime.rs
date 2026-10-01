@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 
 use crate::ast::Value;
 use crate::module_eval::ModuleEvalError;
@@ -80,3 +81,50 @@ pub type RelHostExecutionFuture<'a> =
 pub trait RelHostExecutor: Send + Sync {
     fn execute<'a>(&'a self, request: RelHostRequest) -> RelHostExecutionFuture<'a>;
 }
+
+/// RBE serves one frozen Runtime Image per Backend process. The privileged REL
+/// executor is therefore installed once after Backend has admitted the
+/// Container/runtime authority, then cloned into each request-scoped host
+/// capability adapter. Replacing it at runtime is intentionally forbidden.
+static REL_HOST_EXECUTOR: OnceLock<Arc<dyn RelHostExecutor>> = OnceLock::new();
+
+pub fn install_rel_host_executor(
+    executor: Arc<dyn RelHostExecutor>,
+) -> Result<(), RelHostExecutorInstallError> {
+    REL_HOST_EXECUTOR
+        .set(executor)
+        .map_err(|_| RelHostExecutorInstallError::AlreadyInstalled)
+}
+
+pub(crate) fn installed_rel_host_executor() -> Option<Arc<dyn RelHostExecutor>> {
+    REL_HOST_EXECUTOR.get().cloned()
+}
+
+/// Public installation hook reachable through the already-exported
+/// `RelHostExecutor` trait object, so Backend does not need Route Engine's
+/// internal module path. The string error keeps the private installation error
+/// type out of the cross-crate API.
+impl dyn RelHostExecutor {
+    pub fn install_process_executor(
+        executor: Arc<dyn RelHostExecutor>,
+    ) -> Result<(), String> {
+        install_rel_host_executor(executor).map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelHostExecutorInstallError {
+    AlreadyInstalled,
+}
+
+impl std::fmt::Display for RelHostExecutorInstallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyInstalled => formatter.write_str(
+                "trusted REL host executor is already installed for this Backend process",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RelHostExecutorInstallError {}

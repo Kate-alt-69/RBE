@@ -9,7 +9,7 @@ use crate::field_manager::FieldRuntimeContext;
 use crate::module_eval::{HostCapabilityCaller, HostCapabilityFuture, ModuleEvalError};
 use crate::rel_host_builtins::is_host_builtin;
 use crate::rel_host_descriptor::{deferred_call, temp_request};
-use crate::rel_host_runtime::RelHostExecutor;
+use crate::rel_host_runtime::{installed_rel_host_executor, RelHostExecutor};
 use crate::runtime_image::RuntimeImage;
 
 pub struct RuntimeHostCapabilities {
@@ -25,7 +25,7 @@ impl RuntimeHostCapabilities {
             video: VideoLanguage::new(state.video_manager.clone()),
             image,
             fields: None,
-            rel_host_executor: None,
+            rel_host_executor: installed_rel_host_executor(),
         }
     }
 
@@ -38,14 +38,13 @@ impl RuntimeHostCapabilities {
             video: VideoLanguage::new(state.video_manager.clone()),
             image,
             fields: Some(fields),
-            rel_host_executor: None,
+            rel_host_executor: installed_rel_host_executor(),
         }
     }
 
-    /// Attach the trusted Backend/Container executor for host-backed REL
-    /// operations. Without this bridge, deferred descriptors may still be
-    /// constructed, but materialization (for example `workspace.temp(...)`)
-    /// fails closed.
+    /// Attach a trusted Backend/Container executor explicitly. The normal
+    /// Backend path installs one process-wide executor once at boot; this
+    /// override remains useful for isolated tests and embedded Route Engine use.
     pub fn with_rel_host_executor(mut self, executor: Arc<dyn RelHostExecutor>) -> Self {
         self.rel_host_executor = Some(executor);
         self
