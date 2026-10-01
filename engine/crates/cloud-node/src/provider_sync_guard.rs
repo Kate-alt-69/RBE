@@ -1,6 +1,8 @@
 use crate::config::CloudNodeSettings;
-use crate::provider_sync::{
-    self, ProviderSyncAction, ProviderSyncRelation, ProviderSyncResult, ProviderSyncStatus,
+use crate::provider_sync_raw;
+pub use crate::provider_sync_raw::{
+    provider_status, ProviderSyncAction, ProviderSyncRelation, ProviderSyncResult,
+    ProviderSyncStatus,
 };
 use crate::store::CloudNodeStore;
 
@@ -24,12 +26,10 @@ pub async fn synchronize_provider(
     let mut last_mutating_action = None;
 
     for pass in 1..=MAX_PROVIDER_STABILIZATION_PASSES {
-        let mut result = provider_sync::synchronize_provider(settings, store)
+        let mut result = provider_sync_raw::synchronize_provider(settings, store)
             .await
             .map_err(|error| {
-                anyhow::anyhow!(
-                    "Cloud Node provider synchronization pass {pass} failed: {error:#}"
-                )
+                anyhow::anyhow!("Cloud Node provider synchronization pass {pass} failed: {error:#}")
             })?;
 
         if first_before.is_none() {
@@ -39,7 +39,7 @@ pub async fn synchronize_provider(
             last_mutating_action = Some(result.action);
         }
 
-        let status = provider_sync::provider_status(settings, store)
+        let status = provider_sync_raw::provider_status(settings, store)
             .await
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -83,10 +83,7 @@ fn provider_sync_stable(status: &ProviderSyncStatus) -> bool {
     status.relation == ProviderSyncRelation::InSync
 }
 
-fn pull_regressed(
-    last_action: Option<ProviderSyncAction>,
-    relation: ProviderSyncRelation,
-) -> bool {
+fn pull_regressed(last_action: Option<ProviderSyncAction>, relation: ProviderSyncRelation) -> bool {
     matches!(
         last_action,
         Some(ProviderSyncAction::Pull | ProviderSyncAction::ForcedPull)
