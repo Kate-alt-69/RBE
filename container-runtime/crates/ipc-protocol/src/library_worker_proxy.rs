@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 pub const LIBRARY_WORKER_PROXY_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_LIBRARY_WORKER_PROXY_SOURCE_FILES: usize = 16_384;
 pub const MAX_LIBRARY_WORKER_PROXY_PATH_BYTES: usize = 4 * 1024;
-pub const MAX_LIBRARY_WORKER_PROXY_STARTUP_SECONDS: u64 = 300;
+pub const MAX_LIBRARY_WORKER_PROXY_STARTUP_SECONDS: u64 = 15 * 60;
+pub const MAX_LIBRARY_WORKER_PROXY_ARGUMENTS: usize = 128;
+pub const MAX_LIBRARY_WORKER_PROXY_ARGUMENT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,9 +40,10 @@ pub struct LibraryWorkerProxyBootstrap {
 impl LibraryWorkerProxyBootstrap {
     /// Validate the complete trusted Backend -> Container worker handoff.
     ///
-    /// Protocol v1 intentionally supports only one interpreted entrypoint
-    /// argument. Extra interpreter flags, inherited environment, shell launch,
-    /// and direct networking are rejected rather than silently weakened.
+    /// Argument zero is always the verified interpreted entrypoint. Additional
+    /// arguments are bounded opaque script arguments that must already have
+    /// been sealed by the source-only worker launch plan. Inherited environment,
+    /// shell launch and direct networking remain forbidden.
     pub fn validate(&self) -> Result<(), LibraryWorkerProxyError> {
         if self.protocol != LIBRARY_WORKER_PROXY_PROTOCOL_VERSION {
             return Err(LibraryWorkerProxyError::UnsupportedProtocol(self.protocol));
@@ -49,13 +52,21 @@ impl LibraryWorkerProxyBootstrap {
         validate_sha256("program_sha256", &self.program_sha256)?;
         validate_absolute_path("working_directory", &self.working_directory)?;
 
-        if self.args.len() != 1 {
+        if self.args.is_empty() || self.args.len() > MAX_LIBRARY_WORKER_PROXY_ARGUMENTS + 1 {
             return Err(LibraryWorkerProxyError::InvalidArgumentCount(
                 self.args.len(),
             ));
         }
         let entrypoint = &self.args[0];
         validate_absolute_path("entrypoint", entrypoint)?;
+        for (index, argument) in self.args.iter().enumerate().skip(1) {
+            if argument.len() > MAX_LIBRARY_WORKER_PROXY_ARGUMENT_BYTES || argument.contains('\0') {
+                return Err(LibraryWorkerProxyError::InvalidArgument {
+                    index: index - 1,
+                    maximum_bytes: MAX_LIBRARY_WORKER_PROXY_ARGUMENT_BYTES,
+                });
+            }
+        }
         let root = Path::new(&self.working_directory);
         let entrypoint_path = Path::new(entrypoint);
         if entrypoint_path == root || !entrypoint_path.starts_with(root) {
@@ -173,6 +184,7 @@ pub enum LibraryWorkerProxyError {
     InvalidAbsolutePath(&'static str),
     InvalidSha256(&'static str),
     InvalidArgumentCount(usize),
+    InvalidArgument { index: usize, maximum_bytes: usize },
     EntrypointOutsideSourceRoot,
     EntrypointPathNotUtf8,
     EnvironmentMustBeEmpty,
@@ -209,7 +221,16 @@ impl fmt::Display for LibraryWorkerProxyError {
             Self::InvalidArgumentCount(count) => {
                 write!(
                     formatter,
-                    "Library Worker Proxy v1 requires exactly one entrypoint argument, got {count}"
+                    "Library Worker Proxy requires an entrypoint plus at most {MAX_LIBRARY_WORKER_PROXY_ARGUMENTS} script arguments, got {count} total arguments"
+                )
+            }
+            Self::InvalidArgument {
+                index,
+                maximum_bytes,
+            } => {
+                write!(
+                    formatter,
+                    "Library Worker Proxy script argument {index} exceeds {maximum_bytes} bytes or contains NUL"
                 )
             }
             Self::EntrypointOutsideSourceRoot => formatter
@@ -296,6 +317,23 @@ mod tests {
     #[test]
     fn strict_bootstrap_accepts_verified_interpreted_worker_shape() {
         valid().validate().unwrap();
+    }
+
+    #[test]
+    fn bounded_script_arguments_are_allowed() {
+        let mut value = valid();
+        value.args.push("--mode".into());
+        value.args.push("build".into());
+        value.validate().unwrap();
+
+        let mut too_many = valid();
+        too_many
+            .args
+            .extend((0..=MAX_LIBRARY_WORKER_PROXY_ARGUMENTS).map(|_| "x".to_string()));
+        assert!(matches!(
+            too_many.validate(),
+            Err(LibraryWorkerProxyError::InvalidArgumentCount(_))
+        ));
     }
 
     #[test]
