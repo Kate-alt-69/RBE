@@ -30,14 +30,12 @@ CAPABILITIES = {
     "CRYPTO": "crypto",
 }
 
-NET_METHODS = (
+GENERIC_NET_METHODS = (
     "http",
     "cookies",
     "headers",
     "url",
-    "dns",
     "ip",
-    "tcp",
     "udp",
     "quic",
     "websocket",
@@ -46,6 +44,8 @@ NET_METHODS = (
     "mask",
 )
 
+DNS_METHODS = ("lookup", "ip", "mx")
+TCP_METHODS = ("connect", "write", "read", "close")
 LOG_METHODS = ("debug", "info", "warn", "error", "fatal")
 
 
@@ -69,11 +69,43 @@ for name, value in CAPABILITIES.items():
     require(JS, f'{name}: "{value}"', f"JS capability {name}")
     require(PY, f'{name} = "{value}"', f"Python capability {name}")
 
-for method in NET_METHODS:
+for method in GENERIC_NET_METHODS:
     require(RUST, f"pub fn {method}(self) -> NetLibrary", f"Rust net.{method}")
     require(JS, f"{method}() {{ return new CapabilityClient", f"JS net.{method}")
     require(TS, f"{method}(): CapabilityClient;", f"TypeScript net.{method}")
     require(PY, f"def {method}(self) -> CapabilityClient:", f"Python net.{method}")
+
+require(RUST, "pub fn dns(self) -> Dns", "Rust typed net.dns")
+require(RUST, "pub fn tcp(self) -> Tcp", "Rust typed net.tcp")
+require(JS, "dns() { return new DnsClient", "JS typed net.dns")
+require(JS, "tcp() { return new TcpClient", "JS typed net.tcp")
+require(TS, "dns(): DnsClient;", "TypeScript typed net.dns")
+require(TS, "tcp(): TcpClient;", "TypeScript typed net.tcp")
+require(PY, "def dns(self) -> DnsClient:", "Python typed net.dns")
+require(PY, "def tcp(self) -> TcpClient:", "Python typed net.tcp")
+
+rust_dns = class_slice(RUST, "impl<'a> Dns<'a>", "/// Typed stateful TCP client")
+js_dns = class_slice(JS, "export class DnsClient", "export class TcpClient")
+py_dns = class_slice(PY, "class DnsClient", "class TcpClient")
+for method in DNS_METHODS:
+    require(rust_dns, f"pub fn {method}(&self", f"Rust DNS.{method}")
+    require(js_dns, f"{method}(name)", f"JS DNS.{method}")
+    require(py_dns, f"def {method}(self, name: str)", f"Python DNS.{method}")
+    require(TS, f"{method}(name: string):", f"TypeScript DNS.{method}")
+
+rust_tcp = class_slice(RUST, "impl<'a> Tcp<'a>", "/// Generic reusable client")
+js_tcp = class_slice(JS, "export class TcpClient", "export class NetClient")
+py_tcp = class_slice(PY, "class TcpClient", "class NetClient")
+for method in TCP_METHODS:
+    require(rust_tcp, f"pub fn {method}(", f"Rust TCP.{method}")
+    require(js_tcp, f"{method}(", f"JS TCP.{method}")
+    require(py_tcp, f"def {method}(", f"Python TCP.{method}")
+    require(TS, f"{method}(", f"TypeScript TCP.{method}")
+
+require(RUST, "pub fn raw(&self) -> &CapabilityClient", "Rust typed net raw escape hatch")
+require(JS, "extends CapabilityClient", "JS typed net raw escape hatch")
+require(PY, "class DnsClient(CapabilityClient)", "Python DNS raw escape hatch")
+require(PY, "class TcpClient(CapabilityClient)", "Python TCP raw escape hatch")
 
 require(RUST, "pub fn log(self, library_name: &str)", "Rust log")
 require(JS, "log(libraryName) {", "JS explicit log identity")
