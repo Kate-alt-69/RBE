@@ -612,6 +612,7 @@ async fn push_provider_state(
     local_head: &HistoryCommit,
     expected_remote: Option<&HistoryCommit>,
 ) -> anyhow::Result<()> {
+    verify_provider_push_source(store)?;
     let cache_owner = provider_cache_owner(client.namespace());
     upload_snapshot(client, store, plan, &cache_owner).await?;
     let commits = history.chain_to_ancestor(
@@ -644,6 +645,12 @@ async fn push_provider_state(
     )
     .await?;
     cleanup_outbound_cache(store, &cache_owner).await
+}
+
+fn verify_provider_push_source(store: &CloudNodeStore) -> anyhow::Result<()> {
+    store.verify().map(|_| ()).map_err(|error| {
+        anyhow::anyhow!("Cloud Node provider push refused corrupted local snapshot: {error}")
+    })
 }
 
 async fn pull_provider_state(
@@ -1793,6 +1800,41 @@ mod tests {
         let mut missing = valid_file_provider_snapshot();
         missing.resources.pop();
         assert!(validate_snapshot(&missing).is_err());
+    }
+
+    #[test]
+    fn provider_push_rejects_corrupted_local_snapshot() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node": {
+                "id": "node-a",
+                "storageRoot": root,
+                "backupVersions": 5,
+                "preserveOriginal": true,
+                "videoChunkBytes": 1048576
+            }
+        }))
+        .unwrap();
+        let source = root.join("users.db");
+        fs::write(&source, b"provider-authoritative-bytes").unwrap();
+        let store = CloudNodeStore::open(&settings).unwrap();
+        let stored = store.store_file(&source, "db/users.db").unwrap();
+        verify_provider_push_source(&store).unwrap();
+
+        let payload = store
+            .summary()
+            .storage
+            .join(&stored.object_key)
+            .join("versions")
+            .join(&stored.content_sha256)
+            .join("payload");
+        fs::write(&payload, b"corrupt").unwrap();
+        let error = verify_provider_push_source(&store).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider push refused corrupted local snapshot"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
