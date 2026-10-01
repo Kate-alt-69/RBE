@@ -119,6 +119,7 @@ mod modules;
 mod parser;
 mod paths;
 mod rel_host_builtins;
+mod rel_host_descriptor;
 mod rel_host_runtime;
 mod route_collision;
 mod runtime_roots;
