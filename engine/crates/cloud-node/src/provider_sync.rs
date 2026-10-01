@@ -510,14 +510,14 @@ pub async fn synchronize_provider(
             ),
             ProviderConflictPolicy::PreferLocal => {
                 push_provider_state(
-                &client,
-                &history,
-                store,
-                &plan,
-                &local_head,
-                remote.as_ref(),
-            )
-            .await?;
+                    &client,
+                    &history,
+                    store,
+                    &plan,
+                    &local_head,
+                    remote.as_ref(),
+                )
+                .await?;
                 Ok(ProviderSyncResult {
                     action: ProviderSyncAction::ForcedPush,
                     final_root: local_head.snapshot_root.clone(),
@@ -528,14 +528,14 @@ pub async fn synchronize_provider(
             ProviderConflictPolicy::PreferRemote => {
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("Cloud Node provider remote head disappeared"))?;
                 pull_provider_state(
-                &client,
-                &history,
-                store,
-                &remote,
-                &recovery_owner,
-                &mut remote_cache,
-            )
-            .await?;
+                    &client,
+                    &history,
+                    store,
+                    &remote,
+                    &recovery_owner,
+                    &mut remote_cache,
+                )
+                .await?;
                 Ok(ProviderSyncResult {
                     action: ProviderSyncAction::ForcedPull,
                     final_root: remote.snapshot_root.clone(),
@@ -890,7 +890,9 @@ async fn upload_snapshot(
                 "Cloud Node provider snapshot index for root {root} does not match the local sync plan"
             );
         }
-        return Ok(());
+        if snapshot_resources_available(client, &snapshot).await? {
+            return Ok(());
+        }
     }
 
     let cache_root = prepare_outbound_cache(store, cache_owner, plan).await?;
@@ -1038,6 +1040,82 @@ async fn upload_snapshot(
         );
     }
     Ok(())
+}
+
+async fn snapshot_resources_available(
+    client: &ProviderClient,
+    snapshot: &ProviderSnapshot,
+) -> anyhow::Result<bool> {
+    for resource in &snapshot.resources {
+        if !provider_resource_available(client, resource).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn provider_resource_available(
+    client: &ProviderClient,
+    resource: &ProviderResource,
+) -> anyhow::Result<bool> {
+    let start = resource.size.saturating_sub(1);
+    let Some(mut response) = client.open_download(&resource.key, start).await? else {
+        return Ok(false);
+    };
+
+    if resource.size == 0 {
+        return match response.content_length() {
+            Some(0) => Ok(true),
+            Some(_) => Ok(false),
+            None => Ok(response
+                .chunk()
+                .await
+                .map_err(provider_transport_error)?
+                .is_none()),
+        };
+    }
+
+    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cloud Node provider resource range probe omitted Content-Range for {:?}",
+                    resource.key
+                )
+            })?;
+        let total = content_range_total(content_range).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node provider resource range probe returned malformed Content-Range {content_range:?} for {:?}",
+                resource.key
+            )
+        })?;
+        return Ok(total == resource.size);
+    }
+
+    if let Some(length) = response.content_length() {
+        return Ok(length == resource.size);
+    }
+
+    // A generic HTTP origin may ignore Range and stream without Content-Length.
+    // In that case prove that the referenced object exists and is non-empty
+    // without downloading the complete resource. Restore still verifies the
+    // declared size and SHA-256 before activation.
+    Ok(response
+        .chunk()
+        .await
+        .map_err(provider_transport_error)?
+        .is_some())
+}
+
+fn content_range_total(value: &str) -> Option<u64> {
+    let (_, total) = value.rsplit_once('/')?;
+    if total == "*" {
+        return None;
+    }
+    total.parse().ok()
 }
 
 async fn hash_and_size(path: &Path) -> anyhow::Result<([u8; 32], u64)> {
@@ -1678,6 +1756,13 @@ mod tests {
         }
         validate_snapshot(&poisoned).unwrap();
         assert!(!snapshot_matches_plan(&poisoned, &plan).unwrap());
+    }
+
+    #[test]
+    fn provider_range_probe_reads_declared_total_size() {
+        assert_eq!(content_range_total("bytes 4-4/5"), Some(5));
+        assert_eq!(content_range_total("bytes 0-0/*"), None);
+        assert_eq!(content_range_total("not-a-range"), None);
     }
 
     #[test]
