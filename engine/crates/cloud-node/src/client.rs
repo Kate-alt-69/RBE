@@ -795,8 +795,7 @@ mod tests {
         append_limited_response_chunk(&mut body, &[2u8; 2], 6, "test response").unwrap();
         assert_eq!(body.len(), 6);
 
-        let error = append_limited_response_chunk(&mut body, &[3], 6, "test response")
-            .unwrap_err();
+        let error = append_limited_response_chunk(&mut body, &[3], 6, "test response").unwrap_err();
         assert!(error.to_string().contains("oversized"));
         assert_eq!(body.len(), 6);
     }
