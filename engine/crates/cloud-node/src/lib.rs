@@ -16,8 +16,11 @@ mod protocol;
 #[cfg(feature = "client")]
 mod provider;
 #[cfg(feature = "client")]
-#[path = "provider_sync_guard.rs"]
+#[path = "provider_sync_checked.rs"]
 mod provider_sync;
+#[cfg(feature = "client")]
+#[path = "provider_sync_guard.rs"]
+mod provider_sync_guard;
 #[cfg(feature = "client")]
 #[path = "provider_sync.rs"]
 mod provider_sync_raw;
