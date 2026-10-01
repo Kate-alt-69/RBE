@@ -162,6 +162,8 @@ pub struct ProviderSettings {
     pub max_reconnect_delay_ms: u64,
     #[serde(default = "default_provider_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    #[serde(default = "default_provider_integrity_audit_interval_ms")]
+    pub integrity_audit_interval_ms: u64,
     #[serde(default = "default_provider_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
     #[serde(default = "default_provider_read_timeout_ms")]
@@ -267,6 +269,7 @@ fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
         provider.max_reconnect_delay_ms,
     )?;
     validate_provider_poll_interval(provider.poll_interval_ms)?;
+    validate_provider_integrity_audit_interval(provider.integrity_audit_interval_ms)?;
     validate_provider_timeout("connectTimeoutMs", provider.connect_timeout_ms)?;
     validate_provider_timeout("readTimeoutMs", provider.read_timeout_ms)?;
 
@@ -480,6 +483,15 @@ fn validate_provider_poll_interval(value: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_provider_integrity_audit_interval(value: u64) -> anyhow::Result<()> {
+    if !(30_000..=86_400_000).contains(&value) {
+        anyhow::bail!(
+            "Cloud Node provider integrityAuditIntervalMs must be between 30000 and 86400000"
+        );
+    }
+    Ok(())
+}
+
 fn validate_provider_timeout(label: &str, value: u64) -> anyhow::Result<()> {
     if !(250..=300_000).contains(&value) {
         anyhow::bail!("Cloud Node provider {label} must be between 250 and 300000");
@@ -603,6 +615,9 @@ const fn default_provider_max_reconnect_delay_ms() -> u64 {
 const fn default_provider_poll_interval_ms() -> u64 {
     30_000
 }
+const fn default_provider_integrity_audit_interval_ms() -> u64 {
+    15 * 60 * 1_000
+}
 const fn default_provider_connect_timeout_ms() -> u64 {
     10_000
 }
@@ -661,6 +676,7 @@ mod tests {
         .unwrap();
         assert_eq!(provider.max_reconnect_delay_ms, 60_000);
         assert_eq!(provider.poll_interval_ms, 30_000);
+        assert_eq!(provider.integrity_audit_interval_ms, 900_000);
         assert_eq!(provider.connect_timeout_ms, 10_000);
         assert_eq!(provider.read_timeout_ms, 60_000);
         validate_provider(&provider).unwrap();
@@ -673,6 +689,12 @@ mod tests {
         assert!(validate_provider(&invalid).is_err());
         invalid = provider.clone();
         invalid.poll_interval_ms = 999;
+        assert!(validate_provider(&invalid).is_err());
+        invalid = provider.clone();
+        invalid.integrity_audit_interval_ms = 29_999;
+        assert!(validate_provider(&invalid).is_err());
+        invalid = provider.clone();
+        invalid.integrity_audit_interval_ms = 86_400_001;
         assert!(validate_provider(&invalid).is_err());
         invalid = provider.clone();
         invalid.max_reconnect_delay_ms = provider.reconnect_delay_ms - 1;
@@ -744,6 +766,7 @@ mod tests {
         assert_eq!(provider.conflict_policy, ProviderConflictPolicy::Fail);
         assert!(provider.auto_reconnect);
         assert!(provider.sync_on_connect);
+        assert_eq!(provider.integrity_audit_interval_ms, 900_000);
     }
 
     #[test]
