@@ -147,7 +147,7 @@ impl LibraryManifest {
             Language::Javascript if !matches!(self.runtime.kind.as_str(), "bun" | "node") => {
                 return Err(ManifestError::RuntimeLanguageMismatch)
             }
-            Language::Python if self.runtime.kind != "python" => {
+            Language::Python if !matches!(self.runtime.kind.as_str(), "python" | "pypy") => {
                 return Err(ManifestError::RuntimeLanguageMismatch)
             }
             _ => {}
@@ -494,6 +494,19 @@ args = ["install"]
         assert!(manifest.supports_abi(1));
         assert_eq!(manifest.build.for_host(HostOs::Windows)[0].args.len(), 2);
         assert_eq!(manifest.build.for_host(HostOs::Linux)[0].args, ["install"]);
+    }
+
+    #[test]
+    fn python_packages_accept_cpython_or_pypy_only() {
+        let python = VALID
+            .replace("language = \"javascript\"", "language = \"python\"")
+            .replace("family = \"javascript\"", "family = \"python\"")
+            .replace("package = \"@rbe/sdk\"", "package = \"rbe-sdk\"")
+            .replace("kind = \"bun\"", "kind = \"python\"")
+            .replace("src/index.js", "src/index.py");
+        assert!(LibraryManifest::parse(&python).is_ok());
+        assert!(LibraryManifest::parse(&python.replace("kind = \"python\"", "kind = \"pypy\"")).is_ok());
+        assert!(LibraryManifest::parse(&python.replace("kind = \"python\"", "kind = \"micropython\"")).is_err());
     }
 
     #[test]
