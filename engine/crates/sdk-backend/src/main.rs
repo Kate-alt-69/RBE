@@ -284,7 +284,11 @@ fn status(project: &Path) -> Result<()> {
     );
     println!(
         "  current shell: {}",
-        if activation_active { "ACTIVE" } else { "INACTIVE" }
+        if activation_active {
+            "ACTIVE"
+        } else {
+            "INACTIVE"
+        }
     );
     if activation_ok && !activation_active {
         println!("  activate now: {}", activation_command(&activation_path));
