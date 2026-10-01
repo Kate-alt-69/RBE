@@ -40,6 +40,35 @@ def _assert_library_name(value: str) -> str:
     return value
 
 
+def _assert_non_empty_string(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    return value
+
+
+def _assert_positive_int(value: int, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _optional_timeout(payload: dict[str, Any], timeout_ms: int | None) -> dict[str, Any]:
+    if timeout_ms is not None:
+        payload["timeout_ms"] = _assert_positive_int(timeout_ms, "timeout_ms")
+    return payload
+
+
+def _byte_list(data: bytes | bytearray | memoryview | list[int] | tuple[int, ...]) -> list[int]:
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return list(bytes(data))
+    if isinstance(data, (list, tuple)) and all(
+        isinstance(byte, int) and not isinstance(byte, bool) and 0 <= byte <= 255
+        for byte in data
+    ):
+        return list(data)
+    raise TypeError("TCP write data must be bytes-like or a sequence of byte values")
+
+
 @dataclass(frozen=True, slots=True)
 class LibraryDescriptor:
     name: str
@@ -275,6 +304,68 @@ class LoggerClient:
         return self.emit("fatal", message)
 
 
+class DnsClient(CapabilityClient):
+    def __init__(self, bridge: HostBridge) -> None:
+        super().__init__(bridge, NET_DNS)
+
+    def lookup(self, name: str) -> Any:
+        return self.call("lookup", {"name": _assert_non_empty_string(name, "DNS name")})
+
+    def ip(self, name: str) -> Any:
+        return self.call("ip", {"name": _assert_non_empty_string(name, "DNS name")})
+
+    def mx(self, name: str) -> Any:
+        return self.call("mx", {"name": _assert_non_empty_string(name, "DNS name")})
+
+
+class TcpClient(CapabilityClient):
+    def __init__(self, bridge: HostBridge) -> None:
+        super().__init__(bridge, NET_TCP)
+
+    def connect(self, host: str, port: int, timeout_ms: int | None = None) -> Any:
+        if port < 1 or port > 65535:
+            raise ValueError("TCP port must be in 1..=65535")
+        return self.call(
+            "connect",
+            _optional_timeout(
+                {"host": _assert_non_empty_string(host, "TCP host"), "port": port},
+                timeout_ms,
+            ),
+        )
+
+    def write(
+        self,
+        handle: str,
+        data: bytes | bytearray | memoryview | list[int] | tuple[int, ...],
+        timeout_ms: int | None = None,
+    ) -> Any:
+        return self.call(
+            "write",
+            _optional_timeout(
+                {
+                    "handle": _assert_non_empty_string(handle, "TCP handle"),
+                    "data": _byte_list(data),
+                },
+                timeout_ms,
+            ),
+        )
+
+    def read(self, handle: str, max_bytes: int, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "read",
+            _optional_timeout(
+                {
+                    "handle": _assert_non_empty_string(handle, "TCP handle"),
+                    "max_bytes": _assert_positive_int(max_bytes, "max_bytes"),
+                },
+                timeout_ms,
+            ),
+        )
+
+    def close(self, handle: str) -> Any:
+        return self.call("close", {"handle": _assert_non_empty_string(handle, "TCP handle")})
+
+
 class NetClient:
     def __init__(self, bridge: HostBridge) -> None:
         self._bridge = bridge
@@ -296,14 +387,14 @@ class NetClient:
     def url(self) -> CapabilityClient:
         return CapabilityClient(self._bridge, NET_URL)
 
-    def dns(self) -> CapabilityClient:
-        return CapabilityClient(self._bridge, NET_DNS)
+    def dns(self) -> DnsClient:
+        return DnsClient(self._bridge)
 
     def ip(self) -> CapabilityClient:
         return CapabilityClient(self._bridge, NET_IP)
 
-    def tcp(self) -> CapabilityClient:
-        return CapabilityClient(self._bridge, NET_TCP)
+    def tcp(self) -> TcpClient:
+        return TcpClient(self._bridge)
 
     def udp(self) -> CapabilityClient:
         return CapabilityClient(self._bridge, NET_UDP)
