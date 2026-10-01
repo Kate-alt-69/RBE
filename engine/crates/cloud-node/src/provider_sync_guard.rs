@@ -78,7 +78,9 @@ pub async fn synchronize_provider(
         {
             match verify_stable_provider_snapshot_bytes(settings, store, &result.final_root).await {
                 Ok(ProviderSnapshotAudit::Verified) => {}
-                Ok(ProviderSnapshotAudit::LocalChanged) if pass < MAX_PROVIDER_STABILIZATION_PASSES => {
+                Ok(ProviderSnapshotAudit::LocalChanged)
+                    if pass < MAX_PROVIDER_STABILIZATION_PASSES =>
+                {
                     continue;
                 }
                 Ok(ProviderSnapshotAudit::LocalChanged) => {
@@ -308,8 +310,12 @@ async fn provider_plan_resources_complete(
                         )
                     })?
                     .len();
-                if !provider_resource_size_available(client, &format!("{base}/payload"), payload_size)
-                    .await?
+                if !provider_resource_size_available(
+                    client,
+                    &format!("{base}/payload"),
+                    payload_size,
+                )
+                .await?
                 {
                     return Ok(false);
                 }
