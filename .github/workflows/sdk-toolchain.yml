@@ -25,6 +25,8 @@ on:
       - 'build-select.ps1'
       - 'build-select.sh'
       - '.github/workflows/sdk-toolchain.yml'
+  schedule:
+    - cron: '17 3 * * 1'
   workflow_dispatch:
 
 permissions:
