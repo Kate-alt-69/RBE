@@ -342,6 +342,7 @@ fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
             }
         }
     }
+    validate_legacy_provider_auth(provider)?;
 
     for env_name in [
         provider.credential_env.as_deref(),
@@ -386,6 +387,96 @@ fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
             anyhow::bail!("Cloud Node header provider auth requires headerName");
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_legacy_provider_auth(provider: &ProviderSettings) -> anyhow::Result<()> {
+    match provider.kind {
+        ProviderKind::AmazonS3 => {
+            if provider.credential_env.is_some() {
+                anyhow::bail!(
+                    "Cloud Node provider.credentialEnv is only a legacy Google Cloud Storage token alias; Amazon S3 credentials belong under provider.auth.*Env"
+                );
+            }
+            reject_conflicting_env_alias(
+                "provider.accessKeyEnv",
+                provider.access_key_env.as_deref(),
+                "provider.auth.accessKeyEnv",
+                provider.auth.access_key_env.as_deref(),
+            )?;
+            reject_conflicting_env_alias(
+                "provider.secretKeyEnv",
+                provider.secret_key_env.as_deref(),
+                "provider.auth.secretKeyEnv",
+                provider.auth.secret_key_env.as_deref(),
+            )?;
+            reject_conflicting_env_alias(
+                "provider.sessionTokenEnv",
+                provider.session_token_env.as_deref(),
+                "provider.auth.sessionTokenEnv",
+                provider.auth.session_token_env.as_deref(),
+            )?;
+        }
+        ProviderKind::GoogleCloudStorage => {
+            if provider.access_key_env.is_some()
+                || provider.secret_key_env.is_some()
+                || provider.session_token_env.is_some()
+            {
+                anyhow::bail!(
+                    "Cloud Node legacy provider accessKeyEnv/secretKeyEnv/sessionTokenEnv are Amazon S3-only; Google Cloud Storage credentials belong under provider.auth.oauthTokenEnv or provider.auth.bearerTokenEnv"
+                );
+            }
+            if let (Some(oauth), Some(bearer)) = (
+                provider.auth.oauth_token_env.as_deref(),
+                provider.auth.bearer_token_env.as_deref(),
+            ) {
+                if oauth != bearer {
+                    anyhow::bail!(
+                        "Cloud Node Google Cloud Storage config names two different token environments in provider.auth.oauthTokenEnv ({oauth:?}) and provider.auth.bearerTokenEnv ({bearer:?}); configure one token source"
+                    );
+                }
+            }
+            let canonical = provider
+                .auth
+                .oauth_token_env
+                .as_deref()
+                .or(provider.auth.bearer_token_env.as_deref());
+            reject_conflicting_env_alias(
+                "provider.credentialEnv",
+                provider.credential_env.as_deref(),
+                "provider.auth.oauthTokenEnv/provider.auth.bearerTokenEnv",
+                canonical,
+            )?;
+        }
+        ProviderKind::Supabase | ProviderKind::AzureBlob | ProviderKind::Http => {
+            if provider.credential_env.is_some()
+                || provider.access_key_env.is_some()
+                || provider.secret_key_env.is_some()
+                || provider.session_token_env.is_some()
+            {
+                anyhow::bail!(
+                    "Cloud Node legacy top-level provider credential fields are not used by {:?}; configure credentials under provider.auth.*Env",
+                    provider.kind
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_conflicting_env_alias(
+    legacy_label: &str,
+    legacy: Option<&str>,
+    canonical_label: &str,
+    canonical: Option<&str>,
+) -> anyhow::Result<()> {
+    if let (Some(legacy), Some(canonical)) = (legacy, canonical) {
+        if legacy != canonical {
+            anyhow::bail!(
+                "Cloud Node provider auth is ambiguous: {legacy_label} names {legacy:?} while {canonical_label} names {canonical:?}; remove the legacy field or make both names identical"
+            );
+        }
     }
     Ok(())
 }
@@ -753,6 +844,96 @@ mod tests {
         invalid = provider.clone();
         invalid.max_reconnect_delay_ms = 3_600_001;
         assert!(validate_provider(&invalid).is_err());
+    }
+
+    #[test]
+    fn legacy_provider_auth_remains_compatible_without_ambiguity() {
+        let s3: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+            "provider":{
+                "kind":"s3",
+                "namespace":"prod",
+                "bucket":"rbe-backups",
+                "region":"ap-south-1",
+                "accessKeyEnv":"OLD_ACCESS",
+                "secretKeyEnv":"OLD_SECRET"
+            }
+        }))
+        .unwrap();
+        s3.validate().unwrap();
+
+        let gcs: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+            "provider":{
+                "kind":"gcs",
+                "namespace":"prod",
+                "bucket":"rbe-backups",
+                "credentialEnv":"OLD_GOOGLE_TOKEN"
+            }
+        }))
+        .unwrap();
+        gcs.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_provider_auth_rejects_conflicting_canonical_fields() {
+        let s3: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+            "provider":{
+                "kind":"s3",
+                "namespace":"prod",
+                "bucket":"rbe-backups",
+                "region":"ap-south-1",
+                "accessKeyEnv":"OLD_ACCESS",
+                "auth":{"accessKeyEnv":"NEW_ACCESS"}
+            }
+        }))
+        .unwrap();
+        assert!(s3.validate().is_err());
+
+        let gcs: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+            "provider":{
+                "kind":"gcs",
+                "namespace":"prod",
+                "bucket":"rbe-backups",
+                "credentialEnv":"OLD_GOOGLE_TOKEN",
+                "auth":{"oauthTokenEnv":"NEW_GOOGLE_TOKEN"}
+            }
+        }))
+        .unwrap();
+        assert!(gcs.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_provider_auth_rejects_irrelevant_or_double_token_fields() {
+        let http: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+            "provider":{
+                "kind":"http",
+                "namespace":"prod",
+                "bucket":"rbe-backups",
+                "endpoint":"https://objects.example.test",
+                "credentialEnv":"IGNORED_BEFORE"
+            }
+        }))
+        .unwrap();
+        assert!(http.validate().is_err());
+
+        let gcs: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node":{"id":"nas-main","storageRoot":"/srv/nas"},
+            "provider":{
+                "kind":"gcs",
+                "namespace":"prod",
+                "bucket":"rbe-backups",
+                "auth":{
+                    "oauthTokenEnv":"GOOGLE_OAUTH_A",
+                    "bearerTokenEnv":"GOOGLE_OAUTH_B"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(gcs.validate().is_err());
     }
 
     #[test]
