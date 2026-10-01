@@ -717,9 +717,7 @@ mod tests {
             .store_file(&source, "workspace/nested/state.txt")
             .unwrap();
 
-        let status = store
-            .local_directory_status(&watched, "workspace")
-            .unwrap();
+        let status = store.local_directory_status(&watched, "workspace").unwrap();
         assert_eq!(status.missing_managed_objects, 1);
         assert_eq!(status.changed_managed_objects, 0);
         assert_eq!(status.untracked_files, 0);
@@ -754,9 +752,7 @@ mod tests {
         store.store_file(&source_b, "workspace/b.txt").unwrap();
         fs::write(watched.join("a.txt"), b"local edit").unwrap();
 
-        let before = store
-            .local_directory_status(&watched, "workspace")
-            .unwrap();
+        let before = store.local_directory_status(&watched, "workspace").unwrap();
         assert_eq!(before.missing_managed_objects, 1);
         assert_eq!(before.changed_managed_objects, 1);
         assert_eq!(before.untracked_files, 0);
@@ -768,9 +764,7 @@ mod tests {
         assert_eq!(fs::read(watched.join("a.txt")).unwrap(), b"local edit");
         assert_eq!(fs::read(watched.join("b.txt")).unwrap(), b"remote b");
 
-        let after = store
-            .local_directory_status(&watched, "workspace")
-            .unwrap();
+        let after = store.local_directory_status(&watched, "workspace").unwrap();
         assert_eq!(after.missing_managed_objects, 0);
         assert_eq!(after.changed_managed_objects, 1);
         assert_eq!(after.untracked_files, 0);
