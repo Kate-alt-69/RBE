@@ -218,6 +218,9 @@ pub fn system_toolchain_for_manifest(
     host_id: &str,
 ) -> Result<Option<SystemToolchainNeed>, OrchestratorError> {
     manifest.validate()?;
+    if !manifest.runtime.managed {
+        return Ok(None);
+    }
     let runtime = match manifest.language {
         Language::Rust => SystemRuntimeKind::Rust,
         Language::Python if manifest.runtime.kind == "pypy" => SystemRuntimeKind::PyPy,
@@ -470,6 +473,39 @@ entry = "worker.py"
             .endpoint
             .as_str()
             .contains("rbe.sys.pypy/linux-x86_64/manifest.json"));
+    }
+
+    #[test]
+    fn unmanaged_runtime_does_not_request_rbe_system_toolchain() {
+        let manifest = LibraryManifest::parse(
+            r#"
+name = "externalpy"
+version = "1.0.0"
+language = "python"
+rbe_abi_min = 1
+rbe_abi_max = 1
+
+[sdk]
+family = "python"
+package = "rbe-sdk"
+version = "0.1"
+
+[runtime]
+kind = "python"
+version = "3.13"
+managed = false
+entry = "worker.py"
+"#,
+        )
+        .unwrap();
+        assert!(system_toolchain_for_manifest(
+            &manifest,
+            "/project",
+            "https://registry.kastrick.invalid/",
+            "linux-x86_64",
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
