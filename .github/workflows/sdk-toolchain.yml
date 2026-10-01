@@ -155,16 +155,32 @@ jobs:
         run: |
           set -euo pipefail
           tag="sdk-v0.0.0-dev.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          latest_tag="sdk-v0.0.0-dev.latest"
+          assets=(
+            sdk-assets/rbe-sdk-linux-x64.tar.gz
+            sdk-assets/rbe-sdk-linux-x64.tar.gz.sha256
+            sdk-assets/rbe-sdk-windows-x64.zip
+            sdk-assets/rbe-sdk-windows-x64.zip.sha256
+            sdk-assets/rbe-sdk-macos-x64.tar.gz
+            sdk-assets/rbe-sdk-macos-x64.tar.gz.sha256
+            sdk-assets/rbe-sdk-macos-arm64.tar.gz
+            sdk-assets/rbe-sdk-macos-arm64.tar.gz.sha256
+          )
+
           gh release create "$tag" \
-            sdk-assets/rbe-sdk-linux-x64.tar.gz \
-            sdk-assets/rbe-sdk-linux-x64.tar.gz.sha256 \
-            sdk-assets/rbe-sdk-windows-x64.zip \
-            sdk-assets/rbe-sdk-windows-x64.zip.sha256 \
-            sdk-assets/rbe-sdk-macos-x64.tar.gz \
-            sdk-assets/rbe-sdk-macos-x64.tar.gz.sha256 \
-            sdk-assets/rbe-sdk-macos-arm64.tar.gz \
-            sdk-assets/rbe-sdk-macos-arm64.tar.gz.sha256 \
+            "${assets[@]}" \
             --target "$GITHUB_SHA" \
             --title "RBE SDK development ${tag#sdk-v}" \
             --notes "Automated development SDK bundle from RBE main at $GITHUB_SHA." \
+            --prerelease
+
+          # `sdk.latest` resolves this deterministic moving alias. Delete/recreate
+          # it only after all four bundles have built and their checksum files
+          # have been validated, so clients never observe a partial release.
+          gh release delete "$latest_tag" --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create "$latest_tag" \
+            "${assets[@]}" \
+            --target "$GITHUB_SHA" \
+            --title "RBE SDK latest development" \
+            --notes "Moving verified SDK development alias from RBE main at $GITHUB_SHA." \
             --prerelease
