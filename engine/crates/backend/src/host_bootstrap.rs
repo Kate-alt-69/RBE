@@ -129,7 +129,9 @@ async fn start_provider_cloud_node(args: &[String]) -> anyhow::Result<()> {
     let project_root = std::env::current_dir()
         .map_err(|error| anyhow::anyhow!("resolve backend project root for Cloud Node: {error}"))?
         .canonicalize()
-        .map_err(|error| anyhow::anyhow!("canonicalize backend project root for Cloud Node: {error}"))?;
+        .map_err(|error| {
+            anyhow::anyhow!("canonicalize backend project root for Cloud Node: {error}")
+        })?;
     let verbose = verbose_debug(args);
 
     if provider.sync_on_connect {
