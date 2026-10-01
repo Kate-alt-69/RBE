@@ -50,6 +50,10 @@ pub fn function_exists(module: &str, function: &str) -> bool {
     }
 }
 
+pub fn route_allowed(name: &str) -> bool {
+    is_host_builtin(name)
+}
+
 /// Host-backed filesystem/process capabilities are never legal in pure Field
 /// REL. Server REL may declare them, although execution of Server helper calls
 /// remains gated by the Server host bridge.
@@ -69,6 +73,7 @@ mod tests {
             assert!(allowed_for_role(name, RelSourceKind::Service));
             assert!(allowed_for_role(name, RelSourceKind::Route));
             assert!(allowed_for_role(name, RelSourceKind::Server));
+            assert!(route_allowed(name));
         }
     }
 }
