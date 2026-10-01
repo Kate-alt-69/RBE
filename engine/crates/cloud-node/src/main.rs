@@ -67,6 +67,9 @@ async fn run() -> anyhow::Result<()> {
                 println!("localSyncDirty={}", status.dirty);
                 println!("localSyncFiles={}", status.scanned_files);
                 println!("localSyncObjects={}", status.managed_objects);
+                println!("localSyncMissing={}", status.missing_managed_objects);
+                println!("localSyncChanged={}", status.changed_managed_objects);
+                println!("localSyncUntracked={}", status.untracked_files);
             }
             if let Some(upstream) = &settings.upstream {
                 println!("transport=peer");
@@ -293,15 +296,7 @@ fn restore_local_after_pull(
     Ok(())
 }
 
-fn bootstrap_empty_checkout(
-    bootstrap_recovery: bool,
-    scanned_files: usize,
-    managed_objects: usize,
-) -> bool {
-    bootstrap_recovery && scanned_files == 0 && managed_objects > 0
-}
-
-fn restore_empty_bootstrap_checkout(
+fn restore_missing_bootstrap_checkout(
     store: &CloudNodeStore,
     local_sync: Option<&LocalSyncRuntime>,
     should_restore: bool,
@@ -312,14 +307,15 @@ fn restore_empty_bootstrap_checkout(
     let Some(local) = local_sync else {
         return Ok(());
     };
-    let result = store.restore_local_directory(&local.directory, &local.settings.logical_prefix)?;
-    eprintln!(
-        "cloud_node: bootstrap restored empty localSync checkout restored={} removed={} unchanged={} directory={}",
-        result.restored,
-        result.removed,
-        result.unchanged,
-        local.directory.display()
-    );
+    let restored =
+        store.restore_missing_local_directory(&local.directory, &local.settings.logical_prefix)?;
+    if restored > 0 {
+        eprintln!(
+            "cloud_node: bootstrap repaired partial localSync checkout restored={} directory={}",
+            restored,
+            local.directory.display()
+        );
+    }
     Ok(())
 }
 
@@ -335,16 +331,19 @@ async fn sync_provider_cycle(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
     let remote = provider_status(settings, store).await?;
-    let (local_dirty, restore_empty_checkout) = local_sync
+    let (local_dirty, restore_missing_checkout) = local_sync
         .map(|local| {
             let status =
                 store.local_directory_status(&local.directory, &local.settings.logical_prefix)?;
-            let restore_empty = bootstrap_empty_checkout(
-                bootstrap_recovery,
-                status.scanned_files,
-                status.managed_objects,
-            );
-            Ok::<_, anyhow::Error>((status.dirty && !restore_empty, restore_empty))
+            let material_local_changes =
+                status.changed_managed_objects > 0 || status.untracked_files > 0;
+            let local_dirty = if bootstrap_recovery {
+                material_local_changes
+            } else {
+                status.dirty
+            };
+            let restore_missing = bootstrap_recovery && status.missing_managed_objects > 0;
+            Ok::<_, anyhow::Error>((local_dirty, restore_missing))
         })
         .transpose()?
         .unwrap_or((false, false));
@@ -380,12 +379,11 @@ async fn sync_provider_cycle(
         restore_local_after_pull(store, local_sync, recovered.action)?;
     }
 
-    // Backend bootstrap uses `sync --bootstrap`. If the working directory is
-    // completely empty while Cloud Node still owns backed-up objects, treat it
-    // like a missing checkout rather than a user request to delete everything.
-    // Ordinary `sync` does not use this behavior, so explicit local deletions
-    // keep their existing semantics after the application is running.
-    restore_empty_bootstrap_checkout(store, local_sync, restore_empty_checkout)?;
+    // Backend bootstrap uses `sync --bootstrap`. Missing managed files are
+    // treated as an incomplete checkout and filled from the verified CAS before
+    // the normal scanner can interpret them as deletions. Existing changed and
+    // untracked files are deliberately preserved as real local changes.
+    restore_missing_bootstrap_checkout(store, local_sync, restore_missing_checkout)?;
 
     sync_local_inputs(store, project_root, local_sync)?;
     let result = synchronize_provider(settings, store).await?;
@@ -607,14 +605,6 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bootstrap_only_restores_a_completely_missing_checkout() {
-        assert!(bootstrap_empty_checkout(true, 0, 1));
-        assert!(!bootstrap_empty_checkout(false, 0, 1));
-        assert!(!bootstrap_empty_checkout(true, 1, 1));
-        assert!(!bootstrap_empty_checkout(true, 0, 0));
-    }
 
     #[test]
     fn sync_bootstrap_flag_is_explicit_and_bounded() {
