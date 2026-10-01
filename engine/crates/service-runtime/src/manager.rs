@@ -351,9 +351,6 @@ impl ServiceManager {
         manager
     }
 
-    /// Start resident/hybrid children after every service identity is already
-    /// addressable by Mother. Direct service dependencies are started first so
-    /// lifecycle hooks can synchronously call an already-running dependency.
     pub async fn start_prepared(&self, catalog: &ServiceCatalog) -> anyhow::Result<()> {
         for file in service_startup_order(catalog)? {
             if file.mode == ServiceMode::OnDemand {
@@ -506,18 +503,11 @@ impl ServiceManager {
                     }
                     Ok(Ok(ServiceRestartDirective::Default)) => local_restart,
                     Ok(Err(error)) => {
-                        tracing::warn!(
-                            service = %service.file.name,
-                            error = %error,
-                            "CONTROL ER restart decision failed; using local restart policy"
-                        );
+                        tracing::warn!(service = %service.file.name, error = %error, "CONTROL ER restart decision failed; using local restart policy");
                         local_restart
                     }
                     Err(_) => {
-                        tracing::warn!(
-                            service = %service.file.name,
-                            "CONTROL ER restart decision timed out; using local restart policy"
-                        );
+                        tracing::warn!(service = %service.file.name, "CONTROL ER restart decision timed out; using local restart policy");
                         local_restart
                     }
                 }
@@ -528,14 +518,7 @@ impl ServiceManager {
             if !restart {
                 service.exit_observed = true;
                 service.restarting = false;
-                tracing::warn!(
-                    service = %service.file.name,
-                    pid = old_pid,
-                    %status,
-                    restart = ?service.file.restart,
-                    authority_reason = authority_reason.as_deref().unwrap_or("local restart policy"),
-                    "service process exited and recovery policy leaves it stopped"
-                );
+                tracing::warn!(service = %service.file.name, pid = old_pid, %status, restart = ?service.file.restart, authority_reason = authority_reason.as_deref().unwrap_or("local restart policy"), "service process exited and recovery policy leaves it stopped");
                 continue;
             }
 
@@ -552,15 +535,7 @@ impl ServiceManager {
                 .min(max_restart_backoff);
             let file = service.file.clone();
             service.restarting = true;
-            tracing::warn!(
-                service = %file.name,
-                pid = old_pid,
-                %status,
-                attempt,
-                backoff_ms = delay.as_millis() as u64,
-                authority_reason = authority_reason.as_deref().unwrap_or("local restart policy"),
-                "service process exited; scheduling restart"
-            );
+            tracing::warn!(service = %file.name, pid = old_pid, %status, attempt, backoff_ms = delay.as_millis() as u64, authority_reason = authority_reason.as_deref().unwrap_or("local restart policy"), "service process exited; scheduling restart");
             drop(service);
 
             tokio::time::sleep(delay).await;
@@ -573,11 +548,7 @@ impl ServiceManager {
                 return;
             }
             if !service.restarting {
-                tracing::debug!(
-                    service = %file.name,
-                    attempt,
-                    "scheduled service restart was superseded"
-                );
+                tracing::debug!(service = %file.name, attempt, "scheduled service restart was superseded");
                 continue;
             }
 
@@ -586,12 +557,7 @@ impl ServiceManager {
                     Ok(None) => process.child.id(),
                     Ok(Some(_)) => None,
                     Err(error) => {
-                        tracing::warn!(
-                            service = %file.name,
-                            attempt,
-                            error = %error,
-                            "failed to re-check service before restart"
-                        );
+                        tracing::warn!(service = %file.name, attempt, error = %error, "failed to re-check service before restart");
                         continue;
                     }
                 }
@@ -600,12 +566,7 @@ impl ServiceManager {
             };
             if let Some(pid) = running_pid {
                 service.restarting = false;
-                tracing::debug!(
-                    service = %file.name,
-                    pid,
-                    attempt,
-                    "scheduled service restart found a running replacement"
-                );
+                tracing::debug!(service = %file.name, pid, attempt, "scheduled service restart found a running replacement");
                 continue;
             }
 
@@ -624,23 +585,12 @@ impl ServiceManager {
                     service.exit_observed = false;
                     service.restarting = false;
                     service.last_activity = Instant::now();
-                    tracing::info!(
-                    service = %file.name,
-                    old_pid,
-                    new_pid,
-                    attempt,
-                    "service process restarted"
-                              );
+                    tracing::info!(service = %file.name, old_pid, new_pid, attempt, "service process restarted");
                 }
                 Err(error) => {
                     service.restart_attempts = attempt;
                     service.restarting = true;
-                    tracing::error!(
-                    service = %file.name,
-                    attempt,
-                    error = %error,
-                    "service restart attempt failed"
-                              );
+                    tracing::error!(service = %file.name, attempt, error = %error, "service restart attempt failed");
                 }
             }
         }
@@ -661,10 +611,7 @@ impl ServiceManager {
         let (file, old_process) = {
             let mut service = handle.lock().await;
             if service.restarting {
-                tracing::info!(
-                    service = %service.file.name,
-                    "explicit restart request joined an already-running restart"
-                );
+                tracing::info!(service = %service.file.name, "explicit restart request joined an already-running restart");
                 return Ok(service.file.name.clone());
             }
             service.restarting = true;
@@ -754,12 +701,7 @@ impl ServiceManager {
                     service.exit_observed = false;
                     service.restarting = false;
                     service.last_activity = Instant::now();
-                    tracing::info!(
-                        service = %file.name,
-                        pid,
-                        attempts = attempt,
-                        "explicit Service restart completed"
-                    );
+                    tracing::info!(service = %file.name, pid, attempts = attempt, "explicit Service restart completed");
                     return;
                 }
                 Err(error) => {
@@ -772,21 +714,9 @@ impl ServiceManager {
                         service.restart_attempts = attempt;
                     }
                     if attempt >= CRASH_LOOP_BACKOFF_THRESHOLD {
-                        tracing::error!(
-                            service = %file.name,
-                            attempt,
-                            retry_in_ms = delay.as_millis() as u64,
-                            error = %error,
-                            "Service remains in crash-loop backoff; retrying explicit restart"
-                        );
+                        tracing::error!(service = %file.name, attempt, retry_in_ms = delay.as_millis() as u64, error = %error, "Service remains in crash-loop backoff; retrying explicit restart");
                     } else {
-                        tracing::warn!(
-                            service = %file.name,
-                            attempt,
-                            retry_in_ms = delay.as_millis() as u64,
-                            error = %error,
-                            "explicit Service restart failed; retry scheduled"
-                        );
+                        tracing::warn!(service = %file.name, attempt, retry_in_ms = delay.as_millis() as u64, error = %error, "explicit Service restart failed; retry scheduled");
                     }
                     tokio::time::sleep(delay).await;
                 }
@@ -926,12 +856,7 @@ impl ServiceManager {
                 service.exit_observed = false;
                 service.restarting = false;
                 service.last_activity = Instant::now();
-                tracing::info!(
-                    service = %file.name,
-                    pid,
-                    mode = ?file.mode,
-                    "service activated on demand"
-                );
+                tracing::info!(service = %file.name, pid, mode = ?file.mode, "service activated on demand");
                 Ok(())
             }
             Err(error) => {
@@ -980,10 +905,7 @@ impl ServiceManager {
         while let Some(result) = snapshots.join_next().await {
             match result {
                 Ok(snapshot) => out.push(snapshot),
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    "service snapshot task failed"
-                ),
+                Err(error) => tracing::warn!(error = %error, "service snapshot task failed"),
             }
         }
         out.sort_by(|left, right| left.name.cmp(&right.name));
@@ -1006,20 +928,13 @@ impl ServiceManager {
             .cloned()
             .collect::<Vec<_>>();
 
-        // Acquire every service lock once after raising `shutting_down`. This
-        // closes the race with a call that passed the outer check but had not
-        // yet acquired its activity guard.
         let mut activity = Vec::with_capacity(handles.len());
         for handle in &handles {
             let service = handle.lock().await;
             activity.push(service.active_calls.clone());
         }
         if !wait_for_service_drain(&activity, SERVICE_SHUTDOWN_DRAIN_TIMEOUT).await {
-            tracing::warn!(
-                active_calls = total_active_calls(&activity),
-                timeout_ms = SERVICE_SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64,
-                "service shutdown drain timed out; forcing remaining service processes to stop"
-            );
+            tracing::warn!(active_calls = total_active_calls(&activity), timeout_ms = SERVICE_SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64, "service shutdown drain timed out; forcing remaining service processes to stop");
         }
 
         let mut stops = tokio::task::JoinSet::new();
@@ -1093,8 +1008,8 @@ async fn snapshot_managed_service(
                 pid,
                 state,
                 mode: service.file.mode,
-                restart: service.file.restart,
                 restart_attempts: service.restart_attempts,
+                restart,
                 idle_timeout_ms: service.file.idle_timeout_ms,
                 ready: state == ServiceRuntimeState::Dormant,
                 health_checked: false,
@@ -1229,11 +1144,7 @@ fn should_restart(policy: RestartPolicy, success: bool) -> bool {
 }
 
 fn next_restart_attempt(current: u32, stable: bool, retry_in_progress: bool) -> u32 {
-    let base = if stable && !retry_in_progress {
-        0
-    } else {
-        current
-    };
+    let base = if stable && !retry_in_progress { 0 } else { current };
     base.saturating_add(1)
 }
 
@@ -1334,11 +1245,7 @@ async fn stop_process(service_name: &str, process: &mut ServiceProcess) {
     .await;
     match tokio::time::timeout(Duration::from_secs(3), process.child.wait()).await {
         Ok(Ok(_)) => {}
-        Ok(Err(error)) => tracing::warn!(
-            service = %service_name,
-            error = %error,
-            "failed while waiting for service shutdown"
-        ),
+        Ok(Err(error)) => tracing::warn!(service = %service_name, error = %error, "failed while waiting for service shutdown"),
         Err(_) => {
             let _ = process.child.kill().await;
             let _ = process.child.wait().await;
@@ -1363,7 +1270,6 @@ where
             }
             anyhow::bail!("{label} is not newline terminated");
         }
-
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(buffer.len(), |index| index + 1);
         if bytes.len().saturating_add(consumed) > max_bytes {
@@ -1409,7 +1315,6 @@ where
                 Err(_) => ServiceStdoutLine::InvalidUtf8,
             }));
         }
-
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(buffer.len(), |index| index + 1);
         if !oversized {
@@ -1421,7 +1326,6 @@ where
             }
         }
         reader.consume(consumed);
-
         if newline.is_some() {
             if oversized {
                 return Ok(Some(ServiceStdoutLine::Oversized));
@@ -1437,20 +1341,49 @@ where
 fn harden_service_child_environment(command: &mut Command) {
     command.env_clear();
     for name in [
-        "SYSTEMROOT",
-        "WINDIR",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-        "LANG",
-        "LC_ALL",
-        "RUST_LOG",
+        "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "RUST_LOG",
     ] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
     }
     command.env("RBE_PARENT_LIVENESS_PIPE", "1");
+}
+
+fn worker_spawn_hint(error: &std::io::Error) -> &'static str {
+    if cfg!(target_os = "linux") && error.raw_os_error() == Some(11) {
+        "Linux returned EAGAIN (OS error 11) while creating this Service worker. The worker did not execute. Check the host/container PID limit (pids.max), process limit (ulimit -u), and available memory, then retry."
+    } else {
+        "Inspect the raw OS error below and verify the canonical Service executable can create a child process on this host."
+    }
+}
+
+fn service_worker_spawn_error(
+    file: &ServiceFile,
+    service_exe: &Path,
+    error: std::io::Error,
+) -> anyhow::Error {
+    let raw_os_error = error
+        .raw_os_error()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let reason = error.to_string();
+    let hint = worker_spawn_hint(&error);
+    let context = format!(
+        "SVC5103 Service worker process could not be spawned.\n\n  service:\n    {}\n\n  title:\n    {}\n\n  service_file:\n    {}\n\n  service_binary:\n    {}\n\n  mode:\n    {:?}\n\n  restart:\n    {:?}\n\n  host:\n    {}/{}\n\n  raw_os_error:\n    {}\n\n  reason:\n    {}\n\n  hint:\n    {}\n\n  action:\n    Fix the host process-spawn condition and retry. The named .service worker did not start.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5103",
+        file.name,
+        file.title,
+        file.path.display(),
+        service_exe.display(),
+        file.mode,
+        file.restart,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        raw_os_error,
+        reason,
+        hint,
+    );
+    anyhow::Error::new(error).context(context)
 }
 
 async fn spawn_process(
@@ -1481,9 +1414,7 @@ async fn spawn_process(
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     if !stem.eq_ignore_ascii_case("service") {
-        anyhow::bail!(
-            "ServiceManager process spawning is restricted to the canonical service executable"
-        );
+        anyhow::bail!("ServiceManager process spawning is restricted to the canonical service executable");
     }
 
     let token = random_token();
@@ -1521,9 +1452,7 @@ async fn spawn_process(
         .spawn()
     {
         Ok(child) => child,
-        Err(error) => {
-            return Err(error.into());
-        }
+        Err(error) => return Err(service_worker_spawn_error(file, &service_exe, error)),
     };
 
     let mut liveness = match child.stdin.take() {
@@ -1535,28 +1464,18 @@ async fn spawn_process(
     };
     if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, &token).await {
         cleanup_failed_spawn(&mut child).await;
-        return Err(anyhow::anyhow!(
-            "send service {:?} parent bootstrap secret: {error}",
-            file.name
-        ));
+        return Err(anyhow::anyhow!("send service {:?} parent bootstrap secret: {error}", file.name));
     }
     if let Some(fabric) = fabric {
-        if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, fabric.auth()).await
-        {
+        if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, fabric.auth()).await {
             cleanup_failed_spawn(&mut child).await;
-            return Err(anyhow::anyhow!(
-                "send service {:?} Service Fabric bootstrap secret: {error}",
-                file.name
-            ));
+            return Err(anyhow::anyhow!("send service {:?} Service Fabric bootstrap secret: {error}", file.name));
         }
     }
     if let Some(runtime_env) = runtime_env {
         if let Err(error) = super::write_parent_bootstrap_json(&mut liveness, runtime_env).await {
             cleanup_failed_spawn(&mut child).await;
-            return Err(anyhow::anyhow!(
-                "send service {:?} Runtime ENV snapshot: {error}",
-                file.name
-            ));
+            return Err(anyhow::anyhow!("send service {:?} Runtime ENV snapshot: {error}", file.name));
         }
     }
     let stdout = match child.stdout.take() {
@@ -1591,20 +1510,20 @@ async fn spawn_process(
         Ok(ready) => ready,
         Err(error) => {
             cleanup_failed_spawn(&mut child).await;
-            return Err(error.into());
+            return Err(anyhow::anyhow!("service {:?} returned malformed readiness JSON: {error}", file.name));
         }
     };
     if ready.service != file.name {
         cleanup_failed_spawn(&mut child).await;
-        anyhow::bail!("service readiness identity mismatch");
+        anyhow::bail!("service {:?} readiness identity mismatch: worker reported {:?}", file.name, ready.service);
     }
     if !ready.address.ip().is_loopback() {
         cleanup_failed_spawn(&mut child).await;
-        anyhow::bail!("service readiness advertised a non-loopback endpoint");
+        anyhow::bail!("service {:?} readiness advertised a non-loopback endpoint", file.name);
     }
     if child.id() != Some(ready.pid) {
         cleanup_failed_spawn(&mut child).await;
-        anyhow::bail!("service readiness PID does not match child process");
+        anyhow::bail!("service {:?} readiness PID does not match child process", file.name);
     }
 
     let service_name = file.name.clone();
@@ -1618,15 +1537,8 @@ async fn spawn_process(
                         tracing::info!(service = %service_name, %output, ".service stdout");
                     }
                 }
-                Ok(Some(ServiceStdoutLine::Oversized)) => tracing::warn!(
-                    service = %service_name,
-                    max_bytes = SERVICE_STDOUT_LINE_MAX_BYTES,
-                    "discarded oversized .service stdout line"
-                ),
-                Ok(Some(ServiceStdoutLine::InvalidUtf8)) => tracing::warn!(
-                    service = %service_name,
-                    "discarded non-UTF-8 .service stdout line"
-                ),
+                Ok(Some(ServiceStdoutLine::Oversized)) => tracing::warn!(service = %service_name, max_bytes = SERVICE_STDOUT_LINE_MAX_BYTES, "discarded oversized .service stdout line"),
+                Ok(Some(ServiceStdoutLine::InvalidUtf8)) => tracing::warn!(service = %service_name, "discarded non-UTF-8 .service stdout line"),
                 Err(error) => {
                     tracing::warn!(service = %service_name, %error, "failed to drain .service stdout");
                     return;
@@ -1661,10 +1573,7 @@ async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<Ser
     }
     let mut payload = serde_json::to_vec(&request)?;
     if payload.len().saturating_add(1) > SERVICE_IPC_REQUEST_MAX_BYTES {
-        anyhow::bail!(
-            "service IPC request exceeded {} bytes",
-            SERVICE_IPC_REQUEST_MAX_BYTES
-        );
+        anyhow::bail!("service IPC request exceeded {} bytes", SERVICE_IPC_REQUEST_MAX_BYTES);
     }
     payload.push(b'\n');
 
@@ -1689,6 +1598,45 @@ async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<Ser
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn test_service(name: &str) -> ServiceFile {
+        ServiceFile {
+            path: PathBuf::from(format!("service/{name}.service")),
+            name: name.into(),
+            title: format!("{name} title"),
+            mode: ServiceMode::Resident,
+            restart: RestartPolicy::OnFailure,
+            memory_limit_mb: 64,
+            startup_timeout_ms: 1_000,
+            idle_timeout_ms: 5_000,
+            imports: Vec::new(),
+            exports: vec!["get".into()],
+            source_digest: [0; 32],
+        }
+    }
+
+    #[test]
+    fn worker_spawn_diagnostic_names_service_and_os_error() {
+        let file = test_service("mail");
+        let error = service_worker_spawn_error(
+            &file,
+            Path::new("dep/service"),
+            std::io::Error::from_raw_os_error(11),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("SVC5103"));
+        assert!(rendered.contains("service:\n    mail"));
+        assert!(rendered.contains("service/mail.service"));
+        assert!(rendered.contains("dep/service"));
+        assert!(rendered.contains("raw_os_error:\n    11"));
+        assert!(rendered.contains("OS error 11"));
+        if cfg!(target_os = "linux") {
+            assert!(rendered.contains("EAGAIN"));
+            assert!(rendered.contains("pids.max"));
+        }
+    }
+
     #[test]
     fn diagnostic_operation_never_contains_call_arguments() {
         let operation = ServiceOperation::Call {
@@ -1707,16 +1655,11 @@ mod tests {
         assert_eq!(local.max(authority).min(maximum), local);
     }
 
-    use super::*;
-
     #[tokio::test]
     async fn begin_shutdown_closes_service_call_admission() {
         let manager = ServiceManager::default();
         manager.begin_shutdown();
-        let error = manager
-            .call("missing", "run", Vec::new())
-            .await
-            .unwrap_err();
+        let error = manager.call("missing", "run", Vec::new()).await.unwrap_err();
         assert!(matches!(error, ServiceCallError::Unavailable { .. }));
     }
 
@@ -1823,19 +1766,8 @@ mod tests {
     #[tokio::test]
     async fn on_demand_service_snapshot_is_dormant() {
         let manager = ServiceManager::default();
-        let file = ServiceFile {
-            path: PathBuf::from("test.service"),
-            name: "lazy".into(),
-            title: "Lazy".into(),
-            mode: ServiceMode::OnDemand,
-            restart: RestartPolicy::OnFailure,
-            memory_limit_mb: 64,
-            startup_timeout_ms: 1_000,
-            idle_timeout_ms: 5_000,
-            imports: Vec::new(),
-            exports: vec!["get".into()],
-            source_digest: [0; 32],
-        };
+        let mut file = test_service("lazy");
+        file.mode = ServiceMode::OnDemand;
         manager.services.write().await.insert(
             file.name.clone(),
             Arc::new(Mutex::new(Managed::dormant(file))),
