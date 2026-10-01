@@ -14,6 +14,9 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 
 pub const CAPABILITY: &str = "net:tcp";
 const HANDLE_RANDOM_BYTES: usize = 24;
@@ -25,20 +28,36 @@ const MAX_READ_BYTES: usize = 16 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const MAX_TIMEOUT_MS: u64 = 10_000;
 
+#[derive(Debug)]
+enum ManagedStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
 #[derive(Clone)]
 struct ManagedConnection {
     owner: String,
     package: String,
-    stream: Arc<AsyncMutex<TcpStream>>,
+    server_name: String,
+    stream: Arc<AsyncMutex<Option<ManagedStream>>>,
 }
 
 static CONNECTIONS: OnceLock<Mutex<BTreeMap<String, ManagedConnection>>> = OnceLock::new();
+static TLS_CONNECTOR: OnceLock<TlsConnector> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConnectRequest {
     host: String,
     port: u16,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartTlsRequest {
+    handle: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
@@ -73,6 +92,7 @@ pub fn grant() -> anyhow::Result<LibraryCapabilityGrant> {
         CAPABILITY,
         [
             "connect".to_string(),
+            "start_tls".to_string(),
             "write".to_string(),
             "read".to_string(),
             "close".to_string(),
@@ -103,6 +123,7 @@ pub async fn dispatch_authorized_call(
 
     let payload = match call.operation.as_str() {
         "connect" => connect(package, &owner, &call.payload).await?,
+        "start_tls" => start_tls(package, &owner, &call.payload).await?,
         "write" => write(package, &owner, &call.payload).await?,
         "read" => read(package, &owner, &call.payload).await?,
         "close" => close(package, &owner, &call.payload).await?,
@@ -135,11 +156,11 @@ async fn connect(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<V
     if request.port == 0 {
         bail!("package net:tcp port must be in 1..=65535");
     }
-    validate_host(&request.host)?;
+    let server_name = normalized_host(&request.host)?;
     ensure_connection_capacity(owner)?;
 
     let timeout = request_timeout(request.timeout_ms)?;
-    let addresses = resolve_public_addresses(&request.host, request.port).await?;
+    let addresses = resolve_public_addresses(&server_name, request.port).await?;
     let mut connected = None;
     let mut last_error = None;
     for address in addresses {
@@ -155,7 +176,7 @@ async fn connect(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<V
     let (stream, peer) = connected.ok_or_else(|| {
         anyhow::anyhow!(
             "package net:tcp could not connect to public destination {}:{}: {}",
-            request.host,
+            server_name,
             request.port,
             last_error.unwrap_or_else(|| "no usable public address".to_string())
         )
@@ -164,12 +185,57 @@ async fn connect(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<V
         .set_nodelay(true)
         .context("configure package TCP connection")?;
 
-    let handle = insert_connection(package, owner, stream)?;
+    let handle = insert_connection(package, owner, server_name, stream)?;
     serde_json::to_vec(&json!({
         "handle": handle,
         "peer": peer.to_string(),
     }))
     .context("encode package net:tcp connect response")
+}
+
+async fn start_tls(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let request: StartTlsRequest =
+        serde_json::from_slice(payload).context("decode package net:tcp start_tls request")?;
+    let connection = connection_for(package, owner, &request.handle)?;
+    let server_name = tls_server_name(&connection.server_name)?;
+    let timeout = request_timeout(request.timeout_ms)?;
+    let mut stream = connection.stream.lock().await;
+
+    let plain = match stream.take() {
+        Some(ManagedStream::Plain(stream)) => stream,
+        Some(ManagedStream::Tls(tls)) => {
+            *stream = Some(ManagedStream::Tls(tls));
+            bail!("package net:tcp handle is already protected by TLS");
+        }
+        None => bail!("package net:tcp handle is currently changing transport state"),
+    };
+
+    match tokio::time::timeout(timeout, tls_connector().connect(server_name, plain)).await {
+        Ok(Ok(tls)) => {
+            *stream = Some(ManagedStream::Tls(Box::new(tls)));
+            serde_json::to_vec(&json!({
+                "tls": true,
+                "serverName": connection.server_name,
+            }))
+            .context("encode package net:tcp start_tls response")
+        }
+        Ok(Err(error)) => {
+            drop(stream);
+            let _ = remove_connection(package, owner, &request.handle);
+            Err(anyhow::anyhow!(
+                "package net:tcp TLS handshake failed for {:?}: {error}",
+                connection.server_name
+            ))
+        }
+        Err(_) => {
+            drop(stream);
+            let _ = remove_connection(package, owner, &request.handle);
+            bail!(
+                "package net:tcp TLS handshake timed out for {:?}",
+                connection.server_name
+            )
+        }
+    }
 }
 
 async fn write(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -184,10 +250,21 @@ async fn write(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec
     let connection = connection_for(package, owner, &request.handle)?;
     let timeout = request_timeout(request.timeout_ms)?;
     let mut stream = connection.stream.lock().await;
-    tokio::time::timeout(timeout, stream.write_all(&request.data))
-        .await
-        .map_err(|_| anyhow::anyhow!("package net:tcp write timed out"))?
-        .context("write package TCP data")?;
+    match stream.as_mut() {
+        Some(ManagedStream::Plain(stream)) => {
+            tokio::time::timeout(timeout, stream.write_all(&request.data))
+                .await
+                .map_err(|_| anyhow::anyhow!("package net:tcp write timed out"))?
+                .context("write package TCP data")?;
+        }
+        Some(ManagedStream::Tls(stream)) => {
+            tokio::time::timeout(timeout, stream.write_all(&request.data))
+                .await
+                .map_err(|_| anyhow::anyhow!("package net:tcp TLS write timed out"))?
+                .context("write package TLS data")?;
+        }
+        None => bail!("package net:tcp handle is currently changing transport state"),
+    }
 
     serde_json::to_vec(&json!({ "written": request.data.len() }))
         .context("encode package net:tcp write response")
@@ -206,10 +283,17 @@ async fn read(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec<
     let timeout = request_timeout(request.timeout_ms)?;
     let mut stream = connection.stream.lock().await;
     let mut data = vec![0u8; request.max_bytes];
-    let read = tokio::time::timeout(timeout, stream.read(&mut data))
-        .await
-        .map_err(|_| anyhow::anyhow!("package net:tcp read timed out"))?
-        .context("read package TCP data")?;
+    let read = match stream.as_mut() {
+        Some(ManagedStream::Plain(stream)) => tokio::time::timeout(timeout, stream.read(&mut data))
+            .await
+            .map_err(|_| anyhow::anyhow!("package net:tcp read timed out"))?
+            .context("read package TCP data")?,
+        Some(ManagedStream::Tls(stream)) => tokio::time::timeout(timeout, stream.read(&mut data))
+            .await
+            .map_err(|_| anyhow::anyhow!("package net:tcp TLS read timed out"))?
+            .context("read package TLS data")?,
+        None => bail!("package net:tcp handle is currently changing transport state"),
+    };
     data.truncate(read);
 
     serde_json::to_vec(&json!({
@@ -224,8 +308,34 @@ async fn close(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec
         serde_json::from_slice(payload).context("decode package net:tcp close request")?;
     let connection = remove_connection(package, owner, &request.handle)?;
     let mut stream = connection.stream.lock().await;
-    let _ = stream.shutdown().await;
+    if let Some(stream) = stream.as_mut() {
+        match stream {
+            ManagedStream::Plain(stream) => {
+                let _ = stream.shutdown().await;
+            }
+            ManagedStream::Tls(stream) => {
+                let _ = stream.shutdown().await;
+            }
+        }
+    }
+    *stream = None;
     Ok(Vec::new())
+}
+
+fn tls_connector() -> &'static TlsConnector {
+    TLS_CONNECTOR.get_or_init(|| {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        TlsConnector::from(Arc::new(config))
+    })
+}
+
+fn tls_server_name(host: &str) -> anyhow::Result<ServerName<'static>> {
+    ServerName::try_from(host.to_string())
+        .map_err(|_| anyhow::anyhow!("package net:tcp destination is not a valid TLS server name"))
 }
 
 fn registry() -> &'static Mutex<BTreeMap<String, ManagedConnection>> {
@@ -260,7 +370,12 @@ fn ensure_connection_capacity(owner: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn insert_connection(package: &str, owner: &str, stream: TcpStream) -> anyhow::Result<String> {
+fn insert_connection(
+    package: &str,
+    owner: &str,
+    server_name: String,
+    stream: TcpStream,
+) -> anyhow::Result<String> {
     let mut connections = lock_registry()?;
     if connections.len() >= MAX_CONNECTIONS_GLOBAL {
         bail!("package TCP connection registry became full before insertion");
@@ -284,7 +399,8 @@ fn insert_connection(package: &str, owner: &str, stream: TcpStream) -> anyhow::R
                 ManagedConnection {
                     owner: owner.to_string(),
                     package: package.to_string(),
-                    stream: Arc::new(AsyncMutex::new(stream)),
+                    server_name,
+                    stream: Arc::new(AsyncMutex::new(Some(ManagedStream::Plain(stream)))),
                 },
             );
             return Ok(handle);
@@ -369,6 +485,14 @@ async fn resolve_public_addresses(host: &str, port: u16) -> anyhow::Result<Vec<S
         bail!("package net:tcp hostname resolves to a non-public address");
     }
     Ok(addresses)
+}
+
+fn normalized_host(host: &str) -> anyhow::Result<String> {
+    validate_host(host)?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ip.to_string());
+    }
+    Ok(host.trim_end_matches('.').to_ascii_lowercase())
 }
 
 fn validate_host(host: &str) -> anyhow::Result<()> {
@@ -458,6 +582,7 @@ mod tests {
                 "close".to_string(),
                 "connect".to_string(),
                 "read".to_string(),
+                "start_tls".to_string(),
                 "write".to_string(),
             ])
         );
@@ -499,6 +624,16 @@ mod tests {
         }
         assert!(validate_host("smtp.example.com").is_ok());
         assert!(validate_host("1.1.1.1").is_ok());
+    }
+
+    #[test]
+    fn tls_identity_is_pinned_to_normalized_connect_host() {
+        assert_eq!(
+            normalized_host("SMTP.Example.COM.").unwrap(),
+            "smtp.example.com"
+        );
+        assert_eq!(normalized_host("2606:4700:4700::1111").unwrap(), "2606:4700:4700::1111");
+        assert!(tls_server_name("smtp.example.com").is_ok());
     }
 
     #[test]

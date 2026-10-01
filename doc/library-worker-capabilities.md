@@ -69,12 +69,13 @@ A package cannot retarget logging to another package identity.
 
 `net:dns` is also an explicit verified runtime request. Approved package workers may request only the bounded `lookup`, `ip`, and `mx` operations through RBE's DNS broker. The broker normalizes names, rejects local-only/single-label/private targets, and never gives the package a raw resolver or socket. The trusted Backend dispatcher accepts the call only when the retained Library Host session contains the matching `net:dns` grant.
 
-`net:tcp` is an explicit verified runtime request for packages that need a stateful public TCP conversation, such as a future self-hosted SMTP adapter. The package never receives a host `TcpStream` or raw socket object. Backend keeps the connection and returns an opaque `tcp:<random>` handle that is bound to the accepted package and its session-scoped capability identity.
+`net:tcp` is an explicit verified runtime request for packages that need a stateful public TCP conversation, including self-hosted SMTP adapters. The package never receives a host `TcpStream`, TLS stream, or raw socket object. Backend keeps the connection and returns an opaque `tcp:<random>` handle that is bound to the accepted package and its session-scoped capability identity.
 
 The current `net:tcp` broker admits only these operations:
 
 ```text
 connect
+start_tls
 write
 read
 close
@@ -94,7 +95,7 @@ maximum operation timeout: 10 seconds
 
 TCP destinations must be publicly routable. RBE rejects loopback, private, link-local, multicast, unspecified, CGNAT, documentation/special-purpose ranges, single-label names, `localhost`, and `.local` names. DNS names are resolved by trusted Backend code and the resolved set is rejected if any address is non-public. Handles cannot be used by another package/session, and all retained TCP handles are discarded when the verified Library Host sessions are rebuilt.
 
-`net:tcp` does **not** currently imply TLS or STARTTLS. TLS upgrade is a separate trusted-host capability step because certificate validation and server-name verification must stay inside RBE rather than being delegated to package code.
+`start_tls` upgrades the **same accepted TCP handle** in place. RBE retains the normalized destination identity from the original `connect(host, port)` request and uses that identity for certificate/server-name verification; package code cannot supply a different certificate hostname during the upgrade. The TLS handshake uses RBE's Rustls/WebPKI trust roots and is bounded by the same operation timeout limits. A failed or timed-out handshake invalidates the handle instead of returning a potentially ambiguous half-upgraded transport to package code. This supports both SMTP STARTTLS (`connect` → SMTP negotiation → `start_tls`) and implicit TLS (`connect` → immediate `start_tls`) while keeping certificate validation inside trusted Backend code.
 
 Other package-defined capabilities remain package-owned unless and until RBE deliberately implements a privileged host surface for them.
 
