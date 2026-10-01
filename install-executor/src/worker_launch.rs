@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::{PinnedManagedTool, PinnedManagedToolchain, PinnedToolchainError, SourceFileDigest};
 
 pub const DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS: u64 = 30;
+pub const MAX_WORKER_STARTUP_TIMEOUT_SECONDS: u64 = 15 * 60;
+pub const MAX_WORKER_ARGUMENTS: usize = 128;
+pub const MAX_WORKER_ARGUMENT_BYTES: usize = 16 * 1024;
 
 /// Source-only worker launch contract.
 ///
@@ -23,6 +26,8 @@ pub struct WorkerLaunchPlan {
     source_root: PathBuf,
     entrypoint: PathBuf,
     source_files: Vec<SourceFileDigest>,
+    arguments: Vec<String>,
+    startup_timeout_seconds: u64,
 }
 
 /// Opaque proof that worker process inputs passed the final source-only
@@ -105,11 +110,36 @@ impl WorkerLaunchPlan {
         entrypoint: impl AsRef<Path>,
         source_files: Vec<SourceFileDigest>,
     ) -> Result<Self, WorkerLaunchError> {
+        Self::managed_interpreter_with_options(
+            runtime_tool,
+            toolchain,
+            source_root,
+            entrypoint,
+            source_files,
+            Vec::new(),
+            DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
+    }
+
+    /// Prepare an interpreted worker with caller-supplied script arguments and
+    /// a bounded timeout. Arguments are sealed into the source-only launch plan
+    /// and therefore cannot be appended by Backend after final verification.
+    pub fn managed_interpreter_with_options(
+        runtime_tool: impl Into<String>,
+        toolchain: &PinnedManagedToolchain,
+        source_root: impl AsRef<Path>,
+        entrypoint: impl AsRef<Path>,
+        source_files: Vec<SourceFileDigest>,
+        arguments: Vec<String>,
+        startup_timeout_seconds: u64,
+    ) -> Result<Self, WorkerLaunchError> {
         let runtime_tool = runtime_tool.into();
         let source_root = source_root.as_ref().to_path_buf();
         let entrypoint = entrypoint.as_ref().to_path_buf();
         validate_source_paths(&source_root, &entrypoint)?;
         verify_source_tree(&source_root, &source_files)?;
+        validate_arguments(&arguments)?;
+        validate_timeout(startup_timeout_seconds)?;
         let program = toolchain.verified_tool(&runtime_tool)?.clone();
 
         Ok(Self {
@@ -118,6 +148,8 @@ impl WorkerLaunchPlan {
             source_root,
             entrypoint,
             source_files,
+            arguments,
+            startup_timeout_seconds,
         })
     }
 
@@ -127,20 +159,54 @@ impl WorkerLaunchPlan {
         self.program.verify(&self.runtime_tool)?;
         validate_source_paths(&self.source_root, &self.entrypoint)?;
         verify_source_tree(&self.source_root, &self.source_files)?;
+        validate_arguments(&self.arguments)?;
+        validate_timeout(self.startup_timeout_seconds)?;
+
+        let mut args = Vec::with_capacity(self.arguments.len() + 1);
+        args.push(self.entrypoint.as_os_str().to_os_string());
+        args.extend(self.arguments.iter().map(OsString::from));
 
         Ok(VerifiedWorkerInvocation {
             program: self.program.path().to_path_buf(),
             program_sha256: self.program.sha256().to_string(),
-            args: vec![self.entrypoint.as_os_str().to_os_string()],
+            args,
             working_directory: self.source_root.clone(),
             source_files: self.source_files.clone(),
             clear_environment: true,
             environment: BTreeMap::new(),
             direct_network_allowed: false,
             use_shell: false,
-            startup_timeout_seconds: DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS,
+            startup_timeout_seconds: self.startup_timeout_seconds,
         })
     }
+}
+
+fn validate_arguments(arguments: &[String]) -> Result<(), WorkerLaunchError> {
+    if arguments.len() > MAX_WORKER_ARGUMENTS {
+        return Err(WorkerLaunchError::TooManyArguments {
+            count: arguments.len(),
+            maximum: MAX_WORKER_ARGUMENTS,
+        });
+    }
+    for (index, argument) in arguments.iter().enumerate() {
+        if argument.len() > MAX_WORKER_ARGUMENT_BYTES || argument.contains('\0') {
+            return Err(WorkerLaunchError::InvalidArgument {
+                index,
+                maximum_bytes: MAX_WORKER_ARGUMENT_BYTES,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_timeout(timeout_seconds: u64) -> Result<(), WorkerLaunchError> {
+    if timeout_seconds == 0 || timeout_seconds > MAX_WORKER_STARTUP_TIMEOUT_SECONDS {
+        return Err(WorkerLaunchError::InvalidTimeout {
+            timeout_seconds,
+            maximum_seconds: MAX_WORKER_STARTUP_TIMEOUT_SECONDS,
+        });
+    }
+    Ok(())
 }
 
 fn validate_source_paths(source_root: &Path, entrypoint: &Path) -> Result<(), WorkerLaunchError> {
@@ -387,6 +453,15 @@ pub enum WorkerLaunchError {
     },
     #[error("worker source tree changed after materialization")]
     SourceTreeDrift,
+    #[error("worker argument count {count} exceeds maximum {maximum}")]
+    TooManyArguments { count: usize, maximum: usize },
+    #[error("worker argument {index} exceeds {maximum_bytes} bytes or contains NUL")]
+    InvalidArgument { index: usize, maximum_bytes: usize },
+    #[error("worker timeout {timeout_seconds}s must be 1..={maximum_seconds}s")]
+    InvalidTimeout {
+        timeout_seconds: u64,
+        maximum_seconds: u64,
+    },
     #[error(transparent)]
     Toolchain(#[from] PinnedToolchainError),
     #[error("worker launch verification I/O failed: {0}")]
@@ -488,6 +563,61 @@ mod tests {
             invocation.startup_timeout_seconds(),
             DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS
         );
+    }
+
+    #[test]
+    fn script_arguments_and_timeout_are_sealed_before_spawn() {
+        let (_temp, root, entrypoint, pinned, files) = fixture();
+        let plan = WorkerLaunchPlan::managed_interpreter_with_options(
+            "bun",
+            &pinned,
+            &root,
+            &entrypoint,
+            files,
+            vec!["--mode".into(), "build".into()],
+            45,
+        )
+        .unwrap();
+        let invocation = plan.verify_before_spawn().unwrap();
+        assert_eq!(
+            invocation.args(),
+            [
+                entrypoint.into_os_string(),
+                OsString::from("--mode"),
+                OsString::from("build"),
+            ]
+        );
+        assert_eq!(invocation.startup_timeout_seconds(), 45);
+    }
+
+    #[test]
+    fn script_arguments_and_timeout_are_bounded() {
+        let (_temp, root, entrypoint, pinned, files) = fixture();
+        let too_many = vec!["x".to_string(); MAX_WORKER_ARGUMENTS + 1];
+        assert!(matches!(
+            WorkerLaunchPlan::managed_interpreter_with_options(
+                "bun",
+                &pinned,
+                &root,
+                &entrypoint,
+                files.clone(),
+                too_many,
+                30,
+            ),
+            Err(WorkerLaunchError::TooManyArguments { .. })
+        ));
+        assert!(matches!(
+            WorkerLaunchPlan::managed_interpreter_with_options(
+                "bun",
+                &pinned,
+                &root,
+                &entrypoint,
+                files,
+                Vec::new(),
+                MAX_WORKER_STARTUP_TIMEOUT_SECONDS + 1,
+            ),
+            Err(WorkerLaunchError::InvalidTimeout { .. })
+        ));
     }
 
     #[test]
