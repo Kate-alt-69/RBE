@@ -82,6 +82,8 @@ The provider remains authoritative for remote history during initial recovery. A
 
 After a pull, Cloud Node verifies its content-addressed store before materializing the working directory. File payloads are copied through verified temporary files before activation. A failed provider transfer never makes an unverified remote object become working-directory state.
 
+Authoritative provider materialization is deliberately stronger than bootstrap repair. After a `Pull` or `ForcedPull`, the verified provider snapshot is the selected checkout state: if the provider requires `nested/state.txt` while the local checkout has a regular file named `nested`, the local file blocker may be replaced with the required directory; if the provider requires a file where the checkout currently has a directory tree, that local tree may be replaced by the provider file. Symlinked path components are never followed for either mode, so a restore cannot escape `localSync.directory`. Cloud Node also rejects impossible managed snapshots that would require one logical path to be both a file and an ancestor directory before mutating the checkout.
+
 ### Missing or partial working directory during boot
 
 Backend bootstrap uses a recovery-only form of the sync command:
@@ -92,7 +94,7 @@ cloud_node sync --bootstrap
 
 This protects fresh-host and interrupted-checkout cases where Cloud Node CAS/history already contains valid backed-up objects but `localSync.directory` is empty or only partially materialized. During bootstrap, a managed file that is missing from the working directory is treated as missing checkout state rather than an intentional deletion. Cloud Node fills that missing file from the verified current CAS before the normal scanner can turn it into deletion history.
 
-Bootstrap repair is intentionally additive. Existing files are never overwritten by this missing-file repair, even when an existing managed file has local edits, and untracked files are not removed. A partially restored checkout can therefore resume after a process or machine interruption without destroying work that already exists locally.
+Bootstrap repair is intentionally additive. Existing files are never overwritten by this missing-file repair, even when an existing managed file has local edits, and untracked files are not removed. A partially restored checkout can therefore resume after a process or machine interruption without destroying work that already exists locally. Filesystem shape blockers are preserved too: bootstrap does not delete a local file merely because the recovered snapshot expects a directory at that path, and it does not delete a local directory merely because the snapshot expects a file there. Such a blocker fails the bootstrap repair instead of silently destroying local state.
 
 The distinction is important:
 
@@ -100,7 +102,9 @@ The distinction is important:
 managed file missing during bootstrap  -> restore it from verified CAS
 managed file present but edited        -> preserve it as a real local change
 untracked local file                    -> preserve it as a real local change
+bootstrap file/directory shape blocker -> preserve it and fail the repair
 normal run-time deletion                -> keep ordinary deletion semantics
+authoritative provider pull            -> materialize the selected provider tree
 ```
 
 This recovery behavior is deliberately limited to bootstrap. Normal `cloud_node sync` and the continuously supervised `cloud_node run` retain ordinary deletion semantics, so deleting files while the node is operating still creates a new snapshot/history state instead of silently restoring those files.
