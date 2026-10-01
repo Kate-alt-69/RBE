@@ -340,6 +340,18 @@ fn validate_provider(provider: &ProviderSettings) -> anyhow::Result<()> {
             if provider.endpoint.as_deref().is_none_or(str::is_empty) {
                 anyhow::bail!("Cloud Node http provider requires endpoint");
             }
+            validate_auth_mode(
+                provider,
+                &[
+                    ProviderAuthMode::Auto,
+                    ProviderAuthMode::None,
+                    ProviderAuthMode::ApiKey,
+                    ProviderAuthMode::Bearer,
+                    ProviderAuthMode::OAuthBearer,
+                    ProviderAuthMode::Basic,
+                    ProviderAuthMode::Header,
+                ],
+            )?;
         }
     }
     validate_legacy_provider_auth(provider)?;
@@ -1015,5 +1027,24 @@ mod tests {
         }))
         .unwrap();
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn http_provider_rejects_cloud_specific_auth_modes_during_validation() {
+        for mode in ["aws-sig-v4", "azure-sas"] {
+            let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+                "node": {"id":"nas-main","storageRoot":"/srv/nas"},
+                "provider": {
+                    "kind":"http",
+                    "namespace":"prod",
+                    "bucket":"rbe-backups",
+                    "endpoint":"https://objects.example.test",
+                    "auth":{"mode":mode}
+                }
+            }))
+            .unwrap();
+            let error = settings.validate().unwrap_err().to_string();
+            assert!(error.contains("does not support"), "unexpected error: {error}");
+        }
     }
 }
