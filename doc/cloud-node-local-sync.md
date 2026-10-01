@@ -53,7 +53,8 @@ Example:
     "syncOnConnect": true,
     "reconnectDelayMs": 2000,
     "maxReconnectDelayMs": 60000,
-    "pollIntervalMs": 30000
+    "pollIntervalMs": 30000,
+    "integrityAuditIntervalMs": 900000
   }
 }
 ```
@@ -160,7 +161,7 @@ The default is deliberately conservative. Cloud Node does not silently choose on
 cloud_node sync
 ```
 
-With a provider this performs remote-first recovery, watched-directory reconciliation, and provider push/pull as one safe cycle.
+With a provider this performs remote-first recovery, watched-directory reconciliation, and provider push/pull as one safe cycle. Explicit one-shot synchronization also performs the full same-root provider integrity audit before returning success.
 
 With a peer it scans local inputs and performs the existing authenticated peer synchronization behavior.
 
@@ -178,7 +179,9 @@ This is the provider-only recovery-safe boot variant. In addition to remote-firs
 cloud_node run
 ```
 
-When provider `syncOnConnect` is `true`, every provider poll performs the normal full cycle. Healthy provider polling uses `pollIntervalMs`; failures use the existing capped exponential reconnect backoff. Continuous mode does not use the bootstrap-only missing-checkout repair behavior.
+When provider `syncOnConnect` is `true`, every successful daemon poll still scans local inputs and checks provider history/root state. Any real `LocalAhead`, `RemoteAhead`, `Diverged`, or empty-remote condition synchronizes immediately. Same-root immutable provider-object auditing is intentionally more expensive, so it runs on the first daemon cycle and then on `integrityAuditIntervalMs` rather than on every `pollIntervalMs` tick. The default integrity audit interval is `900000` milliseconds (15 minutes) and the accepted range is 30000 through 86400000 milliseconds. A successful push or pull also resets the audit clock because that cycle already verified or repaired provider state.
+
+Healthy provider polling uses `pollIntervalMs`; failures use the existing capped exponential reconnect backoff. Continuous mode does not use the bootstrap-only missing-checkout repair behavior.
 
 ### Provider-only reconciliation
 
@@ -186,7 +189,7 @@ When provider `syncOnConnect` is `true`, every provider poll performs the normal
 cloud_node sync-provider
 ```
 
-This command intentionally remains lower level: it reconciles only the Cloud Node CAS/provider history and does **not** scan or mutate `localSync.directory`. This preserves callers such as trusted registry bridges that need to recover provider state before importing their own authoritative snapshot.
+This command intentionally remains lower level: it reconciles only the Cloud Node CAS/provider history and does **not** scan or mutate `localSync.directory`. This preserves callers such as trusted registry bridges that need to recover provider state before importing their own authoritative snapshot. Explicit `sync-provider` remains thorough and is not daemon-throttled.
 
 ### Inspect state
 
@@ -196,7 +199,7 @@ cloud_node provider-status
 cloud_node sync-plan
 ```
 
-`evaluate` reports the configured watched directory, logical prefix, whether it differs from the local Cloud Node CAS, and the managed/scanned object counts. It also reports `localSyncMissing`, `localSyncChanged`, and `localSyncUntracked` so incomplete checkout state can be distinguished from actual local edits.
+`evaluate` reports the configured watched directory, logical prefix, whether it differs from the local Cloud Node CAS, and the managed/scanned object counts. It also reports `localSyncMissing`, `localSyncChanged`, and `localSyncUntracked` so incomplete checkout state can be distinguished from actual local edits. In provider mode it also reports `providerIntegrityAuditIntervalMs` so the daemon's deep-audit cadence is visible from the effective settings.
 
 ## Supabase S3
 
