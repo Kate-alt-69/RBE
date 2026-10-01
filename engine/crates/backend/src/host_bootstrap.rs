@@ -226,7 +226,7 @@ fn spawn_cloud_node_supervisor(
     project_root: PathBuf,
     verbose: bool,
 ) {
-    let _ = tokio::spawn(async move {
+    std::mem::drop(tokio::spawn(async move {
         let mut consecutive_failures = 0u32;
         loop {
             let mut command = tokio::process::Command::new(&executable);
@@ -282,7 +282,7 @@ fn spawn_cloud_node_supervisor(
             }
             tokio::time::sleep(delay).await;
         }
-    });
+    }));
 }
 
 fn cloud_node_restart_delay(attempt: u32) -> Duration {
