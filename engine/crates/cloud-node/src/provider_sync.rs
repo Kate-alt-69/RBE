@@ -399,24 +399,12 @@ pub async fn synchronize_provider(
     let plan = store.sync_plan()?;
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
-    let existing_head = history.head()?;
+    let mut existing_head = history.head()?;
 
     if let Some(remote_head) = remote.as_ref() {
         if should_adopt_matching_remote_history(existing_head.as_ref(), &local_root, remote_head) {
             import_remote_history(&history, &client, remote_head, &mut remote_cache).await?;
-            let before = ProviderSyncStatus {
-                relation: ProviderSyncRelation::InSync,
-                local_head: remote_head.id.clone(),
-                remote_head: Some(remote_head.id.clone()),
-                local_root: local_root.clone(),
-                remote_root: Some(remote_head.snapshot_root.clone()),
-            };
-            return Ok(ProviderSyncResult {
-                action: ProviderSyncAction::None,
-                final_root: local_root,
-                final_head: remote_head.id.clone(),
-                before,
-            });
+            existing_head = Some(remote_head.clone());
         }
     }
 
@@ -461,12 +449,46 @@ pub async fn synchronize_provider(
     .await?;
 
     match before.relation {
-        ProviderSyncRelation::InSync => Ok(ProviderSyncResult {
-            action: ProviderSyncAction::None,
-            final_root: before.local_root.clone(),
-            final_head: before.local_head.clone(),
-            before,
-        }),
+        ProviderSyncRelation::InSync => {
+            let remote_head = remote.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Cloud Node provider in-sync state has no remote HEAD")
+            })?;
+            if let Err(local_error) = store.verify() {
+                pull_provider_state(
+                    &client,
+                    &history,
+                    store,
+                    remote_head,
+                    &recovery_owner,
+                    &mut remote_cache,
+                )
+                .await
+                .map_err(|remote_error| {
+                    anyhow::anyhow!(
+                        "Cloud Node provider history matches the local root, but the local snapshot failed integrity verification ({local_error}) and same-root provider recovery also failed: {remote_error}"
+                    )
+                })?;
+                return Ok(ProviderSyncResult {
+                    action: ProviderSyncAction::Pull,
+                    final_root: remote_head.snapshot_root.clone(),
+                    final_head: remote_head.id.clone(),
+                    before,
+                });
+            }
+
+            // History equality alone is not proof that lifecycle rules or a
+            // manual provider edit did not remove immutable snapshot objects.
+            // Re-run snapshot validation/repair while keeping HEAD unchanged.
+            let cache_owner = provider_cache_owner(client.namespace());
+            upload_snapshot(&client, store, &plan, &cache_owner).await?;
+            cleanup_outbound_cache(store, &cache_owner).await?;
+            Ok(ProviderSyncResult {
+                action: ProviderSyncAction::None,
+                final_root: before.local_root.clone(),
+                final_head: before.local_head.clone(),
+                before,
+            })
+        }
         ProviderSyncRelation::EmptyRemote | ProviderSyncRelation::LocalAhead => {
             push_provider_state(
                 &client,
