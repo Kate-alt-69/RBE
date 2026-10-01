@@ -1138,15 +1138,11 @@ async fn provider_resource_available(
         return Ok(length == resource.size);
     }
 
-    // A generic HTTP origin may ignore Range and stream without Content-Length.
-    // In that case prove that the referenced object exists and is non-empty
-    // without downloading the complete resource. Restore still verifies the
-    // declared size and SHA-256 before activation.
-    Ok(response
-        .chunk()
-        .await
-        .map_err(provider_transport_error)?
-        .is_some())
+    // If an origin ignores Range and omits Content-Length, a tiny existence
+    // probe cannot prove the immutable object's exact size. Treat that response
+    // as ambiguous so upload_snapshot falls through to create/collision handling,
+    // where the existing object is fully size/hash verified before publication.
+    Ok(false)
 }
 
 fn content_range_total(value: &str) -> Option<u64> {
