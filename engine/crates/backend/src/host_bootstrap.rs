@@ -199,6 +199,7 @@ async fn run_cloud_node_boot_sync(
     let status = tokio::process::Command::new(executable)
         .arg(format!("--config={}", config_path.display()))
         .arg("sync")
+        .arg("--bootstrap")
         .env("RBE_PROJECT_ROOT", project_root)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
