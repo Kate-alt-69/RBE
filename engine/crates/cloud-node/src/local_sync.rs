@@ -394,7 +394,7 @@ fn prepare_local_root(store: &CloudNodeStore, directory: &Path) -> anyhow::Resul
     })?;
     if root == store_root || root.starts_with(&store_root) {
         anyhow::bail!(
-            "Cloud Node localSync.directory {} cannot be the Cloud Node store or one of its children",
+            "Cloud Node localSync.directory {} cannot be the Cloud Node store {} or one of its children",
             root.display(),
             store_root.display()
         );
