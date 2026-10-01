@@ -133,12 +133,23 @@ async fn run() -> anyhow::Result<()> {
             print_provider_result(&result);
         }
         "sync" => {
+            let bootstrap_recovery = sync_bootstrap_requested(&args)?;
             if settings.provider.is_some() {
-                let result =
-                    sync_provider_cycle(&settings, &store, &project_root, local_sync.as_ref())
-                        .await?;
+                let result = sync_provider_cycle(
+                    &settings,
+                    &store,
+                    &project_root,
+                    local_sync.as_ref(),
+                    bootstrap_recovery,
+                )
+                .await?;
                 print_provider_result(&result);
             } else if settings.upstream.is_some() {
+                if bootstrap_recovery {
+                    anyhow::bail!(
+                        "cloud_node sync --bootstrap is only supported for provider-backed synchronization"
+                    );
+                }
                 sync_local_inputs(&store, &project_root, local_sync.as_ref())?;
                 let peer = probe_upstream(&settings).await?;
                 let negotiation = synchronize_upstream(&settings, &store, &peer).await?;
@@ -282,25 +293,61 @@ fn restore_local_after_pull(
     Ok(())
 }
 
+fn bootstrap_empty_checkout(
+    bootstrap_recovery: bool,
+    scanned_files: usize,
+    managed_objects: usize,
+) -> bool {
+    bootstrap_recovery && scanned_files == 0 && managed_objects > 0
+}
+
+fn restore_empty_bootstrap_checkout(
+    store: &CloudNodeStore,
+    local_sync: Option<&LocalSyncRuntime>,
+    should_restore: bool,
+) -> anyhow::Result<()> {
+    if !should_restore {
+        return Ok(());
+    }
+    let Some(local) = local_sync else {
+        return Ok(());
+    };
+    let result = store.restore_local_directory(&local.directory, &local.settings.logical_prefix)?;
+    eprintln!(
+        "cloud_node: bootstrap restored empty localSync checkout restored={} removed={} unchanged={} directory={}",
+        result.restored,
+        result.removed,
+        result.unchanged,
+        local.directory.display()
+    );
+    Ok(())
+}
+
 async fn sync_provider_cycle(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
     project_root: &Path,
     local_sync: Option<&LocalSyncRuntime>,
+    bootstrap_recovery: bool,
 ) -> anyhow::Result<ProviderSyncResult> {
     let provider = settings
         .provider
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Cloud Node provider mode is not configured"))?;
     let remote = provider_status(settings, store).await?;
-    let local_dirty = local_sync
+    let (local_dirty, restore_empty_checkout) = local_sync
         .map(|local| {
-            store
-                .local_directory_status(&local.directory, &local.settings.logical_prefix)
-                .map(|status| status.dirty)
+            let status =
+                store.local_directory_status(&local.directory, &local.settings.logical_prefix)?;
+            let restore_empty = bootstrap_empty_checkout(
+                bootstrap_recovery,
+                status.scanned_files,
+                status.managed_objects,
+            );
+            Ok::<_, anyhow::Error>((status.dirty && !restore_empty, restore_empty))
         })
         .transpose()?
-        .unwrap_or(false);
+        .unwrap_or((false, false));
 
     if local_dirty
         && matches!(
@@ -326,12 +373,19 @@ async fn sync_provider_cycle(
         ProviderSyncRelation::RemoteAhead | ProviderSyncRelation::Diverged
     ) && !prefer_local_dirty
     {
-        // Git-like recovery rule: reconcile the provider history before any
+        // Git-like recovery rule: reconcile provider history before any
         // working-tree/project mutation. An empty local store therefore adopts
         // the provider head instead of manufacturing a conflicting root.
         let recovered = synchronize_provider(settings, store).await?;
         restore_local_after_pull(store, local_sync, recovered.action)?;
     }
+
+    // Backend bootstrap uses `sync --bootstrap`. If the working directory is
+    // completely empty while Cloud Node still owns backed-up objects, treat it
+    // like a missing checkout rather than a user request to delete everything.
+    // Ordinary `sync` does not use this behavior, so explicit local deletions
+    // keep their existing semantics after the application is running.
+    restore_empty_bootstrap_checkout(store, local_sync, restore_empty_checkout)?;
 
     sync_local_inputs(store, project_root, local_sync)?;
     let result = synchronize_provider(settings, store).await?;
@@ -421,7 +475,7 @@ async fn run_provider_daemon(
     let mut write_probe_verified = false;
     loop {
         let result = if provider.sync_on_connect {
-            sync_provider_cycle(settings, store, project_root, local_sync)
+            sync_provider_cycle(settings, store, project_root, local_sync, false)
                 .await
                 .map(|sync| {
                     println!(
@@ -483,6 +537,19 @@ fn print_provider_result(result: &ProviderSyncResult) {
     println!("root={}", result.final_root);
 }
 
+fn sync_bootstrap_requested(args: &[String]) -> anyhow::Result<bool> {
+    match args.get(1).map(String::as_str) {
+        None => Ok(false),
+        Some("--bootstrap") if args.len() == 2 => Ok(true),
+        Some("--bootstrap") => {
+            anyhow::bail!("cloud_node sync --bootstrap does not accept additional arguments")
+        }
+        Some(other) => anyhow::bail!(
+            "cloud_node sync does not accept argument {other:?}; only the optional --bootstrap flag is supported"
+        ),
+    }
+}
+
 fn take_config_arg(args: &mut Vec<String>) -> anyhow::Result<Option<PathBuf>> {
     let mut found = None;
     let mut index = 0usize;
@@ -533,6 +600,28 @@ fn default_config_path() -> PathBuf {
 
 fn print_help() {
     println!(
-        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|sync|ingest-registry <export-root>|sync-registry <export-root>|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
+        "cloud_node [--config=<setting.node.cn.json>] [evaluate|probe-upstream|negotiate-sync|sync-upstream|probe-provider|provider-status|sync-provider|sync [--bootstrap]|ingest-registry <export-root>|sync-registry <export-root>|run|sync-plan|verify|public-key|store-file <source> <logical>|store-video <source> <logical>|snapshot-folder <source> <logical>]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_only_restores_a_completely_missing_checkout() {
+        assert!(bootstrap_empty_checkout(true, 0, 1));
+        assert!(!bootstrap_empty_checkout(false, 0, 1));
+        assert!(!bootstrap_empty_checkout(true, 1, 1));
+        assert!(!bootstrap_empty_checkout(true, 0, 0));
+    }
+
+    #[test]
+    fn sync_bootstrap_flag_is_explicit_and_bounded() {
+        assert!(!sync_bootstrap_requested(&["sync".into()]).unwrap());
+        assert!(sync_bootstrap_requested(&["sync".into(), "--bootstrap".into()]).unwrap());
+        assert!(sync_bootstrap_requested(&["sync".into(), "--bootstrap".into(), "oops".into()])
+            .is_err());
+        assert!(sync_bootstrap_requested(&["sync".into(), "unexpected".into()]).is_err());
+    }
 }
