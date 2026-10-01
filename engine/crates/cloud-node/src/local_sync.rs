@@ -60,6 +60,18 @@ struct ScannedEntry {
     content_sha256: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreMode {
+    Authoritative,
+    MissingOnly,
+}
+
+impl RestoreMode {
+    fn authoritative(self) -> bool {
+        matches!(self, Self::Authoritative)
+    }
+}
+
 pub fn load_local_sync_settings(path: &Path) -> anyhow::Result<Option<LocalSyncSettings>> {
     let source = fs::read_to_string(path)
         .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
@@ -205,6 +217,7 @@ impl CloudNodeStore {
                 anyhow::bail!("Cloud Node localSync snapshot contains duplicate logical paths");
             }
         }
+        validate_desired_file_tree(&desired, &prefix)?;
 
         let mut result = LocalDirectoryRestoreResult::default();
         for (logical_path, object) in &desired {
@@ -223,7 +236,13 @@ impl CloudNodeStore {
                     object.logical_path
                 )
             })?;
-            restore_payload_atomic(&root, payload, &target, object.content_sha256)?;
+            restore_payload_atomic(
+                &root,
+                payload,
+                &target,
+                object.content_sha256,
+                RestoreMode::Authoritative,
+            )?;
             result.restored = result.restored.saturating_add(1);
         }
 
@@ -266,6 +285,7 @@ impl CloudNodeStore {
                 anyhow::bail!("Cloud Node localSync snapshot contains duplicate logical paths");
             }
         }
+        validate_desired_file_tree(&desired, &prefix)?;
 
         let mut restored = 0usize;
         for (logical_path, object) in &desired {
@@ -274,9 +294,9 @@ impl CloudNodeStore {
             }
             let relative = logical_relative_path(logical_path, &prefix)?;
             let target = join_relative_logical_path(&root, relative)?;
-            if target.exists() {
+            if path_entry_exists(&target)? {
                 anyhow::bail!(
-                    "Cloud Node bootstrap checkout cannot restore managed file over non-file path: {}",
+                    "Cloud Node bootstrap checkout cannot restore managed file over existing path: {}",
                     target.display()
                 );
             }
@@ -286,7 +306,13 @@ impl CloudNodeStore {
                     object.logical_path
                 )
             })?;
-            restore_payload_atomic(&root, payload, &target, object.content_sha256)?;
+            restore_payload_atomic(
+                &root,
+                payload,
+                &target,
+                object.content_sha256,
+                RestoreMode::MissingOnly,
+            )?;
             restored = restored.saturating_add(1);
         }
         Ok(restored)
@@ -300,6 +326,30 @@ fn managed_objects(store: &CloudNodeStore, prefix: &str) -> anyhow::Result<Vec<S
         .filter(|object| logical_is_managed(&object.logical_path, prefix))
         .cloned()
         .collect())
+}
+
+fn validate_desired_file_tree(
+    desired: &BTreeMap<String, SyncObject>,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    for logical_path in desired.keys() {
+        let relative = logical_relative_path(logical_path, prefix)?;
+        let mut ancestor = prefix.to_owned();
+        let mut parts = relative.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            ancestor.push('/');
+            ancestor.push_str(part);
+            if desired.contains_key(&ancestor) {
+                anyhow::bail!(
+                    "Cloud Node localSync snapshot cannot materialize file {ancestor:?} and descendant {logical_path:?} at the same time"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn local_directory_dirty(scanned: &BTreeMap<String, ScannedEntry>, managed: &[SyncObject]) -> bool {
@@ -473,12 +523,13 @@ fn restore_payload_atomic(
     source: &Path,
     target: &Path,
     expected_sha256: [u8; 32],
+    mode: RestoreMode,
 ) -> anyhow::Result<()> {
     let parent = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| anyhow::anyhow!("Cloud Node localSync restore target has no parent"))?;
-    prepare_restore_parent(root, parent)?;
+    prepare_restore_parent(root, parent, mode)?;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -511,17 +562,14 @@ fn restore_payload_atomic(
         // Revalidate immediately before activation. This catches an ancestor
         // replaced with a symlink while the payload was being copied and keeps
         // restore writes confined to the canonical localSync checkout root.
-        prepare_restore_parent(root, parent)?;
+        prepare_restore_parent(root, parent, mode)?;
+        prepare_restore_target(target, mode)?;
 
         #[cfg(windows)]
-        if target.exists() {
-            // Windows std::fs::rename cannot replace an existing target. The
-            // durable Cloud Node store remains authoritative if the process dies
-            // in this tiny remove/rename window, so the next cycle repairs it.
-            durable::remove_file(target)?;
-        }
-        #[cfg(all(not(unix), not(windows)))]
-        if target.exists() {
+        if mode.authoritative() && target.is_file() {
+            // Windows std::fs::rename cannot replace an existing regular file.
+            // The durable Cloud Node store remains authoritative if the process
+            // dies in this tiny remove/rename window, so the next cycle repairs it.
             durable::remove_file(target)?;
         }
         durable::rename(&temporary, target)?;
@@ -533,7 +581,7 @@ fn restore_payload_atomic(
     copied
 }
 
-fn prepare_restore_parent(root: &Path, parent: &Path) -> anyhow::Result<()> {
+fn prepare_restore_parent(root: &Path, parent: &Path, mode: RestoreMode) -> anyhow::Result<()> {
     let relative = parent.strip_prefix(root).map_err(|_| {
         anyhow::anyhow!(
             "Cloud Node localSync restore parent escaped checkout root: {}",
@@ -551,15 +599,25 @@ fn prepare_restore_parent(root: &Path, parent: &Path) -> anyhow::Result<()> {
         current.push(part);
 
         match fs::symlink_metadata(&current) {
-            Ok(metadata) => validate_restore_directory(&current, &metadata)?,
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "Cloud Node localSync restore refuses symlinked directory component: {}",
+                    current.display()
+                );
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(metadata) if metadata.is_file() && mode.authoritative() => {
+                durable::remove_file(&current)?;
+                create_and_validate_restore_directory(root, &current)?;
+            }
+            Ok(_) => {
+                anyhow::bail!(
+                    "Cloud Node localSync restore parent component is not a directory: {}",
+                    current.display()
+                );
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&current) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error.into()),
-                }
-                let metadata = fs::symlink_metadata(&current)?;
-                validate_restore_directory(&current, &metadata)?;
+                create_and_validate_restore_directory(root, &current)?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -586,6 +644,64 @@ fn prepare_restore_parent(root: &Path, parent: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn create_and_validate_restore_directory(root: &Path, path: &Path) -> anyhow::Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    validate_restore_directory(path, &metadata)?;
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(root) {
+        anyhow::bail!(
+            "Cloud Node localSync restore directory escaped checkout root: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn prepare_restore_target(target: &Path, mode: RestoreMode) -> anyhow::Result<()> {
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    if !mode.authoritative() {
+        anyhow::bail!(
+            "Cloud Node bootstrap checkout refuses to overwrite existing path: {}",
+            target.display()
+        );
+    }
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "Cloud Node authoritative restore refuses a symlink at managed target: {}",
+            target.display()
+        );
+    }
+    if metadata.is_dir() {
+        durable::remove_dir_all(target)?;
+        return Ok(());
+    }
+    if metadata.is_file() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Cloud Node authoritative restore target is not a regular file or directory: {}",
+        target.display()
+    )
+}
+
+fn path_entry_exists(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn validate_restore_directory(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<()> {
@@ -851,6 +967,89 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn authoritative_restore_replaces_local_shape_blockers() {
+        let root = root("shape-blockers");
+        let nested_source = root.join("nested-source.txt");
+        let leaf_source = root.join("leaf-source.txt");
+        fs::write(&nested_source, b"remote nested").unwrap();
+        fs::write(&leaf_source, b"remote leaf").unwrap();
+        let watched = root.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let store = store(&root);
+        store
+            .store_file(&nested_source, "workspace/nested/state.txt")
+            .unwrap();
+        store
+            .store_file(&leaf_source, "workspace/leaf.txt")
+            .unwrap();
+
+        fs::write(watched.join("nested"), b"local file blocker").unwrap();
+        fs::create_dir_all(watched.join("leaf.txt")).unwrap();
+        fs::write(watched.join("leaf.txt/extra.txt"), b"local tree blocker").unwrap();
+
+        let restored = store
+            .restore_local_directory(&watched, "workspace")
+            .unwrap();
+        assert_eq!(restored.restored, 2);
+        assert_eq!(
+            fs::read(watched.join("nested/state.txt")).unwrap(),
+            b"remote nested"
+        );
+        assert_eq!(fs::read(watched.join("leaf.txt")).unwrap(), b"remote leaf");
+        assert!(!store
+            .local_directory_status(&watched, "workspace")
+            .unwrap()
+            .dirty);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bootstrap_restore_preserves_local_shape_blocker() {
+        let root = root("bootstrap-shape-blocker");
+        let source = root.join("source.txt");
+        fs::write(&source, b"remote state").unwrap();
+        let watched = root.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let store = store(&root);
+        store
+            .store_file(&source, "workspace/nested/state.txt")
+            .unwrap();
+        fs::write(watched.join("nested"), b"local blocker").unwrap();
+
+        let error = store
+            .restore_missing_local_directory(&watched, "workspace")
+            .unwrap_err();
+        assert!(error.to_string().contains("not a directory"));
+        assert_eq!(fs::read(watched.join("nested")).unwrap(), b"local blocker");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_rejects_impossible_managed_file_tree() {
+        let root = root("impossible-tree");
+        let parent_source = root.join("parent-source.txt");
+        let child_source = root.join("child-source.txt");
+        fs::write(&parent_source, b"parent").unwrap();
+        fs::write(&child_source, b"child").unwrap();
+        let watched = root.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let store = store(&root);
+        store
+            .store_file(&parent_source, "workspace/node")
+            .unwrap();
+        store
+            .store_file(&child_source, "workspace/node/child.txt")
+            .unwrap();
+
+        let error = store
+            .restore_local_directory(&watched, "workspace")
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot materialize file"));
+        assert!(fs::read_dir(&watched).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn restore_rejects_symlinked_parent_escape() {
@@ -880,6 +1079,31 @@ mod tests {
             .unwrap_err();
         assert!(full_error.to_string().contains("symlinked directory"));
         assert!(!outside.join("state.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_restore_does_not_replace_dangling_target_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = root("dangling-target");
+        let watched = root.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let source = root.join("source.txt");
+        fs::write(&source, b"remote state").unwrap();
+        let store = store(&root);
+        store.store_file(&source, "workspace/state.txt").unwrap();
+        symlink(root.join("missing-outside"), watched.join("state.txt")).unwrap();
+
+        let error = store
+            .restore_missing_local_directory(&watched, "workspace")
+            .unwrap_err();
+        assert!(error.to_string().contains("existing path"));
+        assert!(fs::symlink_metadata(watched.join("state.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
         let _ = fs::remove_dir_all(root);
     }
 
