@@ -369,9 +369,7 @@ impl CloudNodeRecoveryReceiver {
                     );
                 }
                 let BlobBody::Video { chunks, .. } = &manifest.body else {
-                    anyhow::bail!(
-                        "Cloud Node recovery video chunk does not have a video manifest"
-                    );
+                    anyhow::bail!("Cloud Node recovery video chunk does not have a video manifest");
                 };
                 if chunk.total_size > MAX_RECOVERY_VIDEO_CHUNK_BYTES
                     || !chunks.iter().any(|entry| {
@@ -722,10 +720,10 @@ fn validate_staged_resource(
         }
         TransferResource::VideoChunk => {
             let manifest = load_staged_manifest(staging_storage, chunk)?;
-            if manifest.kind != BlobKind::Video
-                || manifest.content_sha256 != chunk.content_sha256
-            {
-                anyhow::bail!("Cloud Node recovery video chunk identity does not match its manifest");
+            if manifest.kind != BlobKind::Video || manifest.content_sha256 != chunk.content_sha256 {
+                anyhow::bail!(
+                    "Cloud Node recovery video chunk identity does not match its manifest"
+                );
             }
             let BlobBody::Video { chunks, .. } = manifest.body else {
                 anyhow::bail!("Cloud Node recovery video chunk does not have a video manifest");
