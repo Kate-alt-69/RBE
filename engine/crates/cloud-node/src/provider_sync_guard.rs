@@ -32,6 +32,8 @@ enum ProviderSnapshotAudit {
 /// remote movement is reconciled again within a small bounded number of passes.
 /// A provider that disappears or moves backwards immediately after a pull is
 /// failed closed instead of turning the freshly pulled snapshot into a push.
+/// Every mutating pass must also be followed by a no-op confirmation pass so
+/// authoritative provider metadata is re-read before success is reported.
 pub async fn synchronize_provider(
     settings: &CloudNodeSettings,
     store: &CloudNodeStore,
@@ -181,6 +183,16 @@ pub async fn synchronize_provider(
             }
         }
 
+        if provider_sync_stable(&status) && provider_action_mutates(result.action) {
+            if pass < MAX_PROVIDER_STABILIZATION_PASSES {
+                continue;
+            }
+            anyhow::bail!(
+                "Cloud Node provider reached the stabilization limit on a mutating pass ({:?}); refusing to report success without a following no-op metadata confirmation pass",
+                result.action
+            );
+        }
+
         if provider_sync_stable(&status) {
             result.before = first_before.take().unwrap_or(result.before);
             if let Some(action) = last_mutating_action {
@@ -262,6 +274,10 @@ fn provider_push_expected(
         ProviderSyncRelation::EmptyRemote | ProviderSyncRelation::LocalAhead
     ) || (relation == ProviderSyncRelation::Diverged
         && conflict_policy == ProviderConflictPolicy::PreferLocal)
+}
+
+fn provider_action_mutates(action: ProviderSyncAction) -> bool {
+    action != ProviderSyncAction::None
 }
 
 async fn provider_plan_resources_complete(
@@ -629,6 +645,19 @@ mod tests {
         assert_eq!(content_range_total("bytes 4-4/5"), Some(5));
         assert_eq!(content_range_total("bytes 0-0/*"), None);
         assert_eq!(content_range_total("garbage"), None);
+    }
+
+    #[test]
+    fn provider_mutations_require_a_followup_confirmation_pass() {
+        assert!(!provider_action_mutates(ProviderSyncAction::None));
+        for action in [
+            ProviderSyncAction::Push,
+            ProviderSyncAction::Pull,
+            ProviderSyncAction::ForcedPush,
+            ProviderSyncAction::ForcedPull,
+        ] {
+            assert!(provider_action_mutates(action));
+        }
     }
 
     #[test]
