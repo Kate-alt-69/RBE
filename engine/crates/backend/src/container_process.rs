@@ -5,6 +5,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -13,9 +14,14 @@ use sha2::{Digest, Sha256};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::time::{sleep, timeout};
 
+#[path = "rel_host_executor.rs"]
+mod rel_host_executor;
+
 mod container_integrity {
     include!(concat!(env!("OUT_DIR"), "/container_integrity.rs"));
 }
+
+static REL_HOST_EXECUTOR_INSTALL: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub struct ContainerProcess {
     child: Child,
@@ -40,6 +46,13 @@ impl ContainerProcess {
             );
         }
         verify_container(binary)?;
+        if let Err(error) = REL_HOST_EXECUTOR_INSTALL.get_or_init(|| {
+            rel_host_executor::BackendRelHostExecutor::install(project_root)
+        }) {
+            anyhow::bail!(
+                "REL2216 trusted REL host executor could not be installed: {error}. No unsafe process/PATH fallback is permitted"
+            );
+        }
         const MAX_SPAWN_ATTEMPTS: u32 = 3;
         let mut last_err = None;
 
