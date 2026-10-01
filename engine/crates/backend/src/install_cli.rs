@@ -61,15 +61,15 @@ Registry configuration:
 
 Current execution boundary:
   Named-package registry hydration, deterministic dependency resolution,
-  verified artifact staging, manifest inspection, exact root-scoped lock
-  construction, durable content-addressed artifact promotion, safe project
-  state merge, attestation, crash-recoverable install sessions, and atomic
-  project activation are active before Backend boot for package graphs that
-  require no host build steps. SDK bootstrap downloads the fixed Kastrick
-  installer over HTTPS; that installer verifies the selected SDK release
-  archive SHA-256 before the project-local SDK backend installs it. Packages
-  that require compilation still fail closed until the managed build executor
-  is connected."#;
+  verified artifact staging, manifest inspection, managed rbe.sys runtime
+  hydration/admission, exact root-scoped lock construction, durable
+  content-addressed artifact promotion, safe project state merge, attestation,
+  crash-recoverable install sessions, and atomic project activation are active
+  before Backend boot for package graphs that require no host build steps. SDK
+  bootstrap downloads the fixed Kastrick installer over HTTPS; that installer
+  verifies the selected SDK release archive SHA-256 before the project-local SDK
+  backend installs it. Packages that require compilation still fail closed until
+  the managed build executor is connected."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCliFailure {
@@ -389,6 +389,14 @@ async fn resolve_named_async(
                 "verify resolved package graph for `{key}` failed: {error}"
             ))
         })?;
+    let managed_runtimes = graph
+        .hydrate_system_runtimes(project_root, registry)
+        .await
+        .map_err(|error| {
+            InstallCliFailure::unavailable(format!(
+                "hydrate managed runtimes for `{key}` failed: {error}"
+            ))
+        })?;
     let promotion = promote_verified_graph(&graph).map_err(|error| {
         InstallCliFailure::unavailable(format!(
             "promote verified package graph for `{key}` failed: {error}"
@@ -437,6 +445,7 @@ async fn resolve_named_async(
             "dependencies": dependencies,
             "verified_packages": graph.packages.len(),
             "verified_bytes": verified_bytes,
+            "managed_runtimes": managed_runtimes.len(),
             "cache": {
                 "published": promotion.published,
                 "reused_existing": promotion.reused_existing,
@@ -473,9 +482,10 @@ async fn resolve_named_async(
         )
     } else {
         format!(
-            "Installed `{key}` {} successfully.\nverified graph: {} package(s), {verified_bytes} byte(s)\ncache: {} published, {} reused\nroot artifact: {}\nartifact sha256: {}\nmanifest sha256: {}\nproject roots: {}\nproject manifest sha256: {}\nproject lock sha256: {}\ninstall session: {}\nactivated package instances: {}\n\npackage.rbe.yaml and package.lock.rbe.yaml were activated atomically before Backend boot. No RBE server was started.",
+            "Installed `{key}` {} successfully.\nverified graph: {} package(s), {verified_bytes} byte(s)\nmanaged runtimes: {}\ncache: {} published, {} reused\nroot artifact: {}\nartifact sha256: {}\nmanifest sha256: {}\nproject roots: {}\nproject manifest sha256: {}\nproject lock sha256: {}\ninstall session: {}\nactivated package instances: {}\n\npackage.rbe.yaml and package.lock.rbe.yaml were activated atomically before Backend boot. No RBE server was started.",
             root.version,
             graph.packages.len(),
+            managed_runtimes.len(),
             promotion.published,
             promotion.reused_existing,
             root.artifact_url,
