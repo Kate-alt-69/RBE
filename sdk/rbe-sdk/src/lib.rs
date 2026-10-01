@@ -868,8 +868,7 @@ fn encode_tcp_write(handle: &str, data: &[u8], timeout_ms: Option<u64>) -> Vec<u
 fn encode_tcp_read(handle: &str, max_bytes: usize, timeout_ms: Option<u64>) -> Vec<u8> {
     let mut output = String::from("{\"handle\":");
     push_json_string(&mut output, handle);
-    write!(output, ",\"max_bytes\":{max_bytes}")
-        .expect("writing TCP JSON to String cannot fail");
+    write!(output, ",\"max_bytes\":{max_bytes}").expect("writing TCP JSON to String cannot fail");
     push_timeout(&mut output, timeout_ms);
     output.push('}');
     output.into_bytes()
