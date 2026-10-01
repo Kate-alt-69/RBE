@@ -3,7 +3,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cloud_node::{CloudNodeSettings, SETTINGS_FILE_NAME};
+use cloud_node::{discover_settings_path, CloudNodeSettings};
 use rand::RngCore;
 #[cfg(target_os = "linux")]
 use tokio::io::AsyncWriteExt;
@@ -168,13 +168,7 @@ fn resolve_cloud_node_settings_path() -> anyhow::Result<Option<PathBuf>> {
 
     let executable = std::env::current_exe()
         .map_err(|error| anyhow::anyhow!("resolve backend executable for Cloud Node: {error}"))?;
-    let parent = executable.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "backend executable has no parent directory while resolving {SETTINGS_FILE_NAME}"
-        )
-    })?;
-    let sibling = parent.join(SETTINGS_FILE_NAME);
-    Ok(sibling.is_file().then_some(sibling))
+    discover_settings_path(&executable)
 }
 
 fn sibling_cloud_node_executable() -> anyhow::Result<PathBuf> {
