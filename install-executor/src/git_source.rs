@@ -264,21 +264,14 @@ impl GitSourceAcquisitionPlan {
 
         let roots = source_files
             .iter()
-            .map(|file| {
-                file.path
-                    .split('/')
-                    .next()
-                    .unwrap_or_default()
-                    .to_string()
-            })
+            .map(|file| file.path.split('/').next().unwrap_or_default().to_string())
             .collect::<BTreeSet<_>>();
         if roots.contains("") {
             return Err(GitSourceError::InvalidTreePath(String::new()));
         }
 
         let selection = SourceSelection::new(roots)?;
-        let source_tree =
-            SourceTreeDigest::from_files(&selection, source_files.iter().cloned())?;
+        let source_tree = SourceTreeDigest::from_files(&selection, source_files.iter().cloned())?;
 
         Ok(GitSourceReceipt {
             repository: self.repository.as_str().to_string(),
@@ -688,8 +681,7 @@ mod tests {
     fn toolchain(root: &Path) -> PinnedManagedToolchain {
         let git = root.join("git");
         std::fs::write(&git, b"managed-git-v1").unwrap();
-        let managed =
-            ManagedToolchain::new(BTreeMap::from([("git".to_string(), git)])).unwrap();
+        let managed = ManagedToolchain::new(BTreeMap::from([("git".to_string(), git)])).unwrap();
         PinnedManagedToolchain::pin(&managed).unwrap()
     }
 
@@ -805,8 +797,14 @@ mod tests {
             .any(|arg| arg == &commit));
 
         let blob = "c".repeat(40);
-        assert_eq!(materialization.blob_args(&blob).unwrap().last(), Some(&blob));
-        assert_eq!(materialization.size_args(&blob).unwrap().last(), Some(&blob));
+        assert_eq!(
+            materialization.blob_args(&blob).unwrap().last(),
+            Some(&blob)
+        );
+        assert_eq!(
+            materialization.size_args(&blob).unwrap().last(),
+            Some(&blob)
+        );
     }
 
     #[test]
