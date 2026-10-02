@@ -18,10 +18,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub const PACKAGE_MANIFEST: &str = "package.rbe.toml";
 pub const DEFAULT_COMPONENTS_DIR: &str = "components";
-/// Transitional format-1 writer. The Phase-3 `export_id` field is already
-/// emitted and verified; the wire-format bump lands after every consumer can
-/// read format 2 so main never contains an unreadable package artifact.
-pub const PACKAGE_INDEX_FORMAT: u32 = 1;
+pub const PACKAGE_INDEX_FORMAT: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
