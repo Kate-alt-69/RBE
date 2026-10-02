@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rbe_install_request::{SystemRuntimeKind, SystemRuntimeManifestRequest};
 use rbe_install_runtime::{
-    current_system_runtime_host, AdmittedSystemRuntime, GitSourceAcquisitionPlan,
-    GitSourceReceipt, PinnedManagedToolchain,
+    current_system_runtime_host, AdmittedSystemRuntime, GitSourceAcquisitionPlan, GitSourceReceipt,
+    PinnedManagedToolchain,
 };
 
 use super::git_exec;
@@ -33,12 +33,10 @@ impl SourceAuthority {
             SystemRuntimeKind::Git,
             &host,
         )?;
-        let (git, manifest) = AdmittedSystemRuntime::hydrate_from_registry(
-            &manifest_request,
-            runtime_cache_root,
-        )
-        .await
-        .context("hydrate managed rbe.sys.git runtime")?;
+        let (git, manifest) =
+            AdmittedSystemRuntime::hydrate_from_registry(&manifest_request, runtime_cache_root)
+                .await
+                .context("hydrate managed rbe.sys.git runtime")?;
         let pinned_git = PinnedManagedToolchain::from_pins([(
             "git".to_owned(),
             git.executable,

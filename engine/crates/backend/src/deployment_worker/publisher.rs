@@ -167,7 +167,8 @@ impl PublisherClient {
             .get("body")
             .and_then(Value::as_str)
             .context("HTTP broker response is missing body")?;
-        let value: Value = serde_json::from_str(body).context("decode deployment publisher JSON")?;
+        let value: Value =
+            serde_json::from_str(body).context("decode deployment publisher JSON")?;
         if !http_ok {
             anyhow::bail!(
                 "deployment publisher returned HTTP {status}: {}",

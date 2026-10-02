@@ -40,7 +40,8 @@ pub async fn run() -> Result<()> {
             continue;
         };
 
-        if let Err(error) = process_deployment(&publisher, &source_authority, &config, &deployment).await
+        if let Err(error) =
+            process_deployment(&publisher, &source_authority, &config, &deployment).await
         {
             let message = bounded_message(&format!("source acquisition failed: {error:#}"));
             let terminal = deployment.attempt >= MAX_SOURCE_ATTEMPTS;
@@ -85,7 +86,8 @@ async fn process_deployment(
                     status: "running",
                     stage: "validation",
                     level: "success",
-                    message: "Immutable RBE source receipt already sealed; source acquisition skipped.",
+                    message:
+                        "Immutable RBE source receipt already sealed; source acquisition skipped.",
                     blocked_reason: Some("managed_validation_executor_not_connected"),
                 },
             )

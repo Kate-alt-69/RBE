@@ -1,0 +1,51 @@
+name: Deployment Worker CI
+
+on:
+  push:
+    paths:
+      - 'engine/crates/backend/src/deployment_worker/**'
+      - 'engine/crates/backend/src/deployment_worker_main.rs'
+      - 'engine/crates/backend/Cargo.toml'
+      - 'install-runtime/src/lib.rs'
+      - 'install-executor/src/git_source.rs'
+      - '.github/workflows/deployment-worker-ci.yml'
+  pull_request:
+    paths:
+      - 'engine/crates/backend/src/deployment_worker/**'
+      - 'engine/crates/backend/src/deployment_worker_main.rs'
+      - 'engine/crates/backend/Cargo.toml'
+      - 'install-runtime/src/lib.rs'
+      - 'install-executor/src/git_source.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deployment-worker-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deployment-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: worker fmt
+        run: |
+          rustfmt --edition 2021 --check \
+            engine/crates/backend/src/deployment_worker_main.rs \
+            engine/crates/backend/src/deployment_worker/mod.rs \
+            engine/crates/backend/src/deployment_worker/publisher.rs \
+            engine/crates/backend/src/deployment_worker/source.rs \
+            engine/crates/backend/src/deployment_worker/git_exec.rs \
+            engine/crates/backend/src/deployment_worker/git_exec_impl.rs
+      - name: worker clippy
+        working-directory: engine
+        run: cargo clippy -p backend --bin deployment-worker --locked -- -D warnings
