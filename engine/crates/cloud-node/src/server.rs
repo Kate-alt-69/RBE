@@ -9,6 +9,8 @@ use crate::crypto::load_signing_key_from_env;
 
 pub const MAX_AUTH_PROOF_BYTES: usize = 1024;
 pub const DEFAULT_SESSION_TTL_MS: u64 = 5 * 60_000;
+const MAX_ACTIVE_SESSIONS: usize = 4096;
+const MAX_REPLAY_ENTRIES: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedSession {
@@ -103,6 +105,7 @@ impl CloudNodeAuthenticator {
                 "Cloud Node authentication session id is already active; peer must create a fresh session"
             );
         }
+        ensure_auth_capacity(state.sessions.len(), state.replays.len(), true)?;
 
         let (_, local_nonce) = random_session_and_nonce();
         let accept = NodeProof::accept(
@@ -170,6 +173,7 @@ impl CloudNodeAuthenticator {
         if proof.peer_nonce != session.local_nonce {
             anyhow::bail!("Cloud Node session proof is not bound to this authenticated peer");
         }
+        ensure_auth_capacity(state.sessions.len(), state.replays.len(), false)?;
         state.replays.insert(
             replay_key,
             proof.timestamp_ms.saturating_add(self.max_skew_ms),
@@ -212,6 +216,24 @@ fn prune_state(state: &mut AuthState, now_ms: u64) {
     state
         .sessions
         .retain(|_, session| session.expires_at_ms >= now_ms);
+}
+
+fn ensure_auth_capacity(
+    active_sessions: usize,
+    replay_entries: usize,
+    adding_session: bool,
+) -> anyhow::Result<()> {
+    if replay_entries >= MAX_REPLAY_ENTRIES {
+        anyhow::bail!(
+            "Cloud Node authentication replay cache reached its bounded capacity; retry after the freshness window advances"
+        );
+    }
+    if adding_session && active_sessions >= MAX_ACTIVE_SESSIONS {
+        anyhow::bail!(
+            "Cloud Node authenticated session table reached its bounded capacity; retry after an active session expires"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -285,6 +307,15 @@ mod tests {
         assert!(auth.accept_knock(&replacement, 50_300).is_err());
         let active = auth.session("nas-main", &session, 50_400).unwrap().unwrap();
         assert_eq!(active.peer_nonce, [5u8; 32]);
+    }
+
+    #[test]
+    fn authentication_state_capacity_is_bounded() {
+        assert!(ensure_auth_capacity(0, 0, true).is_ok());
+        assert!(ensure_auth_capacity(MAX_ACTIVE_SESSIONS - 1, 0, true).is_ok());
+        assert!(ensure_auth_capacity(MAX_ACTIVE_SESSIONS, 0, true).is_err());
+        assert!(ensure_auth_capacity(0, MAX_REPLAY_ENTRIES - 1, false).is_ok());
+        assert!(ensure_auth_capacity(0, MAX_REPLAY_ENTRIES, false).is_err());
     }
 
     #[test]
