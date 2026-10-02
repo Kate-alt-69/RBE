@@ -45,7 +45,7 @@ hex = "0.4"
 rand = "0.8"
 keyring = "2"
 ed25519-dalek = "2"
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = "1"
 
 [build-dependencies]
