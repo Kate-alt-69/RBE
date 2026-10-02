@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod execution;
+mod git_source;
 mod hydration;
 mod pinned_toolchain;
 mod source;
@@ -9,6 +10,7 @@ mod worker_launch;
 mod worker_proxy;
 
 pub use execution::*;
+pub use git_source::*;
 pub use hydration::*;
 pub use pinned_toolchain::*;
 pub use source::*;
