@@ -52,8 +52,12 @@ pub(crate) fn approved_runtime_capabilities(
 
     let current_lock_sha256 = current_project_lock_sha256(project_root)?;
     if approval.version != snapshot.version
-        || !approval.artifact_sha256.eq_ignore_ascii_case(&snapshot.artifact_sha256)
-        || !approval.project_lock_sha256.eq_ignore_ascii_case(&current_lock_sha256)
+        || !approval
+            .artifact_sha256
+            .eq_ignore_ascii_case(&snapshot.artifact_sha256)
+        || !approval
+            .project_lock_sha256
+            .eq_ignore_ascii_case(&current_lock_sha256)
     {
         return Ok(Vec::new());
     }
