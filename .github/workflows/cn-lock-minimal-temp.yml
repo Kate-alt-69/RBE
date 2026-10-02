@@ -16,12 +16,9 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - name: Resolve Backend against existing lock
+      - name: Resolve workspace metadata against existing lock
         working-directory: engine
-        run: cargo check -p backend --all-targets
-      - name: Resolve install executor against existing lock
-        working-directory: engine
-        run: cargo check -p rbe-install-executor --all-targets
+        run: cargo metadata --format-version 1 > /dev/null
       - name: Commit minimal lock delta
         shell: bash
         run: |
