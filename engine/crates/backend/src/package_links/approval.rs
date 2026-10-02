@@ -38,11 +38,6 @@ struct PackageApproval {
     runtime: Vec<String>,
 }
 
-/// Load exact approvals for one verified package snapshot.
-///
-/// Missing or stale approval is equivalent to no authority. Malformed approval
-/// state, or an approval for a capability the verified artifact no longer
-/// requests, fails closed instead of being silently widened.
 pub(crate) fn approved_runtime_capabilities(
     project_root: &Path,
     snapshot: &VerifiedRpxRootSnapshot,
@@ -57,12 +52,8 @@ pub(crate) fn approved_runtime_capabilities(
 
     let current_lock_sha256 = current_project_lock_sha256(project_root)?;
     if approval.version != snapshot.version
-        || !approval
-            .artifact_sha256
-            .eq_ignore_ascii_case(&snapshot.artifact_sha256)
-        || !approval
-            .project_lock_sha256
-            .eq_ignore_ascii_case(&current_lock_sha256)
+        || !approval.artifact_sha256.eq_ignore_ascii_case(&snapshot.artifact_sha256)
+        || !approval.project_lock_sha256.eq_ignore_ascii_case(&current_lock_sha256)
     {
         return Ok(Vec::new());
     }
@@ -106,13 +97,6 @@ pub(crate) fn requested_runtime_capabilities(
     Ok(requested)
 }
 
-/// Replace the explicit host privileges approved for one exact installed root.
-///
-/// The approval is bound to the verified package version, artifact SHA-256 and
-/// current project-lock SHA-256. Package upgrades or lock changes therefore
-/// invalidate old authority automatically. Passing an empty list revokes all
-/// explicit host privileges for this package. The implicit package-scoped `log`
-/// capability is not stored here and cannot be widened through this API.
 #[allow(dead_code)]
 pub(crate) fn replace_runtime_approval(
     project_root: &Path,
@@ -162,18 +146,19 @@ pub(crate) fn replace_runtime_approval(
 pub(crate) fn explicit_host_privilege_description(capability: &str) -> Option<&'static str> {
     match capability {
         "net:http" => Some("make public HTTP/HTTPS requests through RBE's hardened network broker"),
-        "net:dns" => {
-            Some("resolve public DNS address and MX records through RBE's bounded DNS broker")
-        }
+        "net:dns" => Some("resolve public DNS address and MX records through RBE's bounded DNS broker"),
         "net:tcp" => Some(
             "open bounded stateful connections to public TCP destinations through RBE's session-scoped network broker",
         ),
         "net:tls" => Some(
             "open bounded public TLS/STARTTLS transports with RBE-owned certificate validation; net:tcp approval is also required",
         ),
-        // `log` is an implicit package-scoped host capability and never needs a
-        // privilege prompt. Unknown/custom names remain package-private until a
-        // trusted RBE host provider explicitly registers them.
+        "storage" => Some(
+            "read and write package-scoped durable blobs under this project's RBE state directory",
+        ),
+        "crypto" => Some(
+            "use bounded RBE-owned cryptographic primitives including secure randomness, SHA-256 and HMAC-SHA256",
+        ),
         _ => None,
     }
 }
@@ -304,6 +289,8 @@ mod tests {
         assert!(explicit_host_privilege_description("net:dns").is_some());
         assert!(explicit_host_privilege_description("net:tcp").is_some());
         assert!(explicit_host_privilege_description("net:tls").is_some());
+        assert!(explicit_host_privilege_description("storage").is_some());
+        assert!(explicit_host_privilege_description("crypto").is_some());
         assert!(explicit_host_privilege_description("log").is_none());
         assert!(explicit_host_privilege_description("mail:smtp").is_none());
     }

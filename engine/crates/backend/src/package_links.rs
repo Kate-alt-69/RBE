@@ -1,7 +1,11 @@
 #[path = "package_links/approval.rs"]
 pub(crate) mod approval;
+#[path = "package_links/crypto.rs"]
+pub(crate) mod crypto;
 #[path = "package_links/host.rs"]
 pub(crate) mod host;
+#[path = "package_links/storage.rs"]
+pub(crate) mod storage;
 #[path = "package_links/tcp.rs"]
 pub(crate) mod tcp;
 #[path = "package_links/tls.rs"]
@@ -56,6 +60,10 @@ fn dispatch_verified_host_call<'a>(
             LibraryHostCallReply::success(call.call_id, payload)
                 .context("encode successful package TLS host-call reply")
         })
+    } else if call.capability == storage::CAPABILITY {
+        Box::pin(async move { storage::dispatch_authorized_call(package, binding, call) })
+    } else if call.capability == crypto::CAPABILITY {
+        Box::pin(async move { crypto::dispatch_authorized_call(binding, call) })
     } else {
         Box::pin(host::dispatch_authorized_host_call(package, binding, call))
     }
@@ -101,12 +109,6 @@ struct RpxPackageExport {
     language: String,
 }
 
-/// Build RELC's package namespace from SHA-verified explicit package roots.
-///
-/// The same verified root snapshot also seeds fail-closed Library Host sessions
-/// before the public export namespace is returned. Explicit RBE-owned package
-/// authority is loaded only from the project-local approval record and is
-/// rechecked against the active lock and SHA-verified artifact request list.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
     let loaded = load_with_workers(project_root)?;
     install_verified_host_sessions(project_root, &loaded.roots)?;
@@ -160,20 +162,30 @@ fn build_approved_host_sessions(
             .with_context(|| format!("load approved RBE privileges for root {package:?}"))?;
         let mut grants = host::grants_for_verified_requests(&approved)
             .with_context(|| format!("materialize approved RBE privileges for root {package:?}"))?;
-        if approved
-            .iter()
-            .any(|capability| capability == tcp::CAPABILITY)
-        {
+        if approved.iter().any(|capability| capability == tcp::CAPABILITY) {
             grants.push(tcp::grant().with_context(|| {
                 format!("materialize approved TCP privilege for root {package:?}")
             })?);
         }
-        if approved
-            .iter()
-            .any(|capability| capability == tls::CAPABILITY)
-        {
+        if approved.iter().any(|capability| capability == tls::CAPABILITY) {
             grants.push(tls::grant().with_context(|| {
                 format!("materialize approved TLS privilege for root {package:?}")
+            })?);
+        }
+        if approved
+            .iter()
+            .any(|capability| capability == storage::CAPABILITY)
+        {
+            grants.push(storage::grant().with_context(|| {
+                format!("materialize approved storage privilege for root {package:?}")
+            })?);
+        }
+        if approved
+            .iter()
+            .any(|capability| capability == crypto::CAPABILITY)
+        {
+            grants.push(crypto::grant().with_context(|| {
+                format!("materialize approved crypto privilege for root {package:?}")
             })?);
         }
         Ok(grants)
@@ -184,6 +196,8 @@ fn install_verified_host_sessions(
     project_root: &Path,
     roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
 ) -> anyhow::Result<()> {
+    storage::configure_project_root(project_root)
+        .context("configure project-scoped package storage authority")?;
     let sessions = build_approved_host_sessions(project_root, roots)?;
     let registry = LIBRARY_HOST_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut active = registry
