@@ -20,6 +20,7 @@ pub const RBE_SYSTEM_PYPY: &str = "rbe.sys.pypy";
 pub const RBE_SYSTEM_NODEJS: &str = "rbe.sys.nodejs";
 pub const RBE_SYSTEM_BUNJS: &str = "rbe.sys.bunjs";
 pub const RBE_SYSTEM_RUST: &str = "rbe.sys.rust";
+pub const RBE_SYSTEM_GIT: &str = "rbe.sys.git";
 pub const SYSTEM_PYTHON_SCRAPER_ID: &str = "index-discovery-v1";
 pub const RBE_WELL_KNOWN_INDEX: &str = "/.well-known/rbe/index.json";
 pub const RBE_ROOT_INDEX: &str = "/rbe-index.json";
