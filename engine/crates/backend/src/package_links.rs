@@ -41,7 +41,21 @@ fn dispatch_verified_host_call<'a>(
     if call.capability == tcp::CAPABILITY {
         Box::pin(tcp::dispatch_authorized_call(package, binding, call))
     } else if call.capability == tls::CAPABILITY {
-        Box::pin(tls::dispatch_authorized_call(package, binding, call))
+        Box::pin(async move {
+            let grant = binding
+                .authorize_host_call(call)
+                .context("authorize package TLS call against accepted Library Host session")?;
+            let payload = tls::dispatch_authorized_call(package, binding, call).await?;
+            if payload.len() > grant.max_response_bytes {
+                bail!(
+                    "package TLS response exceeded admitted capability limit: limit={}, observed={}",
+                    grant.max_response_bytes,
+                    payload.len()
+                );
+            }
+            LibraryHostCallReply::success(call.call_id, payload)
+                .context("encode successful package TLS host-call reply")
+        })
     } else {
         Box::pin(host::dispatch_authorized_host_call(package, binding, call))
     }
