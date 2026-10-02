@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
+pub use crate::config::SETTINGS_FILE_NAME as LEGACY_SETTINGS_FILE_NAME;
+
 pub const PREFERRED_SETTINGS_FILE_NAME: &str = "setting.cn.json";
-pub const LEGACY_SETTINGS_FILE_NAME: &str = "setting.node.cn.json";
 
 /// Discover an implicit Cloud Node settings file beside an executable.
 ///
