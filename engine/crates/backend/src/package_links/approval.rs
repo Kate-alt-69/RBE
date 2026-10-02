@@ -168,6 +168,9 @@ pub(crate) fn explicit_host_privilege_description(capability: &str) -> Option<&'
         "net:tcp" => Some(
             "open bounded stateful connections to public TCP destinations through RBE's session-scoped network broker",
         ),
+        "net:tls" => Some(
+            "open bounded public TLS/STARTTLS transports with RBE-owned certificate validation; net:tcp approval is also required",
+        ),
         // `log` is an implicit package-scoped host capability and never needs a
         // privilege prompt. Unknown/custom names remain package-private until a
         // trusted RBE host provider explicitly registers them.
@@ -300,6 +303,7 @@ mod tests {
         assert!(explicit_host_privilege_description("net:http").is_some());
         assert!(explicit_host_privilege_description("net:dns").is_some());
         assert!(explicit_host_privilege_description("net:tcp").is_some());
+        assert!(explicit_host_privilege_description("net:tls").is_some());
         assert!(explicit_host_privilege_description("log").is_none());
         assert!(explicit_host_privilege_description("mail:smtp").is_none());
     }
