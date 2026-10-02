@@ -67,7 +67,7 @@ mod form_urlencoded_compat {
             let mut parts = sequence.splitn(2, |byte| *byte == b'=');
             let name = parts.next().unwrap_or_default();
             let value = parts.next().unwrap_or_default();
-            pairs.push((Cow::Owned(decode(name)), Cow::Owned(decode(value)));
+            pairs.push((Cow::Owned(decode(name)), Cow::Owned(decode(value))));
         }
         pairs.into_iter()
     }
