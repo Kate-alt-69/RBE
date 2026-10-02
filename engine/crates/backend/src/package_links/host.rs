@@ -1,3 +1,6 @@
+#[path = "tcp_listen.rs"]
+mod tcp_listen;
+
 use std::collections::BTreeSet;
 
 use anyhow::{bail, Context};
@@ -128,6 +131,7 @@ pub fn grants_for_verified_requests(
             LIBRARY_LOG_CAPABILITY => {}
             LIBRARY_NET_HTTP_CAPABILITY => grants.push(package_http_grant()?),
             LIBRARY_NET_DNS_CAPABILITY => grants.push(package_dns_grant()?),
+            tcp_listen::CAPABILITY => grants.push(tcp_listen::grant()?),
             _ => {}
         }
     }
@@ -147,6 +151,7 @@ pub async fn dispatch_authorized_host_call(
         LIBRARY_LOG_CAPABILITY => dispatch_package_log_call(package, call)?,
         LIBRARY_NET_HTTP_CAPABILITY => dispatch_package_http_call(call).await?,
         LIBRARY_NET_DNS_CAPABILITY => dispatch_package_dns_call(call).await?,
+        tcp_listen::CAPABILITY => tcp_listen::dispatch_authorized_call(package, binding, call).await?,
         capability => bail!(
             "trusted Backend dispatcher for package capability {capability:?} is not installed"
         ),
@@ -258,6 +263,7 @@ pub fn bind_session(
     snapshot: &VerifiedRpxRootSnapshot,
     grants: impl IntoIterator<Item = LibraryCapabilityGrant>,
 ) -> anyhow::Result<LibrarySessionBinding> {
+    tcp_listen::revoke_package(&snapshot.package);
     let expected = expected_worker(snapshot)?;
     let mut admitted = Vec::new();
     for grant in grants {
@@ -357,6 +363,16 @@ mod tests {
         assert_eq!(grants.len(), 2);
         assert_eq!(grants[0].capability, "net:http");
         assert_eq!(grants[1].capability, "net:dns");
+    }
+
+    #[test]
+    fn tcp_listener_request_gets_bounded_host_grant() {
+        let grants = grants_for_verified_requests(&["net:tcp-listen".into()]).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].capability, "net:tcp-listen");
+        assert!(grants[0].operations.contains("bind"));
+        assert!(grants[0].operations.contains("accept"));
+        assert!(grants[0].operations.contains("close"));
     }
 
     #[test]
