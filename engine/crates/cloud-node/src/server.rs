@@ -98,6 +98,11 @@ impl CloudNodeAuthenticator {
         if state.replays.contains_key(&replay_key) {
             anyhow::bail!("Cloud Node authentication replay rejected");
         }
+        if state.sessions.contains_key(&knock.session) {
+            anyhow::bail!(
+                "Cloud Node authentication session id is already active; peer must create a fresh session"
+            );
+        }
 
         let (_, local_nonce) = random_session_and_nonce();
         let accept = NodeProof::accept(
@@ -258,6 +263,28 @@ mod tests {
             session
         );
         assert!(auth.accept_knock(&encoded, 50_300).is_err());
+    }
+
+    #[test]
+    fn active_session_id_cannot_be_replaced_by_fresh_knock() {
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        let client = SigningKey::from_bytes(&[7u8; 32]);
+        let settings = settings(&client);
+        let auth = CloudNodeAuthenticator::new(&settings, server).unwrap();
+        let session = [3u8; 16];
+        let first = NodeProof::knock(&client, "nas-main", 50_000, session, [5u8; 32])
+            .unwrap()
+            .encode()
+            .unwrap();
+        auth.accept_knock(&first, 50_100).unwrap();
+
+        let replacement = NodeProof::knock(&client, "nas-main", 50_200, session, [6u8; 32])
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert!(auth.accept_knock(&replacement, 50_300).is_err());
+        let active = auth.session("nas-main", &session, 50_400).unwrap().unwrap();
+        assert_eq!(active.peer_nonce, [5u8; 32]);
     }
 
     #[test]
