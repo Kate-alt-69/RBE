@@ -182,16 +182,16 @@ fn build_approved_host_sessions(
             .any(|capability| capability == storage::CAPABILITY)
         {
             grants.push(storage::grant().with_context(|| {
-                format!("materialize approved storage privilege for root {package:?}"))
-            })?;
+                format!("materialize approved storage privilege for root {package:?}")
+            })?);
         }
         if approved
             .iter()
             .any(|capability| capability == crypto::CAPABILITY)
         {
             grants.push(crypto::grant().with_context(|| {
-                format!("materialize approved crypto privilege for root {package:?}"))
-            })?;
+                format!("materialize approved crypto privilege for root {package:?}")
+            })?);
         }
         Ok(grants)
     })
