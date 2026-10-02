@@ -2,7 +2,7 @@
 
 Cloud Node can use a provider-backed history as a Git-like durable remote for one configured local directory. This mode does not require a second Cloud Node peer: the provider is the remote persistence/history endpoint and the local Cloud Node content-addressed store is the local repository state.
 
-The canonical Cloud Node settings filename remains `setting.node.cn.json`. Provider credentials stay in environment variables; the settings file contains only provider configuration and credential environment-variable names.
+The preferred Cloud Node settings filename is `setting.cn.json`. The original `setting.node.cn.json` remains supported as a legacy compatibility name. If both implicit files exist beside the executable, Cloud Node refuses to guess which one is authoritative; use only one or select an explicit path with `--config` / `RBE_CN_SETTINGS`. Provider credentials stay in environment variables; the settings file contains only provider configuration and credential environment-variable names.
 
 ## Model
 
@@ -59,7 +59,7 @@ Example:
 }
 ```
 
-Relative `localSync.directory` paths are resolved relative to `setting.node.cn.json`. `logicalPrefix` defaults to `local` and names the Cloud Node logical namespace owned by this watched directory. Symlinks are skipped. Empty directories are not tracked, matching Git's file-oriented working-tree behavior.
+Relative `localSync.directory` paths are resolved relative to the selected Cloud Node settings file. `logicalPrefix` defaults to `local` and names the Cloud Node logical namespace owned by this watched directory. Symlinks are skipped. Empty directories are not tracked, matching Git's file-oriented working-tree behavior.
 
 If the Cloud Node internal store is nested below the watched directory, the scanner excludes that store so Cloud Node never recursively backs up its own CAS. Configuring the watched directory *inside* the Cloud Node internal store is rejected.
 
@@ -120,7 +120,7 @@ For normal backend launches the order is:
 
 ```text
 backend starts
-  -> validate setting.node.cn.json
+  -> resolve + validate the selected Cloud Node settings file
   -> provider + syncOnConnect=true:
        wait for `cloud_node sync --bootstrap`
        -> inspect remote history before local mutation
@@ -212,7 +212,7 @@ RBE_CN_PROV_SUPABASE_ACCESS_KEY=<S3 access key id>
 RBE_CN_PROV_SUPABASE_SECRET_KEY=<S3 secret access key>
 ```
 
-Do not store those credential values in `setting.node.cn.json`.
+Do not store those credential values in the Cloud Node settings file.
 
 The watched directory, Cloud Node internal CAS, and Supabase provider are three distinct layers:
 
