@@ -58,12 +58,18 @@ impl CloudNodeAuthenticator {
 
     pub fn new(settings: &CloudNodeSettings, signing: SigningKey) -> anyhow::Result<Self> {
         settings.validate()?;
-        let trusted_peers = settings
-            .replication
-            .targets
-            .iter()
-            .map(|target| (target.node_id.clone(), target.public_key.clone()))
-            .collect::<HashMap<_, _>>();
+        let mut trusted_peers = HashMap::with_capacity(settings.replication.targets.len());
+        for target in &settings.replication.targets {
+            if trusted_peers
+                .insert(target.node_id.clone(), target.public_key.clone())
+                .is_some()
+            {
+                anyhow::bail!(
+                    "Cloud Node replication targets contain duplicate trusted node id {:?}",
+                    target.node_id
+                );
+            }
+        }
         Ok(Self {
             node_id: settings.node.id.clone(),
             signing,
@@ -307,6 +313,18 @@ mod tests {
         assert!(auth.accept_knock(&replacement, 50_300).is_err());
         let active = auth.session("nas-main", &session, 50_400).unwrap().unwrap();
         assert_eq!(active.peer_nonce, [5u8; 32]);
+    }
+
+    #[test]
+    fn duplicate_trusted_node_ids_are_rejected() {
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        let client = SigningKey::from_bytes(&[7u8; 32]);
+        let mut settings = settings(&client);
+        settings
+            .replication
+            .targets
+            .push(settings.replication.targets[0].clone());
+        assert!(CloudNodeAuthenticator::new(&settings, server).is_err());
     }
 
     #[test]
