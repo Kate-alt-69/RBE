@@ -28,7 +28,8 @@ use route_engine::relc::{
 };
 use serde::Deserialize;
 
-const RPX_PACKAGE_INDEX_FORMAT: u32 = 1;
+const LEGACY_RPX_PACKAGE_INDEX_FORMAT: u32 = 1;
+const RPX_PACKAGE_INDEX_FORMAT: u32 = 2;
 
 type LibraryHostDispatchFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<LibraryHostCallReply>> + 'a>>;
@@ -106,8 +107,8 @@ struct RpxPackageIdentity {
 #[serde(deny_unknown_fields)]
 struct RpxPackageExport {
     name: String,
-    /// Phase-3 stable package identity. Kept optional for one migration window
-    /// so format-1 artifacts already installed in projects remain readable.
+    /// Format 2 requires this stable RPX identity. It remains optional only so
+    /// already-installed format-1 artifacts can be linked during migration.
     #[serde(default)]
     export_id: Option<String>,
     source: String,
@@ -275,11 +276,15 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
                     verified.package
                 )
             })?;
+        let index_format = index.format;
 
-        if index.format != RPX_PACKAGE_INDEX_FORMAT {
+        if !matches!(
+            index_format,
+            LEGACY_RPX_PACKAGE_INDEX_FORMAT | RPX_PACKAGE_INDEX_FORMAT
+        ) {
             bail!(
                 "unsupported RPX package index format {} for explicit root {:?}",
-                index.format,
+                index_format,
                 verified.package
             );
         }
@@ -339,23 +344,33 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
                         export.name, verified.package
                     )
                 })?;
-            if let Some(observed_export_id) = export.export_id.as_deref() {
-                if observed_export_id != expected_export_id {
+            match export.export_id.as_deref() {
+                Some(observed_export_id) => {
+                    if observed_export_id != expected_export_id {
+                        bail!(
+                            "RPX export ID mismatch for {:?} from {:?}: expected {:?}, observed {:?}",
+                            export.name,
+                            verified.package,
+                            expected_export_id,
+                            observed_export_id
+                        );
+                    }
+                    if !verified_export_ids.insert(observed_export_id.to_string()) {
+                        bail!(
+                            "duplicate deterministic RPX export ID {:?} in explicit root {:?}",
+                            observed_export_id,
+                            verified.package
+                        );
+                    }
+                }
+                None if index_format == RPX_PACKAGE_INDEX_FORMAT => {
                     bail!(
-                        "RPX export ID mismatch for {:?} from {:?}: expected {:?}, observed {:?}",
+                        "format-2 RPX export {:?} from {:?} is missing export_id",
                         export.name,
-                        verified.package,
-                        expected_export_id,
-                        observed_export_id
-                    );
-                }
-                if !verified_export_ids.insert(observed_export_id.to_string()) {
-                    bail!(
-                        "duplicate deterministic RPX export ID {:?} in explicit root {:?}",
-                        observed_export_id,
                         verified.package
-                    );
+                    )
                 }
+                None => {}
             }
 
             let name = export.name;
@@ -475,6 +490,27 @@ mod tests {
             "{}",
             r#"[{"name":"request","export_id":"lib_advancenet_request","source":"components/request/request.ts","language":"typescript"}]"#,
         );
+        assert!(from_verified_indexes(vec![verified(&input)]).is_ok());
+    }
+
+    #[test]
+    fn format_two_requires_deterministic_export_id() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","source":"components/request/request.ts","language":"typescript"}]"#,
+        )
+        .replacen("\"format\": 1", "\"format\": 2", 1);
+        let error = from_verified_indexes(vec![verified(&input)]).unwrap_err();
+        assert!(error.to_string().contains("missing export_id"));
+    }
+
+    #[test]
+    fn format_two_accepts_verified_export_id() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","export_id":"lib_advancenet_request","source":"components/request/request.ts","language":"typescript"}]"#,
+        )
+        .replacen("\"format\": 1", "\"format\": 2", 1);
         assert!(from_verified_indexes(vec![verified(&input)]).is_ok());
     }
 
