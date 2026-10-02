@@ -93,7 +93,8 @@ pub async fn acquire_git_source(
 
     let materialization = plan.materialization(resolved_commit)?;
     let source_root = prepare_fresh_source_root(source_root.as_ref())?;
-    let source_files = materialize_tree(&materialization, &source_root, fetch.timeout_seconds).await?;
+    let source_files =
+        materialize_tree(&materialization, &source_root, fetch.timeout_seconds).await?;
     let receipt = plan.seal_receipt(&materialization.resolved_commit, &source_files)?;
 
     Ok(MaterializedGitSource {
@@ -137,7 +138,10 @@ async fn resolve_public_repository(
     if addresses.is_empty() {
         return Err(GitSourceExecutionError::DnsNoAddresses(host));
     }
-    if let Some(address) = addresses.iter().find(|address| !is_public_address(**address)) {
+    if let Some(address) = addresses
+        .iter()
+        .find(|address| !is_public_address(**address))
+    {
         return Err(GitSourceExecutionError::DnsPrivateAddress {
             host,
             address: *address,
@@ -209,7 +213,9 @@ fn prepare_fetch_workspace(
 
 fn prepare_fresh_source_root(path: &Path) -> Result<PathBuf, GitSourceExecutionError> {
     if !path.is_absolute() {
-        return Err(GitSourceExecutionError::UnsafeDestination(path.to_path_buf()));
+        return Err(GitSourceExecutionError::UnsafeDestination(
+            path.to_path_buf(),
+        ));
     }
     prepare_fresh_directory(path)?;
     Ok(path.to_path_buf())
@@ -217,17 +223,23 @@ fn prepare_fresh_source_root(path: &Path) -> Result<PathBuf, GitSourceExecutionE
 
 fn prepare_fresh_directory(path: &Path) -> Result<(), GitSourceExecutionError> {
     if !path.is_absolute() || path.parent().is_none() || path.exists() {
-        return Err(GitSourceExecutionError::UnsafeDestination(path.to_path_buf()));
+        return Err(GitSourceExecutionError::UnsafeDestination(
+            path.to_path_buf(),
+        ));
     }
     let parent = path.parent().expect("absolute non-root path has parent");
     if !parent.is_dir() {
-        return Err(GitSourceExecutionError::UnsafeDestination(path.to_path_buf()));
+        return Err(GitSourceExecutionError::UnsafeDestination(
+            path.to_path_buf(),
+        ));
     }
     ensure_no_symlink_components(parent)?;
     std::fs::create_dir(path)?;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(GitSourceExecutionError::UnsafeDestination(path.to_path_buf()));
+        return Err(GitSourceExecutionError::UnsafeDestination(
+            path.to_path_buf(),
+        ));
     }
     Ok(())
 }
@@ -310,8 +322,7 @@ async fn materialize_tree(
             &materialization.working_directory,
             &materialization.environment,
             timeout_seconds,
-            usize::try_from(size)
-                .map_err(|_| GitSourceExecutionError::SourceSizeOverflow)?,
+            usize::try_from(size).map_err(|_| GitSourceExecutionError::SourceSizeOverflow)?,
             None,
         )
         .await?;
@@ -363,11 +374,8 @@ fn write_source_file(
         std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode))?;
     }
 
-    let mut hasher = SourceFileHasher::with_limit(
-        entry.path.clone(),
-        expected_size,
-        expected_size.max(1),
-    )?;
+    let mut hasher =
+        SourceFileHasher::with_limit(entry.path.clone(), expected_size, expected_size.max(1))?;
     hasher.update(bytes)?;
     Ok(hasher.finish()?)
 }
@@ -438,10 +446,7 @@ async fn run_git(
             if observed > limit {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                return Err(GitSourceExecutionError::DownloadBudgetExceeded {
-                    observed,
-                    limit,
-                });
+                return Err(GitSourceExecutionError::DownloadBudgetExceeded { observed, limit });
             }
         }
         sleep(PROCESS_POLL_INTERVAL).await;
@@ -469,10 +474,7 @@ async fn run_git(
     if let Some((root, limit)) = disk_budget {
         let observed = directory_regular_file_bytes(root)?;
         if observed > limit {
-            return Err(GitSourceExecutionError::DownloadBudgetExceeded {
-                observed,
-                limit,
-            });
+            return Err(GitSourceExecutionError::DownloadBudgetExceeded { observed, limit });
         }
     }
     Ok(GitCommandOutput { stdout })
@@ -500,14 +502,13 @@ async fn drain_output<R: AsyncRead + Unpin>(
     Ok((output, exceeded))
 }
 
-fn verify_program(
-    path: &Path,
-    expected_sha256: &str,
-) -> Result<(), GitSourceExecutionError> {
+fn verify_program(path: &Path, expected_sha256: &str) -> Result<(), GitSourceExecutionError> {
     ensure_no_symlink_components(path)?;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(GitSourceExecutionError::UnsafeManagedGit(path.to_path_buf()));
+        return Err(GitSourceExecutionError::UnsafeManagedGit(
+            path.to_path_buf(),
+        ));
     }
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
