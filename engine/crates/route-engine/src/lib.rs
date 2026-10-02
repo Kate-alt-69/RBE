@@ -138,6 +138,7 @@ pub mod script;
 pub mod server_policy;
 pub mod server_rel;
 pub mod service_bin;
+pub mod service_oid;
 pub mod source_registry;
 pub mod transpiled_support;
 pub mod transpiler;
@@ -193,6 +194,13 @@ pub use server_rel::{
     ServerSettingBody, ServerValue,
 };
 pub use service_eval::ServiceProgramExecutor;
+pub use service_oid::{
+    prepare_service_oid_cache, CoreMaterializationReport, OidCache, OidDiagnostic,
+    OidDiagnosticSeverity, OidError, OidIndex, OidRecord, OidRecordKind, OidRelocation,
+    OidRelocationKind, OidSlotClass, OidTarget, PackageOidOwner, OID_DONE, OID_END_PACKAGE,
+    OID_NATIVE_ABI_VERSION, OID_PACKAGE_END, OID_PACKAGE_START, OID_RBE_CORE_END,
+    OID_RBE_CORE_START, OID_REL_END, OID_REL_START,
+};
 pub use source_registry::{
     RelSource, RelSourceKind, RelSourceRegistry, SourceId, SourceOrigin, SourceRegistryError,
 };
