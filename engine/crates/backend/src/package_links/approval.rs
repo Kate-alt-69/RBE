@@ -163,6 +163,9 @@ pub(crate) fn explicit_host_privilege_description(capability: &str) -> Option<&'
         "crypto" => Some(
             "use bounded RBE-owned cryptographic primitives including secure randomness, SHA-256 and HMAC-SHA256",
         ),
+        "service:package" => Some(
+            "register verified package-owned .service programs with Service Mother under the package namespace",
+        ),
         _ => None,
     }
 }
@@ -295,6 +298,7 @@ mod tests {
         assert!(explicit_host_privilege_description("net:tls").is_some());
         assert!(explicit_host_privilege_description("storage").is_some());
         assert!(explicit_host_privilege_description("crypto").is_some());
+        assert!(explicit_host_privilege_description("service:package").is_some());
         assert!(explicit_host_privilege_description("log").is_none());
         assert!(explicit_host_privilege_description("mail:smtp").is_none());
     }
