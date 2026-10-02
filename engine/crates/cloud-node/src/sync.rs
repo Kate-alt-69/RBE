@@ -316,7 +316,19 @@ fn windows_reserved_name(segment: &str) -> bool {
         .to_ascii_uppercase();
     if matches!(
         stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CLOCK$"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
     ) {
         return true;
     }
@@ -336,9 +348,10 @@ fn windows_logical_path_key(path: &str) -> anyhow::Result<String> {
         if segment.is_empty()
             || segment.ends_with(' ')
             || segment.ends_with('.')
+            || segment.encode_utf16().count() > 255
             || segment
                 .chars()
-                .any(|ch| matches!(ch, '<' | '>' | '"' | '|' | '?' | '*'))
+                .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | '"' | '|' | '?' | '*'))
         {
             anyhow::bail!(
                 "Cloud Node logical path {path:?} contains a component that cannot be materialized safely on Windows"
@@ -458,6 +471,12 @@ mod tests {
             "local/com9",
             "local/LPT1.txt",
             "local/lpt9",
+            "local/COM¹.txt",
+            "local/COM²",
+            "local/COM³.log",
+            "local/LPT¹.txt",
+            "local/LPT²",
+            "local/LPT³.log",
         ] {
             assert!(
                 validate_windows_logical_paths([path]).is_err(),
@@ -476,6 +495,14 @@ mod tests {
     fn windows_device_guard_handles_non_ascii_four_byte_stems() {
         assert!(!windows_reserved_name("ABé"));
         assert!(!windows_reserved_name("éAB"));
+    }
+
+    #[test]
+    fn windows_logical_path_guard_bounds_component_length() {
+        let accepted = format!("local/{}", "a".repeat(255));
+        let rejected = format!("local/{}", "a".repeat(256));
+        assert!(validate_windows_logical_paths([accepted.as_str()]).is_ok());
+        assert!(validate_windows_logical_paths([rejected.as_str()]).is_err());
     }
 
     #[test]
