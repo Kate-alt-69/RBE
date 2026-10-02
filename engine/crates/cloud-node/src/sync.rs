@@ -307,7 +307,19 @@ fn windows_reserved_name(segment: &str) -> bool {
         .to_ascii_uppercase();
     if matches!(
         stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$" | "COM¹" | "COM²" | "COM³" | "LPT¹" | "LPT²" | "LPT³"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CLOCK$"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
     ) {
         return true;
     }
@@ -430,10 +442,24 @@ mod tests {
     #[test]
     fn windows_logical_path_guard_rejects_device_names() {
         for path in [
-            "local/NUL", "local/nul.txt", "local/CON", "local/PRN.log", "local/AUX",
-            "local/CLOCK$", "local/CONIN$", "local/CONOUT$", "local/COM1.json", "local/com9",
-            "local/LPT1.txt", "local/lpt9", "local/COM¹.txt", "local/COM²", "local/COM³.log",
-            "local/LPT¹.txt", "local/LPT²", "local/LPT³.log",
+            "local/NUL",
+            "local/nul.txt",
+            "local/CON",
+            "local/PRN.log",
+            "local/AUX",
+            "local/CLOCK$",
+            "local/CONIN$",
+            "local/CONOUT$",
+            "local/COM1.json",
+            "local/com9",
+            "local/LPT1.txt",
+            "local/lpt9",
+            "local/COM¹.txt",
+            "local/COM²",
+            "local/COM³.log",
+            "local/LPT¹.txt",
+            "local/LPT²",
+            "local/LPT³.log",
         ] {
             assert!(validate_windows_logical_paths([path]).is_err());
         }
@@ -474,7 +500,11 @@ mod tests {
         let store = CloudNodeStore::open(&settings).unwrap();
         let tree = root.join("tree");
         fs::create_dir_all(&tree).unwrap();
-        fs::write(tree.join("NUL.txt"), b"portable on Linux, reserved on Windows").unwrap();
+        fs::write(
+            tree.join("NUL.txt"),
+            b"portable on Linux, reserved on Windows",
+        )
+        .unwrap();
         store.snapshot_folder(&tree, "root").unwrap();
         assert!(store.sync_plan().is_err());
         fs::remove_dir_all(root).unwrap();
@@ -501,8 +531,12 @@ mod tests {
         let low = root.join("low.json");
         fs::write(&high, b"high").unwrap();
         fs::write(&low, b"low").unwrap();
-        store.store_file_with_priority(&low, "data/low.json", 3).unwrap();
-        store.store_file_with_priority(&high, "data/high.json", 1).unwrap();
+        store
+            .store_file_with_priority(&low, "data/low.json", 3)
+            .unwrap();
+        store
+            .store_file_with_priority(&high, "data/high.json", 1)
+            .unwrap();
 
         let plan = store.sync_plan().unwrap();
         let root_before = plan.root_sha256;
@@ -516,7 +550,9 @@ mod tests {
             vec![("data/high.json".into(), 1), ("data/low.json".into(), 3)]
         );
 
-        store.store_file_with_priority(&high, "data/high.json", 3).unwrap();
+        store
+            .store_file_with_priority(&high, "data/high.json", 3)
+            .unwrap();
         assert_eq!(store.sync_plan().unwrap().root_sha256, root_before);
         let _ = fs::remove_dir_all(root);
     }
@@ -551,7 +587,10 @@ mod tests {
         let plan = store.sync_plan().unwrap();
         assert_eq!(plan.object_count(), 3);
         let kinds = plan.ordered().map(|object| object.kind).collect::<Vec<_>>();
-        assert_eq!(kinds, vec![BlobKind::Folder, BlobKind::Video, BlobKind::File]);
+        assert_eq!(
+            kinds,
+            vec![BlobKind::Folder, BlobKind::Video, BlobKind::File]
+        );
         assert_eq!(
             SyncPlanHeader::decode(&plan.header().unwrap().encode()).unwrap(),
             plan.header().unwrap()
