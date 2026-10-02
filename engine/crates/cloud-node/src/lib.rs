@@ -49,7 +49,7 @@ pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 pub use config::{
     CloudNodeSettings, NodeMode, NodeSettings, ProviderAuthMode, ProviderAuthSettings,
     ProviderConflictPolicy, ProviderKind, ProviderSettings, ReplicationSettings, ReplicationTarget,
-    UpstreamSettings, SETTINGS_FILE_NAME,
+    UpstreamSettings,
 };
 pub use crypto::{
     load_signing_key_from_env, public_key_hex, sign_challenge, verify_challenge,
@@ -81,6 +81,7 @@ pub use server::{
 pub use settings_path::{
     discover_settings_path, LEGACY_SETTINGS_FILE_NAME, PREFERRED_SETTINGS_FILE_NAME,
 };
+pub use settings_path::PREFERRED_SETTINGS_FILE_NAME as SETTINGS_FILE_NAME;
 pub use store::{CloudNodeStore, StoreSummary, StoredObject};
 pub use sync::{SyncObject, SyncPlan, SyncPlanHeader};
 pub use transfer::{TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES, RESUME_ACK_HEADER};
