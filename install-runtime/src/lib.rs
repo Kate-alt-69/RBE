@@ -72,6 +72,9 @@ mod target;
 mod verified_worker;
 mod worker_source;
 
+pub use rbe_install_executor::{
+    GitSourceAcquisitionPlan, GitSourceReceipt, PinnedManagedToolchain, SourceFileDigest,
+};
 pub use activation::{
     activate_project_target, recover_project_activation, ActivationRuntimeError,
     InstallActivationProof, ProjectActivationResult, ProjectInstallRecovery,
