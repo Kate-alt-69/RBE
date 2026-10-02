@@ -95,6 +95,12 @@ impl SandboxPolicy {
                     return Err("network allow-list entries require a host and at least one port");
                 }
             }
+            // The Linux launcher currently enforces DenyAll by creating a new
+            // network namespace. It does not yet install packet filtering for
+            // HostRule entries. Treating AllowList as valid here would therefore
+            // grant ambient host networking while claiming a restriction exists.
+            // Fail closed until the network backend can enforce every rule.
+            return Err("network allow-list enforcement is not implemented; refusing ambient network");
         }
         if self.max_processes == 0 || self.max_memory_bytes == 0 || self.timeout_ms == 0 {
             return Err("sandbox limits must be non-zero");
@@ -306,5 +312,20 @@ mod tests {
             ..Default::default()
         };
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn valid_network_allowlist_still_fails_closed_until_backend_exists() {
+        let policy = SandboxPolicy {
+            network: NetworkPolicy::AllowList(vec![HostRule {
+                host: "registry.npmjs.org".to_string(),
+                ports: vec![443],
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.validate(),
+            Err("network allow-list enforcement is not implemented; refusing ambient network")
+        );
     }
 }
