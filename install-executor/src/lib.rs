@@ -2,6 +2,7 @@
 
 mod execution;
 mod git_source;
+mod git_source_execution;
 mod hydration;
 mod pinned_toolchain;
 mod source;
@@ -11,6 +12,7 @@ mod worker_proxy;
 
 pub use execution::*;
 pub use git_source::*;
+pub use git_source_execution::*;
 pub use hydration::*;
 pub use pinned_toolchain::*;
 pub use source::*;
