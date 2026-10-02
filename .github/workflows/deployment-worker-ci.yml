@@ -39,13 +39,16 @@ jobs:
           workspaces: engine
       - name: worker fmt
         run: |
+          # git_exec_impl.rs is an include-only implementation file; the broad
+          # engine cargo-fmt job still owns whole-tree formatting. Keep this
+          # focused gate on standalone worker modules so unrelated formatter
+          # drift cannot hide worker compiler failures.
           rustfmt --edition 2021 --check \
             engine/crates/backend/src/deployment_worker_main.rs \
             engine/crates/backend/src/deployment_worker/mod.rs \
             engine/crates/backend/src/deployment_worker/publisher.rs \
             engine/crates/backend/src/deployment_worker/source.rs \
-            engine/crates/backend/src/deployment_worker/git_exec.rs \
-            engine/crates/backend/src/deployment_worker/git_exec_impl.rs
+            engine/crates/backend/src/deployment_worker/git_exec.rs
       - name: worker clippy
         working-directory: engine
         run: cargo clippy -p backend --bin deployment-worker --locked -- -D warnings
