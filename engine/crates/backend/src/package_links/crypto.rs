@@ -125,8 +125,8 @@ fn hmac_sha256(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 fn constant_time_eq(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let request: EqualRequest =
-        serde_json::from_slice(payload).context("decode package crypto constant-time compare request")?;
+    let request: EqualRequest = serde_json::from_slice(payload)
+        .context("decode package crypto constant-time compare request")?;
     let left = decode_hex_bounded(&request.left_hex, MAX_DATA_BYTES, "left_hex")?;
     let right = decode_hex_bounded(&request.right_hex, MAX_DATA_BYTES, "right_hex")?;
 
@@ -145,7 +145,8 @@ fn decode_hex_bounded(value: &str, max_bytes: usize, label: &str) -> anyhow::Res
     if value.len() > max_bytes.saturating_mul(2) {
         bail!("package crypto {label} exceeds maximum size");
     }
-    hex::decode(value).with_context(|| format!("package crypto {label} must contain valid hexadecimal bytes"))
+    hex::decode(value)
+        .with_context(|| format!("package crypto {label} must contain valid hexadecimal bytes"))
 }
 
 #[cfg(test)]
@@ -162,8 +163,10 @@ mod tests {
         let different: serde_json::Value = serde_json::from_slice(&different).unwrap();
         assert_eq!(different["equal"], false);
 
-        let different_length = constant_time_eq(br#"{"left_hex":"aa","right_hex":"aabb"}"#).unwrap();
-        let different_length: serde_json::Value = serde_json::from_slice(&different_length).unwrap();
+        let different_length =
+            constant_time_eq(br#"{"left_hex":"aa","right_hex":"aabb"}"#).unwrap();
+        let different_length: serde_json::Value =
+            serde_json::from_slice(&different_length).unwrap();
         assert_eq!(different_length["equal"], false);
     }
 }
