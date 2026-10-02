@@ -121,7 +121,10 @@ impl SyncPlan {
         videos.sort_by(sort);
         files.sort_by(sort);
 
-        #[cfg(windows)]
+        // Cloud Node snapshots are portable state, not host-local filesystem
+        // accidents. Reject trees that cannot be materialized safely on a
+        // case-insensitive Windows checkout even when the publishing node is
+        // Linux/macOS, so an invalid tree never enters shared provider history.
         validate_windows_logical_paths(
             folders
                 .iter()
@@ -307,7 +310,6 @@ fn sync_object(
     })
 }
 
-#[cfg(any(windows, test))]
 fn windows_reserved_name(segment: &str) -> bool {
     let stem = segment
         .split('.')
@@ -341,7 +343,6 @@ fn windows_reserved_name(segment: &str) -> bool {
     false
 }
 
-#[cfg(any(windows, test))]
 fn windows_logical_path_key(path: &str) -> anyhow::Result<String> {
     let mut folded = Vec::new();
     for segment in path.split('/') {
@@ -349,9 +350,9 @@ fn windows_logical_path_key(path: &str) -> anyhow::Result<String> {
             || segment.ends_with(' ')
             || segment.ends_with('.')
             || segment.encode_utf16().count() > 255
-            || segment
-                .chars()
-                .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | '"' | '|' | '?' | '*'))
+            || segment.chars().any(|ch| {
+                ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+            })
         {
             anyhow::bail!(
                 "Cloud Node logical path {path:?} contains a component that cannot be materialized safely on Windows"
@@ -367,7 +368,6 @@ fn windows_logical_path_key(path: &str) -> anyhow::Result<String> {
     Ok(folded.join("/"))
 }
 
-#[cfg(any(windows, test))]
 fn validate_windows_logical_paths<'a>(
     paths: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<()> {
@@ -441,6 +441,7 @@ mod tests {
         for path in [
             "local/file.",
             "local/file ",
+            "local/cache:state.json",
             "local/a?.json",
             "local/a*.json",
             "local/a|b.json",
