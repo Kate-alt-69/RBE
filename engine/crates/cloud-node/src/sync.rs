@@ -350,9 +350,9 @@ fn windows_logical_path_key(path: &str) -> anyhow::Result<String> {
             || segment.ends_with(' ')
             || segment.ends_with('.')
             || segment.encode_utf16().count() > 255
-            || segment.chars().any(|ch| {
-                ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*')
-            })
+            || segment
+                .chars()
+                .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
         {
             anyhow::bail!(
                 "Cloud Node logical path {path:?} contains a component that cannot be materialized safely on Windows"
