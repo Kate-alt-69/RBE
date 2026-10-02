@@ -208,7 +208,8 @@ pub fn validate_package_spec(spec: &PackageLinkSpec) -> Result<(), OidLinkError>
 /// Compatible exports in an unchanged verified artifact keep their OIDs. A
 /// package update retires the old owner first and allocates the new artifact
 /// from currently reusable holes. `pinned_oids` models Phase 5's old-image pins:
-/// those slots are never reused even when their current owner disappeared.
+/// pinned slots may be retained by the exact compatible current target, but may
+/// never be reassigned to another target while the pin is live.
 pub fn reconcile_package_oids(
     current: &BTreeMap<String, PackageOidOwner>,
     desired: &[PackageLinkSpec],
@@ -223,10 +224,11 @@ pub fn reconcile_package_oids(
     }
     validate_pins(pinned_oids, PACKAGE_OID_START, PACKAGE_OID_END)?;
 
-    let mut occupied = pinned_oids.clone();
+    // Preserve compatible ownership first. Only after those exact retainers are
+    // known do we reserve the remaining Phase-5 pins against reuse.
+    let mut occupied = BTreeSet::new();
     let mut owners = BTreeMap::new();
 
-    // Pass 1: preserve compatible assignments before allocating anything new.
     for (package, spec) in &desired_map {
         let old = current.get(package);
         let unchanged_artifact = old.is_some_and(|owner| {
@@ -256,6 +258,8 @@ pub fn reconcile_package_oids(
             },
         );
     }
+
+    occupied.extend(pinned_oids.iter().copied());
 
     // Pass 2: deterministic hole-first allocation in package/export sort order.
     for (package, spec) in desired_map {
@@ -296,7 +300,7 @@ pub fn reconcile_rel_oids(
     }
     validate_rel_graph(&specs)?;
 
-    let mut occupied = pinned_oids.clone();
+    let mut occupied = BTreeSet::new();
     let mut bindings = BTreeMap::new();
 
     // Preserve identity slots when symbol identity/kind still agree. Source/hash
@@ -315,6 +319,8 @@ pub fn reconcile_rel_oids(
             }
         }
     }
+
+    occupied.extend(pinned_oids.iter().copied());
 
     for (canonical_id, spec) in specs {
         if bindings.contains_key(&canonical_id) {
@@ -540,7 +546,7 @@ impl fmt::Display for OidLinkError {
             Self::MissingLinkedDependency { symbol, dependency } => write!(formatter, "linked REL symbol {symbol:?} requires missing symbol {dependency:?}"),
             Self::InvalidClassMemberKind { class, member, kind } => write!(formatter, "class {class:?} references {member:?} with invalid member kind {kind:?}"),
             Self::OidOutsideDynamicRange { oid, start, end } => write!(formatter, "OID {oid} is outside dynamic range {start}..={end}"),
-            Self::OidCollision(oid) => write!(formatter, "dynamic OID {oid} is assigned/pinned more than once"),
+            Self::OidCollision(oid) => write!(formatter, "dynamic OID {oid} is assigned more than once"),
             Self::PackageRangeExhausted => write!(formatter, "package OID range 20086..=30456 is exhausted"),
             Self::RelRangeExhausted => write!(formatter, "linked REL OID range 30458..=65535 is exhausted"),
             Self::Serialization(message) => write!(formatter, "failed to serialize OID-link identity: {message}"),
@@ -615,6 +621,24 @@ mod tests {
     }
 
     #[test]
+    fn compatible_pinned_package_oid_is_retained() {
+        let first = reconcile_package_oids(
+            &BTreeMap::new(),
+            &[package("1.0.0", 'a', &["send"])],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let oid = first["mail"].bindings["lib_mail_send"];
+        let second = reconcile_package_oids(
+            &first,
+            &[package("1.0.0", 'a', &["send"])],
+            &BTreeSet::from([oid]),
+        )
+        .unwrap();
+        assert_eq!(second["mail"].bindings["lib_mail_send"], oid);
+    }
+
+    #[test]
     fn package_update_retires_owner_and_respects_pinned_slots() {
         let first = reconcile_package_oids(
             &BTreeMap::new(),
@@ -659,6 +683,15 @@ mod tests {
             required_symbols: deps.iter().map(|value| (*value).to_string()).collect(),
             capabilities: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn compatible_pinned_rel_oid_is_retained() {
+        let desired = vec![rel("module_users_findUser", LinkedRelKind::ModuleExport, &[])];
+        let first = reconcile_rel_oids(&BTreeMap::new(), &desired, &BTreeSet::new()).unwrap();
+        let oid = first["module_users_findUser"].oid;
+        let second = reconcile_rel_oids(&first, &desired, &BTreeSet::from([oid])).unwrap();
+        assert_eq!(second["module_users_findUser"].oid, oid);
     }
 
     #[test]
