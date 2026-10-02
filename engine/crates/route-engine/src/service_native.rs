@@ -6,10 +6,9 @@
 //! workers still reference them, and treating a damaged `.bin` as disposable
 //! cache instead of executable truth.
 //!
-//! The final worker cutover intentionally does not live here. ServiceManager
-//! must consume these pins only after the native execution/parity gate is met;
-//! until then an evaluator path is permitted only when it is recorded as an
-//! explicit fallback with a reason.
+//! ServiceManager must not consume these pins as its default execution path
+//! until native execution/parity is proven. Until then an evaluator path is
+//! allowed only when it is recorded as an explicit fallback with a reason.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -35,9 +34,6 @@ pub struct PackageArtifactPin {
 }
 
 impl PackageArtifactPin {
-    /// Stable dependency identity stored in `ServiceAssemblyPlan::dependency_hashes`.
-    /// Keeping name + resolved version in the key means a package update cannot
-    /// silently keep the previous Service plan identity.
     pub fn dependency_key(&self) -> String {
         format!("package:{}@{}", self.name, self.version)
     }
@@ -58,11 +54,6 @@ impl PackageArtifactPin {
 }
 
 /// Exact native artifact selected for one Service in one Runtime Image.
-///
-/// The plan already pins the OID-index identity, target, Service source hash,
-/// exact required OID record hashes, dependency hashes, and placement order.
-/// Phase 5 adds the index generation/liveness identity and the assembled `.bin`
-/// hash so activation never asks for an unpinned "latest" artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeServiceArtifactPin {
     pub source_id: SourceId,
@@ -97,6 +88,7 @@ impl NativeServiceArtifactPin {
             )));
         }
         validate_sha256(&bin.assembly_hash, "service assembly")?;
+
         let pin = Self {
             source_id,
             oid_index_generation,
@@ -170,7 +162,7 @@ impl NativeServiceArtifactPin {
 }
 
 /// Native/fallback decision for every Service in one immutable Runtime Image.
-/// Missing entries are rejected: fallback must always be deliberate and visible.
+/// Missing entries are rejected so fallback can never happen silently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeRuntimeImagePins {
     pub runtime_image_id: String,
@@ -257,11 +249,7 @@ struct DynamicOidPinState {
     holders: u64,
 }
 
-/// Shared liveness registry used by both Runtime Images and spawned workers.
-///
-/// The Phase-3 linker already accepts pinned OID sets. `package_allocator_pins`
-/// and `rel_allocator_pins` are the bridge: RELC feeds them into reconciliation
-/// while Image A is live so compiling Image B cannot reuse A's dynamic slots.
+/// Shared liveness registry used by Runtime Images and spawned workers.
 #[derive(Debug, Clone, Default)]
 pub struct DynamicOidPinRegistry {
     inner: Arc<Mutex<BTreeMap<u16, DynamicOidPinState>>>,
@@ -292,8 +280,7 @@ impl DynamicOidPinRegistry {
     }
 
     /// Worker-level lease. ServiceManager should hold this from worker spawn
-    /// through worker teardown so image replacement cannot free an OID while a
-    /// Resident/OnDemand/Hybrid worker is still executing the old assembly.
+    /// through worker teardown.
     pub fn pin_service(
         &self,
         pin: &NativeServiceArtifactPin,
@@ -306,10 +293,12 @@ impl DynamicOidPinRegistry {
         )
     }
 
+    /// Feed this directly into Phase-3 package OID reconciliation.
     pub fn package_allocator_pins(&self) -> BTreeSet<u16> {
         self.pins_in_range(PACKAGE_OID_START, PACKAGE_OID_END)
     }
 
+    /// Feed this directly into Phase-3 linked-REL OID reconciliation.
     pub fn rel_allocator_pins(&self) -> BTreeSet<u16> {
         self.pins_in_range(REL_OID_START, REL_OID_END)
     }
@@ -348,7 +337,7 @@ impl DynamicOidPinRegistry {
             .lock()
             .expect("dynamic OID pin registry poisoned");
 
-        // Check the entire transaction before changing holder counts.
+        // Validate the complete transaction before changing holder counts.
         for (&oid, requested_hash) in &requested {
             if !is_dynamic_oid(oid) {
                 return Err(ServiceNativeError::InvalidPin(format!(
@@ -427,9 +416,7 @@ impl Drop for DynamicOidLease {
     }
 }
 
-/// Runtime Image + exact native Service pins + lifetime lease. Readers retain an
-/// `Arc` snapshot, therefore replacing the active image cannot release its OIDs
-/// until every old snapshot (and separately pinned worker) is gone.
+/// Runtime Image + exact native Service pins + a lifetime lease.
 #[derive(Debug)]
 pub struct NativeRuntimeImageSnapshot {
     image: Arc<RuntimeImage>,
@@ -477,9 +464,8 @@ impl NativeRuntimeImageSlot {
             .clone()
     }
 
-    /// Transactional A-running/B-activating swap. The B lease is acquired
-    /// before the slot changes. If it conflicts with a still-live A/worker OID,
-    /// activation fails and A remains untouched.
+    /// Acquire Image B's OID lease before swapping it in. If B conflicts with
+    /// any still-live Image A/worker OID, activation fails and A stays active.
     pub fn activate(
         &self,
         next: RuntimeImage,
@@ -511,9 +497,8 @@ pub enum ServiceBinCacheLookup {
     CorruptEvicted { path: PathBuf, reason: String },
 }
 
-/// Read only the exact `.bin` selected by the Runtime Image pin. Corruption or
-/// stale metadata is evicted and returned as a cache miss class so RELC can
-/// rebuild from source/OID records; it is never executed opportunistically.
+/// Load only the exact `.bin` selected by the Runtime Image pin. Corruption or
+/// stale metadata is evicted and treated as rebuildable cache, never executed.
 pub fn load_pinned_service_bin(
     compiler_cache_root: &Path,
     pin: &NativeServiceArtifactPin,
@@ -522,7 +507,9 @@ pub fn load_pinned_service_bin(
     let path = pin.cache_path(compiler_cache_root)?;
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(ServiceBinCacheLookup::Miss),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(ServiceBinCacheLookup::Miss)
+        }
         Err(error) => return Err(ServiceNativeError::Io(error.to_string())),
     };
 
@@ -579,12 +566,11 @@ pub struct MinimizedServiceAssemblyInputs {
     pub removed_oids: BTreeSet<u16>,
 }
 
-/// Phase-6 safe DCE/minimal-OID pass.
+/// Phase-6 safe dead-code/minimal-OID pass.
 ///
-/// Reachability is the union of RELC's call graph and machine-code relocation
-/// targets, so an OID referenced only by a native patch cannot be incorrectly
-/// deleted. The pass does not rewrite semantics or machine code; it only removes
-/// already-materialized fragments unreachable from every Service entry OID.
+/// Reachability combines RELC's call graph with OID relocation targets. This
+/// pass only removes already-materialized fragments that are unreachable from
+/// every Service entry OID; it does not rewrite semantics or machine code.
 pub fn minimize_service_assembly_inputs(
     plan: &ServiceAssemblyPlan,
     records: &BTreeMap<u16, VerifiedAssemblyOidRecord>,
@@ -638,7 +624,10 @@ pub fn minimize_service_assembly_inputs(
 
     let reachable = reachable_oids(plan.entry_oids.iter().copied(), &graph);
     let all_required = required.keys().copied().collect::<BTreeSet<_>>();
-    let removed_oids = all_required.difference(&reachable).copied().collect::<BTreeSet<_>>();
+    let removed_oids = all_required
+        .difference(&reachable)
+        .copied()
+        .collect::<BTreeSet<_>>();
 
     let mut minimized = plan.clone();
     minimized
@@ -647,6 +636,7 @@ pub fn minimize_service_assembly_inputs(
     minimized
         .placement_order
         .retain(|oid| reachable.contains(oid));
+    minimized.call_graph = graph;
     minimized.call_graph.retain(|oid, dependencies| {
         if !reachable.contains(oid) {
             return false;
@@ -710,7 +700,9 @@ impl std::fmt::Display for ServiceNativeError {
                 formatter,
                 "dynamic OID {oid} is still pinned to record {active_hash}; refusing reuse as {requested_hash}"
             ),
-            Self::Assembly(message) => write!(formatter, "Service assembly validation failed: {message}"),
+            Self::Assembly(message) => {
+                write!(formatter, "Service assembly validation failed: {message}")
+            }
             Self::Io(message) => write!(formatter, "Service native cache I/O failed: {message}"),
         }
     }
@@ -721,10 +713,9 @@ impl std::error::Error for ServiceNativeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oid_link::REL_OID_START;
     use crate::service_bin::{
-        assemble_service_bin, AssemblyRecordKind, RequiredOid, ServiceAssemblyPlan,
-        VerifiedAssemblyOidRecord, DONE_OID, SERVICE_PLAN_FORMAT,
+        assemble_service_bin, AssemblyRecordKind, OidRelocation, RequiredOid, DONE_OID,
+        SERVICE_PLAN_FORMAT,
     };
 
     fn sha(ch: char) -> String {
@@ -811,8 +802,14 @@ mod tests {
         let rel = pin(REL_OID_START, 'b');
         let _package_lease = registry.pin_service(&package).unwrap();
         let _rel_lease = registry.pin_service(&rel).unwrap();
-        assert_eq!(registry.package_allocator_pins(), BTreeSet::from([PACKAGE_OID_START]));
-        assert_eq!(registry.rel_allocator_pins(), BTreeSet::from([REL_OID_START]));
+        assert_eq!(
+            registry.package_allocator_pins(),
+            BTreeSet::from([PACKAGE_OID_START])
+        );
+        assert_eq!(
+            registry.rel_allocator_pins(),
+            BTreeSet::from([REL_OID_START])
+        );
     }
 
     #[test]
@@ -851,7 +848,10 @@ mod tests {
         fs::write(&path, b"definitely-not-a-service-bin").unwrap();
 
         let lookup = load_pinned_service_bin(&root, &pin).unwrap();
-        assert!(matches!(lookup, ServiceBinCacheLookup::CorruptEvicted { .. }));
+        assert!(matches!(
+            lookup,
+            ServiceBinCacheLookup::CorruptEvicted { .. }
+        ));
         assert!(!path.exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -862,12 +862,17 @@ mod tests {
         let call_dep = REL_OID_START + 1;
         let relocation_dep = REL_OID_START + 2;
         let dead = REL_OID_START + 3;
-        let mut plan = plan(&[(entry, 'a'), (call_dep, 'b'), (relocation_dep, 'c'), (dead, 'd')]);
+        let mut plan = plan(&[
+            (entry, 'a'),
+            (call_dep, 'b'),
+            (relocation_dep, 'c'),
+            (dead, 'd'),
+        ]);
         plan.call_graph.insert(entry, BTreeSet::from([call_dep]));
 
         let mut call_record = record(call_dep, 'b');
         call_record.machine_code = vec![0; 8];
-        call_record.relocations.push(crate::service_bin::OidRelocation {
+        call_record.relocations.push(OidRelocation {
             offset: 0,
             kind: OidRelocationKind::Abs64ToOid {
                 target_oid: relocation_dep,
