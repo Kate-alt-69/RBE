@@ -154,6 +154,9 @@ pub(crate) fn explicit_host_privilege_description(capability: &str) -> Option<&'
         "net:tcp" => Some(
             "open bounded stateful connections to public TCP destinations through RBE's session-scoped network broker",
         ),
+        "net:tcp-listen" => Some(
+            "bind bounded inbound TCP listeners through RBE; this can expose network services and may require host permission for privileged ports",
+        ),
         "net:tls" => Some(
             "open bounded public TLS/STARTTLS transports with RBE-owned certificate validation; net:tcp approval is also required",
         ),
@@ -295,6 +298,7 @@ mod tests {
         assert!(explicit_host_privilege_description("net:http").is_some());
         assert!(explicit_host_privilege_description("net:dns").is_some());
         assert!(explicit_host_privilege_description("net:tcp").is_some());
+        assert!(explicit_host_privilege_description("net:tcp-listen").is_some());
         assert!(explicit_host_privilege_description("net:tls").is_some());
         assert!(explicit_host_privilege_description("storage").is_some());
         assert!(explicit_host_privilege_description("crypto").is_some());
