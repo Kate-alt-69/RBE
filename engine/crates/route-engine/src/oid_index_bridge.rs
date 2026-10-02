@@ -12,6 +12,7 @@ use crate::oid_link::{
     PackageLinkSpec, PackageOidOwner as LinkedPackageOidOwner,
 };
 use crate::relc::{PackageLinkContext, PackageLinkError};
+use crate::service_native::DynamicOidPinRegistry;
 use crate::service_oid::{
     OidCache, OidError, OidIndex, PackageOidOwner as IndexedPackageOidOwner,
 };
@@ -194,6 +195,19 @@ pub fn reconcile_package_links(
 ) -> Result<PackageIndexDelta, OidIndexBridgeError> {
     let desired = package_specs_from_links(links)?;
     reconcile_package_cache(cache, &desired, pinned_oids)
+}
+
+/// Phase-5 safe package reconciliation. Callers that own the process-wide
+/// native Runtime Image/worker pin registry should prefer this over manually
+/// assembling a pinned-OID set; it makes old-image liveness part of the
+/// reconciliation operation rather than an optional caller convention.
+pub fn reconcile_package_links_with_active_pins(
+    cache: &mut OidCache,
+    links: &PackageLinkContext,
+    active_pins: &DynamicOidPinRegistry,
+) -> Result<PackageIndexDelta, OidIndexBridgeError> {
+    let pinned_oids = active_pins.package_allocator_pins();
+    reconcile_package_links(cache, links, &pinned_oids)
 }
 
 fn package_identity_by_oid(
