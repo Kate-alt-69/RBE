@@ -14,6 +14,7 @@ use crate::registry_contract::ResolvedRegistryRelease;
 use anyhow::{bail, Context, Result};
 use rbe_install_executor::{ArtifactDownloadPlan, DownloadLimits, ResumePolicy};
 use rbe_install_runtime::{promote_artifact, stage_artifact};
+use sdk_package::canonical_export_id;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -29,6 +30,8 @@ pub const ARCHIVE_PACKAGE_MANIFEST: &str = "package.rbe.yaml";
 pub const ARCHIVE_PACKAGE_INDEX: &str = ".rbe/package-index.json";
 const MAX_PACKAGE_MANIFEST_BYTES: u64 = 512 * 1024;
 const MAX_PACKAGE_INDEX_BYTES: u64 = 512 * 1024;
+const LEGACY_PACKAGE_INDEX_FORMAT: u64 = 1;
+const PHASE3_PACKAGE_INDEX_FORMAT: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallReport {
@@ -466,8 +469,12 @@ fn validate_package_index(
 ) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).context("invalid .rbe/package-index.json")?;
-    if value.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
-        bail!("unsupported .rbe/package-index.json format");
+    let format = value
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .context("package index is missing a numeric format")?;
+    if !matches!(format, LEGACY_PACKAGE_INDEX_FORMAT | PHASE3_PACKAGE_INDEX_FORMAT) {
+        bail!("unsupported .rbe/package-index.json format {format}");
     }
     let package = value
         .get("package")
@@ -477,6 +484,39 @@ fn validate_package_index(
         || package.get("version").and_then(serde_json::Value::as_str) != Some(expected_version)
     {
         bail!("package index identity does not match the registry release");
+    }
+
+    let exports = value
+        .get("exports")
+        .and_then(serde_json::Value::as_array)
+        .context("package index is missing exports")?;
+    let mut ids = BTreeSet::new();
+    for export in exports {
+        let export = export
+            .as_object()
+            .context("package index export must be an object")?;
+        let name = export
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .context("package index export is missing name")?;
+        let expected_id = canonical_export_id(expected_package, name)
+            .with_context(|| format!("derive deterministic export ID for {name:?}"))?;
+        match export.get("export_id").and_then(serde_json::Value::as_str) {
+            Some(observed) => {
+                if observed != expected_id {
+                    bail!(
+                        "package index export ID mismatch for {name:?}: expected {expected_id:?}, observed {observed:?}"
+                    );
+                }
+                if !ids.insert(observed.to_string()) {
+                    bail!("package index contains duplicate export ID {observed:?}");
+                }
+            }
+            None if format == PHASE3_PACKAGE_INDEX_FORMAT => {
+                bail!("format-2 package index export {name:?} is missing export_id")
+            }
+            None => {}
+        }
     }
     Ok(())
 }
@@ -536,6 +576,30 @@ fn report(project_root: &Path, lock: &ProjectLock, reused_lock: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_index_format_two_requires_verified_export_ids() {
+        let good = br#"{
+            "format": 2,
+            "package": {"name":"mail","version":"1.0.0"},
+            "exports": [{"name":"send","export_id":"lib_mail_send"}]
+        }"#;
+        validate_package_index(good, "mail", "1.0.0").unwrap();
+
+        let missing = br#"{
+            "format": 2,
+            "package": {"name":"mail","version":"1.0.0"},
+            "exports": [{"name":"send"}]
+        }"#;
+        assert!(validate_package_index(missing, "mail", "1.0.0").is_err());
+
+        let forged = br#"{
+            "format": 2,
+            "package": {"name":"mail","version":"1.0.0"},
+            "exports": [{"name":"send","export_id":"lib_evil_send"}]
+        }"#;
+        assert!(validate_package_index(forged, "mail", "1.0.0").is_err());
+    }
 
     #[test]
     fn locked_graph_allows_same_private_name_per_root() {
