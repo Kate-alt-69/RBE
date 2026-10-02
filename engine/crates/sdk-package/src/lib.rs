@@ -12,12 +12,16 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 pub const PACKAGE_MANIFEST: &str = "package.rbe.toml";
 pub const DEFAULT_COMPONENTS_DIR: &str = "components";
+/// Transitional format-1 writer. The Phase-3 `export_id` field is already
+/// emitted and verified; the wire-format bump lands after every consumer can
+/// read format 2 so main never contains an unreadable package artifact.
+pub const PACKAGE_INDEX_FORMAT: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,6 +138,9 @@ pub struct PackageIndexIdentity {
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageExport {
     pub name: String,
+    /// Stable RPX identity. Numeric OIDs are intentionally not published here;
+    /// RELC assigns them project-locally inside the single `oid/index`.
+    pub export_id: String,
     pub source: String,
     pub language: PackageLanguage,
 }
@@ -141,7 +148,7 @@ pub struct PackageExport {
 impl CheckedPackage {
     pub fn index(&self) -> PackageIndex {
         PackageIndex {
-            format: 1,
+            format: PACKAGE_INDEX_FORMAT,
             package: PackageIndexIdentity {
                 name: self.manifest.package.name.clone(),
                 version: self.manifest.package.version.clone(),
@@ -152,6 +159,8 @@ impl CheckedPackage {
                 .iter()
                 .map(|component| PackageExport {
                     name: component.name.clone(),
+                    export_id: canonical_export_id(&self.manifest.package.name, &component.name)
+                        .expect("checked package components must have canonical export IDs"),
                     source: relative_slash(&self.root, &component.source),
                     language: component.language,
                 })
@@ -159,6 +168,40 @@ impl CheckedPackage {
             private_dependencies: self.manifest.dependencies.rbe.clone(),
         }
     }
+}
+
+/// Deterministic package export identity used by RPX indexes.
+///
+/// `mail` + `send` -> `lib_mail_send`. Hyphens canonicalize to underscores so
+/// the checked package must reject collisions such as `send-fast`/`send_fast`.
+pub fn canonical_export_id(package: &str, export: &str) -> Result<String, PackageError> {
+    let package = canonical_id_segment(package)?;
+    let mut out = format!("lib_{package}");
+    if !export.is_empty() {
+        for segment in export.split('/') {
+            out.push('_');
+            out.push_str(&canonical_id_segment(segment)?);
+        }
+    }
+    if out.len() > 512 {
+        return Err(PackageError::InvalidExportId(out));
+    }
+    Ok(out)
+}
+
+fn canonical_id_segment(value: &str) -> Result<String, PackageError> {
+    if value.is_empty() || value.len() > 192 {
+        return Err(PackageError::InvalidExportId(value.to_string()));
+    }
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'a'..=b'z' | b'0'..=b'9' | b'_' => out.push(byte as char),
+            b'-' => out.push('_'),
+            _ => return Err(PackageError::InvalidExportId(value.to_string())),
+        }
+    }
+    Ok(out)
 }
 
 pub fn find_package_root(start: impl AsRef<Path>) -> Result<PathBuf, PackageError> {
@@ -261,6 +304,17 @@ fn check_loaded(
 
     if components.is_empty() {
         return Err(PackageError::NoComponents(components_root));
+    }
+
+    let mut export_ids = BTreeSet::new();
+    for component in &components {
+        let export_id = canonical_export_id(&manifest.package.name, &component.name)?;
+        if !export_ids.insert(export_id.clone()) {
+            return Err(PackageError::ExportIdCollision {
+                package: manifest.package.name.clone(),
+                export_id,
+            });
+        }
     }
 
     Ok(CheckedPackage {
@@ -449,6 +503,10 @@ pub enum PackageError {
     InvalidVersion(String),
     #[error("components root must be a safe relative directory: {0:?}")]
     InvalidComponentsRoot(String),
+    #[error("invalid deterministic package export ID {0:?}")]
+    InvalidExportId(String),
+    #[error("deterministic package export ID collision in {package:?}: {export_id:?}")]
+    ExportIdCollision { package: String, export_id: String },
     #[error("JavaScript/TypeScript packages must declare runtime = \"node\" or runtime = \"bun\"")]
     MissingJsRuntime,
     #[error("runtime is only valid for JavaScript/TypeScript packages")]
@@ -460,7 +518,7 @@ pub enum PackageError {
     #[error("component {component:?} directory does not exist: {directory}")]
     ComponentDirectoryMissing {
         component: String,
-        directory: PathBuf,
+        directory,
     },
     #[error("invalid component name {0:?}")]
     InvalidComponentName(String),
@@ -499,6 +557,67 @@ mod tests {
     fn package_names_do_not_accept_path_syntax() {
         assert!(validate_name("package", "advancenet").is_ok());
         assert!(validate_name("package", "../advancenet").is_err());
+    }
+
+    #[test]
+    fn deterministic_export_ids_follow_phase_three_contract() {
+        assert_eq!(canonical_export_id("mail", "").unwrap(), "lib_mail");
+        assert_eq!(canonical_export_id("mail", "send").unwrap(), "lib_mail_send");
+        assert_eq!(
+            canonical_export_id("my-mail", "client/send-fast").unwrap(),
+            "lib_my_mail_client_send_fast"
+        );
+    }
+
+    #[test]
+    fn checked_package_index_publishes_export_ids_not_numeric_oids() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rbe-sdk-package-index-{stamp}"));
+        let request = root.join("components/request");
+        fs::create_dir_all(&request).unwrap();
+        fs::write(
+            root.join(PACKAGE_MANIFEST),
+            "[package]\nname = \"advancenet\"\nversion = \"1.0.0\"\nlanguage = \"typescript\"\nruntime = \"bun\"\n",
+        )
+        .unwrap();
+        fs::write(request.join("request.ts"), "export const request = 1;\n").unwrap();
+
+        let checked = check_package(&root).unwrap();
+        let index = checked.index();
+        assert_eq!(index.format, PACKAGE_INDEX_FORMAT);
+        assert_eq!(index.exports[0].export_id, "lib_advancenet_request");
+        let encoded = serde_json::to_value(index).unwrap();
+        assert!(encoded["exports"][0].get("export_id").is_some());
+        assert!(encoded["exports"][0].get("oid").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_export_collision_is_rejected() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rbe-sdk-package-collision-{stamp}"));
+        for name in ["send-fast", "send_fast"] {
+            let component = root.join(format!("components/{name}"));
+            fs::create_dir_all(&component).unwrap();
+            fs::write(component.join(format!("{name}.ts")), "export const x = 1;\n").unwrap();
+        }
+        fs::write(
+            root.join(PACKAGE_MANIFEST),
+            "[package]\nname = \"mail\"\nversion = \"1.0.0\"\nlanguage = \"typescript\"\nruntime = \"bun\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            check_package(&root),
+            Err(PackageError::ExportIdCollision { .. })
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
