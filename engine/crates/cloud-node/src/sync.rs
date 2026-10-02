@@ -121,6 +121,15 @@ impl SyncPlan {
         videos.sort_by(sort);
         files.sort_by(sort);
 
+        #[cfg(windows)]
+        validate_windows_logical_paths(
+            folders
+                .iter()
+                .chain(&videos)
+                .chain(&files)
+                .map(|object| object.logical_path.as_str()),
+        )?;
+
         let root_sha256 = sync_root(&folders, &videos, &files);
         Ok(Self {
             root_sha256,
@@ -298,6 +307,20 @@ fn sync_object(
     })
 }
 
+#[cfg(any(windows, test))]
+fn validate_windows_logical_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashMap::<String, &'a str>::new();
+    for path in paths {
+        let folded = path.to_lowercase();
+        if let Some(existing) = seen.insert(folded, path) {
+            anyhow::bail!(
+                "Cloud Node logical paths {existing:?} and {path:?} collide on a case-insensitive Windows checkout"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn sync_root(folders: &[SyncObject], videos: &[SyncObject], files: &[SyncObject]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(SYNC_ROOT_DOMAIN);
@@ -343,6 +366,12 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn windows_logical_path_guard_rejects_case_collisions() {
+        assert!(validate_windows_logical_paths(["local/Foo.txt", "local/foo.txt"]).is_err());
+        assert!(validate_windows_logical_paths(["local/Foo.txt", "local/bar.txt"]).is_ok());
     }
 
     #[test]
