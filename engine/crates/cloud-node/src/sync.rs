@@ -308,12 +308,55 @@ fn sync_object(
 }
 
 #[cfg(any(windows, test))]
+fn windows_reserved_name(segment: &str) -> bool {
+    let stem = segment.split('.').next().unwrap_or(segment).to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    if stem.len() == 4 {
+        let (prefix, digit) = stem.split_at(3);
+        if matches!(prefix, "COM" | "LPT") && matches!(digit.as_bytes(), [b'1'..=b'9']) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(any(windows, test))]
+fn windows_logical_path_key(path: &str) -> anyhow::Result<String> {
+    let mut folded = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty()
+            || segment.ends_with(' ')
+            || segment.ends_with('.')
+            || segment
+                .chars()
+                .any(|ch| matches!(ch, '<' | '>' | '"' | '|' | '?' | '*'))
+        {
+            anyhow::bail!(
+                "Cloud Node logical path {path:?} contains a component that cannot be materialized safely on Windows"
+            );
+        }
+        if windows_reserved_name(segment) {
+            anyhow::bail!(
+                "Cloud Node logical path {path:?} uses reserved Windows device component {segment:?}"
+            );
+        }
+        folded.push(segment.to_lowercase());
+    }
+    Ok(folded.join("/"))
+}
+
+#[cfg(any(windows, test))]
 fn validate_windows_logical_paths<'a>(
     paths: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<()> {
     let mut seen = std::collections::HashMap::<String, &'a str>::new();
     for path in paths {
-        let folded = path.to_lowercase();
+        let folded = windows_logical_path_key(path)?;
         if let Some(existing) = seen.insert(folded, path) {
             anyhow::bail!(
                 "Cloud Node logical paths {existing:?} and {path:?} collide on a case-insensitive Windows checkout"
@@ -374,6 +417,55 @@ mod tests {
     fn windows_logical_path_guard_rejects_case_collisions() {
         assert!(validate_windows_logical_paths(["local/Foo.txt", "local/foo.txt"]).is_err());
         assert!(validate_windows_logical_paths(["local/Foo.txt", "local/bar.txt"]).is_ok());
+    }
+
+    #[test]
+    fn windows_logical_path_guard_rejects_unstable_components() {
+        for path in [
+            "local/file.",
+            "local/file ",
+            "local/a?.json",
+            "local/a*.json",
+            "local/a|b.json",
+            "local/a\"b.json",
+            "local/a<b.json",
+            "local/a>b.json",
+        ] {
+            assert!(
+                validate_windows_logical_paths([path]).is_err(),
+                "unexpectedly accepted {path:?}"
+            );
+        }
+        assert!(validate_windows_logical_paths(["local/file.txt"]).is_ok());
+    }
+
+    #[test]
+    fn windows_logical_path_guard_rejects_device_names() {
+        for path in [
+            "local/NUL",
+            "local/nul.txt",
+            "local/CON",
+            "local/PRN.log",
+            "local/AUX",
+            "local/CLOCK$",
+            "local/CONIN$",
+            "local/CONOUT$",
+            "local/COM1.json",
+            "local/com9",
+            "local/LPT1.txt",
+            "local/lpt9",
+        ] {
+            assert!(
+                validate_windows_logical_paths([path]).is_err(),
+                "unexpectedly accepted reserved device path {path:?}"
+            );
+        }
+        assert!(validate_windows_logical_paths([
+            "local/COM10.json",
+            "local/LPT10.txt",
+            "local/NULLED.txt"
+        ])
+        .is_ok());
     }
 
     #[test]
