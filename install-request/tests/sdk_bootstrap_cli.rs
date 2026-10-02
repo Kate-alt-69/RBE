@@ -1,44 +1,29 @@
 use rbe_install_request::{InstallCommand, InstallTarget};
 
+fn assert_sdk_command(command: InstallCommand, language: Option<&str>) {
+    let InstallTarget::Named { key, version } = command.target else {
+        panic!("SDK install must resolve to a named target");
+    };
+    assert_eq!(key, "sdk");
+    assert!(version.is_none());
+    assert_eq!(command.flags.language.as_deref(), language);
+}
+
 #[test]
 fn bare_sdk_alias_selects_latest_channel() {
-    let command = InstallCommand::parse(&["sdk"]).expect("bare SDK alias must parse");
-    assert!(matches!(
-        command.target,
-        InstallTarget::Named {
-            ref key,
-            version: None
-        } if key == "sdk"
-    ));
-    assert!(command.flags.language.is_none());
-    assert!(command.flags.path.is_none());
+    let command = InstallCommand::parse(&["sdk"]).unwrap();
+    assert_sdk_command(command, None);
 }
 
 #[test]
 fn bare_sdk_accepts_language_selection() {
-    let command = InstallCommand::parse(&["sdk", "-language=rust"])
-        .expect("bare SDK alias with language must parse");
-    assert!(matches!(
-        command.target,
-        InstallTarget::Named {
-            ref key,
-            version: None
-        } if key == "sdk"
-    ));
-    assert_eq!(command.flags.language.as_deref(), Some("rust"));
+    let command = InstallCommand::parse(&["sdk", "-language=rust"]).unwrap();
+    assert_sdk_command(command, Some("rust"));
 }
 
 #[test]
 fn sdk_latest_accepts_project_and_typescript_flags() {
-    let command = InstallCommand::parse(&["sdk.latest", "-path=.", "-language=typescript"])
-        .expect("sdk.latest authoring command must parse");
-    assert!(matches!(
-        command.target,
-        InstallTarget::Named {
-            ref key,
-            version: None
-        } if key == "sdk"
-    ));
+    let command = InstallCommand::parse(&["sdk.latest", "-path=.", "-language=typescript"]).unwrap();
     assert_eq!(command.flags.path.as_deref(), Some(std::path::Path::new(".")));
-    assert_eq!(command.flags.language.as_deref(), Some("typescript"));
+    assert_sdk_command(command, Some("typescript"));
 }
