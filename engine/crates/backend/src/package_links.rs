@@ -4,6 +4,8 @@ pub(crate) mod approval;
 pub(crate) mod host;
 #[path = "package_links/tcp.rs"]
 pub(crate) mod tcp;
+#[path = "package_links/tls.rs"]
+pub(crate) mod tls;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -38,6 +40,8 @@ fn dispatch_verified_host_call<'a>(
 ) -> LibraryHostDispatchFuture<'a> {
     if call.capability == tcp::CAPABILITY {
         Box::pin(tcp::dispatch_authorized_call(package, binding, call))
+    } else if call.capability == tls::CAPABILITY {
+        Box::pin(tls::dispatch_authorized_call(package, binding, call))
     } else {
         Box::pin(host::dispatch_authorized_host_call(package, binding, call))
     }
@@ -150,6 +154,14 @@ fn build_approved_host_sessions(
                 format!("materialize approved TCP privilege for root {package:?}")
             })?);
         }
+        if approved
+            .iter()
+            .any(|capability| capability == tls::CAPABILITY)
+        {
+            grants.push(tls::grant().with_context(|| {
+                format!("materialize approved TLS privilege for root {package:?}")
+            })?);
+        }
         Ok(grants)
     })
 }
@@ -165,6 +177,7 @@ fn install_verified_host_sessions(
         .map_err(|_| anyhow::anyhow!("Library Host session registry lock is poisoned"))?;
 
     tcp::clear_all();
+    tls::clear_all();
     for session in active.values_mut() {
         session.binding.close();
     }
@@ -248,8 +261,7 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
             bail!(
                 "RPX package index version mismatch for explicit root {:?}: lock={}, index={}",
                 verified.package,
-                verified.version,
-                index.package.version
+                verified.version
             );
         }
         if !matches!(
