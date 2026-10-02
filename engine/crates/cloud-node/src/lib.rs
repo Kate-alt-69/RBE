@@ -80,8 +80,8 @@ pub use server::{
 };
 pub use settings_path::{
     discover_settings_path, LEGACY_SETTINGS_FILE_NAME, PREFERRED_SETTINGS_FILE_NAME,
+    PREFERRED_SETTINGS_FILE_NAME as SETTINGS_FILE_NAME,
 };
-pub use settings_path::PREFERRED_SETTINGS_FILE_NAME as SETTINGS_FILE_NAME;
 pub use store::{CloudNodeStore, StoreSummary, StoredObject};
 pub use sync::{SyncObject, SyncPlan, SyncPlanHeader};
 pub use transfer::{TransferChunk, TransferResource, MAX_TRANSFER_DATA_BYTES, RESUME_ACK_HEADER};
