@@ -518,7 +518,7 @@ pub enum PackageError {
     #[error("component {component:?} directory does not exist: {directory}")]
     ComponentDirectoryMissing {
         component: String,
-        directory,
+        directory: PathBuf,
     },
     #[error("invalid component name {0:?}")]
     InvalidComponentName(String),
