@@ -260,8 +260,7 @@ async fn materialize_tree(
 
     let listing_limit = materialization
         .maximum_total_bytes
-        .min(MAX_TREE_LISTING_BYTES)
-        .max(1) as usize;
+        .clamp(1, MAX_TREE_LISTING_BYTES) as usize;
     let listing = run_git(
         "list-tree",
         &materialization.program,
@@ -385,6 +384,9 @@ struct GitCommandOutput {
     stdout: Vec<u8>,
 }
 
+// Keeping these authority-bearing fields explicit makes call sites auditable:
+// executable/hash, argv, cwd, environment, timeout, output cap, and disk cap.
+#[allow(clippy::too_many_arguments)]
 async fn run_git(
     phase: &'static str,
     program: &Path,
