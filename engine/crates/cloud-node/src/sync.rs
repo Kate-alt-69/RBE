@@ -348,7 +348,7 @@ fn windows_logical_path_key(path: &str) -> anyhow::Result<String> {
                 "Cloud Node logical path {path:?} uses reserved Windows device component {segment:?}"
             );
         }
-        folded.push(segment.to_lowercase());
+        folded.push(segment.to_uppercase());
     }
     Ok(folded.join("/"))
 }
@@ -419,6 +419,12 @@ mod tests {
     fn windows_logical_path_guard_rejects_case_collisions() {
         assert!(validate_windows_logical_paths(["local/Foo.txt", "local/foo.txt"]).is_err());
         assert!(validate_windows_logical_paths(["local/Foo.txt", "local/bar.txt"]).is_ok());
+    }
+
+    #[test]
+    fn windows_logical_path_guard_rejects_unicode_case_collisions() {
+        assert!(validate_windows_logical_paths(["local/σ.txt", "local/ς.txt"]).is_err());
+        assert!(validate_windows_logical_paths(["local/ſ.txt", "local/s.txt"]).is_err());
     }
 
     #[test]
