@@ -141,6 +141,7 @@ pub mod server_rel;
 pub mod service_bin;
 pub mod service_native;
 pub mod service_oid;
+pub mod service_oid_adapter;
 pub mod source_registry;
 pub mod transpiled_support;
 pub mod transpiler;
