@@ -62,6 +62,7 @@ mod cache;
 mod graph;
 mod http;
 mod package;
+mod package_service;
 mod prepare;
 mod promotion;
 mod registry;
@@ -83,6 +84,10 @@ pub use package::{
     inspect_registry_stage, read_verified_rpx_root_indexes, registry_artifact_plan,
     stage_registry_package, VerifiedRegistryPackage, VerifiedRpxRootIndex,
     MAX_RPX_PACKAGE_INDEX_BYTES, RPX_PACKAGE_INDEX,
+};
+pub use package_service::{
+    read_verified_package_services, PackageServiceError, VerifiedPackageServiceSource,
+    MAX_PACKAGE_SERVICES, MAX_PACKAGE_SERVICE_BYTES, PACKAGE_SERVICE_CAPABILITY,
 };
 pub use prepare::{prepare_prebuilt_activation_proofs, PrebuiltPreparationError};
 pub use promotion::{
