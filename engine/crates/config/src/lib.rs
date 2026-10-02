@@ -501,6 +501,12 @@ impl Config {
                 "storage.driver is \"postgres\" but DATABASE_URL is not set".into(),
             ));
         }
+        if self.storage.supabase_sync_enabled {
+            return Err(ConfigError::Invalid(
+                "storage.supabaseSyncEnabled is a legacy non-functional setting and cannot enable Cloud Node synchronization; leave it false and configure provider synchronization in setting.cn.json using provider + syncOnConnect"
+                    .into(),
+            ));
+        }
         if !matches!(
             self.logging.level.as_str(),
             "trace" | "debug" | "info" | "warn" | "error"
@@ -652,6 +658,21 @@ mod tests {
         assert_eq!(config.video_manager.live_idle_secs, 7200);
         assert!(!config.video_manager.download_worker_enabled);
         assert_eq!(config.video_manager.worker_recovery_scan_secs, 30);
+    }
+
+    #[test]
+    fn rejects_legacy_supabase_sync_switch() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "api": { "host": "0.0.0.0", "port": 8080 },
+                "storage": { "supabaseSyncEnabled": true }
+            }"#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.supabaseSyncEnabled"));
+        assert!(error.contains("setting.cn.json"));
+        assert!(error.contains("syncOnConnect"));
     }
 
     #[test]
