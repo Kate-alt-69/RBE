@@ -309,7 +309,11 @@ fn sync_object(
 
 #[cfg(any(windows, test))]
 fn windows_reserved_name(segment: &str) -> bool {
-    let stem = segment.split('.').next().unwrap_or(segment).to_ascii_uppercase();
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or(segment)
+        .to_ascii_uppercase();
     if matches!(
         stem.as_str(),
         "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
