@@ -316,11 +316,11 @@ fn windows_reserved_name(segment: &str) -> bool {
     ) {
         return true;
     }
-    if stem.len() == 4 {
-        let (prefix, digit) = stem.split_at(3);
-        if matches!(prefix, "COM" | "LPT") && matches!(digit.as_bytes(), [b'1'..=b'9']) {
-            return true;
-        }
+    if stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && matches!(stem.as_bytes()[3], b'1'..=b'9')
+    {
+        return true;
     }
     false
 }
@@ -466,6 +466,12 @@ mod tests {
             "local/NULLED.txt"
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn windows_device_guard_handles_non_ascii_four_byte_stems() {
+        assert!(!windows_reserved_name("ABé"));
+        assert!(!windows_reserved_name("éAB"));
     }
 
     #[test]
