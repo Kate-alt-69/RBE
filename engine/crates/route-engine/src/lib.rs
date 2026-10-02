@@ -130,6 +130,7 @@ mod terminal;
 pub mod archive;
 pub mod cache;
 pub mod middleware_plan;
+pub mod oid_cache_bootstrap;
 pub mod oid_index_bridge;
 pub mod oid_link;
 pub mod relc;
@@ -171,12 +172,15 @@ pub use module_runtime::{
     ModuleCompileError, ModuleCompileErrors, ModuleProgram, ServiceInterfaces,
 };
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
+pub use oid_cache_bootstrap::{
+    clear_service_oid_cache, oid_cache_root, open_service_oid_cache, prepare_service_oid_cache,
+};
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
 pub use rel_host_builtins::{
     allowed_for_role as host_builtin_allowed_for_role,
-    function_exists as host_builtin_function_exists, is_host_builtin,
-    ARCHIVE_BUILTIN, SCRIPT_BUILTIN, WORKSPACE_BUILTIN,
+    function_exists as host_builtin_function_exists, is_host_builtin, ARCHIVE_BUILTIN,
+    SCRIPT_BUILTIN, WORKSPACE_BUILTIN,
 };
 pub use rel_host_runtime::{
     RelHostExecutionFuture, RelHostExecutor, RelHostOutput, RelHostRequest,
@@ -198,11 +202,10 @@ pub use server_rel::{
 };
 pub use service_eval::ServiceProgramExecutor;
 pub use service_oid::{
-    prepare_service_oid_cache, CoreMaterializationReport, OidCache, OidDiagnostic,
-    OidDiagnosticSeverity, OidError, OidIndex, OidRecord, OidRecordKind, OidRelocation,
-    OidRelocationKind, OidSlotClass, OidTarget, PackageOidOwner, OID_DONE, OID_END_PACKAGE,
-    OID_NATIVE_ABI_VERSION, OID_PACKAGE_END, OID_PACKAGE_START, OID_RBE_CORE_END,
-    OID_RBE_CORE_START, OID_REL_END, OID_REL_START,
+    CoreMaterializationReport, OidCache, OidDiagnostic, OidDiagnosticSeverity, OidError, OidIndex,
+    OidRecord, OidRecordKind, OidRelocation, OidRelocationKind, OidSlotClass, OidTarget,
+    PackageOidOwner, OID_DONE, OID_END_PACKAGE, OID_NATIVE_ABI_VERSION, OID_PACKAGE_END,
+    OID_PACKAGE_START, OID_RBE_CORE_END, OID_RBE_CORE_START, OID_REL_END, OID_REL_START,
 };
 pub use source_registry::{
     RelSource, RelSourceKind, RelSourceRegistry, SourceId, SourceOrigin, SourceRegistryError,
@@ -212,7 +215,9 @@ pub use wasm_compiler::{
     compile_route as compile_route_wasm, RouteWasmArtifact, RouteWasmCompilation,
     ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
 };
-pub use workspace::{WorkspaceOperation, WorkspacePlan, WorkspacePlanError, WorkspacePath, WorkspaceRoot};
+pub use workspace::{
+    WorkspaceOperation, WorkspacePath, WorkspacePlan, WorkspacePlanError, WorkspaceRoot,
+};
 
 pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
     let tokens = lexer::Lexer::new(source)
