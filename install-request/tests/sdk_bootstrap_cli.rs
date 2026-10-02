@@ -30,12 +30,8 @@ fn bare_sdk_accepts_language_selection() {
 
 #[test]
 fn sdk_latest_accepts_project_and_typescript_flags() {
-    let command = InstallCommand::parse(&[
-        "sdk.latest",
-        "-path=.",
-        "-language=typescript",
-    ])
-    .expect("sdk.latest authoring command must parse");
+    let command = InstallCommand::parse(&["sdk.latest", "-path=.", "-language=typescript"])
+        .expect("sdk.latest authoring command must parse");
     assert!(matches!(
         command.target,
         InstallTarget::Named {
