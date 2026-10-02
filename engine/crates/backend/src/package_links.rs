@@ -22,6 +22,7 @@ use core_lib::{
     LibraryCapabilityGrant, LibraryHostCall, LibraryHostCallReply, LibrarySessionBinding,
 };
 use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex, VerifiedRpxRootSnapshot};
+use route_engine::oid_link::canonical_package_export_id;
 use route_engine::relc::{
     PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
 };
@@ -105,6 +106,10 @@ struct RpxPackageIdentity {
 #[serde(deny_unknown_fields)]
 struct RpxPackageExport {
     name: String,
+    /// Phase-3 stable package identity. Kept optional for one migration window
+    /// so format-1 artifacts already installed in projects remain readable.
+    #[serde(default)]
+    export_id: Option<String>,
     source: String,
     language: String,
 }
@@ -177,16 +182,16 @@ fn build_approved_host_sessions(
             .any(|capability| capability == storage::CAPABILITY)
         {
             grants.push(storage::grant().with_context(|| {
-                format!("materialize approved storage privilege for root {package:?}")
-            })?);
+                format!("materialize approved storage privilege for root {package:?}"))
+            })?;
         }
         if approved
             .iter()
             .any(|capability| capability == crypto::CAPABILITY)
         {
             grants.push(crypto::grant().with_context(|| {
-                format!("materialize approved crypto privilege for root {package:?}")
-            })?);
+                format!("materialize approved crypto privilege for root {package:?}"))
+            })?;
         }
         Ok(grants)
     })
@@ -306,6 +311,7 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
         let _private_dependency_names = index.private_dependencies.keys().collect::<BTreeSet<_>>();
 
         let mut exports = BTreeMap::new();
+        let mut verified_export_ids = BTreeSet::new();
         for export in index.exports {
             if export.language == "global" {
                 bail!(
@@ -325,6 +331,33 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
                     verified.package
                 );
             }
+
+            let expected_export_id = canonical_package_export_id(&verified.package, &export.name)
+                .with_context(|| {
+                    format!(
+                        "derive deterministic RPX export identity for {:?} from {:?}",
+                        export.name, verified.package
+                    )
+                })?;
+            if let Some(observed_export_id) = export.export_id.as_deref() {
+                if observed_export_id != expected_export_id {
+                    bail!(
+                        "RPX export ID mismatch for {:?} from {:?}: expected {:?}, observed {:?}",
+                        export.name,
+                        verified.package,
+                        expected_export_id,
+                        observed_export_id
+                    );
+                }
+                if !verified_export_ids.insert(observed_export_id.to_string()) {
+                    bail!(
+                        "duplicate deterministic RPX export ID {:?} in explicit root {:?}",
+                        observed_export_id,
+                        verified.package
+                    );
+                }
+            }
+
             let name = export.name;
             if exports
                 .insert(
@@ -434,6 +467,25 @@ mod tests {
         assert_eq!(request.entry, "components/request/request.ts");
         assert_eq!(request.language, "typescript");
         assert!(links.root("secret-parser").is_none());
+    }
+
+    #[test]
+    fn deterministic_export_id_is_verified_when_present() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","export_id":"lib_advancenet_request","source":"components/request/request.ts","language":"typescript"}]"#,
+        );
+        assert!(from_verified_indexes(vec![verified(&input)]).is_ok());
+    }
+
+    #[test]
+    fn forged_export_id_is_rejected() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","export_id":"lib_other_request","source":"components/request/request.ts","language":"typescript"}]"#,
+        );
+        let error = from_verified_indexes(vec![verified(&input)]).unwrap_err();
+        assert!(error.to_string().contains("export ID mismatch"));
     }
 
     #[test]
