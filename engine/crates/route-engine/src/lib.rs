@@ -133,6 +133,7 @@ pub mod middleware_plan;
 pub mod oid_cache_bootstrap;
 pub mod oid_index_bridge;
 pub mod oid_link;
+pub mod rel_oid_bridge;
 pub mod relc;
 pub mod runtime_env;
 pub mod runtime_image;
