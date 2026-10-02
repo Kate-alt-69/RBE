@@ -308,7 +308,9 @@ fn sync_object(
 }
 
 #[cfg(any(windows, test))]
-fn validate_windows_logical_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> anyhow::Result<()> {
+fn validate_windows_logical_paths<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<()> {
     let mut seen = std::collections::HashMap::<String, &'a str>::new();
     for path in paths {
         let folded = path.to_lowercase();
