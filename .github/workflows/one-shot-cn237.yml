@@ -1,0 +1,158 @@
+name: One-shot Cloud Node bounded manifest reads
+
+on:
+  push:
+    paths:
+      - ".github/workflows/one-shot-cn237.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: startsWith(github.event.head_commit.message, 'CHORE | CN-237 stage')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Bound local manifest reads before allocation
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          fmt = Path('engine/crates/cloud-node/src/format.rs')
+          text = fmt.read_text()
+          old_import = 'use std::io::{Cursor, Read};\n'
+          new_import = 'use std::fs::File;\nuse std::io::{Cursor, Read};\nuse std::path::Path;\n'
+          if text.count(old_import) != 1:
+              raise SystemExit(f'format import anchor count={text.count(old_import)}')
+          text = text.replace(old_import, new_import, 1)
+
+          anchor = 'impl BlobManifest {\n    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {'
+          helper = '''impl BlobManifest {
+    pub fn read(path: &Path) -> anyhow::Result<Self> {
+        let file = File::open(path).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to open Cloud Node blob manifest {}: {error}",
+                path.display()
+            )
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to inspect Cloud Node blob manifest {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "Cloud Node blob manifest is not a regular file: {}",
+                path.display()
+            );
+        }
+        if metadata.len() > MAX_MANIFEST_BYTES as u64 {
+            anyhow::bail!(
+                "Cloud Node blob manifest {} exceeds {MAX_MANIFEST_BYTES} bytes",
+                path.display()
+            );
+        }
+
+        let capacity = usize::try_from(metadata.len())
+            .unwrap_or(MAX_MANIFEST_BYTES)
+            .min(MAX_MANIFEST_BYTES);
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut limited = file.take(MAX_MANIFEST_BYTES as u64 + 1);
+        limited.read_to_end(&mut bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to read Cloud Node blob manifest {}: {error}",
+                path.display()
+            )
+        })?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            anyhow::bail!(
+                "Cloud Node blob manifest {} exceeds {MAX_MANIFEST_BYTES} bytes",
+                path.display()
+            );
+        }
+        Self::decode(&bytes)
+    }
+
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {'''
+          if text.count(anchor) != 1:
+              raise SystemExit(f'format impl anchor count={text.count(anchor)}')
+          text = text.replace(anchor, helper, 1)
+
+          test_anchor = '''    #[test]
+    fn file_blob_is_binary_and_round_trips_exact_bytes() {'''
+          test = '''    #[test]
+    fn manifest_file_read_rejects_oversized_input_before_decode() {
+        let path = std::env::temp_dir().join(format!(
+            "rbe-cn-oversized-manifest-{}",
+            std::process::id()
+        ));
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_MANIFEST_BYTES as u64 + 1).unwrap();
+        drop(file);
+        let error = BlobManifest::read(&path).unwrap_err().to_string();
+        assert!(error.contains("exceeds"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_blob_is_binary_and_round_trips_exact_bytes() {'''
+          if text.count(test_anchor) != 1:
+              raise SystemExit(f'format test anchor count={text.count(test_anchor)}')
+          fmt.write_text(text.replace(test_anchor, test, 1))
+
+          replacements = {
+              'engine/crates/cloud-node/src/store.rs': [
+                  ('BlobManifest::decode(&fs::read(&path)?)?', 'BlobManifest::read(&path)?', 1),
+                  ('Ok(Some(BlobManifest::decode(&fs::read(path)?)?))', 'Ok(Some(BlobManifest::read(path)?))', 1),
+              ],
+              'engine/crates/cloud-node/src/sync.rs': [
+                  ('BlobManifest::decode(&fs::read(&manifest_path)?)?', 'BlobManifest::read(&manifest_path)?', 1),
+              ],
+              'engine/crates/cloud-node/src/recovery.rs': [
+                  ('BlobManifest::decode(&fs::read(&manifest_path)?)?', 'BlobManifest::read(&manifest_path)?', 1),
+                  ('BlobManifest::decode(&fs::read(path)?)?', 'BlobManifest::read(path)?', 1),
+              ],
+          }
+          for name, edits in replacements.items():
+              path = Path(name)
+              text = path.read_text()
+              for old, new, expected in edits:
+                  count = text.count(old)
+                  if count != expected:
+                      raise SystemExit(f'{name}: anchor {old!r} count={count}, expected={expected}')
+                  text = text.replace(old, new, expected)
+              path.write_text(text)
+          PY
+          cd engine
+          cargo fmt -p cloud-node
+          cd ..
+      - name: Remove one-shot workflow
+        run: git rm .github/workflows/one-shot-cn237.yml
+      - name: Commit and rebase onto live main
+        shell: bash
+        run: |
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git add engine/crates/cloud-node/src/format.rs engine/crates/cloud-node/src/store.rs engine/crates/cloud-node/src/sync.rs engine/crates/cloud-node/src/recovery.rs
+          git commit -m "FIX | BUG-CN-237 bound local blob manifest reads"
+          git pull --rebase origin main
+      - name: Validate Cloud Node after rebase
+        working-directory: engine
+        run: |
+          cargo fmt -p cloud-node -- --check
+          cargo clippy -p cloud-node --all-targets --locked -- -D warnings
+          cargo test -p cloud-node --locked
+      - name: Push final commit
+        run: git push origin HEAD:main
