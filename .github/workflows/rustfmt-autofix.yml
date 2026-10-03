@@ -1,0 +1,36 @@
+name: Rustfmt Autofix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rustfmt-autofix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format Rust workspaces
+        shell: bash
+        run: cargo fmt --all
+      - name: Commit formatter output
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo 'No rustfmt changes required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -u
+          git commit -m 'FIX | OID-004 normalize workspace rustfmt'
+          git push origin HEAD:main
