@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use crate::rel_native_link::{
     prepare_rel_native_link, PreparedRelNativeLink, RelNativeLinkError, RelNativeLinkReport,
@@ -19,6 +20,9 @@ use crate::service_bin::{AssembledServiceBin, AssemblyRecordKind};
 use crate::service_native::{
     load_pinned_service_bin, DynamicOidPinRegistry, NativeRuntimeImagePins,
     NativeServiceArtifactPin, PackageArtifactPin, ServiceBinCacheLookup, ServiceNativeError,
+};
+use crate::service_native_lifetime::{
+    NativeServiceLifetimeLease, NativeServiceLifetimeRegistry,
 };
 use crate::service_oid::OidCache;
 use crate::service_oid_adapter::{
@@ -82,6 +86,136 @@ pub struct BuiltNativeService {
 pub struct NativeRuntimeImageBuild {
     pub pins: NativeRuntimeImagePins,
     pub services: BTreeMap<SourceId, BuiltNativeService>,
+}
+
+/// One fully validated Runtime Image/native-Service generation with a lifetime
+/// lease already acquired. The private lease keeps all dynamic OID meanings and
+/// content-addressed Service plan/bin artifacts alive until the last `Arc` to
+/// this activation is dropped.
+#[derive(Debug)]
+pub struct NativeRuntimeImageActivation {
+    image: Arc<RuntimeImage>,
+    build: Arc<NativeRuntimeImageBuild>,
+    _lifetime: NativeServiceLifetimeLease,
+}
+
+impl NativeRuntimeImageActivation {
+    pub fn image(&self) -> &Arc<RuntimeImage> {
+        &self.image
+    }
+
+    pub fn build(&self) -> &Arc<NativeRuntimeImageBuild> {
+        &self.build
+    }
+
+    pub fn pins(&self) -> &NativeRuntimeImagePins {
+        &self.build.pins
+    }
+
+    pub fn launch(&self, source_id: &SourceId) -> Option<&NativeServiceLaunch> {
+        self.build.services.get(source_id).map(|service| &service.launch)
+    }
+}
+
+/// Atomic A -> B holder for fully built native Runtime Image generations.
+///
+/// Acquiring B's lifetime lease happens before callers can place it in this slot.
+/// Swapping therefore never invalidates A: the returned/borrowed `Arc` keeps A's
+/// lifetime lease until every draining owner releases the old activation.
+pub struct NativeRuntimeImageActivationSlot {
+    current: RwLock<Arc<NativeRuntimeImageActivation>>,
+}
+
+impl NativeRuntimeImageActivationSlot {
+    pub fn new(initial: NativeRuntimeImageActivation) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(initial)),
+        }
+    }
+
+    pub fn snapshot(&self) -> Arc<NativeRuntimeImageActivation> {
+        self.current
+            .read()
+            .expect("native Runtime Image activation slot poisoned")
+            .clone()
+    }
+
+    pub fn activate(
+        &self,
+        next: NativeRuntimeImageActivation,
+    ) -> Arc<NativeRuntimeImageActivation> {
+        let next = Arc::new(next);
+        let mut current = self
+            .current
+            .write()
+            .expect("native Runtime Image activation slot poisoned");
+        std::mem::replace(&mut *current, next)
+    }
+}
+
+/// Turn a completely built Image B into an activation candidate. This validates
+/// the build/pin/launch relationship first and only then acquires its Phase-5
+/// lifetime lease. No active slot is mutated here, so failure always leaves A
+/// untouched.
+pub fn prepare_native_runtime_image_activation(
+    image: RuntimeImage,
+    build: NativeRuntimeImageBuild,
+    lifetimes: &NativeServiceLifetimeRegistry,
+) -> Result<NativeRuntimeImageActivation, NativeServiceBuildError> {
+    validate_activation_build(&image, &build)?;
+    let lifetime = lifetimes
+        .pin_image(&build.pins)
+        .map_err(NativeServiceBuildError::Native)?;
+    Ok(NativeRuntimeImageActivation {
+        image: Arc::new(image),
+        build: Arc::new(build),
+        _lifetime: lifetime,
+    })
+}
+
+fn validate_activation_build(
+    image: &RuntimeImage,
+    build: &NativeRuntimeImageBuild,
+) -> Result<(), NativeServiceBuildError> {
+    build
+        .pins
+        .validate_for_image(image)
+        .map_err(NativeServiceBuildError::Native)?;
+
+    let pin_services = build.pins.services.keys().cloned().collect::<BTreeSet<_>>();
+    let built_services = build.services.keys().cloned().collect::<BTreeSet<_>>();
+    if pin_services != built_services {
+        return Err(NativeServiceBuildError::ArtifactDrift(format!(
+            "Runtime Image {} native build contains Service artifacts {:?}, but immutable pins contain {:?}",
+            image.image_id, built_services, pin_services
+        )));
+    }
+
+    for (source_id, built) in &build.services {
+        let pin = build.pins.services.get(source_id).ok_or_else(|| {
+            NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} has no immutable pin",
+                image.image_id
+            ))
+        })?;
+        if &built.pin != pin {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} build pin differs from the activation pin set",
+                image.image_id
+            )));
+        }
+        if built.launch.source_id != *source_id
+            || built.launch.plan_hash != pin.plan_hash
+            || built.launch.assembly_hash != pin.assembly_hash
+            || built.launch.target_fingerprint != pin.plan.target_fingerprint
+        {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} launch metadata does not match its immutable artifact pin",
+                image.image_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Prepare Image B's linked-REL generation using the exact dynamic OIDs still
