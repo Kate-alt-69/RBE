@@ -40,7 +40,7 @@ impl PublisherClient {
     pub async fn claim_next(&self, worker_id: &str) -> Result<Option<ClaimedDeployment>> {
         let value = self
             .post(
-                "v1/developer/deployment/claim-next",
+                "v1/developer/deployment/source/claim-next",
                 json!({ "workerId": worker_id }),
             )
             .await?;
