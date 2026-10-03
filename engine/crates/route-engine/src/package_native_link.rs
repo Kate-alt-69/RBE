@@ -23,7 +23,10 @@ use crate::service_cache_invalidation::{
     invalidate_service_cache_for_oids, ServiceCacheInvalidationError,
     ServiceCacheInvalidationReport, ServiceCacheProtection,
 };
-use crate::service_oid::{OidCache, OidError, OidIndex, OidRecord, OidRecordKind};
+use crate::service_oid::{
+    OidCache, OidError, OidIndex, OidRecord, OidRecordKind, OID_NATIVE_ABI_VERSION,
+    OID_RECORD_FORMAT_VERSION,
+};
 
 pub type PackageFragmentKey = (String, String);
 
@@ -202,9 +205,7 @@ fn materialize_changed_package_records(
     bindings: &BTreeMap<PackageFragmentKey, u16>,
     fragments: &BTreeMap<PackageFragmentKey, NativeOidFragment>,
 ) -> Result<OidMaterializationReport, PackageNativeLinkError> {
-    let mut written = BTreeSet::new();
-    let mut reused = BTreeSet::new();
-    let mut record_sha256 = BTreeMap::new();
+    let mut report = OidMaterializationReport::default();
 
     for ((package_name, export_id), oid) in bindings {
         let owner = index
@@ -217,46 +218,37 @@ fn materialize_changed_package_records(
                 package: package_name.clone(),
                 export_id: export_id.clone(),
             })?;
-        fragment
-            .validate_for_oid(*oid)
-            .map_err(PackageNativeLinkError::Materialize)?;
 
         let record = OidRecord {
-            record_version: 1,
+            format_version: OID_RECORD_FORMAT_VERSION,
+            native_abi_version: OID_NATIVE_ABI_VERSION,
             oid: *oid,
             kind: OidRecordKind::PackageOperation,
             flags: fragment.flags,
             target: index.target.clone(),
-            name: export_id.clone(),
-            owner: Some(format!("{}@{}", owner.name, owner.version)),
-            source_identity: Some(owner.artifact_sha256.clone()),
-            required_oids: fragment.required_oids.clone(),
-            capabilities: fragment.capabilities.clone(),
+            name: format!("package:{}@{}:{}", owner.name, owner.version, export_id),
+            entry_offset: fragment.entry_offset,
+            alignment: fragment.alignment,
+            required_oids: fragment.required_oids.iter().copied().collect(),
             relocations: fragment.relocations.clone(),
             diagnostics: fragment.diagnostics.clone(),
             machine_code: fragment.machine_code.clone(),
         };
         record.validate().map_err(PackageNativeLinkError::Oid)?;
-        let hash = record
-            .record_hash_hex()
-            .map_err(PackageNativeLinkError::Oid)?;
-        if cache
+        let encoded = record.to_bytes().map_err(PackageNativeLinkError::Oid)?;
+        let hash = hex::encode(Sha256::digest(&encoded));
+        let changed = cache
             .write_record_if_changed(&record)
-            .map_err(PackageNativeLinkError::Oid)?
-        {
-            written.insert(*oid);
+            .map_err(PackageNativeLinkError::Oid)?;
+        report.record_hashes.insert(*oid, hash);
+        if changed {
+            report.changed_oids.insert(*oid);
         } else {
-            reused.insert(*oid);
+            report.unchanged_oids.insert(*oid);
         }
-        record_sha256.insert(*oid, hash);
     }
 
-    Ok(OidMaterializationReport {
-        index_generation: index.generation,
-        written_oids: written,
-        reused_oids: reused,
-        record_sha256,
-    })
+    Ok(report)
 }
 
 fn index_sha256(index: &OidIndex) -> Result<String, PackageNativeLinkError> {
@@ -296,8 +288,12 @@ impl fmt::Display for PackageNativeLinkError {
         match self {
             Self::Oid(error) => write!(formatter, "package OID cache failed: {error}"),
             Self::Bridge(error) => write!(formatter, "package OID reconciliation failed: {error}"),
-            Self::Materialize(error) => write!(formatter, "package OID materialization failed: {error}"),
-            Self::Invalidation(error) => write!(formatter, "package Service cache invalidation failed: {error}"),
+            Self::Materialize(error) => {
+                write!(formatter, "package OID materialization failed: {error}")
+            }
+            Self::Invalidation(error) => {
+                write!(formatter, "package Service cache invalidation failed: {error}")
+            }
             Self::StalePreparation { expected, observed } => write!(
                 formatter,
                 "package OID preparation targeted index {expected}, but live index is now {observed}; prepare again"
