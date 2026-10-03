@@ -139,6 +139,7 @@ pub mod package_native_semantics;
 pub mod rel_image_discovery;
 pub mod rel_native_link;
 pub mod rel_native_lowering;
+pub mod rel_native_service_select;
 pub mod rel_native_semantics;
 pub mod rel_oid_bridge;
 pub mod rel_symbol_discovery;
@@ -200,6 +201,9 @@ pub use rel_host_runtime::{
 };
 pub use rel_image_discovery::{discover_linked_rel_from_runtime_image, RuntimeImageLinkedRelError};
 pub use rel_native_lowering::{lower_linked_rel_function, NativeRelLowering};
+pub use rel_native_service_select::{
+    select_native_services, NativeServiceSelection, NativeServiceSelectionError,
+};
 pub use rel_symbol_discovery::{
     discover_linked_rel_symbols, linked_source_sha256, LinkedRelDiscovery, LinkedRelDiscoveryError,
     LinkedRelSourceRef, LinkedRelSourceUnit,

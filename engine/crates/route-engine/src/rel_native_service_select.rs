@@ -9,7 +9,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::ast::ServiceProgram;
-use crate::oid_link::{LinkedRelKind, LinkedRelSymbolSpec};
+use crate::oid_link::LinkedRelKind;
+#[cfg(test)]
+use crate::oid_link::LinkedRelSymbolSpec;
 use crate::oid_materialize::NativeOidFragment;
 use crate::rel_native_lowering::{lower_linked_rel_function, NativeRelLowering};
 use crate::rel_symbol_discovery::LinkedRelDiscovery;
@@ -112,7 +114,12 @@ fn select_programs(
             .cloned()
             .unwrap_or_default();
 
-        let parsed_exports = runtime.program.exports.iter().cloned().collect::<BTreeSet<_>>();
+        let parsed_exports = runtime
+            .program
+            .exports
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let discovered_exports = exports.keys().cloned().collect::<BTreeSet<_>>();
         if parsed_exports != discovered_exports {
             return Err(NativeServiceSelectionError::ExportSurfaceMismatch {
@@ -219,6 +226,7 @@ fn select_programs(
             symbols: selected_symbols,
             service_roots,
             service_exports,
+            service_lifecycle: BTreeMap::new(),
             reachable_symbols: selected_ids,
         },
         fragments,
@@ -364,6 +372,7 @@ mod tests {
             symbols,
             service_roots: BTreeMap::from([("demo".into(), roots)]),
             service_exports: BTreeMap::from([("demo".into(), export_map)]),
+            service_lifecycle: BTreeMap::new(),
             reachable_symbols,
         }
     }
@@ -434,7 +443,9 @@ mod tests {
         let extra = symbol("module_unused_ready", LinkedRelKind::ModuleExport);
         let mut linked = discovery(&[("ready", "service_demo_ready")], vec![extra]);
         let lifecycle = "service_demo_lifecycle_start".to_string();
-        linked.symbols.push(symbol(&lifecycle, LinkedRelKind::Function));
+        linked
+            .symbols
+            .push(symbol(&lifecycle, LinkedRelKind::Function));
         linked
             .service_roots
             .get_mut("demo")
