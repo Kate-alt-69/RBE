@@ -3,6 +3,7 @@ use core_lib::{
     LibraryCapabilityGrant, LibraryHostCall, LibraryHostCallReply, LibrarySessionBinding,
     MAX_LIBRARY_PAYLOAD_BYTES,
 };
+use ed25519_dalek::{Signer, SigningKey};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::Deserialize;
@@ -13,6 +14,7 @@ pub const CAPABILITY: &str = "crypto";
 const MAX_RANDOM_BYTES: usize = 4096;
 const MAX_DATA_BYTES: usize = 512 * 1024;
 const MAX_KEY_BYTES: usize = 64 * 1024;
+const ED25519_SEED_BYTES: usize = 32;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -42,6 +44,19 @@ struct EqualRequest {
     right_hex: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Ed25519KeyRequest {
+    seed_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Ed25519SignRequest {
+    seed_hex: String,
+    data_hex: String,
+}
+
 pub fn grant() -> anyhow::Result<LibraryCapabilityGrant> {
     LibraryCapabilityGrant::new(
         CAPABILITY,
@@ -51,6 +66,8 @@ pub fn grant() -> anyhow::Result<LibraryCapabilityGrant> {
             "sha256".to_string(),
             "hmac_sha256".to_string(),
             "constant_time_eq".to_string(),
+            "ed25519_public".to_string(),
+            "ed25519_sign".to_string(),
         ],
         MAX_LIBRARY_PAYLOAD_BYTES,
         MAX_LIBRARY_PAYLOAD_BYTES,
@@ -74,6 +91,8 @@ pub fn dispatch_authorized_call(
         "sha256" => sha256(&call.payload)?,
         "hmac_sha256" => hmac_sha256(&call.payload)?,
         "constant_time_eq" => constant_time_eq(&call.payload)?,
+        "ed25519_public" => ed25519_public(&call.payload)?,
+        "ed25519_sign" => ed25519_sign(&call.payload)?,
         other => bail!("unsupported package crypto operation {other:?}"),
     };
     if payload.len() > grant.max_response_bytes {
@@ -141,6 +160,40 @@ fn constant_time_eq(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
         .context("encode package crypto constant-time compare response")
 }
 
+fn ed25519_public(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let request: Ed25519KeyRequest =
+        serde_json::from_slice(payload).context("decode package crypto Ed25519 public-key request")?;
+    let signing_key = decode_ed25519_signing_key(&request.seed_hex)?;
+    serde_json::to_vec(&json!({
+        "public_key_hex": hex::encode(signing_key.verifying_key().to_bytes()),
+    }))
+    .context("encode package crypto Ed25519 public-key response")
+}
+
+fn ed25519_sign(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let request: Ed25519SignRequest =
+        serde_json::from_slice(payload).context("decode package crypto Ed25519 signing request")?;
+    let signing_key = decode_ed25519_signing_key(&request.seed_hex)?;
+    let data = decode_hex_bounded(&request.data_hex, MAX_DATA_BYTES, "data_hex")?;
+    let signature = signing_key.sign(&data);
+    serde_json::to_vec(&json!({
+        "public_key_hex": hex::encode(signing_key.verifying_key().to_bytes()),
+        "signature_hex": hex::encode(signature.to_bytes()),
+    }))
+    .context("encode package crypto Ed25519 signing response")
+}
+
+fn decode_ed25519_signing_key(value: &str) -> anyhow::Result<SigningKey> {
+    let seed = decode_hex_bounded(value, ED25519_SEED_BYTES, "seed_hex")?;
+    let seed: [u8; ED25519_SEED_BYTES] = seed.try_into().map_err(|seed: Vec<u8>| {
+        anyhow::anyhow!(
+            "package crypto Ed25519 seed must contain exactly {ED25519_SEED_BYTES} bytes; observed {}",
+            seed.len()
+        )
+    })?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
 fn decode_hex_bounded(value: &str, max_bytes: usize, label: &str) -> anyhow::Result<Vec<u8>> {
     if value.len() > max_bytes.saturating_mul(2) {
         bail!("package crypto {label} exceeds maximum size");
@@ -151,6 +204,8 @@ fn decode_hex_bounded(value: &str, max_bytes: usize, label: &str) -> anyhow::Res
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::{Signature, Verifier};
+
     use super::*;
 
     #[test]
@@ -168,5 +223,40 @@ mod tests {
         let different_length: serde_json::Value =
             serde_json::from_slice(&different_length).unwrap();
         assert_eq!(different_length["equal"], false);
+    }
+
+    #[test]
+    fn ed25519_signing_is_bounded_and_verifiable() {
+        let seed = [7u8; ED25519_SEED_BYTES];
+        let data = b"dkim-signing-input";
+        let payload = serde_json::to_vec(&json!({
+            "seed_hex": hex::encode(seed),
+            "data_hex": hex::encode(data),
+        }))
+        .unwrap();
+        let response = ed25519_sign(&payload).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        let signature_bytes = hex::decode(response["signature_hex"].as_str().unwrap()).unwrap();
+        let signature = Signature::from_slice(&signature_bytes).unwrap();
+        let signing_key = SigningKey::from_bytes(&seed);
+        signing_key
+            .verifying_key()
+            .verify(data, &signature)
+            .unwrap();
+
+        let invalid = serde_json::to_vec(&json!({
+            "seed_hex": "aa",
+            "data_hex": "00",
+        }))
+        .unwrap();
+        assert!(ed25519_sign(&invalid).is_err());
+    }
+
+    #[test]
+    fn crypto_grant_includes_asymmetric_signing_without_generic_key_operations() {
+        let grant = grant().unwrap();
+        assert!(grant.operations.contains("ed25519_public"));
+        assert!(grant.operations.contains("ed25519_sign"));
+        assert!(!grant.operations.contains("private_key_export"));
     }
 }
