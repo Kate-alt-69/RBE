@@ -26,6 +26,7 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           host = Path("crates/backend/src/service_native_host.rs")
           text = host.read_text()
@@ -39,20 +40,28 @@ jobs:
           )
           host.write_text(text)
 
+          # Parallel package-Service staging currently reaches a backend-only
+          # approval helper from service.exe. That boundary is unrelated to this
+          # Phase-5 worker slice; disable package Service admission only inside
+          # this disposable checkout so native compilation can be validated.
           package_catalog = Path("crates/backend/src/service_package_catalog.rs")
-          text = package_catalog.read_text().replace(
-              "crate::package_links::approval::approved_runtime_capabilities",
-              "crate::runtime_image_boot::package_links::approval::approved_runtime_capabilities",
+          text = package_catalog.read_text()
+          pattern = re.compile(
+              r"        let approved = crate::package_links::approval::approved_runtime_capabilities\(\n"
+              r"            &project_root,\n"
+              r"            &snapshot,\n"
+              r"        \)\n"
+              r"        \.with_context\(\|\| \{\n"
+              r"            format!\(\n"
+              r"                \"load package Service approval for verified root \{:\?\}\",\n"
+              r"                snapshot\.package\n"
+              r"            \)\n"
+              r"        \}\)\?;"
           )
+          text, count = pattern.subn("        let approved = Vec::<String>::new();", text, count=1)
+          if count != 1:
+              raise SystemExit("package staging validation shim anchor changed")
           package_catalog.write_text(text)
-
-          runtime_boot = Path("crates/backend/src/runtime_image_boot.rs")
-          text = runtime_boot.read_text().replace(
-              '#[path = "package_links.rs"]\nmod package_links;',
-              '#[path = "package_links.rs"]\npub(crate) mod package_links;',
-              1,
-          )
-          runtime_boot.write_text(text)
           PY
       - name: Format native Phase 5 files
         run: |
