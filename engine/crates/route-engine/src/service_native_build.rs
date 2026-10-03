@@ -11,6 +11,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use serde::{Deserialize, Serialize};
+
 use crate::rel_native_link::{
     prepare_rel_native_link, PreparedRelNativeLink, RelNativeLinkError, RelNativeLinkReport,
 };
@@ -28,6 +30,8 @@ use crate::service_oid_adapter::{
     ServiceOidAdapterError,
 };
 use crate::source_registry::{RelSourceKind, SourceId};
+
+pub const NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL: &str = "RBE-SERVICE-NATIVE-LAUNCH/1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeServiceBuildSpec {
@@ -68,6 +72,42 @@ pub struct NativeServiceLaunch {
 
 impl NativeServiceLaunch {
     pub fn export(&self, name: &str) -> Option<&NativeServiceLaunchEntry> {
+        self.exports.get(name)
+    }
+}
+
+/// Stable cross-process representation of one native Service export.
+///
+/// `entry_offset` is deliberately `u64` rather than `usize`: the bootstrap is a
+/// serialized process boundary and therefore must not inherit the parent
+/// process's pointer width. The worker will later validate conversion to its
+/// local address size before native execution is enabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeServiceWorkerBootstrapEntry {
+    pub oid: u16,
+    pub entry_offset: u64,
+}
+
+/// Immutable metadata a Service worker will eventually consume before entering
+/// the native execution path. This contract contains no evaluator/source input;
+/// it identifies one exact already-validated Runtime Image assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeServiceWorkerBootstrap {
+    pub protocol: String,
+    pub runtime_image_id: String,
+    pub source_id: String,
+    pub oid_index_generation: u64,
+    pub plan_hash: String,
+    pub assembly_hash: String,
+    pub target_fingerprint: String,
+    pub bin_path: PathBuf,
+    pub exports: BTreeMap<String, NativeServiceWorkerBootstrapEntry>,
+}
+
+impl NativeServiceWorkerBootstrap {
+    pub fn export(&self, name: &str) -> Option<&NativeServiceWorkerBootstrapEntry> {
         self.exports.get(name)
     }
 }
@@ -115,6 +155,66 @@ impl NativeRuntimeImageActivation {
             .services
             .get(source_id)
             .map(|service| &service.launch)
+    }
+
+    /// Freeze the worker-facing bootstrap from the same activation `Arc` that
+    /// owns the native lifetime lease. Producing this frame never switches the
+    /// worker execution mode; it only provides exact immutable launch metadata
+    /// for a later parity-gated native worker path.
+    pub fn worker_bootstrap(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<NativeServiceWorkerBootstrap, NativeServiceBuildError> {
+        let built = self.build.services.get(source_id).ok_or_else(|| {
+            NativeServiceBuildError::InvalidService(format!(
+                "Runtime Image {} has no built native Service {source_id}",
+                self.image.image_id
+            ))
+        })?;
+
+        let bin_path = std::fs::canonicalize(&built.bin_path).map_err(|error| {
+            NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} bin {} cannot be canonicalized for worker bootstrap: {error}",
+                self.image.image_id,
+                built.bin_path.display()
+            ))
+        })?;
+        if !bin_path.is_file() {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} worker bootstrap bin {} is not a file",
+                self.image.image_id,
+                bin_path.display()
+            )));
+        }
+
+        let mut exports = BTreeMap::new();
+        for (name, entry) in &built.launch.exports {
+            let entry_offset = u64::try_from(entry.entry_offset).map_err(|_| {
+                NativeServiceBuildError::InvalidDispatch(format!(
+                    "Service {source_id} export {name:?} entry offset {} cannot cross the worker bootstrap boundary",
+                    entry.entry_offset
+                ))
+            })?;
+            exports.insert(
+                name.clone(),
+                NativeServiceWorkerBootstrapEntry {
+                    oid: entry.oid,
+                    entry_offset,
+                },
+            );
+        }
+
+        Ok(NativeServiceWorkerBootstrap {
+            protocol: NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL.to_string(),
+            runtime_image_id: self.image.image_id.clone(),
+            source_id: source_id.as_str().to_string(),
+            oid_index_generation: built.pin.oid_index_generation,
+            plan_hash: built.launch.plan_hash.clone(),
+            assembly_hash: built.launch.assembly_hash.clone(),
+            target_fingerprint: built.launch.target_fingerprint.clone(),
+            bin_path,
+            exports,
+        })
     }
 }
 
