@@ -934,7 +934,11 @@ impl ServiceManager {
             activity.push(service.active_calls.clone());
         }
         if !wait_for_service_drain(&activity, SERVICE_SHUTDOWN_DRAIN_TIMEOUT).await {
-            tracing::warn!(active_calls = total_active_calls(&activity), timeout_ms = SERVICE_SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64, "service shutdown drain timed out; forcing remaining service processes to stop");
+            tracing::warn!(
+                active_calls = total_active_calls(&activity),
+                timeout_ms = SERVICE_SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64,
+                "service shutdown drain timed out; forcing remaining service processes to stop"
+            );
         }
 
         let mut stops = tokio::task::JoinSet::new();
@@ -1144,7 +1148,11 @@ fn should_restart(policy: RestartPolicy, success: bool) -> bool {
 }
 
 fn next_restart_attempt(current: u32, stable: bool, retry_in_progress: bool) -> u32 {
-    let base = if stable && !retry_in_progress { 0 } else { current };
+    let base = if stable && !retry_in_progress {
+        0
+    } else {
+        current
+    };
     base.saturating_add(1)
 }
 
@@ -1245,7 +1253,9 @@ async fn stop_process(service_name: &str, process: &mut ServiceProcess) {
     .await;
     match tokio::time::timeout(Duration::from_secs(3), process.child.wait()).await {
         Ok(Ok(_)) => {}
-        Ok(Err(error)) => tracing::warn!(service = %service_name, error = %error, "failed while waiting for service shutdown"),
+        Ok(Err(error)) => {
+            tracing::warn!(service = %service_name, error = %error, "failed while waiting for service shutdown")
+        }
         Err(_) => {
             let _ = process.child.kill().await;
             let _ = process.child.wait().await;
@@ -1341,7 +1351,14 @@ where
 fn harden_service_child_environment(command: &mut Command) {
     command.env_clear();
     for name in [
-        "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "RUST_LOG",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "RUST_LOG",
     ] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
@@ -1414,7 +1431,9 @@ async fn spawn_process(
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     if !stem.eq_ignore_ascii_case("service") {
-        anyhow::bail!("ServiceManager process spawning is restricted to the canonical service executable");
+        anyhow::bail!(
+            "ServiceManager process spawning is restricted to the canonical service executable"
+        );
     }
 
     let token = random_token();
@@ -1464,18 +1483,28 @@ async fn spawn_process(
     };
     if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, &token).await {
         cleanup_failed_spawn(&mut child).await;
-        return Err(anyhow::anyhow!("send service {:?} parent bootstrap secret: {error}", file.name));
+        return Err(anyhow::anyhow!(
+            "send service {:?} parent bootstrap secret: {error}",
+            file.name
+        ));
     }
     if let Some(fabric) = fabric {
-        if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, fabric.auth()).await {
+        if let Err(error) = super::write_parent_bootstrap_secret(&mut liveness, fabric.auth()).await
+        {
             cleanup_failed_spawn(&mut child).await;
-            return Err(anyhow::anyhow!("send service {:?} Service Fabric bootstrap secret: {error}", file.name));
+            return Err(anyhow::anyhow!(
+                "send service {:?} Service Fabric bootstrap secret: {error}",
+                file.name
+            ));
         }
     }
     if let Some(runtime_env) = runtime_env {
         if let Err(error) = super::write_parent_bootstrap_json(&mut liveness, runtime_env).await {
             cleanup_failed_spawn(&mut child).await;
-            return Err(anyhow::anyhow!("send service {:?} Runtime ENV snapshot: {error}", file.name));
+            return Err(anyhow::anyhow!(
+                "send service {:?} Runtime ENV snapshot: {error}",
+                file.name
+            ));
         }
     }
     let stdout = match child.stdout.take() {
@@ -1510,20 +1539,33 @@ async fn spawn_process(
         Ok(ready) => ready,
         Err(error) => {
             cleanup_failed_spawn(&mut child).await;
-            return Err(anyhow::anyhow!("service {:?} returned malformed readiness JSON: {error}", file.name));
+            return Err(anyhow::anyhow!(
+                "service {:?} returned malformed readiness JSON: {error}",
+                file.name
+            ));
         }
     };
     if ready.service != file.name {
         cleanup_failed_spawn(&mut child).await;
-        anyhow::bail!("service {:?} readiness identity mismatch: worker reported {:?}", file.name, ready.service);
+        anyhow::bail!(
+            "service {:?} readiness identity mismatch: worker reported {:?}",
+            file.name,
+            ready.service
+        );
     }
     if !ready.address.ip().is_loopback() {
         cleanup_failed_spawn(&mut child).await;
-        anyhow::bail!("service {:?} readiness advertised a non-loopback endpoint", file.name);
+        anyhow::bail!(
+            "service {:?} readiness advertised a non-loopback endpoint",
+            file.name
+        );
     }
     if child.id() != Some(ready.pid) {
         cleanup_failed_spawn(&mut child).await;
-        anyhow::bail!("service {:?} readiness PID does not match child process", file.name);
+        anyhow::bail!(
+            "service {:?} readiness PID does not match child process",
+            file.name
+        );
     }
 
     let service_name = file.name.clone();
@@ -1537,8 +1579,12 @@ async fn spawn_process(
                         tracing::info!(service = %service_name, %output, ".service stdout");
                     }
                 }
-                Ok(Some(ServiceStdoutLine::Oversized)) => tracing::warn!(service = %service_name, max_bytes = SERVICE_STDOUT_LINE_MAX_BYTES, "discarded oversized .service stdout line"),
-                Ok(Some(ServiceStdoutLine::InvalidUtf8)) => tracing::warn!(service = %service_name, "discarded non-UTF-8 .service stdout line"),
+                Ok(Some(ServiceStdoutLine::Oversized)) => {
+                    tracing::warn!(service = %service_name, max_bytes = SERVICE_STDOUT_LINE_MAX_BYTES, "discarded oversized .service stdout line")
+                }
+                Ok(Some(ServiceStdoutLine::InvalidUtf8)) => {
+                    tracing::warn!(service = %service_name, "discarded non-UTF-8 .service stdout line")
+                }
                 Err(error) => {
                     tracing::warn!(service = %service_name, %error, "failed to drain .service stdout");
                     return;
@@ -1573,7 +1619,10 @@ async fn rpc(address: SocketAddr, request: ServiceRequest) -> anyhow::Result<Ser
     }
     let mut payload = serde_json::to_vec(&request)?;
     if payload.len().saturating_add(1) > SERVICE_IPC_REQUEST_MAX_BYTES {
-        anyhow::bail!("service IPC request exceeded {} bytes", SERVICE_IPC_REQUEST_MAX_BYTES);
+        anyhow::bail!(
+            "service IPC request exceeded {} bytes",
+            SERVICE_IPC_REQUEST_MAX_BYTES
+        );
     }
     payload.push(b'\n');
 
@@ -1659,7 +1708,10 @@ mod tests {
     async fn begin_shutdown_closes_service_call_admission() {
         let manager = ServiceManager::default();
         manager.begin_shutdown();
-        let error = manager.call("missing", "run", Vec::new()).await.unwrap_err();
+        let error = manager
+            .call("missing", "run", Vec::new())
+            .await
+            .unwrap_err();
         assert!(matches!(error, ServiceCallError::Unavailable { .. }));
     }
 

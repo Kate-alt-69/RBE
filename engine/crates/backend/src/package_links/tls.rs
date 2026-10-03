@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use core_lib::{LibraryCapabilityGrant, LibraryHostCall, LibrarySessionBinding, MAX_LIBRARY_PAYLOAD_BYTES};
+use core_lib::{
+    LibraryCapabilityGrant, LibraryHostCall, LibrarySessionBinding, MAX_LIBRARY_PAYLOAD_BYTES,
+};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::json;
@@ -110,10 +112,13 @@ pub async fn dispatch_authorized_call(
     if call.capability != CAPABILITY || call.target != CAPABILITY {
         bail!("package TLS call does not match admitted net:tls authority");
     }
-    let accepted = binding
-        .accepted_info()
-        .ok_or_else(|| anyhow::anyhow!("package TLS call arrived before Library Host acceptance"))?;
-    if !accepted.granted_capabilities.contains(REQUIRED_TCP_CAPABILITY) {
+    let accepted = binding.accepted_info().ok_or_else(|| {
+        anyhow::anyhow!("package TLS call arrived before Library Host acceptance")
+    })?;
+    if !accepted
+        .granted_capabilities
+        .contains(REQUIRED_TCP_CAPABILITY)
+    {
         bail!(
             "package net:tls requires an accepted net:tcp grant in the same Library Host session"
         );
@@ -590,7 +595,10 @@ mod tests {
     #[test]
     fn tls_requires_dns_identity_and_rejects_local_names() {
         for host in ["", "127.0.0.1", "::1", "localhost", "mail.local", "printer"] {
-            assert!(validate_tls_host(host).is_err(), "{host:?} must be rejected");
+            assert!(
+                validate_tls_host(host).is_err(),
+                "{host:?} must be rejected"
+            );
         }
         assert!(validate_tls_host("smtp.example.com").is_ok());
     }

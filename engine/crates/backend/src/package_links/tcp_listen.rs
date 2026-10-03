@@ -106,9 +106,9 @@ pub async fn dispatch_authorized_call(
     if call.capability != CAPABILITY || call.target != CAPABILITY {
         bail!("package TCP listener call does not match admitted net:tcp-listen authority");
     }
-    let accepted = binding
-        .accepted_info()
-        .ok_or_else(|| anyhow::anyhow!("package TCP listener call arrived before Library Host acceptance"))?;
+    let accepted = binding.accepted_info().ok_or_else(|| {
+        anyhow::anyhow!("package TCP listener call arrived before Library Host acceptance")
+    })?;
     if !accepted.granted_capabilities.contains(CAPABILITY) {
         bail!("package net:tcp-listen is not granted to the accepted Library Host session");
     }
@@ -136,7 +136,9 @@ pub fn revoke_package(package: &str) {
     }
     if let Some(registry) = CONNECTIONS.get() {
         match registry.lock() {
-            Ok(mut connections) => connections.retain(|_, connection| connection.package != package),
+            Ok(mut connections) => {
+                connections.retain(|_, connection| connection.package != package)
+            }
             Err(poisoned) => poisoned
                 .into_inner()
                 .retain(|_, connection| connection.package != package),
@@ -282,7 +284,10 @@ fn ensure_listener_capacity(owner: &str) -> anyhow::Result<()> {
     if listeners.len() >= MAX_LISTENERS_GLOBAL {
         bail!("package TCP listener registry reached global limit {MAX_LISTENERS_GLOBAL}");
     }
-    if listeners.values().filter(|listener| listener.owner == owner).count()
+    if listeners
+        .values()
+        .filter(|listener| listener.owner == owner)
+        .count()
         >= MAX_LISTENERS_PER_SESSION
     {
         bail!("package TCP listener session reached listener limit {MAX_LISTENERS_PER_SESSION}");
@@ -297,7 +302,10 @@ fn ensure_connection_capacity(owner: &str) -> anyhow::Result<()> {
     if connections.len() >= MAX_CONNECTIONS_GLOBAL {
         bail!("package inbound TCP registry reached global limit {MAX_CONNECTIONS_GLOBAL}");
     }
-    if connections.values().filter(|connection| connection.owner == owner).count()
+    if connections
+        .values()
+        .filter(|connection| connection.owner == owner)
+        .count()
         >= MAX_CONNECTIONS_PER_SESSION
     {
         bail!("package TCP listener session reached accepted-connection limit {MAX_CONNECTIONS_PER_SESSION}");
@@ -421,7 +429,8 @@ fn remove_stale_package_sessions(package: &str, owner: &str) {
         listeners.retain(|_, listener| listener.package != package || listener.owner == owner);
     }
     if let Ok(mut connections) = connection_registry().lock() {
-        connections.retain(|_, connection| connection.package != package || connection.owner == owner);
+        connections
+            .retain(|_, connection| connection.package != package || connection.owner == owner);
     }
 }
 
@@ -456,10 +465,9 @@ fn spawn_listener_reaper(handle: String, package: String, owner: String) {
             };
             if stale {
                 if let Ok(mut listeners) = listener_registry().lock() {
-                    if listeners
-                        .get(&handle)
-                        .is_some_and(|listener| listener.package == package && listener.owner == owner)
-                    {
+                    if listeners.get(&handle).is_some_and(|listener| {
+                        listener.package == package && listener.owner == owner
+                    }) {
                         listeners.remove(&handle);
                     }
                 }
@@ -488,7 +496,8 @@ fn validate_handle(handle: &str, prefix: &str) -> anyhow::Result<()> {
     let Some(value) = handle.strip_prefix(&expected) else {
         bail!("invalid package {prefix} handle");
     };
-    if value.len() != HANDLE_RANDOM_BYTES * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() != HANDLE_RANDOM_BYTES * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         bail!("invalid package {prefix} handle");
     }
     Ok(())
@@ -501,7 +510,12 @@ fn random_handle(prefix: &str) -> String {
 }
 
 fn accept_timeout(value: Option<u64>) -> anyhow::Result<Duration> {
-    bounded_timeout(value, DEFAULT_ACCEPT_TIMEOUT_MS, MAX_ACCEPT_TIMEOUT_MS, "accept")
+    bounded_timeout(
+        value,
+        DEFAULT_ACCEPT_TIMEOUT_MS,
+        MAX_ACCEPT_TIMEOUT_MS,
+        "accept",
+    )
 }
 
 fn io_timeout(value: Option<u64>) -> anyhow::Result<Duration> {

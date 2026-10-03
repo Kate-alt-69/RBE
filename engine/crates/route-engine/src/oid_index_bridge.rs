@@ -13,9 +13,7 @@ use crate::oid_link::{
 };
 use crate::relc::{PackageLinkContext, PackageLinkError};
 use crate::service_native::DynamicOidPinRegistry;
-use crate::service_oid::{
-    OidCache, OidError, OidIndex, PackageOidOwner as IndexedPackageOidOwner,
-};
+use crate::service_oid::{OidCache, OidError, OidIndex, PackageOidOwner as IndexedPackageOidOwner};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageOidIdentity {
@@ -58,7 +56,9 @@ impl PackageIndexDelta {
 pub fn package_specs_from_links(
     links: &PackageLinkContext,
 ) -> Result<Vec<PackageLinkSpec>, OidIndexBridgeError> {
-    links.validate().map_err(OidIndexBridgeError::PackageLinks)?;
+    links
+        .validate()
+        .map_err(OidIndexBridgeError::PackageLinks)?;
     let mut specs = Vec::with_capacity(links.roots.len());
     for (package, root) in &links.roots {
         let mut exports = Vec::with_capacity(root.exports.len());
@@ -89,7 +89,9 @@ pub fn reconcile_package_index(
     desired: &[PackageLinkSpec],
     pinned_oids: &BTreeSet<u16>,
 ) -> Result<PackageIndexDelta, OidIndexBridgeError> {
-    index.validate_structure().map_err(OidIndexBridgeError::Oid)?;
+    index
+        .validate_structure()
+        .map_err(OidIndexBridgeError::Oid)?;
     let previous_generation = index.generation;
     let current = index
         .packages
@@ -159,7 +161,9 @@ pub fn reconcile_package_index(
             .generation
             .checked_add(1)
             .ok_or(OidIndexBridgeError::GenerationExhausted)?;
-        next_index.validate_structure().map_err(OidIndexBridgeError::Oid)?;
+        next_index
+            .validate_structure()
+            .map_err(OidIndexBridgeError::Oid)?;
         *index = next_index;
     }
 
@@ -183,7 +187,9 @@ pub fn reconcile_package_cache(
     let mut next = cache.index().clone();
     let delta = reconcile_package_index(&mut next, desired, pinned_oids)?;
     if delta.changed() {
-        cache.replace_index(next).map_err(OidIndexBridgeError::Oid)?;
+        cache
+            .replace_index(next)
+            .map_err(OidIndexBridgeError::Oid)?;
     }
     Ok(delta)
 }
@@ -242,11 +248,22 @@ pub enum OidIndexBridgeError {
 impl fmt::Display for OidIndexBridgeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PackageLinks(error) => write!(formatter, "verified package-link context is invalid: {error}"),
-            Self::LinkPolicy(error) => write!(formatter, "dynamic package OID reconciliation failed: {error}"),
+            Self::PackageLinks(error) => write!(
+                formatter,
+                "verified package-link context is invalid: {error}"
+            ),
+            Self::LinkPolicy(error) => write!(
+                formatter,
+                "dynamic package OID reconciliation failed: {error}"
+            ),
             Self::Oid(error) => write!(formatter, "project OID index update failed: {error}"),
-            Self::DuplicateOid(oid) => write!(formatter, "package OID {oid} appears more than once while computing ownership delta"),
-            Self::GenerationExhausted => write!(formatter, "OID index generation counter is exhausted"),
+            Self::DuplicateOid(oid) => write!(
+                formatter,
+                "package OID {oid} appears more than once while computing ownership delta"
+            ),
+            Self::GenerationExhausted => {
+                write!(formatter, "OID index generation counter is exhausted")
+            }
         }
     }
 }

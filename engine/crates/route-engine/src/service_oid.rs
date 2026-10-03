@@ -86,7 +86,9 @@ impl fmt::Display for OidError {
                 "native Service OID lowering is not implemented for host target {target}"
             ),
             Self::Exhausted(range) => write!(formatter, "OID range {range} is exhausted"),
-            Self::Invariant(message) => write!(formatter, "OID compiler invariant failed: {message}"),
+            Self::Invariant(message) => {
+                write!(formatter, "OID compiler invariant failed: {message}")
+            }
         }
     }
 }
@@ -1678,7 +1680,10 @@ mod tests {
                 vec!["lib_mail".into(), "lib_mail_send".into()],
             )
             .unwrap();
-        assert_eq!(index.first_free_package_oid().unwrap(), OID_PACKAGE_START + 2);
+        assert_eq!(
+            index.first_free_package_oid().unwrap(),
+            OID_PACKAGE_START + 2
+        );
         index.remove_package("mail");
         assert_eq!(index.first_free_package_oid().unwrap(), OID_PACKAGE_START);
 
@@ -1768,7 +1773,8 @@ mod tests {
     #[test]
     fn aarch64_core_lowering_emits_baseline_leaf_code() {
         let target = fake_target("aarch64", "linux");
-        let add64 = lower_core_machine_code(CoreLowering::Binary64(BinaryOp::Add), &target).unwrap();
+        let add64 =
+            lower_core_machine_code(CoreLowering::Binary64(BinaryOp::Add), &target).unwrap();
         assert_eq!(
             add64,
             [0x8B010000u32.to_le_bytes(), 0xD65F03C0u32.to_le_bytes()].concat()
@@ -1800,7 +1806,10 @@ mod tests {
         assert!(!cache.record_path(5_026).exists());
 
         let file_count = fs::read_dir(cache.root()).unwrap().count();
-        assert!(file_count < 100, "cache must stay sparse, got {file_count} files");
+        assert!(
+            file_count < 100,
+            "cache must stay sparse, got {file_count} files"
+        );
         let _ = fs::remove_dir_all(project);
     }
 

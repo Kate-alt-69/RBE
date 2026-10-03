@@ -68,9 +68,8 @@ pub fn configure_project_root(project_root: &Path) -> anyhow::Result<()> {
             project_root.display()
         )
     })?;
-    let metadata = fs::symlink_metadata(&canonical).with_context(|| {
-        format!("inspect canonical project root: {}", canonical.display())
-    })?;
+    let metadata = fs::symlink_metadata(&canonical)
+        .with_context(|| format!("inspect canonical project root: {}", canonical.display()))?;
     if !metadata.is_dir() {
         bail!("package storage project root is not a directory");
     }
@@ -174,7 +173,12 @@ fn put(package: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
 
     AtomicIo::new()
         .write_atomic(&path, &data)
-        .with_context(|| format!("atomically write package storage object: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "atomically write package storage object: {}",
+                path.display()
+            )
+        })?;
     serde_json::to_vec(&json!({
         "key": request.key,
         "bytes": data.len(),
@@ -245,7 +249,11 @@ fn list(package: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
     };
     let start = prefix
         .as_ref()
-        .map(|components| components.iter().fold(package_root.clone(), |path, part| path.join(part)))
+        .map(|components| {
+            components
+                .iter()
+                .fold(package_root.clone(), |path, part| path.join(part))
+        })
         .unwrap_or_else(|| package_root.clone());
 
     let mut keys = Vec::new();
@@ -254,8 +262,7 @@ fn list(package: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
     keys.sort();
     keys.truncate(limit);
-    serde_json::to_vec(&json!({ "keys": keys }))
-        .context("encode package storage list response")
+    serde_json::to_vec(&json!({ "keys": keys })).context("encode package storage list response")
 }
 
 fn storage_root() -> anyhow::Result<PathBuf> {
@@ -320,7 +327,10 @@ fn ensure_directory(path: &Path) -> anyhow::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                bail!("package storage directory is not a regular directory: {}", path.display());
+                bail!(
+                    "package storage directory is not a regular directory: {}",
+                    path.display()
+                );
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -352,14 +362,22 @@ fn ensure_directory_tree(path: &Path, package_root: &Path) -> anyhow::Result<()>
     Ok(())
 }
 
-fn walk_files(root: &Path, current: &Path, keys: &mut Vec<String>, limit: usize) -> anyhow::Result<()> {
+fn walk_files(
+    root: &Path,
+    current: &Path,
+    keys: &mut Vec<String>,
+    limit: usize,
+) -> anyhow::Result<()> {
     if keys.len() >= limit {
         return Ok(());
     }
     let metadata = match fs::symlink_metadata(current) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("inspect package storage path: {}", current.display())),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect package storage path: {}", current.display()))
+        }
     };
     if metadata.file_type().is_symlink() {
         bail!("package storage list encountered a symlink");

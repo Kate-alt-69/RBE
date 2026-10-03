@@ -72,9 +72,6 @@ mod target;
 mod verified_worker;
 mod worker_source;
 
-pub use rbe_install_executor::{
-    GitSourceAcquisitionPlan, GitSourceReceipt, PinnedManagedToolchain, SourceFileDigest,
-};
 pub use activation::{
     activate_project_target, recover_project_activation, ActivationRuntimeError,
     InstallActivationProof, ProjectActivationResult, ProjectInstallRecovery,
@@ -96,6 +93,9 @@ pub use prepare::{prepare_prebuilt_activation_proofs, PrebuiltPreparationError};
 pub use promotion::{
     promote_artifact, promote_verified_graph, ArtifactPromotionResult, ArtifactPromotionState,
     RootGraphPromotion,
+};
+pub use rbe_install_executor::{
+    GitSourceAcquisitionPlan, GitSourceReceipt, PinnedManagedToolchain, SourceFileDigest,
 };
 pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
@@ -139,7 +139,9 @@ pub enum InstallRuntimeError {
         #[source]
         source: url::ParseError,
     },
-    #[error("install-runtime network URL must use credential-free HTTPS without a fragment: {0:?}")]
+    #[error(
+        "install-runtime network URL must use credential-free HTTPS without a fragment: {0:?}"
+    )]
     UnsafeUrl(String),
     #[error("install-runtime destination is not publicly routable: {0}")]
     NonPublicDestination(String),

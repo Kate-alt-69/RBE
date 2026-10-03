@@ -59,9 +59,7 @@ pub fn read_verified_package_services(
         || inspected.manifest.runtime.entry != snapshot.worker.runtime_entry
         || inspected.manifest.runtime.managed != snapshot.worker.runtime_managed
     {
-        return Err(PackageServiceError::SnapshotDrift(
-            snapshot.package.clone(),
-        ));
+        return Err(PackageServiceError::SnapshotDrift(snapshot.package.clone()));
     }
     if inspected
         .manifest
@@ -69,9 +67,7 @@ pub fn read_verified_package_services(
         .get(PACKAGE_SERVICE_CAPABILITY)
         != Some(&true)
     {
-        return Err(PackageServiceError::SnapshotDrift(
-            snapshot.package.clone(),
-        ));
+        return Err(PackageServiceError::SnapshotDrift(snapshot.package.clone()));
     }
 
     let mut service_entries = inspected
@@ -220,7 +216,9 @@ pub enum PackageServiceError {
     },
     #[error("verified package metadata drifted before service discovery for {0:?}")]
     SnapshotDrift(String),
-    #[error("package {package:?} requests service:package but contains no service/**/*.service source")]
+    #[error(
+        "package {package:?} requests service:package but contains no service/**/*.service source"
+    )]
     CapabilityWithoutService { package: String },
     #[error("package {package:?} contributes {observed} services; maximum is {maximum}")]
     TooManyServices {

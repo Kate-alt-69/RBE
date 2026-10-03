@@ -160,11 +160,12 @@ pub(crate) fn verify_admission_for_plan(
         SYSTEM_RUNTIME_ADMISSION_MAX_BYTES,
         "runtime admission",
     )?;
-    let admission: SystemRuntimeAdmission = serde_json::from_slice(&bytes)
-        .map_err(|source| SystemRuntimeAdmissionError::AdmissionJson {
+    let admission: SystemRuntimeAdmission = serde_json::from_slice(&bytes).map_err(|source| {
+        SystemRuntimeAdmissionError::AdmissionJson {
             path: admission_path.clone(),
             source,
-        })?;
+        }
+    })?;
 
     if admission.format != SYSTEM_RUNTIME_ADMISSION_FORMAT {
         return Err(SystemRuntimeAdmissionError::AdmissionMismatch(format!(
@@ -175,9 +176,7 @@ pub(crate) fn verify_admission_for_plan(
     if admission.runtime != plan.runtime.key()
         || admission.version != plan.version
         || admission.host != plan.host
-        || !admission
-            .artifact_sha256
-            .eq_ignore_ascii_case(&plan.sha256)
+        || !admission.artifact_sha256.eq_ignore_ascii_case(&plan.sha256)
     {
         return Err(SystemRuntimeAdmissionError::AdmissionMismatch(
             "runtime/version/host/artifact identity does not match the cached manifest".into(),
@@ -268,17 +267,18 @@ async fn fetch_manifest(
         }
         bytes.extend_from_slice(&chunk);
     }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| SystemRuntimeAdmissionError::RemoteManifestUtf8)?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| SystemRuntimeAdmissionError::RemoteManifestUtf8)?;
     SystemRuntimeManifest::parse_json(text, request.runtime, &request.host).map_err(Into::into)
 }
 
 async fn download_runtime_artifact(
     artifact: &SystemRuntimeArtifactPlan,
 ) -> Result<(), SystemRuntimeAdmissionError> {
-    let staging_parent = artifact.staging_path.parent().ok_or_else(|| {
-        SystemRuntimeAdmissionError::UnsafePath(artifact.staging_path.clone())
-    })?;
+    let staging_parent = artifact
+        .staging_path
+        .parent()
+        .ok_or_else(|| SystemRuntimeAdmissionError::UnsafePath(artifact.staging_path.clone()))?;
     ensure_no_symlink_components(staging_parent)?;
     std::fs::create_dir_all(staging_parent)?;
     ensure_no_symlink_components(staging_parent)?;
@@ -358,9 +358,10 @@ fn materialize_runtime(
             plan.install_dir.clone(),
         ));
     }
-    let install_parent = plan.install_dir.parent().ok_or_else(|| {
-        SystemRuntimeAdmissionError::UnsafePath(plan.install_dir.clone())
-    })?;
+    let install_parent = plan
+        .install_dir
+        .parent()
+        .ok_or_else(|| SystemRuntimeAdmissionError::UnsafePath(plan.install_dir.clone()))?;
     ensure_no_symlink_components(install_parent)?;
     std::fs::create_dir_all(install_parent)?;
     ensure_no_symlink_components(install_parent)?;
@@ -411,9 +412,9 @@ fn extract_raw_runtime(
         .map_err(|_| SystemRuntimeAdmissionError::UnsafePath(plan.executable.clone()))?;
     validate_relative_path(relative)?;
     let destination = staging_root.join(relative);
-    let parent = destination.parent().ok_or_else(|| {
-        SystemRuntimeAdmissionError::UnsafePath(destination.clone())
-    })?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| SystemRuntimeAdmissionError::UnsafePath(destination.clone()))?;
     std::fs::create_dir_all(parent)?;
     let mut source = File::open(&artifact.staging_path)?;
     let mut target = OpenOptions::new()
@@ -492,9 +493,9 @@ fn extract_zip_runtime(
             std::fs::create_dir_all(&destination)?;
             continue;
         }
-        let parent = destination.parent().ok_or_else(|| {
-            SystemRuntimeAdmissionError::UnsafePath(destination.clone())
-        })?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| SystemRuntimeAdmissionError::UnsafePath(destination.clone()))?;
         std::fs::create_dir_all(parent)?;
         let mut target = OpenOptions::new()
             .write(true)
@@ -545,7 +546,9 @@ fn remove_incomplete_install_dir(path: &Path) -> Result<(), SystemRuntimeAdmissi
     ensure_safe_directory(path)?;
     let admission = path.join(SYSTEM_RUNTIME_ADMISSION_FILE);
     if admission.exists() {
-        return Err(SystemRuntimeAdmissionError::ExistingAdmissionInvalid(path.to_path_buf()));
+        return Err(SystemRuntimeAdmissionError::ExistingAdmissionInvalid(
+            path.to_path_buf(),
+        ));
     }
     std::fs::remove_dir_all(path)?;
     Ok(())
@@ -560,7 +563,10 @@ fn cleanup_staging_file(path: &Path) -> Result<(), SystemRuntimeAdmissionError> 
     Ok(())
 }
 
-fn normalized_zip_path(value: &str, directory: bool) -> Result<String, SystemRuntimeAdmissionError> {
+fn normalized_zip_path(
+    value: &str,
+    directory: bool,
+) -> Result<String, SystemRuntimeAdmissionError> {
     if value.is_empty()
         || value.len() > MAX_RUNTIME_PATH_BYTES
         || value.contains(['\\', '\0', ':'])
@@ -736,7 +742,9 @@ fn relative_utf8(root: &Path, path: &Path) -> Result<String, SystemRuntimeAdmiss
 
 fn validate_sha256(value: &str) -> Result<(), SystemRuntimeAdmissionError> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(SystemRuntimeAdmissionError::InvalidSha256(value.to_string()));
+        return Err(SystemRuntimeAdmissionError::InvalidSha256(
+            value.to_string(),
+        ));
     }
     Ok(())
 }

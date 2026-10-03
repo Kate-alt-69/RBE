@@ -136,11 +136,7 @@ impl ArchivePlan {
         })
     }
 
-    pub fn replace(
-        path: &str,
-        entry: &str,
-        source: &str,
-    ) -> Result<Self, ArchivePlanError> {
+    pub fn replace(path: &str, entry: &str, source: &str) -> Result<Self, ArchivePlanError> {
         let archive = WorkspacePath::parse(path).map_err(ArchivePlanError::Workspace)?;
         let source = WorkspacePath::parse(source).map_err(ArchivePlanError::Workspace)?;
         let format = ArchiveFormat::infer(archive.relative())?;
@@ -212,9 +208,21 @@ mod tests {
 
     #[test]
     fn infers_supported_formats() {
-        assert_eq!(ArchiveFormat::infer("package.zip").unwrap(), ArchiveFormat::Zip);
-        assert_eq!(ArchiveFormat::infer("package.tar.gz").unwrap(), ArchiveFormat::TarGz);
-        assert_eq!(ArchiveFormat::infer("package.tgz").unwrap(), ArchiveFormat::TarGz);
-        assert_eq!(ArchiveFormat::infer("package.tar.xz").unwrap(), ArchiveFormat::TarXz);
+        assert_eq!(
+            ArchiveFormat::infer("package.zip").unwrap(),
+            ArchiveFormat::Zip
+        );
+        assert_eq!(
+            ArchiveFormat::infer("package.tar.gz").unwrap(),
+            ArchiveFormat::TarGz
+        );
+        assert_eq!(
+            ArchiveFormat::infer("package.tgz").unwrap(),
+            ArchiveFormat::TarGz
+        );
+        assert_eq!(
+            ArchiveFormat::infer("package.tar.xz").unwrap(),
+            ArchiveFormat::TarXz
+        );
     }
 }

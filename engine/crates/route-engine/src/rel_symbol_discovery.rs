@@ -14,7 +14,9 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-use crate::ast::{Expr, FunctionDef, ImportTarget, ModuleFile, RouteFile, ServiceProgram, Statement};
+use crate::ast::{
+    Expr, FunctionDef, ImportTarget, ModuleFile, RouteFile, ServiceProgram, Statement,
+};
 use crate::modules::binding_name;
 use crate::oid_link::{LinkedRelKind, LinkedRelSymbolSpec};
 
@@ -57,7 +59,11 @@ impl<'a> LinkedRelSourceUnit<'a> {
         }
     }
 
-    pub fn service(logical_name: impl Into<String>, source: &str, file: &'a ServiceProgram) -> Self {
+    pub fn service(
+        logical_name: impl Into<String>,
+        source: &str,
+        file: &'a ServiceProgram,
+    ) -> Self {
         Self {
             logical_name: logical_name.into(),
             source_sha256: linked_source_sha256(source),
@@ -229,11 +235,7 @@ pub fn discover_linked_rel_symbols(
                             export: export.clone(),
                         });
                     }
-                    let canonical = canonical_symbol_id(&[
-                        "module",
-                        &logical_name,
-                        export,
-                    ])?;
+                    let canonical = canonical_symbol_id(&["module", &logical_name, export])?;
                     let node = meta
                         .function_nodes
                         .get(export)
@@ -299,11 +301,7 @@ pub fn discover_linked_rel_symbols(
                             export: export.clone(),
                         });
                     }
-                    let canonical = canonical_symbol_id(&[
-                        "service",
-                        &logical_name,
-                        export,
-                    ])?;
+                    let canonical = canonical_symbol_id(&["service", &logical_name, export])?;
                     let node = meta
                         .function_nodes
                         .get(export)
@@ -321,7 +319,8 @@ pub fn discover_linked_rel_symbols(
                             descriptor_members: BTreeSet::new(),
                         },
                     )?;
-                    public_services.insert((logical_name.clone(), export.clone()), canonical.clone());
+                    public_services
+                        .insert((logical_name.clone(), export.clone()), canonical.clone());
                     service_roots
                         .entry(logical_name.clone())
                         .or_default()
@@ -372,12 +371,8 @@ pub fn discover_linked_rel_symbols(
                 }
 
                 for class in &file.classes {
-                    let class_canonical = canonical_symbol_id(&[
-                        "service",
-                        &logical_name,
-                        "class",
-                        &class.name,
-                    ])?;
+                    let class_canonical =
+                        canonical_symbol_id(&["service", &logical_name, "class", &class.name])?;
                     let mut member_ids = BTreeSet::new();
                     for method in &class.methods {
                         let node = NodeId::new(
@@ -399,10 +394,8 @@ pub fn discover_linked_rel_symbols(
                                 symbol: format!("{}.{}", class.name, method.name),
                             });
                         }
-                        meta.class_method_nodes.insert(
-                            (class.name.clone(), method.name.clone()),
-                            node.clone(),
-                        );
+                        meta.class_method_nodes
+                            .insert((class.name.clone(), method.name.clone()), node.clone());
                         let method_canonical = canonical_symbol_id(&[
                             "service",
                             &logical_name,
@@ -465,7 +458,13 @@ pub fn discover_linked_rel_symbols(
     for (node_id, node) in &mut nodes {
         let meta = &metas[node_id.unit];
         let mut edges = BTreeSet::new();
-        collect_statement_edges(&node.body, meta, &public_modules, &public_services, &mut edges)?;
+        collect_statement_edges(
+            &node.body,
+            meta,
+            &public_modules,
+            &public_services,
+            &mut edges,
+        )?;
         node.edges = edges;
     }
 
@@ -538,15 +537,12 @@ pub fn discover_linked_rel_symbols(
             ));
         };
         let required_symbols = if candidate.kind == LinkedRelKind::Class {
-            used_class_members.get(canonical).cloned().unwrap_or_default()
+            used_class_members
+                .get(canonical)
+                .cloned()
+                .unwrap_or_default()
         } else if let Some(node) = &candidate.node {
-            first_oid_dependencies(
-                node,
-                canonical,
-                &nodes,
-                &candidate_by_node,
-                &candidates,
-            )?
+            first_oid_dependencies(node, canonical, &nodes, &candidate_by_node, &candidates)?
         } else {
             BTreeSet::new()
         };
@@ -1027,7 +1023,9 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(ids.contains("module_math_publicValue"));
         assert!(ids.contains("service_worker_run"));
-        assert!(!ids.iter().any(|id| id.contains("helper") || id.contains("unused")));
+        assert!(!ids
+            .iter()
+            .any(|id| id.contains("helper") || id.contains("unused")));
     }
 
     #[test]
@@ -1084,9 +1082,9 @@ mod tests {
                 ],
             }],
         };
-        let discovery = discover_linked_rel_symbols(&[
-            LinkedRelSourceUnit::service("worker", "service", &service),
-        ])
+        let discovery = discover_linked_rel_symbols(&[LinkedRelSourceUnit::service(
+            "worker", "service", &service,
+        )])
         .unwrap();
         let by_id = discovery
             .symbols
@@ -1098,7 +1096,10 @@ mod tests {
         assert!(by_id.contains_key(class_id));
         assert!(by_id.contains_key(get_id));
         assert!(!by_id.contains_key("service_worker_class_Cache_method_clear"));
-        assert_eq!(by_id[class_id].required_symbols, BTreeSet::from([get_id.into()]));
+        assert_eq!(
+            by_id[class_id].required_symbols,
+            BTreeSet::from([get_id.into()])
+        );
         assert_eq!(
             by_id["service_worker_run"].required_symbols,
             BTreeSet::from([get_id.into()])
@@ -1119,17 +1120,16 @@ mod tests {
             }],
             classes: Vec::new(),
         };
-        let discovery = discover_linked_rel_symbols(&[
-            LinkedRelSourceUnit::service("daemon", "service", &service),
-        ])
+        let discovery = discover_linked_rel_symbols(&[LinkedRelSourceUnit::service(
+            "daemon", "service", &service,
+        )])
         .unwrap();
         assert_eq!(discovery.symbols.len(), 1);
         assert_eq!(
             discovery.symbols[0].canonical_id,
             "service_daemon_lifecycle_start"
         );
-        assert!(discovery.service_roots["daemon"]
-            .contains("service_daemon_lifecycle_start"));
+        assert!(discovery.service_roots["daemon"].contains("service_daemon_lifecycle_start"));
     }
 
     #[test]
@@ -1145,9 +1145,9 @@ mod tests {
             lifecycle: Vec::new(),
             classes: Vec::new(),
         };
-        let discovery = discover_linked_rel_symbols(&[
-            LinkedRelSourceUnit::service("loop", "service", &service),
-        ])
+        let discovery = discover_linked_rel_symbols(&[LinkedRelSourceUnit::service(
+            "loop", "service", &service,
+        )])
         .unwrap();
         assert_eq!(
             discovery.symbols[0].required_symbols,

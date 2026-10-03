@@ -505,8 +505,13 @@ args = ["install"]
             .replace("kind = \"bun\"", "kind = \"python\"")
             .replace("src/index.js", "src/index.py");
         assert!(LibraryManifest::parse(&python).is_ok());
-        assert!(LibraryManifest::parse(&python.replace("kind = \"python\"", "kind = \"pypy\"")).is_ok());
-        assert!(LibraryManifest::parse(&python.replace("kind = \"python\"", "kind = \"micropython\"")).is_err());
+        assert!(
+            LibraryManifest::parse(&python.replace("kind = \"python\"", "kind = \"pypy\"")).is_ok()
+        );
+        assert!(LibraryManifest::parse(
+            &python.replace("kind = \"python\"", "kind = \"micropython\"")
+        )
+        .is_err());
     }
 
     #[test]

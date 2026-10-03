@@ -168,12 +168,18 @@ fn build_approved_host_sessions(
             .with_context(|| format!("load approved RBE privileges for root {package:?}"))?;
         let mut grants = host::grants_for_verified_requests(&approved)
             .with_context(|| format!("materialize approved RBE privileges for root {package:?}"))?;
-        if approved.iter().any(|capability| capability == tcp::CAPABILITY) {
+        if approved
+            .iter()
+            .any(|capability| capability == tcp::CAPABILITY)
+        {
             grants.push(tcp::grant().with_context(|| {
                 format!("materialize approved TCP privilege for root {package:?}")
             })?);
         }
-        if approved.iter().any(|capability| capability == tls::CAPABILITY) {
+        if approved
+            .iter()
+            .any(|capability| capability == tls::CAPABILITY)
+        {
             grants.push(tls::grant().with_context(|| {
                 format!("materialize approved TLS privilege for root {package:?}")
             })?);
@@ -339,11 +345,11 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
 
             let expected_export_id = canonical_package_export_id(&verified.package, &export.name)
                 .with_context(|| {
-                    format!(
-                        "derive deterministic RPX export identity for {:?} from {:?}",
-                        export.name, verified.package
-                    )
-                })?;
+                format!(
+                    "derive deterministic RPX export identity for {:?} from {:?}",
+                    export.name, verified.package
+                )
+            })?;
             match export.export_id.as_deref() {
                 Some(observed_export_id) => {
                     if observed_export_id != expected_export_id {

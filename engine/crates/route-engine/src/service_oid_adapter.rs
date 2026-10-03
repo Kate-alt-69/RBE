@@ -169,9 +169,15 @@ pub fn build_service_plan_from_oid_cache(
                 maximum: MAX_SERVICE_REQUIRED_OIDS,
             });
         }
-        let record = cache.read_record(oid).map_err(ServiceOidAdapterError::Oid)?;
+        let record = cache
+            .read_record(oid)
+            .map_err(ServiceOidAdapterError::Oid)?;
         let adapted = adapt_oid_record(&record)?;
-        let dependencies = record.required_oids.iter().copied().collect::<BTreeSet<_>>();
+        let dependencies = record
+            .required_oids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         graph.insert(oid, dependencies.clone());
         required.insert(
             oid,
@@ -390,8 +396,7 @@ impl std::error::Error for ServiceOidAdapterError {}
 mod tests {
     use super::*;
     use crate::service_oid::{
-        OidDiagnostic, OidRelocation, OidTarget, OID_NATIVE_ABI_VERSION,
-        OID_RECORD_FORMAT_VERSION,
+        OidDiagnostic, OidRelocation, OidTarget, OID_NATIVE_ABI_VERSION, OID_RECORD_FORMAT_VERSION,
     };
 
     fn function_record(oid: u16, required_oids: Vec<u16>) -> OidRecord {

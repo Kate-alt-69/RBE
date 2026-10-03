@@ -105,9 +105,7 @@ pub(crate) fn installed_rel_host_executor() -> Option<Arc<dyn RelHostExecutor>> 
 /// internal module path. The string error keeps the private installation error
 /// type out of the cross-crate API.
 impl dyn RelHostExecutor {
-    pub fn install_process_executor(
-        executor: Arc<dyn RelHostExecutor>,
-    ) -> Result<(), String> {
+    pub fn install_process_executor(executor: Arc<dyn RelHostExecutor>) -> Result<(), String> {
         install_rel_host_executor(executor).map_err(|error| error.to_string())
     }
 }

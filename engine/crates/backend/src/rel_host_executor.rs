@@ -29,7 +29,10 @@ const MAX_SCRIPT_SOURCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const PROXY_GRACE_SECONDS: u64 = 5;
 
 mod proxy_integrity {
-    include!(concat!(env!("OUT_DIR"), "/library_worker_proxy_integrity.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/library_worker_proxy_integrity.rs"
+    ));
 }
 
 pub struct BackendRelHostExecutor {
@@ -255,9 +258,10 @@ impl BackendRelHostExecutor {
                 format!("could not spawn verified Container Library Worker Proxy: {error}"),
             )
         })?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            rel_error("REL2215", "Container proxy stdin pipe was not created")
-        })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| rel_error("REL2215", "Container proxy stdin pipe was not created"))?;
         stdin.write_all(&bootstrap_bytes).await.map_err(|error| {
             rel_error(
                 "REL2215",
@@ -286,10 +290,7 @@ impl BackendRelHostExecutor {
                 )
             })?
             .map_err(|error| {
-                rel_error(
-                    "REL2215",
-                    format!("Container proxy wait failed: {error}"),
-                )
+                rel_error("REL2215", format!("Container proxy wait failed: {error}"))
             })?;
 
         let result = read_library_worker_proxy_result(&mut Cursor::new(output.stdout)).map_err(
@@ -628,9 +629,7 @@ fn verify_proxy(binary: &Path) -> anyhow::Result<()> {
         || proxy_integrity::LIBRARY_WORKER_PROXY_PUBLIC_KEY_HEX.is_empty()
         || proxy_integrity::LIBRARY_WORKER_PROXY_SIGNATURE_HEX.is_empty()
     {
-        anyhow::bail!(
-            "Library Worker Proxy integrity metadata is absent from this backend build"
-        );
+        anyhow::bail!("Library Worker Proxy integrity metadata is absent from this backend build");
     }
     let metadata = fs::symlink_metadata(binary)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -683,8 +682,8 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 }
 
 fn decode_exact<const N: usize>(hex_value: &str, label: &str) -> anyhow::Result<[u8; N]> {
-    let bytes = hex::decode(hex_value)
-        .map_err(|error| anyhow::anyhow!("invalid {label}: {error}"))?;
+    let bytes =
+        hex::decode(hex_value).map_err(|error| anyhow::anyhow!("invalid {label}: {error}"))?;
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid {label}: expected {N} bytes"))

@@ -147,11 +147,7 @@ impl WorkspacePlan {
         Ok(self)
     }
 
-    pub fn after(
-        &mut self,
-        step: &str,
-        dependency: &str,
-    ) -> Result<&mut Self, WorkspacePlanError> {
+    pub fn after(&mut self, step: &str, dependency: &str) -> Result<&mut Self, WorkspacePlanError> {
         if step == dependency {
             return Err(WorkspacePlanError::Cycle(vec![step.to_string()]));
         }
@@ -184,9 +180,7 @@ impl WorkspacePlan {
                 .collect::<Vec<_>>();
 
             if ready.is_empty() {
-                return Err(WorkspacePlanError::Cycle(
-                    pending.iter().cloned().collect(),
-                ));
+                return Err(WorkspacePlanError::Cycle(pending.iter().cloned().collect()));
             }
             for name in &ready {
                 pending.remove(name);
@@ -281,7 +275,9 @@ mod tests {
             WorkspaceRoot::Project
         );
         assert_eq!(
-            WorkspacePath::parse("??/generated/output.zip").unwrap().root(),
+            WorkspacePath::parse("??/generated/output.zip")
+                .unwrap()
+                .root(),
             WorkspaceRoot::Temp
         );
         assert!(WorkspacePath::parse("??/../escape").is_err());

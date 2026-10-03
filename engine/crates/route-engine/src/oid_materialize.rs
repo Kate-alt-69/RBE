@@ -76,17 +76,15 @@ pub fn materialize_package_records(
         for (export_id, &oid) in &owner.exports {
             let key = (package.clone(), export_id.clone());
             expected.insert(key.clone());
-            let fragment = fragments
-                .get(&key)
-                .ok_or_else(|| OidMaterializeError::MissingPackageFragment {
-                    package: package.clone(),
-                    export_id: export_id.clone(),
-                    oid,
-                })?;
-            let name = format!(
-                "package:{}@{}:{}",
-                package, owner.version, export_id
-            );
+            let fragment =
+                fragments
+                    .get(&key)
+                    .ok_or_else(|| OidMaterializeError::MissingPackageFragment {
+                        package: package.clone(),
+                        export_id: export_id.clone(),
+                        oid,
+                    })?;
+            let name = format!("package:{}@{}:{}", package, owner.version, export_id);
             records.push(build_record(
                 cache,
                 oid,
@@ -122,12 +120,13 @@ pub fn materialize_rel_records(
     let mut records = Vec::with_capacity(bindings.len());
 
     for (canonical_id, binding) in bindings {
-        let fragment = fragments
-            .get(canonical_id)
-            .ok_or_else(|| OidMaterializeError::MissingRelFragment {
-                canonical_id: canonical_id.clone(),
-                oid: binding.oid,
-            })?;
+        let fragment =
+            fragments
+                .get(canonical_id)
+                .ok_or_else(|| OidMaterializeError::MissingRelFragment {
+                    canonical_id: canonical_id.clone(),
+                    oid: binding.oid,
+                })?;
         let mut required = fragment.required_oids.clone();
         for dependency in &binding.required_symbols {
             let target = bindings.get(dependency).ok_or_else(|| {
@@ -297,7 +296,9 @@ mod tests {
     use crate::oid_index_bridge::{package_specs_from_links, reconcile_package_index};
     use crate::oid_link::{LinkedRelKind, LinkedRelSymbolSpec};
     use crate::rel_oid_bridge::reconcile_rel_index;
-    use crate::relc::{PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT};
+    use crate::relc::{
+        PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
+    };
     use crate::service_oid::{OidIndex, OidTarget};
 
     fn sha(ch: char) -> String {

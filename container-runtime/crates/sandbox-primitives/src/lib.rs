@@ -100,7 +100,9 @@ impl SandboxPolicy {
             // HostRule entries. Treating AllowList as valid here would therefore
             // grant ambient host networking while claiming a restriction exists.
             // Fail closed until the network backend can enforce every rule.
-            return Err("network allow-list enforcement is not implemented; refusing ambient network");
+            return Err(
+                "network allow-list enforcement is not implemented; refusing ambient network",
+            );
         }
         if self.max_processes == 0 || self.max_memory_bytes == 0 || self.timeout_ms == 0 {
             return Err("sandbox limits must be non-zero");

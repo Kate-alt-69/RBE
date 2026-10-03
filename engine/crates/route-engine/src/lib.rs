@@ -189,8 +189,8 @@ pub use rel_host_runtime::{
     RelHostExecutionFuture, RelHostExecutor, RelHostOutput, RelHostRequest,
 };
 pub use rel_symbol_discovery::{
-    discover_linked_rel_symbols, linked_source_sha256, LinkedRelDiscovery,
-    LinkedRelDiscoveryError, LinkedRelSourceRef, LinkedRelSourceUnit,
+    discover_linked_rel_symbols, linked_source_sha256, LinkedRelDiscovery, LinkedRelDiscoveryError,
+    LinkedRelSourceRef, LinkedRelSourceUnit,
 };
 pub use relc::{
     compile_runtime_image, discover_physical_rel_sources, PhysicalRelSource, RelcError,

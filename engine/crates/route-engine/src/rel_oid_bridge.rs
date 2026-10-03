@@ -9,9 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::oid_link::{
-    reconcile_rel_oids, LinkedRelBinding, LinkedRelSymbolSpec, OidLinkError,
-};
+use crate::oid_link::{reconcile_rel_oids, LinkedRelBinding, LinkedRelSymbolSpec, OidLinkError};
 use crate::service_oid::{OidCache, OidError, OidIndex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +134,9 @@ pub fn reconcile_rel_index(
             .generation
             .checked_add(1)
             .ok_or(RelOidBridgeError::GenerationExhausted)?;
-        next_index.validate_structure().map_err(RelOidBridgeError::Oid)?;
+        next_index
+            .validate_structure()
+            .map_err(RelOidBridgeError::Oid)?;
         *index = next_index;
     }
 
@@ -192,10 +192,20 @@ impl fmt::Display for RelOidBridgeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Oid(error) => write!(formatter, "linked REL OID index update failed: {error}"),
-            Self::LinkPolicy(error) => write!(formatter, "linked REL OID reconciliation failed: {error}"),
-            Self::DuplicateDesiredSymbol => write!(formatter, "linked REL input contains duplicate canonical symbols"),
-            Self::DuplicateOid(oid) => write!(formatter, "linked REL OID {oid} is bound to more than one canonical symbol"),
-            Self::GenerationExhausted => write!(formatter, "OID index generation counter is exhausted"),
+            Self::LinkPolicy(error) => {
+                write!(formatter, "linked REL OID reconciliation failed: {error}")
+            }
+            Self::DuplicateDesiredSymbol => write!(
+                formatter,
+                "linked REL input contains duplicate canonical symbols"
+            ),
+            Self::DuplicateOid(oid) => write!(
+                formatter,
+                "linked REL OID {oid} is bound to more than one canonical symbol"
+            ),
+            Self::GenerationExhausted => {
+                write!(formatter, "OID index generation counter is exhausted")
+            }
         }
     }
 }
@@ -227,7 +237,11 @@ mod tests {
         let mut index = OidIndex::fresh();
         let report = reconcile_rel_index(
             &mut index,
-            &[symbol("module_users_findUser", LinkedRelKind::ModuleExport, &[])],
+            &[symbol(
+                "module_users_findUser",
+                LinkedRelKind::ModuleExport,
+                &[],
+            )],
             &BTreeSet::new(),
         )
         .unwrap();

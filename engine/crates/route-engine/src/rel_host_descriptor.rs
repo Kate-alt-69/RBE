@@ -43,7 +43,9 @@ pub(crate) fn deferred_call(
 
 pub(crate) fn temp_request(args: &[Value]) -> Result<RelHostRequest, ModuleEvalError> {
     if args.len() != 1 {
-        return Err(error("workspace.temp() expects exactly one deferred host operation"));
+        return Err(error(
+            "workspace.temp() expects exactly one deferred host operation",
+        ));
     }
     let inner = request_from_descriptor(&args[0])?;
     Ok(RelHostRequest::Temp(Box::new(inner)))
@@ -95,10 +97,7 @@ fn script_descriptor(function: &str, args: Vec<Value>) -> Result<Value, ModuleEv
 fn script_plan_value(plan: ScriptPlan) -> Value {
     Value::Object(HashMap::from([
         (MARKER.into(), Value::String("script".into())),
-        (
-            PATH.into(),
-            Value::String(plan.path.workspace().symbolic()),
-        ),
+        (PATH.into(), Value::String(plan.path.workspace().symbolic())),
         (
             "runtime".into(),
             Value::String(plan.path.runtime_identity().into()),
@@ -127,7 +126,9 @@ fn archive_descriptor(function: &str, args: Vec<Value>) -> Result<Value, ModuleE
         "extract" => {
             expect_arity(function, &args, 3)?;
             let Value::Array(entries) = &args[1] else {
-                return Err(error("archive.extract() entries must be an array of strings"));
+                return Err(error(
+                    "archive.extract() entries must be an array of strings",
+                ));
             };
             let mut parsed = Vec::with_capacity(entries.len());
             for entry in entries {
@@ -262,11 +263,8 @@ fn workspace_copy(args: Vec<Value>) -> Result<Value, ModuleEvalError> {
     expect_arity("workspace.copy", &args, 2)?;
     let source = WorkspacePath::parse(string_arg(args.first(), "workspace copy source")?)
         .map_err(|e| error(e.to_string()))?;
-    let destination = WorkspacePath::parse(string_arg(
-        args.get(1),
-        "workspace copy destination",
-    )?)
-    .map_err(|e| error(e.to_string()))?;
+    let destination = WorkspacePath::parse(string_arg(args.get(1), "workspace copy destination")?)
+        .map_err(|e| error(e.to_string()))?;
     Ok(workspace_operation_value(WorkspaceOperation::Copy {
         source,
         destination,
@@ -314,7 +312,9 @@ fn request_from_descriptor(value: &Value) -> Result<RelHostRequest, ModuleEvalEr
     }
 }
 
-fn script_request_from_fields(fields: &HashMap<String, Value>) -> Result<ScriptPlan, ModuleEvalError> {
+fn script_request_from_fields(
+    fields: &HashMap<String, Value>,
+) -> Result<ScriptPlan, ModuleEvalError> {
     let path = string_arg(fields.get(PATH), "deferred script path")?;
     let runtime = string_arg(fields.get("runtime"), "deferred script runtime")?;
     let mut plan = match runtime {
@@ -340,12 +340,16 @@ fn script_request_from_fields(fields: &HashMap<String, Value>) -> Result<ScriptP
             .map_err(|e| error(e.to_string()))?;
     }
     if plan.path.runtime_identity() != runtime {
-        return Err(error("deferred script runtime does not match the validated path"));
+        return Err(error(
+            "deferred script runtime does not match the validated path",
+        ));
     }
     Ok(plan)
 }
 
-fn archive_request_from_fields(fields: &HashMap<String, Value>) -> Result<ArchivePlan, ModuleEvalError> {
+fn archive_request_from_fields(
+    fields: &HashMap<String, Value>,
+) -> Result<ArchivePlan, ModuleEvalError> {
     let operation = string_arg(fields.get(OPERATION), "deferred archive operation")?;
     let plan = match operation {
         "list" => ArchivePlan::list(string_arg(fields.get(PATH), "archive path")?),
@@ -386,7 +390,11 @@ fn archive_request_from_fields(fields: &HashMap<String, Value>) -> Result<Archiv
             string_arg(fields.get(PATH), "archive path")?,
             string_arg(fields.get(ENTRY), "archive entry")?,
         ),
-        other => return Err(error(format!("unknown deferred archive operation {other:?}"))),
+        other => {
+            return Err(error(format!(
+                "unknown deferred archive operation {other:?}"
+            )))
+        }
     };
     plan.map_err(|e| error(e.to_string()))
 }
@@ -416,15 +424,23 @@ fn workspace_request_from_fields(
         "copy" => {
             let source = WorkspacePath::parse(string_arg(fields.get(SOURCE), "copy source")?)
                 .map_err(|e| error(e.to_string()))?;
-            let destination = WorkspacePath::parse(string_arg(
-                fields.get(DESTINATION),
-                "copy destination",
-            )?)
+            let destination =
+                WorkspacePath::parse(string_arg(fields.get(DESTINATION), "copy destination")?)
+                    .map_err(|e| error(e.to_string()))?;
+            plan.step(
+                "operation",
+                WorkspaceOperation::Copy {
+                    source,
+                    destination,
+                },
+            )
             .map_err(|e| error(e.to_string()))?;
-            plan.step("operation", WorkspaceOperation::Copy { source, destination })
-                .map_err(|e| error(e.to_string()))?;
         }
-        other => return Err(error(format!("unknown deferred workspace operation {other:?}"))),
+        other => {
+            return Err(error(format!(
+                "unknown deferred workspace operation {other:?}"
+            )))
+        }
     }
     Ok(plan)
 }
@@ -481,7 +497,9 @@ mod tests {
             panic!("expected descriptor")
         };
         assert!(matches!(fields.get(MARKER), Some(Value::String(value)) if value == "script"));
-        assert!(matches!(fields.get("runtime"), Some(Value::String(value)) if value == "rbe.sys.bunjs"));
+        assert!(
+            matches!(fields.get("runtime"), Some(Value::String(value)) if value == "rbe.sys.bunjs")
+        );
     }
 
     #[test]

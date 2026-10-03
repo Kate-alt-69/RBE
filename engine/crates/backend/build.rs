@@ -30,7 +30,9 @@ fn main() {
     let integrity_dest = Path::new(&out_dir).join("container_integrity.rs");
     let proxy_integrity_dest = Path::new(&out_dir).join("library_worker_proxy_integrity.rs");
     let service_integrity_dest = Path::new(&out_dir).join("service_integrity.rs");
-    let source = std::env::var("RBE_CONTAINER_BIN_PATH").ok().map(PathBuf::from);
+    let source = std::env::var("RBE_CONTAINER_BIN_PATH")
+        .ok()
+        .map(PathBuf::from);
     let proxy_source = std::env::var("RBE_LIBRARY_WORKER_PROXY_BIN_PATH")
         .ok()
         .map(PathBuf::from);
@@ -173,9 +175,7 @@ fn load_signing_key() -> SigningKey {
         panic!("backend/build.rs: RBE_CONTAINER_SIGNING_PRIVATE_KEY is required when building packaged Container dependencies")
     });
     let private_key_bytes = hex::decode(private_key_hex.trim()).unwrap_or_else(|err| {
-        panic!(
-            "backend/build.rs: RBE_CONTAINER_SIGNING_PRIVATE_KEY must be 32-byte hex: {err}"
-        )
+        panic!("backend/build.rs: RBE_CONTAINER_SIGNING_PRIVATE_KEY must be 32-byte hex: {err}")
     });
     let private_key: [u8; 32] = private_key_bytes.try_into().unwrap_or_else(|_| {
         panic!("backend/build.rs: RBE_CONTAINER_SIGNING_PRIVATE_KEY must contain exactly 32 bytes (64 hex characters)")

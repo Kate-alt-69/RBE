@@ -312,10 +312,7 @@ pub fn reconcile_rel_oids(
                 if !occupied.insert(old.oid) {
                     return Err(OidLinkError::OidCollision(old.oid));
                 }
-                bindings.insert(
-                    canonical_id.clone(),
-                    linked_binding(spec, old.oid)?,
-                );
+                bindings.insert(canonical_id.clone(), linked_binding(spec, old.oid)?);
             }
         }
     }
@@ -363,19 +360,21 @@ fn validate_linked_symbol(spec: &LinkedRelSymbolSpec) -> Result<(), OidLinkError
     Ok(())
 }
 
-fn validate_rel_graph(
-    specs: &BTreeMap<String, &LinkedRelSymbolSpec>,
-) -> Result<(), OidLinkError> {
+fn validate_rel_graph(specs: &BTreeMap<String, &LinkedRelSymbolSpec>) -> Result<(), OidLinkError> {
     for (id, spec) in specs {
         for dependency in &spec.required_symbols {
-            let target = specs
-                .get(dependency)
-                .ok_or_else(|| OidLinkError::MissingLinkedDependency {
-                    symbol: id.clone(),
-                    dependency: dependency.clone(),
-                })?;
+            let target =
+                specs
+                    .get(dependency)
+                    .ok_or_else(|| OidLinkError::MissingLinkedDependency {
+                        symbol: id.clone(),
+                        dependency: dependency.clone(),
+                    })?;
             if spec.kind == LinkedRelKind::Class
-                && !matches!(target.kind, LinkedRelKind::Constructor | LinkedRelKind::Method)
+                && !matches!(
+                    target.kind,
+                    LinkedRelKind::Constructor | LinkedRelKind::Method
+                )
             {
                 return Err(OidLinkError::InvalidClassMemberKind {
                     class: id.clone(),
@@ -421,12 +420,13 @@ pub fn rel_edges_by_oid(
     for binding in bindings.values() {
         let mut required = BTreeSet::new();
         for dependency in &binding.required_symbols {
-            let target = bindings
-                .get(dependency)
-                .ok_or_else(|| OidLinkError::MissingLinkedDependency {
-                    symbol: binding.canonical_id.clone(),
-                    dependency: dependency.clone(),
-                })?;
+            let target =
+                bindings
+                    .get(dependency)
+                    .ok_or_else(|| OidLinkError::MissingLinkedDependency {
+                        symbol: binding.canonical_id.clone(),
+                        dependency: dependency.clone(),
+                    })?;
             required.insert(target.oid);
         }
         edges.insert(binding.oid, required);
@@ -583,7 +583,10 @@ mod tests {
     #[test]
     fn canonical_rpx_ids_follow_library_contract() {
         assert_eq!(canonical_package_export_id("mail", "").unwrap(), "lib_mail");
-        assert_eq!(canonical_package_export_id("mail", "send").unwrap(), "lib_mail_send");
+        assert_eq!(
+            canonical_package_export_id("mail", "send").unwrap(),
+            "lib_mail_send"
+        );
         assert_eq!(
             canonical_package_export_id("my-mail", "client/send-fast").unwrap(),
             "lib_my_mail_client_send_fast"
@@ -648,12 +651,8 @@ mod tests {
         .unwrap();
         let pinned_oid = first["mail"].bindings["lib_mail_send"];
         let pinned = BTreeSet::from([pinned_oid]);
-        let second = reconcile_package_oids(
-            &first,
-            &[package("2.0.0", 'b', &["send"])],
-            &pinned,
-        )
-        .unwrap();
+        let second =
+            reconcile_package_oids(&first, &[package("2.0.0", 'b', &["send"])], &pinned).unwrap();
         assert_ne!(second["mail"].bindings["lib_mail_send"], pinned_oid);
         assert_eq!(second["mail"].bindings["lib_mail_send"], 20_086);
     }
@@ -664,7 +663,9 @@ mod tests {
         let mut auth = package("1.0.0", 'b', &["login"]);
         auth.package = "auth".into();
         auth.exports[0].export_id = canonical_package_export_id("auth", "login").unwrap();
-        let first = reconcile_package_oids(&BTreeMap::new(), &[mail, auth.clone()], &BTreeSet::new()).unwrap();
+        let first =
+            reconcile_package_oids(&BTreeMap::new(), &[mail, auth.clone()], &BTreeSet::new())
+                .unwrap();
         let auth_oid = first["auth"].bindings["lib_auth_login"];
 
         let mut files = package("1.0.0", 'c', &["read"]);
@@ -687,7 +688,11 @@ mod tests {
 
     #[test]
     fn compatible_pinned_rel_oid_is_retained() {
-        let desired = vec![rel("module_users_findUser", LinkedRelKind::ModuleExport, &[])];
+        let desired = vec![rel(
+            "module_users_findUser",
+            LinkedRelKind::ModuleExport,
+            &[],
+        )];
         let first = reconcile_rel_oids(&BTreeMap::new(), &desired, &BTreeSet::new()).unwrap();
         let oid = first["module_users_findUser"].oid;
         let second = reconcile_rel_oids(&first, &desired, &BTreeSet::from([oid])).unwrap();
@@ -697,7 +702,11 @@ mod tests {
     #[test]
     fn class_descriptor_stacks_only_constructor_and_method_oids() {
         let desired = vec![
-            rel("class_UserCache", LinkedRelKind::Class, &["ctor_UserCache", "method_UserCache_get"]),
+            rel(
+                "class_UserCache",
+                LinkedRelKind::Class,
+                &["ctor_UserCache", "method_UserCache_get"],
+            ),
             rel("ctor_UserCache", LinkedRelKind::Constructor, &[]),
             rel("method_UserCache_get", LinkedRelKind::Method, &[]),
         ];
@@ -717,10 +726,7 @@ mod tests {
             (30_500, BTreeSet::from([97])),
         ]);
         let reachable = reachable_oids([30_458], &edges);
-        assert_eq!(
-            reachable,
-            BTreeSet::from([96, 20_086, 30_458, 30_459])
-        );
+        assert_eq!(reachable, BTreeSet::from([96, 20_086, 30_458, 30_459]));
         assert!(!reachable.contains(&30_500));
     }
 }

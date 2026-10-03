@@ -151,7 +151,9 @@ pub async fn dispatch_authorized_host_call(
         LIBRARY_LOG_CAPABILITY => dispatch_package_log_call(package, call)?,
         LIBRARY_NET_HTTP_CAPABILITY => dispatch_package_http_call(call).await?,
         LIBRARY_NET_DNS_CAPABILITY => dispatch_package_dns_call(call).await?,
-        tcp_listen::CAPABILITY => tcp_listen::dispatch_authorized_call(package, binding, call).await?,
+        tcp_listen::CAPABILITY => {
+            tcp_listen::dispatch_authorized_call(package, binding, call).await?
+        }
         capability => bail!(
             "trusted Backend dispatcher for package capability {capability:?} is not installed"
         ),

@@ -10,32 +10,12 @@ pub const WORKSPACE_BUILTIN: &str = "workspace";
 pub const SCRIPT_BUILTIN: &str = "script";
 pub const ARCHIVE_BUILTIN: &str = "archive";
 
-pub const WORKSPACE_FUNCTIONS: &[&str] = &[
-    "temp",
-    "construct",
-    "fetch",
-    "copy",
-    "step",
-    "after",
-    "run",
-];
+pub const WORKSPACE_FUNCTIONS: &[&str] =
+    &["temp", "construct", "fetch", "copy", "step", "after", "run"];
 
-pub const SCRIPT_FUNCTIONS: &[&str] = &[
-    "run",
-    "runPyPy",
-    "run_pypy",
-    "runRust",
-    "run_rust",
-];
+pub const SCRIPT_FUNCTIONS: &[&str] = &["run", "runPyPy", "run_pypy", "runRust", "run_rust"];
 
-pub const ARCHIVE_FUNCTIONS: &[&str] = &[
-    "list",
-    "read",
-    "extract",
-    "create",
-    "replace",
-    "remove",
-];
+pub const ARCHIVE_FUNCTIONS: &[&str] = &["list", "read", "extract", "create", "replace", "remove"];
 
 pub fn is_host_builtin(name: &str) -> bool {
     matches!(name, WORKSPACE_BUILTIN | SCRIPT_BUILTIN | ARCHIVE_BUILTIN)

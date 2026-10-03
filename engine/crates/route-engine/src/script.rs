@@ -39,21 +39,28 @@ impl ScriptPath {
     pub fn infer(path: &str) -> Result<Self, ScriptPlanError> {
         let workspace = parse_script_workspace(path)?;
         let lower = workspace.relative().to_ascii_lowercase();
-        let language = if lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".cjs") {
-            ScriptLanguage::JavaScript
-        } else if lower.ends_with(".ts") || lower.ends_with(".mts") || lower.ends_with(".cts") {
-            ScriptLanguage::TypeScript
-        } else if lower.ends_with(".py") {
-            ScriptLanguage::Python
-        } else {
-            return Err(ScriptPlanError::UnsupportedExtension(path.to_string()));
-        };
-        Ok(Self { workspace, language })
+        let language =
+            if lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".cjs") {
+                ScriptLanguage::JavaScript
+            } else if lower.ends_with(".ts") || lower.ends_with(".mts") || lower.ends_with(".cts") {
+                ScriptLanguage::TypeScript
+            } else if lower.ends_with(".py") {
+                ScriptLanguage::Python
+            } else {
+                return Err(ScriptPlanError::UnsupportedExtension(path.to_string()));
+            };
+        Ok(Self {
+            workspace,
+            language,
+        })
     }
 
     pub fn explicit(path: &str, language: ScriptLanguage) -> Result<Self, ScriptPlanError> {
         let workspace = parse_script_workspace(path)?;
-        Ok(Self { workspace, language })
+        Ok(Self {
+            workspace,
+            language,
+        })
     }
 
     pub fn workspace(&self) -> &WorkspacePath {

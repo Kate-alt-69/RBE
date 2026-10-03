@@ -133,7 +133,11 @@ impl ServiceAssemblyPlan {
             return Err(AssemblyError::NoEntryOids);
         }
 
-        let placement = self.placement_order.iter().copied().collect::<BTreeSet<_>>();
+        let placement = self
+            .placement_order
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         if placement.len() != self.placement_order.len()
             || placement != required.keys().copied().collect::<BTreeSet<_>>()
         {
@@ -407,9 +411,7 @@ pub fn assemble_service_bin(
     payload.extend_from_slice(&plan.service_data);
 
     for &oid in &plan.placement_order {
-        let record = records
-            .get(&oid)
-            .expect("record existence verified above");
+        let record = records.get(&oid).expect("record existence verified above");
         let placement = placements
             .get(&oid)
             .expect("placement created for every required OID");
@@ -456,13 +458,13 @@ fn apply_relocation(
                 .get(&target_oid)
                 .ok_or(AssemblyError::RelocationTargetMissing(target_oid))?;
             ensure_patch_bounds(owner, patch, 4)?;
-            let next = patch.checked_add(4).ok_or(AssemblyError::RelocationOverflow)?;
+            let next = patch
+                .checked_add(4)
+                .ok_or(AssemblyError::RelocationOverflow)?;
             let target = add_signed(target.entry, addend)?;
             let delta = (target as i128) - (next as i128);
-            let delta = i32::try_from(delta).map_err(|_| AssemblyError::Rel32OutOfRange {
-                target_oid,
-                delta,
-            })?;
+            let delta = i32::try_from(delta)
+                .map_err(|_| AssemblyError::Rel32OutOfRange { target_oid, delta })?;
             payload[patch..patch + 4].copy_from_slice(&delta.to_le_bytes());
         }
         OidRelocationKind::Abs64ToOid { target_oid, addend } => {
@@ -471,12 +473,16 @@ fn apply_relocation(
                 .ok_or(AssemblyError::RelocationTargetMissing(target_oid))?;
             ensure_patch_bounds(owner, patch, 8)?;
             let absolute = add_signed(target.entry, addend)?;
-            let absolute = u64::try_from(absolute).map_err(|_| AssemblyError::RelocationOverflow)?;
+            let absolute =
+                u64::try_from(absolute).map_err(|_| AssemblyError::RelocationOverflow)?;
             payload[patch..patch + 8].copy_from_slice(&absolute.to_le_bytes());
         }
-        OidRelocationKind::Abs64ToData { data_offset, addend } => {
-            let data_offset = usize::try_from(data_offset)
-                .map_err(|_| AssemblyError::RelocationOverflow)?;
+        OidRelocationKind::Abs64ToData {
+            data_offset,
+            addend,
+        } => {
+            let data_offset =
+                usize::try_from(data_offset).map_err(|_| AssemblyError::RelocationOverflow)?;
             if data_offset > data_len {
                 return Err(AssemblyError::DataRelocationOutOfBounds {
                     offset: data_offset,
@@ -488,7 +494,8 @@ fn apply_relocation(
                 .checked_add(data_offset)
                 .ok_or(AssemblyError::RelocationOverflow)?;
             let absolute = add_signed(base, addend)?;
-            let absolute = u64::try_from(absolute).map_err(|_| AssemblyError::RelocationOverflow)?;
+            let absolute =
+                u64::try_from(absolute).map_err(|_| AssemblyError::RelocationOverflow)?;
             payload[patch..patch + 8].copy_from_slice(&absolute.to_le_bytes());
         }
     }
@@ -665,10 +672,12 @@ fn decode_hex32(value: &str) -> Result<[u8; 32], AssemblyError> {
         label: "hash",
         value: value.to_string(),
     })?;
-    decoded.try_into().map_err(|_| AssemblyError::InvalidSha256 {
-        label: "hash",
-        value: value.to_string(),
-    })
+    decoded
+        .try_into()
+        .map_err(|_| AssemblyError::InvalidSha256 {
+            label: "hash",
+            value: value.to_string(),
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -678,7 +687,10 @@ pub enum AssemblyError {
     InvalidServiceIdentity(String),
     InvalidTargetFingerprint(String),
     InvalidDependencyIdentity(String),
-    InvalidSha256 { label: &'static str, value: String },
+    InvalidSha256 {
+        label: &'static str,
+        value: String,
+    },
     InvalidAlignment(u32),
     DuplicateRequiredOid(u16),
     NoRequiredOids,
@@ -687,29 +699,77 @@ pub enum AssemblyError {
     InvalidPlacementOrder,
     GraphOidNotRequired(u16),
     MissingOidRecord(u16),
-    RecordIdentityMismatch { expected: u16, observed: u16 },
-    RecordHashMismatch { oid: u16, expected: String, observed: String },
-    RecordKindMismatch { oid: u16, expected: AssemblyRecordKind, observed: AssemblyRecordKind },
-    RecordTargetMismatch { oid: u16, expected: String, observed: String },
+    RecordIdentityMismatch {
+        expected: u16,
+        observed: u16,
+    },
+    RecordHashMismatch {
+        oid: u16,
+        expected: String,
+        observed: String,
+    },
+    RecordKindMismatch {
+        oid: u16,
+        expected: AssemblyRecordKind,
+        observed: AssemblyRecordKind,
+    },
+    RecordTargetMismatch {
+        oid: u16,
+        expected: String,
+        observed: String,
+    },
     MissingMachineCode(u16),
     InvalidDescriptorRecord(u16),
-    InvalidEntryOffset { oid: u16, offset: u32, len: usize },
-    InvalidFrameTerminator { oid: u16, kind: AssemblyRecordKind, expected: Option<u16>, observed: Option<u16> },
-    OidDiagnostic { oid: u16, severity: DiagnosticSeverity, code: String },
-    WarningWithoutExecutablePayload { oid: u16, code: String },
+    InvalidEntryOffset {
+        oid: u16,
+        offset: u32,
+        len: usize,
+    },
+    InvalidFrameTerminator {
+        oid: u16,
+        kind: AssemblyRecordKind,
+        expected: Option<u16>,
+        observed: Option<u16>,
+    },
+    OidDiagnostic {
+        oid: u16,
+        severity: DiagnosticSeverity,
+        code: String,
+    },
+    WarningWithoutExecutablePayload {
+        oid: u16,
+        code: String,
+    },
     RelocationTargetMissing(u16),
     RelocationOverflow,
-    Rel32OutOfRange { target_oid: u16, delta: i128 },
-    RelocationPatchOutOfBounds { patch: usize, width: usize, owner_start: usize, owner_len: usize },
-    DataRelocationOutOfBounds { offset: usize, len: usize },
+    Rel32OutOfRange {
+        target_oid: u16,
+        delta: i128,
+    },
+    RelocationPatchOutOfBounds {
+        patch: usize,
+        width: usize,
+        owner_start: usize,
+        owner_len: usize,
+    },
+    DataRelocationOutOfBounds {
+        offset: usize,
+        len: usize,
+    },
     Serialization(String),
     Io(String),
     TargetTooLong,
     BinTooLarge,
     InvalidBinHeader,
-    InvalidBinLength { expected: usize, observed: usize },
+    InvalidBinLength {
+        expected: usize,
+        observed: usize,
+    },
     InvalidBinTarget,
-    AssemblyHashMismatch { expected: String, observed: String },
+    AssemblyHashMismatch {
+        expected: String,
+        observed: String,
+    },
 }
 
 impl fmt::Display for AssemblyError {
@@ -774,7 +834,12 @@ mod tests {
         }
     }
 
-    fn record(oid: u16, kind: AssemblyRecordKind, hash: char, code: Vec<u8>) -> VerifiedAssemblyOidRecord {
+    fn record(
+        oid: u16,
+        kind: AssemblyRecordKind,
+        hash: char,
+        code: Vec<u8>,
+    ) -> VerifiedAssemblyOidRecord {
         VerifiedAssemblyOidRecord {
             oid,
             record_hash: sha(hash),
@@ -817,7 +882,12 @@ mod tests {
     fn assembler_applies_rel32_to_pinned_oid_entry() {
         let caller = 30_458;
         let callee = 30_459;
-        let mut caller_record = record(caller, AssemblyRecordKind::Function, 'a', vec![0xE8, 0, 0, 0, 0]);
+        let mut caller_record = record(
+            caller,
+            AssemblyRecordKind::Function,
+            'a',
+            vec![0xE8, 0, 0, 0, 0],
+        );
         caller_record.relocations.push(OidRelocation {
             offset: 1,
             kind: OidRelocationKind::Rel32ToOid {
@@ -827,7 +897,10 @@ mod tests {
         });
         let records = BTreeMap::from([
             (caller, caller_record),
-            (callee, record(callee, AssemblyRecordKind::Function, 'b', vec![0xC3])),
+            (
+                callee,
+                record(callee, AssemblyRecordKind::Function, 'b', vec![0xC3]),
+            ),
         ]);
         let plan = plan(
             vec![
@@ -847,11 +920,17 @@ mod tests {
         let mut bad = record(oid, AssemblyRecordKind::PackageOperation, 'a', vec![0xC3]);
         bad.frame_terminator = Some(DONE_OID);
         let error = assemble_service_bin(
-            &plan(vec![required(oid, AssemblyRecordKind::PackageOperation, 'a')], vec![oid]),
+            &plan(
+                vec![required(oid, AssemblyRecordKind::PackageOperation, 'a')],
+                vec![oid],
+            ),
             &BTreeMap::from([(oid, bad)]),
         )
         .unwrap_err();
-        assert!(matches!(error, AssemblyError::InvalidFrameTerminator { .. }));
+        assert!(matches!(
+            error,
+            AssemblyError::InvalidFrameTerminator { .. }
+        ));
     }
 
     #[test]
@@ -863,7 +942,10 @@ mod tests {
             error_book_code: "REL2001".into(),
         });
         let bin = assemble_service_bin(
-            &plan(vec![required(oid, AssemblyRecordKind::Function, 'a')], vec![oid]),
+            &plan(
+                vec![required(oid, AssemblyRecordKind::Function, 'a')],
+                vec![oid],
+            ),
             &BTreeMap::from([(oid, warning)]),
         )
         .unwrap();
@@ -879,7 +961,10 @@ mod tests {
             error_book_code: "SVC4201".into(),
         });
         let error = assemble_service_bin(
-            &plan(vec![required(oid, AssemblyRecordKind::Function, 'a')], vec![oid]),
+            &plan(
+                vec![required(oid, AssemblyRecordKind::Function, 'a')],
+                vec![oid],
+            ),
             &BTreeMap::from([(oid, record)]),
         )
         .unwrap_err();
@@ -894,7 +979,10 @@ mod tests {
             record(oid, AssemblyRecordKind::Function, 'a', vec![0x90, 0xC3]),
         )]);
         let bin = assemble_service_bin(
-            &plan(vec![required(oid, AssemblyRecordKind::Function, 'a')], vec![oid]),
+            &plan(
+                vec![required(oid, AssemblyRecordKind::Function, 'a')],
+                vec![oid],
+            ),
             &records,
         )
         .unwrap();
@@ -909,7 +997,10 @@ mod tests {
     #[test]
     fn plan_rejects_unpinned_call_graph_target() {
         let oid = 30_458;
-        let mut plan = plan(vec![required(oid, AssemblyRecordKind::Function, 'a')], vec![oid]);
+        let mut plan = plan(
+            vec![required(oid, AssemblyRecordKind::Function, 'a')],
+            vec![oid],
+        );
         plan.call_graph.insert(oid, BTreeSet::from([30_459]));
         assert!(matches!(
             plan.validate(),

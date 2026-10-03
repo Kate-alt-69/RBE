@@ -64,9 +64,7 @@ pub fn clear_service_oid_cache(project_root: &Path) -> Result<(), OidError> {
 fn recoverable_cache_error(error: &OidError) -> bool {
     matches!(
         error,
-        OidError::InvalidIndex(_)
-            | OidError::InvalidRecord(_)
-            | OidError::TargetMismatch { .. }
+        OidError::InvalidIndex(_) | OidError::InvalidRecord(_) | OidError::TargetMismatch { .. }
     )
 }
 
@@ -89,9 +87,7 @@ mod tests {
         assert!(!recoverable_cache_error(&OidError::UnsupportedTarget(
             "mips64".into()
         )));
-        assert!(!recoverable_cache_error(&OidError::Exhausted(
-            "package"
-        )));
+        assert!(!recoverable_cache_error(&OidError::Exhausted("package")));
         assert!(!recoverable_cache_error(&OidError::Invariant(
             "compiler bug".into()
         )));

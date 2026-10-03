@@ -7,8 +7,8 @@ use rbe_library_resolver::{version_satisfies_requirement, Resolution};
 use rbe_project_package::{ProjectCacheLayout, ProjectPackageLock};
 
 use crate::{
-    current_system_runtime_host, stage_registry_package, AdmittedSystemRuntime, InstallRuntimeError,
-    VerifiedRegistryPackage,
+    current_system_runtime_host, stage_registry_package, AdmittedSystemRuntime,
+    InstallRuntimeError, VerifiedRegistryPackage,
 };
 
 #[derive(Debug)]
@@ -102,9 +102,7 @@ impl VerifiedRootGraph {
             )
             .await
             .map_err(|error| {
-                format!(
-                    "hydrate managed runtime {runtime_key:?} for package {package:?}: {error}"
-                )
+                format!("hydrate managed runtime {runtime_key:?} for package {package:?}: {error}")
             })?;
             require_runtime_version(
                 package,

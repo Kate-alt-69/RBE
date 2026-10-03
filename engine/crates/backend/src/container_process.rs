@@ -46,9 +46,9 @@ impl ContainerProcess {
             );
         }
         verify_container(binary)?;
-        if let Err(error) = REL_HOST_EXECUTOR_INSTALL.get_or_init(|| {
-            rel_host_executor::BackendRelHostExecutor::install(project_root)
-        }) {
+        if let Err(error) = REL_HOST_EXECUTOR_INSTALL
+            .get_or_init(|| rel_host_executor::BackendRelHostExecutor::install(project_root))
+        {
             anyhow::bail!(
                 "REL2216 trusted REL host executor could not be installed: {error}. No unsafe process/PATH fallback is permitted"
             );
