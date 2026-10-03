@@ -45,6 +45,9 @@ fn merge_invalidation(
 ) {
     current.affected_oids.extend(additional.affected_oids);
     current
+        .affected_dependency_keys
+        .extend(additional.affected_dependency_keys);
+    current
         .removed_plan_hashes
         .extend(additional.removed_plan_hashes);
     current
@@ -71,21 +74,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalidation_merge_keeps_ownership_and_record_changes() {
+    fn invalidation_merge_keeps_ownership_record_and_semantic_changes() {
         let mut current = ServiceCacheInvalidationReport {
             affected_oids: BTreeSet::from([20_086]),
+            affected_dependency_keys: BTreeSet::from(["rel-semantic/a".into()]),
             removed_plan_hashes: BTreeSet::from(["a".repeat(64)]),
             retained_assembly_hashes: BTreeSet::from(["b".repeat(64)]),
             ..ServiceCacheInvalidationReport::default()
         };
         let additional = ServiceCacheInvalidationReport {
             affected_oids: BTreeSet::from([20_087]),
+            affected_dependency_keys: BTreeSet::from(["rel-semantic/b".into()]),
             removed_assembly_hashes: BTreeSet::from(["c".repeat(64)]),
             retained_plan_hashes: BTreeSet::from(["d".repeat(64)]),
             ..ServiceCacheInvalidationReport::default()
         };
         merge_invalidation(&mut current, additional);
         assert_eq!(current.affected_oids, BTreeSet::from([20_086, 20_087]));
+        assert_eq!(current.affected_dependency_keys.len(), 2);
         assert_eq!(current.removed_plan_hashes.len(), 1);
         assert_eq!(current.removed_assembly_hashes.len(), 1);
         assert_eq!(current.retained_plan_hashes.len(), 1);
