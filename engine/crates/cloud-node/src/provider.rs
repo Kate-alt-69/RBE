@@ -1456,6 +1456,18 @@ fn resolve_secret_value(name: &str, value: &str) -> anyhow::Result<Option<String
             path.display()
         )
     })?;
+    let metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to inspect opened Cloud Node provider credential file {} from {name}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "Cloud Node provider credential source {} from {name} must resolve to a regular file",
+            path.display()
+        );
+    }
     let mut bytes = Vec::new();
     file.take(MAX_PROVIDER_SECRET_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1706,8 +1718,10 @@ mod tests {
     }
 
     #[test]
-    fn credential_file_reference_requires_absolute_path() {
+    fn credential_file_reference_requires_absolute_regular_file() {
         assert!(resolve_secret_value("RBE_TEST_SECRET", "file:relative/token").is_err());
+        let directory = format!("file:{}", std::env::temp_dir().display());
+        assert!(resolve_secret_value("RBE_TEST_SECRET", &directory).is_err());
     }
 
     #[test]

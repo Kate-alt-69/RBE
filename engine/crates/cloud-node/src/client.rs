@@ -24,7 +24,7 @@ pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 const MAX_PROOF_RESPONSE_BYTES: usize = 1024;
 const MAX_SYNC_RESPONSE_BYTES: usize = 4096;
 const MAX_TRANSFER_RESPONSE_BYTES: usize = 4096;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedPeer {
@@ -676,7 +676,7 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(REQUEST_TIMEOUT)
+        .read_timeout(REQUEST_READ_TIMEOUT)
         .build()?)
 }
 
