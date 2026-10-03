@@ -148,6 +148,7 @@ pub mod service_bin;
 pub mod service_cache_invalidation;
 pub mod service_native;
 pub mod service_native_build;
+pub mod service_native_lifetime;
 pub mod service_oid;
 pub mod service_oid_adapter;
 pub mod source_registry;
