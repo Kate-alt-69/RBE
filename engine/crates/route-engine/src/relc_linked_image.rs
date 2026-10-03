@@ -1,10 +1,11 @@
 //! RELC compile product for the native Service/OID pipeline.
 //!
 //! The compatibility RELC entrypoints continue to return only `RuntimeImage`.
-//! Native compilation needs one additional compiler-owned product: the exact
-//! linked-REL reachability snapshot derived from the *same* parsed Runtime Image
-//! and original source bytes. Keeping that pairing explicit prevents backend or
-//! Service code from rebuilding compiler meaning after RELC has finished.
+//! Native compilation needs additional compiler-owned products: the exact
+//! linked-REL reachability snapshot and the whole-Service native selection
+//! derived from the *same* parsed Runtime Image and original source bytes.
+//! Keeping those products paired prevents backend or Service code from
+//! rebuilding compiler meaning after RELC has finished.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -15,12 +16,17 @@ use crate::oid_link::LinkedRelKind;
 use crate::rel_image_discovery::{
     discover_linked_rel_from_runtime_image, RuntimeImageLinkedRelError,
 };
+use crate::rel_native_service_select::{
+    select_native_services, NativeServiceSelection, NativeServiceSelectionError,
+};
 use crate::rel_symbol_discovery::LinkedRelDiscovery;
 use crate::relc::{
     compile_runtime_image_with_packages, PackageLinkContext, PhysicalRelSource, RelcError,
 };
 use crate::runtime_image::RuntimeImage;
-use crate::service_oid::{OID_PACKAGE_END, OID_PACKAGE_START, OID_REL_END, OID_REL_START};
+use crate::service_oid::{
+    OidTarget, OID_PACKAGE_END, OID_PACKAGE_START, OID_REL_END, OID_REL_START,
+};
 
 const MAX_CAPACITY_CONTRIBUTORS: usize = 8;
 
@@ -28,6 +34,10 @@ const MAX_CAPACITY_CONTRIBUTORS: usize = 8;
 pub struct RelcLinkedImage {
     pub image: RuntimeImage,
     pub linked_rel: LinkedRelDiscovery,
+    /// Phase-2 compiler output for the Services that can be lowered completely
+    /// with the current native subset. Phase 3/4 consumes the fragments and
+    /// filtered discovery without rediscovering source or reparsing Service REL.
+    pub native_services: NativeServiceSelection,
 }
 
 impl RelcLinkedImage {
@@ -36,9 +46,9 @@ impl RelcLinkedImage {
     }
 }
 
-/// Compile a Runtime Image and its Phase-4 linked-REL snapshot with no installed
-/// package roots. This mirrors `relc::compile_runtime_image` while preserving the
-/// source bytes needed for native OID identity.
+/// Compile a Runtime Image and its linked-REL/native-Service compiler products
+/// with no installed package roots. This mirrors `relc::compile_runtime_image`
+/// while preserving the source bytes needed for native OID identity.
 pub fn compile_runtime_image_with_linked_rel(
     raw_server_source: &str,
     physical_sources: Vec<PhysicalRelSource>,
@@ -52,10 +62,11 @@ pub fn compile_runtime_image_with_linked_rel(
     )
 }
 
-/// Compile a Runtime Image plus the exact linked-REL snapshot consumed by the
-/// Phase-4 OID allocator. Package resolution remains outside RELC; the supplied
-/// context is the same verified root-only view accepted by the existing compiler
-/// entrypoint.
+/// Compile a Runtime Image plus the exact linked-REL snapshot and Phase-2
+/// native-Service selection consumed by the OID linker.
+///
+/// Package resolution remains outside RELC; the supplied context is the same
+/// verified root-only view accepted by the existing compiler entrypoint.
 pub fn compile_runtime_image_with_packages_and_linked_rel(
     raw_server_source: &str,
     physical_sources: Vec<PhysicalRelSource>,
@@ -88,7 +99,18 @@ pub fn compile_runtime_image_with_packages_and_linked_rel(
     // checked *after* discovery so dead/private helpers do not inflate the count.
     validate_linked_rel_oid_capacity(&linked_rel).map_err(RelcLinkedImageError::Capacity)?;
 
-    Ok(RelcLinkedImage { image, linked_rel })
+    // Phase 2 lowers only whole Services whose complete executable root surface
+    // is supported. Unsupported Services remain explicit evaluator fallbacks and
+    // emit no placeholder fragments. This selection is compiler-owned so later
+    // phases never need to reparse source or recreate symbol meaning.
+    let native_services = select_native_services(&image, &linked_rel, &OidTarget::current())
+        .map_err(RelcLinkedImageError::NativeSelection)?;
+
+    Ok(RelcLinkedImage {
+        image,
+        linked_rel,
+        native_services,
+    })
 }
 
 fn validate_package_oid_capacity(links: &PackageLinkContext) -> Result<(), OidCapacityError> {
@@ -242,6 +264,7 @@ pub enum RelcLinkedImageError {
     Compile(RelcError),
     LinkedRel(RuntimeImageLinkedRelError),
     Capacity(OidCapacityError),
+    NativeSelection(NativeServiceSelectionError),
 }
 
 impl fmt::Display for RelcLinkedImageError {
@@ -257,6 +280,9 @@ impl fmt::Display for RelcLinkedImageError {
                 )
             }
             Self::Capacity(error) => write!(formatter, "{error}"),
+            Self::NativeSelection(error) => {
+                write!(formatter, "RELC native Service selection failed: {error}")
+            }
         }
     }
 }
@@ -266,6 +292,7 @@ impl std::error::Error for RelcLinkedImageError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source_registry::RelSourceKind;
 
     #[test]
     fn fixed_dynamic_capacities_match_the_frozen_range_map() {
@@ -316,5 +343,32 @@ mod tests {
         assert!(rendered.contains("reachable package operations: 10502"));
         assert!(rendered.contains("capacity: 10371"));
         assert!(rendered.contains("giant-sdk: 8900"));
+    }
+
+    #[test]
+    fn compiler_product_carries_native_service_selection_without_reparse() {
+        let service = PhysicalRelSource::new(
+            RelSourceKind::Service,
+            "demo",
+            "services/demo.service",
+            r#"
+                :service[name = demo]
+                export function ready() {
+                    return true;
+                }
+            "#,
+        );
+
+        let product = compile_runtime_image_with_linked_rel(
+            "server Main {}",
+            vec![service],
+            &serde_json::json!({}),
+        )
+        .expect("compile linked Runtime Image with native Service selection");
+
+        assert!(product.native_services.native_services.contains("demo"));
+        assert_eq!(product.native_services.fragments.len(), 1);
+        assert!(product.native_services.evaluator_fallbacks.is_empty());
+        assert_eq!(product.native_services.discovery.service_exports.len(), 1);
     }
 }
