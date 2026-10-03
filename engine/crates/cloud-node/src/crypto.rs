@@ -38,6 +38,18 @@ fn resolve_signing_key_value(value: &str) -> anyhow::Result<String> {
     if !path.is_absolute() {
         anyhow::bail!("{CLOUD_NODE_PRIVATE_KEY_ENV} file: path must be absolute");
     }
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to inspect Cloud Node private-key file {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "Cloud Node private-key source {} must resolve to a regular file",
+            path.display()
+        );
+    }
     let file = std::fs::File::open(path).map_err(|error| {
         anyhow::anyhow!(
             "failed to open Cloud Node private-key file {}: {error}",
@@ -169,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn private_key_file_indirection_rejects_relative_and_oversized_sources() {
+    fn private_key_file_indirection_rejects_relative_oversized_and_non_file_sources() {
         assert!(load_signing_key_value("file:relative.secret").is_err());
 
         let unique = SystemTime::now()
@@ -183,5 +195,13 @@ mod tests {
         fs::write(&path, vec![b'a'; (MAX_PRIVATE_KEY_FILE_BYTES + 1) as usize]).unwrap();
         assert!(load_signing_key_value(&format!("file:{}", path.display())).is_err());
         let _ = fs::remove_file(path);
+
+        let directory = std::env::temp_dir().join(format!(
+            "rbe-cn-private-key-directory-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        assert!(load_signing_key_value(&format!("file:{}", directory.display())).is_err());
+        let _ = fs::remove_dir_all(directory);
     }
 }
