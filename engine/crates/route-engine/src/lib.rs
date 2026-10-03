@@ -140,6 +140,7 @@ pub mod rel_native_link;
 pub mod rel_oid_bridge;
 pub mod rel_symbol_discovery;
 pub mod relc;
+pub mod relc_linked_image;
 pub mod runtime_env;
 pub mod runtime_image;
 pub mod script;
