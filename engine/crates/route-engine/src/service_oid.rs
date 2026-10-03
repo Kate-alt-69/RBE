@@ -39,6 +39,8 @@ pub const OID_FLAG_CALLABLE_LEAF: u32 = 1 << 0;
 pub const OID_FLAG_CORE: u32 = 1 << 1;
 pub const OID_FLAG_SENTINEL: u32 = 1 << 2;
 pub const OID_FLAG_BASELINE_CPU: u32 = 1 << 3;
+/// Native callable returns a canonical REL Boolean as integer 0/1 in the platform result register.
+pub const OID_FLAG_RETURNS_BOOL: u32 = 1 << 4;
 
 const INDEX_MAGIC: [u8; 8] = *b"RBEOIDX1";
 const RECORD_MAGIC: [u8; 8] = *b"RBEOIDR1";
@@ -1294,6 +1296,13 @@ fn ensure_supported_native_target(target: &OidTarget) -> Result<(), OidError> {
         "x86_64" | "aarch64" => Ok(()),
         _ => Err(OidError::UnsupportedTarget(target.label())),
     }
+}
+
+pub(crate) fn lower_native_bool_return(
+    value: bool,
+    target: &OidTarget,
+) -> Result<Vec<u8>, OidError> {
+    lower_core_machine_code(CoreLowering::ReturnBool(value), target)
 }
 
 fn lower_core_machine_code(
