@@ -20,10 +20,9 @@ use service_runtime::{
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+use route_engine::service_native_build::NativeServiceWorkerBootstrap;
 use route_engine::service_native_worker::NativeServiceExecutor;
-use route_engine::{
-    verify_native_service_worker_bootstrap, NativeServiceWorkerBootstrap, RelSourceKind, SourceId,
-};
+use route_engine::{verify_native_service_worker_bootstrap, RelSourceKind, SourceId};
 
 pub const NATIVE_SERVICE_RUNTIME_ENV_KEY: &str = "__rbeNativeServiceWorkerV1";
 pub const NATIVE_SERVICE_HOST_PROTOCOL: &str = "RBE-SERVICE-NATIVE-HOST/1";
@@ -673,6 +672,7 @@ fn apply_native_memory_limit(memory_limit_mb: u64) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use route_engine::service_native_build::NativeServiceWorkerBootstrapEntry;
 
     #[test]
     fn native_transport_is_removed_before_runtime_env_exposure() {
@@ -688,7 +688,7 @@ mod tests {
             bin_path: std::env::temp_dir().join(format!("{}.bin", "b".repeat(64))),
             exports: BTreeMap::from([(
                 "run".into(),
-                route_engine::NativeServiceWorkerBootstrapEntry {
+                NativeServiceWorkerBootstrapEntry {
                     oid: route_engine::OID_REL_START,
                     entry_offset: 0,
                 },
@@ -729,7 +729,7 @@ mod tests {
             bin_path: std::env::temp_dir().join(format!("{}.bin", "b".repeat(64))),
             exports: BTreeMap::from([(
                 "run".into(),
-                route_engine::NativeServiceWorkerBootstrapEntry {
+                NativeServiceWorkerBootstrapEntry {
                     oid: route_engine::OID_REL_START,
                     entry_offset: 0,
                 },
