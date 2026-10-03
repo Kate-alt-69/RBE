@@ -16,7 +16,9 @@ use crate::rel_native_link::{
     commit_rel_native_link, PreparedRelNativeLink, RelNativeLinkError, RelNativeLinkReport,
     ServiceNativeLinkInput,
 };
-use crate::service_cache_invalidation::ServiceCacheProtection;
+use crate::service_cache_invalidation::{
+    invalidate_service_cache_for_oids, ServiceCacheInvalidationReport, ServiceCacheProtection,
+};
 use crate::service_oid::OidCache;
 
 const REL_SEMANTIC_DEPENDENCY_PREFIX: &str = "rel-semantic/";
@@ -27,6 +29,13 @@ const REL_SEMANTIC_DEPENDENCY_PREFIX: &str = "rel-semantic/";
 /// This is intentionally separate from authorization. Capability fingerprints
 /// are already part of `LinkedRelBinding::identity_sha256`; Runtime Image stays
 /// the authority that validates and lowers actual grants.
+///
+/// The low-level linker invalidates ownership-rebound OIDs before publication.
+/// After materialization we make a second selective pass over the OIDs whose
+/// *encoded sparse record bytes actually changed*. This closes the important
+/// same-OID case: source/capability/native-code changes can keep a numeric OID,
+/// but every unpinned Service plan/bin that consumed the old record hash is
+/// still stale and must be removed before this guarded transaction returns.
 pub fn commit_rel_native_link_with_semantic_dependencies(
     project_root: &Path,
     cache: &mut OidCache,
@@ -36,7 +45,7 @@ pub fn commit_rel_native_link_with_semantic_dependencies(
     protection: &ServiceCacheProtection,
 ) -> Result<RelNativeLinkReport, RelNativeSemanticError> {
     let services = bind_service_semantic_dependencies(&prepared, services)?;
-    commit_rel_native_link(
+    let mut report = commit_rel_native_link(
         project_root,
         cache,
         prepared,
@@ -44,7 +53,16 @@ pub fn commit_rel_native_link_with_semantic_dependencies(
         &services,
         protection,
     )
-    .map_err(RelNativeSemanticError::Link)
+    .map_err(RelNativeSemanticError::Link)?;
+
+    let record_invalidation = invalidate_service_cache_for_oids(
+        project_root,
+        report.materialization.changed_oids.iter().copied(),
+        protection,
+    )
+    .map_err(|error| RelNativeSemanticError::Link(RelNativeLinkError::Invalidation(error)))?;
+    merge_invalidation(&mut report.invalidation, record_invalidation);
+    Ok(report)
 }
 
 /// Return cloned Service inputs with deterministic `rel-semantic/<canonical>`
@@ -101,6 +119,31 @@ pub fn bind_service_semantic_dependencies(
         out.push(service);
     }
     Ok(out)
+}
+
+fn merge_invalidation(
+    current: &mut ServiceCacheInvalidationReport,
+    additional: ServiceCacheInvalidationReport,
+) {
+    current.affected_oids.extend(additional.affected_oids);
+    current
+        .removed_plan_hashes
+        .extend(additional.removed_plan_hashes);
+    current
+        .removed_assembly_hashes
+        .extend(additional.removed_assembly_hashes);
+    current
+        .retained_plan_hashes
+        .extend(additional.retained_plan_hashes);
+    current
+        .retained_assembly_hashes
+        .extend(additional.retained_assembly_hashes);
+    current.skipped_unreadable_plans = current
+        .skipped_unreadable_plans
+        .saturating_add(additional.skipped_unreadable_plans);
+    current.skipped_unreadable_bins = current
+        .skipped_unreadable_bins
+        .saturating_add(additional.skipped_unreadable_bins);
 }
 
 fn transitive_symbols(
@@ -218,5 +261,31 @@ mod tests {
             transitive_symbols(&roots, &symbols),
             Err(RelNativeSemanticError::UnknownSymbol(_))
         ));
+    }
+
+    #[test]
+    fn invalidation_reports_merge_without_losing_pin_retention() {
+        let mut current = ServiceCacheInvalidationReport {
+            affected_oids: BTreeSet::from([30_458]),
+            removed_plan_hashes: BTreeSet::from(["a".repeat(64)]),
+            retained_assembly_hashes: BTreeSet::from(["b".repeat(64)]),
+            skipped_unreadable_plans: 1,
+            ..ServiceCacheInvalidationReport::default()
+        };
+        let additional = ServiceCacheInvalidationReport {
+            affected_oids: BTreeSet::from([30_459]),
+            removed_assembly_hashes: BTreeSet::from(["c".repeat(64)]),
+            retained_plan_hashes: BTreeSet::from(["d".repeat(64)]),
+            skipped_unreadable_bins: 2,
+            ..ServiceCacheInvalidationReport::default()
+        };
+        merge_invalidation(&mut current, additional);
+        assert_eq!(current.affected_oids, BTreeSet::from([30_458, 30_459]));
+        assert_eq!(current.skipped_unreadable_plans, 1);
+        assert_eq!(current.skipped_unreadable_bins, 2);
+        assert_eq!(current.removed_plan_hashes.len(), 1);
+        assert_eq!(current.removed_assembly_hashes.len(), 1);
+        assert_eq!(current.retained_plan_hashes.len(), 1);
+        assert_eq!(current.retained_assembly_hashes.len(), 1);
     }
 }
