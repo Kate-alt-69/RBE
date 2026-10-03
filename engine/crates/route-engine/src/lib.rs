@@ -193,9 +193,7 @@ pub use rel_host_builtins::{
 pub use rel_host_runtime::{
     RelHostExecutionFuture, RelHostExecutor, RelHostOutput, RelHostRequest,
 };
-pub use rel_image_discovery::{
-    discover_linked_rel_from_runtime_image, RuntimeImageLinkedRelError,
-};
+pub use rel_image_discovery::{discover_linked_rel_from_runtime_image, RuntimeImageLinkedRelError};
 pub use rel_symbol_discovery::{
     discover_linked_rel_symbols, linked_source_sha256, LinkedRelDiscovery, LinkedRelDiscoveryError,
     LinkedRelSourceRef, LinkedRelSourceUnit,
