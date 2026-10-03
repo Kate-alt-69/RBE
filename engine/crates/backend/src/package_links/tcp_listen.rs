@@ -13,6 +13,10 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 
 pub const CAPABILITY: &str = "net:tcp-listen";
 const HANDLE_RANDOM_BYTES: usize = 24;
@@ -22,6 +26,9 @@ const MAX_CONNECTIONS_GLOBAL: usize = 512;
 const MAX_CONNECTIONS_PER_SESSION: usize = 32;
 const MAX_WRITE_BYTES: usize = 64 * 1024;
 const MAX_READ_BYTES: usize = 16 * 1024;
+const MAX_CERT_CHAIN_ENTRIES: usize = 8;
+const MAX_CERT_CHAIN_BYTES: usize = 256 * 1024;
+const MAX_PRIVATE_KEY_BYTES: usize = 32 * 1024;
 const DEFAULT_ACCEPT_TIMEOUT_MS: u64 = 30_000;
 const MAX_ACCEPT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_IO_TIMEOUT_MS: u64 = 5_000;
@@ -37,11 +44,17 @@ struct ManagedListener {
     last_touch: Arc<Mutex<Instant>>,
 }
 
+#[derive(Debug)]
+enum ManagedInboundTransport {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
 #[derive(Clone)]
 struct ManagedInboundConnection {
     owner: String,
     package: String,
-    stream: Arc<AsyncMutex<TcpStream>>,
+    stream: Arc<AsyncMutex<Option<ManagedInboundTransport>>>,
 }
 
 static LISTENERS: OnceLock<Mutex<BTreeMap<String, ManagedListener>>> = OnceLock::new();
@@ -76,6 +89,16 @@ struct IoRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StartTlsRequest {
+    handle: String,
+    cert_chain_der: Vec<Vec<u8>>,
+    private_key_pkcs8_der: Vec<u8>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CloseRequest {
     handle: String,
 }
@@ -89,6 +112,7 @@ pub fn grant() -> anyhow::Result<LibraryCapabilityGrant> {
             "accept".to_string(),
             "read".to_string(),
             "write".to_string(),
+            "start_tls".to_string(),
             "close_connection".to_string(),
             "close".to_string(),
         ],
@@ -119,6 +143,7 @@ pub async fn dispatch_authorized_call(
         "accept" => accept(package, &owner, &call.payload).await,
         "read" => read(package, &owner, &call.payload).await,
         "write" => write(package, &owner, &call.payload).await,
+        "start_tls" => start_tls(package, &owner, &call.payload).await,
         "close_connection" => close_connection(package, &owner, &call.payload).await,
         "close" => close_listener(package, &owner, &call.payload),
         other => bail!("unsupported package TCP listener operation {other:?}"),
@@ -225,14 +250,24 @@ async fn read(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec<
     }
     let connection = connection_for(package, owner, &request.handle)?;
     let timeout = io_timeout(request.timeout_ms)?;
-    let mut stream = connection.stream.lock().await;
+    let mut slot = connection.stream.lock().await;
+    let stream = slot
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("package inbound TCP transport is unavailable during transition"))?;
+    let tls = matches!(stream, ManagedInboundTransport::Tls(_));
     let mut data = vec![0u8; request.max_bytes];
-    let read = tokio::time::timeout(timeout, stream.read(&mut data))
+    let future = async {
+        match stream {
+            ManagedInboundTransport::Plain(stream) => stream.read(&mut data).await,
+            ManagedInboundTransport::Tls(stream) => stream.read(&mut data).await,
+        }
+    };
+    let read = tokio::time::timeout(timeout, future)
         .await
         .map_err(|_| anyhow::anyhow!("package net:tcp-listen read timed out"))?
         .context("read accepted package TCP data")?;
     data.truncate(read);
-    serde_json::to_vec(&json!({ "data": data, "eof": read == 0 }))
+    serde_json::to_vec(&json!({ "data": data, "eof": read == 0, "tls": tls }))
         .context("encode package net:tcp-listen read response")
 }
 
@@ -244,8 +279,17 @@ async fn write(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec
     }
     let connection = connection_for(package, owner, &request.handle)?;
     let timeout = io_timeout(request.timeout_ms)?;
-    let mut stream = connection.stream.lock().await;
-    tokio::time::timeout(timeout, stream.write_all(&request.data))
+    let mut slot = connection.stream.lock().await;
+    let stream = slot
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("package inbound TCP transport is unavailable during transition"))?;
+    let future = async {
+        match stream {
+            ManagedInboundTransport::Plain(stream) => stream.write_all(&request.data).await,
+            ManagedInboundTransport::Tls(stream) => stream.write_all(&request.data).await,
+        }
+    };
+    tokio::time::timeout(timeout, future)
         .await
         .map_err(|_| anyhow::anyhow!("package net:tcp-listen write timed out"))?
         .context("write accepted package TCP data")?;
@@ -253,12 +297,125 @@ async fn write(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec
         .context("encode package net:tcp-listen write response")
 }
 
+async fn start_tls(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let request: StartTlsRequest = serde_json::from_slice(payload)
+        .context("decode package net:tcp-listen STARTTLS request")?;
+    validate_tls_material(&request.cert_chain_der, &request.private_key_pkcs8_der)?;
+
+    let connection = connection_for(package, owner, &request.handle)?;
+    let timeout = io_timeout(request.timeout_ms)?;
+    let mut slot = connection.stream.lock().await;
+
+    match slot.as_ref() {
+        Some(ManagedInboundTransport::Tls(_)) => {
+            bail!("package inbound TCP connection is already encrypted")
+        }
+        Some(ManagedInboundTransport::Plain(_)) => {}
+        None => bail!("package inbound TCP transport is unavailable during transition"),
+    }
+
+    let plain = match slot.take() {
+        Some(ManagedInboundTransport::Plain(stream)) => stream,
+        Some(ManagedInboundTransport::Tls(stream)) => {
+            *slot = Some(ManagedInboundTransport::Tls(stream));
+            bail!("package inbound TCP connection is already encrypted");
+        }
+        None => bail!("package inbound TCP transport is unavailable during transition"),
+    };
+
+    let certificates = request
+        .cert_chain_der
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect::<Vec<_>>();
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        request.private_key_pkcs8_der,
+    ));
+    let config = match ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+    {
+        Ok(config) => Arc::new(config),
+        Err(error) => {
+            drop(slot);
+            let _ = remove_connection(package, owner, &request.handle);
+            return Err(anyhow::anyhow!(
+                "package net:tcp-listen TLS certificate/key is invalid; connection was destroyed to prevent plaintext fallback: {error}"
+            ));
+        }
+    };
+
+    let acceptor = TlsAcceptor::from(config);
+    match tokio::time::timeout(timeout, acceptor.accept(plain)).await {
+        Ok(Ok(stream)) => {
+            *slot = Some(ManagedInboundTransport::Tls(Box::new(stream)));
+            serde_json::to_vec(&json!({
+                "handle": request.handle,
+                "tls": true,
+            }))
+            .context("encode package net:tcp-listen STARTTLS response")
+        }
+        Ok(Err(error)) => {
+            drop(slot);
+            let _ = remove_connection(package, owner, &request.handle);
+            bail!(
+                "package net:tcp-listen TLS handshake failed; connection was destroyed to prevent plaintext fallback: {error}"
+            )
+        }
+        Err(_) => {
+            drop(slot);
+            let _ = remove_connection(package, owner, &request.handle);
+            bail!(
+                "package net:tcp-listen TLS handshake timed out; connection was destroyed to prevent plaintext fallback"
+            )
+        }
+    }
+}
+
+fn validate_tls_material(cert_chain: &[Vec<u8>], private_key: &[u8]) -> anyhow::Result<()> {
+    if cert_chain.is_empty() || cert_chain.len() > MAX_CERT_CHAIN_ENTRIES {
+        bail!(
+            "package net:tcp-listen TLS certificate chain must contain 1..={MAX_CERT_CHAIN_ENTRIES} entries"
+        );
+    }
+    let total_cert_bytes = cert_chain
+        .iter()
+        .try_fold(0usize, |total, certificate| {
+            if certificate.is_empty() {
+                bail!("package net:tcp-listen TLS certificate entries cannot be empty");
+            }
+            total
+                .checked_add(certificate.len())
+                .ok_or_else(|| anyhow::anyhow!("package TLS certificate chain size overflow"))
+        })?;
+    if total_cert_bytes > MAX_CERT_CHAIN_BYTES {
+        bail!(
+            "package net:tcp-listen TLS certificate chain exceeds {MAX_CERT_CHAIN_BYTES} bytes"
+        );
+    }
+    if private_key.is_empty() || private_key.len() > MAX_PRIVATE_KEY_BYTES {
+        bail!(
+            "package net:tcp-listen TLS PKCS#8 private key must contain 1..={MAX_PRIVATE_KEY_BYTES} bytes"
+        );
+    }
+    Ok(())
+}
+
 async fn close_connection(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
     let request: CloseRequest = serde_json::from_slice(payload)
         .context("decode package net:tcp-listen close_connection request")?;
     let connection = remove_connection(package, owner, &request.handle)?;
-    let mut stream = connection.stream.lock().await;
-    let _ = stream.shutdown().await;
+    let mut slot = connection.stream.lock().await;
+    if let Some(mut stream) = slot.take() {
+        match &mut stream {
+            ManagedInboundTransport::Plain(stream) => {
+                let _ = stream.shutdown().await;
+            }
+            ManagedInboundTransport::Tls(stream) => {
+                let _ = stream.shutdown().await;
+            }
+        }
+    }
     Ok(Vec::new())
 }
 
@@ -347,7 +504,7 @@ fn insert_connection(package: &str, owner: &str, stream: TcpStream) -> anyhow::R
                 ManagedInboundConnection {
                     owner: owner.to_string(),
                     package: package.to_string(),
-                    stream: Arc::new(AsyncMutex::new(stream)),
+                    stream: Arc::new(AsyncMutex::new(Some(ManagedInboundTransport::Plain(stream)))),
                 },
             );
             return Ok(handle);
@@ -553,6 +710,7 @@ mod tests {
                 "close".to_string(),
                 "close_connection".to_string(),
                 "read".to_string(),
+                "start_tls".to_string(),
                 "write".to_string(),
             ])
         );
@@ -573,5 +731,26 @@ mod tests {
         assert!(validate_handle(&format!("tcp-listen:{}", "a".repeat(48)), "tcp-listen").is_ok());
         assert!(validate_handle(&format!("tcp-in:{}", "b".repeat(48)), "tcp-in").is_ok());
         assert!(validate_handle(&format!("tcp:{}", "c".repeat(48)), "tcp-in").is_err());
+    }
+
+    #[test]
+    fn listener_tls_material_is_bounded() {
+        assert!(validate_tls_material(&[], &[1]).is_err());
+        assert!(validate_tls_material(&[vec![1]], &[]).is_err());
+        assert!(validate_tls_material(&[vec![1]], &[1]).is_ok());
+        assert!(
+            validate_tls_material(
+                &vec![vec![1]; MAX_CERT_CHAIN_ENTRIES + 1],
+                &[1]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tls_material(
+                &[vec![1]],
+                &vec![1; MAX_PRIVATE_KEY_BYTES + 1]
+            )
+            .is_err()
+        );
     }
 }
