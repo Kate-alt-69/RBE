@@ -144,6 +144,7 @@ pub mod script;
 pub mod server_policy;
 pub mod server_rel;
 pub mod service_bin;
+pub mod service_cache_invalidation;
 pub mod service_native;
 pub mod service_native_build;
 pub mod service_oid;
@@ -181,7 +182,7 @@ pub use oid_cache_bootstrap::{
     clear_service_oid_cache, oid_cache_root, open_service_oid_cache, prepare_service_oid_cache,
 };
 pub use parser::ParseError;
-pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
+pub use paths::{binary_dir, default_api_dir, resolve_custom_import};
 pub use rel_host_builtins::{
     allowed_for_role as host_builtin_allowed_for_role,
     function_exists as host_builtin_function_exists, is_host_builtin, ARCHIVE_BUILTIN,
