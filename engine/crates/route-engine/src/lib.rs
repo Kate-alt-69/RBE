@@ -139,8 +139,8 @@ pub mod package_native_semantics;
 pub mod rel_image_discovery;
 pub mod rel_native_link;
 pub mod rel_native_lowering;
-pub mod rel_native_service_select;
 pub mod rel_native_semantics;
+pub mod rel_native_service_select;
 pub mod rel_oid_bridge;
 pub mod rel_symbol_discovery;
 pub mod relc;
@@ -155,6 +155,7 @@ pub mod service_cache_invalidation;
 pub mod service_native;
 pub mod service_native_build;
 pub mod service_native_lifetime;
+pub mod service_native_worker;
 pub mod service_oid;
 pub mod service_oid_adapter;
 pub mod source_registry;
@@ -224,6 +225,10 @@ pub use server_rel::{
     ServerSettingBody, ServerValue,
 };
 pub use service_eval::ServiceProgramExecutor;
+pub use service_native_worker::{
+    verify_native_service_worker_bootstrap, NativeServiceWorkerBootstrapError,
+    VerifiedNativeServiceWorkerBootstrap, VerifiedNativeServiceWorkerEntry,
+};
 pub use service_oid::{
     CoreMaterializationReport, OidCache, OidDiagnostic, OidDiagnosticSeverity, OidError, OidIndex,
     OidRecord, OidRecordKind, OidRelocation, OidRelocationKind, OidSlotClass, OidTarget,

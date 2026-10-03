@@ -42,10 +42,7 @@ fn native_worker_bootstrap_json_round_trip_is_stable() {
     assert_eq!(value["exports"]["run"]["oid"], 30_458);
     assert_eq!(value["exports"]["run"]["entryOffset"], large_offset);
     assert_eq!(value["lifecycle"]["start"]["oid"], 30_459);
-    assert_eq!(
-        value["lifecycle"]["start"]["entryOffset"],
-        large_offset + 8
-    );
+    assert_eq!(value["lifecycle"]["start"]["entryOffset"], large_offset + 8);
     assert!(value.get("runtime_image_id").is_none());
     assert!(value.get("entry_offset").is_none());
 
