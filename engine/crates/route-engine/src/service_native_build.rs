@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 
 use crate::runtime_image::RuntimeImage;
 use crate::service_native::{
-    load_pinned_service_bin, NativeRuntimeImagePins, NativeServiceArtifactPin,
-    PackageArtifactPin, ServiceBinCacheLookup, ServiceNativeError,
+    load_pinned_service_bin, NativeRuntimeImagePins, NativeServiceArtifactPin, PackageArtifactPin,
+    ServiceBinCacheLookup, ServiceNativeError,
 };
 use crate::service_oid::OidCache;
 use crate::service_oid_adapter::{
-    assemble_service_from_oid_cache, build_service_plan_from_oid_cache,
-    write_service_plan_atomic, ServiceOidAdapterError,
+    assemble_service_from_oid_cache, build_service_plan_from_oid_cache, write_service_plan_atomic,
+    ServiceOidAdapterError,
 };
 use crate::source_registry::{RelSourceKind, SourceId};
 
@@ -56,11 +56,8 @@ pub fn build_native_service_artifact(
 ) -> Result<BuiltNativeService, NativeServiceBuildError> {
     validate_service_target(image, &spec.source_id)?;
 
-    let dependency_hashes = bind_package_dependencies(
-        spec.dependency_hashes,
-        &spec.packages,
-        &spec.source_id,
-    )?;
+    let dependency_hashes =
+        bind_package_dependencies(spec.dependency_hashes, &spec.packages, &spec.source_id)?;
 
     let plan = build_service_plan_from_oid_cache(
         cache,
@@ -288,10 +285,16 @@ impl fmt::Display for NativeServiceBuildError {
                 write!(formatter, "native Service compiler adapter failed: {error}")
             }
             Self::Native(error) => {
-                write!(formatter, "native Service pin/cache validation failed: {error}")
+                write!(
+                    formatter,
+                    "native Service pin/cache validation failed: {error}"
+                )
             }
             Self::DuplicateService(source) => {
-                write!(formatter, "native Runtime Image build repeats Service {source}")
+                write!(
+                    formatter,
+                    "native Runtime Image build repeats Service {source}"
+                )
             }
             Self::InvalidService(message)
             | Self::DependencyConflict(message)
