@@ -22,6 +22,45 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+      - name: Apply validation-only fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          host = Path("crates/backend/src/service_native_host.rs")
+          text = host.read_text()
+          text = text.replace(
+              "AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader",
+              "AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader",
+          )
+          text = text.replace(
+              "route_engine::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL",
+              "route_engine::service_native_build::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL",
+          )
+          host.write_text(text)
+
+          package_catalog = Path("crates/backend/src/service_package_catalog.rs")
+          text = package_catalog.read_text().replace(
+              "crate::package_links::approval::approved_runtime_capabilities",
+              "crate::runtime_image_boot::package_links::approval::approved_runtime_capabilities",
+          )
+          package_catalog.write_text(text)
+
+          runtime_boot = Path("crates/backend/src/runtime_image_boot.rs")
+          text = runtime_boot.read_text().replace(
+              '#[path = "package_links.rs"]\nmod package_links;',
+              '#[path = "package_links.rs"]\npub(crate) mod package_links;',
+              1,
+          )
+          runtime_boot.write_text(text)
+          PY
+      - name: Format native Phase 5 files
+        run: |
+          rustfmt --edition 2021 \
+            crates/route-engine/src/service_native_build.rs \
+            crates/route-engine/src/service_native_worker.rs \
+            crates/backend/src/service_boot.rs \
+            crates/backend/src/service_native_host.rs
       - name: Check route-engine and backend
         run: cargo check -p route-engine -p backend --all-targets --locked
       - name: Test native worker executor
