@@ -1,0 +1,212 @@
+name: One-shot Phase 4 explicit route exports
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-phase4-route-exports.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Add explicit callable route export linking
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git pull --rebase origin main
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Route AST: explicit callable export surface lives separately from HTTP methods.
+          path = Path('engine/crates/route-engine/src/ast.rs')
+          text = path.read_text()
+          old = '''pub struct RouteFile {\n    pub imports: Vec<ImportTarget>,\n    pub field_bindings: Vec<FieldBinding>,\n    pub functions: Vec<FunctionDef>,\n    pub class_name: String,\n    pub methods: Vec<MethodDef>,\n}'''
+          new = '''pub struct RouteFile {\n    pub imports: Vec<ImportTarget>,\n    pub field_bindings: Vec<FieldBinding>,\n    pub functions: Vec<FunctionDef>,\n    /// Only helpers explicitly declared with `export function` are generic\n    /// callable route targets. HTTP Route methods remain request handlers only.\n    pub exports: Vec<String>,\n    pub class_name: String,\n    pub methods: Vec<MethodDef>,\n}'''
+          if text.count(old) != 1:
+              raise SystemExit('RouteFile AST anchor changed; refusing blind edit')
+          path.write_text(text.replace(old, new, 1))
+
+          # Parser: accept `export function` before Route class and remember only those names.
+          path = Path('engine/crates/route-engine/src/parser.rs')
+          text = path.read_text()
+          old = '''        let mut field_bindings = Vec::new();\n        let mut functions = Vec::new();\n'''
+          new = '''        let mut field_bindings = Vec::new();\n        let mut functions = Vec::new();\n        let mut exports = Vec::new();\n'''
+          if text.count(old) != 1:
+              raise SystemExit('route parser locals anchor changed; refusing blind edit')
+          text = text.replace(old, new, 1)
+
+          old = '''        while self.check(&TokenKind::Function) {\n            match self.parse_function_collecting(&mut errors) {\n                Some(function) => functions.push(function),\n                None => self.recover_top_level(),\n            }\n        }\n\n        let class_result = self.parse_class_collecting(&mut errors);'''
+          new = '''        while self.check(&TokenKind::Function) || self.is_export_keyword() {\n            let exported = self.is_export_keyword();\n            if exported {\n                self.advance();\n                if self.check(&TokenKind::Async) {\n                    self.advance();\n                }\n                if !self.check(&TokenKind::Function) {\n                    errors.push(self.error_here(\n                        "route `export` must be followed by `function` or `async function`",\n                    ));\n                    self.recover_top_level();\n                    continue;\n                }\n            }\n            match self.parse_function_collecting(&mut errors) {\n                Some(function) => {\n                    if exported {\n                        exports.push(function.name.clone());\n                    }\n                    functions.push(function);\n                }\n                None => self.recover_top_level(),\n            }\n        }\n\n        let class_result = self.parse_class_collecting(&mut errors);'''
+          if text.count(old) != 1:
+              raise SystemExit('route function loop anchor changed; refusing blind edit')
+          text = text.replace(old, new, 1)
+
+          old = '''                field_bindings,\n                functions,\n                class_name,\n                methods,\n'''
+          new = '''                field_bindings,\n                functions,\n                exports,\n                class_name,\n                methods,\n'''
+          if text.count(old) != 1:
+              raise SystemExit('RouteFile parser construction anchor changed; refusing blind edit')
+          path.write_text(text.replace(old, new, 1))
+
+          # Linked discovery: export helpers can be OIDs; HTTP methods stay roots-only.
+          path = Path('engine/crates/route-engine/src/rel_symbol_discovery.rs')
+          text = path.read_text()
+          text = text.replace(
+              '''/// Route handlers are reachability roots, but are intentionally not emitted as\n/// generic `RouteExport` OIDs: the current Route AST has no explicit callable\n/// export list. This preserves the service-upgrade rule that an HTTP handler\n/// must not accidentally become a generic callable merely because it lives in a\n/// `.route` source.''',
+              '''/// Route handlers are reachability roots but are never generic callable OIDs.\n/// Only helpers explicitly listed by the Route AST's `export function` surface\n/// may become `RouteExport` OIDs.''',
+              1,
+          )
+          text = text.replace(
+              '''/// - HTTP Route methods (as graph roots only, not generic callable OIDs).\n///\n/// Module exports are retained only when one of those roots actually reaches\n/// them.''',
+              '''/// - HTTP Route methods (as graph roots only, not generic callable OIDs).\n///\n/// Module/Route exports are retained only when one of those roots actually reaches\n/// them.''',
+              1,
+          )
+
+          old = '''    let mut public_modules = BTreeMap::<(String, String), String>::new();\n    let mut public_services = BTreeMap::<(String, String), String>::new();\n'''
+          new = '''    let mut public_modules = BTreeMap::<(String, String), String>::new();\n    let mut public_routes = BTreeMap::<(String, String), String>::new();\n    let mut public_services = BTreeMap::<(String, String), String>::new();\n'''
+          if text.count(old) != 1:
+              raise SystemExit('public linked maps anchor changed; refusing blind edit')
+          text = text.replace(old, new, 1)
+
+          old = '''            LinkedRelSourceRef::Route(file) => {\n                declare_functions(unit_index, &file.functions, &mut meta, &mut nodes)?;\n                for method in &file.methods {'''
+          new = '''            LinkedRelSourceRef::Route(file) => {\n                declare_functions(unit_index, &file.functions, &mut meta, &mut nodes)?;\n                let declared = file\n                    .functions\n                    .iter()\n                    .map(|function| function.name.as_str())\n                    .collect::<BTreeSet<_>>();\n                for export in &file.exports {\n                    if !declared.contains(export.as_str()) {\n                        return Err(LinkedRelDiscoveryError::MissingExportBody {\n                            source: logical_name.clone(),\n                            export: export.clone(),\n                        });\n                    }\n                    let canonical = canonical_symbol_id(&["route", &logical_name, export])?;\n                    let node = meta\n                        .function_nodes\n                        .get(export)\n                        .expect("validated exported route function exists")\n                        .clone();\n                    insert_candidate(\n                        &mut candidates,\n                        &mut candidate_by_node,\n                        OidCandidate {\n                            canonical_id: canonical.clone(),\n                            kind: LinkedRelKind::RouteExport,\n                            source_sha256: unit.source_sha256.clone(),\n                            node: Some(node),\n                            descriptor_members: BTreeSet::new(),\n                        },\n                    )?;\n                    if public_routes\n                        .insert((logical_name.clone(), export.clone()), canonical)\n                        .is_some()\n                    {\n                        return Err(LinkedRelDiscoveryError::DuplicatePublicExport {\n                            source: logical_name.clone(),\n                            export: export.clone(),\n                        });\n                    }\n                }\n                for method in &file.methods {'''
+          if text.count(old) != 1:
+              raise SystemExit('Route discovery branch anchor changed; refusing blind edit')
+          text = text.replace(old, new, 1)
+
+          # Import-resolution signatures/calls.
+          text = text.replace(
+              'resolve_import_binding(import, &public_modules, &public_services)',
+              'resolve_import_binding(import, &public_modules, &public_routes, &public_services)',
+          )
+          text = text.replace(
+              '''            &public_modules,\n            &public_services,\n            &mut edges,''',
+              '''            &public_modules,\n            &public_routes,\n            &public_services,\n            &mut edges,''',
+          )
+
+          old = '''enum ImportBinding {\n    LinkedFunction(String),\n    ModuleNamespace(String),\n    ServiceNamespace(String),\n    Other,\n}'''
+          new = '''enum ImportBinding {\n    LinkedFunction(String),\n    ModuleNamespace(String),\n    RouteNamespace(String),\n    ServiceNamespace(String),\n    Other,\n}'''
+          if text.count(old) != 1:
+              raise SystemExit('ImportBinding anchor changed; refusing blind edit')
+          text = text.replace(old, new, 1)
+
+          old = '''fn resolve_import_binding(\n    import: &ImportTarget,\n    public_modules: &BTreeMap<(String, String), String>,\n    public_services: &BTreeMap<(String, String), String>,\n) -> Result<ImportBinding, LinkedRelDiscoveryError> {\n    match import_base(import) {\n        ImportTarget::Custom(path) => Ok(ImportBinding::ModuleNamespace(logical_module_name(path))),\n        ImportTarget::CustomFunction { path, function } => {\n            let logical = logical_module_name(path);\n            let canonical = public_modules\n                .get(&(logical.clone(), function.clone()))\n                .ok_or_else(|| LinkedRelDiscoveryError::MissingImportedExport {\n                    kind: "module",\n                    source: logical.clone(),\n                    export: function.clone(),\n                })?;\n            Ok(ImportBinding::LinkedFunction(canonical.clone()))\n        }'''
+          new = '''fn resolve_import_binding(\n    import: &ImportTarget,\n    public_modules: &BTreeMap<(String, String), String>,\n    public_routes: &BTreeMap<(String, String), String>,\n    public_services: &BTreeMap<(String, String), String>,\n) -> Result<ImportBinding, LinkedRelDiscoveryError> {\n    match import_base(import) {\n        ImportTarget::Custom(path) if is_route_source_path(path) => {\n            Ok(ImportBinding::RouteNamespace(logical_route_name(path)))\n        }\n        ImportTarget::Custom(path) => Ok(ImportBinding::ModuleNamespace(logical_module_name(path))),\n        ImportTarget::CustomFunction { path, function } if is_route_source_path(path) => {\n            let logical = logical_route_name(path);\n            let canonical = public_routes\n                .get(&(logical.clone(), function.clone()))\n                .ok_or_else(|| LinkedRelDiscoveryError::MissingImportedExport {\n                    kind: "route",\n                    source: logical.clone(),\n                    export: function.clone(),\n                })?;\n            Ok(ImportBinding::LinkedFunction(canonical.clone()))\n        }\n        ImportTarget::CustomFunction { path, function } => {\n            let logical = logical_module_name(path);\n            let canonical = public_modules\n                .get(&(logical.clone(), function.clone()))\n                .ok_or_else(|| LinkedRelDiscoveryError::MissingImportedExport {\n                    kind: "module",\n                    source: logical.clone(),\n                    export: function.clone(),\n                })?;\n            Ok(ImportBinding::LinkedFunction(canonical.clone()))\n        }'''
+          if text.count(old) != 1:
+              raise SystemExit('resolve_import_binding anchor changed; refusing blind edit')
+          text = text.replace(old, new, 1)
+
+          text = text.replace(
+              '''fn collect_statement_edges(\n    statements: &[Statement],\n    meta: &UnitMeta,\n    public_modules: &BTreeMap<(String, String), String>,\n    public_services: &BTreeMap<(String, String), String>,''',
+              '''fn collect_statement_edges(\n    statements: &[Statement],\n    meta: &UnitMeta,\n    public_modules: &BTreeMap<(String, String), String>,\n    public_routes: &BTreeMap<(String, String), String>,\n    public_services: &BTreeMap<(String, String), String>,''',
+              1,
+          )
+          text = text.replace(
+              'collect_expr_edges(value, meta, public_modules, public_services, out)?;',
+              'collect_expr_edges(value, meta, public_modules, public_routes, public_services, out)?;',
+          )
+          text = text.replace(
+              'collect_expr_edges(condition, meta, public_modules, public_services, out)?;',
+              'collect_expr_edges(condition, meta, public_modules, public_routes, public_services, out)?;',
+          )
+          text = text.replace(
+              'collect_statement_edges(then_body, meta, public_modules, public_services, out)?;',
+              'collect_statement_edges(then_body, meta, public_modules, public_routes, public_services, out)?;',
+          )
+          text = text.replace(
+              'collect_statement_edges(else_body, meta, public_modules, public_services, out)?;',
+              'collect_statement_edges(else_body, meta, public_modules, public_routes, public_services, out)?;',
+          )
+
+          text = text.replace(
+              '''fn collect_expr_edges(\n    expr: &Expr,\n    meta: &UnitMeta,\n    public_modules: &BTreeMap<(String, String), String>,\n    public_services: &BTreeMap<(String, String), String>,''',
+              '''fn collect_expr_edges(\n    expr: &Expr,\n    meta: &UnitMeta,\n    public_modules: &BTreeMap<(String, String), String>,\n    public_routes: &BTreeMap<(String, String), String>,\n    public_services: &BTreeMap<(String, String), String>,''',
+              1,
+          )
+          # Recursive expression calls all gain the route table.
+          text = text.replace(
+              'collect_expr_edges(target, meta, public_modules, public_services, out)?;',
+              'collect_expr_edges(target, meta, public_modules, public_routes, public_services, out)?;',
+          )
+          text = text.replace(
+              'collect_expr_edges(other, meta, public_modules, public_services, out)?',
+              'collect_expr_edges(other, meta, public_modules, public_routes, public_services, out)?',
+          )
+          text = text.replace(
+              'collect_expr_edges(arg, meta, public_modules, public_services, out)?;',
+              'collect_expr_edges(arg, meta, public_modules, public_routes, public_services, out)?;',
+          )
+          text = text.replace(
+              'collect_expr_edges(value, meta, public_modules, public_services, out)?;',
+              'collect_expr_edges(value, meta, public_modules, public_routes, public_services, out)?;',
+          )
+          text = text.replace(
+              'collect_expr_edges(left, meta, public_modules, public_services, out)?;',
+              'collect_expr_edges(left, meta, public_modules, public_routes, public_services, out)?;',
+          )
+          text = text.replace(
+              'collect_expr_edges(right, meta, public_modules, public_services, out)?;',
+              'collect_expr_edges(right, meta, public_modules, public_routes, public_services, out)?;',
+          )
+
+          old = '''                                ImportBinding::ServiceNamespace(service) => {\n                                    let canonical = public_services'''
+          new = '''                                ImportBinding::RouteNamespace(route) => {\n                                    let canonical = public_routes\n                                        .get(&(route.clone(), method.clone()))\n                                        .ok_or_else(|| {\n                                            LinkedRelDiscoveryError::MissingImportedExport {\n                                                kind: "route",\n                                                source: route.clone(),\n                                                export: method.clone(),\n                                            }\n                                        })?;\n                                    out.insert(NodeEdge::Canonical(canonical.clone()));\n                                }\n                                ImportBinding::ServiceNamespace(service) => {\n                                    let canonical = public_services'''
+          if text.count(old) != 1:
+              raise SystemExit('namespace import match anchor changed; refusing blind edit')
+          text = text.replace(old, new, 1)
+
+          # logical route identity from quoted path.
+          helper_anchor = '''fn logical_module_name(path: &str) -> String {'''
+          helpers = '''fn is_route_source_path(path: &str) -> bool {\n    path.replace('\\\\', "/").ends_with(".route")\n}\n\nfn logical_route_name(path: &str) -> String {\n    let normalized = path.replace('\\\\', "/");\n    let after_amp = normalized.rsplit('&').next().unwrap_or(&normalized);\n    let relative = after_amp.strip_prefix("./").unwrap_or(after_amp);\n    let relative = relative.strip_prefix("route/").unwrap_or(relative);\n    relative\n        .strip_suffix(".route")\n        .unwrap_or(relative)\n        .to_string()\n}\n\n'''
+          if text.count(helper_anchor) != 1:
+              raise SystemExit('logical module helper anchor changed; refusing blind edit')
+          text = text.replace(helper_anchor, helpers + helper_anchor, 1)
+
+          # Tests: explicit route export is an OID boundary; handler is not.
+          test_anchor = '''    #[test]\n    fn route_handlers_are_roots_but_not_generic_oid_exports() {'''
+          if test_anchor not in text:
+              # Current test name may differ; insert before first test module test via stable helper test near end.
+              test_anchor = '''    #[test]\n    fn service_exports_are_roots() {'''
+          tests = '''    #[test]\n    fn explicit_route_export_is_linked_but_http_handler_is_not() {\n        let route = RouteFile {\n            imports: Vec::new(),\n            field_bindings: Vec::new(),\n            functions: vec![FunctionDef {\n                name: "helper".into(),\n                params: Vec::new(),\n                body: vec![Statement::Return(Expr::Bool(true))],\n            }],\n            exports: vec!["helper".into()],\n            class_name: "Route".into(),\n            methods: vec![crate::ast::MethodDef {\n                verb: "get".into(),\n                param_name: None,\n                body: vec![Statement::Return(Expr::Call(\n                    Box::new(Expr::Ident("helper".into())),\n                    Vec::new(),\n                ))],\n            }],\n        };\n        let discovery = discover_linked_rel_symbols(&[LinkedRelSourceUnit::route(\n            "home",\n            "route",\n            &route,\n        )])\n        .unwrap();\n        assert_eq!(discovery.symbols.len(), 1);\n        assert_eq!(discovery.symbols[0].canonical_id, "route_home_helper");\n        assert_eq!(discovery.symbols[0].kind, LinkedRelKind::RouteExport);\n        assert!(!discovery\n            .symbols\n            .iter()\n            .any(|symbol| symbol.canonical_id.contains("route_get")));\n    }\n\n    #[test]\n    fn service_can_reach_explicit_route_export_by_quoted_route_path() {\n        let route = RouteFile {\n            imports: Vec::new(),\n            field_bindings: Vec::new(),\n            functions: vec![FunctionDef {\n                name: "helper".into(),\n                params: Vec::new(),\n                body: vec![Statement::Return(Expr::Bool(true))],\n            }],\n            exports: vec!["helper".into()],\n            class_name: "Route".into(),\n            methods: Vec::new(),\n        };\n        let service = ServiceProgram {\n            imports: vec![ImportTarget::CustomFunction {\n                path: "./route/helpers.route".into(),\n                function: "helper".into(),\n            }],\n            functions: vec![FunctionDef {\n                name: "run".into(),\n                params: Vec::new(),\n                body: vec![Statement::Return(Expr::Call(\n                    Box::new(Expr::Ident("helper".into())),\n                    Vec::new(),\n                ))],\n            }],\n            exports: vec!["run".into()],\n            class_name: None,\n            lifecycle: Vec::new(),\n            classes: Vec::new(),\n        };\n        let discovery = discover_linked_rel_symbols(&[\n            LinkedRelSourceUnit::route("helpers", "route", &route),\n            LinkedRelSourceUnit::service("worker", "service", &service),\n        ])\n        .unwrap();\n        let route_symbol = discovery\n            .symbols\n            .iter()\n            .find(|symbol| symbol.canonical_id == "route_helpers_helper")\n            .expect("reachable explicit route export");\n        assert_eq!(route_symbol.kind, LinkedRelKind::RouteExport);\n        let service_symbol = discovery\n            .symbols\n            .iter()\n            .find(|symbol| symbol.canonical_id == "service_worker_run")\n            .expect("service root");\n        assert!(service_symbol\n            .required_symbols\n            .contains("route_helpers_helper"));\n    }\n\n'''
+          if text.count(test_anchor) != 1:
+              raise SystemExit('route export test insertion anchor changed; refusing blind edit')
+          text = text.replace(test_anchor, tests + test_anchor, 1)
+          path.write_text(text)
+          PY
+
+          rustfmt --edition 2021 \
+            engine/crates/route-engine/src/ast.rs \
+            engine/crates/route-engine/src/parser.rs \
+            engine/crates/route-engine/src/rel_symbol_discovery.rs
+
+          cd engine
+          cargo test -p route-engine explicit_route_export --locked
+          cargo test -p route-engine service_can_reach_explicit_route_export --locked
+          cargo clippy -p route-engine --all-targets --locked -- -D warnings
+          cd ..
+
+          rm .github/workflows/one-shot-phase4-route-exports.yml
+          git add \
+            engine/crates/route-engine/src/ast.rs \
+            engine/crates/route-engine/src/parser.rs \
+            engine/crates/route-engine/src/rel_symbol_discovery.rs \
+            .github/workflows/one-shot-phase4-route-exports.yml
+          git commit -m "FEAT | SVC-OID-345 link explicit Route exports"
+
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            git pull --rebase origin main
+          done
+          echo "failed to fast-forward push SVC-OID-345" >&2
+          exit 1
