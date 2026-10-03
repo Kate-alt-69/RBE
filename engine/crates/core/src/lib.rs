@@ -10,6 +10,7 @@ mod library_session;
 mod library_wire;
 mod metrics;
 mod network_broker;
+mod public_https;
 mod video_language;
 
 use std::path::Path;
@@ -70,6 +71,7 @@ pub use network_broker::{
     call_public_http, PublicHttpError, PUBLIC_HTTP_MAX_TIMEOUT_MS, PUBLIC_HTTP_REQUEST_MAX_BYTES,
     PUBLIC_HTTP_RESPONSE_MAX_BYTES, PUBLIC_HTTP_TARGET,
 };
+pub use public_https::{resolve_public_https_target, ResolvedPublicHttpsTarget};
 pub use video_language::{
     video_language_operation_allowed, VideoLanguage, VideoLanguageError,
     VIDEO_CAPABILITY_TARGET_PREFIX, VIDEO_LANGUAGE_OPERATIONS,

@@ -20,6 +20,11 @@ pub struct WorkerUpdate<'a> {
     pub blocked_reason: Option<&'a str>,
 }
 
+pub struct SourceArtifactUpload {
+    pub url: String,
+    pub content_type: String,
+}
+
 pub struct PublisherClient {
     base: String,
     helper_token: String,
@@ -74,22 +79,6 @@ impl PublisherClient {
         }))
     }
 
-    pub async fn source_receipt_exists(&self, deployment: &ClaimedDeployment) -> Result<bool> {
-        let value = self
-            .post(
-                "v1/developer/deployment/source/get",
-                json!({
-                    "deploymentId": deployment.deployment_id,
-                    "leaseToken": deployment.lease_token
-                }),
-            )
-            .await?;
-        require_ok(&value)?;
-        Ok(value
-            .get("sourceReceipt")
-            .is_some_and(|value| !value.is_null()))
-    }
-
     pub async fn seal_source_receipt(
         &self,
         deployment: &ClaimedDeployment,
@@ -114,6 +103,85 @@ impl PublisherClient {
         require_ok(&value)?;
         if value.get("sourceReceipt").is_none_or(Value::is_null) {
             anyhow::bail!("publisher did not return the sealed source receipt");
+        }
+        Ok(())
+    }
+
+    pub async fn prepare_source_artifact(
+        &self,
+        deployment: &ClaimedDeployment,
+        archive_sha256: &str,
+        size_bytes: u64,
+        source_tree_sha256: &str,
+    ) -> Result<SourceArtifactUpload> {
+        let value = self
+            .post(
+                "v1/developer/deployment/source/artifact/prepare",
+                json!({
+                    "deploymentId": deployment.deployment_id,
+                    "leaseToken": deployment.lease_token,
+                    "archiveSha256": archive_sha256,
+                    "sizeBytes": size_bytes,
+                    "sourceTreeSha256": source_tree_sha256
+                }),
+            )
+            .await?;
+        require_ok(&value)?;
+        if value.get("format").and_then(Value::as_str) != Some("rbe-source-bundle-v1")
+            || value.get("archiveSha256").and_then(Value::as_str) != Some(archive_sha256)
+            || value.get("sizeBytes").and_then(Value::as_u64) != Some(size_bytes)
+            || value.get("sourceTreeSha256").and_then(Value::as_str)
+                != Some(source_tree_sha256)
+        {
+            anyhow::bail!("publisher returned inconsistent source artifact preparation metadata");
+        }
+        let upload = value
+            .get("upload")
+            .context("publisher source artifact response is missing upload")?;
+        if upload.get("method").and_then(Value::as_str) != Some("PUT") {
+            anyhow::bail!("publisher returned unsupported source artifact upload method");
+        }
+        let content_type = required_string(upload, "contentType")?;
+        if content_type != "application/octet-stream" {
+            anyhow::bail!("publisher returned unsupported source artifact content type");
+        }
+        let url = required_string(upload, "url")?;
+        if !url.starts_with("https://") {
+            anyhow::bail!("publisher returned a non-HTTPS source artifact upload URL");
+        }
+        Ok(SourceArtifactUpload { url, content_type })
+    }
+
+    pub async fn finalize_source_artifact(
+        &self,
+        deployment: &ClaimedDeployment,
+        archive_sha256: &str,
+        size_bytes: u64,
+        source_tree_sha256: &str,
+    ) -> Result<()> {
+        let value = self
+            .post(
+                "v1/developer/deployment/source/artifact/finalize",
+                json!({
+                    "deploymentId": deployment.deployment_id,
+                    "leaseToken": deployment.lease_token,
+                    "archiveSha256": archive_sha256,
+                    "sizeBytes": size_bytes,
+                    "sourceTreeSha256": source_tree_sha256
+                }),
+            )
+            .await?;
+        require_ok(&value)?;
+        let artifact = value
+            .get("sourceArtifact")
+            .context("publisher source artifact finalize response is missing sourceArtifact")?;
+        if artifact.get("format").and_then(Value::as_str) != Some("rbe-source-bundle-v1")
+            || artifact.get("archiveSha256").and_then(Value::as_str) != Some(archive_sha256)
+            || artifact.get("sizeBytes").and_then(Value::as_u64) != Some(size_bytes)
+            || artifact.get("sourceTreeSha256").and_then(Value::as_str)
+                != Some(source_tree_sha256)
+        {
+            anyhow::bail!("publisher finalized inconsistent source artifact metadata");
         }
         Ok(())
     }

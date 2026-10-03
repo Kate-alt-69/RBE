@@ -23,6 +23,7 @@ pub struct SourceRequest<'a> {
 pub struct SourceResult {
     pub receipt: GitSourceReceipt,
     pub git_version: String,
+    pub source_root: PathBuf,
 }
 
 impl SourceAuthority {
@@ -75,6 +76,7 @@ impl SourceAuthority {
         Ok(SourceResult {
             receipt,
             git_version: self.git_version.clone(),
+            source_root,
         })
     }
 }

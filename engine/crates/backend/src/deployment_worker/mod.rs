@@ -1,6 +1,8 @@
+mod artifact_transfer;
 mod git_exec;
 mod publisher;
 mod source;
+mod source_bundle;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -8,11 +10,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use publisher::{bounded_message, ClaimedDeployment, PublisherClient, WorkerUpdate};
 use source::{SourceAuthority, SourceRequest};
+use source_bundle::create_source_bundle;
 use uuid::Uuid;
 
 const DEFAULT_RUNTIME_REGISTRY_BASE: &str = "https://kastrick-backend.onrender.com/api/";
 const DEFAULT_POLL_SECONDS: u64 = 3;
 const MAX_SOURCE_ATTEMPTS: u32 = 3;
+const SOURCE_ARTIFACT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub async fn run() -> Result<()> {
     let config = WorkerConfig::from_env()?;
@@ -78,16 +82,6 @@ async fn process_deployment(
     config: &WorkerConfig,
     deployment: &ClaimedDeployment,
 ) -> Result<()> {
-    if publisher.source_receipt_exists(deployment).await? {
-        publisher
-            .complete_source_handoff(
-                deployment,
-                "Immutable RBE source receipt already sealed; source acquisition skipped and handed to validation.",
-            )
-            .await?;
-        return Ok(());
-    }
-
     let attempt_root = attempt_root(
         &config.work_root,
         &deployment.deployment_id,
@@ -101,21 +95,60 @@ async fn process_deployment(
         })
         .await?;
 
+    // Receipt sealing is immutable/idempotent. If a mutable ref moved between
+    // retries, the publisher rejects the new commit/tree instead of silently
+    // changing the deployment source identity.
     publisher
         .seal_source_receipt(deployment, &result.receipt)
         .await?;
 
+    let bundle_path = attempt_root.join("source.rbe-source");
+    let bundle = create_source_bundle(&result.source_root, &result.receipt, &bundle_path).await?;
+    let upload = publisher
+        .prepare_source_artifact(
+            deployment,
+            &bundle.sha256,
+            bundle.size_bytes,
+            &result.receipt.source_tree.sha256,
+        )
+        .await?;
+    artifact_transfer::upload_file(
+        &upload.url,
+        &bundle.path,
+        bundle.size_bytes,
+        &upload.content_type,
+        SOURCE_ARTIFACT_TRANSFER_TIMEOUT,
+    )
+    .await?;
+    publisher
+        .finalize_source_artifact(
+            deployment,
+            &bundle.sha256,
+            bundle.size_bytes,
+            &result.receipt.source_tree.sha256,
+        )
+        .await?;
+
     let message = bounded_message(&format!(
-        "Source sealed at commit {} with {} files / {} bytes (tree {}, managed Git {}); handed to validation.",
+        "Source sealed at commit {} with {} files / {} bytes (tree {}, bundle {} / {} bytes, managed Git {}); handed to validation.",
         result.receipt.resolved_commit,
         result.receipt.source_tree.file_count,
         result.receipt.source_tree.total_bytes,
         result.receipt.source_tree.sha256,
+        bundle.sha256,
+        bundle.size_bytes,
         result.git_version
     ));
     publisher
         .complete_source_handoff(deployment, &message)
         .await?;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&attempt_root).await {
+        eprintln!(
+            "deployment {} source workspace cleanup failed: {error}",
+            deployment.deployment_id
+        );
+    }
     Ok(())
 }
 
