@@ -131,7 +131,7 @@ impl Drop for ActiveCallGuard {
     fn drop(&mut self) {
         let _ = self
             .counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_sub(1)
             });
     }
