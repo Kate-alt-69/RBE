@@ -3,7 +3,7 @@
 //! RPX export IDs are stable identities, while numeric package OIDs are local
 //! to one project/Runtime Image lineage. This module applies that contract to
 //! native records without rebuilding every package export: only the OIDs in
-//! `PackageCacheDelta::materialize_oids` require fresh native fragments.
+//! `PackageIndexDelta::materialize_oids` require fresh native fragments.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,13 +12,13 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::oid_index_bridge::{
-    package_specs_from_links, reconcile_package_index, OidIndexBridgeError, PackageCacheDelta,
-    PackageLinkSnapshot,
+    package_specs_from_links, reconcile_package_index, OidIndexBridgeError, PackageIndexDelta,
 };
 use crate::oid_materialize::{
     remove_retired_dynamic_records, NativeOidFragment, OidMaterializationReport,
     OidMaterializeError,
 };
+use crate::relc::PackageLinkContext;
 use crate::service_cache_invalidation::{
     invalidate_service_cache_for_oids, ServiceCacheInvalidationError,
     ServiceCacheInvalidationReport, ServiceCacheProtection,
@@ -34,13 +34,13 @@ pub type PackageFragmentKey = (String, String);
 pub struct PreparedPackageNativeLink {
     base_index_sha256: String,
     next_index: OidIndex,
-    delta: PackageCacheDelta,
+    delta: PackageIndexDelta,
     materialize: BTreeMap<PackageFragmentKey, u16>,
     pinned_oids: BTreeSet<u16>,
 }
 
 impl PreparedPackageNativeLink {
-    pub fn delta(&self) -> &PackageCacheDelta {
+    pub fn delta(&self) -> &PackageIndexDelta {
         &self.delta
     }
 
@@ -53,7 +53,7 @@ impl PreparedPackageNativeLink {
 
 #[derive(Debug, Clone)]
 pub struct PackageNativeLinkReport {
-    pub delta: PackageCacheDelta,
+    pub delta: PackageIndexDelta,
     pub invalidation: ServiceCacheInvalidationReport,
     pub materialization: OidMaterializationReport,
     pub removed_retired_oids: BTreeSet<u16>,
@@ -65,7 +65,7 @@ pub struct PackageNativeLinkReport {
 /// its old numeric ownership.
 pub fn prepare_package_native_link(
     cache: &OidCache,
-    links: &[PackageLinkSnapshot],
+    links: &PackageLinkContext,
     pinned_oids: &BTreeSet<u16>,
 ) -> Result<PreparedPackageNativeLink, PackageNativeLinkError> {
     let specs = package_specs_from_links(links).map_err(PackageNativeLinkError::Bridge)?;

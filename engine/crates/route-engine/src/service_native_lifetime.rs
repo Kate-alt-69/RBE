@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::oid_index_bridge::PackageLinkSnapshot;
 use crate::oid_materialize::NativeOidFragment;
 use crate::package_native_link::{
     commit_package_native_link, prepare_package_native_link, PackageFragmentKey,
@@ -23,6 +22,7 @@ use crate::rel_native_link::{
     RelNativeLinkReport, ServiceNativeLinkInput,
 };
 use crate::rel_symbol_discovery::LinkedRelDiscovery;
+use crate::relc::PackageLinkContext;
 use crate::service_cache_invalidation::ServiceCacheProtection;
 use crate::service_native::{
     DynamicOidLease, DynamicOidPinRegistry, NativeRuntimeImagePins, NativeServiceArtifactPin,
@@ -205,7 +205,7 @@ impl NativeServiceLinkGuard<'_> {
     pub fn prepare_package(
         &self,
         cache: &OidCache,
-        links: &[PackageLinkSnapshot],
+        links: &PackageLinkContext,
     ) -> Result<PreparedPackageNativeLink, PackageNativeLinkError> {
         let pinned_oids = self.registry.package_allocator_pins();
         prepare_package_native_link(cache, links, &pinned_oids)
