@@ -68,12 +68,9 @@ pub fn compile_runtime_image_with_packages_and_linked_rel(
         package_links,
     )
     .map_err(RelcLinkedImageError::Compile)?;
-    let linked_rel = discover_linked_rel_from_runtime_image(
-        &image,
-        raw_server_source,
-        &discovery_sources,
-    )
-    .map_err(RelcLinkedImageError::LinkedRel)?;
+    let linked_rel =
+        discover_linked_rel_from_runtime_image(&image, raw_server_source, &discovery_sources)
+            .map_err(RelcLinkedImageError::LinkedRel)?;
 
     Ok(RelcLinkedImage { image, linked_rel })
 }
@@ -87,9 +84,14 @@ pub enum RelcLinkedImageError {
 impl fmt::Display for RelcLinkedImageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Compile(error) => write!(formatter, "RELC Runtime Image compilation failed: {error}"),
+            Self::Compile(error) => {
+                write!(formatter, "RELC Runtime Image compilation failed: {error}")
+            }
             Self::LinkedRel(error) => {
-                write!(formatter, "RELC linked-REL discovery failed after image link: {error}")
+                write!(
+                    formatter,
+                    "RELC linked-REL discovery failed after image link: {error}"
+                )
             }
         }
     }
