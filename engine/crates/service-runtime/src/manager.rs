@@ -129,11 +129,18 @@ impl ActiveCallGuard {
 
 impl Drop for ActiveCallGuard {
     fn drop(&mut self) {
-        let _ = self
-            .counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_sub(1)
-            });
+        let mut current = self.counter.load(Ordering::Acquire);
+        while current != 0 {
+            match self.counter.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
