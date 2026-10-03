@@ -25,38 +25,21 @@ jobs:
           git pull --rebase origin main
           python3 - <<'PY'
           from pathlib import Path
-
           package = Path('engine/crates/route-engine/src/package_native_link.rs')
           text = package.read_text()
-          text = text.replace('`PackageCacheDelta::materialize_oids`', '`PackageIndexDelta::materialize_oids`')
-          old = '''use crate::oid_index_bridge::{
-    package_specs_from_links, reconcile_package_index, OidIndexBridgeError, PackageCacheDelta,
-    PackageLinkSnapshot,
-};'''
-          new = '''use crate::oid_index_bridge::{
-    package_specs_from_links, reconcile_package_index, OidIndexBridgeError, PackageIndexDelta,
-};
-use crate::relc::PackageLinkContext;'''
-          if old not in text:
-              raise SystemExit('package_native_link import ABI shape changed; refusing blind edit')
-          text = text.replace(old, new, 1)
+          if text.count('PackageCacheDelta') < 1 or text.count('PackageLinkSnapshot') < 1:
+              raise SystemExit('package native ABI shape changed; refusing blind edit')
           text = text.replace('PackageCacheDelta', 'PackageIndexDelta')
-          old_sig = '    links: &[PackageLinkSnapshot],\n'
-          if text.count(old_sig) != 1:
-              raise SystemExit(f'expected one package snapshot signature, found {text.count(old_sig)}')
-          text = text.replace(old_sig, '    links: &PackageLinkContext,\n', 1)
+          text = text.replace('    PackageLinkSnapshot,\n', '')
+          text = text.replace('use crate::oid_materialize::{', 'use crate::relc::PackageLinkContext;\nuse crate::oid_materialize::{', 1)
+          text = text.replace('links: &[PackageLinkSnapshot]', 'links: &PackageLinkContext')
           package.write_text(text)
-
           lifetime = Path('engine/crates/route-engine/src/service_native_lifetime.rs')
           text = lifetime.read_text()
-          old_import = 'use crate::oid_index_bridge::PackageLinkSnapshot;\n'
-          if text.count(old_import) != 1:
-              raise SystemExit(f'expected one lifetime snapshot import, found {text.count(old_import)}')
-          text = text.replace(old_import, 'use crate::relc::PackageLinkContext;\n', 1)
-          old_sig = '        links: &[PackageLinkSnapshot],\n'
-          if text.count(old_sig) != 1:
-              raise SystemExit(f'expected one lifetime snapshot signature, found {text.count(old_sig)}')
-          text = text.replace(old_sig, '        links: &PackageLinkContext,\n', 1)
+          if text.count('PackageLinkSnapshot') < 1:
+              raise SystemExit('service lifetime package ABI shape changed; refusing blind edit')
+          text = text.replace('use crate::oid_index_bridge::PackageLinkSnapshot;', 'use crate::relc::PackageLinkContext;', 1)
+          text = text.replace('links: &[PackageLinkSnapshot]', 'links: &PackageLinkContext')
           lifetime.write_text(text)
           PY
           rm .github/workflows/one-shot-package-oid-abi.yml
