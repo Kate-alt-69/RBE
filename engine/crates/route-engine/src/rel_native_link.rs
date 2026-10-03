@@ -586,7 +586,7 @@ mod tests {
     use super::*;
 
     fn sha(ch: char) -> String {
-        std::iter::repeat(ch).take(64).collect()
+        std::iter::repeat_n(ch, 64).collect()
     }
 
     fn symbol(id: &str, kind: LinkedRelKind, deps: &[&str]) -> LinkedRelSymbolSpec {

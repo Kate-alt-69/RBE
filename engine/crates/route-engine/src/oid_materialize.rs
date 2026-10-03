@@ -302,7 +302,7 @@ mod tests {
     use crate::service_oid::{OidIndex, OidTarget};
 
     fn sha(ch: char) -> String {
-        std::iter::repeat(ch).take(64).collect()
+        std::iter::repeat_n(ch, 64).collect()
     }
 
     fn package_links() -> PackageLinkContext {
@@ -371,6 +371,46 @@ mod tests {
             required.insert(report.bindings[dependency].oid);
         }
         assert_eq!(required.len(), 2);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("rbe-class-record-{}-{nonce}", std::process::id()));
+        let mut cache = OidCache::open_or_rebuild(&root).expect("open OID cache");
+        cache
+            .replace_index(index)
+            .expect("persist linked REL index");
+
+        let fragments = BTreeMap::from([
+            (
+                "class_UserCache".to_string(),
+                NativeOidFragment::descriptor(),
+            ),
+            (
+                "ctor_UserCache".to_string(),
+                NativeOidFragment::executable(vec![0xC3]),
+            ),
+            (
+                "method_UserCache_get".to_string(),
+                NativeOidFragment::executable(vec![0xC3]),
+            ),
+        ]);
+        materialize_rel_records(&cache, &report.bindings, &fragments)
+            .expect("materialize class descriptor and members");
+
+        let record = cache
+            .read_record(class.oid)
+            .expect("read materialized class descriptor");
+        assert_eq!(record.kind, OidRecordKind::Class);
+        assert!(record.machine_code.is_empty());
+        assert_eq!(
+            record.required_oids.into_iter().collect::<BTreeSet<_>>(),
+            required
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

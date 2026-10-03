@@ -14,7 +14,7 @@ use route_engine::service_cache_invalidation::{
 use route_engine::service_oid_adapter::write_service_plan_atomic;
 
 fn sha(ch: char) -> String {
-    std::iter::repeat(ch).take(64).collect()
+    std::iter::repeat_n(ch, 64).collect()
 }
 
 fn temp_root(label: &str) -> PathBuf {

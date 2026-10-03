@@ -823,7 +823,7 @@ mod tests {
     use super::*;
 
     fn sha(ch: char) -> String {
-        std::iter::repeat(ch).take(64).collect()
+        std::iter::repeat_n(ch, 64).collect()
     }
 
     fn required(oid: u16, kind: AssemblyRecordKind, hash: char) -> RequiredOid {

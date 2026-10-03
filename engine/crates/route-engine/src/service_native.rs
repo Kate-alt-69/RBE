@@ -719,7 +719,7 @@ mod tests {
     };
 
     fn sha(ch: char) -> String {
-        std::iter::repeat(ch).take(64).collect()
+        std::iter::repeat_n(ch, 64).collect()
     }
 
     fn record(oid: u16, hash: char) -> VerifiedAssemblyOidRecord {

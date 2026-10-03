@@ -297,7 +297,7 @@ mod tests {
     use crate::service_bin::{AssemblyRecordKind, RequiredOid, SERVICE_PLAN_FORMAT};
 
     fn sha(ch: char) -> String {
-        std::iter::repeat(ch).take(64).collect()
+        std::iter::repeat_n(ch, 64).collect()
     }
 
     fn plan(dependencies: BTreeMap<String, String>) -> ServiceAssemblyPlan {
