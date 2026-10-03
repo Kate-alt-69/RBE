@@ -20,9 +20,7 @@ use crate::relc::{
     compile_runtime_image_with_packages, PackageLinkContext, PhysicalRelSource, RelcError,
 };
 use crate::runtime_image::RuntimeImage;
-use crate::service_oid::{
-    OID_PACKAGE_END, OID_PACKAGE_START, OID_REL_END, OID_REL_START,
-};
+use crate::service_oid::{OID_PACKAGE_END, OID_PACKAGE_START, OID_REL_END, OID_REL_START};
 
 const MAX_CAPACITY_CONTRIBUTORS: usize = 8;
 
@@ -93,9 +91,7 @@ pub fn compile_runtime_image_with_packages_and_linked_rel(
     Ok(RelcLinkedImage { image, linked_rel })
 }
 
-fn validate_package_oid_capacity(
-    links: &PackageLinkContext,
-) -> Result<(), OidCapacityError> {
+fn validate_package_oid_capacity(links: &PackageLinkContext) -> Result<(), OidCapacityError> {
     let requested = links
         .roots
         .values()
@@ -131,7 +127,9 @@ fn validate_linked_rel_oid_capacity(
 
     let mut by_kind = BTreeMap::<&'static str, usize>::new();
     for symbol in &discovery.symbols {
-        *by_kind.entry(linked_rel_kind_label(symbol.kind)).or_default() += 1;
+        *by_kind
+            .entry(linked_rel_kind_label(symbol.kind))
+            .or_default() += 1;
     }
     let contributors = ranked_contributors(
         by_kind
