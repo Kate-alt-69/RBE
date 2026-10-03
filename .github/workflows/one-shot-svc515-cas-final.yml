@@ -29,15 +29,14 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('engine/crates/service-runtime/src/manager.rs')
           text = path.read_text()
-          old = '''        let _ = self
-              .counter
-              .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                  value.checked_sub(1)
-              });'''
-          new = '''        let mut current = self.counter.load(Ordering::Acquire);
+          pattern = re.compile(
+              r'''        let _ = self\s*\.counter\s*\.fetch_update\(Ordering::AcqRel, Ordering::Acquire, \|value\| \{\s*value\.checked_sub\(1\)\s*\}\);'''
+          )
+          replacement = '''        let mut current = self.counter.load(Ordering::Acquire);
           while current != 0 {
               match self.counter.compare_exchange_weak(
                   current,
@@ -49,11 +48,10 @@ jobs:
                   Err(observed) => current = observed,
               }
           }'''
-          if old not in text:
-              raise SystemExit('expected fetch_update ActiveCallGuard block was not found')
-          if text.count(old) != 1:
-              raise SystemExit('expected exactly one fetch_update ActiveCallGuard block')
-          path.write_text(text.replace(old, new, 1))
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'expected exactly one fetch_update ActiveCallGuard block, found {count}')
+          path.write_text(text)
           PY
 
           rustfmt --edition 2021 engine/crates/service-runtime/src/manager.rs
