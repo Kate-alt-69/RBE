@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rbe_install_executor::{
     PinnedManagedToolchain, VerifiedWorkerInvocation, WorkerLaunchError, WorkerLaunchPlan,
