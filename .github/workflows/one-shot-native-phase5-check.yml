@@ -1,0 +1,37 @@
+name: One-shot Phase 5 Native Validation
+
+on:
+  push:
+    paths:
+      - .github/workflows/one-shot-native-phase5-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  native-phase5:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Format native Phase 5 files
+        run: |
+          rustfmt --edition 2021 --check \
+            crates/route-engine/src/service_native_build.rs \
+            crates/route-engine/src/service_native_worker.rs \
+            crates/backend/src/service_boot.rs \
+            crates/backend/src/service_native_host.rs
+      - name: Check route-engine and backend
+        run: cargo check -p route-engine -p backend --all-targets --locked
+      - name: Test native worker executor
+        run: cargo test -p route-engine service_native_worker --locked
+      - name: Test native host transport
+        run: cargo test -p backend native_ --locked
