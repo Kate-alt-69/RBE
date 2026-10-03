@@ -1,0 +1,88 @@
+name: One-shot SVC-515 cross-version CAS fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-svc515-cas-final.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Replace version-split atomic helper with stable CAS
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git pull --rebase origin main
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('engine/crates/service-runtime/src/manager.rs')
+          text = path.read_text()
+          old = '''        let _ = self
+              .counter
+              .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                  value.checked_sub(1)
+              });'''
+          new = '''        let mut current = self.counter.load(Ordering::Acquire);
+          while current != 0 {
+              match self.counter.compare_exchange_weak(
+                  current,
+                  current - 1,
+                  Ordering::AcqRel,
+                  Ordering::Acquire,
+              ) {
+                  Ok(_) => return,
+                  Err(observed) => current = observed,
+              }
+          }'''
+          if old not in text:
+              raise SystemExit('expected fetch_update ActiveCallGuard block was not found')
+          if text.count(old) != 1:
+              raise SystemExit('expected exactly one fetch_update ActiveCallGuard block')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+          rustfmt --edition 2021 engine/crates/service-runtime/src/manager.rs
+
+          cd engine
+          cargo check -p service-runtime --locked
+          cargo test -p service-runtime --locked
+          cargo clippy -p service-runtime --all-targets --locked -- -D warnings
+
+          cargo check -p route-engine --locked
+          cargo test -p route-engine relc_linked_image --locked
+          cargo test -p route-engine rel_native_service_select --locked
+          cargo clippy -p route-engine --all-targets --locked -- -D warnings
+          cd ..
+
+          changed="$(git status --porcelain | awk '{print $2}')"
+          if [ "$changed" != "engine/crates/service-runtime/src/manager.rs" ]; then
+            echo "unexpected files changed:" >&2
+            printf '%s\n' "$changed" >&2
+            exit 1
+          fi
+
+          git add engine/crates/service-runtime/src/manager.rs
+          git commit -m "FIX | BUG-SVC-515 use cross-version atomic CAS"
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            git pull --rebase origin main
+          done
+          echo "failed to fast-forward push BUG-SVC-515 CAS fix" >&2
+          exit 1
