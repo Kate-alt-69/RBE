@@ -31,9 +31,7 @@ impl ServiceCacheProtection {
         for image in images {
             for pin in image.services.values() {
                 protection.plan_hashes.insert(pin.plan_hash.clone());
-                protection
-                    .assembly_hashes
-                    .insert(pin.assembly_hash.clone());
+                protection.assembly_hashes.insert(pin.assembly_hash.clone());
             }
         }
         protection
