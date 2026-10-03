@@ -83,6 +83,10 @@ pub struct LinkedRelDiscovery {
     /// each Service. This is compiler truth used later to build native dispatch
     /// metadata; consumers must not reverse-parse canonical symbol strings.
     pub service_exports: BTreeMap<String, BTreeMap<String, String>>,
+    /// Source-level lifecycle verb -> canonical linked symbol for each Service.
+    /// This stays separate from Service Fabric exports so lifecycle hooks never
+    /// become remotely callable merely because they are native entry roots.
+    pub service_lifecycle: BTreeMap<String, BTreeMap<String, String>>,
     /// Canonical symbols retained by graph reachability. Exposed mainly for
     /// compiler diagnostics/tests; numeric OID allocation happens later.
     pub reachable_symbols: BTreeSet<String>,
@@ -187,6 +191,7 @@ pub fn discover_linked_rel_symbols(
     let mut candidates = BTreeMap::<String, OidCandidate>::new();
     let mut candidate_by_node = BTreeMap::<NodeId, String>::new();
     let mut service_roots = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut service_lifecycle = BTreeMap::<String, BTreeMap<String, String>>::new();
     let mut public_modules = BTreeMap::<(String, String), String>::new();
     let mut public_services = BTreeMap::<(String, String), String>::new();
 
@@ -368,6 +373,10 @@ pub fn discover_linked_rel_symbols(
                             descriptor_members: BTreeSet::new(),
                         },
                     )?;
+                    service_lifecycle
+                        .entry(logical_name.clone())
+                        .or_default()
+                        .insert(lifecycle.verb.clone(), canonical.clone());
                     service_roots
                         .entry(logical_name.clone())
                         .or_default()
@@ -575,6 +584,7 @@ pub fn discover_linked_rel_symbols(
         symbols,
         service_roots,
         service_exports,
+        service_lifecycle,
         reachable_symbols: reachable_canonical,
     })
 }
@@ -1147,6 +1157,10 @@ mod tests {
             "service_daemon_lifecycle_start"
         );
         assert!(discovery.service_roots["daemon"].contains("service_daemon_lifecycle_start"));
+        assert_eq!(
+            discovery.service_lifecycle["daemon"]["start"],
+            "service_daemon_lifecycle_start"
+        );
         assert!(!discovery.service_exports.contains_key("daemon"));
     }
 
