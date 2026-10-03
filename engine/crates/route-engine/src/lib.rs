@@ -135,6 +135,7 @@ pub mod oid_index_bridge;
 pub mod oid_link;
 pub mod oid_materialize;
 pub mod rel_oid_bridge;
+pub mod rel_symbol_discovery;
 pub mod relc;
 pub mod runtime_env;
 pub mod runtime_image;
@@ -186,6 +187,10 @@ pub use rel_host_builtins::{
 };
 pub use rel_host_runtime::{
     RelHostExecutionFuture, RelHostExecutor, RelHostOutput, RelHostRequest,
+};
+pub use rel_symbol_discovery::{
+    discover_linked_rel_symbols, linked_source_sha256, LinkedRelDiscovery,
+    LinkedRelDiscoveryError, LinkedRelSourceRef, LinkedRelSourceUnit,
 };
 pub use relc::{
     compile_runtime_image, discover_physical_rel_sources, PhysicalRelSource, RelcError,
