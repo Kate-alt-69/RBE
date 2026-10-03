@@ -259,6 +259,13 @@ pub fn reconcile_package_oids(
         );
     }
 
+    let package_pin_pressure = OidPinPressure {
+        requested: desired_map.values().map(|spec| spec.exports.len()).sum(),
+        capacity: oid_capacity(PACKAGE_OID_START, PACKAGE_OID_END),
+        retained: occupied.len(),
+        live_pins: pinned_oids.len(),
+        blocking_pins: pinned_oids.difference(&occupied).count(),
+    };
     occupied.extend(pinned_oids.iter().copied());
 
     // Pass 2: deterministic hole-first allocation in package/export sort order.
@@ -273,7 +280,7 @@ pub fn reconcile_package_oids(
                 continue;
             }
             let oid = next_free_oid(PACKAGE_OID_START, PACKAGE_OID_END, &occupied)
-                .ok_or(OidLinkError::PackageRangeExhausted)?;
+                .ok_or_else(|| package_range_exhaustion_error(&package_pin_pressure))?;
             occupied.insert(oid);
             owner.bindings.insert(export.export_id, oid);
         }
@@ -317,6 +324,13 @@ pub fn reconcile_rel_oids(
         }
     }
 
+    let rel_pin_pressure = OidPinPressure {
+        requested: specs.len(),
+        capacity: oid_capacity(REL_OID_START, REL_OID_END),
+        retained: occupied.len(),
+        live_pins: pinned_oids.len(),
+        blocking_pins: pinned_oids.difference(&occupied).count(),
+    };
     occupied.extend(pinned_oids.iter().copied());
 
     for (canonical_id, spec) in specs {
@@ -324,7 +338,7 @@ pub fn reconcile_rel_oids(
             continue;
         }
         let oid = next_free_oid(REL_OID_START, REL_OID_END, &occupied)
-            .ok_or(OidLinkError::RelRangeExhausted)?;
+            .ok_or_else(|| rel_range_exhaustion_error(&rel_pin_pressure))?;
         occupied.insert(oid);
         bindings.insert(canonical_id, linked_binding(spec, oid)?);
     }
@@ -447,6 +461,60 @@ fn next_free_oid(start: u16, end: u16, occupied: &BTreeSet<u16>) -> Option<u16> 
     }
 }
 
+fn oid_capacity(start: u16, end: u16) -> usize {
+    usize::from(end) - usize::from(start) + 1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidPinPressure {
+    pub requested: usize,
+    pub capacity: usize,
+    pub retained: usize,
+    pub live_pins: usize,
+    pub blocking_pins: usize,
+}
+
+impl OidPinPressure {
+    pub fn usable_capacity(&self) -> usize {
+        self.capacity.saturating_sub(self.blocking_pins)
+    }
+}
+
+fn package_range_exhaustion_error(pressure: &OidPinPressure) -> OidLinkError {
+    if pressure.requested <= pressure.capacity && pressure.blocking_pins > 0 {
+        OidLinkError::PackageRangePinnedPressure(pressure.clone())
+    } else {
+        OidLinkError::PackageRangeExhausted
+    }
+}
+
+fn rel_range_exhaustion_error(pressure: &OidPinPressure) -> OidLinkError {
+    if pressure.requested <= pressure.capacity && pressure.blocking_pins > 0 {
+        OidLinkError::RelRangePinnedPressure(pressure.clone())
+    } else {
+        OidLinkError::RelRangeExhausted
+    }
+}
+
+fn fmt_pin_pressure(
+    formatter: &mut fmt::Formatter<'_>,
+    label: &str,
+    start: u16,
+    end: u16,
+    pressure: &OidPinPressure,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "{label} OID range {start}..={end} is temporarily exhausted by live Runtime Image/worker pins: requested targets: {}; capacity: {}; currently usable capacity: {}; retained compatible OIDs: {}; live pinned OIDs: {} ({} block reuse). Drain/retire old Runtime Images or workers before reusing those OIDs",
+        pressure.requested,
+        pressure.capacity,
+        pressure.usable_capacity(),
+        pressure.retained,
+        pressure.live_pins,
+        pressure.blocking_pins,
+    )
+}
+
 fn validate_pins(pins: &BTreeSet<u16>, start: u16, end: u16) -> Result<(), OidLinkError> {
     for &oid in pins {
         validate_oid_in_range(oid, start, end)?;
@@ -525,6 +593,8 @@ pub enum OidLinkError {
     OidCollision(u16),
     PackageRangeExhausted,
     RelRangeExhausted,
+    PackageRangePinnedPressure(OidPinPressure),
+    RelRangePinnedPressure(OidPinPressure),
     Serialization(String),
 }
 
@@ -549,6 +619,20 @@ impl fmt::Display for OidLinkError {
             Self::OidCollision(oid) => write!(formatter, "dynamic OID {oid} is assigned more than once"),
             Self::PackageRangeExhausted => write!(formatter, "package OID range 20086..=30456 is exhausted"),
             Self::RelRangeExhausted => write!(formatter, "linked REL OID range 30458..=65535 is exhausted"),
+            Self::PackageRangePinnedPressure(pressure) => fmt_pin_pressure(
+                formatter,
+                "package",
+                PACKAGE_OID_START,
+                PACKAGE_OID_END,
+                pressure,
+            ),
+            Self::RelRangePinnedPressure(pressure) => fmt_pin_pressure(
+                formatter,
+                "linked REL",
+                REL_OID_START,
+                REL_OID_END,
+                pressure,
+            ),
             Self::Serialization(message) => write!(formatter, "failed to serialize OID-link identity: {message}"),
         }
     }
@@ -716,6 +800,55 @@ mod tests {
         assert_eq!(edges[&class].len(), 2);
         assert!(edges[&class].contains(&bindings["ctor_UserCache"].oid));
         assert!(edges[&class].contains(&bindings["method_UserCache_get"].oid));
+    }
+
+    #[test]
+    fn package_exhaustion_reports_live_pin_pressure() {
+        let pins = (PACKAGE_OID_START..PACKAGE_OID_END).collect::<BTreeSet<_>>();
+        let error = reconcile_package_oids(
+            &BTreeMap::new(),
+            &[package("1.0.0", 'a', &["send", "receive"])],
+            &pins,
+        )
+        .unwrap_err();
+
+        let rendered = error.to_string();
+        let pressure = match error {
+            OidLinkError::PackageRangePinnedPressure(pressure) => pressure,
+            other => panic!("expected package pin-pressure diagnostic, got {other:?}"),
+        };
+        assert_eq!(pressure.requested, 2);
+        assert_eq!(pressure.capacity, 10_371);
+        assert_eq!(pressure.retained, 0);
+        assert_eq!(pressure.live_pins, 10_370);
+        assert_eq!(pressure.blocking_pins, 10_370);
+        assert_eq!(pressure.usable_capacity(), 1);
+        assert!(rendered.contains("temporarily exhausted by live Runtime Image/worker pins"));
+        assert!(rendered.contains("currently usable capacity: 1"));
+    }
+
+    #[test]
+    fn rel_exhaustion_reports_live_pin_pressure() {
+        let pins = (REL_OID_START..REL_OID_END).collect::<BTreeSet<_>>();
+        let desired = vec![
+            rel("module_users_first", LinkedRelKind::ModuleExport, &[]),
+            rel("module_users_second", LinkedRelKind::ModuleExport, &[]),
+        ];
+        let error = reconcile_rel_oids(&BTreeMap::new(), &desired, &pins).unwrap_err();
+
+        let rendered = error.to_string();
+        let pressure = match error {
+            OidLinkError::RelRangePinnedPressure(pressure) => pressure,
+            other => panic!("expected REL pin-pressure diagnostic, got {other:?}"),
+        };
+        assert_eq!(pressure.requested, 2);
+        assert_eq!(pressure.capacity, 35_078);
+        assert_eq!(pressure.retained, 0);
+        assert_eq!(pressure.live_pins, 35_077);
+        assert_eq!(pressure.blocking_pins, 35_077);
+        assert_eq!(pressure.usable_capacity(), 1);
+        assert!(rendered.contains("linked REL OID range 30458..=65535"));
+        assert!(rendered.contains("currently usable capacity: 1"));
     }
 
     #[test]
