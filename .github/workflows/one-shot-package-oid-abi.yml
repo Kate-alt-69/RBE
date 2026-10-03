@@ -1,0 +1,75 @@
+name: One-shot package OID ABI repair
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-package-oid-abi.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Align package native transaction with live index bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git pull --rebase origin main
+          python3 - <<'PY'
+          from pathlib import Path
+
+          package = Path('engine/crates/route-engine/src/package_native_link.rs')
+          text = package.read_text()
+          text = text.replace('`PackageCacheDelta::materialize_oids`', '`PackageIndexDelta::materialize_oids`')
+          old = '''use crate::oid_index_bridge::{
+    package_specs_from_links, reconcile_package_index, OidIndexBridgeError, PackageCacheDelta,
+    PackageLinkSnapshot,
+};'''
+          new = '''use crate::oid_index_bridge::{
+    package_specs_from_links, reconcile_package_index, OidIndexBridgeError, PackageIndexDelta,
+};
+use crate::relc::PackageLinkContext;'''
+          if old not in text:
+              raise SystemExit('package_native_link import ABI shape changed; refusing blind edit')
+          text = text.replace(old, new, 1)
+          text = text.replace('PackageCacheDelta', 'PackageIndexDelta')
+          old_sig = '    links: &[PackageLinkSnapshot],\n'
+          if text.count(old_sig) != 1:
+              raise SystemExit(f'expected one package snapshot signature, found {text.count(old_sig)}')
+          text = text.replace(old_sig, '    links: &PackageLinkContext,\n', 1)
+          package.write_text(text)
+
+          lifetime = Path('engine/crates/route-engine/src/service_native_lifetime.rs')
+          text = lifetime.read_text()
+          old_import = 'use crate::oid_index_bridge::PackageLinkSnapshot;\n'
+          if text.count(old_import) != 1:
+              raise SystemExit(f'expected one lifetime snapshot import, found {text.count(old_import)}')
+          text = text.replace(old_import, 'use crate::relc::PackageLinkContext;\n', 1)
+          old_sig = '        links: &[PackageLinkSnapshot],\n'
+          if text.count(old_sig) != 1:
+              raise SystemExit(f'expected one lifetime snapshot signature, found {text.count(old_sig)}')
+          text = text.replace(old_sig, '        links: &PackageLinkContext,\n', 1)
+          lifetime.write_text(text)
+          PY
+          rm .github/workflows/one-shot-package-oid-abi.yml
+          cd engine
+          cargo fmt --all
+          cd ..
+          git add engine/crates/route-engine/src/package_native_link.rs engine/crates/route-engine/src/service_native_lifetime.rs .github/workflows/one-shot-package-oid-abi.yml
+          git commit -m "FIX | OID-006 align package transaction bridge ABI"
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            git pull --rebase origin main
+          done
+          echo "failed to fast-forward push package OID ABI repair" >&2
+          exit 1
