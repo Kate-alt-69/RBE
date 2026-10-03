@@ -1,17 +1,17 @@
-//! Phase 4 orchestration from linked-REL discovery to sparse OID records and
-//! disposable native Service binaries.
+//! Phase 4 orchestration from linked-REL discovery to sparse OID records.
 //!
 //! The link is deliberately two-stage. `prepare_rel_native_link` allocates OIDs
 //! against a cloned index and exposes those exact numeric bindings to native
 //! lowering without mutating the live cache. `commit_rel_native_link` accepts
 //! the lowered fragments, materializes sparse records, atomically publishes the
-//! prepared index, builds exact per-Service plans, then runs the plan-only
-//! assembler. This keeps REL parsing/semantic work out of the assembler while
-//! avoiding a half-published OID index when lowering fails.
+//! prepared index, and emits exact `NativeServiceBuildSpec`s for Phase 5.
+//!
+//! Phase 4 does not duplicate Phase 5's plan -> `.bin` -> immutable-pin build
+//! transaction. The handoff is numeric entry OIDs plus exact source/dependency
+//! identity; `service_native_build` consumes that after this link succeeds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -22,34 +22,22 @@ use crate::oid_materialize::{
 };
 use crate::rel_oid_bridge::{reconcile_rel_index, RelOidBridgeError, RelReconcileReport};
 use crate::rel_symbol_discovery::LinkedRelDiscovery;
-use crate::service_bin::ServiceAssemblyPlan;
+use crate::service_native::PackageArtifactPin;
+use crate::service_native_build::NativeServiceBuildSpec;
 use crate::service_oid::{OidCache, OidError, OidIndex};
-use crate::service_oid_adapter::{
-    assemble_service_from_oid_cache, build_service_plan_from_oid_cache, write_service_plan_atomic,
-    ServiceOidAdapterError,
-};
+use crate::source_registry::SourceId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceNativePlanInput {
+pub struct ServiceNativeLinkInput {
     /// Logical Service name used by `LinkedRelDiscovery::service_roots`.
     pub logical_name: String,
     /// Stable Runtime Image source identity, normally `service:<logical-name>`.
-    pub service_identity: String,
+    pub source_id: SourceId,
     pub source_sha256: String,
     pub service_data: Vec<u8>,
     pub dependency_hashes: BTreeMap<String, String>,
     pub compile_options: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkedServiceNativeArtifact {
-    pub service_identity: String,
-    pub entry_oids: Vec<u16>,
-    pub plan: ServiceAssemblyPlan,
-    pub plan_hash: String,
-    pub plan_path: PathBuf,
-    pub assembly_hash: String,
-    pub bin_path: PathBuf,
+    pub packages: Vec<PackageArtifactPin>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,8 +52,8 @@ pub struct PreparedRelNativeLink {
 
 impl PreparedRelNativeLink {
     /// Numeric identities native lowering must target. These are not published
-    /// to the live `oid/index` until commit succeeds far enough to materialize
-    /// every requested sparse record.
+    /// to the live `oid/index` until commit has materialized every requested
+    /// sparse record.
     pub fn bindings(&self) -> &BTreeMap<String, LinkedRelBinding> {
         &self.reconcile.bindings
     }
@@ -88,7 +76,8 @@ pub struct RelNativeLinkReport {
     pub reconcile: RelReconcileReport,
     pub materialization: OidMaterializationReport,
     pub removed_retired_oids: BTreeSet<u16>,
-    pub services: BTreeMap<String, LinkedServiceNativeArtifact>,
+    /// Ready for `service_native_build::build_native_runtime_image_pins`.
+    pub service_specs: BTreeMap<SourceId, NativeServiceBuildSpec>,
 }
 
 /// Allocate/reuse linked REL OIDs against a private index snapshot.
@@ -121,15 +110,18 @@ pub fn prepare_rel_native_link(
     })
 }
 
-/// Publish one prepared linked-REL generation and assemble all requested native
-/// Services. The live index is checked again before any record is written so a
+/// Publish one prepared linked-REL generation.
+///
+/// The live index is checked again before any sparse record is written, so a
 /// stale prepare result cannot silently overwrite a newer compiler generation.
+/// Service inputs are also fully validated before publication. Only then are
+/// records written, the index atomically replaced, and unpinned retired records
+/// removed.
 pub fn commit_rel_native_link(
-    project_root: &Path,
     cache: &mut OidCache,
     prepared: PreparedRelNativeLink,
     fragments: &BTreeMap<String, NativeOidFragment>,
-    services: &[ServiceNativePlanInput],
+    services: &[ServiceNativeLinkInput],
 ) -> Result<RelNativeLinkReport, RelNativeLinkError> {
     let observed_index_sha256 = index_sha256(cache.index())?;
     if observed_index_sha256 != prepared.base_index_sha256 {
@@ -140,6 +132,7 @@ pub fn commit_rel_native_link(
     }
 
     let effective_fragments = effective_fragments(&prepared.normalized_symbols, fragments)?;
+    let service_specs = build_service_specs(&prepared, services)?;
 
     // Sparse records are written before the index is published. If a record
     // write fails, the live index still describes the previous complete link
@@ -163,6 +156,18 @@ pub fn commit_rel_native_link(
     )
     .map_err(RelNativeLinkError::Materialize)?;
 
+    Ok(RelNativeLinkReport {
+        reconcile: prepared.reconcile,
+        materialization,
+        removed_retired_oids,
+        service_specs,
+    })
+}
+
+fn build_service_specs(
+    prepared: &PreparedRelNativeLink,
+    services: &[ServiceNativeLinkInput],
+) -> Result<BTreeMap<SourceId, NativeServiceBuildSpec>, RelNativeLinkError> {
     let symbol_sources = prepared
         .normalized_symbols
         .iter()
@@ -170,17 +175,16 @@ pub fn commit_rel_native_link(
         .collect::<BTreeMap<_, _>>();
 
     let mut seen_logical = BTreeSet::new();
-    let mut seen_identity = BTreeSet::new();
-    let mut service_artifacts = BTreeMap::new();
+    let mut specs = BTreeMap::new();
     for service in services {
         if !seen_logical.insert(service.logical_name.clone()) {
             return Err(RelNativeLinkError::DuplicateServiceLogicalName(
                 service.logical_name.clone(),
             ));
         }
-        if !seen_identity.insert(service.service_identity.clone()) {
+        if specs.contains_key(&service.source_id) {
             return Err(RelNativeLinkError::DuplicateServiceIdentity(
-                service.service_identity.clone(),
+                service.source_id.clone(),
             ));
         }
 
@@ -218,43 +222,21 @@ pub fn commit_rel_native_link(
             })?;
             entry_oids.insert(binding.oid);
         }
-        let entry_oids = entry_oids.into_iter().collect::<Vec<_>>();
 
-        let plan = build_service_plan_from_oid_cache(
-            cache,
-            service.service_identity.clone(),
-            service.source_sha256.clone(),
-            entry_oids.clone(),
-            service.service_data.clone(),
-            service.dependency_hashes.clone(),
-            service.compile_options.clone(),
-        )
-        .map_err(RelNativeLinkError::Plan)?;
-        let (plan_hash, plan_path) =
-            write_service_plan_atomic(project_root, &plan).map_err(RelNativeLinkError::Plan)?;
-        let (assembled, bin_path) = assemble_service_from_oid_cache(project_root, cache, &plan)
-            .map_err(RelNativeLinkError::Plan)?;
-
-        service_artifacts.insert(
-            service.logical_name.clone(),
-            LinkedServiceNativeArtifact {
-                service_identity: service.service_identity.clone(),
-                entry_oids,
-                plan,
-                plan_hash,
-                plan_path,
-                assembly_hash: assembled.assembly_hash,
-                bin_path,
+        specs.insert(
+            service.source_id.clone(),
+            NativeServiceBuildSpec {
+                source_id: service.source_id.clone(),
+                service_source_sha256: service.source_sha256.clone(),
+                entry_oids: entry_oids.into_iter().collect(),
+                service_data: service.service_data.clone(),
+                dependency_hashes: service.dependency_hashes.clone(),
+                compile_options: service.compile_options.clone(),
+                packages: service.packages.clone(),
             },
         );
     }
-
-    Ok(RelNativeLinkReport {
-        reconcile: prepared.reconcile,
-        materialization,
-        removed_retired_oids,
-        services: service_artifacts,
-    })
+    Ok(specs)
 }
 
 fn normalize_symbols(
@@ -342,7 +324,6 @@ pub enum RelNativeLinkError {
     Oid(OidError),
     Bridge(RelOidBridgeError),
     Materialize(OidMaterializeError),
-    Plan(ServiceOidAdapterError),
     DuplicateSymbol,
     MissingSymbolDependency {
         symbol: String,
@@ -354,7 +335,7 @@ pub enum RelNativeLinkError {
         observed: String,
     },
     DuplicateServiceLogicalName(String),
-    DuplicateServiceIdentity(String),
+    DuplicateServiceIdentity(SourceId),
     MissingServiceRoots(String),
     EmptyServiceRoots(String),
     UnknownServiceRoot {
@@ -381,7 +362,6 @@ impl fmt::Display for RelNativeLinkError {
             Self::Materialize(error) => {
                 write!(formatter, "linked REL OID materialization failed: {error}")
             }
-            Self::Plan(error) => write!(formatter, "native Service plan/assembly failed: {error}"),
             Self::DuplicateSymbol => {
                 formatter.write_str("linked REL discovery contains duplicate canonical symbols")
             }
@@ -401,7 +381,7 @@ impl fmt::Display for RelNativeLinkError {
                 write!(formatter, "native Service input repeats logical Service {service:?}")
             }
             Self::DuplicateServiceIdentity(service) => {
-                write!(formatter, "native Service input repeats Runtime Image identity {service:?}")
+                write!(formatter, "native Service input repeats Runtime Image identity {service}")
             }
             Self::MissingServiceRoots(service) => write!(
                 formatter,
@@ -426,7 +406,7 @@ impl fmt::Display for RelNativeLinkError {
                 observed,
             } => write!(
                 formatter,
-                "Service {service:?} root {symbol:?} belongs to source {observed}, but Service plan pins {expected}"
+                "Service {service:?} root {symbol:?} belongs to source {observed}, but Service link pins {expected}"
             ),
         }
     }
