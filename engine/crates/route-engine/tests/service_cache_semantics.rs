@@ -22,10 +22,7 @@ fn temp_root(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "rbe-{label}-{}-{nonce}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("rbe-{label}-{}-{nonce}", std::process::id()))
 }
 
 fn plan(service: &str, dependency_key: &str, dependency_hash: String) -> ServiceAssemblyPlan {
@@ -45,15 +42,15 @@ fn plan(service: &str, dependency_key: &str, dependency_hash: String) -> Service
         call_graph: BTreeMap::new(),
         service_data: Vec::new(),
         data_alignment: 8,
-        dependency_hashes: BTreeMap::from([(
-            dependency_key.to_string(),
-            dependency_hash,
-        )]),
+        dependency_hashes: BTreeMap::from([(dependency_key.to_string(), dependency_hash)]),
         compile_options: BTreeMap::new(),
     }
 }
 
-fn write_artifacts(root: &std::path::Path, plan: &ServiceAssemblyPlan) -> (String, String, PathBuf, PathBuf) {
+fn write_artifacts(
+    root: &std::path::Path,
+    plan: &ServiceAssemblyPlan,
+) -> (String, String, PathBuf, PathBuf) {
     let (plan_hash, plan_path) = write_service_plan_atomic(root, plan).unwrap();
     let required = &plan.required_oids[0];
     let record = VerifiedAssemblyOidRecord {
@@ -70,12 +67,8 @@ fn write_artifacts(root: &std::path::Path, plan: &ServiceAssemblyPlan) -> (Strin
     };
     let bin = assemble_service_bin(plan, &BTreeMap::from([(record.oid, record)])).unwrap();
     let assembly_hash = bin.assembly_hash.clone();
-    let bin_path = write_service_bin_atomic(
-        &AtomicIo::new(),
-        &root.join(".cache/compiler"),
-        &bin,
-    )
-    .unwrap();
+    let bin_path =
+        write_service_bin_atomic(&AtomicIo::new(), &root.join(".cache/compiler"), &bin).unwrap();
     (plan_hash, assembly_hash, plan_path, bin_path)
 }
 
