@@ -112,6 +112,22 @@ impl NativeServiceWorkerBootstrap {
     }
 }
 
+/// Parent-side ownership token for one worker bootstrap. The serializable frame
+/// is intentionally not returned on its own by the activation API: this lease
+/// retains the exact Service OIDs and content-addressed artifacts from spawn
+/// through final worker teardown.
+#[derive(Debug)]
+pub struct NativeServiceWorkerBootstrapLease {
+    bootstrap: NativeServiceWorkerBootstrap,
+    _lifetime: NativeServiceLifetimeLease,
+}
+
+impl NativeServiceWorkerBootstrapLease {
+    pub fn bootstrap(&self) -> &NativeServiceWorkerBootstrap {
+        &self.bootstrap
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltNativeService {
     pub pin: NativeServiceArtifactPin,
@@ -134,6 +150,7 @@ pub struct NativeRuntimeImageBuild {
 pub struct NativeRuntimeImageActivation {
     image: Arc<RuntimeImage>,
     build: Arc<NativeRuntimeImageBuild>,
+    lifetimes: NativeServiceLifetimeRegistry,
     _lifetime: NativeServiceLifetimeLease,
 }
 
@@ -157,11 +174,32 @@ impl NativeRuntimeImageActivation {
             .map(|service| &service.launch)
     }
 
-    /// Freeze the worker-facing bootstrap from the same activation `Arc` that
-    /// owns the native lifetime lease. Producing this frame never switches the
-    /// worker execution mode; it only provides exact immutable launch metadata
-    /// for a later parity-gated native worker path.
-    pub fn worker_bootstrap(
+    /// Acquire worker-level liveness before exposing the serialized bootstrap.
+    /// The returned lease is intended to live inside the supervised worker
+    /// process record; dropping it after teardown releases only this worker's
+    /// Service-level OID/artifact hold.
+    pub fn worker_bootstrap_lease(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<NativeServiceWorkerBootstrapLease, NativeServiceBuildError> {
+        let built = self.build.services.get(source_id).ok_or_else(|| {
+            NativeServiceBuildError::InvalidService(format!(
+                "Runtime Image {} has no built native Service {source_id}",
+                self.image.image_id
+            ))
+        })?;
+        let lifetime = self
+            .lifetimes
+            .pin_service(&built.pin)
+            .map_err(NativeServiceBuildError::Native)?;
+        let bootstrap = self.worker_bootstrap_frame(source_id)?;
+        Ok(NativeServiceWorkerBootstrapLease {
+            bootstrap,
+            _lifetime: lifetime,
+        })
+    }
+
+    fn worker_bootstrap_frame(
         &self,
         source_id: &SourceId,
     ) -> Result<NativeServiceWorkerBootstrap, NativeServiceBuildError> {
@@ -252,6 +290,18 @@ impl NativeRuntimeImageActivationSlot {
             .expect("native Runtime Image activation slot poisoned");
         std::mem::replace(&mut *current, next)
     }
+
+    /// Snapshot the active generation, acquire a Service-level worker lifetime,
+    /// then let the generation snapshot fall away. The returned lease is enough
+    /// to keep the worker's exact native dependencies alive across a later A->B
+    /// activation swap.
+    pub fn worker_bootstrap_lease(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<NativeServiceWorkerBootstrapLease, NativeServiceBuildError> {
+        let active = self.snapshot();
+        active.worker_bootstrap_lease(source_id)
+    }
 }
 
 /// Turn a completely built Image B into an activation candidate. This validates
@@ -270,6 +320,7 @@ pub fn prepare_native_runtime_image_activation(
     Ok(NativeRuntimeImageActivation {
         image: Arc::new(image),
         build: Arc::new(build),
+        lifetimes: lifetimes.clone(),
         _lifetime: lifetime,
     })
 }
