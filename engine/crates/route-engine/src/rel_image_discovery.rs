@@ -6,18 +6,23 @@
 //! bridge therefore combines the immutable parsed ASTs with the exact original
 //! physical/embedded source bytes only to derive per-source SHA-256 identity.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+use sha2::{Digest, Sha256};
 
 use crate::embedded_rel::{extract_embedded_rel, EmbeddedRelError};
 use crate::rel_symbol_discovery::{
-    discover_linked_rel_symbols, LinkedRelDiscovery, LinkedRelDiscoveryError, LinkedRelSourceUnit,
+    discover_linked_rel_symbols, linked_source_sha256, LinkedRelDiscovery,
+    LinkedRelDiscoveryError, LinkedRelSourceUnit,
 };
 use crate::relc::PhysicalRelSource;
-use crate::runtime_image::{RuntimeExecutable, RuntimeImage};
+use crate::runtime_image::{RuntimeCapabilityRequirement, RuntimeExecutable, RuntimeImage};
 use crate::source_registry::RelSourceKind;
 
 type SourceKey = (RelSourceKind, String);
+
+const CAPABILITY_IDENTITY_DOMAIN: &[u8] = b"RBE_RUNTIME_CAPABILITY_IDENTITY_V1";
 
 /// Build the linked-REL reachability snapshot for the exact Runtime Image that
 /// RELC already produced.
@@ -32,6 +37,8 @@ pub fn discover_linked_rel_from_runtime_image(
 ) -> Result<LinkedRelDiscovery, RuntimeImageLinkedRelError> {
     let sources = collect_original_sources(raw_server_source, physical_sources)?;
     let mut units = Vec::new();
+    let mut capability_identities =
+        BTreeMap::<String, (String, BTreeSet<String>)>::new();
 
     for manifest in &image.sources {
         let kind = manifest.kind;
@@ -56,6 +63,31 @@ pub fn discover_linked_rel_from_runtime_image(
             }
         })?;
 
+        let source_sha256 = linked_source_sha256(source);
+        let capabilities = image
+            .capability_requirements(&manifest.id)
+            .into_iter()
+            .flatten()
+            .map(capability_identity)
+            .collect::<BTreeSet<_>>();
+        let source_label = manifest.id.to_string();
+        if let Some((existing_source, existing_capabilities)) =
+            capability_identities.get(&source_sha256)
+        {
+            if existing_capabilities != &capabilities {
+                return Err(RuntimeImageLinkedRelError::AmbiguousSourceCapabilities {
+                    source_sha256,
+                    first_source: existing_source.clone(),
+                    second_source: source_label,
+                });
+            }
+        } else {
+            capability_identities.insert(
+                source_sha256,
+                (source_label, capabilities),
+            );
+        }
+
         let unit = match (kind, executable) {
             (RelSourceKind::Route, RuntimeExecutable::Route(file)) => {
                 LinkedRelSourceUnit::route(&manifest.logical_name, source, file.as_ref())
@@ -76,7 +108,54 @@ pub fn discover_linked_rel_from_runtime_image(
         units.push(unit);
     }
 
-    discover_linked_rel_symbols(&units).map_err(RuntimeImageLinkedRelError::Discovery)
+    let mut discovery =
+        discover_linked_rel_symbols(&units).map_err(RuntimeImageLinkedRelError::Discovery)?;
+    for symbol in &mut discovery.symbols {
+        let (_, capabilities) = capability_identities
+            .get(&symbol.source_sha256)
+            .ok_or_else(|| RuntimeImageLinkedRelError::MissingCapabilityIdentitySource {
+                canonical_id: symbol.canonical_id.clone(),
+                source_sha256: symbol.source_sha256.clone(),
+            })?;
+        symbol.capabilities = capabilities.clone();
+    }
+    Ok(discovery)
+}
+
+/// OID linking needs capability *identity* so a permission-semantic change
+/// participates in the linked symbol hash. Runtime Image remains the only
+/// authorization authority: this opaque fingerprint is never interpreted as a
+/// second grant/policy language by the OID cache or service assembler.
+fn capability_identity(requirement: &RuntimeCapabilityRequirement) -> String {
+    let mut hash = Sha256::new();
+    hash.update(CAPABILITY_IDENTITY_DOMAIN);
+    match requirement {
+        RuntimeCapabilityRequirement::PublicHttp { operation } => {
+            feed_identity(&mut hash, b"public-http");
+            feed_identity(&mut hash, operation.as_bytes());
+        }
+        RuntimeCapabilityRequirement::Storage { owner, operation } => {
+            feed_identity(&mut hash, b"storage");
+            feed_identity(&mut hash, owner.as_bytes());
+            feed_identity(&mut hash, operation.as_bytes());
+        }
+        RuntimeCapabilityRequirement::Video { owner, operation } => {
+            feed_identity(&mut hash, b"video");
+            feed_identity(&mut hash, owner.as_bytes());
+            feed_identity(&mut hash, operation.as_bytes());
+        }
+        RuntimeCapabilityRequirement::Service { service, operation } => {
+            feed_identity(&mut hash, b"service");
+            feed_identity(&mut hash, service.as_bytes());
+            feed_identity(&mut hash, operation.as_bytes());
+        }
+    }
+    format!("cap-sha256:{}", hex::encode(hash.finalize()))
+}
+
+fn feed_identity(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
 }
 
 fn collect_original_sources(
@@ -146,6 +225,15 @@ pub enum RuntimeImageLinkedRelError {
         source: String,
         expected: RelSourceKind,
     },
+    AmbiguousSourceCapabilities {
+        source_sha256: String,
+        first_source: String,
+        second_source: String,
+    },
+    MissingCapabilityIdentitySource {
+        canonical_id: String,
+        source_sha256: String,
+    },
 }
 
 impl fmt::Display for RuntimeImageLinkedRelError {
@@ -172,6 +260,21 @@ impl fmt::Display for RuntimeImageLinkedRelError {
             Self::ExecutableKindMismatch { source, expected } => write!(
                 formatter,
                 "compiled Runtime Image source {source} does not carry the expected {expected} executable AST"
+            ),
+            Self::AmbiguousSourceCapabilities {
+                source_sha256,
+                first_source,
+                second_source,
+            } => write!(
+                formatter,
+                "identical REL source identity {source_sha256} resolves to different Runtime Image capabilities for {first_source} and {second_source}; linked OID identity cannot be chosen safely"
+            ),
+            Self::MissingCapabilityIdentitySource {
+                canonical_id,
+                source_sha256,
+            } => write!(
+                formatter,
+                "linked REL symbol {canonical_id:?} references source identity {source_sha256}, but no Runtime Image capability identity was recorded"
             ),
         }
     }
@@ -219,5 +322,24 @@ export function auth() { return false; }
             error,
             RuntimeImageLinkedRelError::DuplicateOriginalSource { .. }
         ));
+    }
+
+    #[test]
+    fn capability_identity_is_stable_and_typed() {
+        let get = RuntimeCapabilityRequirement::PublicHttp {
+            operation: "get".into(),
+        };
+        let post = RuntimeCapabilityRequirement::PublicHttp {
+            operation: "post".into(),
+        };
+        let service = RuntimeCapabilityRequirement::Service {
+            service: "mail".into(),
+            operation: "get".into(),
+        };
+
+        assert_eq!(capability_identity(&get), capability_identity(&get));
+        assert_ne!(capability_identity(&get), capability_identity(&post));
+        assert_ne!(capability_identity(&get), capability_identity(&service));
+        assert!(capability_identity(&get).starts_with("cap-sha256:"));
     }
 }
