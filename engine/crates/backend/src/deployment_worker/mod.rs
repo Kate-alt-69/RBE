@@ -27,7 +27,7 @@ pub async fn run() -> Result<()> {
     let source_authority = SourceAuthority::hydrate(&config.runtime_registry_base, &runtime_cache)
         .await
         .context("initialize RBE deployment source authority before claiming work")?;
-    let publisher = PublisherClient::new(&config.publisher_base, config.helper_token)?;
+    let publisher = PublisherClient::new(&config.publisher_base, config.helper_token.clone())?;
 
     eprintln!(
         "RBE deployment worker {} ready; managed Git admitted before lease claims",

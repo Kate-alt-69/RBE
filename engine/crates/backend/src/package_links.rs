@@ -305,7 +305,8 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
             bail!(
                 "RPX package index version mismatch for explicit root {:?}: lock={}, index={}",
                 verified.package,
-                verified.version
+                verified.version,
+                index.package.version
             );
         }
         if !matches!(

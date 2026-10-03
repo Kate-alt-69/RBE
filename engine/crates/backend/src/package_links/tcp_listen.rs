@@ -458,10 +458,11 @@ fn spawn_listener_reaper(handle: String, package: String, owner: String) {
                 if listener.package != package || listener.owner != owner {
                     return;
                 }
-                match listener.last_touch.lock() {
+                let idle = match listener.last_touch.lock() {
                     Ok(last_touch) => last_touch.elapsed() >= LISTENER_IDLE_LEASE,
                     Err(_) => true,
-                }
+                };
+                idle
             };
             if stale {
                 if let Ok(mut listeners) = listener_registry().lock() {
