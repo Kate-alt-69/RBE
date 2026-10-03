@@ -137,6 +137,7 @@ pub mod oid_materialize;
 pub mod package_native_link;
 pub mod rel_image_discovery;
 pub mod rel_native_link;
+pub mod rel_native_semantics;
 pub mod rel_oid_bridge;
 pub mod rel_symbol_discovery;
 pub mod relc;
