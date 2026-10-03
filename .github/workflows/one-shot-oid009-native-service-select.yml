@@ -27,6 +27,42 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
+          selector = Path('engine/crates/route-engine/src/rel_native_service_select.rs')
+          text = selector.read_text()
+          old_import = 'use crate::oid_link::{LinkedRelKind, LinkedRelSymbolSpec};\n'
+          if old_import in text:
+              text = text.replace(
+                  old_import,
+                  'use crate::oid_link::LinkedRelKind;\n#[cfg(test)]\nuse crate::oid_link::LinkedRelSymbolSpec;\n',
+                  1,
+              )
+
+          output_anchor = '            service_exports,\n            reachable_symbols: selected_ids,\n'
+          output_replacement = (
+              '            service_exports,\n'
+              '            service_lifecycle: BTreeMap::new(),\n'
+              '            reachable_symbols: selected_ids,\n'
+          )
+          if output_anchor in text:
+              text = text.replace(output_anchor, output_replacement, 1)
+          elif output_replacement not in text:
+              raise SystemExit('selector output LinkedRelDiscovery anchor changed')
+
+          test_anchor = (
+              '            service_exports: BTreeMap::from([("demo".into(), export_map)]),\n'
+              '            reachable_symbols,\n'
+          )
+          test_replacement = (
+              '            service_exports: BTreeMap::from([("demo".into(), export_map)]),\n'
+              '            service_lifecycle: BTreeMap::new(),\n'
+              '            reachable_symbols,\n'
+          )
+          if test_anchor in text:
+              text = text.replace(test_anchor, test_replacement, 1)
+          elif test_replacement not in text:
+              raise SystemExit('selector test LinkedRelDiscovery anchor changed')
+          selector.write_text(text)
+
           lib = Path('engine/crates/route-engine/src/lib.rs')
           text = lib.read_text()
           module = 'pub mod rel_native_service_select;\n'
