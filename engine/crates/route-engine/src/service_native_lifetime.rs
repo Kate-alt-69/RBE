@@ -18,8 +18,11 @@ use crate::package_native_link::{
     PackageNativeLinkError, PackageNativeLinkReport, PreparedPackageNativeLink,
 };
 use crate::rel_native_link::{
-    commit_rel_native_link, prepare_rel_native_link, PreparedRelNativeLink, RelNativeLinkError,
-    RelNativeLinkReport, ServiceNativeLinkInput,
+    prepare_rel_native_link, PreparedRelNativeLink, RelNativeLinkError, RelNativeLinkReport,
+    ServiceNativeLinkInput,
+};
+use crate::rel_native_semantics::{
+    commit_rel_native_link_with_semantic_dependencies, RelNativeSemanticError,
 };
 use crate::rel_symbol_discovery::LinkedRelDiscovery;
 use crate::relc::PackageLinkContext;
@@ -231,6 +234,8 @@ impl NativeServiceLinkGuard<'_> {
         prepare_rel_native_link(cache, discovery, &pinned_oids)
     }
 
+    /// Commit through Phase 4's semantic binder so every guarded Service plan
+    /// pins the exact transitive REL identities/capabilities it was lowered from.
     pub fn commit_rel(
         &self,
         project_root: &Path,
@@ -238,9 +243,9 @@ impl NativeServiceLinkGuard<'_> {
         prepared: PreparedRelNativeLink,
         fragments: &BTreeMap<String, NativeOidFragment>,
         services: &[ServiceNativeLinkInput],
-    ) -> Result<RelNativeLinkReport, RelNativeLinkError> {
+    ) -> Result<RelNativeLinkReport, RelNativeSemanticError> {
         let protection = self.registry.cache_protection();
-        commit_rel_native_link(
+        commit_rel_native_link_with_semantic_dependencies(
             project_root,
             cache,
             prepared,
