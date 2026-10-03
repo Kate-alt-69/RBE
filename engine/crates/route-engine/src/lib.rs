@@ -144,6 +144,7 @@ pub mod server_policy;
 pub mod server_rel;
 pub mod service_bin;
 pub mod service_native;
+pub mod service_native_build;
 pub mod service_oid;
 pub mod service_oid_adapter;
 pub mod source_registry;

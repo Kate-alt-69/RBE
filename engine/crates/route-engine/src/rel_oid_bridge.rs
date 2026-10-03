@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::oid_link::{reconcile_rel_oids, LinkedRelBinding, LinkedRelSymbolSpec, OidLinkError};
+use crate::service_native::DynamicOidPinRegistry;
 use crate::service_oid::{OidCache, OidError, OidIndex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +166,17 @@ pub fn reconcile_rel_cache(
         cache.replace_index(next).map_err(RelOidBridgeError::Oid)?;
     }
     Ok(report)
+}
+
+/// Phase-5 safe linked-REL reconciliation. Prefer this at Runtime Image
+/// boundaries so active Image/worker OID liveness cannot be omitted by callers.
+pub fn reconcile_rel_cache_with_active_pins(
+    cache: &mut OidCache,
+    desired: &[LinkedRelSymbolSpec],
+    active_pins: &DynamicOidPinRegistry,
+) -> Result<RelReconcileReport, RelOidBridgeError> {
+    let pinned_oids = active_pins.rel_allocator_pins();
+    reconcile_rel_cache(cache, desired, &pinned_oids)
 }
 
 fn invert_bindings(
