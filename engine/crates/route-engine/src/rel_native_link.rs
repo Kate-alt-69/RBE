@@ -3,7 +3,8 @@
 //! The link is deliberately two-stage. `prepare_rel_native_link` allocates OIDs
 //! against a cloned index and exposes those exact numeric bindings to native
 //! lowering without mutating the live cache. `commit_rel_native_link` accepts
-//! the lowered fragments, materializes sparse records, atomically publishes the
+//! the lowered fragments, invalidates only stale Service artifacts that depend
+//! on changed OIDs, materializes sparse records, atomically publishes the
 //! prepared index, and emits exact `NativeServiceBuildSpec`s for Phase 5.
 //!
 //! Phase 4 does not duplicate Phase 5's plan -> `.bin` -> immutable-pin build
@@ -12,6 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
@@ -22,6 +24,10 @@ use crate::oid_materialize::{
 };
 use crate::rel_oid_bridge::{reconcile_rel_index, RelOidBridgeError, RelReconcileReport};
 use crate::rel_symbol_discovery::LinkedRelDiscovery;
+use crate::service_cache_invalidation::{
+    invalidate_service_cache_for_oids, ServiceCacheInvalidationError,
+    ServiceCacheInvalidationReport, ServiceCacheProtection,
+};
 use crate::service_native::PackageArtifactPin;
 use crate::service_native_build::NativeServiceBuildSpec;
 use crate::service_oid::{OidCache, OidError, OidIndex};
@@ -74,6 +80,7 @@ impl PreparedRelNativeLink {
 #[derive(Debug, Clone)]
 pub struct RelNativeLinkReport {
     pub reconcile: RelReconcileReport,
+    pub invalidation: ServiceCacheInvalidationReport,
     pub materialization: OidMaterializationReport,
     pub removed_retired_oids: BTreeSet<u16>,
     /// Ready for `service_native_build::build_native_runtime_image_pins`.
@@ -112,16 +119,18 @@ pub fn prepare_rel_native_link(
 
 /// Publish one prepared linked-REL generation.
 ///
-/// The live index is checked again before any sparse record is written, so a
-/// stale prepare result cannot silently overwrite a newer compiler generation.
-/// Service inputs are also fully validated before publication. Only then are
-/// records written, the index atomically replaced, and unpinned retired records
-/// removed.
+/// The live index is checked again before any cache artifact or sparse record is
+/// changed, so a stale prepare result cannot silently overwrite a newer compiler
+/// generation. Service inputs are also fully validated before publication.
+/// Unprotected plans/binaries that reference changed OIDs are selectively
+/// removed; live Image A artifacts survive while Image B receives fresh OIDs.
 pub fn commit_rel_native_link(
+    project_root: &Path,
     cache: &mut OidCache,
     prepared: PreparedRelNativeLink,
     fragments: &BTreeMap<String, NativeOidFragment>,
     services: &[ServiceNativeLinkInput],
+    protection: &ServiceCacheProtection,
 ) -> Result<RelNativeLinkReport, RelNativeLinkError> {
     let observed_index_sha256 = index_sha256(cache.index())?;
     if observed_index_sha256 != prepared.base_index_sha256 {
@@ -133,6 +142,17 @@ pub fn commit_rel_native_link(
 
     let effective_fragments = effective_fragments(&prepared.normalized_symbols, fragments)?;
     let service_specs = build_service_specs(&prepared, services)?;
+
+    // Plans are already content-addressed by their exact required OID record
+    // hashes. Delete only stale, unprotected consumers of OIDs whose ownership
+    // changed. Pinned Image A artifacts remain available until Phase 5 releases
+    // their liveness pins.
+    let invalidation = invalidate_service_cache_for_oids(
+        project_root,
+        prepared.reconcile.delta.changed_oids.iter().copied(),
+        protection,
+    )
+    .map_err(RelNativeLinkError::Invalidation)?;
 
     // Sparse records are written before the index is published. If a record
     // write fails, the live index still describes the previous complete link
@@ -155,6 +175,7 @@ pub fn commit_rel_native_link(
 
     Ok(RelNativeLinkReport {
         reconcile: prepared.reconcile,
+        invalidation,
         materialization,
         removed_retired_oids,
         service_specs,
@@ -321,6 +342,7 @@ fn index_sha256(index: &OidIndex) -> Result<String, RelNativeLinkError> {
 pub enum RelNativeLinkError {
     Oid(OidError),
     Bridge(RelOidBridgeError),
+    Invalidation(ServiceCacheInvalidationError),
     Materialize(OidMaterializeError),
     DuplicateSymbol,
     MissingSymbolDependency {
@@ -357,6 +379,9 @@ impl fmt::Display for RelNativeLinkError {
         match self {
             Self::Oid(error) => write!(formatter, "linked REL OID cache failed: {error}"),
             Self::Bridge(error) => write!(formatter, "linked REL OID allocation failed: {error}"),
+            Self::Invalidation(error) => {
+                write!(formatter, "linked REL Service cache invalidation failed: {error}")
+            }
             Self::Materialize(error) => {
                 write!(formatter, "linked REL OID materialization failed: {error}")
             }
