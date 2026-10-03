@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use ed25519_dalek::SigningKey;
@@ -58,8 +58,28 @@ impl CloudNodeAuthenticator {
 
     pub fn new(settings: &CloudNodeSettings, signing: SigningKey) -> anyhow::Result<Self> {
         settings.validate()?;
+        let local_public_key = hex::encode(signing.verifying_key().to_bytes());
         let mut trusted_peers = HashMap::with_capacity(settings.replication.targets.len());
+        let mut trusted_keys = HashSet::with_capacity(settings.replication.targets.len());
         for target in &settings.replication.targets {
+            if target.node_id == settings.node.id {
+                anyhow::bail!(
+                    "Cloud Node replication target {:?} reuses the local node id; trusted peer identities must be distinct from the local node",
+                    target.node_id
+                );
+            }
+            let normalized_key = target.public_key.to_ascii_lowercase();
+            if normalized_key == local_public_key {
+                anyhow::bail!(
+                    "Cloud Node replication target {:?} reuses the local node signing key under a trusted peer identity",
+                    target.node_id
+                );
+            }
+            if !trusted_keys.insert(normalized_key) {
+                anyhow::bail!(
+                    "Cloud Node replication targets reuse one trusted public key across multiple node ids; each trusted node identity must have its own key"
+                );
+            }
             if trusted_peers
                 .insert(target.node_id.clone(), target.public_key.clone())
                 .is_some()
@@ -325,6 +345,34 @@ mod tests {
             .targets
             .push(settings.replication.targets[0].clone());
         assert!(CloudNodeAuthenticator::new(&settings, server).is_err());
+    }
+
+    #[test]
+    fn duplicate_trusted_public_keys_are_rejected() {
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        let client = SigningKey::from_bytes(&[7u8; 32]);
+        let mut settings = settings(&client);
+        let mut alias = settings.replication.targets[0].clone();
+        alias.node_id = "nas-alias".into();
+        alias.url = "https://nas-alias.invalid".into();
+        alias.public_key = alias.public_key.to_ascii_uppercase();
+        settings.replication.targets.push(alias);
+        assert!(CloudNodeAuthenticator::new(&settings, server).is_err());
+    }
+
+    #[test]
+    fn local_node_identity_cannot_be_trusted_as_replication_target() {
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        let client = SigningKey::from_bytes(&[7u8; 32]);
+
+        let mut same_id = settings(&client);
+        same_id.replication.targets[0].node_id = same_id.node.id.clone();
+        assert!(CloudNodeAuthenticator::new(&same_id, server.clone()).is_err());
+
+        let mut same_key = settings(&client);
+        same_key.replication.targets[0].node_id = "render-alias".into();
+        same_key.replication.targets[0].public_key = public_key_hex(&server);
+        assert!(CloudNodeAuthenticator::new(&same_key, server).is_err());
     }
 
     #[test]
