@@ -134,6 +134,7 @@ pub mod oid_cache_bootstrap;
 pub mod oid_index_bridge;
 pub mod oid_link;
 pub mod oid_materialize;
+pub mod rel_native_link;
 pub mod rel_oid_bridge;
 pub mod rel_symbol_discovery;
 pub mod relc;
