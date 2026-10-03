@@ -1,0 +1,82 @@
+name: One-shot OID-008 clippy retry
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-oid008-clippy-retry.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Clear route-engine clippy blockers and retrigger OID-008
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git pull --rebase origin main
+          python3 - <<'PY'
+          from pathlib import Path
+
+          paths = [
+              'engine/crates/route-engine/tests/service_cache_semantics.rs',
+              'engine/crates/route-engine/src/oid_index_bridge.rs',
+              'engine/crates/route-engine/src/oid_link.rs',
+              'engine/crates/route-engine/src/oid_materialize.rs',
+              'engine/crates/route-engine/src/rel_native_link.rs',
+              'engine/crates/route-engine/src/rel_oid_bridge.rs',
+              'engine/crates/route-engine/src/service_bin.rs',
+              'engine/crates/route-engine/src/service_cache_invalidation.rs',
+              'engine/crates/route-engine/src/service_native.rs',
+          ]
+          old = 'std::iter::repeat(ch).take(64).collect()'
+          new = 'std::iter::repeat_n(ch, 64).collect()'
+          for raw in paths:
+              path = Path(raw)
+              text = path.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{raw}: expected exactly one Rust 1.98 repeat/take helper, found {count}')
+              path.write_text(text.replace(old, new, 1))
+
+          oid_workflow = Path('.github/workflows/one-shot-oid-phase2-bool-leaf.yml')
+          text = oid_workflow.read_text()
+          marker = '# retry-trigger: rust-1.98-manual-repeat-n\n'
+          if marker not in text:
+              text = text.replace('name: One-shot OID Phase 2 Boolean leaf lowerer\n', 'name: One-shot OID Phase 2 Boolean leaf lowerer\n' + marker, 1)
+              oid_workflow.write_text(text)
+          PY
+          rm .github/workflows/one-shot-oid008-clippy-retry.yml
+          cd engine
+          cargo fmt --all
+          cargo clippy -p route-engine --all-targets --locked -- -D warnings
+          cargo fmt --all -- --check
+          cd ..
+          git add engine/crates/route-engine/tests/service_cache_semantics.rs \
+            engine/crates/route-engine/src/oid_index_bridge.rs \
+            engine/crates/route-engine/src/oid_link.rs \
+            engine/crates/route-engine/src/oid_materialize.rs \
+            engine/crates/route-engine/src/rel_native_link.rs \
+            engine/crates/route-engine/src/rel_oid_bridge.rs \
+            engine/crates/route-engine/src/service_bin.rs \
+            engine/crates/route-engine/src/service_cache_invalidation.rs \
+            engine/crates/route-engine/src/service_native.rs \
+            .github/workflows/one-shot-oid-phase2-bool-leaf.yml \
+            .github/workflows/one-shot-oid008-clippy-retry.yml
+          git commit -m "FIX | OID-008 clear Rust 1.98 clippy blockers"
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            git pull --rebase origin main
+          done
+          echo "failed to fast-forward push OID-008 clippy retry" >&2
+          exit 1
