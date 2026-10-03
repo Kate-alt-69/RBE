@@ -45,18 +45,24 @@ pub struct ServiceCacheInvalidationReport {
     pub affected_oids: BTreeSet<u16>,
     pub removed_plan_hashes: BTreeSet<String>,
     pub removed_assembly_hashes: BTreeSet<String>,
+    /// A live/draining Runtime Image still owns these exact cache artifacts.
+    /// They intentionally survive until that image/worker releases its pin.
+    pub retained_plan_hashes: BTreeSet<String>,
+    pub retained_assembly_hashes: BTreeSet<String>,
     /// Corrupt/unrecognized cache entries are not treated as dependencies and
     /// are left for normal cache-corruption cleanup instead of broad deletion.
     pub skipped_unreadable_plans: usize,
     pub skipped_unreadable_bins: usize,
 }
 
-/// Remove only Service plans that require one of `affected_oids`, followed by
-/// only bytecode bins whose embedded plan hash points at one of those plans.
+/// Remove only unprotected Service plans that require one of `affected_oids`,
+/// followed by only bytecode bins whose embedded plan hash points at one of
+/// those removed plans.
 ///
-/// This is deliberately a preflight-then-delete operation. If any affected
-/// artifact is still pinned by a live Runtime Image, no files are removed and
-/// the caller gets a hard liveness error instead of silently breaking overlap.
+/// Protected artifacts are deliberately retained. A pinned old Runtime Image
+/// may keep executing its old OID record while the next image receives a fresh
+/// OID; deleting that old plan/bin would break the overlap guarantee Phase 5
+/// exists to provide.
 pub fn invalidate_service_cache_for_oids(
     project_root: &Path,
     affected_oids: impl IntoIterator<Item = u16>,
@@ -94,18 +100,8 @@ pub fn invalidate_service_cache_for_oids(
             continue;
         }
         if protection.plan_hashes.contains(&plan_hash) {
-            return Err(ServiceCacheInvalidationError::PinnedPlanAffected {
-                plan_hash,
-                affected_oids: plan
-                    .required_oids
-                    .iter()
-                    .filter_map(|required| {
-                        affected_oids
-                            .contains(&required.oid)
-                            .then_some(required.oid)
-                    })
-                    .collect(),
-            });
+            report.retained_plan_hashes.insert(plan_hash);
+            continue;
         }
         plan_deletes.push((plan_hash, path));
     }
@@ -139,16 +135,14 @@ pub fn invalidate_service_cache_for_oids(
             continue;
         }
         if protection.assembly_hashes.contains(&assembly_hash) {
-            return Err(ServiceCacheInvalidationError::PinnedBinAffected {
-                assembly_hash,
-                plan_hash: decoded.plan_hash,
-            });
+            report.retained_assembly_hashes.insert(assembly_hash);
+            continue;
         }
         bin_deletes.push((assembly_hash, path));
     }
 
-    // No liveness conflict exists. Apply the previously computed exact delete
-    // set; unrelated plans/bins are never touched.
+    // Apply the exact unprotected delete set; unrelated and live-pinned cache
+    // artifacts are never touched.
     for (plan_hash, path) in plan_deletes {
         remove_cache_file(&path)?;
         report.removed_plan_hashes.insert(plan_hash);
@@ -214,18 +208,7 @@ fn remove_cache_file(path: &Path) -> Result<(), ServiceCacheInvalidationError> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceCacheInvalidationError {
-    Io {
-        path: PathBuf,
-        error: String,
-    },
-    PinnedPlanAffected {
-        plan_hash: String,
-        affected_oids: BTreeSet<u16>,
-    },
-    PinnedBinAffected {
-        assembly_hash: String,
-        plan_hash: String,
-    },
+    Io { path: PathBuf, error: String },
 }
 
 impl fmt::Display for ServiceCacheInvalidationError {
@@ -235,20 +218,6 @@ impl fmt::Display for ServiceCacheInvalidationError {
                 formatter,
                 "service cache invalidation failed at {}: {error}",
                 path.display()
-            ),
-            Self::PinnedPlanAffected {
-                plan_hash,
-                affected_oids,
-            } => write!(
-                formatter,
-                "service plan {plan_hash} is still pinned but depends on changing OIDs {affected_oids:?}"
-            ),
-            Self::PinnedBinAffected {
-                assembly_hash,
-                plan_hash,
-            } => write!(
-                formatter,
-                "service bin {assembly_hash} (plan {plan_hash}) is still pinned and cannot be invalidated"
             ),
         }
     }
