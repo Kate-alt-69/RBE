@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceMemory};
 
+#[path = "service_package_catalog.rs"]
+mod service_package_catalog;
+
 pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let value = |flag: &str| {
         args.windows(2)
@@ -238,8 +241,10 @@ pub fn compile(
     settings: &config::ServicesConfig,
     io: &atomic_io::AtomicIo,
 ) -> anyhow::Result<Option<ServiceCatalog>> {
-    let directory = resolve_runtime_path(&settings.directory);
-    compile_resolved(settings, io, &directory)
+    let application_root = std::env::current_dir().map_err(|error| {
+        anyhow::anyhow!("could not resolve application root for Service compilation: {error}")
+    })?;
+    compile_from_root(settings, io, &application_root)
 }
 
 pub fn compile_from_root(
@@ -248,7 +253,30 @@ pub fn compile_from_root(
     application_root: &Path,
 ) -> anyhow::Result<Option<ServiceCatalog>> {
     let directory = resolve_runtime_path_from(application_root, &settings.directory);
-    compile_resolved(settings, io, &directory)
+    if !settings.enabled {
+        return compile_resolved(settings, io, &directory);
+    }
+
+    let staged = service_package_catalog::stage_if_needed(application_root, &directory, io)?;
+    let compile_root = staged
+        .as_ref()
+        .map(service_package_catalog::StagedServiceCatalog::root)
+        .unwrap_or(directory.as_path());
+    let catalog = compile_resolved(settings, io, compile_root)?;
+
+    if let (Some(catalog), Some(staged)) = (catalog.as_ref(), staged.as_ref()) {
+        if let Err(rendered) = staged.validate_namespaces(catalog) {
+            report_compile_failure(&rendered, io);
+            return Err(anyhow::anyhow!("package-owned .service namespace validation failed"));
+        }
+        tracing::info!(
+            package_services = staged.package_service_count(),
+            total_services = catalog.services().len(),
+            "compiled application and approved package-owned .service programs into one catalog"
+        );
+    }
+
+    Ok(catalog)
 }
 
 fn compile_resolved(
