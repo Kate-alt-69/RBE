@@ -21,9 +21,7 @@ use crate::service_native::{
     load_pinned_service_bin, DynamicOidPinRegistry, NativeRuntimeImagePins,
     NativeServiceArtifactPin, PackageArtifactPin, ServiceBinCacheLookup, ServiceNativeError,
 };
-use crate::service_native_lifetime::{
-    NativeServiceLifetimeLease, NativeServiceLifetimeRegistry,
-};
+use crate::service_native_lifetime::{NativeServiceLifetimeLease, NativeServiceLifetimeRegistry};
 use crate::service_oid::OidCache;
 use crate::service_oid_adapter::{
     assemble_service_from_oid_cache, build_service_plan_from_oid_cache, write_service_plan_atomic,
@@ -113,7 +111,10 @@ impl NativeRuntimeImageActivation {
     }
 
     pub fn launch(&self, source_id: &SourceId) -> Option<&NativeServiceLaunch> {
-        self.build.services.get(source_id).map(|service| &service.launch)
+        self.build
+            .services
+            .get(source_id)
+            .map(|service| &service.launch)
     }
 }
 
