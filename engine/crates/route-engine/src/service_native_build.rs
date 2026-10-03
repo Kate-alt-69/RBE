@@ -15,7 +15,7 @@ use crate::rel_native_link::{
 };
 use crate::rel_symbol_discovery::LinkedRelDiscovery;
 use crate::runtime_image::RuntimeImage;
-use crate::service_bin::{AssemblyRecordKind, AssembledServiceBin};
+use crate::service_bin::{AssembledServiceBin, AssemblyRecordKind};
 use crate::service_native::{
     load_pinned_service_bin, DynamicOidPinRegistry, NativeRuntimeImagePins,
     NativeServiceArtifactPin, PackageArtifactPin, ServiceBinCacheLookup, ServiceNativeError,
