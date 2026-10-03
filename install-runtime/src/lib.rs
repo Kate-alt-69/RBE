@@ -70,6 +70,7 @@ mod snapshot;
 mod system_runtime;
 mod target;
 mod verified_worker;
+mod worker_launch;
 mod worker_source;
 
 pub use activation::{
@@ -95,7 +96,8 @@ pub use promotion::{
     RootGraphPromotion,
 };
 pub use rbe_install_executor::{
-    GitSourceAcquisitionPlan, GitSourceReceipt, PinnedManagedToolchain, SourceFileDigest,
+    library_worker_proxy_bootstrap, GitSourceAcquisitionPlan, GitSourceReceipt,
+    PinnedManagedToolchain, SourceFileDigest, VerifiedWorkerInvocation, WorkerProxyBridgeError,
 };
 pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
@@ -112,6 +114,10 @@ pub use target::{
     load_named_install_target, merge_named_install_target, InstallTargetError, NamedInstallTarget,
 };
 pub use verified_worker::{read_verified_root_worker_identities, VerifiedPackageWorkerIdentity};
+pub use worker_launch::{
+    prepare_verified_library_worker_launch, LibraryWorkerLaunchPreparationError,
+    PreparedLibraryWorkerLaunch,
+};
 pub use worker_source::{
     prepare_verified_worker_source, MaterializedWorkerSource, VerifiedWorkerSourcePlan,
     WorkerSourceError,
