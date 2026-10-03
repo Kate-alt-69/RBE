@@ -20,6 +20,7 @@ jobs:
         with:
           components: rustfmt
       - name: Format Rust workspaces
+        working-directory: engine
         shell: bash
         run: cargo fmt --all
       - name: Commit formatter output
