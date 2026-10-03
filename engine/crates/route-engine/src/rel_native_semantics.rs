@@ -66,7 +66,9 @@ pub fn bind_service_semantic_dependencies(
         let roots = prepared
             .service_roots()
             .get(&service.logical_name)
-            .ok_or_else(|| RelNativeSemanticError::MissingServiceRoots(service.logical_name.clone()))?;
+            .ok_or_else(|| {
+                RelNativeSemanticError::MissingServiceRoots(service.logical_name.clone())
+            })?;
         if roots.is_empty() {
             return Err(RelNativeSemanticError::EmptyServiceRoots(
                 service.logical_name.clone(),
@@ -76,9 +78,10 @@ pub fn bind_service_semantic_dependencies(
         let reachable = transitive_symbols(roots, &symbols)?;
         let mut service = service.clone();
         for canonical_id in reachable {
-            let binding = prepared.bindings().get(&canonical_id).ok_or_else(|| {
-                RelNativeSemanticError::MissingBinding(canonical_id.clone())
-            })?;
+            let binding = prepared
+                .bindings()
+                .get(&canonical_id)
+                .ok_or_else(|| RelNativeSemanticError::MissingBinding(canonical_id.clone()))?;
             let key = format!("{REL_SEMANTIC_DEPENDENCY_PREFIX}{canonical_id}");
             if let Some(existing) = service.dependency_hashes.get(&key) {
                 if existing != &binding.identity_sha256 {
