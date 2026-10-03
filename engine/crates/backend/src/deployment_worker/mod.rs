@@ -80,16 +80,9 @@ async fn process_deployment(
 ) -> Result<()> {
     if publisher.source_receipt_exists(deployment).await? {
         publisher
-            .update(
+            .complete_source_handoff(
                 deployment,
-                WorkerUpdate {
-                    status: "running",
-                    stage: "validation",
-                    level: "success",
-                    message:
-                        "Immutable RBE source receipt already sealed; source acquisition skipped.",
-                    blocked_reason: Some("managed_validation_executor_not_connected"),
-                },
+                "Immutable RBE source receipt already sealed; source acquisition skipped and handed to validation.",
             )
             .await?;
         return Ok(());
@@ -113,7 +106,7 @@ async fn process_deployment(
         .await?;
 
     let message = bounded_message(&format!(
-        "Source sealed at commit {} with {} files / {} bytes (tree {}, managed Git {}).",
+        "Source sealed at commit {} with {} files / {} bytes (tree {}, managed Git {}); handed to validation.",
         result.receipt.resolved_commit,
         result.receipt.source_tree.file_count,
         result.receipt.source_tree.total_bytes,
@@ -121,16 +114,7 @@ async fn process_deployment(
         result.git_version
     ));
     publisher
-        .update(
-            deployment,
-            WorkerUpdate {
-                status: "running",
-                stage: "validation",
-                level: "success",
-                message: &message,
-                blocked_reason: Some("managed_validation_executor_not_connected"),
-            },
-        )
+        .complete_source_handoff(deployment, &message)
         .await?;
     Ok(())
 }

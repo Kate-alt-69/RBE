@@ -118,6 +118,25 @@ impl PublisherClient {
         Ok(())
     }
 
+    pub async fn complete_source_handoff(
+        &self,
+        deployment: &ClaimedDeployment,
+        message: &str,
+    ) -> Result<()> {
+        let value = self
+            .post(
+                "v1/developer/deployment/source/complete",
+                json!({
+                    "deploymentId": deployment.deployment_id,
+                    "leaseToken": deployment.lease_token,
+                    "message": message
+                }),
+            )
+            .await?;
+        require_ok(&value)?;
+        Ok(())
+    }
+
     pub async fn update(
         &self,
         deployment: &ClaimedDeployment,
