@@ -79,6 +79,10 @@ pub struct LinkedRelDiscovery {
     /// Canonical OID roots for each service. Lifecycle hooks are compiler roots
     /// even though they are not public Service Fabric exports.
     pub service_roots: BTreeMap<String, BTreeSet<String>>,
+    /// Source-level Service Fabric export name -> canonical linked symbol for
+    /// each Service. This is compiler truth used later to build native dispatch
+    /// metadata; consumers must not reverse-parse canonical symbol strings.
+    pub service_exports: BTreeMap<String, BTreeMap<String, String>>,
     /// Canonical symbols retained by graph reachability. Exposed mainly for
     /// compiler diagnostics/tests; numeric OID allocation happens later.
     pub reachable_symbols: BTreeSet<String>,
@@ -559,9 +563,18 @@ pub fn discover_linked_rel_symbols(
     }
     symbols.sort_by(|left, right| left.canonical_id.cmp(&right.canonical_id));
 
+    let mut service_exports = BTreeMap::<String, BTreeMap<String, String>>::new();
+    for ((service, export), canonical) in public_services {
+        service_exports
+            .entry(service)
+            .or_default()
+            .insert(export, canonical);
+    }
+
     Ok(LinkedRelDiscovery {
         symbols,
         service_roots,
+        service_exports,
         reachable_symbols: reachable_canonical,
     })
 }
@@ -1023,6 +1036,10 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(ids.contains("module_math_publicValue"));
         assert!(ids.contains("service_worker_run"));
+        assert_eq!(
+            discovery.service_exports["worker"]["run"],
+            "service_worker_run"
+        );
         assert!(!ids
             .iter()
             .any(|id| id.contains("helper") || id.contains("unused")));
@@ -1130,6 +1147,7 @@ mod tests {
             "service_daemon_lifecycle_start"
         );
         assert!(discovery.service_roots["daemon"].contains("service_daemon_lifecycle_start"));
+        assert!(!discovery.service_exports.contains_key("daemon"));
     }
 
     #[test]
