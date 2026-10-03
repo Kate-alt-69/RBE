@@ -9,18 +9,32 @@
 //! plan or native binary the worker would need for restart.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::oid_index_bridge::PackageLinkSnapshot;
+use crate::oid_materialize::NativeOidFragment;
+use crate::package_native_link::{
+    commit_package_native_link, prepare_package_native_link, PackageFragmentKey,
+    PackageNativeLinkError, PackageNativeLinkReport, PreparedPackageNativeLink,
+};
+use crate::rel_native_link::{
+    commit_rel_native_link, prepare_rel_native_link, PreparedRelNativeLink, RelNativeLinkError,
+    RelNativeLinkReport, ServiceNativeLinkInput,
+};
+use crate::rel_symbol_discovery::LinkedRelDiscovery;
 use crate::service_cache_invalidation::ServiceCacheProtection;
 use crate::service_native::{
     DynamicOidLease, DynamicOidPinRegistry, NativeRuntimeImagePins, NativeServiceArtifactPin,
     ServiceNativeError,
 };
+use crate::service_oid::OidCache;
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeServiceLifetimeRegistry {
     oid_pins: DynamicOidPinRegistry,
     artifacts: Arc<Mutex<ArtifactPinState>>,
+    link_transaction: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -34,11 +48,27 @@ impl NativeServiceLifetimeRegistry {
         Self {
             oid_pins,
             artifacts: Arc::new(Mutex::new(ArtifactPinState::default())),
+            link_transaction: Arc::new(Mutex::new(())),
         }
     }
 
     pub fn oid_pins(&self) -> DynamicOidPinRegistry {
         self.oid_pins.clone()
+    }
+
+    /// Hold this guard across native-link prepare, native lowering, and commit.
+    ///
+    /// New image/worker lifetime acquisition is serialized behind the guard, so
+    /// the allocator pin set and cache-protection set observed during prepare do
+    /// not become stale before commit deletes retired records/cache artifacts.
+    pub fn begin_link_transaction(&self) -> NativeServiceLinkGuard<'_> {
+        NativeServiceLinkGuard {
+            registry: self,
+            _transaction: self
+                .link_transaction
+                .lock()
+                .expect("native Service link transaction registry poisoned"),
+        }
     }
 
     /// Pin every native Service selected by one immutable Runtime Image.
@@ -47,6 +77,10 @@ impl NativeServiceLifetimeRegistry {
         &self,
         pins: &NativeRuntimeImagePins,
     ) -> Result<NativeServiceLifetimeLease, ServiceNativeError> {
+        let _transaction = self
+            .link_transaction
+            .lock()
+            .expect("native Service link transaction registry poisoned");
         let oid_lease = self.oid_pins.pin_image(pins)?;
         let artifacts = pins
             .services
@@ -69,6 +103,10 @@ impl NativeServiceLifetimeRegistry {
         &self,
         pin: &NativeServiceArtifactPin,
     ) -> Result<NativeServiceLifetimeLease, ServiceNativeError> {
+        let _transaction = self
+            .link_transaction
+            .lock()
+            .expect("native Service link transaction registry poisoned");
         pin.validate()?;
         let oid_lease = self.oid_pins.pin_service(pin)?;
         let artifact_lease = self.pin_artifacts(BTreeSet::from([(
@@ -81,17 +119,15 @@ impl NativeServiceLifetimeRegistry {
         })
     }
 
-    /// Exact artifact protection to pass into Phase-3/4 selective invalidation.
-    /// This includes image- and worker-held leases, not merely the current image.
+    /// Snapshot current artifact protection. Native-link callers should prefer
+    /// `begin_link_transaction` and the guard's commit helpers so this snapshot
+    /// cannot become stale before invalidation executes.
     pub fn cache_protection(&self) -> ServiceCacheProtection {
         let active = self
             .artifacts
             .lock()
             .expect("native Service artifact pin registry poisoned");
-        ServiceCacheProtection {
-            plan_hashes: active.plan_holders.keys().cloned().collect(),
-            assembly_hashes: active.assembly_holders.keys().cloned().collect(),
-        }
+        protection_from_state(&active)
     }
 
     pub fn package_allocator_pins(&self) -> BTreeSet<u16> {
@@ -151,6 +187,74 @@ impl NativeServiceLifetimeRegistry {
             decrement_holder(&mut active.plan_holders, plan_hash);
             decrement_holder(&mut active.assembly_holders, assembly_hash);
         }
+    }
+}
+
+/// Exclusive Phase-3/4 native-link view of Phase-5 liveness.
+///
+/// Keep this value alive from prepare through commit. While it exists, no new
+/// Runtime Image or worker can acquire a native lifetime lease, so OID and cache
+/// liveness cannot change underneath the prepared transaction.
+#[derive(Debug)]
+pub struct NativeServiceLinkGuard<'a> {
+    registry: &'a NativeServiceLifetimeRegistry,
+    _transaction: MutexGuard<'a, ()>,
+}
+
+impl NativeServiceLinkGuard<'_> {
+    pub fn prepare_package(
+        &self,
+        cache: &OidCache,
+        links: &[PackageLinkSnapshot],
+    ) -> Result<PreparedPackageNativeLink, PackageNativeLinkError> {
+        let pinned_oids = self.registry.package_allocator_pins();
+        prepare_package_native_link(cache, links, &pinned_oids)
+    }
+
+    pub fn commit_package(
+        &self,
+        project_root: &Path,
+        cache: &mut OidCache,
+        prepared: PreparedPackageNativeLink,
+        fragments: &BTreeMap<PackageFragmentKey, NativeOidFragment>,
+    ) -> Result<PackageNativeLinkReport, PackageNativeLinkError> {
+        let protection = self.registry.cache_protection();
+        commit_package_native_link(project_root, cache, prepared, fragments, &protection)
+    }
+
+    pub fn prepare_rel(
+        &self,
+        cache: &OidCache,
+        discovery: &LinkedRelDiscovery,
+    ) -> Result<PreparedRelNativeLink, RelNativeLinkError> {
+        let pinned_oids = self.registry.rel_allocator_pins();
+        prepare_rel_native_link(cache, discovery, &pinned_oids)
+    }
+
+    pub fn commit_rel(
+        &self,
+        project_root: &Path,
+        cache: &mut OidCache,
+        prepared: PreparedRelNativeLink,
+        fragments: &BTreeMap<String, NativeOidFragment>,
+        services: &[ServiceNativeLinkInput],
+    ) -> Result<RelNativeLinkReport, RelNativeLinkError> {
+        let protection = self.registry.cache_protection();
+        commit_rel_native_link(
+            project_root,
+            cache,
+            prepared,
+            fragments,
+            services,
+            &protection,
+        )
+    }
+}
+
+fn protection_from_state(active: &ArtifactPinState) -> ServiceCacheProtection {
+    ServiceCacheProtection {
+        plan_hashes: active.plan_holders.keys().cloned().collect(),
+        assembly_hashes: active.assembly_holders.keys().cloned().collect(),
     }
 }
 
