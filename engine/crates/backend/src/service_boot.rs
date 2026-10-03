@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceMemory};
 
+#[path = "service_native_host.rs"]
+mod service_native_host;
 #[path = "service_package_catalog.rs"]
 mod service_package_catalog;
 
@@ -16,6 +18,13 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let service_file = value("--service-file")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("service --service-host requires --service-file <path>"))?;
+    let service_name = value("--service-name").unwrap_or_else(|| {
+        service_file
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    });
     let mother_managed = args.iter().any(|arg| arg == "--service-mother-address");
     let application_root = value("--application-root").map(PathBuf::from);
     if mother_managed && application_root.is_none() {
@@ -64,16 +73,19 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
 
     // Service children load the same typed settings as the mother process so
     // configurable defaults stay consistent even when the .service file omits
-    // memoryLimitMb/startupTimeoutMs.
+    // memoryLimitMb/startupTimeoutMs. The native compiler transport is removed
+    // before RuntimeEnv sees the snapshot, so internal OID/bin metadata cannot
+    // become an application environment variable.
     let settings_path = value("--settings").unwrap_or_else(|| "settings.json".into());
     let config = config::Config::load(&settings_path)
         .map_err(|error| anyhow::anyhow!("service host failed to load {settings_path}: {error}"))?;
-    let runtime_env = Arc::new(route_engine::RuntimeEnv::from_snapshot(
-        match runtime_env_frame {
-            Some(value) => value,
-            None => serde_json::to_value(&config.runtime_env)?,
-        },
-    )?);
+    let mut runtime_env_snapshot = match runtime_env_frame {
+        Some(value) => value,
+        None => serde_json::to_value(&config.runtime_env)?,
+    };
+    let native_frame =
+        service_native_host::take_native_service_frame(&mut runtime_env_snapshot, &service_name)?;
+    let runtime_env = Arc::new(route_engine::RuntimeEnv::from_snapshot(runtime_env_snapshot)?);
     let defaults = ServiceDefaults {
         memory_limit_mb: config.services.default_memory_limit_mb,
         startup_timeout_ms: config.services.startup_timeout_ms,
@@ -81,6 +93,22 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         monitor_interval_ms: config.services.monitor_interval_ms,
         max_restart_backoff_ms: config.services.max_restart_backoff_ms,
     };
+
+    if let Some(native_frame) = native_frame {
+        // All inherited pipe frames have been consumed at this point. Native
+        // execution starts from the verified pinned `.bin`; source text and
+        // ModuleProgram are deliberately never opened in this branch.
+        prefer_kernel_parent_liveness_on_linux()?;
+        tracing::info!(
+            service = %service_name,
+            image = %native_frame.runtime_image_id,
+            assembly = %native_frame.bootstrap.assembly_hash,
+            "starting Service worker from pinned native assembly"
+        );
+        return service_native_host::run_native_service_host(native_frame, &service_name, token)
+            .await;
+    }
+
     let source = std::fs::read_to_string(&service_file).map_err(|error| {
         anyhow::anyhow!(
             "service host failed to read executable body {}: {error}",
@@ -267,7 +295,9 @@ pub fn compile_from_root(
     if let (Some(catalog), Some(staged)) = (catalog.as_ref(), staged.as_ref()) {
         if let Err(rendered) = staged.validate_namespaces(catalog) {
             report_compile_failure(&rendered, io);
-            return Err(anyhow::anyhow!("package-owned .service namespace validation failed"));
+            return Err(anyhow::anyhow!(
+                "package-owned .service namespace validation failed"
+            ));
         }
         tracing::info!(
             package_services = staged.package_service_count(),
