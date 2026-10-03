@@ -43,12 +43,13 @@ pub fn discover_linked_rel_from_runtime_image(
         }
 
         let key = (kind, manifest.logical_name.clone());
-        let source = sources
-            .get(&key)
-            .ok_or_else(|| RuntimeImageLinkedRelError::MissingOriginalSource {
-                kind,
-                logical_name: manifest.logical_name.clone(),
-            })?;
+        let source =
+            sources
+                .get(&key)
+                .ok_or_else(|| RuntimeImageLinkedRelError::MissingOriginalSource {
+                    kind,
+                    logical_name: manifest.logical_name.clone(),
+                })?;
         let executable = image.executable(&manifest.id).ok_or_else(|| {
             RuntimeImageLinkedRelError::MissingExecutable {
                 source: manifest.id.to_string(),
