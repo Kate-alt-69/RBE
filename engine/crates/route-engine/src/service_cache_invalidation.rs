@@ -5,12 +5,12 @@
 //! exact plan hash, so those existing artifacts are sufficient to invalidate
 //! only the dependency closure that actually changed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::service_bin::decode_cached_service_bin;
+use crate::service_bin::{decode_cached_service_bin, ServiceAssemblyPlan};
 use crate::service_native::NativeRuntimeImagePins;
 use crate::service_oid_adapter::read_service_plan;
 
@@ -41,6 +41,9 @@ impl ServiceCacheProtection {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServiceCacheInvalidationReport {
     pub affected_oids: BTreeSet<u16>,
+    /// Semantic dependency keys whose expected hash changed or disappeared.
+    /// OID-only invalidation leaves this empty.
+    pub affected_dependency_keys: BTreeSet<String>,
     pub removed_plan_hashes: BTreeSet<String>,
     pub removed_assembly_hashes: BTreeSet<String>,
     /// A live/draining Runtime Image still owns these exact cache artifacts.
@@ -67,14 +70,78 @@ pub fn invalidate_service_cache_for_oids(
     protection: &ServiceCacheProtection,
 ) -> Result<ServiceCacheInvalidationReport, ServiceCacheInvalidationError> {
     let affected_oids = affected_oids.into_iter().collect::<BTreeSet<_>>();
-    let mut report = ServiceCacheInvalidationReport {
-        affected_oids: affected_oids.clone(),
-        ..ServiceCacheInvalidationReport::default()
-    };
     if affected_oids.is_empty() {
-        return Ok(report);
+        return Ok(ServiceCacheInvalidationReport {
+            affected_oids,
+            ..ServiceCacheInvalidationReport::default()
+        });
     }
 
+    let mut report = invalidate_service_cache_matching(project_root, protection, |plan| {
+        plan.required_oids
+            .iter()
+            .any(|required| affected_oids.contains(&required.oid))
+    })?;
+    report.affected_oids = affected_oids;
+    Ok(report)
+}
+
+/// Invalidate unprotected plans whose stored dependency hash under one compiler
+/// namespace no longer matches the current semantic identity.
+///
+/// This covers the case an OID keeps the same number and even emits identical
+/// machine bytes while its source/capability/call-graph meaning changes. The
+/// plan's `rel-semantic/...` binding is compiler truth for that higher-level
+/// meaning; stale plans must not remain eligible for the next Runtime Image.
+pub fn invalidate_service_cache_for_dependency_hashes(
+    project_root: &Path,
+    namespace_prefix: &str,
+    expected_hashes: &BTreeMap<String, String>,
+    protection: &ServiceCacheProtection,
+) -> Result<ServiceCacheInvalidationReport, ServiceCacheInvalidationError> {
+    if namespace_prefix.is_empty() {
+        return Err(ServiceCacheInvalidationError::InvalidDependencyNamespace);
+    }
+
+    let mut affected_dependency_keys = BTreeSet::new();
+    let mut report = invalidate_service_cache_matching(project_root, protection, |plan| {
+        semantic_plan_is_stale(
+            plan,
+            namespace_prefix,
+            expected_hashes,
+            &mut affected_dependency_keys,
+        )
+    })?;
+    report.affected_dependency_keys = affected_dependency_keys;
+    Ok(report)
+}
+
+fn semantic_plan_is_stale(
+    plan: &ServiceAssemblyPlan,
+    namespace_prefix: &str,
+    expected_hashes: &BTreeMap<String, String>,
+    affected: &mut BTreeSet<String>,
+) -> bool {
+    let mut stale = false;
+    for (key, observed_hash) in &plan.dependency_hashes {
+        if !key.starts_with(namespace_prefix) {
+            continue;
+        }
+        if expected_hashes.get(key) == Some(observed_hash) {
+            continue;
+        }
+        affected.insert(key.clone());
+        stale = true;
+    }
+    stale
+}
+
+fn invalidate_service_cache_matching(
+    project_root: &Path,
+    protection: &ServiceCacheProtection,
+    mut invalid_plan: impl FnMut(&ServiceAssemblyPlan) -> bool,
+) -> Result<ServiceCacheInvalidationReport, ServiceCacheInvalidationError> {
+    let mut report = ServiceCacheInvalidationReport::default();
     let plan_root = project_root.join(".cache/compiler/service/plan");
     let bytecode_root = project_root.join(".cache/compiler/service/bytecode");
 
@@ -90,11 +157,7 @@ pub fn invalidate_service_cache_for_oids(
                 continue;
             }
         };
-        let intersects = plan
-            .required_oids
-            .iter()
-            .any(|required| affected_oids.contains(&required.oid));
-        if !intersects {
+        if !invalid_plan(&plan) {
             continue;
         }
         if protection.plan_hashes.contains(&plan_hash) {
@@ -207,6 +270,7 @@ fn remove_cache_file(path: &Path) -> Result<(), ServiceCacheInvalidationError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceCacheInvalidationError {
     Io { path: PathBuf, error: String },
+    InvalidDependencyNamespace,
 }
 
 impl fmt::Display for ServiceCacheInvalidationError {
@@ -217,6 +281,10 @@ impl fmt::Display for ServiceCacheInvalidationError {
                 "service cache invalidation failed at {}: {error}",
                 path.display()
             ),
+            Self::InvalidDependencyNamespace => write!(
+                formatter,
+                "service cache semantic invalidation requires a non-empty dependency namespace"
+            ),
         }
     }
 }
@@ -226,6 +294,33 @@ impl std::error::Error for ServiceCacheInvalidationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service_bin::{AssemblyRecordKind, RequiredOid, SERVICE_PLAN_FORMAT};
+
+    fn sha(ch: char) -> String {
+        std::iter::repeat(ch).take(64).collect()
+    }
+
+    fn plan(dependencies: BTreeMap<String, String>) -> ServiceAssemblyPlan {
+        ServiceAssemblyPlan {
+            format: SERVICE_PLAN_FORMAT,
+            service_identity: "worker".into(),
+            service_source_sha256: sha('a'),
+            index_identity_sha256: sha('b'),
+            target_fingerprint: "test-target".into(),
+            entry_oids: vec![30_458],
+            required_oids: vec![RequiredOid {
+                oid: 30_458,
+                record_hash: sha('c'),
+                kind: AssemblyRecordKind::ServiceExport,
+            }],
+            placement_order: vec![30_458],
+            call_graph: BTreeMap::new(),
+            service_data: Vec::new(),
+            data_alignment: 8,
+            dependency_hashes: dependencies,
+            compile_options: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn accepts_only_content_addressed_cache_names() {
@@ -256,5 +351,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.affected_oids, BTreeSet::from([30_458, 30_459]));
+    }
+
+    #[test]
+    fn semantic_hash_change_marks_plan_stale() {
+        let key = "rel-semantic/service_worker_run".to_string();
+        let old_hash = sha('d');
+        let current_hash = sha('e');
+        let plan = plan(BTreeMap::from([(key.clone(), old_hash)]));
+        let mut affected = BTreeSet::new();
+        assert!(semantic_plan_is_stale(
+            &plan,
+            "rel-semantic/",
+            &BTreeMap::from([(key.clone(), current_hash)]),
+            &mut affected,
+        ));
+        assert_eq!(affected, BTreeSet::from([key]));
+    }
+
+    #[test]
+    fn removed_semantic_target_marks_plan_stale_but_other_namespace_does_not() {
+        let rel_key = "rel-semantic/module_math_add".to_string();
+        let pkg_key = "package/mail".to_string();
+        let plan = plan(BTreeMap::from([
+            (rel_key.clone(), sha('d')),
+            (pkg_key, sha('e')),
+        ]));
+        let mut affected = BTreeSet::new();
+        assert!(semantic_plan_is_stale(
+            &plan,
+            "rel-semantic/",
+            &BTreeMap::new(),
+            &mut affected,
+        ));
+        assert_eq!(affected, BTreeSet::from([rel_key]));
+    }
+
+    #[test]
+    fn matching_semantic_hash_keeps_plan_valid() {
+        let key = "rel-semantic/service_worker_run".to_string();
+        let hash = sha('d');
+        let plan = plan(BTreeMap::from([(key.clone(), hash.clone())]));
+        let mut affected = BTreeSet::new();
+        assert!(!semantic_plan_is_stale(
+            &plan,
+            "rel-semantic/",
+            &BTreeMap::from([(key, hash)]),
+            &mut affected,
+        ));
+        assert!(affected.is_empty());
     }
 }
