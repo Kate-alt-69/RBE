@@ -38,9 +38,15 @@ fn resolve_signing_key_value(value: &str) -> anyhow::Result<String> {
     if !path.is_absolute() {
         anyhow::bail!("{CLOUD_NODE_PRIVATE_KEY_ENV} file: path must be absolute");
     }
-    let metadata = std::fs::metadata(path).map_err(|error| {
+    let file = std::fs::File::open(path).map_err(|error| {
         anyhow::anyhow!(
-            "failed to inspect Cloud Node private-key file {}: {error}",
+            "failed to open Cloud Node private-key file {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to inspect opened Cloud Node private-key file {}: {error}",
             path.display()
         )
     })?;
@@ -50,12 +56,6 @@ fn resolve_signing_key_value(value: &str) -> anyhow::Result<String> {
             path.display()
         );
     }
-    let file = std::fs::File::open(path).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to open Cloud Node private-key file {}: {error}",
-            path.display()
-        )
-    })?;
     let mut bytes = Vec::new();
     file.take(MAX_PRIVATE_KEY_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
