@@ -138,12 +138,9 @@ pub fn commit_rel_native_link(
     // write fails, the live index still describes the previous complete link
     // state. Successfully written orphan cache records are harmless and
     // rebuildable; they are not source-of-truth state.
-    let materialization = materialize_rel_records(
-        cache,
-        &prepared.reconcile.bindings,
-        &effective_fragments,
-    )
-    .map_err(RelNativeLinkError::Materialize)?;
+    let materialization =
+        materialize_rel_records(cache, &prepared.reconcile.bindings, &effective_fragments)
+            .map_err(RelNativeLinkError::Materialize)?;
 
     cache
         .replace_index(prepared.next_index.clone())
@@ -200,12 +197,13 @@ fn build_service_specs(
 
         let mut entry_oids = BTreeSet::new();
         for root in roots {
-            let source_sha256 = symbol_sources
-                .get(root)
-                .ok_or_else(|| RelNativeLinkError::UnknownServiceRoot {
-                    service: service.logical_name.clone(),
-                    symbol: root.clone(),
-                })?;
+            let source_sha256 =
+                symbol_sources
+                    .get(root)
+                    .ok_or_else(|| RelNativeLinkError::UnknownServiceRoot {
+                        service: service.logical_name.clone(),
+                        symbol: root.clone(),
+                    })?;
             if source_sha256 != &service.source_sha256 {
                 return Err(RelNativeLinkError::ServiceSourceMismatch {
                     service: service.logical_name.clone(),
