@@ -17,7 +17,8 @@ use crate::rel_native_link::{
     ServiceNativeLinkInput,
 };
 use crate::service_cache_invalidation::{
-    invalidate_service_cache_for_oids, ServiceCacheInvalidationReport, ServiceCacheProtection,
+    invalidate_service_cache_for_dependency_hashes, invalidate_service_cache_for_oids,
+    ServiceCacheInvalidationReport, ServiceCacheProtection,
 };
 use crate::service_oid::OidCache;
 
@@ -30,12 +31,12 @@ const REL_SEMANTIC_DEPENDENCY_PREFIX: &str = "rel-semantic/";
 /// are already part of `LinkedRelBinding::identity_sha256`; Runtime Image stays
 /// the authority that validates and lowers actual grants.
 ///
-/// The low-level linker invalidates ownership-rebound OIDs before publication.
-/// After materialization we make a second selective pass over the OIDs whose
-/// *encoded sparse record bytes actually changed*. This closes the important
-/// same-OID case: source/capability/native-code changes can keep a numeric OID,
-/// but every unpinned Service plan/bin that consumed the old record hash is
-/// still stale and must be removed before this guarded transaction returns.
+/// The guarded commit performs three narrow invalidation passes and merges their
+/// reports:
+/// 1. ownership/rebound OIDs from the low-level transaction;
+/// 2. exact sparse OID records whose encoded bytes actually changed; and
+/// 3. old `rel-semantic/*` plan dependencies whose compiler identity changed or
+///    disappeared even when emitted machine bytes stayed identical.
 pub fn commit_rel_native_link_with_semantic_dependencies(
     project_root: &Path,
     cache: &mut OidCache,
@@ -44,6 +45,16 @@ pub fn commit_rel_native_link_with_semantic_dependencies(
     services: &[ServiceNativeLinkInput],
     protection: &ServiceCacheProtection,
 ) -> Result<RelNativeLinkReport, RelNativeSemanticError> {
+    let semantic_hashes = prepared
+        .bindings()
+        .iter()
+        .map(|(canonical_id, binding)| {
+            (
+                format!("{REL_SEMANTIC_DEPENDENCY_PREFIX}{canonical_id}"),
+                binding.identity_sha256.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let services = bind_service_semantic_dependencies(&prepared, services)?;
     let mut report = commit_rel_native_link(
         project_root,
@@ -62,6 +73,15 @@ pub fn commit_rel_native_link_with_semantic_dependencies(
     )
     .map_err(|error| RelNativeSemanticError::Link(RelNativeLinkError::Invalidation(error)))?;
     merge_invalidation(&mut report.invalidation, record_invalidation);
+
+    let semantic_invalidation = invalidate_service_cache_for_dependency_hashes(
+        project_root,
+        REL_SEMANTIC_DEPENDENCY_PREFIX,
+        &semantic_hashes,
+        protection,
+    )
+    .map_err(|error| RelNativeSemanticError::Link(RelNativeLinkError::Invalidation(error)))?;
+    merge_invalidation(&mut report.invalidation, semantic_invalidation);
     Ok(report)
 }
 
@@ -126,6 +146,9 @@ fn merge_invalidation(
     additional: ServiceCacheInvalidationReport,
 ) {
     current.affected_oids.extend(additional.affected_oids);
+    current
+        .affected_dependency_keys
+        .extend(additional.affected_dependency_keys);
     current
         .removed_plan_hashes
         .extend(additional.removed_plan_hashes);
@@ -267,6 +290,7 @@ mod tests {
     fn invalidation_reports_merge_without_losing_pin_retention() {
         let mut current = ServiceCacheInvalidationReport {
             affected_oids: BTreeSet::from([30_458]),
+            affected_dependency_keys: BTreeSet::from(["rel-semantic/old".into()]),
             removed_plan_hashes: BTreeSet::from(["a".repeat(64)]),
             retained_assembly_hashes: BTreeSet::from(["b".repeat(64)]),
             skipped_unreadable_plans: 1,
@@ -274,6 +298,7 @@ mod tests {
         };
         let additional = ServiceCacheInvalidationReport {
             affected_oids: BTreeSet::from([30_459]),
+            affected_dependency_keys: BTreeSet::from(["rel-semantic/new".into()]),
             removed_assembly_hashes: BTreeSet::from(["c".repeat(64)]),
             retained_plan_hashes: BTreeSet::from(["d".repeat(64)]),
             skipped_unreadable_bins: 2,
@@ -281,6 +306,7 @@ mod tests {
         };
         merge_invalidation(&mut current, additional);
         assert_eq!(current.affected_oids, BTreeSet::from([30_458, 30_459]));
+        assert_eq!(current.affected_dependency_keys.len(), 2);
         assert_eq!(current.skipped_unreadable_plans, 1);
         assert_eq!(current.skipped_unreadable_bins, 2);
         assert_eq!(current.removed_plan_hashes.len(), 1);
