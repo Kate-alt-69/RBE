@@ -207,9 +207,10 @@ fn materialize_changed_package_records(
     let mut record_sha256 = BTreeMap::new();
 
     for ((package_name, export_id), oid) in bindings {
-        let owner = index.packages.get(package_name).ok_or_else(|| {
-            PackageNativeLinkError::MissingPackageOwner(package_name.clone())
-        })?;
+        let owner = index
+            .packages
+            .get(package_name)
+            .ok_or_else(|| PackageNativeLinkError::MissingPackageOwner(package_name.clone()))?;
         let fragment = fragments
             .get(&(package_name.clone(), export_id.clone()))
             .ok_or_else(|| PackageNativeLinkError::MissingFragment {
@@ -354,13 +355,14 @@ mod tests {
         let mut index = OidIndex::fresh();
         index.packages.insert(
             "mail".into(),
-            owner(&[("lib_mail_send", OID_PACKAGE_START), ("lib_mail_recv", OID_PACKAGE_START + 1)]),
+            owner(&[
+                ("lib_mail_send", OID_PACKAGE_START),
+                ("lib_mail_recv", OID_PACKAGE_START + 1),
+            ]),
         );
-        let bindings = package_materialization_bindings(
-            &index,
-            &BTreeSet::from([OID_PACKAGE_START + 1]),
-        )
-        .unwrap();
+        let bindings =
+            package_materialization_bindings(&index, &BTreeSet::from([OID_PACKAGE_START + 1]))
+                .unwrap();
         assert_eq!(bindings.len(), 1);
         assert_eq!(
             bindings.get(&("mail".into(), "lib_mail_recv".into())),
@@ -370,10 +372,17 @@ mod tests {
 
     #[test]
     fn extra_fragment_for_unchanged_export_is_rejected() {
-        let expected = BTreeMap::from([(("mail".into(), "lib_mail_send".into()), OID_PACKAGE_START)]);
+        let expected =
+            BTreeMap::from([(("mail".into(), "lib_mail_send".into()), OID_PACKAGE_START)]);
         let fragments = BTreeMap::from([
-            (("mail".into(), "lib_mail_send".into()), NativeOidFragment::executable(vec![0xC3])),
-            (("mail".into(), "lib_mail_recv".into()), NativeOidFragment::executable(vec![0xC3])),
+            (
+                ("mail".into(), "lib_mail_send".into()),
+                NativeOidFragment::executable(vec![0xC3]),
+            ),
+            (
+                ("mail".into(), "lib_mail_recv".into()),
+                NativeOidFragment::executable(vec![0xC3]),
+            ),
         ]);
         assert!(matches!(
             validate_fragment_surface(&expected, &fragments),
