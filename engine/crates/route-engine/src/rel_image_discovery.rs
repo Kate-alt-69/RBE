@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::embedded_rel::{extract_embedded_rel, EmbeddedRelError};
 use crate::rel_symbol_discovery::{
-    discover_linked_rel_symbols, linked_source_sha256, LinkedRelDiscovery,
-    LinkedRelDiscoveryError, LinkedRelSourceUnit,
+    discover_linked_rel_symbols, linked_source_sha256, LinkedRelDiscovery, LinkedRelDiscoveryError,
+    LinkedRelSourceUnit,
 };
 use crate::relc::PhysicalRelSource;
 use crate::runtime_image::{RuntimeCapabilityRequirement, RuntimeExecutable, RuntimeImage};
@@ -37,8 +37,7 @@ pub fn discover_linked_rel_from_runtime_image(
 ) -> Result<LinkedRelDiscovery, RuntimeImageLinkedRelError> {
     let sources = collect_original_sources(raw_server_source, physical_sources)?;
     let mut units = Vec::new();
-    let mut capability_identities =
-        BTreeMap::<String, (String, BTreeSet<String>)>::new();
+    let mut capability_identities = BTreeMap::<String, (String, BTreeSet<String>)>::new();
 
     for manifest in &image.sources {
         let kind = manifest.kind;
@@ -82,10 +81,7 @@ pub fn discover_linked_rel_from_runtime_image(
                 });
             }
         } else {
-            capability_identities.insert(
-                source_sha256,
-                (source_label, capabilities),
-            );
+            capability_identities.insert(source_sha256, (source_label, capabilities));
         }
 
         let unit = match (kind, executable) {
@@ -113,10 +109,12 @@ pub fn discover_linked_rel_from_runtime_image(
     for symbol in &mut discovery.symbols {
         let (_, capabilities) = capability_identities
             .get(&symbol.source_sha256)
-            .ok_or_else(|| RuntimeImageLinkedRelError::MissingCapabilityIdentitySource {
-                canonical_id: symbol.canonical_id.clone(),
-                source_sha256: symbol.source_sha256.clone(),
-            })?;
+            .ok_or_else(
+                || RuntimeImageLinkedRelError::MissingCapabilityIdentitySource {
+                    canonical_id: symbol.canonical_id.clone(),
+                    source_sha256: symbol.source_sha256.clone(),
+                },
+            )?;
         symbol.capabilities = capabilities.clone();
     }
     Ok(discovery)
