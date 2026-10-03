@@ -54,12 +54,14 @@ pub fn prepare_verified_library_worker_launch(
     let admitted = load_admitted_system_runtime(project_root, runtime)?;
 
     if admitted.version != snapshot.worker.runtime_version {
-        return Err(LibraryWorkerLaunchPreparationError::RuntimeVersionMismatch {
-            package: snapshot.package.clone(),
-            runtime: snapshot.worker.runtime_kind.clone(),
-            locked: snapshot.worker.runtime_version.clone(),
-            admitted: admitted.version,
-        });
+        return Err(
+            LibraryWorkerLaunchPreparationError::RuntimeVersionMismatch {
+                package: snapshot.package.clone(),
+                runtime: snapshot.worker.runtime_kind.clone(),
+                locked: snapshot.worker.runtime_version.clone(),
+                admitted: admitted.version,
+            },
+        );
     }
 
     let source_plan = prepare_verified_worker_source(project_root, snapshot, source_root)?;
@@ -106,10 +108,12 @@ fn managed_system_runtime(
         "node" => Ok(SystemRuntimeKind::Nodejs),
         "python" => Ok(SystemRuntimeKind::Python),
         "pypy" => Ok(SystemRuntimeKind::PyPy),
-        "rust" => Err(LibraryWorkerLaunchPreparationError::CompiledWorkerRequired {
-            package: worker.package.clone(),
-            runtime: worker.runtime_kind.clone(),
-        }),
+        "rust" => Err(
+            LibraryWorkerLaunchPreparationError::CompiledWorkerRequired {
+                package: worker.package.clone(),
+                runtime: worker.runtime_kind.clone(),
+            },
+        ),
         runtime => Err(LibraryWorkerLaunchPreparationError::UnsupportedRuntime {
             package: worker.package.clone(),
             runtime: runtime.to_string(),
@@ -218,10 +222,8 @@ mod tests {
 
     #[test]
     fn failed_post_materialization_preparation_can_clean_fresh_tree() {
-        let root = std::env::temp_dir().join(format!(
-            "rbe-worker-launch-cleanup-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rbe-worker-launch-cleanup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("worker.js"), b"worker").unwrap();
