@@ -25,13 +25,39 @@ jobs:
           git pull --rebase origin main
           python3 - <<'PY'
           from pathlib import Path
+
+          manifest = Path('install-runtime/Cargo.toml')
+          manifest_text = manifest.read_text()
+          reqwest_line = 'reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }\n'
+          if reqwest_line not in manifest_text:
+              raise SystemExit('install-runtime dependency anchor changed; refusing blind edit')
+          additions = []
+          if '\nserde = ' not in manifest_text:
+              additions.append('serde = { version = "1", features = ["derive"] }')
+          if '\nserde_json = ' not in manifest_text:
+              additions.append('serde_json = "1"')
+          if additions:
+              manifest_text = manifest_text.replace(
+                  reqwest_line,
+                  reqwest_line + '\n'.join(additions) + '\n',
+                  1,
+              )
+              manifest.write_text(manifest_text)
+
           path = Path('engine/crates/backend/src/runtime_image_boot.rs')
           text = path.read_text()
           compile_anchor = 'pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Result<RuntimeImage> {\n    let root = runtime_paths::binary_dir();\n'
           if text.count(compile_anchor) != 1:
               raise SystemExit(f'backend compile anchor changed; found {text.count(compile_anchor)} matches')
           helper = '''fn prepare_core_oid_cache(root: &Path) -> anyhow::Result<route_engine::CoreMaterializationReport> {\n    let report = route_engine::prepare_service_oid_cache(root).map_err(|error| {\n        anyhow::anyhow!(\n            "RBE5100 Backend could not prepare the project OID compiler cache.\\n\\nCache:\\n  {}\\n\\nError:\\n  {error}\\n\\nNote:\\n  Corrupt/stale disposable OID cache state is rebuilt automatically. This failure is a real target, permission, capacity, or compiler invariant error. Startup stopped before the API listener was bound.\\n\\nHelp:\\n  {RUNTIME_IMAGE_COMPILE_HELP}",\n            route_engine::oid_cache_root(root).display()\n        )\n    })?;\n    tracing::debug!(\n        target = %report.target.label(),\n        generation = report.index_generation,\n        total = report.total,\n        written = report.written,\n        reused = report.reused,\n        cache = %route_engine::oid_cache_root(root).display(),\n        "prepared project OID compiler cache"\n    );\n    Ok(report)\n}\n\n'''
-          text = text.replace(compile_anchor, helper + compile_anchor.replace('    let root = runtime_paths::binary_dir();\n', '    let root = runtime_paths::binary_dir();\n    prepare_core_oid_cache(&root)?;\n'), 1)
+          text = text.replace(
+              compile_anchor,
+              helper + compile_anchor.replace(
+                  '    let root = runtime_paths::binary_dir();\n',
+                  '    let root = runtime_paths::binary_dir();\n    prepare_core_oid_cache(&root)?;\n',
+              ),
+              1,
+          )
           test_anchor = '    use super::*;\n\n'
           if text.count(test_anchor) < 1:
               raise SystemExit('runtime_image_boot test import anchor missing')
@@ -42,10 +68,13 @@ jobs:
           rm .github/workflows/one-shot-oid-core-bootstrap.yml
           cd engine
           cargo fmt --all
+          cargo check -p rbe-install-runtime
+          cargo check -p rbe-install-runtime --locked
           cargo check -p backend --locked
           cargo test -p backend backend_compile_root_prepares_and_reuses_core_oid_cache --locked
+          cargo fmt --all -- --check
           cd ..
-          git add engine/crates/backend/src/runtime_image_boot.rs .github/workflows/one-shot-oid-core-bootstrap.yml
+          git add install-runtime/Cargo.toml engine/Cargo.lock engine/crates/backend/src/runtime_image_boot.rs .github/workflows/one-shot-oid-core-bootstrap.yml
           git commit -m "FEAT | OID-007 prepare core OIDs during backend compile"
           for attempt in 1 2 3 4 5; do
             if git push origin HEAD:main; then
