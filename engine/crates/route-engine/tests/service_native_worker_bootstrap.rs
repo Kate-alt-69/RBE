@@ -25,6 +25,13 @@ fn native_worker_bootstrap_json_round_trip_is_stable() {
                 entry_offset: large_offset,
             },
         )]),
+        lifecycle: BTreeMap::from([(
+            "start".into(),
+            NativeServiceWorkerBootstrapEntry {
+                oid: 30_459,
+                entry_offset: large_offset + 8,
+            },
+        )]),
     };
 
     let value = serde_json::to_value(&bootstrap).expect("serialize worker bootstrap");
@@ -34,6 +41,11 @@ fn native_worker_bootstrap_json_round_trip_is_stable() {
     assert_eq!(value["oidIndexGeneration"], 42);
     assert_eq!(value["exports"]["run"]["oid"], 30_458);
     assert_eq!(value["exports"]["run"]["entryOffset"], large_offset);
+    assert_eq!(value["lifecycle"]["start"]["oid"], 30_459);
+    assert_eq!(
+        value["lifecycle"]["start"]["entryOffset"],
+        large_offset + 8
+    );
     assert!(value.get("runtime_image_id").is_none());
     assert!(value.get("entry_offset").is_none());
 
@@ -41,4 +53,8 @@ fn native_worker_bootstrap_json_round_trip_is_stable() {
         serde_json::from_value(value).expect("deserialize worker bootstrap");
     assert_eq!(decoded, bootstrap);
     assert_eq!(decoded.export("run").unwrap().entry_offset, large_offset);
+    assert_eq!(
+        decoded.lifecycle("start").unwrap().entry_offset,
+        large_offset + 8
+    );
 }

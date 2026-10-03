@@ -56,6 +56,9 @@ pub struct PreparedRelNativeLink {
     /// Source-level Service Fabric export name -> canonical linked symbol.
     /// Lifecycle roots are deliberately absent from this map.
     service_exports: BTreeMap<String, BTreeMap<String, String>>,
+    /// Source-level lifecycle verb -> canonical linked symbol. Kept separate
+    /// from Service Fabric exports all the way into Phase 5.
+    service_lifecycle: BTreeMap<String, BTreeMap<String, String>>,
     pinned_oids: BTreeSet<u16>,
 }
 
@@ -77,6 +80,10 @@ impl PreparedRelNativeLink {
 
     pub fn service_exports(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
         &self.service_exports
+    }
+
+    pub fn service_lifecycle(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
+        &self.service_lifecycle
     }
 
     pub fn reconcile_report(&self) -> &RelReconcileReport {
@@ -109,6 +116,7 @@ pub fn prepare_rel_native_link(
     let normalized_symbols = normalize_symbols(&discovery.symbols)?;
     validate_service_roots(&discovery.service_roots, &normalized_symbols)?;
     validate_service_exports(&discovery.service_exports, &normalized_symbols)?;
+    validate_service_lifecycle(&discovery.service_lifecycle, &normalized_symbols)?;
 
     let base_index_sha256 = index_sha256(cache.index())?;
     let mut next_index = cache.index().clone();
@@ -122,6 +130,7 @@ pub fn prepare_rel_native_link(
         normalized_symbols,
         service_roots: discovery.service_roots.clone(),
         service_exports: discovery.service_exports.clone(),
+        service_lifecycle: discovery.service_lifecycle.clone(),
         pinned_oids: pinned_oids.clone(),
     })
 }
@@ -252,8 +261,8 @@ fn build_service_specs(
         }
 
         let mut exports = BTreeMap::new();
+        let mut export_oids = BTreeSet::new();
         if let Some(public_exports) = prepared.service_exports.get(&service.logical_name) {
-            let mut seen_export_oids = BTreeSet::new();
             for (export, symbol) in public_exports {
                 let binding = prepared.reconcile.bindings.get(symbol).ok_or_else(|| {
                     RelNativeLinkError::UnboundServiceExport {
@@ -278,13 +287,57 @@ fn build_service_specs(
                         oid: binding.oid,
                     });
                 }
-                if !seen_export_oids.insert(binding.oid) {
+                if !export_oids.insert(binding.oid) {
                     return Err(RelNativeLinkError::DuplicateServiceExportOid {
                         service: service.logical_name.clone(),
                         oid: binding.oid,
                     });
                 }
                 exports.insert(export.clone(), binding.oid);
+            }
+        }
+
+        let mut lifecycle = BTreeMap::new();
+        let mut lifecycle_oids = BTreeSet::new();
+        if let Some(hooks) = prepared.service_lifecycle.get(&service.logical_name) {
+            for (verb, symbol) in hooks {
+                let binding = prepared.reconcile.bindings.get(symbol).ok_or_else(|| {
+                    RelNativeLinkError::UnboundServiceLifecycle {
+                        service: service.logical_name.clone(),
+                        verb: verb.clone(),
+                        symbol: symbol.clone(),
+                    }
+                })?;
+                if binding.kind != LinkedRelKind::Function {
+                    return Err(RelNativeLinkError::InvalidServiceLifecycleKind {
+                        service: service.logical_name.clone(),
+                        verb: verb.clone(),
+                        symbol: symbol.clone(),
+                        kind: binding.kind,
+                    });
+                }
+                if !entry_oids.contains(&binding.oid) {
+                    return Err(RelNativeLinkError::ServiceLifecycleNotEntry {
+                        service: service.logical_name.clone(),
+                        verb: verb.clone(),
+                        symbol: symbol.clone(),
+                        oid: binding.oid,
+                    });
+                }
+                if export_oids.contains(&binding.oid) {
+                    return Err(RelNativeLinkError::ServiceLifecycleExportOidCollision {
+                        service: service.logical_name.clone(),
+                        verb: verb.clone(),
+                        oid: binding.oid,
+                    });
+                }
+                if !lifecycle_oids.insert(binding.oid) {
+                    return Err(RelNativeLinkError::DuplicateServiceLifecycleOid {
+                        service: service.logical_name.clone(),
+                        oid: binding.oid,
+                    });
+                }
+                lifecycle.insert(verb.clone(), binding.oid);
             }
         }
 
@@ -295,6 +348,7 @@ fn build_service_specs(
                 service_source_sha256: service.source_sha256.clone(),
                 entry_oids: entry_oids.into_iter().collect(),
                 exports,
+                lifecycle,
                 service_data: service.service_data.clone(),
                 dependency_hashes: service.dependency_hashes.clone(),
                 compile_options: service.compile_options.clone(),
@@ -379,6 +433,39 @@ fn validate_service_exports(
                     return Err(RelNativeLinkError::UnknownServiceExport {
                         service: service.clone(),
                         export: export.clone(),
+                        symbol: symbol.clone(),
+                    })
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_lifecycle(
+    lifecycle: &BTreeMap<String, BTreeMap<String, String>>,
+    symbols: &[LinkedRelSymbolSpec],
+) -> Result<(), RelNativeLinkError> {
+    let kinds = symbols
+        .iter()
+        .map(|symbol| (symbol.canonical_id.as_str(), symbol.kind))
+        .collect::<BTreeMap<_, _>>();
+    for (service, hooks) in lifecycle {
+        for (verb, symbol) in hooks {
+            match kinds.get(symbol.as_str()) {
+                Some(LinkedRelKind::Function) => {}
+                Some(kind) => {
+                    return Err(RelNativeLinkError::InvalidServiceLifecycleKind {
+                        service: service.clone(),
+                        verb: verb.clone(),
+                        symbol: symbol.clone(),
+                        kind: *kind,
+                    })
+                }
+                None => {
+                    return Err(RelNativeLinkError::UnknownServiceLifecycle {
+                        service: service.clone(),
+                        verb: verb.clone(),
                         symbol: symbol.clone(),
                     })
                 }
@@ -478,6 +565,37 @@ pub enum RelNativeLinkError {
         service: String,
         oid: u16,
     },
+    UnknownServiceLifecycle {
+        service: String,
+        verb: String,
+        symbol: String,
+    },
+    UnboundServiceLifecycle {
+        service: String,
+        verb: String,
+        symbol: String,
+    },
+    InvalidServiceLifecycleKind {
+        service: String,
+        verb: String,
+        symbol: String,
+        kind: LinkedRelKind,
+    },
+    ServiceLifecycleNotEntry {
+        service: String,
+        verb: String,
+        symbol: String,
+        oid: u16,
+    },
+    DuplicateServiceLifecycleOid {
+        service: String,
+        oid: u16,
+    },
+    ServiceLifecycleExportOidCollision {
+        service: String,
+        verb: String,
+        oid: u16,
+    },
 }
 
 impl fmt::Display for RelNativeLinkError {
@@ -575,6 +693,48 @@ impl fmt::Display for RelNativeLinkError {
                 formatter,
                 "Service {service:?} maps more than one public export to OID {oid}; native dispatch aliases are not supported"
             ),
+            Self::UnknownServiceLifecycle {
+                service,
+                verb,
+                symbol,
+            } => write!(
+                formatter,
+                "Service {service:?} lifecycle {verb:?} references unknown linked-REL symbol {symbol:?}"
+            ),
+            Self::UnboundServiceLifecycle {
+                service,
+                verb,
+                symbol,
+            } => write!(
+                formatter,
+                "Service {service:?} lifecycle {verb:?} symbol {symbol:?} has no allocated linked-REL OID"
+            ),
+            Self::InvalidServiceLifecycleKind {
+                service,
+                verb,
+                symbol,
+                kind,
+            } => write!(
+                formatter,
+                "Service {service:?} lifecycle {verb:?} resolves to {symbol:?} with non-lifecycle function kind {kind:?}"
+            ),
+            Self::ServiceLifecycleNotEntry {
+                service,
+                verb,
+                symbol,
+                oid,
+            } => write!(
+                formatter,
+                "Service {service:?} lifecycle {verb:?} ({symbol:?}) resolves to OID {oid}, but that OID is not a Service entry root"
+            ),
+            Self::DuplicateServiceLifecycleOid { service, oid } => write!(
+                formatter,
+                "Service {service:?} maps more than one lifecycle verb to OID {oid}; native lifecycle aliases are not supported"
+            ),
+            Self::ServiceLifecycleExportOidCollision { service, verb, oid } => write!(
+                formatter,
+                "Service {service:?} lifecycle {verb:?} aliases public Service export OID {oid}"
+            ),
         }
     }
 }
@@ -642,6 +802,27 @@ mod tests {
         assert!(matches!(
             error,
             RelNativeLinkError::InvalidServiceExportKind { .. }
+        ));
+    }
+
+    #[test]
+    fn service_export_cannot_be_published_as_lifecycle() {
+        let lifecycle = BTreeMap::from([(
+            "worker".into(),
+            BTreeMap::from([("start".into(), "service_worker_run".into())]),
+        )]);
+        let error = validate_service_lifecycle(
+            &lifecycle,
+            &[symbol(
+                "service_worker_run",
+                LinkedRelKind::ServiceExport,
+                &[],
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            RelNativeLinkError::InvalidServiceLifecycleKind { .. }
         ));
     }
 

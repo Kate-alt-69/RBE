@@ -3,8 +3,8 @@
 //! This module joins the Phase-4 OID adapter/assembler with Phase-5 Runtime
 //! Image pinning. A successful build always means the exact same verified OID
 //! cache snapshot produced the Service plan, native `.bin`, immutable pin, and
-//! source-level Service Fabric dispatch metadata. No worker execution policy
-//! lives here.
+//! source-level Service Fabric/lifecycle dispatch metadata. No worker execution
+//! policy lives here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -31,7 +31,7 @@ use crate::service_oid_adapter::{
 };
 use crate::source_registry::{RelSourceKind, SourceId};
 
-pub const NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL: &str = "RBE-SERVICE-NATIVE-LAUNCH/1";
+pub const NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL: &str = "RBE-SERVICE-NATIVE-LAUNCH/2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeServiceBuildSpec {
@@ -42,6 +42,9 @@ pub struct NativeServiceBuildSpec {
     /// Public Service Fabric call name -> ServiceExport OID. Lifecycle hooks are
     /// deliberately excluded even though they are present in `entry_oids`.
     pub exports: BTreeMap<String, u16>,
+    /// Source-level lifecycle verb -> Function OID. These entry roots are kept
+    /// separate from public Service Fabric dispatch for the entire native path.
+    pub lifecycle: BTreeMap<String, u16>,
     pub service_data: Vec<u8>,
     pub dependency_hashes: BTreeMap<String, String>,
     pub compile_options: BTreeMap<String, String>,
@@ -58,9 +61,9 @@ pub struct NativeServiceLaunchEntry {
 
 /// Immutable launch metadata paired with one exact native Service assembly.
 ///
-/// The worker must dispatch by this table instead of reparsing REL or guessing a
-/// canonical symbol name. `plan_hash` + `assembly_hash` bind every offset to the
-/// exact content-addressed payload that produced it.
+/// The worker must dispatch by these compiler-owned tables instead of reparsing
+/// REL or guessing canonical symbol names. `plan_hash` + `assembly_hash` bind
+/// every offset to the exact content-addressed payload that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeServiceLaunch {
     pub source_id: SourceId,
@@ -68,15 +71,20 @@ pub struct NativeServiceLaunch {
     pub assembly_hash: String,
     pub target_fingerprint: String,
     pub exports: BTreeMap<String, NativeServiceLaunchEntry>,
+    pub lifecycle: BTreeMap<String, NativeServiceLaunchEntry>,
 }
 
 impl NativeServiceLaunch {
     pub fn export(&self, name: &str) -> Option<&NativeServiceLaunchEntry> {
         self.exports.get(name)
     }
+
+    pub fn lifecycle(&self, verb: &str) -> Option<&NativeServiceLaunchEntry> {
+        self.lifecycle.get(verb)
+    }
 }
 
-/// Stable cross-process representation of one native Service export.
+/// Stable cross-process representation of one native Service entry.
 ///
 /// `entry_offset` is deliberately `u64` rather than `usize`: the bootstrap is a
 /// serialized process boundary and therefore must not inherit the parent
@@ -104,11 +112,16 @@ pub struct NativeServiceWorkerBootstrap {
     pub target_fingerprint: String,
     pub bin_path: PathBuf,
     pub exports: BTreeMap<String, NativeServiceWorkerBootstrapEntry>,
+    pub lifecycle: BTreeMap<String, NativeServiceWorkerBootstrapEntry>,
 }
 
 impl NativeServiceWorkerBootstrap {
     pub fn export(&self, name: &str) -> Option<&NativeServiceWorkerBootstrapEntry> {
         self.exports.get(name)
+    }
+
+    pub fn lifecycle(&self, verb: &str) -> Option<&NativeServiceWorkerBootstrapEntry> {
+        self.lifecycle.get(verb)
     }
 }
 
@@ -225,22 +238,9 @@ impl NativeRuntimeImageActivation {
             )));
         }
 
-        let mut exports = BTreeMap::new();
-        for (name, entry) in &built.launch.exports {
-            let entry_offset = u64::try_from(entry.entry_offset).map_err(|_| {
-                NativeServiceBuildError::InvalidDispatch(format!(
-                    "Service {source_id} export {name:?} entry offset {} cannot cross the worker bootstrap boundary",
-                    entry.entry_offset
-                ))
-            })?;
-            exports.insert(
-                name.clone(),
-                NativeServiceWorkerBootstrapEntry {
-                    oid: entry.oid,
-                    entry_offset,
-                },
-            );
-        }
+        let exports = worker_bootstrap_entries(source_id, "export", &built.launch.exports)?;
+        let lifecycle =
+            worker_bootstrap_entries(source_id, "lifecycle", &built.launch.lifecycle)?;
 
         Ok(NativeServiceWorkerBootstrap {
             protocol: NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL.to_string(),
@@ -252,8 +252,34 @@ impl NativeRuntimeImageActivation {
             target_fingerprint: built.launch.target_fingerprint.clone(),
             bin_path,
             exports,
+            lifecycle,
         })
     }
+}
+
+fn worker_bootstrap_entries(
+    source_id: &SourceId,
+    label: &str,
+    entries: &BTreeMap<String, NativeServiceLaunchEntry>,
+) -> Result<BTreeMap<String, NativeServiceWorkerBootstrapEntry>, NativeServiceBuildError> {
+    entries
+        .iter()
+        .map(|(name, entry)| {
+            let entry_offset = u64::try_from(entry.entry_offset).map_err(|_| {
+                NativeServiceBuildError::InvalidDispatch(format!(
+                    "Service {source_id} {label} {name:?} entry offset {} cannot cross the worker bootstrap boundary",
+                    entry.entry_offset
+                ))
+            })?;
+            Ok((
+                name.clone(),
+                NativeServiceWorkerBootstrapEntry {
+                    oid: entry.oid,
+                    entry_offset,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Atomic A -> B holder for fully built native Runtime Image generations.
@@ -432,6 +458,7 @@ pub fn build_native_service_artifact(
     validate_service_target(image, &spec.source_id)?;
 
     let exports = spec.exports.clone();
+    let lifecycle = spec.lifecycle.clone();
     let dependency_hashes =
         bind_package_dependencies(spec.dependency_hashes, &spec.packages, &spec.source_id)?;
 
@@ -467,7 +494,7 @@ pub fn build_native_service_artifact(
         )));
     }
 
-    let launch = build_native_service_launch(&pin, &bin, exports)?;
+    let launch = build_native_service_launch(&pin, &bin, exports, lifecycle)?;
 
     let compiler_cache_root = project_root.join(".cache/compiler");
     let expected_bin_path = pin
@@ -512,6 +539,7 @@ fn build_native_service_launch(
     pin: &NativeServiceArtifactPin,
     bin: &AssembledServiceBin,
     exports: BTreeMap<String, u16>,
+    lifecycle: BTreeMap<String, u16>,
 ) -> Result<NativeServiceLaunch, NativeServiceBuildError> {
     if bin.plan_hash != pin.plan_hash || bin.assembly_hash != pin.assembly_hash {
         return Err(NativeServiceBuildError::ArtifactDrift(format!(
@@ -534,70 +562,49 @@ fn build_native_service_launch(
         .copied()
         .filter(|oid| required.get(oid) == Some(&AssemblyRecordKind::ServiceExport))
         .collect::<BTreeSet<_>>();
+    let expected_lifecycle_entries = pin
+        .plan
+        .entry_oids
+        .iter()
+        .copied()
+        .filter(|oid| required.get(oid) == Some(&AssemblyRecordKind::Function))
+        .collect::<BTreeSet<_>>();
 
-    let mut observed_public_entries = BTreeSet::new();
-    let mut launch_exports = BTreeMap::new();
-    for (name, oid) in exports {
-        if name.trim().is_empty() || name.chars().any(char::is_control) {
-            return Err(NativeServiceBuildError::InvalidDispatch(format!(
-                "Service {} has invalid native export name {name:?}",
-                pin.source_id
-            )));
-        }
-        if !entry_set.contains(&oid) {
-            return Err(NativeServiceBuildError::InvalidDispatch(format!(
-                "Service {} export {name:?} targets OID {oid}, which is not an entry root",
-                pin.source_id
-            )));
-        }
-        match required.get(&oid) {
-            Some(AssemblyRecordKind::ServiceExport) => {}
-            Some(kind) => {
-                return Err(NativeServiceBuildError::InvalidDispatch(format!(
-                    "Service {} export {name:?} targets OID {oid} with non-Service-export kind {kind:?}",
-                    pin.source_id
-                )))
-            }
-            None => {
-                return Err(NativeServiceBuildError::InvalidDispatch(format!(
-                    "Service {} export {name:?} targets unpinned OID {oid}",
-                    pin.source_id
-                )))
-            }
-        }
-        if !observed_public_entries.insert(oid) {
-            return Err(NativeServiceBuildError::InvalidDispatch(format!(
-                "Service {} maps multiple public export names to OID {oid}; native dispatch aliases are unsupported",
-                pin.source_id
-            )));
-        }
-        let placement = bin.placements.get(&oid).ok_or_else(|| {
-            NativeServiceBuildError::InvalidDispatch(format!(
-                "Service {} export {name:?} OID {oid} has no assembled placement",
-                pin.source_id
-            ))
-        })?;
-        if placement.entry >= bin.payload.len() {
-            return Err(NativeServiceBuildError::InvalidDispatch(format!(
-                "Service {} export {name:?} entry offset {} is outside assembled payload length {}",
-                pin.source_id,
-                placement.entry,
-                bin.payload.len()
-            )));
-        }
-        launch_exports.insert(
-            name,
-            NativeServiceLaunchEntry {
-                oid,
-                entry_offset: placement.entry,
-            },
-        );
-    }
-
+    let (launch_exports, observed_public_entries) = build_named_launch_entries(
+        pin,
+        bin,
+        &required,
+        &entry_set,
+        exports,
+        AssemblyRecordKind::ServiceExport,
+        "export",
+    )?;
     if observed_public_entries != expected_public_entries {
         return Err(NativeServiceBuildError::InvalidDispatch(format!(
             "Service {} native dispatch covers OIDs {:?}, but its ServiceExport entry roots are {:?}",
             pin.source_id, observed_public_entries, expected_public_entries
+        )));
+    }
+
+    let (launch_lifecycle, observed_lifecycle_entries) = build_named_launch_entries(
+        pin,
+        bin,
+        &required,
+        &entry_set,
+        lifecycle,
+        AssemblyRecordKind::Function,
+        "lifecycle",
+    )?;
+    if observed_lifecycle_entries != expected_lifecycle_entries {
+        return Err(NativeServiceBuildError::InvalidDispatch(format!(
+            "Service {} native lifecycle covers OIDs {:?}, but its lifecycle Function entry roots are {:?}",
+            pin.source_id, observed_lifecycle_entries, expected_lifecycle_entries
+        )));
+    }
+    if !observed_public_entries.is_disjoint(&observed_lifecycle_entries) {
+        return Err(NativeServiceBuildError::InvalidDispatch(format!(
+            "Service {} native public-export and lifecycle entry tables overlap",
+            pin.source_id
         )));
     }
 
@@ -607,7 +614,78 @@ fn build_native_service_launch(
         assembly_hash: pin.assembly_hash.clone(),
         target_fingerprint: pin.plan.target_fingerprint.clone(),
         exports: launch_exports,
+        lifecycle: launch_lifecycle,
     })
+}
+
+fn build_named_launch_entries(
+    pin: &NativeServiceArtifactPin,
+    bin: &AssembledServiceBin,
+    required: &BTreeMap<u16, AssemblyRecordKind>,
+    entry_set: &BTreeSet<u16>,
+    entries: BTreeMap<String, u16>,
+    expected_kind: AssemblyRecordKind,
+    label: &str,
+) -> Result<(BTreeMap<String, NativeServiceLaunchEntry>, BTreeSet<u16>), NativeServiceBuildError> {
+    let mut observed = BTreeSet::new();
+    let mut launch = BTreeMap::new();
+    for (name, oid) in entries {
+        if name.trim().is_empty() || name.chars().any(char::is_control) {
+            return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} has invalid native {label} name {name:?}",
+                pin.source_id
+            )));
+        }
+        if !entry_set.contains(&oid) {
+            return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} {label} {name:?} targets OID {oid}, which is not an entry root",
+                pin.source_id
+            )));
+        }
+        match required.get(&oid) {
+            Some(kind) if *kind == expected_kind => {}
+            Some(kind) => {
+                return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                    "Service {} {label} {name:?} targets OID {oid} with kind {kind:?}, expected {expected_kind:?}",
+                    pin.source_id
+                )))
+            }
+            None => {
+                return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                    "Service {} {label} {name:?} targets unpinned OID {oid}",
+                    pin.source_id
+                )))
+            }
+        }
+        if !observed.insert(oid) {
+            return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} maps multiple native {label} names to OID {oid}; aliases are unsupported",
+                pin.source_id
+            )));
+        }
+        let placement = bin.placements.get(&oid).ok_or_else(|| {
+            NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} {label} {name:?} OID {oid} has no assembled placement",
+                pin.source_id
+            ))
+        })?;
+        if placement.entry >= bin.payload.len() {
+            return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} {label} {name:?} entry offset {} is outside assembled payload length {}",
+                pin.source_id,
+                placement.entry,
+                bin.payload.len()
+            )));
+        }
+        launch.insert(
+            name,
+            NativeServiceLaunchEntry {
+                oid,
+                entry_offset: placement.entry,
+            },
+        );
+    }
+    Ok((launch, observed))
 }
 
 /// Re-open the exact Service `.bin` selected by a pin. A missing/corrupt cache
