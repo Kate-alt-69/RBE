@@ -753,6 +753,7 @@ impl Parser {
         let mut imports = Vec::new();
         let mut field_bindings = Vec::new();
         let mut functions = Vec::new();
+        let mut exports = Vec::new();
 
         while self.check(&TokenKind::Colon) {
             match self.parse_imports() {
@@ -787,9 +788,28 @@ impl Parser {
             ));
         }
 
-        while self.check(&TokenKind::Function) {
+        while self.check(&TokenKind::Function) || self.is_export_keyword() {
+            let exported = self.is_export_keyword();
+            if exported {
+                self.advance();
+                if self.check(&TokenKind::Async) {
+                    self.advance();
+                }
+                if !self.check(&TokenKind::Function) {
+                    errors.push(self.error_here(
+                        "route `export` must be followed by `function` or `async function`",
+                    ));
+                    self.recover_top_level();
+                    continue;
+                }
+            }
             match self.parse_function_collecting(&mut errors) {
-                Some(function) => functions.push(function),
+                Some(function) => {
+                    if exported {
+                        exports.push(function.name.clone());
+                    }
+                    functions.push(function);
+                }
                 None => self.recover_top_level(),
             }
         }
@@ -808,6 +828,7 @@ impl Parser {
                 imports,
                 field_bindings,
                 functions,
+                exports,
                 class_name,
                 methods,
             }),

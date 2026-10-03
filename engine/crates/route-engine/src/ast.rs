@@ -39,6 +39,9 @@ pub struct RouteFile {
     pub imports: Vec<ImportTarget>,
     pub field_bindings: Vec<FieldBinding>,
     pub functions: Vec<FunctionDef>,
+    /// Only helpers explicitly declared with `export function` are generic
+    /// callable route targets. HTTP Route methods remain request handlers only.
+    pub exports: Vec<String>,
     pub class_name: String,
     pub methods: Vec<MethodDef>,
 }

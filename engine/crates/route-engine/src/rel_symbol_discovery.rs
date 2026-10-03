@@ -22,11 +22,9 @@ use crate::oid_link::{LinkedRelKind, LinkedRelSymbolSpec};
 
 /// Parsed REL roles that can participate in Phase 4 linked-symbol discovery.
 ///
-/// Route handlers are reachability roots, but are intentionally not emitted as
-/// generic `RouteExport` OIDs: the current Route AST has no explicit callable
-/// export list. This preserves the service-upgrade rule that an HTTP handler
-/// must not accidentally become a generic callable merely because it lives in a
-/// `.route` source.
+/// Route handlers are reachability roots but are never generic callable OIDs.
+/// Only helpers explicitly listed by the Route AST's `export function` surface
+/// may become `RouteExport` OIDs.
 #[derive(Debug, Clone, Copy)]
 pub enum LinkedRelSourceRef<'a> {
     Module(&'a ModuleFile),
@@ -151,6 +149,7 @@ struct OidCandidate {
 enum ImportBinding {
     LinkedFunction(String),
     ModuleNamespace(String),
+    RouteNamespace(String),
     ServiceNamespace(String),
     Other,
 }
@@ -178,7 +177,7 @@ pub fn linked_source_sha256(source: &str) -> String {
 /// - service lifecycle hooks;
 /// - HTTP Route methods (as graph roots only, not generic callable OIDs).
 ///
-/// Module exports are retained only when one of those roots actually reaches
+/// Module/Route exports are retained only when one of those roots actually reaches
 /// them. Private helper functions remain local graph connectors and do not
 /// consume OIDs merely because they exist.
 pub fn discover_linked_rel_symbols(
@@ -193,6 +192,7 @@ pub fn discover_linked_rel_symbols(
     let mut service_roots = BTreeMap::<String, BTreeSet<String>>::new();
     let mut service_lifecycle = BTreeMap::<String, BTreeMap<String, String>>::new();
     let mut public_modules = BTreeMap::<(String, String), String>::new();
+    let mut public_routes = BTreeMap::<(String, String), String>::new();
     let mut public_services = BTreeMap::<(String, String), String>::new();
 
     // Pass 1: validate source identity and declare every local node/public OID
@@ -274,6 +274,45 @@ pub fn discover_linked_rel_symbols(
             }
             LinkedRelSourceRef::Route(file) => {
                 declare_functions(unit_index, &file.functions, &mut meta, &mut nodes)?;
+                let declared = file
+                    .functions
+                    .iter()
+                    .map(|function| function.name.as_str())
+                    .collect::<BTreeSet<_>>();
+                for export in &file.exports {
+                    if !declared.contains(export.as_str()) {
+                        return Err(LinkedRelDiscoveryError::MissingExportBody {
+                            source: logical_name.clone(),
+                            export: export.clone(),
+                        });
+                    }
+                    let canonical = canonical_symbol_id(&["route", &logical_name, export])?;
+                    let node = meta
+                        .function_nodes
+                        .get(export)
+                        .expect("validated exported route function exists")
+                        .clone();
+                    insert_candidate(
+                        &mut candidates,
+                        &mut candidate_by_node,
+                        OidCandidate {
+                            canonical_id: canonical.clone(),
+                            kind: LinkedRelKind::RouteExport,
+                            source_sha256: unit.source_sha256.clone(),
+                            node: Some(node),
+                            descriptor_members: BTreeSet::new(),
+                        },
+                    )?;
+                    if public_routes
+                        .insert((logical_name.clone(), export.clone()), canonical)
+                        .is_some()
+                    {
+                        return Err(LinkedRelDiscoveryError::DuplicatePublicExport {
+                            source: logical_name.clone(),
+                            export: export.clone(),
+                        });
+                    }
+                }
                 for method in &file.methods {
                     let node = NodeId::new(unit_index, format!("route:{}", method.verb));
                     if nodes
@@ -460,7 +499,7 @@ pub fn discover_linked_rel_symbols(
         let resolved = imports
             .iter()
             .map(|import| {
-                resolve_import_binding(import, &public_modules, &public_services)
+                resolve_import_binding(import, &public_modules, &public_routes, &public_services)
                     .map(|binding| (binding_name(import), binding))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -475,6 +514,7 @@ pub fn discover_linked_rel_symbols(
             &node.body,
             meta,
             &public_modules,
+            &public_routes,
             &public_services,
             &mut edges,
         )?;
@@ -647,10 +687,25 @@ fn insert_candidate(
 fn resolve_import_binding(
     import: &ImportTarget,
     public_modules: &BTreeMap<(String, String), String>,
+    public_routes: &BTreeMap<(String, String), String>,
     public_services: &BTreeMap<(String, String), String>,
 ) -> Result<ImportBinding, LinkedRelDiscoveryError> {
     match import_base(import) {
+        ImportTarget::Custom(path) if is_route_source_path(path) => {
+            Ok(ImportBinding::RouteNamespace(logical_route_name(path)))
+        }
         ImportTarget::Custom(path) => Ok(ImportBinding::ModuleNamespace(logical_module_name(path))),
+        ImportTarget::CustomFunction { path, function } if is_route_source_path(path) => {
+            let logical = logical_route_name(path);
+            let canonical = public_routes
+                .get(&(logical.clone(), function.clone()))
+                .ok_or_else(|| LinkedRelDiscoveryError::MissingImportedExport {
+                    kind: "route",
+                    source: logical.clone(),
+                    export: function.clone(),
+                })?;
+            Ok(ImportBinding::LinkedFunction(canonical.clone()))
+        }
         ImportTarget::CustomFunction { path, function } => {
             let logical = logical_module_name(path);
             let canonical = public_modules
@@ -684,22 +739,51 @@ fn collect_statement_edges(
     statements: &[Statement],
     meta: &UnitMeta,
     public_modules: &BTreeMap<(String, String), String>,
+    public_routes: &BTreeMap<(String, String), String>,
     public_services: &BTreeMap<(String, String), String>,
     out: &mut BTreeSet<NodeEdge>,
 ) -> Result<(), LinkedRelDiscoveryError> {
     for statement in statements {
         match statement {
             Statement::Const { value, .. } | Statement::Return(value) | Statement::Expr(value) => {
-                collect_expr_edges(value, meta, public_modules, public_services, out)?;
+                collect_expr_edges(
+                    value,
+                    meta,
+                    public_modules,
+                    public_routes,
+                    public_services,
+                    out,
+                )?;
             }
             Statement::If {
                 condition,
                 then_body,
                 else_body,
             } => {
-                collect_expr_edges(condition, meta, public_modules, public_services, out)?;
-                collect_statement_edges(then_body, meta, public_modules, public_services, out)?;
-                collect_statement_edges(else_body, meta, public_modules, public_services, out)?;
+                collect_expr_edges(
+                    condition,
+                    meta,
+                    public_modules,
+                    public_routes,
+                    public_services,
+                    out,
+                )?;
+                collect_statement_edges(
+                    then_body,
+                    meta,
+                    public_modules,
+                    public_routes,
+                    public_services,
+                    out,
+                )?;
+                collect_statement_edges(
+                    else_body,
+                    meta,
+                    public_modules,
+                    public_routes,
+                    public_services,
+                    out,
+                )?;
             }
         }
     }
@@ -710,6 +794,7 @@ fn collect_expr_edges(
     expr: &Expr,
     meta: &UnitMeta,
     public_modules: &BTreeMap<(String, String), String>,
+    public_routes: &BTreeMap<(String, String), String>,
     public_services: &BTreeMap<(String, String), String>,
     out: &mut BTreeSet<NodeEdge>,
 ) -> Result<(), LinkedRelDiscoveryError> {
@@ -746,6 +831,18 @@ fn collect_expr_edges(
                                         })?;
                                     out.insert(NodeEdge::Canonical(canonical.clone()));
                                 }
+                                ImportBinding::RouteNamespace(route) => {
+                                    let canonical = public_routes
+                                        .get(&(route.clone(), method.clone()))
+                                        .ok_or_else(|| {
+                                            LinkedRelDiscoveryError::MissingImportedExport {
+                                                kind: "route",
+                                                source: route.clone(),
+                                                export: method.clone(),
+                                            }
+                                        })?;
+                                    out.insert(NodeEdge::Canonical(canonical.clone()));
+                                }
                                 ImportBinding::ServiceNamespace(service) => {
                                     let canonical = public_services
                                         .get(&(service.clone(), method.clone()))
@@ -762,30 +859,86 @@ fn collect_expr_edges(
                             }
                         }
                     }
-                    collect_expr_edges(target, meta, public_modules, public_services, out)?;
+                    collect_expr_edges(
+                        target,
+                        meta,
+                        public_modules,
+                        public_routes,
+                        public_services,
+                        out,
+                    )?;
                 }
-                other => collect_expr_edges(other, meta, public_modules, public_services, out)?,
+                other => collect_expr_edges(
+                    other,
+                    meta,
+                    public_modules,
+                    public_routes,
+                    public_services,
+                    out,
+                )?,
             }
             for arg in args {
-                collect_expr_edges(arg, meta, public_modules, public_services, out)?;
+                collect_expr_edges(
+                    arg,
+                    meta,
+                    public_modules,
+                    public_routes,
+                    public_services,
+                    out,
+                )?;
             }
         }
         Expr::Member(target, _) | Expr::UnaryNot(target) => {
-            collect_expr_edges(target, meta, public_modules, public_services, out)?;
+            collect_expr_edges(
+                target,
+                meta,
+                public_modules,
+                public_routes,
+                public_services,
+                out,
+            )?;
         }
         Expr::Object(entries) => {
             for (_, value) in entries {
-                collect_expr_edges(value, meta, public_modules, public_services, out)?;
+                collect_expr_edges(
+                    value,
+                    meta,
+                    public_modules,
+                    public_routes,
+                    public_services,
+                    out,
+                )?;
             }
         }
         Expr::Array(values) => {
             for value in values {
-                collect_expr_edges(value, meta, public_modules, public_services, out)?;
+                collect_expr_edges(
+                    value,
+                    meta,
+                    public_modules,
+                    public_routes,
+                    public_services,
+                    out,
+                )?;
             }
         }
         Expr::Binary { left, right, .. } => {
-            collect_expr_edges(left, meta, public_modules, public_services, out)?;
-            collect_expr_edges(right, meta, public_modules, public_services, out)?;
+            collect_expr_edges(
+                left,
+                meta,
+                public_modules,
+                public_routes,
+                public_services,
+                out,
+            )?;
+            collect_expr_edges(
+                right,
+                meta,
+                public_modules,
+                public_routes,
+                public_services,
+                out,
+            )?;
         }
         Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null | Expr::Ident(_) => {}
     }
@@ -897,6 +1050,24 @@ fn canonical_component(value: &str) -> Result<String, LinkedRelDiscoveryError> {
         ));
     }
     Ok(out)
+}
+
+fn is_route_source_path(path: &str) -> bool {
+    path.replace('\\', "/").ends_with(".route")
+}
+
+fn logical_route_name(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let after_amp = normalized.rsplit('&').next().unwrap_or(&normalized);
+    let relative = after_amp.strip_prefix("./").unwrap_or(after_amp);
+    let relative = relative
+        .strip_prefix("api/")
+        .or_else(|| relative.strip_prefix("route/"))
+        .unwrap_or(relative);
+    relative
+        .strip_suffix(".route")
+        .unwrap_or(relative)
+        .to_string()
 }
 
 fn logical_module_name(path: &str) -> String {
@@ -1072,6 +1243,7 @@ mod tests {
             }],
             field_bindings: Vec::new(),
             functions: Vec::new(),
+            exports: Vec::new(),
             class_name: "Route".into(),
             methods: vec![MethodDef {
                 verb: "get".into(),
@@ -1087,6 +1259,73 @@ mod tests {
         assert_eq!(discovery.symbols.len(), 1);
         assert_eq!(discovery.symbols[0].canonical_id, "module_shared_used");
         assert_eq!(discovery.symbols[0].kind, LinkedRelKind::ModuleExport);
+    }
+
+    #[test]
+    fn explicit_route_export_is_linked_but_http_handler_is_not() {
+        let source = r#"
+export function helper() { return true; }
+class Route {
+    get(req) { return helper(); }
+}
+"#;
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let route = crate::parser::Parser::new(tokens).parse_file().unwrap();
+        assert_eq!(route.exports, vec!["helper"]);
+        let discovery =
+            discover_linked_rel_symbols(&[LinkedRelSourceUnit::route("home", source, &route)])
+                .unwrap();
+        assert_eq!(discovery.symbols.len(), 1);
+        assert_eq!(discovery.symbols[0].canonical_id, "route_home_helper");
+        assert_eq!(discovery.symbols[0].kind, LinkedRelKind::RouteExport);
+        assert!(!discovery
+            .symbols
+            .iter()
+            .any(|symbol| symbol.canonical_id.contains("route_get")));
+    }
+
+    #[test]
+    fn service_can_reach_explicit_route_export_by_quoted_route_path() {
+        let route_source = "export function helper() { return true; } class Route {}";
+        let route_tokens = crate::lexer::Lexer::new(route_source).tokenize().unwrap();
+        let route = crate::parser::Parser::new(route_tokens)
+            .parse_file()
+            .unwrap();
+        let service = ServiceProgram {
+            imports: vec![ImportTarget::CustomFunction {
+                path: "./api/helpers.route".into(),
+                function: "helper".into(),
+            }],
+            functions: vec![function(
+                "run",
+                vec![Statement::Return(call_ident("helper"))],
+            )],
+            exports: vec!["run".into()],
+            class_name: None,
+            lifecycle: Vec::new(),
+            classes: Vec::new(),
+        };
+        let discovery = discover_linked_rel_symbols(&[
+            LinkedRelSourceUnit::route("helpers", route_source, &route),
+            LinkedRelSourceUnit::service("worker", "service", &service),
+        ])
+        .unwrap();
+        assert_eq!(
+            discovery
+                .symbols
+                .iter()
+                .find(|symbol| symbol.canonical_id == "route_helpers_helper")
+                .unwrap()
+                .kind,
+            LinkedRelKind::RouteExport
+        );
+        assert!(discovery
+            .symbols
+            .iter()
+            .find(|symbol| symbol.canonical_id == "service_worker_run")
+            .unwrap()
+            .required_symbols
+            .contains("route_helpers_helper"));
     }
 
     #[test]
