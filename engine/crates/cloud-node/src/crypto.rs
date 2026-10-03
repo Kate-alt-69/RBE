@@ -22,9 +22,7 @@ fn load_signing_key_value(value: &str) -> anyhow::Result<SigningKey> {
     let bytes = hex::decode(&resolved)
         .map_err(|_| anyhow::anyhow!("{CLOUD_NODE_PRIVATE_KEY_ENV} must resolve to hexadecimal"))?;
     let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-        anyhow::anyhow!(
-            "{CLOUD_NODE_PRIVATE_KEY_ENV} must resolve to exactly 32 bytes"
-        )
+        anyhow::anyhow!("{CLOUD_NODE_PRIVATE_KEY_ENV} must resolve to exactly 32 bytes")
     })?;
     Ok(SigningKey::from_bytes(&bytes))
 }
@@ -38,9 +36,7 @@ fn resolve_signing_key_value(value: &str) -> anyhow::Result<String> {
     }
     let path = Path::new(file_name);
     if !path.is_absolute() {
-        anyhow::bail!(
-            "{CLOUD_NODE_PRIVATE_KEY_ENV} file: path must be absolute"
-        );
+        anyhow::bail!("{CLOUD_NODE_PRIVATE_KEY_ENV} file: path must be absolute");
     }
     let file = std::fs::File::open(path).map_err(|error| {
         anyhow::anyhow!(
