@@ -37,11 +37,11 @@ jobs:
           PY
 
           cd engine
-          cargo fmt --all
+          cargo fmt -p service-runtime
           cargo check -p service-runtime --locked
           cargo test -p service-runtime --locked
           cargo clippy -p service-runtime --all-targets --locked -- -D warnings
-          cargo fmt --all -- --check
+          cargo fmt -p service-runtime -- --check
           cd ..
 
           changed="$(git status --porcelain | awk '{print $2}')"
