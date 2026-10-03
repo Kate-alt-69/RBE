@@ -9,10 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::rel_native_link::{
+    prepare_rel_native_link, PreparedRelNativeLink, RelNativeLinkError, RelNativeLinkReport,
+};
+use crate::rel_symbol_discovery::LinkedRelDiscovery;
 use crate::runtime_image::RuntimeImage;
 use crate::service_native::{
-    load_pinned_service_bin, NativeRuntimeImagePins, NativeServiceArtifactPin, PackageArtifactPin,
-    ServiceBinCacheLookup, ServiceNativeError,
+    load_pinned_service_bin, DynamicOidPinRegistry, NativeRuntimeImagePins,
+    NativeServiceArtifactPin, PackageArtifactPin, ServiceBinCacheLookup, ServiceNativeError,
 };
 use crate::service_oid::OidCache;
 use crate::service_oid_adapter::{
@@ -43,6 +47,55 @@ pub struct BuiltNativeService {
 pub struct NativeRuntimeImageBuild {
     pub pins: NativeRuntimeImagePins,
     pub services: BTreeMap<SourceId, BuiltNativeService>,
+}
+
+/// Prepare Image B's linked-REL generation using the exact dynamic OIDs still
+/// pinned by active/draining Runtime Images and Service workers. This prevents
+/// callers from accidentally preparing a new generation with an empty pin set.
+pub fn prepare_rel_native_link_for_image_b(
+    cache: &OidCache,
+    discovery: &LinkedRelDiscovery,
+    active_pins: &DynamicOidPinRegistry,
+) -> Result<PreparedRelNativeLink, RelNativeLinkError> {
+    let pinned_oids = active_pins.rel_allocator_pins();
+    prepare_rel_native_link(cache, discovery, &pinned_oids)
+}
+
+/// Consume the exact Phase-4 handoff after its OID index/materialization commit.
+/// The report must describe the same index generation that is currently open;
+/// otherwise the Service plans would be assembled against a different numeric
+/// meaning than the one Phase 4 selected.
+pub fn build_native_runtime_image_from_rel_link(
+    project_root: &Path,
+    cache: &OidCache,
+    image: &RuntimeImage,
+    report: &RelNativeLinkReport,
+    evaluator_fallbacks: BTreeMap<SourceId, String>,
+) -> Result<NativeRuntimeImageBuild, NativeServiceBuildError> {
+    let expected_generation = report.reconcile.delta.generation;
+    let observed_generation = cache.index().generation;
+    if observed_generation != expected_generation {
+        return Err(NativeServiceBuildError::ArtifactDrift(format!(
+            "linked REL handoff targets OID index generation {expected_generation}, current cache is generation {observed_generation}"
+        )));
+    }
+
+    for (source_id, spec) in &report.service_specs {
+        if source_id != &spec.source_id {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "linked REL handoff key {source_id} does not match Service build spec {}",
+                spec.source_id
+            )));
+        }
+    }
+
+    build_native_runtime_image_pins(
+        project_root,
+        cache,
+        image,
+        report.service_specs.values().cloned().collect(),
+        evaluator_fallbacks,
+    )
 }
 
 /// Build one native Service artifact against one immutable in-memory OID cache
