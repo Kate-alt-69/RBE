@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::oid_materialize::NativeOidFragment;
 use crate::package_native_link::{
-    commit_package_native_link, prepare_package_native_link, PackageFragmentKey,
-    PackageNativeLinkError, PackageNativeLinkReport, PreparedPackageNativeLink,
+    prepare_package_native_link, PackageFragmentKey, PackageNativeLinkError,
+    PackageNativeLinkReport, PreparedPackageNativeLink,
 };
+use crate::package_native_semantics::commit_package_native_link_with_record_invalidation;
 use crate::rel_native_link::{
     prepare_rel_native_link, PreparedRelNativeLink, RelNativeLinkError, RelNativeLinkReport,
     ServiceNativeLinkInput,
@@ -214,6 +215,8 @@ impl NativeServiceLinkGuard<'_> {
         prepare_package_native_link(cache, links, &pinned_oids)
     }
 
+    /// Commit package OIDs through the record-hash invalidation wrapper so a
+    /// same-OID native record rewrite cannot leave an unpinned stale Service bin.
     pub fn commit_package(
         &self,
         project_root: &Path,
@@ -222,7 +225,13 @@ impl NativeServiceLinkGuard<'_> {
         fragments: &BTreeMap<PackageFragmentKey, NativeOidFragment>,
     ) -> Result<PackageNativeLinkReport, PackageNativeLinkError> {
         let protection = self.registry.cache_protection();
-        commit_package_native_link(project_root, cache, prepared, fragments, &protection)
+        commit_package_native_link_with_record_invalidation(
+            project_root,
+            cache,
+            prepared,
+            fragments,
+            &protection,
+        )
     }
 
     pub fn prepare_rel(
