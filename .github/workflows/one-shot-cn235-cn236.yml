@@ -64,16 +64,16 @@ jobs:
           text = text.replace(old, new, 1)
 
           old_test = '''    #[test]
-              fn credential_file_reference_requires_absolute_path() {
-                  assert!(resolve_secret_value("RBE_TEST_SECRET", "file:relative/token").is_err());
-              }
+          fn credential_file_reference_requires_absolute_path() {
+              assert!(resolve_secret_value("RBE_TEST_SECRET", "file:relative/token").is_err());
+          }
           '''
           new_test = '''    #[test]
-              fn credential_file_reference_requires_absolute_regular_file() {
-                  assert!(resolve_secret_value("RBE_TEST_SECRET", "file:relative/token").is_err());
-                  let directory = format!("file:{}", std::env::temp_dir().display());
-                  assert!(resolve_secret_value("RBE_TEST_SECRET", &directory).is_err());
-              }
+          fn credential_file_reference_requires_absolute_regular_file() {
+              assert!(resolve_secret_value("RBE_TEST_SECRET", "file:relative/token").is_err());
+              let directory = format!("file:{}", std::env::temp_dir().display());
+              assert!(resolve_secret_value("RBE_TEST_SECRET", &directory).is_err());
+          }
           '''
           if text.count(old_test) != 1:
               raise SystemExit(f'provider credential test anchor count={text.count(old_test)}')
@@ -87,10 +87,10 @@ jobs:
               raise SystemExit(f'peer timeout constant anchor count={text.count(old_const)}')
           text = text.replace(old_const, new_const, 1)
           old_builder = '''        .connect_timeout(Duration::from_secs(10))
-                  .timeout(REQUEST_TIMEOUT)
+          .timeout(REQUEST_TIMEOUT)
           '''
           new_builder = '''        .connect_timeout(Duration::from_secs(10))
-                  .read_timeout(REQUEST_READ_TIMEOUT)
+          .read_timeout(REQUEST_READ_TIMEOUT)
           '''
           if text.count(old_builder) != 1:
               raise SystemExit(f'peer timeout builder anchor count={text.count(old_builder)}')
