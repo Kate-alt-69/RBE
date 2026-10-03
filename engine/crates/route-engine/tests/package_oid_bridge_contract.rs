@@ -46,9 +46,14 @@ fn verified_package_context_prepares_single_index_native_transaction() {
 
     assert!(prepared.delta().changed());
     assert_eq!(prepared.materialize_bindings().len(), 1);
-    let oid = prepared.materialize_bindings()[&(String::from("mail"), String::from("lib_mail_send"))];
+    let oid =
+        prepared.materialize_bindings()[&(String::from("mail"), String::from("lib_mail_send"))];
     assert!((OID_PACKAGE_START..=OID_PACKAGE_END).contains(&oid));
-    assert_eq!(cache.index().generation, 0, "prepare must not publish the next index");
+    assert_eq!(
+        cache.index().generation,
+        0,
+        "prepare must not publish the next index"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }
