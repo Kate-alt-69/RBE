@@ -10,7 +10,9 @@ use crate::crypto::load_signing_key_from_env;
 pub const MAX_AUTH_PROOF_BYTES: usize = 1024;
 pub const DEFAULT_SESSION_TTL_MS: u64 = 5 * 60_000;
 const MAX_ACTIVE_SESSIONS: usize = 4096;
+const MAX_ACTIVE_SESSIONS_PER_PEER: usize = 256;
 const MAX_REPLAY_ENTRIES: usize = 65_536;
+const MAX_REPLAY_ENTRIES_PER_PEER: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedSession {
@@ -131,7 +133,7 @@ impl CloudNodeAuthenticator {
                 "Cloud Node authentication session id is already active; peer must create a fresh session"
             );
         }
-        ensure_auth_capacity(state.sessions.len(), state.replays.len(), true)?;
+        ensure_auth_capacity(&state, &knock.node_id, true)?;
 
         let (_, local_nonce) = random_session_and_nonce();
         let accept = NodeProof::accept(
@@ -199,7 +201,7 @@ impl CloudNodeAuthenticator {
         if proof.peer_nonce != session.local_nonce {
             anyhow::bail!("Cloud Node session proof is not bound to this authenticated peer");
         }
-        ensure_auth_capacity(state.sessions.len(), state.replays.len(), false)?;
+        ensure_auth_capacity(&state, &proof.node_id, false)?;
         state.replays.insert(
             replay_key,
             proof.timestamp_ms.saturating_add(self.max_skew_ms),
@@ -244,9 +246,31 @@ fn prune_state(state: &mut AuthState, now_ms: u64) {
         .retain(|_, session| session.expires_at_ms >= now_ms);
 }
 
-fn ensure_auth_capacity(
+fn ensure_auth_capacity(state: &AuthState, node_id: &str, adding_session: bool) -> anyhow::Result<()> {
+    let peer_sessions = state
+        .sessions
+        .values()
+        .filter(|session| session.node_id == node_id)
+        .count();
+    let peer_replays = state
+        .replays
+        .keys()
+        .filter(|replay| replay.node_id == node_id)
+        .count();
+    ensure_auth_capacity_counts(
+        state.sessions.len(),
+        state.replays.len(),
+        peer_sessions,
+        peer_replays,
+        adding_session,
+    )
+}
+
+fn ensure_auth_capacity_counts(
     active_sessions: usize,
     replay_entries: usize,
+    peer_active_sessions: usize,
+    peer_replay_entries: usize,
     adding_session: bool,
 ) -> anyhow::Result<()> {
     if replay_entries >= MAX_REPLAY_ENTRIES {
@@ -254,9 +278,19 @@ fn ensure_auth_capacity(
             "Cloud Node authentication replay cache reached its bounded capacity; retry after the freshness window advances"
         );
     }
+    if peer_replay_entries >= MAX_REPLAY_ENTRIES_PER_PEER {
+        anyhow::bail!(
+            "Cloud Node trusted peer reached its bounded replay-cache quota; retry after the freshness window advances"
+        );
+    }
     if adding_session && active_sessions >= MAX_ACTIVE_SESSIONS {
         anyhow::bail!(
             "Cloud Node authenticated session table reached its bounded capacity; retry after an active session expires"
+        );
+    }
+    if adding_session && peer_active_sessions >= MAX_ACTIVE_SESSIONS_PER_PEER {
+        anyhow::bail!(
+            "Cloud Node trusted peer reached its bounded active-session quota; retry after an active session expires"
         );
     }
     Ok(())
@@ -376,12 +410,42 @@ mod tests {
     }
 
     #[test]
-    fn authentication_state_capacity_is_bounded() {
-        assert!(ensure_auth_capacity(0, 0, true).is_ok());
-        assert!(ensure_auth_capacity(MAX_ACTIVE_SESSIONS - 1, 0, true).is_ok());
-        assert!(ensure_auth_capacity(MAX_ACTIVE_SESSIONS, 0, true).is_err());
-        assert!(ensure_auth_capacity(0, MAX_REPLAY_ENTRIES - 1, false).is_ok());
-        assert!(ensure_auth_capacity(0, MAX_REPLAY_ENTRIES, false).is_err());
+    fn authentication_state_capacity_is_bounded_and_peer_isolated() {
+        assert!(ensure_auth_capacity_counts(0, 0, 0, 0, true).is_ok());
+        assert!(ensure_auth_capacity_counts(
+            MAX_ACTIVE_SESSIONS - 1,
+            0,
+            MAX_ACTIVE_SESSIONS_PER_PEER - 1,
+            0,
+            true
+        )
+        .is_ok());
+        assert!(ensure_auth_capacity_counts(MAX_ACTIVE_SESSIONS, 0, 0, 0, true).is_err());
+        assert!(ensure_auth_capacity_counts(
+            MAX_ACTIVE_SESSIONS_PER_PEER,
+            0,
+            MAX_ACTIVE_SESSIONS_PER_PEER,
+            0,
+            true
+        )
+        .is_err());
+        assert!(ensure_auth_capacity_counts(
+            0,
+            MAX_REPLAY_ENTRIES - 1,
+            0,
+            MAX_REPLAY_ENTRIES_PER_PEER - 1,
+            false
+        )
+        .is_ok());
+        assert!(ensure_auth_capacity_counts(0, MAX_REPLAY_ENTRIES, 0, 0, false).is_err());
+        assert!(ensure_auth_capacity_counts(
+            0,
+            MAX_REPLAY_ENTRIES_PER_PEER,
+            0,
+            MAX_REPLAY_ENTRIES_PER_PEER,
+            false
+        )
+        .is_err());
     }
 
     #[test]
