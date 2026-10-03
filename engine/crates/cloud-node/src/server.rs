@@ -246,7 +246,11 @@ fn prune_state(state: &mut AuthState, now_ms: u64) {
         .retain(|_, session| session.expires_at_ms >= now_ms);
 }
 
-fn ensure_auth_capacity(state: &AuthState, node_id: &str, adding_session: bool) -> anyhow::Result<()> {
+fn ensure_auth_capacity(
+    state: &AuthState,
+    node_id: &str,
+    adding_session: bool,
+) -> anyhow::Result<()> {
     let peer_sessions = state
         .sessions
         .values()
