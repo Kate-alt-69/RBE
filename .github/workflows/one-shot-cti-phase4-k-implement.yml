@@ -1,0 +1,602 @@
+name: One-shot CTI Phase 4 K implement
+
+on:
+  push:
+    paths:
+      - '.github/workflows/one-shot-cti-phase4-k-implement.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  implement-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: Apply ExecuteTask IPC and Controller integration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if old not in text:
+                  raise SystemExit(f'{label}: anchor not found in {path}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          ipc = 'container-runtime/crates/ipc-protocol/src/lib.rs'
+          replace_once(ipc, 'pub const PROTOCOL_VERSION: u16 = 8;', 'pub const PROTOCOL_VERSION: u16 = 9;', 'protocol version')
+          replace_once(
+              ipc,
+              '''#[derive(Debug, Clone, Serialize, Deserialize)]
+          pub struct AwaitResultRequest {''',
+              '''/// Phase-4 Task addressing request. Backend supplies only immutable Runtime
+          /// Image + numeric Task identity and invocation data; Controller derives all
+          /// source/artifact/name metadata from its validated CTI.
+          #[derive(Debug, Clone, Serialize, Deserialize)]
+          pub struct ExecuteTaskRequest {
+              pub request_id: String,
+              pub auth_token: String,
+              pub runtime_image: String,
+              pub task_oid: u16,
+              pub environment: String,
+              pub input: Vec<u8>,
+          }
+
+          #[derive(Debug, Clone, Serialize, Deserialize)]
+          pub struct AwaitResultRequest {''',
+              'ExecuteTask request struct',
+          )
+          replace_once(
+              ipc,
+              '''    Execute(ExecuteRequest),
+              AwaitResult(AwaitResultRequest),''',
+              '''    Execute(ExecuteRequest),
+              ExecuteTask(ExecuteTaskRequest),
+              AwaitResult(AwaitResultRequest),''',
+              'Request ExecuteTask variant',
+          )
+          replace_once(
+              ipc,
+              '''    Accepted {
+                  request_id: String,
+                  execution_id: String,
+              },
+              ExecutionFinished {''',
+              '''    Accepted {
+                  request_id: String,
+                  execution_id: String,
+              },
+              /// Phase 4 stops after trusted CTI resolution. Phase 5 will turn this
+              /// resolved image into a TaskExecution and therefore may later add a
+              /// separate execution-accepted response without changing this lookup proof.
+              TaskResolved {
+                  request_id: String,
+                  runtime_image: String,
+                  task_oid: u16,
+                  environment: String,
+                  cti_sha256: String,
+              },
+              ExecutionFinished {''',
+              'TaskResolved response',
+          )
+          ipc_path = Path(ipc)
+          ipc_text = ipc_path.read_text(encoding='utf-8')
+          marker = 'fn execute_task_wire_identity_excludes_legacy_names()'
+          if marker not in ipc_text:
+              ipc_text += r'''
+
+          #[cfg(test)]
+          mod execute_task_phase4_tests {
+              use super::*;
+
+              #[test]
+              fn execute_task_wire_identity_excludes_legacy_names() {
+                  let request = Request::ExecuteTask(ExecuteTaskRequest {
+                      request_id: "req-1".into(),
+                      auth_token: "secret".into(),
+                      runtime_image: "ab".repeat(32),
+                      task_oid: 31_844,
+                      environment: "general-1".into(),
+                      input: b"payload".to_vec(),
+                  });
+                  let value = serde_json::to_value(request).unwrap();
+                  let encoded = value.to_string();
+                  assert!(encoded.contains("ExecuteTask"));
+                  assert!(encoded.contains("task_oid"));
+                  assert!(!encoded.contains("source_id"));
+                  assert!(!encoded.contains("artifact_hash"));
+                  assert!(!encoded.contains("service_name"));
+                  assert!(!encoded.contains("function_name"));
+              }
+          }
+          '''
+              ipc_path.write_text(ipc_text, encoding='utf-8')
+
+          client = 'engine/crates/core/src/container_client.rs'
+          replace_once(
+              client,
+              '''    CancelRequest, CapabilityGrant, ExecuteRequest, HealthRequest, InspectRequest,
+              PrepareRefreshRequest,''',
+              '''    CancelRequest, CapabilityGrant, ExecuteRequest, ExecuteTaskRequest, HealthRequest,
+              InspectRequest, PrepareRefreshRequest,''',
+              'Container client ExecuteTask import',
+          )
+          replace_once(
+              client,
+              '''#[derive(Debug, Clone, PartialEq, Eq)]
+          pub struct ContainerCapabilityBinding {
+              pub environment: String,
+              pub generation: u64,
+          }
+
+          #[derive(Debug)]''',
+              '''#[derive(Debug, Clone, PartialEq, Eq)]
+          pub struct ContainerCapabilityBinding {
+              pub environment: String,
+              pub generation: u64,
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq)]
+          pub struct ContainerResolvedTask {
+              pub runtime_image: String,
+              pub task_oid: u16,
+              pub environment: String,
+              pub cti_sha256: String,
+          }
+
+          #[derive(Debug)]''',
+              'ContainerResolvedTask type',
+          )
+          replace_once(
+              client,
+              '''    pub async fn await_result(
+                  &self,''',
+              '''    /// Resolve one precompiled Task through Controller without sending source,
+              /// artifact, service, or function identity. Phase 4 deliberately returns the
+              /// validated CTI binding rather than pretending the Task DAG has executed.
+              pub async fn execute_task(
+                  &self,
+                  runtime_image: &str,
+                  task_oid: u16,
+                  environment: &str,
+                  input: Vec<u8>,
+              ) -> anyhow::Result<ContainerResolvedTask> {
+                  if input.len() > MAX_EXECUTION_INPUT_BYTES {
+                      anyhow::bail!("Container Task input exceeds the IPC limit");
+                  }
+                  let endpoint = self
+                      .endpoint
+                      .read()
+                      .expect("container endpoint lock poisoned")
+                      .clone();
+                  let request_id = next_request_id();
+                  let request = Request::ExecuteTask(ExecuteTaskRequest {
+                      request_id: request_id.clone(),
+                      auth_token: endpoint.token.clone(),
+                      runtime_image: runtime_image.to_string(),
+                      task_oid,
+                      environment: environment.to_string(),
+                      input,
+                  });
+                  match call(endpoint, request, Duration::from_secs(5)).await? {
+                      Response::TaskResolved {
+                          request_id: returned_request_id,
+                          runtime_image: returned_runtime_image,
+                          task_oid: returned_task_oid,
+                          environment: returned_environment,
+                          cti_sha256,
+                      } if returned_request_id == request_id
+                          && returned_runtime_image == runtime_image
+                          && returned_task_oid == task_oid
+                          && returned_environment == environment =>
+                      {
+                          if cti_sha256.len() != 64
+                              || !cti_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                          {
+                              anyhow::bail!("Container returned an invalid CTI SHA-256 identity");
+                          }
+                          Ok(ContainerResolvedTask {
+                              runtime_image: returned_runtime_image,
+                              task_oid: returned_task_oid,
+                              environment: returned_environment,
+                              cti_sha256,
+                          })
+                      }
+                      Response::TaskResolved { .. } => {
+                          anyhow::bail!("Container returned a mismatched Task resolution")
+                      }
+                      Response::Error { code, message, .. } => {
+                          anyhow::bail!("container Task resolution failed [{code}]: {message}")
+                      }
+                      other => anyhow::bail!("unexpected Container ExecuteTask response: {other:?}"),
+                  }
+              }
+
+              pub async fn await_result(
+                  &self,''',
+              'ContainerClient execute_task method',
+          )
+          client_path = Path(client)
+          client_text = client_path.read_text(encoding='utf-8')
+          client_marker = 'async fn execute_task_sends_only_task_addressing_identity()'
+          if client_marker not in client_text:
+              client_text += r'''
+
+          #[cfg(test)]
+          mod execute_task_phase4_tests {
+              use super::*;
+              use std::net::TcpListener;
+
+              #[tokio::test]
+              async fn execute_task_sends_only_task_addressing_identity() {
+                  let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                  let address = listener.local_addr().unwrap();
+                  let token = "test-container-token".to_string();
+                  let expected_token = token.clone();
+                  let runtime_image = "ab".repeat(32);
+                  let expected_runtime_image = runtime_image.clone();
+                  let server = std::thread::spawn(move || {
+                      let (mut stream, _) = listener.accept().unwrap();
+                      let frame = read_frame(&mut stream).unwrap();
+                      let request: Request = serde_json::from_slice(&frame).unwrap();
+                      let Request::ExecuteTask(request) = request else {
+                          panic!("expected ExecuteTask request");
+                      };
+                      assert_eq!(request.auth_token, expected_token);
+                      assert_eq!(request.runtime_image, expected_runtime_image);
+                      assert_eq!(request.task_oid, 31_844);
+                      assert_eq!(request.environment, "general-1");
+                      assert_eq!(request.input, b"input");
+                      write_frame(
+                          &mut stream,
+                          &Response::TaskResolved {
+                              request_id: request.request_id,
+                              runtime_image: request.runtime_image,
+                              task_oid: request.task_oid,
+                              environment: request.environment,
+                              cti_sha256: "cd".repeat(32),
+                          },
+                      )
+                      .unwrap();
+                  });
+
+                  let client = ContainerClient::new(address, token, None);
+                  let resolved = client
+                      .execute_task(&runtime_image, 31_844, "general-1", b"input".to_vec())
+                      .await
+                      .unwrap();
+                  assert_eq!(resolved.runtime_image, runtime_image);
+                  assert_eq!(resolved.task_oid, 31_844);
+                  assert_eq!(resolved.environment, "general-1");
+                  assert_eq!(resolved.cti_sha256, "cd".repeat(32));
+                  server.join().unwrap();
+              }
+          }
+          '''
+              client_path.write_text(client_text, encoding='utf-8')
+
+          main = 'container-runtime/crates/container-bin/src/main.rs'
+          replace_once(
+              main,
+              '''use container_runtime_core::{
+              artifact_sha256_matches, CapabilityBroker, EnvironmentId, EnvironmentProfile,
+              EnvironmentRegistry, ExecutionProvenance, Runtime, RuntimeConfig, WorkCost,
+          };''',
+              '''use container_runtime_core::{
+              artifact_sha256_matches, CapabilityBroker, ContainerTaskLoadError, ContainerTaskLoader,
+              EnvironmentId, EnvironmentProfile, EnvironmentRegistry, ExecutionProvenance,
+              LoadedTaskImage, Runtime, RuntimeConfig, RuntimeImageTaskRegistry, WorkCost,
+          };''',
+              'Controller CTI loader imports',
+          )
+          replace_once(
+              main,
+              '''    let environment_processes = environment_process::EnvironmentProcessSupervisor::start(
+                  general_environments,''',
+              '''    let task_loader = Arc::new(ContainerTaskLoader::new(project_root.join(".cache")));
+              let task_registry = Arc::new(RuntimeImageTaskRegistry::new());
+              let environment_processes = environment_process::EnvironmentProcessSupervisor::start(
+                  general_environments,''',
+              'Controller CTI loader construction',
+          )
+          replace_once(
+              main,
+              '''            capability_broker,
+                      environment_processes,
+                  )?;''',
+              '''            capability_broker,
+                      task_loader,
+                      task_registry,
+                      environment_processes,
+                  )?;''',
+              'run_control_server Task loader args',
+          )
+          replace_once(
+              main,
+              '''    capability_broker: Arc<CapabilityBroker>,
+              environment_processes: Arc<environment_process::EnvironmentProcessSupervisor>,
+          ) -> anyhow::Result<()> {''',
+              '''    capability_broker: Arc<CapabilityBroker>,
+              task_loader: Arc<ContainerTaskLoader>,
+              task_registry: Arc<RuntimeImageTaskRegistry>,
+              environment_processes: Arc<environment_process::EnvironmentProcessSupervisor>,
+          ) -> anyhow::Result<()> {''',
+              'run_control_server signature',
+          )
+          replace_once(
+              main,
+              '''                let capability_broker = Arc::clone(&capability_broker);
+                      let environment_processes = Arc::clone(&environment_processes);''',
+              '''                let capability_broker = Arc::clone(&capability_broker);
+                      let task_loader = Arc::clone(&task_loader);
+                      let task_registry = Arc::clone(&task_registry);
+                      let environment_processes = Arc::clone(&environment_processes);''',
+              'control connection Task loader clones',
+          )
+          replace_once(
+              main,
+              '''                        &capability_broker,
+                              &environment_processes,
+                          ) {''',
+              '''                        &capability_broker,
+                              &task_loader,
+                              &task_registry,
+                              &environment_processes,
+                          ) {''',
+              'handle_connection Task loader args',
+          )
+          replace_once(
+              main,
+              '''fn handle_connection(
+              mut stream: TcpStream,
+              token: &str,
+              runtime: &Runtime,
+              accepting: &AtomicBool,
+              capability_broker: &CapabilityBroker,
+              environment_processes: &environment_process::EnvironmentProcessSupervisor,
+          ) -> anyhow::Result<()> {''',
+              '''fn resolve_container_task(
+              task_loader: &ContainerTaskLoader,
+              task_registry: &RuntimeImageTaskRegistry,
+              runtime_image: &str,
+              task_oid: u16,
+          ) -> Result<Option<Arc<LoadedTaskImage>>, ContainerTaskLoadError> {
+              if let Some(task) = task_registry.lookup_hex(runtime_image, task_oid)? {
+                  return Ok(Some(task));
+              }
+              let table = task_loader.load_runtime_image_hex(runtime_image)?;
+              let task = table.lookup(task_oid);
+              task_registry.install_table(table);
+              Ok(task)
+          }
+
+          fn task_load_error_code(error: &ContainerTaskLoadError) -> &'static str {
+              match error {
+                  ContainerTaskLoadError::InvalidRuntimeImage(_) => "INVALID_RUNTIME_IMAGE",
+                  ContainerTaskLoadError::RuntimeImageNotFound(_) => "TASK_IMAGE_NOT_FOUND",
+                  ContainerTaskLoadError::InvalidIndex(_)
+                  | ContainerTaskLoadError::Io(_)
+                  | ContainerTaskLoadError::HashMismatch(_)
+                  | ContainerTaskLoadError::MalformedCti(_)
+                  | ContainerTaskLoadError::IdentityMismatch(_)
+                  | ContainerTaskLoadError::AbiMismatch(_) => "TASK_IMAGE_INVALID",
+              }
+          }
+
+          fn handle_connection(
+              mut stream: TcpStream,
+              token: &str,
+              runtime: &Runtime,
+              accepting: &AtomicBool,
+              capability_broker: &CapabilityBroker,
+              task_loader: &ContainerTaskLoader,
+              task_registry: &RuntimeImageTaskRegistry,
+              environment_processes: &environment_process::EnvironmentProcessSupervisor,
+          ) -> anyhow::Result<()> {''',
+              'handle_connection signature and resolver helpers',
+          )
+          replace_once(
+              main,
+              '''        Request::Execute(request) => {''',
+              '''        Request::ExecuteTask(request) => {
+                  if request.auth_token != token {
+                      Response::Error {
+                          request_id: Some(request.request_id),
+                          code: "AUTH_FAILED".into(),
+                          message: "container control authentication failed".into(),
+                      }
+                  } else if request.input.len() > MAX_EXECUTION_INPUT_BYTES {
+                      Response::Error {
+                          request_id: Some(request.request_id),
+                          code: "EXECUTION_INPUT_TOO_LARGE".into(),
+                          message: format!(
+                              "Task input exceeds {MAX_EXECUTION_INPUT_BYTES} bytes"
+                          ),
+                      }
+                  } else if !accepting.load(Ordering::Acquire) {
+                      Response::Error {
+                          request_id: Some(request.request_id),
+                          code: "REFRESHING".into(),
+                          message: "container is draining for a supervised process refresh".into(),
+                      }
+                  } else if parse_environment(&request.environment)
+                      .filter(|id| runtime.has_environment(*id))
+                      .is_none()
+                  {
+                      Response::Error {
+                          request_id: Some(request.request_id),
+                          code: "INVALID_ENVIRONMENT".into(),
+                          message: format!(
+                              "container environment is unavailable: {}",
+                              request.environment
+                          ),
+                      }
+                  } else {
+                      match resolve_container_task(
+                          task_loader,
+                          task_registry,
+                          &request.runtime_image,
+                          request.task_oid,
+                      ) {
+                          Ok(Some(task)) => {
+                              emit_event(
+                                  "task_resolved",
+                                  &format!(
+                                      "runtime_image={} task_oid={} cti_sha256={}",
+                                      request.runtime_image,
+                                      request.task_oid,
+                                      hex::encode(task.cti_sha256())
+                                  ),
+                              );
+                              Response::TaskResolved {
+                                  request_id: request.request_id,
+                                  runtime_image: request.runtime_image,
+                                  task_oid: request.task_oid,
+                                  environment: request.environment,
+                                  cti_sha256: hex::encode(task.cti_sha256()),
+                              }
+                          }
+                          Ok(None) => Response::Error {
+                              request_id: Some(request.request_id),
+                              code: "TASK_NOT_FOUND".into(),
+                              message: format!(
+                                  "TaskOID {} is not present in Runtime Image {}",
+                                  request.task_oid, request.runtime_image
+                              ),
+                          },
+                          Err(error) => Response::Error {
+                              request_id: Some(request.request_id),
+                              code: task_load_error_code(&error).into(),
+                              message: error.to_string(),
+                          },
+                      }
+                  }
+              }
+              Request::Execute(request) => {''',
+              'ExecuteTask Controller branch',
+          )
+          main_path = Path(main)
+          main_text = main_path.read_text(encoding='utf-8')
+          main_marker = 'fn execute_task_resolves_cti_by_runtime_image_and_oid()'
+          if main_marker not in main_text:
+              main_text += r'''
+
+          #[cfg(test)]
+          mod execute_task_phase4_tests {
+              use super::*;
+              use container_runtime_core::{ContainerTaskAssembler, ContainerTaskAssemblyInput};
+              use ipc_protocol::{CtiSection, CtiSectionKind, CTI_SECTION_REQUIRED};
+              use std::time::{SystemTime, UNIX_EPOCH};
+
+              fn temp_root() -> PathBuf {
+                  let nonce = SystemTime::now()
+                      .duration_since(UNIX_EPOCH)
+                      .expect("system clock before unix epoch")
+                      .as_nanos();
+                  std::env::temp_dir().join(format!(
+                      "rbe-execute-task-{}-{nonce}",
+                      std::process::id()
+                  ))
+              }
+
+              fn required_sections() -> Vec<CtiSection> {
+                  CtiSectionKind::REQUIRED
+                      .into_iter()
+                      .map(|kind| CtiSection {
+                          kind: kind.code(),
+                          flags: CTI_SECTION_REQUIRED,
+                          data: vec![kind.code() as u8],
+                      })
+                      .collect()
+              }
+
+              #[test]
+              fn execute_task_resolves_cti_by_runtime_image_and_oid() {
+                  let root = temp_root();
+                  let runtime_image = [0xab; 32];
+                  let task_oid = 31_844;
+                  let assembler = ContainerTaskAssembler::new(&root);
+                  let mut index = assembler.load_index().unwrap();
+                  assembler
+                      .assemble_and_commit(
+                          &mut index,
+                          ContainerTaskAssemblyInput {
+                              task_oid,
+                              capability_abi: CAPABILITY_ABI_VERSION,
+                              runtime_image_sha256: runtime_image,
+                              task_semantic_sha256: [0xcd; 32],
+                              entry_node: 0,
+                              target_id: 1,
+                              flags: 0,
+                              sections: required_sections(),
+                          },
+                      )
+                      .unwrap();
+
+                  let loader = ContainerTaskLoader::new(&root);
+                  let registry = RuntimeImageTaskRegistry::new();
+                  let resolved = resolve_container_task(
+                      &loader,
+                      &registry,
+                      &hex::encode(runtime_image),
+                      task_oid,
+                  )
+                  .unwrap()
+                  .expect("Task must resolve");
+                  assert_eq!(resolved.task_oid(), task_oid);
+                  assert_eq!(resolved.runtime_image_sha256(), runtime_image);
+                  assert!(registry
+                      .lookup(&runtime_image, task_oid)
+                      .is_some());
+                  let _ = fs::remove_dir_all(root);
+              }
+          }
+          '''
+              main_path.write_text(main_text, encoding='utf-8')
+          PY
+      - name: Format Phase 4 K surface
+        run: |
+          rustfmt --edition 2021 \
+            container-runtime/crates/ipc-protocol/src/lib.rs \
+            container-runtime/crates/container-bin/src/main.rs \
+            engine/crates/core/src/container_client.rs
+      - name: Check Container IPC and Controller
+        working-directory: container-runtime
+        run: cargo check -p ipc-protocol -p container-bin --locked
+      - name: Test ExecuteTask wire contract
+        working-directory: container-runtime
+        run: cargo test -p ipc-protocol execute_task --locked
+      - name: Test Controller Task resolution
+        working-directory: container-runtime
+        run: cargo test -p container-bin execute_task_resolves --locked
+      - name: Clippy Container Phase 4 K
+        working-directory: container-runtime
+        run: cargo clippy -p ipc-protocol -p container-bin --all-targets --locked -- -D warnings -A clippy::chunks-exact-to-as-chunks
+      - name: Check Backend Container client
+        working-directory: engine
+        run: cargo check -p core-lib --locked
+      - name: Test Backend ExecuteTask client
+        working-directory: engine
+        run: cargo test -p core-lib execute_task --locked
+      - name: Clippy Backend ExecuteTask client
+        working-directory: engine
+        run: cargo clippy -p core-lib --all-targets --locked -- -D warnings
+      - name: Commit verified ExecuteTask integration and remove verifier
+        run: |
+          git config user.name 'Kate'
+          git config user.email 'dhwanksh2000@gmail.com'
+          git add \
+            container-runtime/crates/ipc-protocol/src/lib.rs \
+            container-runtime/crates/container-bin/src/main.rs \
+            engine/crates/core/src/container_client.rs
+          git rm .github/workflows/one-shot-cti-phase4-k-implement.yml
+          git commit -m 'FEAT | CTI-005 add ExecuteTask addressing IPC'
+          git pull --rebase origin main
+          git push origin HEAD:main
