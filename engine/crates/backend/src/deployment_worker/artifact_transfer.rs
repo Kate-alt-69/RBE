@@ -240,7 +240,8 @@ async fn read_response_head(stream: &mut TlsStream<TcpStream>) -> Result<Respons
     }
     let leftover = bytes.split_off(header_end + 4);
     bytes.truncate(header_end);
-    let text = std::str::from_utf8(&bytes).context("artifact server headers are not UTF-8/ASCII")?;
+    let text =
+        std::str::from_utf8(&bytes).context("artifact server headers are not UTF-8/ASCII")?;
     let mut lines = text.split("\r\n");
     let status_line = lines.next().context("artifact server response is empty")?;
     let mut status_parts = status_line.split_whitespace();

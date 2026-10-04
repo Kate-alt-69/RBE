@@ -38,9 +38,11 @@ pub async fn create_source_bundle(
     let source_root = source_root.to_path_buf();
     let receipt = receipt.clone();
     let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || create_source_bundle_sync(&source_root, &receipt, &destination))
-        .await
-        .context("join source bundle writer")?
+    tokio::task::spawn_blocking(move || {
+        create_source_bundle_sync(&source_root, &receipt, &destination)
+    })
+    .await
+    .context("join source bundle writer")?
 }
 
 fn create_source_bundle_sync(

@@ -130,8 +130,7 @@ impl PublisherClient {
         if value.get("format").and_then(Value::as_str) != Some("rbe-source-bundle-v1")
             || value.get("archiveSha256").and_then(Value::as_str) != Some(archive_sha256)
             || value.get("sizeBytes").and_then(Value::as_u64) != Some(size_bytes)
-            || value.get("sourceTreeSha256").and_then(Value::as_str)
-                != Some(source_tree_sha256)
+            || value.get("sourceTreeSha256").and_then(Value::as_str) != Some(source_tree_sha256)
         {
             anyhow::bail!("publisher returned inconsistent source artifact preparation metadata");
         }
@@ -178,8 +177,7 @@ impl PublisherClient {
         if artifact.get("format").and_then(Value::as_str) != Some("rbe-source-bundle-v1")
             || artifact.get("archiveSha256").and_then(Value::as_str) != Some(archive_sha256)
             || artifact.get("sizeBytes").and_then(Value::as_u64) != Some(size_bytes)
-            || artifact.get("sourceTreeSha256").and_then(Value::as_str)
-                != Some(source_tree_sha256)
+            || artifact.get("sourceTreeSha256").and_then(Value::as_str) != Some(source_tree_sha256)
         {
             anyhow::bail!("publisher finalized inconsistent source artifact metadata");
         }
