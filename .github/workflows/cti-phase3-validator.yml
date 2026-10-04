@@ -1,0 +1,32 @@
+name: CTI Phase 3 Validator
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'container-runtime/crates/container-runtime-core/src/container_task_cache.rs'
+      - 'container-runtime/crates/container-runtime-core/src/lib.rs'
+      - '.github/workflows/cti-phase3-validator.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phase3:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: container-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt Phase 3 package
+        run: cargo fmt -p container-runtime-core -- --check
+      - name: check Phase 3 package
+        run: cargo check -p container-runtime-core
+      - name: clippy Phase 3 package
+        run: cargo clippy -p container-runtime-core -- -D warnings
+      - name: test CTI assembler cache and index
+        run: cargo test -p container-runtime-core container_task_cache --lib
