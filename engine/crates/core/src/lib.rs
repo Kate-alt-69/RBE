@@ -33,13 +33,16 @@ pub use dns_broker::{
 };
 pub use ipc_protocol::{
     CapabilityGrant as ContainerCapabilityGrant, CapabilityKind as ContainerCapabilityKind,
-    WorkCost as ContainerWorkCost,
+    CtiEventClass, CtiLogLevel, CtiNodeKind, SlotType as ContainerTaskSlotType, TaskEvent,
+    TaskEventDescriptor, TaskEventDictionary, TaskEventError, WorkCost as ContainerWorkCost,
+    CAPABILITY_ABI_VERSION as CONTAINER_CAPABILITY_ABI_VERSION, CTI_GRAPH_ABI_VERSION,
+    CTI_LOG_ABI_VERSION, CTI_SLOT_ABI_VERSION,
     MAX_CAPABILITY_GRANTS_PER_MANIFEST as CONTAINER_MAX_CAPABILITY_GRANTS_PER_MANIFEST,
     MAX_CAPABILITY_OPERATIONS_PER_GRANT as CONTAINER_MAX_CAPABILITY_OPERATIONS_PER_GRANT,
     MAX_CAPABILITY_OPERATION_BYTES as CONTAINER_MAX_CAPABILITY_OPERATION_BYTES,
     MAX_CAPABILITY_PAYLOAD_BYTES as CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES,
     MAX_CAPABILITY_TARGET_BYTES as CONTAINER_MAX_CAPABILITY_TARGET_BYTES,
-    MAX_EXECUTION_INPUT_BYTES as CONTAINER_MAX_EXECUTION_INPUT_BYTES,
+    MAX_EXECUTION_INPUT_BYTES as CONTAINER_MAX_EXECUTION_INPUT_BYTES, TASK_EVENT_PACKET_BYTES,
 };
 pub use library_host::{
     read_json_message as read_library_message, write_json_message as write_library_message,
