@@ -38,5 +38,6 @@ new_helper = r'''def replace_once(path, old, new):
 
 if body.count(old_helper) != 1:
     raise SystemExit(f'expected one replace_once helper, found {body.count(old_helper)}')
+body = body.replace('from pathlib import Path\n', 'from pathlib import Path\nimport re\n', 1)
 body = body.replace(old_helper, new_helper, 1)
 Path('/tmp/run-oid-vault-v2.sh').write_text(body)
