@@ -1,0 +1,113 @@
+name: One-shot Phase 6 Optimized Reachability
+
+on:
+  push:
+    paths:
+      - .github/workflows/one-shot-phase6-reachability-check.yml
+
+permissions:
+  contents: write
+
+jobs:
+  optimized-reachability:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Apply optimized reachability slice
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one patch anchor, found {count}: {old[:100]!r}")
+              file.write_text(text.replace(old, new, 1))
+
+          optimizer = "crates/route-engine/src/rel_optimizer.rs"
+          replace_once(
+              optimizer,
+              '''pub fn optimize_function(function: &FunctionDef) -> (FunctionDef, RelOptimizationStats) {\n    let mut stats = RelOptimizationStats::default();\n    let mut constants = BTreeMap::new();\n    let body = optimize_block(&function.body, &mut constants, &mut stats);\n    let (body, _) = remove_dead_stores(body, BTreeSet::new(), &mut stats);\n\n    (\n        FunctionDef {\n            name: function.name.clone(),\n            params: function.params.clone(),\n            body,\n        },\n        stats,\n    )\n}''',
+              '''pub fn optimize_function(function: &FunctionDef) -> (FunctionDef, RelOptimizationStats) {\n    let (body, stats) = optimize_statements(&function.body);\n    (\n        FunctionDef {\n            name: function.name.clone(),\n            params: function.params.clone(),\n            body,\n        },\n        stats,\n    )\n}\n\n/// Optimize a standalone REL statement body such as a Route method, Service\n/// lifecycle hook, or class method. This shares the exact same conservative\n/// semantics as function optimization without manufacturing a fake callable.\npub fn optimize_statements(body: &[Statement]) -> (Vec<Statement>, RelOptimizationStats) {\n    let mut stats = RelOptimizationStats::default();\n    let mut constants = BTreeMap::new();\n    let body = optimize_block(body, &mut constants, &mut stats);\n    let (body, _) = remove_dead_stores(body, BTreeSet::new(), &mut stats);\n    (body, stats)\n}''',
+          )
+
+          discovery = Path("crates/route-engine/src/rel_symbol_discovery.rs")
+          text = discovery.read_text()
+          old = "use crate::modules::binding_name;\n"
+          if text.count(old) != 1:
+              raise SystemExit("rel_symbol_discovery optimizer import anchor changed")
+          text = text.replace(
+              old,
+              old + "use crate::rel_optimizer::{optimize_function, optimize_statements};\n",
+              1,
+          )
+          old = "body: method.body.clone(),"
+          if text.count(old) != 2:
+              raise SystemExit(f"expected two method-body graph anchors, found {text.count(old)}")
+          text = text.replace(old, "body: optimize_statements(&method.body).0,")
+          old = "body: lifecycle.body.clone(),"
+          if text.count(old) != 1:
+              raise SystemExit("lifecycle graph anchor changed")
+          text = text.replace(old, "body: optimize_statements(&lifecycle.body).0,", 1)
+          old = "body: function.body.clone(),"
+          if text.count(old) != 1:
+              raise SystemExit(f"function graph anchor changed: {text.count(old)}")
+          text = text.replace(old, "body: optimize_function(function).0.body,", 1)
+          discovery.write_text(text)
+
+          replace_once(
+              "crates/route-engine/src/rel_symbol_discovery.rs",
+              '''    #[test]\n    fn unused_module_exports_are_pruned_until_a_runtime_root_calls_them() {''',
+              '''    #[test]\n    fn constant_dead_branch_does_not_retain_oid_dependency() {\n        let module = ModuleFile {\n            imports: Vec::new(),\n            functions: vec![\n                function("live", vec![Statement::Return(Expr::Bool(true))]),\n                function("dead", vec![Statement::Return(Expr::Bool(false))]),\n            ],\n            exports: vec!["live".into(), "dead".into()],\n        };\n        let service = ServiceProgram {\n            imports: vec![\n                ImportTarget::CustomFunction {\n                    path: "module/math.module".into(),\n                    function: "live".into(),\n                },\n                ImportTarget::CustomFunction {\n                    path: "module/math.module".into(),\n                    function: "dead".into(),\n                },\n            ],\n            functions: vec![function(\n                "run",\n                vec![Statement::If {\n                    condition: Expr::Bool(false),\n                    then_body: vec![Statement::Return(call_ident("dead"))],\n                    else_body: vec![Statement::Return(call_ident("live"))],\n                }],\n            )],\n            exports: vec!["run".into()],\n            class_name: None,\n            lifecycle: Vec::new(),\n            classes: Vec::new(),\n        };\n        let discovery = discover_linked_rel_symbols(&[\n            LinkedRelSourceUnit::module("math", "module", &module),\n            LinkedRelSourceUnit::service("worker", "service", &service),\n        ])\n        .unwrap();\n        let by_id = discovery\n            .symbols\n            .iter()\n            .map(|symbol| (symbol.canonical_id.as_str(), symbol))\n            .collect::<BTreeMap<_, _>>();\n        assert!(by_id.contains_key("module_math_live"));\n        assert!(by_id.contains_key("service_worker_run"));\n        assert!(!by_id.contains_key("module_math_dead"));\n        assert_eq!(\n            by_id["service_worker_run"].required_symbols,\n            BTreeSet::from(["module_math_live".into()])\n        );\n    }\n\n    #[test]\n    fn unused_module_exports_are_pruned_until_a_runtime_root_calls_them() {''',
+          )
+          PY
+
+      - name: Format Phase 6 reachability files
+        run: |
+          rustfmt --edition 2021 \
+            crates/route-engine/src/rel_optimizer.rs \
+            crates/route-engine/src/rel_symbol_discovery.rs
+
+      - name: Check route-engine
+        run: cargo check -p route-engine --all-targets --locked
+
+      - name: Clippy route-engine
+        run: cargo clippy -p route-engine --all-targets --locked -- -D warnings
+
+      - name: Test optimizer
+        run: cargo test -p route-engine rel_optimizer --locked
+
+      - name: Test optimized reachability
+        run: cargo test -p route-engine constant_dead_branch_does_not_retain_oid_dependency --locked
+
+      - name: Test native lowering regression
+        run: cargo test -p route-engine rel_native_lowering --locked
+
+      - name: Publish validated optimized reachability
+        run: |
+          git -C .. diff --check
+          git -C .. config user.name "Kate"
+          git -C .. config user.email "dhwanksh2000@gmail.com"
+          git -C .. rm .github/workflows/one-shot-phase6-reachability-check.yml
+          git -C .. add \
+            engine/crates/route-engine/src/rel_optimizer.rs \
+            engine/crates/route-engine/src/rel_symbol_discovery.rs
+          git -C .. commit -m "FEAT | SVC-NATIVE-605 prune optimized dead OID dependencies"
+          git -C .. reset --hard HEAD
+          git -C .. fetch origin main
+          git -C .. rebase origin/main
+          git -C .. push origin HEAD:main
