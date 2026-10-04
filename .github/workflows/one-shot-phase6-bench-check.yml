@@ -48,6 +48,10 @@ jobs:
               '',
           ])
           text = text[:start] + replacement + text[end:]
+          text = text.replace(
+              '        return line.split_whitespace().nth(1)?.parse().ok();',
+              '        line.split_whitespace().nth(1)?.parse().ok()',
+          )
           path.write_text(text)
           PY
       - name: Format benchmark harness
