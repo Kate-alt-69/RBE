@@ -41,9 +41,9 @@ if body.count(old_helper) != 1:
 body = body.replace('from pathlib import Path\n', 'from pathlib import Path\nimport re\n', 1)
 body = body.replace(old_helper, new_helper, 1)
 
-# The original v2 body used fill_bytes in vault-process but its import patch was
-# lost during earlier staging retries. Ensure the generated source imports the
-# trait before rustfmt/cargo are invoked.
+# New AEAD helpers call `fill_bytes` outside the legacy token function, so the
+# RngCore trait must be imported at module scope (the old local import is not
+# enough).
 rustfmt_marker = '\nrustfmt --edition 2021 '
 if rustfmt_marker not in body:
     raise SystemExit('could not locate rustfmt boundary in v2 staging body')
@@ -52,11 +52,12 @@ python3 - <<'PY'
 from pathlib import Path
 p = Path('vault-process/src/lib.rs')
 text = p.read_text()
-if 'use rand::RngCore;' not in text:
-    anchor = 'use aes_gcm::{Aes256Gcm, Key, Nonce};\n'
+anchor = 'use aes_gcm::{Aes256Gcm, Key, Nonce};\n'
+module_import = anchor + 'use rand::RngCore;\n'
+if module_import not in text:
     if anchor not in text:
         raise SystemExit('vault-process: AES-GCM import anchor missing')
-    text = text.replace(anchor, anchor + 'use rand::RngCore;\n', 1)
+    text = text.replace(anchor, module_import, 1)
 p.write_text(text)
 PY
 '''
