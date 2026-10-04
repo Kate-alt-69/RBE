@@ -13,6 +13,11 @@ mod er_recovery;
 // both binaries share this crate.
 #[path = "error_code_book_core.rs"]
 mod error_code_book;
+#[path = "package_links/approval.rs"]
+pub(crate) mod package_approval;
+mod package_links {
+    pub(crate) use crate::package_approval as approval;
+}
 mod service_boot;
 mod service_control;
 #[allow(dead_code, clippy::too_many_arguments)]
