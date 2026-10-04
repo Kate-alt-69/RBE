@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipc_protocol::container_task_image::{cti_sha256, ContainerTaskImage, CtiHeaderV1, CtiSection};
 

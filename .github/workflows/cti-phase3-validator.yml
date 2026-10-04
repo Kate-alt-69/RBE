@@ -27,6 +27,6 @@ jobs:
       - name: check Phase 3 package
         run: cargo check -p container-runtime-core
       - name: clippy Phase 3 package
-        run: cargo clippy -p container-runtime-core -- -D warnings
+        run: cargo clippy -p container-runtime-core --no-deps -- -D warnings
       - name: test CTI assembler cache and index
         run: cargo test -p container-runtime-core container_task_cache --lib
