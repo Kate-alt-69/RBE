@@ -66,3 +66,21 @@ if old not in text:
     raise SystemExit("benchmark Mother spawn anchor missing")
 text = text.replace(old, new, 1)
 bench.write_text(text)
+
+catalog = Path("engine/crates/backend/src/service_package_catalog.rs")
+text = catalog.read_text()
+anchor = "use service_runtime::ServiceCatalog;\n\n"
+replacement = '''use service_runtime::ServiceCatalog;
+
+#[path = "package_links/approval.rs"]
+mod package_approval;
+
+'''
+if anchor not in text:
+    raise SystemExit("service package approval import anchor missing")
+text = text.replace(anchor, replacement, 1)
+old = "crate::package_links::approval::approved_runtime_capabilities("
+if old not in text:
+    raise SystemExit("service package approval call anchor missing")
+text = text.replace(old, "package_approval::approved_runtime_capabilities(", 1)
+catalog.write_text(text)
