@@ -1,5 +1,4 @@
-#[path = "package_links/approval.rs"]
-pub(crate) mod approval;
+pub(crate) use crate::package_approval as approval;
 #[path = "package_links/crypto.rs"]
 pub(crate) mod crypto;
 #[path = "package_links/host.rs"]
