@@ -112,3 +112,20 @@ if old not in text:
     raise SystemExit("service package approval call anchor missing")
 text = text.replace(old, "crate::package_approval::approved_runtime_capabilities(", 1)
 catalog.write_text(text)
+
+terminal = Path("engine/crates/logging/src/terminal.rs")
+text = terminal.read_text()
+old = '''            .json()
+            .flatten_event(true)
+            .with_filter(suppression_filter);'''
+new = '''            .json()
+            .flatten_event(true)
+            // stdout is reserved for machine-readable child-process protocols
+            // such as Service Mother/worker readiness frames. JSON logs must
+            // stay on stderr just like pretty logs or they can corrupt IPC.
+            .with_writer(std::io::stderr)
+            .with_filter(suppression_filter);'''
+if old not in text:
+    raise SystemExit("JSON logging writer anchor missing")
+text = text.replace(old, new, 1)
+terminal.write_text(text)
