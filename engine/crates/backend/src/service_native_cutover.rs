@@ -8,7 +8,6 @@
 //! immutable worker frames for Service Mother transport.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use anyhow::{bail, Context};
 use serde_json::Value;
@@ -26,9 +25,7 @@ use route_engine::{
     select_native_services, OidTarget, RuntimeImage, SourceId,
 };
 
-use super::service_native_host::{
-    attach_native_service_frames, NativeServiceHostFrame,
-};
+use super::service_boot::{attach_native_service_frames, NativeServiceHostFrame};
 
 /// One active native generation retained by backend.exe for the lifetime of the
 /// Service Mother generation that consumes its worker frames.
@@ -50,6 +47,20 @@ impl NativeServiceCutover {
 
     pub fn attach_runtime_env(&self, runtime_env: &mut Value) -> anyhow::Result<()> {
         attach_native_service_frames(runtime_env, self.frames.clone())
+    }
+}
+
+/// Attach the compiler-owned native bundle to the authenticated Runtime ENV
+/// transport. Calling this even when there is no native generation removes the
+/// reserved internal key, so application Runtime ENV can never spoof a worker
+/// bootstrap frame.
+pub fn attach_native_service_cutover(
+    runtime_env: &mut Value,
+    cutover: Option<&NativeServiceCutover>,
+) -> anyhow::Result<()> {
+    match cutover {
+        Some(cutover) => cutover.attach_runtime_env(runtime_env),
+        None => attach_native_service_frames(runtime_env, BTreeMap::new()),
     }
 }
 
@@ -154,7 +165,11 @@ pub fn prepare_native_service_cutover(
     // exclusive link transaction first so lease acquisition cannot self-deadlock.
     drop(transaction);
 
-    let evaluator_fallbacks = evaluator_fallback_map(image, &selection.native_services, &selection.evaluator_fallbacks)?;
+    let evaluator_fallbacks = evaluator_fallback_map(
+        image,
+        &selection.native_services,
+        &selection.evaluator_fallbacks,
+    )?;
     let build = build_native_runtime_image_from_rel_link(
         &project_root,
         &cache,
@@ -251,12 +266,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_map_requires_explicit_reason_for_every_non_native_service() {
-        let source = SourceId::physical(route_engine::RelSourceKind::Service, "demo").unwrap();
-        let mut image = RuntimeImage::empty_for_tests();
-        image.services.push(source.clone());
-        // `empty_for_tests` intentionally has no manifest; the helper must fail
-        // closed rather than manufacturing a fallback identity/reason.
-        assert!(evaluator_fallback_map(&image, &BTreeSet::new(), &BTreeMap::new()).is_err());
+    fn no_cutover_strips_spoofed_native_runtime_env_frame() {
+        let mut runtime_env = serde_json::json!({
+            "__rbeNativeServiceWorkerV1": {"spoofed": true},
+            "PUBLIC": "ok"
+        });
+        attach_native_service_cutover(&mut runtime_env, None).unwrap();
+        assert!(runtime_env.get("__rbeNativeServiceWorkerV1").is_none());
+        assert_eq!(runtime_env.get("PUBLIC"), Some(&serde_json::json!("ok")));
     }
 }

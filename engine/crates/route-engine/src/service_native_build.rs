@@ -239,8 +239,7 @@ impl NativeRuntimeImageActivation {
         }
 
         let exports = worker_bootstrap_entries(source_id, "export", &built.launch.exports)?;
-        let lifecycle =
-            worker_bootstrap_entries(source_id, "lifecycle", &built.launch.lifecycle)?;
+        let lifecycle = worker_bootstrap_entries(source_id, "lifecycle", &built.launch.lifecycle)?;
 
         Ok(NativeServiceWorkerBootstrap {
             protocol: NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL.to_string(),

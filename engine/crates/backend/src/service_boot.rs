@@ -9,6 +9,9 @@ mod service_native_host;
 #[path = "service_package_catalog.rs"]
 mod service_package_catalog;
 
+#[allow(unused_imports)]
+pub(crate) use service_native_host::{attach_native_service_frames, NativeServiceHostFrame};
+
 pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let value = |flag: &str| {
         args.windows(2)
@@ -85,7 +88,9 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     };
     let native_frame =
         service_native_host::take_native_service_frame(&mut runtime_env_snapshot, &service_name)?;
-    let runtime_env = Arc::new(route_engine::RuntimeEnv::from_snapshot(runtime_env_snapshot)?);
+    let runtime_env = Arc::new(route_engine::RuntimeEnv::from_snapshot(
+        runtime_env_snapshot,
+    )?);
     let defaults = ServiceDefaults {
         memory_limit_mb: config.services.default_memory_limit_mb,
         startup_timeout_ms: config.services.startup_timeout_ms,

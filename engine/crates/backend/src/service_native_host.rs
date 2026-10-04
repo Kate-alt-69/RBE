@@ -17,7 +17,7 @@ use service_runtime::{
     ServiceExecutionError, ServiceExecutor, ServiceLifecycle, ServiceMemory, ServiceMode,
     ServiceRequest, ServiceResponse,
 };
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use route_engine::service_native_build::NativeServiceWorkerBootstrap;
@@ -125,8 +125,9 @@ pub fn take_native_service_frame(
     let Some(raw_bundle) = object.remove(NATIVE_SERVICE_RUNTIME_ENV_KEY) else {
         return Ok(None);
     };
-    let mut bundle: BTreeMap<String, NativeServiceHostFrame> = serde_json::from_value(raw_bundle)
-        .map_err(|error| anyhow::anyhow!("decode native Service bootstrap bundle: {error}"))?;
+    let mut bundle: BTreeMap<String, NativeServiceHostFrame> =
+        serde_json::from_value(raw_bundle)
+            .map_err(|error| anyhow::anyhow!("decode native Service bootstrap bundle: {error}"))?;
     let frame = bundle.remove(expected_service_name);
     if let Some(frame) = frame.as_ref() {
         frame.validate(expected_service_name)?;
@@ -262,7 +263,11 @@ pub async fn run_native_service_host(
         let (read, mut write) = stream.into_split();
         let line = match tokio::time::timeout(
             SERVICE_IPC_TIMEOUT,
-            read_bounded_line(read, SERVICE_IPC_REQUEST_MAX_BYTES, "native service request"),
+            read_bounded_line(
+                read,
+                SERVICE_IPC_REQUEST_MAX_BYTES,
+                "native service request",
+            ),
         )
         .await
         {
@@ -678,7 +683,8 @@ mod tests {
     fn native_transport_is_removed_before_runtime_env_exposure() {
         let source_id = SourceId::physical(RelSourceKind::Service, "demo").unwrap();
         let bootstrap = NativeServiceWorkerBootstrap {
-            protocol: route_engine::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL.to_string(),
+            protocol: route_engine::service_native_build::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL
+                .to_string(),
             runtime_image_id: "image-a".into(),
             source_id: source_id.as_str().to_string(),
             oid_index_generation: 7,
@@ -703,11 +709,8 @@ mod tests {
             bootstrap,
         );
         let mut runtime_env = serde_json::json!({"VISIBLE": "yes"});
-        attach_native_service_frames(
-            &mut runtime_env,
-            BTreeMap::from([("demo".into(), frame)]),
-        )
-        .unwrap();
+        attach_native_service_frames(&mut runtime_env, BTreeMap::from([("demo".into(), frame)]))
+            .unwrap();
         let decoded = take_native_service_frame(&mut runtime_env, "demo")
             .unwrap()
             .unwrap();
@@ -719,7 +722,8 @@ mod tests {
     fn native_frame_rejects_supervised_name_drift() {
         let source_id = SourceId::physical(RelSourceKind::Service, "demo").unwrap();
         let bootstrap = NativeServiceWorkerBootstrap {
-            protocol: route_engine::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL.to_string(),
+            protocol: route_engine::service_native_build::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL
+                .to_string(),
             runtime_image_id: "image-a".into(),
             source_id: source_id.as_str().to_string(),
             oid_index_generation: 7,

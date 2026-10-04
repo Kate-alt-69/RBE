@@ -30,6 +30,7 @@ mod service_boot;
 mod service_control;
 #[allow(dead_code, clippy::too_many_arguments)]
 mod service_mother;
+mod service_native_cutover;
 mod vault_recovery;
 
 mod service_integrity {
@@ -626,6 +627,17 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     let runtime_image = runtime_image_boot::compile(&config, service_catalog.as_ref())?;
     runtime_image_boot::apply_server_policy(&mut config, &runtime_image.server_policy)?;
     runtime_image_boot::apply_middleware_plan(&mut config, &runtime_image.middleware_plan)?;
+    let native_service_cutover = service_native_cutover::prepare_native_service_cutover(
+        &runtime_image,
+        service_catalog.as_ref(),
+    )?;
+    if let Some(cutover) = native_service_cutover.as_ref() {
+        tracing::info!(
+            image = %runtime_image.image_id,
+            native_services = cutover.native_service_count(),
+            "native Service Runtime Image generation prepared"
+        );
+    }
     let runtime_image = Arc::new(route_engine::RuntimeImageSlot::new(runtime_image));
     let config = Arc::new(config);
     boot_trace(format!(
@@ -750,7 +762,12 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         },
     );
 
-    let service_runtime_env = Arc::new(runtime_image.snapshot().environment.to_json());
+    let mut service_runtime_env = runtime_image.snapshot().environment.to_json();
+    service_native_cutover::attach_native_service_cutover(
+        &mut service_runtime_env,
+        native_service_cutover.as_ref(),
+    )?;
+    let service_runtime_env = Arc::new(service_runtime_env);
     let service_mother = match service_catalog.as_ref() {
         Some(catalog) => Some(
             service_mother::spawn(

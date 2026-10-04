@@ -398,10 +398,7 @@ impl NativeServiceExecutor {
     }
 
     pub const fn platform_supported() -> bool {
-        cfg!(all(
-            target_arch = "x86_64",
-            any(unix, windows)
-        ))
+        cfg!(all(target_arch = "x86_64", any(unix, windows)))
     }
 
     fn call_export(&self, function: &str) -> Result<Value, ServiceExecutionError> {
@@ -862,7 +859,9 @@ mod tests {
         .unwrap();
         assert_eq!(verified.runtime_image_id(), "image-b");
         assert_eq!(verified.source_id(), &fixture.source_id);
-        assert_eq!(verified.payload(), &[0xC3, 0xC3]);
+        assert_eq!(&verified.payload()[..2], &[0xC3, 0xC3]);
+        assert_eq!(verified.payload().len() % 8, 0);
+        assert!(verified.payload()[2..].iter().all(|byte| *byte == 0));
         assert_eq!(
             verified.export("run").unwrap().entry_offset,
             usize::try_from(fixture.export_offset).unwrap()
@@ -903,12 +902,20 @@ mod tests {
     #[test]
     fn rejects_out_of_bounds_dispatch_offset() {
         let mut fixture = fixture();
+        let payload_len = verify_native_service_worker_bootstrap(
+            fixture.bootstrap.clone(),
+            "image-b",
+            &fixture.source_id,
+        )
+        .unwrap()
+        .payload()
+        .len();
         fixture
             .bootstrap
             .lifecycle
             .get_mut("start")
             .unwrap()
-            .entry_offset = u64::try_from(fixture.bootstrap.exports.len() + 2).unwrap();
+            .entry_offset = u64::try_from(payload_len).unwrap();
         let error = verify_native_service_worker_bootstrap(
             fixture.bootstrap.clone(),
             "image-b",
