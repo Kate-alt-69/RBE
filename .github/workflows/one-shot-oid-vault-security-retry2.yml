@@ -1,0 +1,118 @@
+name: One-shot OID Vault security retry2
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-oid-vault-security-retry2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  retry-secure-oid-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Run corrected OID Vault security staging body
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          source = Path('.github/workflows/one-shot-oid-vault-security-v2.yml').read_text()
+          marker = '        run: |\n'
+          if source.count(marker) != 1:
+              raise SystemExit('could not uniquely locate v2 staging run block')
+          body = textwrap.dedent(source.split(marker, 1)[1])
+
+          old = """replace_once(
+              'vault-process/src/lib.rs',
+              '''    token: String,
+              seq: u64,
+          ''',
+              '''    token: String,
+              ipc_key: [u8; 32],
+              seq: u64,
+          '''
+          )"""
+          new = """replace_once(
+              'vault-process/src/lib.rs',
+              '''struct Connection {
+              child: Child,
+              stdin: ChildStdin,
+              reader: BufReader<std::process::ChildStdout>,
+              token: String,
+              seq: u64,
+          ''',
+              '''struct Connection {
+              child: Child,
+              stdin: ChildStdin,
+              reader: BufReader<std::process::ChildStdout>,
+              token: String,
+              ipc_key: [u8; 32],
+              seq: u64,
+          '''
+          )"""
+          if body.count(old) != 1:
+              raise SystemExit(f'expected one ambiguous Connection patch in v2 body, found {body.count(old)}')
+          body = body.replace(old, new, 1)
+
+          start_marker = """replace_once(
+              'vault-process/src/lib.rs',
+              '''            ClientCommand::Set {"""
+          end_marker = """replace_once(
+              'vault-process/src/lib.rs',
+              '''    fn ensure_live_connection"""
+          start = body.find(start_marker)
+          end = body.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'could not isolate stale ClientCommand::Set patch: start={start} end={end}')
+          robust = """replace_once(
+              'vault-process/src/lib.rs',
+              '''                if failed {
+                      self.recover_if_process_failed(\"credential-set\");
+                  }
+              }
+          	}
+          	fn request(''',
+              '''                if failed {
+                      self.recover_if_process_failed(\"credential-set\");
+                  }
+              }
+              ClientCommand::Internal {
+                  op,
+                  namespace,
+                  payload,
+                  response,
+              } => {
+                  self.last_operation = Some(\"internal-oid\");
+                  if let Err(err) = self.ensure_live_connection(\"internal-oid\") {
+                      let _ = response.send(Err(err));
+                      return;
+                  }
+                  let result = self.request_internal(&op, &namespace, payload);
+                  let failed = result.is_err();
+                  let _ = response.send(result);
+                  if failed {
+                      self.recover_if_process_failed(\"internal-oid\");
+                  }
+              }
+          	}
+          	fn request('''
+          )
+          """
+          # Build the same tail patch with spaces, not tabs, after Python string construction.
+          robust = robust.replace('\t', '    ')
+          body = body[:start] + robust + body[end:]
+
+          Path('/tmp/run-oid-vault-v2.sh').write_text(body)
+          PY
+          bash /tmp/run-oid-vault-v2.sh
