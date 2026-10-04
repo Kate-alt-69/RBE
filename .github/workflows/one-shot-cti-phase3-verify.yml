@@ -18,6 +18,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
+      - name: Remove stale Phase 3 import
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('engine/crates/route-engine/src/container_task_assembly.rs')
+          source = path.read_text(encoding='utf-8')
+          before = '    ContainerTaskAssembler, ContainerTaskAssemblyInput, ContainerTaskIndex,\n'
+          after = '    ContainerTaskAssembler, ContainerTaskAssemblyInput,\n'
+          if before not in source:
+              raise SystemExit('expected stale ContainerTaskIndex import was not found')
+          path.write_text(source.replace(before, after, 1), encoding='utf-8')
+          PY
       - name: Format Phase 3 surface
         run: |
           rustfmt --edition 2021 \
