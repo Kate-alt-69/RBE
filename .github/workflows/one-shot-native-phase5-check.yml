@@ -159,4 +159,6 @@ jobs:
             engine/crates/backend/src/service_native_cutover.rs \
             engine/crates/backend/src/main.rs
           git -C .. commit -m "FEAT | SVC-NATIVE-530 activate native Service workers"
+          git -C .. fetch origin main
+          git -C .. rebase origin/main
           git -C .. push origin HEAD:main
