@@ -129,6 +129,7 @@ mod terminal;
 
 pub mod archive;
 pub mod cache;
+pub mod container_task_assembly;
 pub mod middleware_plan;
 pub mod oid_cache_bootstrap;
 pub mod oid_index_bridge;
@@ -172,6 +173,10 @@ pub use archive::{ArchiveFormat, ArchivePath, ArchivePlan, ArchivePlanError, Arc
 pub use ast::{
     BinaryOp, Expr, FieldBinding, FieldBindingMode, FieldDirective, FieldFile, FieldValueType,
     FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram, Statement, Value,
+};
+pub use container_task_assembly::{
+    assemble_container_task_cache, ContainerTaskArtifact, ContainerTaskAssemblyError,
+    ContainerTaskAssemblyReport,
 };
 pub use dependency_graph::{SymbolDependencyGraph, SymbolId};
 pub use discovery::RouteCache;
