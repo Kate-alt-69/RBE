@@ -39,27 +39,23 @@ jobs:
                   raise SystemExit(f"{path}: expected exactly one patch anchor, found {count}: {old[:80]!r}")
               file.write_text(text.replace(old, new, 1))
 
-          # Publish the two fixes already proven in the scratch compile.
-          replace_once(
-              "crates/backend/src/service_native_host.rs",
-              "AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader",
-              "AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader",
-          )
-          replace_once(
-              "crates/backend/src/service_native_host.rs",
-              "route_engine::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL",
-              "route_engine::service_native_build::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL",
-          )
+          host = Path("crates/backend/src/service_native_host.rs")
+          text = host.read_text()
+          old = "AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader"
+          if text.count(old) != 1:
+              raise SystemExit("service native host AsyncReadExt anchor changed")
+          text = text.replace(old, "AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader", 1)
+          old = "route_engine::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL"
+          if text.count(old) != 2:
+              raise SystemExit(f"service native host bootstrap protocol anchors changed: {text.count(old)}")
+          text = text.replace(old, "route_engine::service_native_build::NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL")
+          host.write_text(text)
 
-          # service_native_host is intentionally a child of service_boot in both
-          # backend.exe and service.exe. Re-export only the parent-side frame API
-          # instead of compiling the host module twice.
           replace_once(
               "crates/backend/src/service_boot.rs",
               '#[path = "service_package_catalog.rs"]\nmod service_package_catalog;\n',
               '#[path = "service_package_catalog.rs"]\nmod service_package_catalog;\n\npub(crate) use service_native_host::{attach_native_service_frames, NativeServiceHostFrame};\n',
           )
-
           replace_once(
               "crates/backend/src/service_native_cutover.rs",
               "use super::service_native_host::{\n    attach_native_service_frames, NativeServiceHostFrame,\n};",
@@ -71,9 +67,6 @@ jobs:
               '''}\n\n/// Attach the compiler-owned native bundle to the authenticated Runtime ENV\n/// transport. Calling this even when there is no native generation removes the\n/// reserved internal key, so application Runtime ENV can never spoof a worker\n/// bootstrap frame.\npub fn attach_native_service_cutover(\n    runtime_env: &mut Value,\n    cutover: Option<&NativeServiceCutover>,\n) -> anyhow::Result<()> {\n    match cutover {\n        Some(cutover) => cutover.attach_runtime_env(runtime_env),\n        None => attach_native_service_frames(runtime_env, BTreeMap::new()),\n    }\n}\n\n/// Build the native Service generation for one already-compiled Runtime Image.''',
           )
 
-          # The encoded Service bin intentionally includes aligned zero padding.
-          # Tests should assert semantic bytes + canonical padding, not the old
-          # pre-alignment payload length.
           replace_once(
               "crates/route-engine/src/service_native_worker.rs",
               '        assert_eq!(verified.payload(), &[0xC3, 0xC3]);',
@@ -85,8 +78,6 @@ jobs:
               '''        let payload_len = verify_native_service_worker_bootstrap(\n            fixture.bootstrap.clone(),\n            "image-b",\n            &fixture.source_id,\n        )\n        .unwrap()\n        .payload()\n        .len();\n        fixture\n            .bootstrap\n            .lifecycle\n            .get_mut("start")\n            .unwrap()\n            .entry_offset = u64::try_from(payload_len).unwrap();''',
           )
 
-          # Import the backend-owned cutover and prepare Image B before the
-          # RuntimeImageSlot becomes the serving image.
           replace_once(
               "crates/backend/src/main.rs",
               '''#[allow(dead_code)]\nmod service_boot;\n#[allow(dead_code)]\nmod service_control;''',
@@ -103,10 +94,7 @@ jobs:
               '''    let mut service_runtime_env = runtime_image.snapshot().environment.to_json();\n    service_native_cutover::attach_native_service_cutover(\n        &mut service_runtime_env,\n        native_service_cutover.as_ref(),\n    )?;\n    let service_runtime_env = Arc::new(service_runtime_env);\n    let service_mother = match service_catalog.as_ref() {''',
           )
 
-          # Parallel package-Service staging currently reaches a backend-only
-          # approval helper from service.exe. That boundary is unrelated to this
-          # Phase-5 cutover; disable package Service admission only inside this
-          # disposable validation checkout. This file is reverted before commit.
+          # Validation-only isolation for the unrelated package-Service boundary.
           package_catalog = Path("crates/backend/src/service_package_catalog.rs")
           text = package_catalog.read_text()
           pattern = re.compile(
