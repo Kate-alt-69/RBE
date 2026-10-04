@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use ipc_protocol::{
-    ContainerTaskImage, CtiEventClass, CtiLogLevel, CtiSectionKind, TaskEvent,
-    TaskEventDescriptor, TaskEventDictionary, TaskEventError, CTI_LOG_ABI_VERSION,
+    ContainerTaskImage, CtiEventClass, CtiLogLevel, CtiSectionKind, TaskEvent, TaskEventDescriptor,
+    TaskEventDictionary, TaskEventError, CTI_LOG_ABI_VERSION,
 };
 
 use crate::container_task_loader::LoadedTaskImage;
@@ -47,10 +47,8 @@ impl TaskEventRenderer {
         let dictionary = decode_log_events(required_section(image, CtiSectionKind::LogEvents)?)?;
         let files = decode_source_files(required_section(image, CtiSectionKind::SourceFiles)?)?;
         let sites = decode_source_map(required_section(image, CtiSectionKind::SourceMap)?, &files)?;
-        let error_sites = decode_error_sites(
-            required_section(image, CtiSectionKind::ErrorSites)?,
-            &sites,
-        )?;
+        let error_sites =
+            decode_error_sites(required_section(image, CtiSectionKind::ErrorSites)?, &sites)?;
         Ok(Self {
             dictionary,
             sites,
@@ -221,15 +219,18 @@ fn decode_source_map(
         let source_id = reader.string()?;
         let symbol = reader.string()?;
         if site_id == 0 || line == 0 || column == 0 {
-            return Err(invalid("SOURCE_MAP site, line and column IDs must be non-zero"));
+            return Err(invalid(
+                "SOURCE_MAP site, line and column IDs must be non-zero",
+            ));
         }
         if source_id.is_empty() || symbol.is_empty() {
             return Err(invalid("SOURCE_MAP source and symbol must be non-empty"));
         }
-        let path = files
-            .get(&file_id)
-            .cloned()
-            .ok_or_else(|| invalid(format!("site {site_id} references unknown file ID {file_id}")))?;
+        let path = files.get(&file_id).cloned().ok_or_else(|| {
+            invalid(format!(
+                "site {site_id} references unknown file ID {file_id}"
+            ))
+        })?;
         let location = TaskSourceLocation {
             site_id,
             file_id,

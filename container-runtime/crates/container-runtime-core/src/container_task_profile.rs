@@ -18,9 +18,7 @@ const LATENCY_BUCKET_MS: [u64; 16] = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000,
 ];
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TaskProfileKey {
     pub runtime_image_sha256: [u8; 32],
     pub task_oid: u16,
@@ -105,8 +103,7 @@ impl TaskExecutionProfile {
             .position(|upper| sample.elapsed_ms <= *upper)
         {
             Some(index) => {
-                self.latency_histogram[index] =
-                    self.latency_histogram[index].saturating_add(1);
+                self.latency_histogram[index] = self.latency_histogram[index].saturating_add(1);
             }
             None => self.latency_overflow = self.latency_overflow.saturating_add(1),
         }
@@ -222,11 +219,7 @@ impl TaskExecutionProfileStore {
         }
     }
 
-    pub fn record(
-        &self,
-        key: TaskProfileKey,
-        sample: TaskExecutionSample,
-    ) -> TaskExecutionProfile {
+    pub fn record(&self, key: TaskProfileKey, sample: TaskExecutionSample) -> TaskExecutionProfile {
         let profile = {
             let mut profiles = self.lock_profiles();
             let profile = profiles.entry(key).or_default();
@@ -392,7 +385,11 @@ mod tests {
     fn corrupt_persistent_profile_is_ignored_and_does_not_block_recording() {
         let root = temp_root("corrupt");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(format!("{}-31844.json", "aa".repeat(32))), b"{broken").unwrap();
+        fs::write(
+            root.join(format!("{}-31844.json", "aa".repeat(32))),
+            b"{broken",
+        )
+        .unwrap();
 
         let store = TaskExecutionProfileStore::new(&root);
         assert!(store.profiles().is_empty());

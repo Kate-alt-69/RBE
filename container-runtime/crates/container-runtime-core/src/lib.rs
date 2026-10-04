@@ -33,9 +33,7 @@ pub use container_task_cache::{
     ContainerTaskCacheCommit, ContainerTaskIndex, ContainerTaskIndexEntry, ContainerTaskIndexKey,
     CONTAINER_TASK_INDEX_MAGIC, CONTAINER_TASK_INDEX_VERSION, CTI_COMPILER_ABI_VERSION,
 };
-pub use container_task_diagnostics::{
-    TaskDiagnosticError, TaskEventRenderer, TaskSourceLocation,
-};
+pub use container_task_diagnostics::{TaskDiagnosticError, TaskEventRenderer, TaskSourceLocation};
 pub use container_task_loader::{
     ContainerTaskLoadError, ContainerTaskLoader, LoadedTaskImage, RuntimeImageTaskRegistry,
     RuntimeImageTaskTable,
