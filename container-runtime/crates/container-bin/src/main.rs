@@ -20,8 +20,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use container_runtime_core::{
-    artifact_sha256_matches, CapabilityBroker, EnvironmentId, EnvironmentProfile,
-    EnvironmentRegistry, ExecutionProvenance, Runtime, RuntimeConfig, WorkCost,
+    artifact_sha256_matches, CapabilityBroker, ContainerTaskLoadError, ContainerTaskLoader,
+    EnvironmentId, EnvironmentProfile, EnvironmentRegistry, ExecutionProvenance, LoadedTaskImage,
+    Runtime, RuntimeConfig, RuntimeImageTaskRegistry, WorkCost,
 };
 use execution_engine::{CapabilityHost, ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
@@ -163,6 +164,8 @@ fn main() -> anyhow::Result<()> {
             ));
         }
     };
+    let task_loader = Arc::new(ContainerTaskLoader::new(project_root.join(".cache")));
+    let task_registry = Arc::new(RuntimeImageTaskRegistry::new());
     let environment_processes = environment_process::EnvironmentProcessSupervisor::start(
         general_environments,
         debug,
@@ -228,6 +231,8 @@ fn main() -> anyhow::Result<()> {
             runtime.clone(),
             accepting,
             capability_broker,
+            task_loader,
+            task_registry,
             environment_processes,
         )?;
     } else if !debug {
@@ -556,12 +561,15 @@ fn bounded_worker_error(message: &str) -> String {
     format!("{}…", &message[..end])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_control_server(
     address: &str,
     token: String,
     runtime: Arc<Runtime>,
     accepting: Arc<AtomicBool>,
     capability_broker: Arc<CapabilityBroker>,
+    task_loader: Arc<ContainerTaskLoader>,
+    task_registry: Arc<RuntimeImageTaskRegistry>,
     environment_processes: Arc<environment_process::EnvironmentProcessSupervisor>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
@@ -577,6 +585,8 @@ fn run_control_server(
                 let runtime = Arc::clone(&runtime);
                 let accepting = Arc::clone(&accepting);
                 let capability_broker = Arc::clone(&capability_broker);
+                let task_loader = Arc::clone(&task_loader);
+                let task_registry = Arc::clone(&task_registry);
                 let environment_processes = Arc::clone(&environment_processes);
                 thread::spawn(move || {
                     if let Err(err) = handle_connection(
@@ -585,6 +595,8 @@ fn run_control_server(
                         &runtime,
                         &accepting,
                         &capability_broker,
+                        &task_loader,
+                        &task_registry,
                         &environment_processes,
                     ) {
                         tracing::warn!(%err, "container control connection closed with error");
@@ -597,12 +609,43 @@ fn run_control_server(
     Ok(())
 }
 
+fn resolve_container_task(
+    task_loader: &ContainerTaskLoader,
+    task_registry: &RuntimeImageTaskRegistry,
+    runtime_image: &str,
+    task_oid: u16,
+) -> Result<Option<Arc<LoadedTaskImage>>, ContainerTaskLoadError> {
+    if let Some(task) = task_registry.lookup_hex(runtime_image, task_oid)? {
+        return Ok(Some(task));
+    }
+    let table = task_loader.load_runtime_image_hex(runtime_image)?;
+    let task = table.lookup(task_oid);
+    task_registry.install_table(table);
+    Ok(task)
+}
+
+fn task_load_error_code(error: &ContainerTaskLoadError) -> &'static str {
+    match error {
+        ContainerTaskLoadError::InvalidRuntimeImage(_) => "INVALID_RUNTIME_IMAGE",
+        ContainerTaskLoadError::RuntimeImageNotFound(_) => "TASK_IMAGE_NOT_FOUND",
+        ContainerTaskLoadError::InvalidIndex(_)
+        | ContainerTaskLoadError::Io(_)
+        | ContainerTaskLoadError::HashMismatch(_)
+        | ContainerTaskLoadError::MalformedCti(_)
+        | ContainerTaskLoadError::IdentityMismatch(_)
+        | ContainerTaskLoadError::AbiMismatch(_) => "TASK_IMAGE_INVALID",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     mut stream: TcpStream,
     token: &str,
     runtime: &Runtime,
     accepting: &AtomicBool,
     capability_broker: &CapabilityBroker,
+    task_loader: &ContainerTaskLoader,
+    task_registry: &RuntimeImageTaskRegistry,
     environment_processes: &environment_process::EnvironmentProcessSupervisor,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -766,6 +809,78 @@ fn handle_connection(
                         request_id: Some(bound_request.request_id),
                         code: error.code.into(),
                         message: error.message,
+                    },
+                }
+            }
+        }
+        Request::ExecuteTask(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else if request.input.len() > MAX_EXECUTION_INPUT_BYTES {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "EXECUTION_INPUT_TOO_LARGE".into(),
+                    message: format!("Task input exceeds {MAX_EXECUTION_INPUT_BYTES} bytes"),
+                }
+            } else if !accepting.load(Ordering::Acquire) {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "REFRESHING".into(),
+                    message: "container is draining for a supervised process refresh".into(),
+                }
+            } else if parse_environment(&request.environment)
+                .filter(|id| runtime.has_environment(*id))
+                .is_none()
+            {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "INVALID_ENVIRONMENT".into(),
+                    message: format!(
+                        "container environment is unavailable: {}",
+                        request.environment
+                    ),
+                }
+            } else {
+                match resolve_container_task(
+                    task_loader,
+                    task_registry,
+                    &request.runtime_image,
+                    request.task_oid,
+                ) {
+                    Ok(Some(task)) => {
+                        emit_event(
+                            "task_resolved",
+                            &format!(
+                                "runtime_image={} task_oid={} cti_sha256={}",
+                                request.runtime_image,
+                                request.task_oid,
+                                hex::encode(task.cti_sha256())
+                            ),
+                        );
+                        Response::TaskResolved {
+                            request_id: request.request_id,
+                            runtime_image: request.runtime_image,
+                            task_oid: request.task_oid,
+                            environment: request.environment,
+                            cti_sha256: hex::encode(task.cti_sha256()),
+                        }
+                    }
+                    Ok(None) => Response::Error {
+                        request_id: Some(request.request_id),
+                        code: "TASK_NOT_FOUND".into(),
+                        message: format!(
+                            "TaskOID {} is not present in Runtime Image {}",
+                            request.task_oid, request.runtime_image
+                        ),
+                    },
+                    Err(error) => Response::Error {
+                        request_id: Some(request.request_id),
+                        code: task_load_error_code(&error).into(),
+                        message: error.to_string(),
                     },
                 }
             }
@@ -1359,4 +1474,66 @@ fn value_after(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1].clone())
+}
+
+#[cfg(test)]
+mod execute_task_phase4_tests {
+    use super::*;
+    use container_runtime_core::{ContainerTaskAssembler, ContainerTaskAssemblyInput};
+    use ipc_protocol::{CtiSection, CtiSectionKind, CTI_SECTION_REQUIRED};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rbe-execute-task-{}-{nonce}", std::process::id()))
+    }
+
+    fn required_sections() -> Vec<CtiSection> {
+        CtiSectionKind::REQUIRED
+            .into_iter()
+            .map(|kind| CtiSection {
+                kind: kind.code(),
+                flags: CTI_SECTION_REQUIRED,
+                data: vec![kind.code() as u8],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn execute_task_resolves_cti_by_runtime_image_and_oid() {
+        let root = temp_root();
+        let runtime_image = [0xab; 32];
+        let task_oid = 31_844;
+        let assembler = ContainerTaskAssembler::new(&root);
+        let mut index = assembler.load_index().unwrap();
+        assembler
+            .assemble_and_commit(
+                &mut index,
+                ContainerTaskAssemblyInput {
+                    task_oid,
+                    capability_abi: CAPABILITY_ABI_VERSION,
+                    runtime_image_sha256: runtime_image,
+                    task_semantic_sha256: [0xcd; 32],
+                    entry_node: 0,
+                    target_id: 1,
+                    flags: 0,
+                    sections: required_sections(),
+                },
+            )
+            .unwrap();
+
+        let loader = ContainerTaskLoader::new(&root);
+        let registry = RuntimeImageTaskRegistry::new();
+        let resolved =
+            resolve_container_task(&loader, &registry, &hex::encode(runtime_image), task_oid)
+                .unwrap()
+                .expect("Task must resolve");
+        assert_eq!(resolved.task_oid(), task_oid);
+        assert_eq!(resolved.runtime_image_sha256(), runtime_image);
+        assert!(registry.lookup(&runtime_image, task_oid).is_some());
+        let _ = fs::remove_dir_all(root);
+    }
 }

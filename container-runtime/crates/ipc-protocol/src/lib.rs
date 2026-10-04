@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const CAPABILITY_ABI_VERSION: u16 = 1;
 pub const HOST_CAPABILITY_PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -145,6 +145,19 @@ pub struct ExecuteRequest {
     pub input: Vec<u8>,
 }
 
+/// Phase-4 Task addressing request. Backend supplies only immutable Runtime
+/// Image + numeric Task identity and invocation data; Controller derives all
+/// source/artifact/name metadata from its validated CTI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteTaskRequest {
+    pub request_id: String,
+    pub auth_token: String,
+    pub runtime_image: String,
+    pub task_oid: u16,
+    pub environment: String,
+    pub input: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AwaitResultRequest {
     pub request_id: String,
@@ -200,6 +213,7 @@ pub enum Request {
     RegisterArtifact(RegisterArtifactRequest),
     RegisterCapabilityManifest(RegisterCapabilityManifestRequest),
     Execute(ExecuteRequest),
+    ExecuteTask(ExecuteTaskRequest),
     AwaitResult(AwaitResultRequest),
     Cancel(CancelRequest),
     Inspect(InspectRequest),
@@ -321,6 +335,16 @@ pub enum Response {
     Accepted {
         request_id: String,
         execution_id: String,
+    },
+    /// Phase 4 stops after trusted CTI resolution. Phase 5 will turn this
+    /// resolved image into a TaskExecution and therefore may later add a
+    /// separate execution-accepted response without changing this lookup proof.
+    TaskResolved {
+        request_id: String,
+        runtime_image: String,
+        task_oid: u16,
+        environment: String,
+        cti_sha256: String,
     },
     ExecutionFinished {
         request_id: String,
@@ -863,5 +887,30 @@ mod tests {
     fn rejects_zero_length_frame() {
         let bytes = [0, 0, 0, 0];
         assert!(read_frame(&mut bytes.as_slice()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod execute_task_phase4_tests {
+    use super::*;
+
+    #[test]
+    fn execute_task_wire_identity_excludes_legacy_names() {
+        let request = Request::ExecuteTask(ExecuteTaskRequest {
+            request_id: "req-1".into(),
+            auth_token: "secret".into(),
+            runtime_image: "ab".repeat(32),
+            task_oid: 31_844,
+            environment: "general-1".into(),
+            input: b"payload".to_vec(),
+        });
+        let value = serde_json::to_value(request).unwrap();
+        let encoded = value.to_string();
+        assert!(encoded.contains("ExecuteTask"));
+        assert!(encoded.contains("task_oid"));
+        assert!(!encoded.contains("source_id"));
+        assert!(!encoded.contains("artifact_hash"));
+        assert!(!encoded.contains("service_name"));
+        assert!(!encoded.contains("function_name"));
     }
 }

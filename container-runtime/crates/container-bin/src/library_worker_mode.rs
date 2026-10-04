@@ -21,7 +21,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     }
     if args.iter().any(|arg| arg == "--library-worker-live-child") {
         let cgroup_path = required_cgroup_path(args)?;
-        return run_library_worker_proxy_live_child(&cgroup_path).map_err(Into::into);
+        return run_library_worker_proxy_live_child(&cgroup_path);
     }
     if args.iter().any(|arg| arg == "--live") {
         return run_live_parent(args);
@@ -49,7 +49,7 @@ fn run_parent(args: &[String]) -> anyhow::Result<LibraryWorkerProxyResult> {
 fn run_live_parent(args: &[String]) -> anyhow::Result<()> {
     let bootstrap = read_bootstrap()?;
     let cgroup_root = cgroup_root(args)?;
-    run_live_library_worker_proxy(bootstrap, cgroup_root).map_err(Into::into)
+    run_live_library_worker_proxy(bootstrap, cgroup_root)
 }
 
 fn read_bootstrap() -> anyhow::Result<ipc_protocol::LibraryWorkerProxyBootstrap> {
