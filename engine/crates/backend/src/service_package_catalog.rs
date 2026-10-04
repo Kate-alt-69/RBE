@@ -110,16 +110,13 @@ pub fn stage_if_needed(
         .context("load verified RPX roots before package Service discovery")?;
     let mut packages = Vec::new();
     for snapshot in snapshots {
-        let approved = crate::package_links::approval::approved_runtime_capabilities(
-            &project_root,
-            &snapshot,
-        )
-        .with_context(|| {
-            format!(
-                "load package Service approval for verified root {:?}",
-                snapshot.package
-            )
-        })?;
+        let approved = crate::package_approval::approved_runtime_capabilities(&project_root, &snapshot)
+            .with_context(|| {
+                format!(
+                    "load package Service approval for verified root {:?}",
+                    snapshot.package
+                )
+            })?;
         if !approved
             .iter()
             .any(|capability| capability == PACKAGE_SERVICE_CAPABILITY)
