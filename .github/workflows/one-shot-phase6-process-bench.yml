@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - .github/workflows/one-shot-phase6-process-bench.yml
+      - .github/scripts/phase6_process_bench_patch.py
 
 permissions:
   contents: write
@@ -29,8 +30,8 @@ jobs:
 
       - name: Format Phase 6 process benchmark files
         run: |
-          rustfmt --edition 2021 crates/backend/src/main.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs
-          rustfmt --edition 2021 --check crates/backend/src/main.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs
+          rustfmt --edition 2021 crates/backend/src/main.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs crates/backend/src/service_package_catalog.rs
+          rustfmt --edition 2021 --check crates/backend/src/main.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs crates/backend/src/service_package_catalog.rs
 
       - name: Check backend targets
         run: cargo check -p backend --all-targets --locked
@@ -79,7 +80,7 @@ jobs:
           set -euo pipefail
           git config user.name "Kate"
           git config user.email "dhwanksh2000@gmail.com"
-          git add engine/crates/backend/src/main.rs engine/crates/backend/src/service_mother.rs engine/crates/backend/src/service_native_bench.rs
+          git add engine/crates/backend/src/main.rs engine/crates/backend/src/service_mother.rs engine/crates/backend/src/service_native_bench.rs engine/crates/backend/src/service_package_catalog.rs
           git rm .github/workflows/one-shot-phase6-process-bench.yml .github/scripts/phase6_process_bench_patch.py
           git commit -m "FEAT | SVC-NATIVE-611 benchmark native Service process path"
           git reset --hard HEAD
