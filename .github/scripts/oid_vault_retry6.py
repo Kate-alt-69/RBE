@@ -80,19 +80,19 @@ p.write_text(text)
 
 p = Path('engine/crates/route-engine/src/oid_security.rs')
 text = p.read_text()
-lock_anchor = '''        let lease = OpenOptions::new()
+lock_anchor = """        let lease = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(&lock_path)?;
-'''
-lock_fixed = '''        let lease = OpenOptions::new()
+"""
+lock_fixed = """        let lease = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
             .open(&lock_path)?;
-'''
+"""
 if lock_fixed not in text:
     if lock_anchor not in text:
         raise SystemExit('oid_security: lock OpenOptions anchor missing')
