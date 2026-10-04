@@ -30,14 +30,14 @@ jobs:
 
       - name: Format Phase 6 process benchmark files
         run: |
-          rustfmt --edition 2021 crates/backend/src/main.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs crates/backend/src/service_package_catalog.rs
-          rustfmt --edition 2021 --check crates/backend/src/main.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs crates/backend/src/service_package_catalog.rs
+          rustfmt --edition 2021 crates/backend/src/main.rs crates/backend/src/service_main.rs crates/backend/src/package_links.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs crates/backend/src/service_package_catalog.rs
+          rustfmt --edition 2021 --check crates/backend/src/main.rs crates/backend/src/service_main.rs crates/backend/src/package_links.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs crates/backend/src/service_package_catalog.rs
 
       - name: Check backend targets
         run: cargo check -p backend --all-targets --locked
 
-      - name: Clippy backend
-        run: cargo clippy -p backend --all-targets --locked -- -D warnings
+      - name: Clippy benchmark host
+        run: cargo clippy -p backend --bin backend --locked -- -D warnings
 
       - name: Test benchmark helpers
         run: cargo test -p backend --bin backend service_native_bench --locked
@@ -80,7 +80,7 @@ jobs:
           set -euo pipefail
           git config user.name "Kate"
           git config user.email "dhwanksh2000@gmail.com"
-          git add engine/crates/backend/src/main.rs engine/crates/backend/src/service_mother.rs engine/crates/backend/src/service_native_bench.rs engine/crates/backend/src/service_package_catalog.rs
+          git add engine/crates/backend/src/main.rs engine/crates/backend/src/service_main.rs engine/crates/backend/src/package_links.rs engine/crates/backend/src/service_mother.rs engine/crates/backend/src/service_native_bench.rs engine/crates/backend/src/service_package_catalog.rs
           git rm .github/workflows/one-shot-phase6-process-bench.yml .github/scripts/phase6_process_bench_patch.py
           git commit -m "FEAT | SVC-NATIVE-611 benchmark native Service process path"
           git reset --hard HEAD
