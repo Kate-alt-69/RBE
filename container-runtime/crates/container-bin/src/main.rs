@@ -7,6 +7,7 @@
 
 mod dashboard;
 mod environment_process;
+mod library_worker_mode;
 
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -57,8 +58,19 @@ pub(crate) fn monitor_log_path() -> PathBuf {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
     let args = env::args().skip(1).collect::<Vec<_>>();
+
+    // Library Host execution is a Container mode, not a second packaged binary.
+    // Dispatch before normal Container initialization so stdout remains reserved
+    // for the strict Library Worker protocol frames.
+    if args.iter().any(|arg| arg == "--library-worker-proxy")
+        || args.iter().any(|arg| arg == "--library-worker-exec-child")
+        || args.iter().any(|arg| arg == "--library-worker-live-child")
+    {
+        return library_worker_mode::run(&args);
+    }
+
+    tracing_subscriber::fmt::init();
 
     if args.iter().any(|arg| arg == "--environment-child") {
         return environment_process::run_environment_child();

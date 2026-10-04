@@ -10,21 +10,24 @@ use ipc_protocol::{
     LibraryWorkerProxyResult, MAX_LIBRARY_WORKER_PROXY_ERROR_BYTES,
 };
 
-fn main() -> anyhow::Result<()> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+/// Run Container's internal Library Host execution mode.
+///
+/// The public artifact remains `container`; this mode is entered only through
+/// `container --library-worker-proxy` (or one of its private child flags).
+pub fn run(args: &[String]) -> anyhow::Result<()> {
     if args.iter().any(|arg| arg == "--library-worker-exec-child") {
-        let cgroup_path = required_cgroup_path(&args)?;
+        let cgroup_path = required_cgroup_path(args)?;
         return run_library_worker_proxy_exec_child(&cgroup_path).map_err(Into::into);
     }
     if args.iter().any(|arg| arg == "--library-worker-live-child") {
-        let cgroup_path = required_cgroup_path(&args)?;
+        let cgroup_path = required_cgroup_path(args)?;
         return run_library_worker_proxy_live_child(&cgroup_path).map_err(Into::into);
     }
     if args.iter().any(|arg| arg == "--live") {
-        return run_live_parent(&args);
+        return run_live_parent(args);
     }
 
-    let result = match run_parent(&args) {
+    let result = match run_parent(args) {
         Ok(result) => result,
         Err(error) => LibraryWorkerProxyResult::Error {
             code: "proxy_execution_failed".into(),

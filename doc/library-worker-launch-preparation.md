@@ -123,7 +123,7 @@ The secure live Container proxy already exists and establishes the Linux sandbox
 PreparedLibraryWorkerLaunch
         |
         v
-verified packaged container-library-worker-proxy --live
+verified packaged `container --library-worker-proxy` --live
         |
         v
 library.proxy.ready

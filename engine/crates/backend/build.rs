@@ -1,9 +1,10 @@
 //! Build-time integrity binding for the standalone Container dependencies.
 //!
-//! The combined build compiles both `container-bin` and the dedicated
-//! `container-library-worker-proxy` first, then passes their exact outputs
-//! through `RBE_CONTAINER_BIN_PATH` and `RBE_LIBRARY_WORKER_PROXY_BIN_PATH`.
-//! This build script SHA-256 hashes and signs those exact bytes together with
+//! The combined build compiles the Container artifact first and passes its
+//! exact output through `RBE_CONTAINER_BIN_PATH`. Library Host execution is an
+//! internal `container --library-worker-proxy` mode, so no second executable or
+//! second integrity binding exists. This build script SHA-256 hashes and signs
+//! those exact Container bytes together with
 //! the Git/build identifier and target triple.
 //!
 //! Runtime startup never trusts editable sidecar integrity files and does not
@@ -19,7 +20,6 @@ use sha2::{Digest, Sha256};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_BIN_PATH");
-    println!("cargo:rerun-if-env-changed=RBE_LIBRARY_WORKER_PROXY_BIN_PATH");
     println!("cargo:rerun-if-env-changed=RBE_SERVICE_BIN_PATH");
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_SIGNING_PRIVATE_KEY");
     println!("cargo:rerun-if-env-changed=RBE_BUILD_ID");
@@ -28,12 +28,8 @@ fn main() {
     let out_dir =
         std::env::var("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts");
     let integrity_dest = Path::new(&out_dir).join("container_integrity.rs");
-    let proxy_integrity_dest = Path::new(&out_dir).join("library_worker_proxy_integrity.rs");
     let service_integrity_dest = Path::new(&out_dir).join("service_integrity.rs");
     let source = std::env::var("RBE_CONTAINER_BIN_PATH")
-        .ok()
-        .map(PathBuf::from);
-    let proxy_source = std::env::var("RBE_LIBRARY_WORKER_PROXY_BIN_PATH")
         .ok()
         .map(PathBuf::from);
     let service_source = std::env::var("RBE_SERVICE_BIN_PATH")
@@ -45,7 +41,7 @@ fn main() {
         panic!("backend/build.rs: RBE build ID contains control characters");
     }
 
-    let signing_key = if source.is_some() || proxy_source.is_some() {
+    let signing_key = if source.is_some() {
         Some(load_signing_key())
     } else {
         None
@@ -55,14 +51,6 @@ fn main() {
         source,
         "container binary",
         "RBE-CONTAINER-INTEGRITY-V1",
-        signing_key.as_ref(),
-        &build_id,
-        &target,
-    );
-    let (expected_proxy_hash, proxy_public_key, proxy_signature) = signed_artifact(
-        proxy_source,
-        "Library Worker Proxy binary",
-        "RBE-LIBRARY-WORKER-PROXY-INTEGRITY-V1",
         signing_key.as_ref(),
         &build_id,
         &target,
@@ -110,19 +98,6 @@ fn main() {
     );
     fs::write(&integrity_dest, source_literal).unwrap_or_else(|err| {
         panic!("backend/build.rs: failed to write generated container integrity source: {err}")
-    });
-
-    let proxy_literal = format!(
-        "pub const EXPECTED_LIBRARY_WORKER_PROXY_SHA256: &str = \"{expected_proxy_hash}\";\n\
-         pub const LIBRARY_WORKER_PROXY_BUILD_ID: &str = \"{build_id}\";\n\
-         pub const LIBRARY_WORKER_PROXY_TARGET: &str = \"{target}\";\n\
-         pub const LIBRARY_WORKER_PROXY_PUBLIC_KEY_HEX: &str = \"{proxy_public_key}\";\n\
-         pub const LIBRARY_WORKER_PROXY_SIGNATURE_HEX: &str = \"{proxy_signature}\";\n"
-    );
-    fs::write(&proxy_integrity_dest, proxy_literal).unwrap_or_else(|err| {
-        panic!(
-            "backend/build.rs: failed to write generated Library Worker Proxy integrity source: {err}"
-        )
     });
 }
 

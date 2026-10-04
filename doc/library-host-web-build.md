@@ -77,7 +77,7 @@ External workers never receive raw Backend router pointers or mutable internal m
 
 ## 3. Container Library Worker Proxy
 
-`container-library-worker-proxy` is the trusted process boundary used for verified external library workers on the currently supported Unix/Linux path.
+`container --library-worker-proxy` is the trusted process boundary used for verified external library workers on the currently supported Unix/Linux path.
 
 Before executing the worker, the proxy verifies the bootstrap and launch inputs again. The executor then applies the Container sandbox with the following properties:
 

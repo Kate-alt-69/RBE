@@ -11,6 +11,8 @@ This directory is the authoritative user-facing documentation for the current RB
 - [`relc.md`](relc.md) — the implemented RELC compilation/link pipeline and Runtime Image format.
 - [`linux-builds.md`](linux-builds.md) — Linux build prerequisites, `--check-tools`, corrupt rustup cache detection/recovery, deployment-host guidance, and the build-tool CI contract.
 - [`library-system.md`](library-system.md) — external libraries and the current project package/install architecture, including `package.rbe.yaml`, lockfile activation, managed `rbe.sys.*` tools, package attestation, durable install sessions, and controlled dependency hydration.
+- [`library-host.md`](library-host.md) — Library Host purpose, trust boundary, and the internal `container --library-worker-proxy` execution mode.
+- [`oid-compiler-cache.md`](oid-compiler-cache.md) — OID address space, one-index layout, RPX bindings, native Service assembly, diagnostics, and Vault-attested cache security.
 - [`library-host-web-build.md`](library-host-web-build.md) — verified Library Host worker launch, sealed launch proofs, Container worker proxy/sandbox behavior, managed Bun/npm web builds, and the required authority boundary for external multi-instance build coordinators.
 - [`../project-package/README.md`](../project-package/README.md) — concise project package state, cache layout, lockfile activation boundary, and build-dependency cache locations.
 - [`../install-executor/README.md`](../install-executor/README.md) — package acquisition/build execution security contracts, managed tool boundary, dependency hydration rules, receipts, and offline build transition.
@@ -88,7 +90,7 @@ package.lock.rbe.yaml.next
 atomic lockfile swap = graph activation
 ```
 
-The base package/install contracts remain documented in [`library-system.md`](library-system.md). Verified Library Host launch and managed web-build execution now have an implemented path through the current sealed worker proof + Container proxy/sandbox work; external product schedulers/preview queues remain separate coordination systems and do not become package trust authority. See [`library-host-web-build.md`](library-host-web-build.md) for the current boundary.
+The base package/install contracts remain documented in [`library-system.md`](library-system.md). Verified Library Host launch and managed web-build execution now have an implemented path through the current sealed worker proof + Container Library Host mode/sandbox work; external product schedulers/preview queues remain separate coordination systems and do not become package trust authority. See [`library-host-web-build.md`](library-host-web-build.md) for the current boundary.
 
 ## Documentation rules
 
@@ -118,5 +120,5 @@ The base package/install contracts remain documented in [`library-system.md`](li
 - **Project package lock** — `package.lock.rbe.yaml`, the exact resolved package graph and activation boundary.
 - **RBE system runtime** — an internal managed tool such as `rbe.sys.python`, `rbe.sys.nodejs`, `rbe.sys.bunjs`, or `rbe.sys.rust`; it is not a PATH/global installation.
 - **Hydration receipt** — `hydration.rbe.json`, evidence that dependency hydration used the pinned lock, managed tool, bounded policy, and restricted network contract before the package build transitioned back to network-dead execution.
-- **Library Worker Proxy** — the trusted Container-side proxy that re-verifies sealed library worker launch inputs, establishes the bounded sandbox, and emits proxy readiness before Library Protocol traffic begins.
+- **Container Library Host mode** — the internal `container --library-worker-proxy` path that re-verifies sealed library worker launch inputs and establishes the bounded sandbox. `LibraryWorkerProxy*` remains the internal IPC protocol naming; there is no separate packaged proxy executable.
 - **External build coordinator** — a host/application scheduler that may queue/lease build attempts but does not gain RBE package/runtime/source trust authority.

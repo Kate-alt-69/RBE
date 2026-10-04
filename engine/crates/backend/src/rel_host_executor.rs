@@ -6,7 +6,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ipc_protocol::{
     read_library_worker_proxy_result, write_library_worker_proxy_bootstrap,
     LibraryWorkerProxyBootstrap, LibraryWorkerProxyResult, LibraryWorkerProxySourceFile,
@@ -26,18 +25,11 @@ use uuid::Uuid;
 
 const MAX_SCRIPT_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SCRIPT_SOURCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const PROXY_GRACE_SECONDS: u64 = 5;
-
-mod proxy_integrity {
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/library_worker_proxy_integrity.rs"
-    ));
-}
+const LIBRARY_HOST_GRACE_SECONDS: u64 = 5;
 
 pub struct BackendRelHostExecutor {
     project_root: PathBuf,
-    proxy_path: PathBuf,
+    container_path: PathBuf,
     cgroup_root: Option<PathBuf>,
 }
 
@@ -55,8 +47,8 @@ impl BackendRelHostExecutor {
             );
         }
         ensure_no_symlink_components(project_root)?;
-        let proxy_path = packaged_proxy_path()?;
-        verify_proxy(&proxy_path)?;
+        let container_path = super::ContainerProcess::packaged_path()?;
+        super::verify_container(&container_path)?;
         let cgroup_root = std::env::var_os("RBE_CONTAINER_CGROUP_ROOT")
             .map(PathBuf::from)
             .or_else(|| {
@@ -65,7 +57,7 @@ impl BackendRelHostExecutor {
             });
         Ok(Self {
             project_root: project_root.to_path_buf(),
-            proxy_path,
+            container_path,
             cgroup_root,
         })
     }
@@ -159,10 +151,10 @@ impl BackendRelHostExecutor {
         .map_err(|error| {
             rel_error(
                 "REL2215",
-                format!("could not seal Container proxy bootstrap: {error}"),
+                format!("could not seal Container Library Host bootstrap: {error}"),
             )
         })?;
-        let output = self.run_proxy(bootstrap).await?;
+        let output = self.run_library_host(bootstrap).await?;
         Ok(output.into_rel_value())
     }
 
@@ -210,16 +202,14 @@ impl BackendRelHostExecutor {
         }
     }
 
-    async fn run_proxy(
+    async fn run_library_host(
         &self,
         bootstrap: LibraryWorkerProxyBootstrap,
     ) -> Result<RelHostOutput, ModuleEvalError> {
-        verify_proxy(&self.proxy_path).map_err(|error| {
+        super::verify_container(&self.container_path).map_err(|error| {
             rel_error(
                 "REL2214",
-                format!(
-                    "packaged Container Library Worker Proxy failed integrity verification: {error}"
-                ),
+                format!("packaged Container failed integrity verification before Library Host execution: {error}"),
             )
         })?;
         let cgroup_root = self.cgroup_root.as_ref().ok_or_else(|| {
@@ -242,8 +232,9 @@ impl BackendRelHostExecutor {
         write_library_worker_proxy_bootstrap(&mut bootstrap_bytes, &bootstrap)
             .map_err(|error| rel_error("REL2215", format!("invalid proxy bootstrap: {error}")))?;
 
-        let mut command = Command::new(&self.proxy_path);
+        let mut command = Command::new(&self.container_path);
         command
+            .arg("--library-worker-proxy")
             .arg("--cgroup-root")
             .arg(cgroup_root)
             .current_dir(&self.project_root)
@@ -255,23 +246,25 @@ impl BackendRelHostExecutor {
         let mut child = command.spawn().map_err(|error| {
             rel_error(
                 "REL2215",
-                format!("could not spawn verified Container Library Worker Proxy: {error}"),
+                format!("could not spawn verified Container Library Host mode: {error}"),
             )
         })?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| rel_error("REL2215", "Container proxy stdin pipe was not created"))?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            rel_error(
+                "REL2215",
+                "Container Library Host stdin pipe was not created",
+            )
+        })?;
         stdin.write_all(&bootstrap_bytes).await.map_err(|error| {
             rel_error(
                 "REL2215",
-                format!("could not write Container proxy bootstrap: {error}"),
+                format!("could not write Container Library Host bootstrap: {error}"),
             )
         })?;
         stdin.shutdown().await.map_err(|error| {
             rel_error(
                 "REL2215",
-                format!("could not close Container proxy bootstrap pipe: {error}"),
+                format!("could not close Container Library Host bootstrap pipe: {error}"),
             )
         })?;
         drop(stdin);
@@ -279,18 +272,21 @@ impl BackendRelHostExecutor {
         let outer_timeout = Duration::from_secs(
             bootstrap
                 .startup_timeout_seconds
-                .saturating_add(PROXY_GRACE_SECONDS),
+                .saturating_add(LIBRARY_HOST_GRACE_SECONDS),
         );
         let output = timeout(outer_timeout, child.wait_with_output())
             .await
             .map_err(|_| {
                 rel_error(
                     "REL2215",
-                    "Container proxy exceeded its bounded outer timeout",
+                    "Container Library Host mode exceeded its bounded outer timeout",
                 )
             })?
             .map_err(|error| {
-                rel_error("REL2215", format!("Container proxy wait failed: {error}"))
+                rel_error(
+                    "REL2215",
+                    format!("Container Library Host wait failed: {error}"),
+                )
             })?;
 
         let result = read_library_worker_proxy_result(&mut Cursor::new(output.stdout)).map_err(
@@ -299,7 +295,7 @@ impl BackendRelHostExecutor {
                 rel_error(
                     "REL2215",
                     format!(
-                        "Container proxy returned an invalid result frame: {error}; proxy stderr: {proxy_stderr}"
+                        "Container Library Host returned an invalid result frame: {error}; Container stderr: {proxy_stderr}"
                     ),
                 )
             },
@@ -317,7 +313,7 @@ impl BackendRelHostExecutor {
                 if !cgroup_enforced {
                     return Err(rel_error(
                         "REL2212",
-                        "Container proxy completed without cgroup enforcement; refusing the result",
+                        "Container Library Host completed without cgroup enforcement; refusing the result",
                     ));
                 }
                 let mut stderr_text = String::from_utf8_lossy(&stderr).into_owned();
@@ -342,7 +338,7 @@ impl BackendRelHostExecutor {
             }
             LibraryWorkerProxyResult::Error { code, message } => Err(rel_error(
                 "REL2215",
-                format!("Container proxy rejected script execution ({code}): {message}"),
+                format!("Container Library Host rejected script execution ({code}): {message}"),
             )),
         }
     }
@@ -611,62 +607,6 @@ fn utf8_path(label: &str, path: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("{label} path is not valid UTF-8: {}", path.display()))
 }
 
-fn packaged_proxy_path() -> anyhow::Result<PathBuf> {
-    let executable = std::env::current_exe()?;
-    let root = executable
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("backend executable has no parent directory"))?;
-    let name = if cfg!(windows) {
-        "container-library-worker-proxy.exe"
-    } else {
-        "container-library-worker-proxy"
-    };
-    Ok(root.join("dep").join(name))
-}
-
-fn verify_proxy(binary: &Path) -> anyhow::Result<()> {
-    if proxy_integrity::EXPECTED_LIBRARY_WORKER_PROXY_SHA256.is_empty()
-        || proxy_integrity::LIBRARY_WORKER_PROXY_PUBLIC_KEY_HEX.is_empty()
-        || proxy_integrity::LIBRARY_WORKER_PROXY_SIGNATURE_HEX.is_empty()
-    {
-        anyhow::bail!("Library Worker Proxy integrity metadata is absent from this backend build");
-    }
-    let metadata = fs::symlink_metadata(binary)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        anyhow::bail!(
-            "Library Worker Proxy is not a regular non-symlink file: {}",
-            binary.display()
-        );
-    }
-    let actual = sha256_file(binary)?;
-    if !constant_time_eq(
-        actual.as_bytes(),
-        proxy_integrity::EXPECTED_LIBRARY_WORKER_PROXY_SHA256.as_bytes(),
-    ) {
-        anyhow::bail!(
-            "Library Worker Proxy SHA-256 mismatch: expected {}, got {}",
-            proxy_integrity::EXPECTED_LIBRARY_WORKER_PROXY_SHA256,
-            actual
-        );
-    }
-    let public_key = VerifyingKey::from_bytes(&decode_exact::<32>(
-        proxy_integrity::LIBRARY_WORKER_PROXY_PUBLIC_KEY_HEX,
-        "Library Worker Proxy public key",
-    )?)?;
-    let signature = Signature::from_bytes(&decode_exact::<64>(
-        proxy_integrity::LIBRARY_WORKER_PROXY_SIGNATURE_HEX,
-        "Library Worker Proxy signature",
-    )?);
-    let statement = format!(
-        "RBE-LIBRARY-WORKER-PROXY-INTEGRITY-V1\nsha256={}\nbuild_id={}\ntarget={}\n",
-        proxy_integrity::EXPECTED_LIBRARY_WORKER_PROXY_SHA256,
-        proxy_integrity::LIBRARY_WORKER_PROXY_BUILD_ID,
-        proxy_integrity::LIBRARY_WORKER_PROXY_TARGET,
-    );
-    public_key.verify(statement.as_bytes(), &signature)?;
-    Ok(())
-}
-
 fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -679,25 +619,6 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
-}
-
-fn decode_exact<const N: usize>(hex_value: &str, label: &str) -> anyhow::Result<[u8; N]> {
-    let bytes =
-        hex::decode(hex_value).map_err(|error| anyhow::anyhow!("invalid {label}: {error}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid {label}: expected {N} bytes"))
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (left, right) in left.iter().zip(right.iter()) {
-        diff |= left ^ right;
-    }
-    diff == 0
 }
 
 fn ensure_no_symlink_components(path: &Path) -> anyhow::Result<()> {

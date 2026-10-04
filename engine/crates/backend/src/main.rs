@@ -42,20 +42,25 @@ mod service_integrity {
 
 static BACKEND_LOGGING_READY: AtomicBool = AtomicBool::new(false);
 
-fn has_rbe_error_code(details: &str) -> bool {
-    details.lines().any(|line| {
-        let Some(token) = line.split_whitespace().next() else {
-            return false;
-        };
-        token.len() == 7
-            && token.starts_with("RBE")
-            && token.as_bytes()[3..].iter().all(u8::is_ascii_digit)
-    })
+fn is_error_book_code(raw: &str) -> bool {
+    let token = raw.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    let digit_start = token
+        .find(|ch: char| ch.is_ascii_digit())
+        .unwrap_or(token.len());
+    let (namespace, digits) = token.split_at(digit_start);
+    (2..=8).contains(&namespace.len())
+        && namespace.chars().all(|ch| ch.is_ascii_uppercase())
+        && digits.len() == 4
+        && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn has_error_book_code(details: &str) -> bool {
+    details.split_whitespace().any(is_error_book_code)
 }
 
 fn render_backend_boot_fatal(error: &anyhow::Error) -> String {
     let details = format!("{error:#}");
-    if has_rbe_error_code(&details) {
+    if has_error_book_code(&details) {
         details
     } else {
         format!(
@@ -1507,7 +1512,7 @@ mod critical_process_supervision_tests {
 
 #[cfg(test)]
 mod backend_boot_diagnostic_tests {
-    use super::{has_rbe_error_code, render_backend_boot_fatal};
+    use super::{has_error_book_code, render_backend_boot_fatal};
 
     #[test]
     fn backend_boot_fatal_preserves_specific_rbe_codes() {
@@ -1517,7 +1522,7 @@ mod backend_boot_diagnostic_tests {
         let rendered = render_backend_boot_fatal(&error);
         assert!(rendered.starts_with("RBE5001 "));
         assert!(!rendered.contains("RBE5099"));
-        assert!(has_rbe_error_code(&rendered));
+        assert!(has_error_book_code(&rendered));
     }
 
     #[test]
@@ -1528,5 +1533,24 @@ mod backend_boot_diagnostic_tests {
         assert!(rendered.contains("synthetic backend startup failure"));
         assert!(rendered
             .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5099"));
+    }
+}
+
+#[cfg(test)]
+mod boot_error_classification_tests {
+    use super::*;
+
+    #[test]
+    fn classified_rel_boot_error_is_not_wrapped_as_rbe5099() {
+        let error = anyhow::anyhow!("REL2216 trusted REL host executor could not be installed");
+        let rendered = render_backend_boot_fatal(&error);
+        assert!(rendered.starts_with("REL2216 "));
+        assert!(!rendered.contains("RBE5099"));
+    }
+
+    #[test]
+    fn unknown_boot_error_still_gets_rbe5099() {
+        let error = anyhow::anyhow!("synthetic unknown boot failure");
+        assert!(render_backend_boot_fatal(&error).starts_with("RBE5099 "));
     }
 }
