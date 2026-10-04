@@ -169,11 +169,7 @@ fn validate_linked_rel_oid_capacity(
     discovery: &LinkedRelDiscovery,
     container_task_count: usize,
 ) -> Result<(), OidCapacityError> {
-    let requested = discovery
-        .symbols
-        .len()
-        .checked_add(container_task_count)
-        .unwrap_or(usize::MAX);
+    let requested = discovery.symbols.len().saturating_add(container_task_count);
     let capacity = oid_capacity(OID_REL_START, OID_REL_END);
     if requested <= capacity {
         return Ok(());

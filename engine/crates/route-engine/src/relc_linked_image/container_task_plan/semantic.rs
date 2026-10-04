@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ast::{BinaryOp, Expr, Statement};
 use crate::oid_link::LinkedRelKind;
-use crate::rel_symbol_discovery::LinkedRelSymbolSpec;
+use crate::oid_link::LinkedRelSymbolSpec;
 use crate::runtime_image::{RuntimeCapabilityRequirement, RuntimeExecutable, RuntimeImage};
 use crate::source_registry::SourceId;
 use crate::SymbolId;

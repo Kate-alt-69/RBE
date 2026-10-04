@@ -13,7 +13,8 @@ use std::fmt;
 
 use core_lib::{CtiNodeKind, TaskEventDictionary, CONTAINER_CAPABILITY_ABI_VERSION};
 
-use crate::rel_symbol_discovery::{LinkedRelDiscovery, LinkedRelSymbolSpec};
+use crate::oid_link::LinkedRelSymbolSpec;
+use crate::rel_symbol_discovery::LinkedRelDiscovery;
 use crate::relc::PhysicalRelSource;
 use crate::runtime_image::{RuntimeCapabilityRequirement, RuntimeExecutable, RuntimeImage};
 use crate::source_registry::SourceId;

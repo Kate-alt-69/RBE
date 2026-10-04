@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use core_lib::CtiNodeKind;
 
 use crate::ast::ImportTarget;
-use crate::rel_symbol_discovery::LinkedRelSymbolSpec;
+use crate::oid_link::LinkedRelSymbolSpec;
 use crate::runtime_image::{RuntimeCapabilityRequirement, RuntimeExecutable, RuntimeImage};
 use crate::source_registry::{RelSourceKind, SourceId};
 use crate::SymbolId;
