@@ -54,6 +54,26 @@ preflight_repairs = r'''
 python3 - <<'PY'
 from pathlib import Path
 
+p = Path('vault/src/lib.rs')
+text = p.read_text()
+old = """        let backend = if cfg!(any(target_os = \"windows\", target_os = \"macos\")) {
+            Backend::Keyring { service_name }
+        } else if probe_keyring(&service_name) {
+            Backend::Keyring { service_name }
+        } else {
+"""
+new = """        let backend = if cfg!(any(target_os = \"windows\", target_os = \"macos\"))
+            || probe_keyring(&service_name)
+        {
+            Backend::Keyring { service_name }
+        } else {
+"""
+if new not in text:
+    if old not in text:
+        raise SystemExit('vault: backend selection anchor missing')
+    text = text.replace(old, new, 1)
+p.write_text(text)
+
 p = Path('vault-process/src/lib.rs')
 text = p.read_text()
 anchor = 'use aes_gcm::{Aes256Gcm, Key, Nonce};\n'
