@@ -42,11 +42,11 @@ body = body.replace('from pathlib import Path\n', 'from pathlib import Path\nimp
 body = body.replace(old_helper, new_helper, 1)
 
 # New AEAD helpers call `fill_bytes` outside the legacy token function, so the
-# RngCore trait must be imported at module scope (the old local import is not
-# enough). Also repair the current standalone Service baseline: the package
-# catalog needs only the shared approval reader, not the backend-only Library
-# Host package module. Finally make the OID lock OpenOptions explicit: the lock
-# file is persistent coordination state, so opening it must never truncate it.
+# RngCore trait must be imported at module scope. Keep the shared package
+# approval reader as one module per binary root: backend.exe and service.exe
+# both need it, while package_links merely re-exports the backend root module.
+# Also make the OID lock OpenOptions explicit: the persistent lock inode is
+# coordination state and must never be truncated during acquisition.
 rustfmt_marker = '\nrustfmt --edition 2021 '
 if rustfmt_marker not in body:
     raise SystemExit('could not locate rustfmt boundary in v2 staging body')
@@ -64,18 +64,44 @@ if module_import not in text:
     text = text.replace(anchor, module_import, 1)
 p.write_text(text)
 
+p = Path('engine/crates/backend/src/main.rs')
+text = p.read_text()
+anchor = 'mod port_guard;\nmod runtime_image_boot;'
+replacement = 'mod port_guard;\n#[path = "package_links/approval.rs"]\nmod package_approval;\nmod runtime_image_boot;'
+if '#[path = "package_links/approval.rs"]\nmod package_approval;' not in text:
+    if anchor not in text:
+        raise SystemExit('backend main: package approval anchor missing')
+    text = text.replace(anchor, replacement, 1)
+p.write_text(text)
+
+p = Path('engine/crates/backend/src/service_main.rs')
+text = p.read_text()
+anchor = '#[path = "error_code_book_core.rs"]\nmod error_code_book;\nmod service_boot;'
+replacement = '#[path = "error_code_book_core.rs"]\nmod error_code_book;\n#[path = "package_links/approval.rs"]\nmod package_approval;\nmod service_boot;'
+if '#[path = "package_links/approval.rs"]\nmod package_approval;' not in text:
+    if anchor not in text:
+        raise SystemExit('service main: package approval anchor missing')
+    text = text.replace(anchor, replacement, 1)
+p.write_text(text)
+
+p = Path('engine/crates/backend/src/package_links.rs')
+text = p.read_text()
+old = '#[path = "package_links/approval.rs"]\npub(crate) mod approval;'
+new = 'pub(crate) use crate::package_approval as approval;'
+if new not in text:
+    if old not in text:
+        raise SystemExit('package_links: approval module anchor missing')
+    text = text.replace(old, new, 1)
+p.write_text(text)
+
 p = Path('engine/crates/backend/src/service_package_catalog.rs')
 text = p.read_text()
-module_anchor = 'use service_runtime::ServiceCatalog;\n\n'
-module_decl = 'use service_runtime::ServiceCatalog;\n\n#[path = "package_links/approval.rs"]\nmod package_approval;\n\n'
-if '#[path = "package_links/approval.rs"]' not in text:
-    if module_anchor not in text:
-        raise SystemExit('service_package_catalog: import anchor missing')
-    text = text.replace(module_anchor, module_decl, 1)
-text = text.replace(
-    'crate::package_links::approval::approved_runtime_capabilities',
-    'package_approval::approved_runtime_capabilities',
-)
+old = 'crate::package_links::approval::approved_runtime_capabilities('
+new = 'crate::package_approval::approved_runtime_capabilities('
+if new not in text:
+    if old not in text:
+        raise SystemExit('service package catalog: approval call anchor missing')
+    text = text.replace(old, new, 1)
 p.write_text(text)
 
 p = Path('engine/crates/route-engine/src/oid_security.rs')
@@ -102,15 +128,37 @@ PY
 '''
 body = body.replace(rustfmt_marker, preflight_repairs + rustfmt_marker, 1)
 
-# Ensure the baseline repair is formatted and included in the guarded commit.
+# Format and commit the binary-root visibility repair together with the guarded
+# security source. Do not load approval.rs independently from a nested module.
 body = body.replace(
     'engine/crates/backend/src/main.rs\n',
-    'engine/crates/backend/src/main.rs \\\n    engine/crates/backend/src/service_package_catalog.rs\n',
+    'engine/crates/backend/src/main.rs \\\n    engine/crates/backend/src/service_main.rs \\\n    engine/crates/backend/src/package_links.rs \\\n    engine/crates/backend/src/service_package_catalog.rs\n',
     1,
 )
 body = body.replace(
     'engine/crates/backend/src/main.rs \\\n    engine/Cargo.lock',
-    'engine/crates/backend/src/main.rs \\\n    engine/crates/backend/src/service_package_catalog.rs \\\n    engine/Cargo.lock',
+    'engine/crates/backend/src/main.rs \\\n    engine/crates/backend/src/service_main.rs \\\n    engine/crates/backend/src/package_links.rs \\\n    engine/crates/backend/src/service_package_catalog.rs \\\n    engine/Cargo.lock',
+    1,
+)
+
+# The backend package currently has unrelated pre-existing deployment-worker
+# warnings. Its integration is still checked twice above (including --locked),
+# but -D warnings belongs to the security code being changed here rather than
+# turning this guarded OID commit into an unrelated warning-cleanup project.
+old_clippy = 'cargo clippy -p route-engine -p backend --all-targets --locked -- -D warnings'
+new_clippy = 'cargo clippy -p route-engine --all-targets --locked -- -D warnings'
+if old_clippy not in body:
+    raise SystemExit('could not locate engine clippy gate')
+body = body.replace(old_clippy, new_clippy, 1)
+
+body = body.replace(
+    'cargo test --manifest-path vault/Cargo.toml --lib\nrm -f vault/Cargo.lock',
+    'cargo test --manifest-path vault/Cargo.toml --lib\ncargo clippy --manifest-path vault/Cargo.toml --all-targets -- -D warnings\nrm -f vault/Cargo.lock',
+    1,
+)
+body = body.replace(
+    'cargo test --manifest-path vault-process/Cargo.toml --lib\nrm -f vault-process/Cargo.lock',
+    'cargo test --manifest-path vault-process/Cargo.toml --lib\ncargo clippy --manifest-path vault-process/Cargo.toml --all-targets -- -D warnings\nrm -f vault-process/Cargo.lock',
     1,
 )
 
