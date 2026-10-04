@@ -98,6 +98,16 @@ new = '''        let mother = crate::service_mother::spawn_process(
 if old not in text:
     raise SystemExit("benchmark Mother spawn anchor missing")
 text = text.replace(old, new, 1)
+old = "  memoryLimitMb = 64,"
+new = "  memoryLimitMb = 256,"
+if old not in text:
+    raise SystemExit("benchmark Service memory limit anchor missing")
+text = text.replace(old, new, 1)
+old = '            "defaultMemoryLimitMb": 64,'
+new = '            "defaultMemoryLimitMb": 256,'
+if old not in text:
+    raise SystemExit("benchmark default memory limit anchor missing")
+text = text.replace(old, new, 1)
 old = "let index = ((sorted.len() - 1) * percent + 99) / 100;"
 new = "let index = ((sorted.len() - 1) * percent).div_ceil(100);"
 if old not in text:
