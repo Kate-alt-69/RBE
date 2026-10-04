@@ -22,6 +22,9 @@ jobs:
         run: |
           rustfmt --edition 2021 \
             engine/crates/route-engine/src/container_task_assembly.rs
+      - name: Refresh engine lock for CTI dependencies
+        working-directory: engine
+        run: cargo generate-lockfile
       - name: Check route-engine
         working-directory: engine
         run: cargo check -p route-engine --locked
@@ -35,7 +38,9 @@ jobs:
         run: |
           git config user.name 'Kate'
           git config user.email 'dhwanksh2000@gmail.com'
-          git add engine/crates/route-engine/src/container_task_assembly.rs
+          git add \
+            engine/Cargo.lock \
+            engine/crates/route-engine/src/container_task_assembly.rs
           git rm .github/workflows/one-shot-cti-phase3-verify.yml
           git commit -m 'FIX | CTI-003 verify Task assembly bridge'
           git pull --rebase origin main
