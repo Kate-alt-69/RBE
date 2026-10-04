@@ -25,6 +25,36 @@ jobs:
       - name: Apply guarded Library Host refactor
         run: python3 scripts/one_shot_fold_library_host.py
 
+      - name: Finish classifier and removed-verifier cleanup
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          main = Path('engine/crates/backend/src/main.rs')
+          text = main.read_text(encoding='utf-8')
+          text = text.replace(
+              'use super::{has_rbe_error_code, render_backend_boot_fatal};',
+              'use super::{has_error_book_code, render_backend_boot_fatal};',
+          )
+          text = text.replace(
+              'assert!(has_rbe_error_code(&rendered));',
+              'assert!(has_error_book_code(&rendered));',
+          )
+          main.write_text(text, encoding='utf-8')
+
+          rel = Path('engine/crates/backend/src/rel_host_executor.rs')
+          text = rel.read_text(encoding='utf-8')
+          marker = '\nfn decode_exact<const '
+          start = text.find(marker)
+          if start >= 0:
+              next_fn = text.find('\nfn ', start + len(marker))
+              next_cfg = text.find('\n#[cfg', start + len(marker))
+              ends = [p for p in (next_fn, next_cfg) if p >= 0]
+              end = min(ends) if ends else len(text)
+              text = text[:start] + '\n' + text[end:]
+          rel.write_text(text, encoding='utf-8')
+          PY
+
       - name: Format touched Rust
         run: |
           rustfmt --edition 2021 container-runtime/crates/container-bin/src/main.rs
@@ -60,7 +90,7 @@ jobs:
 
       - name: Test backend boot error classification
         working-directory: engine
-        run: cargo test -p backend --bin backend boot_error_classification_tests
+        run: cargo test -p backend --bin backend backend_boot_diagnostic_tests && cargo test -p backend --bin backend boot_error_classification_tests
 
       - name: Commit source and documentation only
         run: |
