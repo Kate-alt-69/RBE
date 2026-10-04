@@ -19,6 +19,7 @@ use crate::ast::{
 };
 use crate::modules::binding_name;
 use crate::oid_link::{LinkedRelKind, LinkedRelSymbolSpec};
+use crate::rel_optimizer::{optimize_function, optimize_statements};
 
 /// Parsed REL roles that can participate in Phase 4 linked-symbol discovery.
 ///
@@ -319,7 +320,7 @@ pub fn discover_linked_rel_symbols(
                         .insert(
                             node.clone(),
                             Node {
-                                body: method.body.clone(),
+                                body: optimize_statements(&method.body).0,
                                 edges: BTreeSet::new(),
                             },
                         )
@@ -381,7 +382,7 @@ pub fn discover_linked_rel_symbols(
                         .insert(
                             node.clone(),
                             Node {
-                                body: lifecycle.body.clone(),
+                                body: optimize_statements(&lifecycle.body).0,
                                 edges: BTreeSet::new(),
                             },
                         )
@@ -435,7 +436,7 @@ pub fn discover_linked_rel_symbols(
                             .insert(
                                 node.clone(),
                                 Node {
-                                    body: method.body.clone(),
+                                    body: optimize_statements(&method.body).0,
                                     edges: BTreeSet::new(),
                                 },
                             )
@@ -645,7 +646,7 @@ fn declare_functions(
                 .insert(
                     node,
                     Node {
-                        body: function.body.clone(),
+                        body: optimize_function(function).0.body,
                         edges: BTreeSet::new(),
                     },
                 )
@@ -1224,6 +1225,59 @@ mod tests {
         assert!(!ids
             .iter()
             .any(|id| id.contains("helper") || id.contains("unused")));
+    }
+
+    #[test]
+    fn constant_dead_branch_does_not_retain_oid_dependency() {
+        let module = ModuleFile {
+            imports: Vec::new(),
+            functions: vec![
+                function("live", vec![Statement::Return(Expr::Bool(true))]),
+                function("dead", vec![Statement::Return(Expr::Bool(false))]),
+            ],
+            exports: vec!["live".into(), "dead".into()],
+        };
+        let service = ServiceProgram {
+            imports: vec![
+                ImportTarget::CustomFunction {
+                    path: "module/math.module".into(),
+                    function: "live".into(),
+                },
+                ImportTarget::CustomFunction {
+                    path: "module/math.module".into(),
+                    function: "dead".into(),
+                },
+            ],
+            functions: vec![function(
+                "run",
+                vec![Statement::If {
+                    condition: Expr::Bool(false),
+                    then_body: vec![Statement::Return(call_ident("dead"))],
+                    else_body: vec![Statement::Return(call_ident("live"))],
+                }],
+            )],
+            exports: vec!["run".into()],
+            class_name: None,
+            lifecycle: Vec::new(),
+            classes: Vec::new(),
+        };
+        let discovery = discover_linked_rel_symbols(&[
+            LinkedRelSourceUnit::module("math", "module", &module),
+            LinkedRelSourceUnit::service("worker", "service", &service),
+        ])
+        .unwrap();
+        let by_id = discovery
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.canonical_id.as_str(), symbol))
+            .collect::<BTreeMap<_, _>>();
+        assert!(by_id.contains_key("module_math_live"));
+        assert!(by_id.contains_key("service_worker_run"));
+        assert!(!by_id.contains_key("module_math_dead"));
+        assert_eq!(
+            by_id["service_worker_run"].required_symbols,
+            BTreeSet::from(["module_math_live".into()])
+        );
     }
 
     #[test]

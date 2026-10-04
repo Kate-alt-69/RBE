@@ -37,11 +37,7 @@ pub struct RelOptimizationStats {
 /// transactional: evaluator-backed execution can continue using the original
 /// AST while native lowering consumes the optimized form.
 pub fn optimize_function(function: &FunctionDef) -> (FunctionDef, RelOptimizationStats) {
-    let mut stats = RelOptimizationStats::default();
-    let mut constants = BTreeMap::new();
-    let body = optimize_block(&function.body, &mut constants, &mut stats);
-    let (body, _) = remove_dead_stores(body, BTreeSet::new(), &mut stats);
-
+    let (body, stats) = optimize_statements(&function.body);
     (
         FunctionDef {
             name: function.name.clone(),
@@ -50,6 +46,17 @@ pub fn optimize_function(function: &FunctionDef) -> (FunctionDef, RelOptimizatio
         },
         stats,
     )
+}
+
+/// Optimize a standalone REL statement body such as a Route method, Service
+/// lifecycle hook, or class method. This shares the exact same conservative
+/// semantics as function optimization without manufacturing a fake callable.
+pub fn optimize_statements(body: &[Statement]) -> (Vec<Statement>, RelOptimizationStats) {
+    let mut stats = RelOptimizationStats::default();
+    let mut constants = BTreeMap::new();
+    let body = optimize_block(body, &mut constants, &mut stats);
+    let (body, _) = remove_dead_stores(body, BTreeSet::new(), &mut stats);
+    (body, stats)
 }
 
 fn optimize_block(
