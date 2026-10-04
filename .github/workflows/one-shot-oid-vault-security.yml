@@ -1,0 +1,1688 @@
+name: One-shot OID Vault security
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-oid-vault-security.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  secure-oid-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Implement and validate Vault-sealed OID cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Kate"
+          git config user.email "dhwanksh2000@gmail.com"
+          git pull --rebase origin main
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f'{path}: expected exactly one anchor, found {text.count(old)}: {old[:120]!r}')
+              p.write_text(text.replace(old, new, 1))
+
+          # Vault fallback optional lookup.
+          replace_once(
+              'vault/src/file_store.rs',
+              '''    pub fn get(&self, name: &str) -> anyhow::Result<String> {
+                  let map = self.load_map()?;
+                  let entry = map
+                      .get(name)
+                      .ok_or_else(|| anyhow::anyhow!("credential {name:?} not found in fallback store"))?;
+                  self.decrypt(entry)
+              }
+''',
+              '''    pub fn get(&self, name: &str) -> anyhow::Result<String> {
+                  self.get_optional(name)?
+                      .ok_or_else(|| anyhow::anyhow!("credential {name:?} not found in fallback store"))
+              }
+
+              pub fn get_optional(&self, name: &str) -> anyhow::Result<Option<String>> {
+                  let map = self.load_map()?;
+                  map.get(name).map(|entry| self.decrypt(entry)).transpose()
+              }
+'''
+          )
+
+          # Vault gets a reserved internal namespace and AES-GCM seal/open primitives.
+          replace_once(
+              'vault/src/lib.rs',
+              '''use logging::Logger;
+          use secrecy::SecretString;
+          use zeroize::Zeroizing;
+''',
+              '''use aes_gcm::aead::{Aead, KeyInit, Payload};
+          use aes_gcm::{Aes256Gcm, Key, Nonce};
+          use logging::Logger;
+          use secrecy::SecretString;
+          use zeroize::Zeroizing;
+'''
+          )
+          replace_once(
+              'vault/src/lib.rs',
+              '''const FALLBACK_MASTER_KEY_ENV: &str = "RBE_VAULT_FALLBACK_MASTER_KEY";
+''',
+              '''const FALLBACK_MASTER_KEY_ENV: &str = "RBE_VAULT_FALLBACK_MASTER_KEY";
+          const INTERNAL_PREFIX: &str = "__rbe.internal.";
+          const INTERNAL_SEAL_MAGIC: &[u8; 8] = b"RBEVSL01";
+'''
+          )
+          replace_once(
+              'vault/src/lib.rs',
+              '''    pub fn credential(&self, name: &str, caller: &str) -> anyhow::Result<SecretString> {
+                  if !self.acl.is_allowed(name, caller) {
+''',
+              '''    pub fn credential(&self, name: &str, caller: &str) -> anyhow::Result<SecretString> {
+                  reject_reserved_credential_name(name)?;
+                  if !self.acl.is_allowed(name, caller) {
+'''
+          )
+          replace_once(
+              'vault/src/lib.rs',
+              '''    pub fn set_credential(&self, name: &str, value: &str, caller: &str) -> anyhow::Result<()> {
+                  if !self.acl.is_allowed(name, caller) {
+''',
+              '''    pub fn set_credential(&self, name: &str, value: &str, caller: &str) -> anyhow::Result<()> {
+                  reject_reserved_credential_name(name)?;
+                  if !self.acl.is_allowed(name, caller) {
+'''
+          )
+          replace_once(
+              'vault/src/lib.rs',
+              '''        Ok(())
+              }
+          }
+
+          fn probe_keyring(service_name: &str) -> bool {
+''',
+              '''        Ok(())
+              }
+
+              pub fn seal_internal(
+                  &self,
+                  namespace: &str,
+                  aad: &[u8],
+                  plaintext: &[u8],
+              ) -> anyhow::Result<Vec<u8>> {
+                  validate_internal_namespace(namespace)?;
+                  let key = self.internal_key(namespace, true)?;
+                  let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
+                  let mut nonce_bytes = [0u8; 12];
+                  rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
+                  let ciphertext = cipher
+                      .encrypt(
+                          Nonce::from_slice(&nonce_bytes),
+                          Payload { msg: plaintext, aad },
+                      )
+                      .map_err(|error| anyhow::anyhow!("Vault internal seal failed: {error}"))?;
+                  let mut out = Vec::with_capacity(INTERNAL_SEAL_MAGIC.len() + 12 + ciphertext.len());
+                  out.extend_from_slice(INTERNAL_SEAL_MAGIC);
+                  out.extend_from_slice(&nonce_bytes);
+                  out.extend_from_slice(&ciphertext);
+                  Ok(out)
+              }
+
+              pub fn open_internal(
+                  &self,
+                  namespace: &str,
+                  aad: &[u8],
+                  sealed: &[u8],
+              ) -> anyhow::Result<Vec<u8>> {
+                  validate_internal_namespace(namespace)?;
+                  if sealed.len() < INTERNAL_SEAL_MAGIC.len() + 12 + 16
+                      || &sealed[..INTERNAL_SEAL_MAGIC.len()] != INTERNAL_SEAL_MAGIC
+                  {
+                      anyhow::bail!("Vault internal sealed object has an invalid envelope");
+                  }
+                  let key = self.internal_key(namespace, false)?;
+                  let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
+                  let nonce_start = INTERNAL_SEAL_MAGIC.len();
+                  let nonce_end = nonce_start + 12;
+                  cipher
+                      .decrypt(
+                          Nonce::from_slice(&sealed[nonce_start..nonce_end]),
+                          Payload {
+                              msg: &sealed[nonce_end..],
+                              aad,
+                          },
+                      )
+                      .map_err(|error| anyhow::anyhow!(
+                          "Vault internal object authentication failed (wrong key, AAD, or tampering): {error}"
+                      ))
+              }
+
+              pub fn internal_head(&self, namespace: &str) -> anyhow::Result<Option<String>> {
+                  validate_internal_namespace(namespace)?;
+                  self.backend_get_optional(&internal_name(namespace, "head"))
+              }
+
+              pub fn set_internal_head(&self, namespace: &str, value: &str) -> anyhow::Result<()> {
+                  validate_internal_namespace(namespace)?;
+                  self.backend_set(&internal_name(namespace, "head"), value)
+              }
+
+              fn internal_key(&self, namespace: &str, create: bool) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+                  let name = internal_name(namespace, "seal-key");
+                  if let Some(value) = self.backend_get_optional(&name)? {
+                      return parse_internal_key(&value);
+                  }
+                  if !create {
+                      anyhow::bail!("Vault internal sealing key for {namespace:?} is unavailable");
+                  }
+                  let mut key = [0u8; 32];
+                  rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+                  let encoded = hex::encode(key);
+                  self.backend_set(&name, &encoded)?;
+                  Ok(Zeroizing::new(key))
+              }
+
+              fn backend_get_optional(&self, name: &str) -> anyhow::Result<Option<String>> {
+                  match &self.backend {
+                      Backend::Keyring { service_name } => {
+                          let entry = keyring::Entry::new(service_name, name)?;
+                          match entry.get_password() {
+                              Ok(value) => Ok(Some(value)),
+                              Err(keyring::Error::NoEntry) => Ok(None),
+                              Err(error) => Err(error.into()),
+                          }
+                      }
+                      Backend::File { store } => store.get_optional(name),
+                  }
+              }
+
+              fn backend_set(&self, name: &str, value: &str) -> anyhow::Result<()> {
+                  match &self.backend {
+                      Backend::Keyring { service_name } => {
+                          keyring::Entry::new(service_name, name)?.set_password(value)?;
+                          Ok(())
+                      }
+                      Backend::File { store } => store.set(name, value),
+                  }
+              }
+          }
+
+          fn reject_reserved_credential_name(name: &str) -> anyhow::Result<()> {
+              if name.starts_with(INTERNAL_PREFIX) {
+                  anyhow::bail!("reserved Vault internal credential namespace is not available to normal callers");
+              }
+              Ok(())
+          }
+
+          fn validate_internal_namespace(namespace: &str) -> anyhow::Result<()> {
+              if namespace.is_empty()
+                  || namespace.len() > 160
+                  || !namespace
+                      .bytes()
+                      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+              {
+                  anyhow::bail!("invalid Vault internal namespace {namespace:?}");
+              }
+              Ok(())
+          }
+
+          fn internal_name(namespace: &str, suffix: &str) -> String {
+              format!("{INTERNAL_PREFIX}{namespace}.{suffix}")
+          }
+
+          fn parse_internal_key(value: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+              let decoded = Zeroizing::new(hex::decode(value.trim())?);
+              let key: [u8; 32] = decoded
+                  .as_slice()
+                  .try_into()
+                  .map_err(|_| anyhow::anyhow!("Vault internal sealing key has the wrong length"))?;
+              Ok(Zeroizing::new(key))
+          }
+
+          fn probe_keyring(service_name: &str) -> bool {
+'''
+          )
+
+          # Encrypted internal Vault IPC for OID operations.
+          replace_once('vault-process/Cargo.toml', 'secrecy = "0.8"\n', 'secrecy = "0.8"\naes-gcm = "0.10"\n')
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''use secrecy::ExposeSecret;
+          use serde::{Deserialize, Serialize};
+''',
+              '''use aes_gcm::aead::{Aead, KeyInit, Payload};
+          use aes_gcm::{Aes256Gcm, Key, Nonce};
+          use secrecy::ExposeSecret;
+          use serde::{Deserialize, Serialize};
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''const MAX_RESTARTS: u32 = 5;
+''',
+              '''const MAX_RESTARTS: u32 = 5;
+          const INTERNAL_CALLER: &str = "__rbe.oid-cache";
+          const INTERNAL_IPC_PROTOCOL: &str = "RBE-VAULT-INTERNAL-IPC/1";
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''struct Ready {
+              kind: String,
+              token: String,
+          }
+''',
+              '''struct Ready {
+              kind: String,
+              token: String,
+              ipc_key: String,
+          }
+
+          #[derive(Debug, Default, Serialize, Deserialize)]
+          struct InternalPayload {
+              aad_hex: Option<String>,
+              data_hex: Option<String>,
+              text: Option<String>,
+          }
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''    Set {
+                  name: String,
+                  value: String,
+                  caller: String,
+                  response: Sender<anyhow::Result<()>>,
+              },
+              Refresh {
+''',
+              '''    Set {
+                  name: String,
+                  value: String,
+                  caller: String,
+                  response: Sender<anyhow::Result<()>>,
+              },
+              Internal {
+                  op: String,
+                  namespace: String,
+                  payload: InternalPayload,
+                  response: Sender<anyhow::Result<InternalPayload>>,
+              },
+              Refresh {
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''    pub fn refresh_process(&self) -> anyhow::Result<()> {
+''',
+              '''    pub fn seal_internal(
+                  &self,
+                  namespace: &str,
+                  aad: &[u8],
+                  plaintext: &[u8],
+              ) -> anyhow::Result<Vec<u8>> {
+                  let payload = InternalPayload {
+                      aad_hex: Some(hex::encode(aad)),
+                      data_hex: Some(hex::encode(plaintext)),
+                      text: None,
+                  };
+                  let response = self.internal("oid-seal", namespace, payload)?;
+                  hex::decode(response.data_hex.ok_or_else(|| anyhow::anyhow!("Vault seal response omitted data"))?)
+                      .map_err(anyhow::Error::from)
+              }
+
+              pub fn open_internal(
+                  &self,
+                  namespace: &str,
+                  aad: &[u8],
+                  sealed: &[u8],
+              ) -> anyhow::Result<Vec<u8>> {
+                  let payload = InternalPayload {
+                      aad_hex: Some(hex::encode(aad)),
+                      data_hex: Some(hex::encode(sealed)),
+                      text: None,
+                  };
+                  let response = self.internal("oid-open", namespace, payload)?;
+                  hex::decode(response.data_hex.ok_or_else(|| anyhow::anyhow!("Vault open response omitted data"))?)
+                      .map_err(anyhow::Error::from)
+              }
+
+              pub fn internal_head(&self, namespace: &str) -> anyhow::Result<Option<String>> {
+                  Ok(self
+                      .internal("oid-head-get", namespace, InternalPayload::default())?
+                      .text)
+              }
+
+              pub fn set_internal_head(&self, namespace: &str, head: &str) -> anyhow::Result<()> {
+                  self.internal(
+                      "oid-head-set",
+                      namespace,
+                      InternalPayload {
+                          text: Some(head.to_owned()),
+                          ..InternalPayload::default()
+                      },
+                  )?;
+                  Ok(())
+              }
+
+              fn internal(
+                  &self,
+                  op: &str,
+                  namespace: &str,
+                  payload: InternalPayload,
+              ) -> anyhow::Result<InternalPayload> {
+                  let (tx, rx) = mpsc::channel();
+                  self.tx
+                      .send(ClientCommand::Internal {
+                          op: op.to_owned(),
+                          namespace: namespace.to_owned(),
+                          payload,
+                          response: tx,
+                      })
+                      .map_err(|_| anyhow::anyhow!("Vault client worker is unavailable"))?;
+                  rx.recv()
+                      .map_err(|_| anyhow::anyhow!("Vault client worker stopped responding"))?
+              }
+
+              pub fn refresh_process(&self) -> anyhow::Result<()> {
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''    token: String,
+              seq: u64,
+''',
+              '''    token: String,
+              ipc_key: [u8; 32],
+              seq: u64,
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''            ClientCommand::Set {
+                  name,
+                  value,
+                  caller,
+                  response,
+              } => {
+                  self.last_operation = Some("credential-set");
+                  if let Err(err) = self.ensure_live_connection("client-request") {
+                      let _ = response.send(Err(err));
+                      return;
+                  }
+                  let result = self.request("set", &name, &caller, Some(value)).map(|_| ());
+                  let failed = result.is_err();
+                  let _ = response.send(result);
+                  if failed {
+                      self.recover_if_process_failed("credential-set");
+                  }
+              }
+''',
+              '''            ClientCommand::Set {
+                  name,
+                  value,
+                  caller,
+                  response,
+              } => {
+                  self.last_operation = Some("credential-set");
+                  if let Err(err) = self.ensure_live_connection("client-request") {
+                      let _ = response.send(Err(err));
+                      return;
+                  }
+                  let result = self.request("set", &name, &caller, Some(value)).map(|_| ());
+                  let failed = result.is_err();
+                  let _ = response.send(result);
+                  if failed {
+                      self.recover_if_process_failed("credential-set");
+                  }
+              }
+              ClientCommand::Internal {
+                  op,
+                  namespace,
+                  payload,
+                  response,
+              } => {
+                  self.last_operation = Some("internal-oid");
+                  if let Err(err) = self.ensure_live_connection("internal-oid") {
+                      let _ = response.send(Err(err));
+                      return;
+                  }
+                  let result = self.request_internal(&op, &namespace, payload);
+                  let failed = result.is_err();
+                  let _ = response.send(result);
+                  if failed {
+                      self.recover_if_process_failed("internal-oid");
+                  }
+              }
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''    fn ensure_live_connection(&mut self, phase: &'static str) -> anyhow::Result<()> {
+''',
+              '''    fn request_internal(
+                  &mut self,
+                  op: &str,
+                  namespace: &str,
+                  payload: InternalPayload,
+              ) -> anyhow::Result<InternalPayload> {
+                  let c = self
+                      .connection
+                      .as_mut()
+                      .ok_or_else(|| anyhow::anyhow!("Vault connection is unavailable"))?;
+                  let seq = c.seq;
+                  c.seq = c.seq.saturating_add(1);
+                  let request_aad = internal_ipc_aad("request", seq, op, namespace);
+                  let plaintext = serde_json::to_vec(&payload)?;
+                  let encrypted = encrypt_internal_ipc(&c.ipc_key, &request_aad, &plaintext)?;
+                  let request = Request {
+                      token: c.token.clone(),
+                      seq,
+                      op: op.to_owned(),
+                      name: namespace.to_owned(),
+                      caller: INTERNAL_CALLER.to_owned(),
+                      value: Some(encrypted),
+                  };
+                  writeln!(c.stdin, "{}", serde_json::to_string(&request)?)?;
+                  c.stdin.flush()?;
+                  let mut line = String::new();
+                  c.reader.read_line(&mut line)?;
+                  if line.is_empty() {
+                      return Err(anyhow::anyhow!("Vault process closed the protocol pipe"));
+                  }
+                  let response: Response = serde_json::from_str(&line)?;
+                  if response.seq != seq {
+                      anyhow::bail!("Vault protocol sequence mismatch");
+                  }
+                  if !response.ok {
+                      anyhow::bail!(
+                          "Vault request failed: {}",
+                          response.error.unwrap_or_else(|| "unknown error".into())
+                      );
+                  }
+                  let encrypted = response
+                      .value
+                      .ok_or_else(|| anyhow::anyhow!("Vault internal response omitted encrypted payload"))?;
+                  let response_aad = internal_ipc_aad("response", seq, op, namespace);
+                  let plaintext = decrypt_internal_ipc(&c.ipc_key, &response_aad, &encrypted)?;
+                  Ok(serde_json::from_slice(&plaintext)?)
+              }
+
+              fn ensure_live_connection(&mut self, phase: &'static str) -> anyhow::Result<()> {
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''        if ready.kind != "ready" || ready.token.is_empty() {
+''',
+              '''        if ready.kind != "ready" || ready.token.is_empty() || ready.ipc_key.is_empty() {
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''        Ok(Connection {
+                  child,
+                  stdin,
+                  reader,
+                  token: ready.token,
+                  seq: 1,
+''',
+              '''        let ipc_key = parse_ipc_key(&ready.ipc_key)?;
+                  Ok(Connection {
+                  child,
+                  stdin,
+                  reader,
+                  token: ready.token,
+                  ipc_key,
+                  seq: 1,
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''    let token = generate_session_token();
+              let ready = serde_json::to_string(&Ready {
+                  kind: "ready".into(),
+                  token: token.clone(),
+              })?;
+''',
+              '''    let token = generate_session_token();
+              let ipc_key = generate_ipc_key();
+              let ready = serde_json::to_string(&Ready {
+                  kind: "ready".into(),
+                  token: token.clone(),
+                  ipc_key: hex::encode(ipc_key),
+              })?;
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''                "set" => match request.value.as_deref() {
+''',
+              '''                "oid-seal" | "oid-open" | "oid-head-get" | "oid-head-set" => {
+                      handle_internal_oid_request(&vault, &ipc_key, &request)
+                  }
+                  "set" => match request.value.as_deref() {
+'''
+          )
+          replace_once(
+              'vault-process/src/lib.rs',
+              '''fn generate_session_token() -> String {
+''',
+              '''fn handle_internal_oid_request(
+              vault: &vault::Vault,
+              ipc_key: &[u8; 32],
+              request: &Request,
+          ) -> Response {
+              let result = (|| -> anyhow::Result<InternalPayload> {
+                  if request.caller != INTERNAL_CALLER {
+                      anyhow::bail!("Vault internal OID operation denied for caller {:?}", request.caller);
+                  }
+                  let encrypted = request
+                      .value
+                      .as_deref()
+                      .ok_or_else(|| anyhow::anyhow!("Vault internal request omitted encrypted payload"))?;
+                  let aad = internal_ipc_aad("request", request.seq, &request.op, &request.name);
+                  let plaintext = decrypt_internal_ipc(ipc_key, &aad, encrypted)?;
+                  let payload: InternalPayload = serde_json::from_slice(&plaintext)?;
+                  match request.op.as_str() {
+                      "oid-seal" => {
+                          let aad = hex::decode(payload.aad_hex.as_deref().unwrap_or_default())?;
+                          let data = hex::decode(payload.data_hex.as_deref().unwrap_or_default())?;
+                          Ok(InternalPayload {
+                              data_hex: Some(hex::encode(vault.seal_internal(&request.name, &aad, &data)?)),
+                              ..InternalPayload::default()
+                          })
+                      }
+                      "oid-open" => {
+                          let aad = hex::decode(payload.aad_hex.as_deref().unwrap_or_default())?;
+                          let data = hex::decode(payload.data_hex.as_deref().unwrap_or_default())?;
+                          Ok(InternalPayload {
+                              data_hex: Some(hex::encode(vault.open_internal(&request.name, &aad, &data)?)),
+                              ..InternalPayload::default()
+                          })
+                      }
+                      "oid-head-get" => Ok(InternalPayload {
+                          text: vault.internal_head(&request.name)?,
+                          ..InternalPayload::default()
+                      }),
+                      "oid-head-set" => {
+                          let value = payload.text.as_deref().ok_or_else(|| anyhow::anyhow!("Vault internal head-set omitted value"))?;
+                          vault.set_internal_head(&request.name, value)?;
+                          Ok(InternalPayload::default())
+                      }
+                      _ => anyhow::bail!("unknown Vault internal operation {:?}", request.op),
+                  }
+              })();
+
+              match result {
+                  Ok(payload) => {
+                      let aad = internal_ipc_aad("response", request.seq, &request.op, &request.name);
+                      match serde_json::to_vec(&payload)
+                          .map_err(anyhow::Error::from)
+                          .and_then(|plain| encrypt_internal_ipc(ipc_key, &aad, &plain))
+                      {
+                          Ok(value) => Response {
+                              kind: "response".into(),
+                              seq: request.seq,
+                              ok: true,
+                              value: Some(value),
+                              error: None,
+                          },
+                          Err(error) => Response {
+                              kind: "response".into(),
+                              seq: request.seq,
+                              ok: false,
+                              value: None,
+                              error: Some(format!("{error:#}")),
+                          },
+                      }
+                  }
+                  Err(error) => Response {
+                      kind: "response".into(),
+                      seq: request.seq,
+                      ok: false,
+                      value: None,
+                      error: Some(format!("{error:#}")),
+                  },
+              }
+          }
+
+          fn internal_ipc_aad(direction: &str, seq: u64, op: &str, namespace: &str) -> Vec<u8> {
+              format!("{INTERNAL_IPC_PROTOCOL}|{direction}|{seq}|{op}|{namespace}").into_bytes()
+          }
+
+          fn encrypt_internal_ipc(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> anyhow::Result<String> {
+              let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+              let mut nonce_bytes = [0u8; 12];
+              rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
+              let ciphertext = cipher
+                  .encrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: plaintext, aad })
+                  .map_err(|error| anyhow::anyhow!("Vault internal IPC encryption failed: {error}"))?;
+              let mut out = Vec::with_capacity(12 + ciphertext.len());
+              out.extend_from_slice(&nonce_bytes);
+              out.extend_from_slice(&ciphertext);
+              Ok(hex::encode(out))
+          }
+
+          fn decrypt_internal_ipc(key: &[u8; 32], aad: &[u8], encoded: &str) -> anyhow::Result<Vec<u8>> {
+              let bytes = hex::decode(encoded)?;
+              if bytes.len() < 12 + 16 {
+                  anyhow::bail!("Vault internal IPC envelope is truncated");
+              }
+              let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+              cipher
+                  .decrypt(
+                      Nonce::from_slice(&bytes[..12]),
+                      Payload { msg: &bytes[12..], aad },
+                  )
+                  .map_err(|error| anyhow::anyhow!("Vault internal IPC authentication failed: {error}"))
+          }
+
+          fn parse_ipc_key(value: &str) -> anyhow::Result<[u8; 32]> {
+              let bytes = hex::decode(value)?;
+              bytes.try_into().map_err(|_| anyhow::anyhow!("Vault IPC key has the wrong length"))
+          }
+
+          fn generate_ipc_key() -> [u8; 32] {
+              let mut bytes = [0u8; 32];
+              rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+              bytes
+          }
+
+          fn generate_session_token() -> String {
+'''
+          )
+
+          # Route-engine Vault authority + sealed manifest/head + external lock.
+          replace_once('engine/crates/route-engine/Cargo.toml', 'subtle = "2"\n', 'subtle = "2"\nfs2 = "0.4"\n')
+          Path('engine/crates/route-engine/src/oid_security.rs').write_text(r'''use std::collections::BTreeMap;
+          use std::fs::{self, File, OpenOptions};
+          use std::path::{Path, PathBuf};
+          use std::sync::{Arc, Mutex};
+
+          use atomic_io::AtomicIo;
+          use fs2::FileExt;
+          use serde::{Deserialize, Serialize};
+          use sha2::{Digest, Sha256};
+
+          use crate::service_oid::OidError;
+
+          const MANIFEST_PROTOCOL: &str = "RBE-OID-MANIFEST/1";
+          const HEAD_PROTOCOL: &str = "RBE-OID-VAULT-HEAD/1";
+          const INDEX_AAD: &[u8] = b"RBE-OID-INDEX/1";
+          const MANIFEST_AAD: &[u8] = b"RBE-OID-MANIFEST/1";
+
+          pub trait OidVaultAuthority: Send + Sync {
+              fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String>;
+              fn open(&self, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, String>;
+              fn trusted_head(&self) -> Result<Option<String>, String>;
+              fn set_trusted_head(&self, head: &str) -> Result<(), String>;
+          }
+
+          #[derive(Clone)]
+          pub(crate) struct OidSecurity {
+              inner: Arc<OidSecurityInner>,
+          }
+
+          struct OidSecurityInner {
+              authority: Arc<dyn OidVaultAuthority>,
+              _lease: Arc<File>,
+              manifest: Mutex<OidManifest>,
+              head_generation: Mutex<Option<u64>>,
+          }
+
+          #[derive(Debug, Clone, Serialize, Deserialize)]
+          struct OidManifest {
+              protocol: String,
+              records: BTreeMap<u16, String>,
+          }
+
+          impl Default for OidManifest {
+              fn default() -> Self {
+                  Self {
+                      protocol: MANIFEST_PROTOCOL.to_string(),
+                      records: BTreeMap::new(),
+                  }
+              }
+          }
+
+          #[derive(Debug, Serialize, Deserialize)]
+          struct OidTrustedHead {
+              protocol: String,
+              generation: u64,
+              index_sha256: String,
+              manifest_sha256: String,
+          }
+
+          impl OidSecurity {
+              pub(crate) fn acquire(
+                  project_root: &Path,
+                  authority: Arc<dyn OidVaultAuthority>,
+              ) -> Result<Self, OidError> {
+                  let compiler_root = project_root.join(".cache/compiler");
+                  fs::create_dir_all(&compiler_root)?;
+                  let lock_path = compiler_root.join("oid.lock");
+                  let lease = OpenOptions::new()
+                      .create(true)
+                      .read(true)
+                      .write(true)
+                      .open(&lock_path)?;
+                  lease.try_lock_exclusive().map_err(|error| {
+                      OidError::Security(format!(
+                          "OID compiler cache is locked by another RBE/RELC process ({}): {error}",
+                          lock_path.display()
+                      ))
+                  })?;
+                  Ok(Self {
+                      inner: Arc::new(OidSecurityInner {
+                          authority,
+                          _lease: Arc::new(lease),
+                          manifest: Mutex::new(OidManifest::default()),
+                          head_generation: Mutex::new(None),
+                      }),
+                  })
+              }
+
+              pub(crate) fn open_index(
+                  &self,
+                  root: &Path,
+                  io: &AtomicIo,
+              ) -> Result<Vec<u8>, OidError> {
+                  let sealed_index = io.read(&root.join("index"))?;
+                  let sealed_manifest = io.read(&root.join("manifest")).map_err(|error| {
+                      OidError::Security(format!("protected OID manifest is unavailable: {error}"))
+                  })?;
+                  let raw_head = self
+                      .inner
+                      .authority
+                      .trusted_head()
+                      .map_err(security_error)?
+                      .ok_or_else(|| OidError::Security("Vault has no trusted OID head for an existing cache".into()))?;
+                  let head: OidTrustedHead = serde_json::from_str(&raw_head)
+                      .map_err(|error| OidError::Security(format!("Vault OID head is malformed: {error}")))?;
+                  if head.protocol != HEAD_PROTOCOL {
+                      return Err(OidError::Security(format!("unsupported Vault OID head protocol {:?}", head.protocol)));
+                  }
+                  if sha256_hex(&sealed_index) != head.index_sha256
+                      || sha256_hex(&sealed_manifest) != head.manifest_sha256
+                  {
+                      return Err(OidError::Security("OID index/manifest does not match the Vault trusted head (tamper or replay detected)".into()));
+                  }
+                  let index = self
+                      .inner
+                      .authority
+                      .open(INDEX_AAD, &sealed_index)
+                      .map_err(security_error)?;
+                  let manifest_bytes = self
+                      .inner
+                      .authority
+                      .open(MANIFEST_AAD, &sealed_manifest)
+                      .map_err(security_error)?;
+                  let manifest: OidManifest = serde_json::from_slice(&manifest_bytes)
+                      .map_err(|error| OidError::Security(format!("protected OID manifest is malformed: {error}")))?;
+                  if manifest.protocol != MANIFEST_PROTOCOL {
+                      return Err(OidError::Security(format!("unsupported OID manifest protocol {:?}", manifest.protocol)));
+                  }
+                  *self.manifest()? = manifest;
+                  *self.head_generation()? = Some(head.generation);
+                  Ok(index)
+              }
+
+              pub(crate) fn verify_generation(&self, generation: u64) -> Result<(), OidError> {
+                  let observed = *self.head_generation()?;
+                  if observed != Some(generation) {
+                      return Err(OidError::Security(format!(
+                          "Vault trusted OID generation {:?} does not match index generation {generation}",
+                          observed
+                      )));
+                  }
+                  Ok(())
+              }
+
+              pub(crate) fn reset_manifest(&self) -> Result<(), OidError> {
+                  *self.manifest()? = OidManifest::default();
+                  *self.head_generation()? = None;
+                  Ok(())
+              }
+
+              pub(crate) fn write_index(
+                  &self,
+                  root: &Path,
+                  io: &AtomicIo,
+                  plaintext: &[u8],
+                  generation: u64,
+              ) -> Result<(), OidError> {
+                  fs::create_dir_all(root)?;
+                  let sealed = self
+                      .inner
+                      .authority
+                      .seal(INDEX_AAD, plaintext)
+                      .map_err(security_error)?;
+                  io.write_atomic(&root.join("index"), &sealed)?;
+                  self.publish_manifest_and_head(root, io, generation)
+              }
+
+              pub(crate) fn record_matches(
+                  &self,
+                  root: &Path,
+                  io: &AtomicIo,
+                  oid: u16,
+                  aad: &[u8],
+                  plaintext: &[u8],
+              ) -> Result<bool, OidError> {
+                  let digest = sha256_hex(plaintext);
+                  if self.manifest()?.records.get(&oid) != Some(&digest) {
+                      return Ok(false);
+                  }
+                  let path = root.join(oid.to_string());
+                  if !path.is_file() {
+                      return Ok(false);
+                  }
+                  let sealed = io.read(&path)?;
+                  let opened = self.inner.authority.open(aad, &sealed).map_err(security_error)?;
+                  Ok(opened == plaintext)
+              }
+
+              pub(crate) fn write_record(
+                  &self,
+                  root: &Path,
+                  io: &AtomicIo,
+                  oid: u16,
+                  aad: &[u8],
+                  plaintext: &[u8],
+                  generation: u64,
+              ) -> Result<(), OidError> {
+                  let sealed = self
+                      .inner
+                      .authority
+                      .seal(aad, plaintext)
+                      .map_err(security_error)?;
+                  io.write_atomic(&root.join(oid.to_string()), &sealed)?;
+                  self.manifest()?.records.insert(oid, sha256_hex(plaintext));
+                  self.publish_manifest_and_head(root, io, generation)
+              }
+
+              pub(crate) fn open_record(
+                  &self,
+                  root: &Path,
+                  io: &AtomicIo,
+                  oid: u16,
+                  aad: &[u8],
+              ) -> Result<Vec<u8>, OidError> {
+                  let expected = self
+                      .manifest()?
+                      .records
+                      .get(&oid)
+                      .cloned()
+                      .ok_or_else(|| OidError::Security(format!("OID {oid} is not present in the Vault-trusted manifest")))?;
+                  let sealed = io.read(&root.join(oid.to_string()))?;
+                  let plaintext = self.inner.authority.open(aad, &sealed).map_err(security_error)?;
+                  if sha256_hex(&plaintext) != expected {
+                      return Err(OidError::Security(format!("OID {oid} plaintext digest does not match the Vault-trusted manifest")));
+                  }
+                  Ok(plaintext)
+              }
+
+              pub(crate) fn remove_record(
+                  &self,
+                  root: &Path,
+                  io: &AtomicIo,
+                  oid: u16,
+                  generation: u64,
+              ) -> Result<bool, OidError> {
+                  let path = root.join(oid.to_string());
+                  let removed = match fs::remove_file(path) {
+                      Ok(()) => true,
+                      Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                      Err(error) => return Err(error.into()),
+                  };
+                  let manifest_changed = self.manifest()?.records.remove(&oid).is_some();
+                  if removed || manifest_changed {
+                      self.publish_manifest_and_head(root, io, generation)?;
+                  }
+                  Ok(removed)
+              }
+
+              fn publish_manifest_and_head(
+                  &self,
+                  root: &Path,
+                  io: &AtomicIo,
+                  generation: u64,
+              ) -> Result<(), OidError> {
+                  let manifest = self.manifest()?.clone();
+                  let manifest_bytes = serde_json::to_vec(&manifest)
+                      .map_err(|error| OidError::Security(format!("encode OID manifest: {error}")))?;
+                  let sealed_manifest = self
+                      .inner
+                      .authority
+                      .seal(MANIFEST_AAD, &manifest_bytes)
+                      .map_err(security_error)?;
+                  io.write_atomic(&root.join("manifest"), &sealed_manifest)?;
+                  let sealed_index = io.read(&root.join("index"))?;
+                  let head = OidTrustedHead {
+                      protocol: HEAD_PROTOCOL.to_string(),
+                      generation,
+                      index_sha256: sha256_hex(&sealed_index),
+                      manifest_sha256: sha256_hex(&sealed_manifest),
+                  };
+                  let raw = serde_json::to_string(&head)
+                      .map_err(|error| OidError::Security(format!("encode Vault OID head: {error}")))?;
+                  self.inner.authority.set_trusted_head(&raw).map_err(security_error)?;
+                  *self.head_generation()? = Some(generation);
+                  Ok(())
+              }
+
+              fn manifest(&self) -> Result<std::sync::MutexGuard<'_, OidManifest>, OidError> {
+                  self.inner.manifest.lock().map_err(|_| OidError::Security("OID security manifest lock poisoned".into()))
+              }
+
+              fn head_generation(&self) -> Result<std::sync::MutexGuard<'_, Option<u64>>, OidError> {
+                  self.inner.head_generation.lock().map_err(|_| OidError::Security("OID trusted-head lock poisoned".into()))
+              }
+          }
+
+          pub(crate) fn record_aad(oid: u16, target: &str, compiler_abi: &str) -> Vec<u8> {
+              format!("RBE-OID-RECORD/1|oid={oid}|target={target}|compiler={compiler_abi}").into_bytes()
+          }
+
+          fn sha256_hex(bytes: &[u8]) -> String {
+              hex::encode(Sha256::digest(bytes))
+          }
+
+          fn security_error(message: String) -> OidError {
+              OidError::Security(message)
+          }
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+              use std::sync::Mutex;
+
+              #[derive(Default)]
+              struct MockVault {
+                  head: Mutex<Option<String>>,
+              }
+
+              impl OidVaultAuthority for MockVault {
+                  fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+                      let mut out = aad.to_vec();
+                      out.push(0);
+                      out.extend_from_slice(plaintext);
+                      Ok(out)
+                  }
+                  fn open(&self, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, String> {
+                      let prefix_len = aad.len() + 1;
+                      if sealed.len() < prefix_len || &sealed[..aad.len()] != aad || sealed[aad.len()] != 0 {
+                          return Err("mock authentication failed".into());
+                      }
+                      Ok(sealed[prefix_len..].to_vec())
+                  }
+                  fn trusted_head(&self) -> Result<Option<String>, String> {
+                      Ok(self.head.lock().unwrap().clone())
+                  }
+                  fn set_trusted_head(&self, head: &str) -> Result<(), String> {
+                      *self.head.lock().unwrap() = Some(head.to_owned());
+                      Ok(())
+                  }
+              }
+
+              #[test]
+              fn record_aad_binds_numeric_identity() {
+                  assert_ne!(record_aad(7, "x", "y"), record_aad(8, "x", "y"));
+              }
+          }
+          ''')
+
+          # Wire OidCache through optional security authority.
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''use atomic_io::AtomicIo;
+          use sha2::{Digest, Sha256};
+''',
+              '''use atomic_io::AtomicIo;
+          use sha2::{Digest, Sha256};
+
+          use crate::oid_security::{record_aad, OidSecurity, OidVaultAuthority};
+          use std::sync::Arc;
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''    Invariant(String),
+          }
+''',
+              '''    Invariant(String),
+              Security(String),
+          }
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''            Self::Invariant(_) => "RELC9001",
+''',
+              '''            Self::Invariant(_) | Self::Security(_) => "RELC9001",
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''            Self::Invariant(message) => {
+                  write!(formatter, "OID compiler invariant failed: {message}")
+              }
+''',
+              '''            Self::Invariant(message) => {
+                  write!(formatter, "OID compiler invariant failed: {message}")
+              }
+              Self::Security(message) => write!(formatter, "OID Vault security failed: {message}"),
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''pub struct OidCache {
+              root: PathBuf,
+              io: AtomicIo,
+              index: OidIndex,
+          }
+''',
+              '''pub struct OidCache {
+              root: PathBuf,
+              io: AtomicIo,
+              index: OidIndex,
+              security: Option<OidSecurity>,
+          }
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''            return Ok(Self { root, io, index });
+              }
+
+              Self::create_fresh(root, io)
+          }
+
+          fn create_fresh(root: PathBuf, io: AtomicIo) -> Result<Self, OidError> {
+              let index = OidIndex::fresh();
+              let cache = Self { root, io, index };
+              cache.persist_index()?;
+              Ok(cache)
+          }
+''',
+              '''            return Ok(Self {
+                      root,
+                      io,
+                      index,
+                      security: None,
+                  });
+              }
+
+              Self::create_fresh(root, io)
+          }
+
+          pub fn open_or_rebuild_with_vault(
+              project_root: &Path,
+              authority: Arc<dyn OidVaultAuthority>,
+          ) -> Result<Self, OidError> {
+              let io = AtomicIo::new();
+              let security = OidSecurity::acquire(project_root, authority)?;
+              let root = project_root.join(".cache/compiler/oid");
+              let index_path = root.join("index");
+              let current_target = OidTarget::current();
+
+              if index_path.is_file() {
+                  let bytes = security.open_index(&root, &io)?;
+                  let index = OidIndex::from_bytes(&bytes)?;
+                  security.verify_generation(index.generation)?;
+                  if index.target != current_target
+                      || index.native_abi_version != OID_NATIVE_ABI_VERSION
+                      || index.compiler_abi != OID_COMPILER_ABI
+                  {
+                      if root.exists() {
+                          fs::remove_dir_all(&root)?;
+                      }
+                      security.reset_manifest()?;
+                      return Self::create_fresh_secured(root, io, security);
+                  }
+                  index.validate_structure()?;
+                  return Ok(Self {
+                      root,
+                      io,
+                      index,
+                      security: Some(security),
+                  });
+              }
+
+              if root.exists() {
+                  fs::remove_dir_all(&root)?;
+              }
+              security.reset_manifest()?;
+              Self::create_fresh_secured(root, io, security)
+          }
+
+          fn create_fresh(root: PathBuf, io: AtomicIo) -> Result<Self, OidError> {
+              let index = OidIndex::fresh();
+              let cache = Self {
+                  root,
+                  io,
+                  index,
+                  security: None,
+              };
+              cache.persist_index()?;
+              Ok(cache)
+          }
+
+          fn create_fresh_secured(
+              root: PathBuf,
+              io: AtomicIo,
+              security: OidSecurity,
+          ) -> Result<Self, OidError> {
+              fs::create_dir_all(&root)?;
+              let index = OidIndex::fresh();
+              let cache = Self {
+                  root,
+                  io,
+                  index,
+                  security: Some(security),
+              };
+              cache.persist_index()?;
+              Ok(cache)
+          }
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''    pub fn persist_index(&self) -> Result<(), OidError> {
+                  self.index.validate_structure()?;
+                  self.io
+                      .write_atomic(&self.root.join("index"), &self.index.to_bytes()?)?;
+                  Ok(())
+              }
+''',
+              '''    pub fn persist_index(&self) -> Result<(), OidError> {
+                  self.index.validate_structure()?;
+                  let bytes = self.index.to_bytes()?;
+                  if let Some(security) = &self.security {
+                      security.write_index(&self.root, &self.io, &bytes, self.index.generation)?;
+                  } else {
+                      self.io.write_atomic(&self.root.join("index"), &bytes)?;
+                  }
+                  Ok(())
+              }
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''        self.io
+                  .write_atomic(&self.root.join("index"), &next.to_bytes()?)?;
+              self.index = next;
+''',
+              '''        let bytes = next.to_bytes()?;
+              if let Some(security) = &self.security {
+                  security.write_index(&self.root, &self.io, &bytes, next.generation)?;
+              } else {
+                  self.io.write_atomic(&self.root.join("index"), &bytes)?;
+              }
+              self.index = next;
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''        self.index = OidIndex::fresh();
+              self.persist_index()
+''',
+              '''        self.index = OidIndex::fresh();
+              if let Some(security) = &self.security {
+                  security.reset_manifest()?;
+              }
+              self.persist_index()
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''    pub fn read_record(&self, oid: u16) -> Result<OidRecord, OidError> {
+                  let bytes = self.io.read(&self.record_path(oid))?;
+                  let record = OidRecord::from_bytes(&bytes)?;
+''',
+              '''    pub fn read_record(&self, oid: u16) -> Result<OidRecord, OidError> {
+                  let bytes = if let Some(security) = &self.security {
+                      let aad = record_aad(oid, &self.index.target.label(), &self.index.compiler_abi);
+                      security.open_record(&self.root, &self.io, oid, &aad)?
+                  } else {
+                      self.io.read(&self.record_path(oid))?
+                  };
+                  let record = OidRecord::from_bytes(&bytes)?;
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''        let bytes = record.to_bytes()?;
+              let path = self.record_path(record.oid);
+              if path.is_file() {
+                  if let Ok(existing) = self.io.read(&path) {
+                      if existing == bytes {
+                          return Ok(false);
+                      }
+                  }
+              }
+              self.io.write_atomic(&path, &bytes)?;
+              Ok(true)
+''',
+              '''        let bytes = record.to_bytes()?;
+              let path = self.record_path(record.oid);
+              if let Some(security) = &self.security {
+                  let aad = record_aad(
+                      record.oid,
+                      &self.index.target.label(),
+                      &self.index.compiler_abi,
+                  );
+                  if security.record_matches(&self.root, &self.io, record.oid, &aad, &bytes)? {
+                      return Ok(false);
+                  }
+                  security.write_record(
+                      &self.root,
+                      &self.io,
+                      record.oid,
+                      &aad,
+                      &bytes,
+                      self.index.generation,
+                  )?;
+              } else {
+                  if path.is_file() {
+                      if let Ok(existing) = self.io.read(&path) {
+                          if existing == bytes {
+                              return Ok(false);
+                          }
+                      }
+                  }
+                  self.io.write_atomic(&path, &bytes)?;
+              }
+              Ok(true)
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''    pub fn remove_record(&self, oid: u16) -> Result<bool, OidError> {
+                  let path = self.record_path(oid);
+                  match fs::remove_file(path) {
+                      Ok(()) => Ok(true),
+                      Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                      Err(error) => Err(error.into()),
+                  }
+              }
+''',
+              '''    pub fn remove_record(&self, oid: u16) -> Result<bool, OidError> {
+                  if let Some(security) = &self.security {
+                      return security.remove_record(
+                          &self.root,
+                          &self.io,
+                          oid,
+                          self.index.generation,
+                      );
+                  }
+                  let path = self.record_path(oid);
+                  match fs::remove_file(path) {
+                      Ok(()) => Ok(true),
+                      Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                      Err(error) => Err(error.into()),
+                  }
+              }
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''pub fn prepare_service_oid_cache(
+              project_root: &Path,
+          ) -> Result<CoreMaterializationReport, OidError> {
+              let cache = OidCache::open_or_rebuild(project_root)?;
+              materialize_bootstrap_core(&cache)
+          }
+''',
+              '''pub fn prepare_service_oid_cache(
+              project_root: &Path,
+          ) -> Result<CoreMaterializationReport, OidError> {
+              let cache = OidCache::open_or_rebuild(project_root)?;
+              materialize_bootstrap_core(&cache)
+          }
+
+          pub fn prepare_service_oid_cache_with_vault(
+              project_root: &Path,
+              authority: Arc<dyn OidVaultAuthority>,
+          ) -> Result<CoreMaterializationReport, OidError> {
+              let cache = OidCache::open_or_rebuild_with_vault(project_root, authority)?;
+              materialize_bootstrap_core(&cache)
+          }
+'''
+          )
+
+          # Protected bootstrap/recovery entrypoints.
+          replace_once(
+              'engine/crates/route-engine/src/oid_cache_bootstrap.rs',
+              '''use std::path::{Path, PathBuf};
+''',
+              '''use std::path::{Path, PathBuf};
+          use std::sync::Arc;
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/oid_cache_bootstrap.rs',
+              '''    prepare_service_oid_cache as prepare_service_oid_cache_once, CoreMaterializationReport,
+              OidCache, OidError,
+          };
+''',
+              '''    prepare_service_oid_cache as prepare_service_oid_cache_once,
+              prepare_service_oid_cache_with_vault as prepare_service_oid_cache_with_vault_once,
+              CoreMaterializationReport, OidCache, OidError,
+          };
+          use crate::oid_security::OidVaultAuthority;
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/oid_cache_bootstrap.rs',
+              '''pub fn open_service_oid_cache(project_root: &Path) -> Result<OidCache, OidError> {
+''',
+              '''pub fn prepare_service_oid_cache_with_vault(
+              project_root: &Path,
+              authority: Arc<dyn OidVaultAuthority>,
+          ) -> Result<CoreMaterializationReport, OidError> {
+              match prepare_service_oid_cache_with_vault_once(project_root, authority.clone()) {
+                  Ok(report) => Ok(report),
+                  Err(error) if recoverable_cache_error(&error) => {
+                      clear_service_oid_cache(project_root)?;
+                      prepare_service_oid_cache_with_vault_once(project_root, authority)
+                  }
+                  Err(error) => Err(error),
+              }
+          }
+
+          pub fn open_service_oid_cache(project_root: &Path) -> Result<OidCache, OidError> {
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/oid_cache_bootstrap.rs',
+              '''pub fn clear_service_oid_cache(project_root: &Path) -> Result<(), OidError> {
+''',
+              '''pub fn open_service_oid_cache_with_vault(
+              project_root: &Path,
+              authority: Arc<dyn OidVaultAuthority>,
+          ) -> Result<OidCache, OidError> {
+              match OidCache::open_or_rebuild_with_vault(project_root, authority.clone()) {
+                  Ok(cache) => Ok(cache),
+                  Err(error) if recoverable_cache_error(&error) => {
+                      clear_service_oid_cache(project_root)?;
+                      OidCache::open_or_rebuild_with_vault(project_root, authority)
+                  }
+                  Err(error) => Err(error),
+              }
+          }
+
+          pub fn clear_service_oid_cache(project_root: &Path) -> Result<(), OidError> {
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/oid_cache_bootstrap.rs',
+              '''        OidError::InvalidIndex(_) | OidError::InvalidRecord(_) | OidError::TargetMismatch { .. }
+''',
+              '''        OidError::InvalidIndex(_)
+              | OidError::InvalidRecord(_)
+              | OidError::TargetMismatch { .. }
+              | OidError::Security(_)
+'''
+          )
+
+          # Route exports.
+          replace_once(
+              'engine/crates/route-engine/src/lib.rs',
+              '''pub mod oid_materialize;
+''',
+              '''pub mod oid_materialize;
+          pub mod oid_security;
+'''
+          )
+          replace_once(
+              'engine/crates/route-engine/src/lib.rs',
+              '''    clear_service_oid_cache, oid_cache_root, open_service_oid_cache, prepare_service_oid_cache,
+          };
+''',
+              '''    clear_service_oid_cache, oid_cache_root, open_service_oid_cache,
+              open_service_oid_cache_with_vault, prepare_service_oid_cache,
+              prepare_service_oid_cache_with_vault,
+          };
+          pub use oid_security::OidVaultAuthority;
+'''
+          )
+
+          # Backend adapter keeps the real Vault client outside route-engine.
+          Path('engine/crates/backend/src/oid_vault.rs').write_text(r'''use std::path::Path;
+          use std::sync::Arc;
+
+          use sha2::{Digest, Sha256};
+
+          #[derive(Clone)]
+          pub struct BackendOidVault {
+              client: Arc<vault_process::VaultClient>,
+              namespace: String,
+          }
+
+          impl BackendOidVault {
+              pub fn new(
+                  client: Arc<vault_process::VaultClient>,
+                  project_root: &Path,
+              ) -> anyhow::Result<Self> {
+                  let canonical = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
+                  let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+                  Ok(Self {
+                      client,
+                      namespace: format!("oid-{}", hex::encode(digest)),
+                  })
+              }
+          }
+
+          impl route_engine::OidVaultAuthority for BackendOidVault {
+              fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+                  self.client
+                      .seal_internal(&self.namespace, aad, plaintext)
+                      .map_err(|error| format!("{error:#}"))
+              }
+
+              fn open(&self, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, String> {
+                  self.client
+                      .open_internal(&self.namespace, aad, sealed)
+                      .map_err(|error| format!("{error:#}"))
+              }
+
+              fn trusted_head(&self) -> Result<Option<String>, String> {
+                  self.client
+                      .internal_head(&self.namespace)
+                      .map_err(|error| format!("{error:#}"))
+              }
+
+              fn set_trusted_head(&self, head: &str) -> Result<(), String> {
+                  self.client
+                      .set_internal_head(&self.namespace, head)
+                      .map_err(|error| format!("{error:#}"))
+              }
+          }
+          ''')
+
+          # Runtime Image compile no longer creates trusted OIDs before Vault exists.
+          replace_once(
+              'engine/crates/backend/src/runtime_image_boot.rs',
+              '''fn prepare_core_oid_cache(root: &Path) -> anyhow::Result<route_engine::CoreMaterializationReport> {
+              let report = route_engine::prepare_service_oid_cache(root).map_err(|error| {
+''',
+              '''pub fn prepare_core_oid_cache(
+              root: &Path,
+              vault: std::sync::Arc<dyn route_engine::OidVaultAuthority>,
+          ) -> anyhow::Result<route_engine::CoreMaterializationReport> {
+              let report = route_engine::prepare_service_oid_cache_with_vault(root, vault).map_err(|error| {
+'''
+          )
+          replace_once(
+              'engine/crates/backend/src/runtime_image_boot.rs',
+              '''    let root = runtime_paths::binary_dir();
+              prepare_core_oid_cache(&root)?;
+              let server_path = root.join("server.server");
+''',
+              '''    let root = runtime_paths::binary_dir();
+              let server_path = root.join("server.server");
+'''
+          )
+          # Old plaintext bootstrap test is intentionally removed; protected behavior is tested in route-engine.
+          p = Path('engine/crates/backend/src/runtime_image_boot.rs')
+          text = p.read_text()
+          start = text.find('    #[test]\n    fn backend_compile_root_prepares_and_reuses_core_oid_cache()')
+          if start != -1:
+              next_test = text.find('\n    #[test]\n', start + 10)
+              if next_test == -1:
+                  raise SystemExit('runtime_image_boot: could not find next test after OID bootstrap test')
+              text = text[:start] + text[next_test + 1:]
+              p.write_text(text)
+
+          # Native cutover must use protected cache.
+          replace_once(
+              'engine/crates/backend/src/service_native_cutover.rs',
+              '''    discover_linked_rel_from_runtime_image, discover_physical_rel_sources, open_service_oid_cache,
+              select_native_services, OidTarget, RuntimeImage, SourceId,
+''',
+              '''    discover_linked_rel_from_runtime_image, discover_physical_rel_sources,
+              open_service_oid_cache_with_vault, select_native_services, OidTarget, OidVaultAuthority,
+              RuntimeImage, SourceId,
+'''
+          )
+          replace_once(
+              'engine/crates/backend/src/service_native_cutover.rs',
+              '''pub fn prepare_native_service_cutover(
+              image: &RuntimeImage,
+              catalog: Option<&ServiceCatalog>,
+          ) -> anyhow::Result<Option<NativeServiceCutover>> {
+''',
+              '''pub fn prepare_native_service_cutover(
+              image: &RuntimeImage,
+              catalog: Option<&ServiceCatalog>,
+              oid_vault: std::sync::Arc<dyn OidVaultAuthority>,
+          ) -> anyhow::Result<Option<NativeServiceCutover>> {
+'''
+          )
+          replace_once(
+              'engine/crates/backend/src/service_native_cutover.rs',
+              '''    let mut cache = open_service_oid_cache(&project_root)
+''',
+              '''    let mut cache = open_service_oid_cache_with_vault(&project_root, oid_vault)
+'''
+          )
+
+          # Backend boot: Vault first, then protected core materialization + native cutover.
+          replace_once(
+              'engine/crates/backend/src/main.rs',
+              '''mod maintenance_notice;
+          mod port_guard;
+''',
+              '''mod maintenance_notice;
+          mod oid_vault;
+          mod port_guard;
+'''
+          )
+          early = '''    let native_service_cutover = service_native_cutover::prepare_native_service_cutover(
+                  &runtime_image,
+                  service_catalog.as_ref(),
+              )?;
+              if let Some(cutover) = native_service_cutover.as_ref() {
+                  tracing::info!(
+                      image = %runtime_image.image_id,
+                      native_services = cutover.native_service_count(),
+                      "native Service Runtime Image generation prepared"
+                  );
+              }
+'''
+          replace_once('engine/crates/backend/src/main.rs', early, '')
+          replace_once(
+              'engine/crates/backend/src/main.rs',
+              '''    boot_trace("vault process ready");
+
+              let vault_refresh_task = spawn_vault_refresh(
+''',
+              '''    boot_trace("vault process ready");
+
+              let oid_vault: Arc<dyn route_engine::OidVaultAuthority> = Arc::new(
+                  oid_vault::BackendOidVault::new(vault_instance.clone(), &runtime_paths::binary_dir())?,
+              );
+              runtime_image_boot::prepare_core_oid_cache(
+                  &runtime_paths::binary_dir(),
+                  oid_vault.clone(),
+              )?;
+              let runtime_image_snapshot = runtime_image.snapshot();
+              let native_service_cutover = service_native_cutover::prepare_native_service_cutover(
+                  runtime_image_snapshot.as_ref(),
+                  service_catalog.as_ref(),
+                  oid_vault,
+              )?;
+              if let Some(cutover) = native_service_cutover.as_ref() {
+                  tracing::info!(
+                      image = %runtime_image_snapshot.image_id,
+                      native_services = cutover.native_service_count(),
+                      "Vault-attested native Service Runtime Image generation prepared"
+                  );
+              }
+
+              let vault_refresh_task = spawn_vault_refresh(
+'''
+          )
+          PY
+
+          rustfmt --edition 2021 \
+            vault/src/file_store.rs \
+            vault/src/lib.rs \
+            vault-process/src/lib.rs \
+            engine/crates/route-engine/src/oid_security.rs \
+            engine/crates/route-engine/src/service_oid.rs \
+            engine/crates/route-engine/src/oid_cache_bootstrap.rs \
+            engine/crates/route-engine/src/lib.rs \
+            engine/crates/backend/src/oid_vault.rs \
+            engine/crates/backend/src/runtime_image_boot.rs \
+            engine/crates/backend/src/service_native_cutover.rs \
+            engine/crates/backend/src/main.rs
+
+          cargo check --manifest-path vault/Cargo.toml
+          cargo check --manifest-path vault-process/Cargo.toml
+          rm -f vault/Cargo.lock vault-process/Cargo.lock
+
+          cd engine
+          cargo check -p route-engine -p backend --locked
+          cargo test -p route-engine oid_security --locked
+          cargo test -p route-engine service_oid --locked
+          cargo clippy -p route-engine -p backend --all-targets --locked -- -D warnings
+          cd ..
+
+          git diff --check
+          git status --short
+          git add \
+            vault/src/file_store.rs vault/src/lib.rs \
+            vault-process/Cargo.toml vault-process/src/lib.rs \
+            engine/crates/route-engine/Cargo.toml \
+            engine/crates/route-engine/src/oid_security.rs \
+            engine/crates/route-engine/src/service_oid.rs \
+            engine/crates/route-engine/src/oid_cache_bootstrap.rs \
+            engine/crates/route-engine/src/lib.rs \
+            engine/crates/backend/src/oid_vault.rs \
+            engine/crates/backend/src/runtime_image_boot.rs \
+            engine/crates/backend/src/service_native_cutover.rs \
+            engine/crates/backend/src/main.rs \
+            engine/Cargo.lock
+          git commit -m "FEAT | OID-SEC-001 Vault-seal OID compiler cache"
+
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            git pull --rebase origin main
+          done
+          echo "failed to fast-forward push OID Vault security" >&2
+          exit 1
