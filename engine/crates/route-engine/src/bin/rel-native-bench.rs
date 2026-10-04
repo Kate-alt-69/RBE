@@ -5,12 +5,11 @@ use std::time::Instant;
 
 use anyhow::Context;
 use route_engine::service_bin::{
-    assemble_service_bin, decode_cached_service_bin, encode_cached_service_bin,
-    AssemblyRecordKind, RequiredOid, ServiceAssemblyPlan, VerifiedAssemblyOidRecord, DONE_OID,
-    SERVICE_PLAN_FORMAT,
+    assemble_service_bin, decode_cached_service_bin, encode_cached_service_bin, AssemblyRecordKind,
+    RequiredOid, ServiceAssemblyPlan, VerifiedAssemblyOidRecord, DONE_OID, SERVICE_PLAN_FORMAT,
 };
 use route_engine::{
-    discover_linked_rel_symbols, optimize_function, BinaryOp, Expr, FunctionDef, ImportTarget,
+    discover_linked_rel_symbols, optimize_function, BinaryOp, Expr, FunctionDef,
     LinkedRelSourceUnit, ModuleFile, OidTarget, ServiceProgram, Statement,
 };
 use serde::Serialize;
@@ -116,7 +115,10 @@ fn main() -> anyhow::Result<()> {
     };
 
     if let Some(path) = &config.output {
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, format!("{json}\n"))?;
@@ -143,10 +145,10 @@ fn parse_args() -> anyhow::Result<BenchConfig> {
                 config.warmup_iterations = parse_u64("--warmup", args.next())?;
             }
             "--output" => {
-                config.output = Some(PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--output requires a path"))?,
-                ));
+                config.output =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--output requires a path")
+                    })?));
             }
             "--pretty" => config.pretty = true,
             "-h" | "--help" => {
@@ -184,7 +186,8 @@ fn run(config: &BenchConfig) -> anyhow::Result<BenchReport> {
         LinkedRelSourceUnit::service("bench", "bench-service-source", &service),
     ];
     let (plan, records) = assembly_fixture(&target.label());
-    let assembled = assemble_service_bin(&plan, &records).context("assemble benchmark Service bin")?;
+    let assembled =
+        assemble_service_bin(&plan, &records).context("assemble benchmark Service bin")?;
     let encoded = encode_cached_service_bin(&assembled).context("encode benchmark Service bin")?;
 
     let rss_kib_before = current_rss_kib();
@@ -326,43 +329,25 @@ fn discovery_fixture() -> (ModuleFile, ServiceProgram) {
         ],
         exports: vec!["live".into(), "dead".into()],
     };
-    let service = ServiceProgram {
-        imports: vec![
-            ImportTarget::CustomFunction {
-                path: "module/bench.module".into(),
-                function: "live".into(),
-            },
-            ImportTarget::CustomFunction {
-                path: "module/bench.module".into(),
-                function: "dead".into(),
-            },
-        ],
-        functions: vec![FunctionDef {
-            name: "run".into(),
-            params: Vec::new(),
-            body: vec![Statement::If {
-                condition: Expr::Bool(false),
-                then_body: vec![Statement::Return(Expr::Call(
-                    Box::new(Expr::Ident("dead".into())),
-                    Vec::new(),
-                ))],
-                else_body: vec![Statement::Return(Expr::Call(
-                    Box::new(Expr::Ident("live".into())),
-                    Vec::new(),
-                ))],
-            }],
-        }],
-        exports: vec!["run".into()],
-        class_name: None,
-        lifecycle: Vec::new(),
-        classes: Vec::new(),
-    };
+    let service = route_engine::parse_service_source(
+        r#":import["module/bench.module".live, "module/bench.module".dead]
+:service[name = bench]
+export function run() {
+    if (false) { return dead(); }
+    else { return live(); }
+}
+"#,
+    )
+    .expect("benchmark Service fixture must parse through the public REL frontend");
     (module, service)
 }
 
 fn assembly_fixture(
     target_fingerprint: &str,
-) -> (ServiceAssemblyPlan, BTreeMap<u16, VerifiedAssemblyOidRecord>) {
+) -> (
+    ServiceAssemblyPlan,
+    BTreeMap<u16, VerifiedAssemblyOidRecord>,
+) {
     const OID: u16 = 40_000;
     let record_hash = "33".repeat(32);
     let plan = ServiceAssemblyPlan {
@@ -404,7 +389,7 @@ fn current_rss_kib() -> Option<u64> {
     {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
-        return line.split_whitespace().nth(1)?.parse().ok();
+        line.split_whitespace().nth(1)?.parse().ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -482,7 +467,9 @@ mod tests {
         assert_eq!(report.artifacts.optimized_statement_count, 1);
         assert_eq!(report.artifacts.reachable_symbol_count, 2);
         assert!(report.artifacts.service_bin_payload_bytes >= 192);
-        assert!(report.artifacts.encoded_service_bin_bytes > report.artifacts.service_bin_payload_bytes);
+        assert!(
+            report.artifacts.encoded_service_bin_bytes > report.artifacts.service_bin_payload_bytes
+        );
     }
 
     #[test]
