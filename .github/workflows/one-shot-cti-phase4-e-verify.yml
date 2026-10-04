@@ -1,0 +1,40 @@
+name: One-shot CTI Phase 4 E verify
+
+on:
+  push:
+    paths:
+      - '.github/workflows/one-shot-cti-phase4-e-verify.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: Format Phase 4 loader
+        run: rustfmt --edition 2021 container-runtime/crates/container-runtime-core/src/container_task_loader.rs
+      - name: Check Container Task loader
+        working-directory: container-runtime
+        run: cargo check -p container-runtime-core --locked
+      - name: Test Container Task loader
+        working-directory: container-runtime
+        run: cargo test -p container-runtime-core container_task_loader --locked
+      - name: Clippy Container Task loader
+        working-directory: container-runtime
+        run: cargo clippy -p container-runtime-core --all-targets --locked -- -D warnings
+      - name: Commit verified loader and remove verifier
+        run: |
+          git config user.name 'Kate'
+          git config user.email 'dhwanksh2000@gmail.com'
+          git add container-runtime/crates/container-runtime-core/src/container_task_loader.rs
+          git rm .github/workflows/one-shot-cti-phase4-e-verify.yml
+          git commit -m 'FIX | CTI-004 verify RuntimeImage Task loader'
+          git pull --rebase origin main
+          git push origin HEAD:main
