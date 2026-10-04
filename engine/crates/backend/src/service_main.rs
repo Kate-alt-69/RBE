@@ -16,6 +16,9 @@ mod error_code_book;
 #[path = "package_links/approval.rs"]
 pub(crate) mod package_approval;
 mod package_links {
+    // backend.exe shared diagnostics use this facade; service.exe does not
+    // perform package approval decisions itself.
+    #[allow(unused_imports)]
     pub(crate) use crate::package_approval as approval;
 }
 mod service_boot;

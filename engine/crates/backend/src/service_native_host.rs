@@ -47,6 +47,9 @@ pub struct NativeServiceHostFrame {
 }
 
 impl NativeServiceHostFrame {
+    // Constructed by backend-side native cutover code; service.exe only consumes
+    // the authenticated frame after bootstrap.
+    #[allow(dead_code)]
     pub fn new(
         service_name: String,
         mode: ServiceMode,
@@ -138,6 +141,9 @@ pub fn take_native_service_frame(
 /// Merge compiler-owned native frames into the authenticated Runtime ENV
 /// transport. Existing user Runtime ENV is preserved, but the reserved key may
 /// never be supplied by user configuration because it is overwritten here.
+// Called by backend-side native cutover assembly; service.exe only consumes the
+// reserved bootstrap bundle through take_native_service_frame().
+#[allow(dead_code)]
 pub fn attach_native_service_frames(
     runtime_env: &mut Value,
     frames: BTreeMap<String, NativeServiceHostFrame>,
