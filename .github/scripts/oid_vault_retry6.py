@@ -43,13 +43,16 @@ body = body.replace(old_helper, new_helper, 1)
 
 # New AEAD helpers call `fill_bytes` outside the legacy token function, so the
 # RngCore trait must be imported at module scope (the old local import is not
-# enough).
+# enough). Also repair the current standalone Service baseline: the package
+# catalog needs only the shared approval reader, not the backend-only Library
+# Host package module.
 rustfmt_marker = '\nrustfmt --edition 2021 '
 if rustfmt_marker not in body:
     raise SystemExit('could not locate rustfmt boundary in v2 staging body')
-ensure_rng = r'''
+preflight_repairs = r'''
 python3 - <<'PY'
 from pathlib import Path
+
 p = Path('vault-process/src/lib.rs')
 text = p.read_text()
 anchor = 'use aes_gcm::{Aes256Gcm, Key, Nonce};\n'
@@ -59,7 +62,34 @@ if module_import not in text:
         raise SystemExit('vault-process: AES-GCM import anchor missing')
     text = text.replace(anchor, module_import, 1)
 p.write_text(text)
+
+p = Path('engine/crates/backend/src/service_package_catalog.rs')
+text = p.read_text()
+module_anchor = 'use service_runtime::ServiceCatalog;\n\n'
+module_decl = 'use service_runtime::ServiceCatalog;\n\n#[path = "package_links/approval.rs"]\nmod package_approval;\n\n'
+if '#[path = "package_links/approval.rs"]' not in text:
+    if module_anchor not in text:
+        raise SystemExit('service_package_catalog: import anchor missing')
+    text = text.replace(module_anchor, module_decl, 1)
+text = text.replace(
+    'crate::package_links::approval::approved_runtime_capabilities',
+    'package_approval::approved_runtime_capabilities',
+)
+p.write_text(text)
 PY
 '''
-body = body.replace(rustfmt_marker, ensure_rng + rustfmt_marker, 1)
+body = body.replace(rustfmt_marker, preflight_repairs + rustfmt_marker, 1)
+
+# Ensure the baseline repair is formatted and included in the guarded commit.
+body = body.replace(
+    'engine/crates/backend/src/main.rs\n',
+    'engine/crates/backend/src/main.rs \\\n    engine/crates/backend/src/service_package_catalog.rs\n',
+    1,
+)
+body = body.replace(
+    'engine/crates/backend/src/main.rs \\\n    engine/Cargo.lock',
+    'engine/crates/backend/src/main.rs \\\n    engine/crates/backend/src/service_package_catalog.rs \\\n    engine/Cargo.lock',
+    1,
+)
+
 Path('/tmp/run-oid-vault-v2.sh').write_text(body)
