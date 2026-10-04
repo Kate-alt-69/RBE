@@ -18,6 +18,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
+      - name: Fix non-const Arc-backed getters
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('container-runtime/crates/container-runtime-core/src/container_task_loader.rs')
+          source = path.read_text(encoding='utf-8')
+          replacements = {
+              'pub const fn task_oid(&self)': 'pub fn task_oid(&self)',
+              'pub const fn runtime_image_sha256(&self)': 'pub fn runtime_image_sha256(&self)',
+              'pub const fn task_semantic_sha256(&self)': 'pub fn task_semantic_sha256(&self)',
+              'pub const fn target_id(&self)': 'pub fn target_id(&self)',
+          }
+          for old, new in replacements.items():
+              if old not in source:
+                  raise SystemExit(f'expected getter signature not found: {old}')
+              source = source.replace(old, new, 1)
+          path.write_text(source, encoding='utf-8')
+          PY
       - name: Format Phase 4 loader
         run: rustfmt --edition 2021 container-runtime/crates/container-runtime-core/src/container_task_loader.rs
       - name: Check Container Task loader
@@ -38,3 +56,4 @@ jobs:
           git commit -m 'FIX | CTI-004 verify RuntimeImage Task loader'
           git pull --rebase origin main
           git push origin HEAD:main
+# retry after rustc rejected const deref through Arc
