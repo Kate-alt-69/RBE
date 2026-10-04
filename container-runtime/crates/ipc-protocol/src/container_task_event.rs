@@ -109,7 +109,8 @@ impl TaskEventDictionary {
         if entries.len() > TASK_EVENT_MAX_DICTIONARY_ENTRIES {
             return Err(TaskEventError::InvalidDictionary(format!(
                 "event dictionary contains {} entries; maximum is {}",
-                entries.len(), TASK_EVENT_MAX_DICTIONARY_ENTRIES
+                entries.len(),
+                TASK_EVENT_MAX_DICTIONARY_ENTRIES
             )));
         }
         entries.sort_by_key(|entry| entry.event_id);

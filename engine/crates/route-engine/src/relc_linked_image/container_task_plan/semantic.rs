@@ -33,9 +33,11 @@ fn symbol_semantic_sha256(
     image: &RuntimeImage,
     symbol: &SymbolId,
 ) -> Result<String, ContainerTaskDiscoveryError> {
-    let executable = image
-        .executable(&symbol.source)
-        .ok_or_else(|| err(format!("missing executable for reachable Task symbol {symbol:?}")))?;
+    let executable = image.executable(&symbol.source).ok_or_else(|| {
+        err(format!(
+            "missing executable for reachable Task symbol {symbol:?}"
+        ))
+    })?;
     let mut hash = Sha256::new();
     feed(&mut hash, b"RBE_CTI_SYMBOL_V1");
     feed(&mut hash, symbol.source.as_str().as_bytes());
@@ -56,7 +58,9 @@ fn symbol_semantic_sha256(
                     .functions
                     .iter()
                     .find(|function| function.name == symbol.name)
-                    .ok_or_else(|| err(format!("missing Route function body for {}", symbol.name)))?;
+                    .ok_or_else(|| {
+                        err(format!("missing Route function body for {}", symbol.name))
+                    })?;
                 hash_params(&mut hash, &function.params);
                 hash_statements(&mut hash, &function.body);
             }
@@ -77,7 +81,10 @@ fn symbol_semantic_sha256(
                     .iter()
                     .find(|method| method.verb == verb)
                     .ok_or_else(|| {
-                        err(format!("missing Service lifecycle body for {}", symbol.name))
+                        err(format!(
+                            "missing Service lifecycle body for {}",
+                            symbol.name
+                        ))
                     })?;
                 hash_optional_param(&mut hash, method.param_name.as_deref());
                 hash_statements(&mut hash, &method.body);
@@ -101,7 +108,9 @@ fn symbol_semantic_sha256(
                     .functions
                     .iter()
                     .find(|function| function.name == symbol.name)
-                    .ok_or_else(|| err(format!("missing Service function body for {}", symbol.name)))?;
+                    .ok_or_else(|| {
+                        err(format!("missing Service function body for {}", symbol.name))
+                    })?;
                 hash_params(&mut hash, &function.params);
                 hash_statements(&mut hash, &function.body);
             }
@@ -150,10 +159,7 @@ pub(super) fn task_semantic_hash(
 ) -> String {
     let mut hash = Sha256::new();
     feed(&mut hash, TASK_HASH_DOMAIN);
-    feed(
-        &mut hash,
-        &CONTAINER_CAPABILITY_ABI_VERSION.to_be_bytes(),
-    );
+    feed(&mut hash, &CONTAINER_CAPABILITY_ABI_VERSION.to_be_bytes());
     feed(
         &mut hash,
         &[match kind {

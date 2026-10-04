@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context};
 use atomic_io::AtomicIo;
 use rbe_install_runtime::{
-    read_verified_package_services, read_verified_rpx_root_snapshots,
-    VerifiedPackageServiceSource, PACKAGE_SERVICE_CAPABILITY,
+    read_verified_package_services, read_verified_rpx_root_snapshots, VerifiedPackageServiceSource,
+    PACKAGE_SERVICE_CAPABILITY,
 };
 use service_runtime::ServiceCatalog;
 
@@ -110,25 +110,27 @@ pub fn stage_if_needed(
         .context("load verified RPX roots before package Service discovery")?;
     let mut packages = Vec::new();
     for snapshot in snapshots {
-        let approved = crate::package_approval::approved_runtime_capabilities(&project_root, &snapshot)
-            .with_context(|| {
-                format!(
-                    "load package Service approval for verified root {:?}",
-                    snapshot.package
-                )
-            })?;
+        let approved =
+            crate::package_approval::approved_runtime_capabilities(&project_root, &snapshot)
+                .with_context(|| {
+                    format!(
+                        "load package Service approval for verified root {:?}",
+                        snapshot.package
+                    )
+                })?;
         if !approved
             .iter()
             .any(|capability| capability == PACKAGE_SERVICE_CAPABILITY)
         {
             continue;
         }
-        let sources = read_verified_package_services(&project_root, &snapshot).with_context(|| {
-            format!(
-                "read verified package-owned .service sources for {:?}",
-                snapshot.package
-            )
-        })?;
+        let sources =
+            read_verified_package_services(&project_root, &snapshot).with_context(|| {
+                format!(
+                    "read verified package-owned .service sources for {:?}",
+                    snapshot.package
+                )
+            })?;
         packages.push((snapshot.package, sources));
     }
 
@@ -192,7 +194,11 @@ fn new_stage_root(project_root: &Path) -> anyhow::Result<PathBuf> {
     Ok(root)
 }
 
-fn copy_application_services(source_root: &Path, target_root: &Path, io: &AtomicIo) -> anyhow::Result<()> {
+fn copy_application_services(
+    source_root: &Path,
+    target_root: &Path,
+    io: &AtomicIo,
+) -> anyhow::Result<()> {
     match fs::symlink_metadata(source_root) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -326,7 +332,10 @@ fn validate_relative_path(path: &Path) -> anyhow::Result<()> {
     }
     for component in path.components() {
         if !matches!(component, Component::Normal(_)) {
-            bail!("Service source path contains an unsafe component: {}", path.display());
+            bail!(
+                "Service source path contains an unsafe component: {}",
+                path.display()
+            );
         }
     }
     Ok(())
@@ -336,14 +345,15 @@ fn ensure_directory(path: &Path) -> anyhow::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                bail!("Service catalog path is not a safe directory: {}", path.display());
+                bail!(
+                    "Service catalog path is not a safe directory: {}",
+                    path.display()
+                );
             }
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)
-                .with_context(|| format!("create Service catalog directory: {}", path.display()))
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path)
+            .with_context(|| format!("create Service catalog directory: {}", path.display())),
         Err(error) => Err(error)
             .with_context(|| format!("inspect Service catalog directory: {}", path.display())),
     }

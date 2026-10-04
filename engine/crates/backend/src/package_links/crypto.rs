@@ -161,8 +161,8 @@ fn constant_time_eq(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 fn ed25519_public(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let request: Ed25519KeyRequest =
-        serde_json::from_slice(payload).context("decode package crypto Ed25519 public-key request")?;
+    let request: Ed25519KeyRequest = serde_json::from_slice(payload)
+        .context("decode package crypto Ed25519 public-key request")?;
     let signing_key = decode_ed25519_signing_key(&request.seed_hex)?;
     serde_json::to_vec(&json!({
         "public_key_hex": hex::encode(signing_key.verifying_key().to_bytes()),

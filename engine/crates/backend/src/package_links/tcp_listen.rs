@@ -251,9 +251,9 @@ async fn read(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec<
     let connection = connection_for(package, owner, &request.handle)?;
     let timeout = io_timeout(request.timeout_ms)?;
     let mut slot = connection.stream.lock().await;
-    let stream = slot
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("package inbound TCP transport is unavailable during transition"))?;
+    let stream = slot.as_mut().ok_or_else(|| {
+        anyhow::anyhow!("package inbound TCP transport is unavailable during transition")
+    })?;
     let tls = matches!(stream, ManagedInboundTransport::Tls(_));
     let mut data = vec![0u8; request.max_bytes];
     let future = async {
@@ -280,9 +280,9 @@ async fn write(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result<Vec
     let connection = connection_for(package, owner, &request.handle)?;
     let timeout = io_timeout(request.timeout_ms)?;
     let mut slot = connection.stream.lock().await;
-    let stream = slot
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("package inbound TCP transport is unavailable during transition"))?;
+    let stream = slot.as_mut().ok_or_else(|| {
+        anyhow::anyhow!("package inbound TCP transport is unavailable during transition")
+    })?;
     let future = async {
         match stream {
             ManagedInboundTransport::Plain(stream) => stream.write_all(&request.data).await,
@@ -328,9 +328,7 @@ async fn start_tls(package: &str, owner: &str, payload: &[u8]) -> anyhow::Result
         .into_iter()
         .map(CertificateDer::from)
         .collect::<Vec<_>>();
-    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        request.private_key_pkcs8_der,
-    ));
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(request.private_key_pkcs8_der));
     let config = match ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)
@@ -378,20 +376,16 @@ fn validate_tls_material(cert_chain: &[Vec<u8>], private_key: &[u8]) -> anyhow::
             "package net:tcp-listen TLS certificate chain must contain 1..={MAX_CERT_CHAIN_ENTRIES} entries"
         );
     }
-    let total_cert_bytes = cert_chain
-        .iter()
-        .try_fold(0usize, |total, certificate| {
-            if certificate.is_empty() {
-                bail!("package net:tcp-listen TLS certificate entries cannot be empty");
-            }
-            total
-                .checked_add(certificate.len())
-                .ok_or_else(|| anyhow::anyhow!("package TLS certificate chain size overflow"))
-        })?;
+    let total_cert_bytes = cert_chain.iter().try_fold(0usize, |total, certificate| {
+        if certificate.is_empty() {
+            bail!("package net:tcp-listen TLS certificate entries cannot be empty");
+        }
+        total
+            .checked_add(certificate.len())
+            .ok_or_else(|| anyhow::anyhow!("package TLS certificate chain size overflow"))
+    })?;
     if total_cert_bytes > MAX_CERT_CHAIN_BYTES {
-        bail!(
-            "package net:tcp-listen TLS certificate chain exceeds {MAX_CERT_CHAIN_BYTES} bytes"
-        );
+        bail!("package net:tcp-listen TLS certificate chain exceeds {MAX_CERT_CHAIN_BYTES} bytes");
     }
     if private_key.is_empty() || private_key.len() > MAX_PRIVATE_KEY_BYTES {
         bail!(
@@ -504,7 +498,9 @@ fn insert_connection(package: &str, owner: &str, stream: TcpStream) -> anyhow::R
                 ManagedInboundConnection {
                     owner: owner.to_string(),
                     package: package.to_string(),
-                    stream: Arc::new(AsyncMutex::new(Some(ManagedInboundTransport::Plain(stream)))),
+                    stream: Arc::new(AsyncMutex::new(Some(ManagedInboundTransport::Plain(
+                        stream,
+                    )))),
                 },
             );
             return Ok(handle);
@@ -738,19 +734,7 @@ mod tests {
         assert!(validate_tls_material(&[], &[1]).is_err());
         assert!(validate_tls_material(&[vec![1]], &[]).is_err());
         assert!(validate_tls_material(&[vec![1]], &[1]).is_ok());
-        assert!(
-            validate_tls_material(
-                &vec![vec![1]; MAX_CERT_CHAIN_ENTRIES + 1],
-                &[1]
-            )
-            .is_err()
-        );
-        assert!(
-            validate_tls_material(
-                &[vec![1]],
-                &vec![1; MAX_PRIVATE_KEY_BYTES + 1]
-            )
-            .is_err()
-        );
+        assert!(validate_tls_material(&vec![vec![1]; MAX_CERT_CHAIN_ENTRIES + 1], &[1]).is_err());
+        assert!(validate_tls_material(&[vec![1]], &vec![1; MAX_PRIVATE_KEY_BYTES + 1]).is_err());
     }
 }

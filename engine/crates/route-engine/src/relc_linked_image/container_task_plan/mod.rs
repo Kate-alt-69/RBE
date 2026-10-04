@@ -21,9 +21,7 @@ use crate::SymbolId;
 
 use graph::{boundary_hints, capability_slots, reachable_symbols, required_oid_symbols};
 use semantic::{symbol_hashes, task_semantic_hash};
-use source_map::{
-    build_log_dictionary, build_source_map, source_provenance_hashes, source_texts,
-};
+use source_map::{build_log_dictionary, build_source_map, source_provenance_hashes, source_texts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerTaskKind {
@@ -185,7 +183,10 @@ pub struct ContainerTaskDiscovery {
 
 impl ContainerTaskDiscovery {
     pub fn oid_requests(&self) -> Vec<ContainerTaskOidRequest> {
-        self.tasks.iter().map(ContainerTaskPlan::oid_request).collect()
+        self.tasks
+            .iter()
+            .map(ContainerTaskPlan::oid_request)
+            .collect()
     }
 
     /// Attach already-reconciled numeric slots. This method never allocates.
@@ -241,12 +242,7 @@ pub fn discover_container_tasks(
         };
         for method in &route.methods {
             let root = SymbolId::new(source_id.clone(), format!("Route.{}", method.verb));
-            let canonical_id = canonical(&[
-                "task",
-                "route",
-                &manifest.logical_name,
-                &method.verb,
-            ])?;
+            let canonical_id = canonical(&["task", "route", &manifest.logical_name, &method.verb])?;
             let artifact = image
                 .route_wasm_artifact(source_id)
                 .filter(|artifact| artifact.verb.eq_ignore_ascii_case(&method.verb));

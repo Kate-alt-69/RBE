@@ -5,10 +5,10 @@
 //! interpreted RBE package workers. `container_task_image` is the shared CTI
 //! compiler/runtime binary contract; it does not grant Container authority.
 
-#[path = "lib.rs"]
-mod control_plane;
 pub mod container_task_event;
 pub mod container_task_image;
+#[path = "lib.rs"]
+mod control_plane;
 mod library_worker_proxy;
 mod library_worker_proxy_frame;
 mod library_worker_proxy_result;

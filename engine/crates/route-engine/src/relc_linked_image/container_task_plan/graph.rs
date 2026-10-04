@@ -64,8 +64,7 @@ pub(super) fn capability_slots(
     image: &RuntimeImage,
     sources: &BTreeSet<SourceId>,
 ) -> Result<Vec<ContainerTaskCapabilitySlot>, ContainerTaskDiscoveryError> {
-    let mut requirements =
-        BTreeMap::<RuntimeCapabilityRequirement, BTreeSet<SourceId>>::new();
+    let mut requirements = BTreeMap::<RuntimeCapabilityRequirement, BTreeSet<SourceId>>::new();
     for source in sources {
         if let Some(found) = image.capability_requirements(source) {
             for requirement in found {
@@ -83,10 +82,8 @@ pub(super) fn capability_slots(
         .into_iter()
         .enumerate()
         .map(|(index, (requirement, sources))| {
-            let node_kind = if matches!(
-                &requirement,
-                RuntimeCapabilityRequirement::Service { .. }
-            ) {
+            let node_kind = if matches!(&requirement, RuntimeCapabilityRequirement::Service { .. })
+            {
                 CtiNodeKind::ServiceCall
             } else {
                 CtiNodeKind::CapabilityCall

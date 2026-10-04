@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use core_lib::{
-    CtiEventClass, CtiLogLevel, CtiNodeKind, TaskEventDescriptor, TaskEventDictionary,
-};
+use core_lib::{CtiEventClass, CtiLogLevel, CtiNodeKind, TaskEventDescriptor, TaskEventDictionary};
 use sha2::{Digest, Sha256};
 
 use crate::embedded_rel::extract_embedded_rel;
@@ -86,7 +84,11 @@ pub(super) fn source_provenance_hashes(
             .ok_or_else(|| err(format!("missing Runtime Image source {id}")))?;
         let text = texts
             .get(&(manifest.kind, manifest.logical_name.clone()))
-            .ok_or_else(|| err(format!("missing source bytes for Container Task dependency {id}")))?;
+            .ok_or_else(|| {
+                err(format!(
+                    "missing source bytes for Container Task dependency {id}"
+                ))
+            })?;
         out.insert(
             id.clone(),
             hex::encode(Sha256::digest(text.source.as_bytes())),
@@ -99,10 +101,8 @@ pub(super) fn build_source_map(
     image: &RuntimeImage,
     reachable: &BTreeSet<SymbolId>,
     texts: &SourceTextCatalog,
-) -> Result<
-    (Vec<ContainerTaskSourceFile>, Vec<ContainerTaskSourceSite>),
-    ContainerTaskDiscoveryError,
-> {
+) -> Result<(Vec<ContainerTaskSourceFile>, Vec<ContainerTaskSourceSite>), ContainerTaskDiscoveryError>
+{
     let mut paths = BTreeSet::new();
     for symbol in reachable {
         if let Some(manifest) = image.source(&symbol.source) {
@@ -114,8 +114,8 @@ pub(super) fn build_source_map(
 
     let mut files = Vec::with_capacity(paths.len());
     for (index, path) in paths.into_iter().enumerate() {
-        let file_id = u32::try_from(index)
-            .map_err(|_| err("CTI source-file ID space exhausted"))?;
+        let file_id =
+            u32::try_from(index).map_err(|_| err("CTI source-file ID space exhausted"))?;
         files.push(ContainerTaskSourceFile { file_id, path });
     }
     let file_ids = files
@@ -134,8 +134,8 @@ pub(super) fn build_source_map(
         let file_id = *file_ids
             .get(&text.path)
             .ok_or_else(|| err("CTI source-map file ID invariant failed"))?;
-        let site_id = u32::try_from(sites.len() + 1)
-            .map_err(|_| err("CTI error-site ID space exhausted"))?;
+        let site_id =
+            u32::try_from(sites.len() + 1).map_err(|_| err("CTI error-site ID space exhausted"))?;
         let (line, column) = locate(&text.source, &symbol.name).unwrap_or((1, 1));
         sites.push(ContainerTaskSourceSite {
             site_id,
@@ -144,8 +144,7 @@ pub(super) fn build_source_map(
             file_id,
             line: u32::try_from(text.first_line.saturating_add(line.saturating_sub(1)))
                 .map_err(|_| err("CTI source line does not fit u32"))?,
-            column: u32::try_from(column)
-                .map_err(|_| err("CTI source column does not fit u32"))?,
+            column: u32::try_from(column).map_err(|_| err("CTI source column does not fit u32"))?,
         });
     }
     Ok((files, sites))
@@ -177,7 +176,12 @@ pub(super) fn build_log_dictionary(
         Ok(())
     };
 
-    push(CtiEventClass::Task, CtiLogLevel::Task, task, "TASK : started {symbol}")?;
+    push(
+        CtiEventClass::Task,
+        CtiLogLevel::Task,
+        task,
+        "TASK : started {symbol}",
+    )?;
     push(
         CtiEventClass::Task,
         CtiLogLevel::Task,

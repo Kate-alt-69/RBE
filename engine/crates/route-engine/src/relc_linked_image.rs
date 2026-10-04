@@ -16,9 +16,9 @@ use serde_json::Value as JsonValue;
 pub mod container_task_plan;
 pub use container_task_plan::{
     discover_container_tasks, ContainerTaskBoundaryHint, ContainerTaskCapabilitySlot,
-    ContainerTaskCodeRef, ContainerTaskDiscovery, ContainerTaskDiscoveryError,
-    ContainerTaskGraph, ContainerTaskKind, ContainerTaskNode, ContainerTaskOidRequest,
-    ContainerTaskPlan, ContainerTaskSourceFile, ContainerTaskSourceSite,
+    ContainerTaskCodeRef, ContainerTaskDiscovery, ContainerTaskDiscoveryError, ContainerTaskGraph,
+    ContainerTaskKind, ContainerTaskNode, ContainerTaskOidRequest, ContainerTaskPlan,
+    ContainerTaskSourceFile, ContainerTaskSourceSite,
 };
 
 use crate::oid_link::LinkedRelKind;
@@ -114,13 +114,9 @@ pub fn compile_runtime_image_with_packages_and_linked_rel(
     // OID or assemble a `.bin`; instead it emits canonical Task OID requests,
     // DAG metadata, capability slots, logging dictionaries and source/error maps
     // for the later assembler/index phases.
-    let container_tasks = discover_container_tasks(
-        &image,
-        &linked_rel,
-        raw_server_source,
-        &discovery_sources,
-    )
-    .map_err(RelcLinkedImageError::ContainerTask)?;
+    let container_tasks =
+        discover_container_tasks(&image, &linked_rel, raw_server_source, &discovery_sources)
+            .map_err(RelcLinkedImageError::ContainerTask)?;
 
     // Phase 4 allocates only the post-DCE reachable symbol set plus the Task OID
     // identities emitted above. Capacity must be checked after discovery so
@@ -422,13 +418,11 @@ mod tests {
 
         let first_hash = &first.container_tasks.tasks[0].semantic_sha256;
         assert_eq!(
-            first_hash,
-            &unrelated_changed.container_tasks.tasks[0].semantic_sha256,
+            first_hash, &unrelated_changed.container_tasks.tasks[0].semantic_sha256,
             "unreachable same-file helpers must not invalidate a Task"
         );
         assert_ne!(
-            first_hash,
-            &reachable_changed.container_tasks.tasks[0].semantic_sha256,
+            first_hash, &reachable_changed.container_tasks.tasks[0].semantic_sha256,
             "reachable body changes must invalidate a Task"
         );
     }
@@ -468,9 +462,7 @@ mod tests {
         assert_eq!(task.graph.nodes[1].kind, core_lib::CtiNodeKind::Return);
         assert_eq!(task.graph.nodes[2].kind, core_lib::CtiNodeKind::Fail);
         assert!(!task.semantic_sha256.is_empty());
-        assert!(task
-            .required_oid_symbols
-            .contains("service_demo_ready"));
+        assert!(task.required_oid_symbols.contains("service_demo_ready"));
         assert!(task.log_events.entries().len() >= 3);
     }
 }
