@@ -1,3 +1,4 @@
+# Temporary guarded migration; delete after LIBHOST-049 lands.
 name: one-shot fold Library Host proxy into Container
 
 on:
