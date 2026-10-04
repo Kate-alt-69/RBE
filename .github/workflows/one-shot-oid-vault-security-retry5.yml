@@ -1,0 +1,162 @@
+name: One-shot OID Vault security retry5
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-oid-vault-security-retry5.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  retry-secure-oid-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Run structurally corrected OID Vault security staging body
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          source = Path('.github/workflows/one-shot-oid-vault-security-v2.yml').read_text()
+          marker = '        run: |\n'
+          if source.count(marker) != 1:
+              raise SystemExit('could not uniquely locate v2 staging run block')
+          body = textwrap.dedent(source.split(marker, 1)[1])
+
+          # 1) Disambiguate Connection field patch.
+          old = """replace_once(
+              'vault-process/src/lib.rs',
+              '''    token: String,
+              seq: u64,
+          ''',
+              '''    token: String,
+              ipc_key: [u8; 32],
+              seq: u64,
+          '''
+          )"""
+          new = """replace_once(
+              'vault-process/src/lib.rs',
+              '''struct Connection {
+              child: Child,
+              stdin: ChildStdin,
+              reader: BufReader<std::process::ChildStdout>,
+              token: String,
+              seq: u64,
+          ''',
+              '''struct Connection {
+              child: Child,
+              stdin: ChildStdin,
+              reader: BufReader<std::process::ChildStdout>,
+              token: String,
+              ipc_key: [u8; 32],
+              seq: u64,
+          '''
+          )"""
+          if body.count(old) != 1:
+              raise SystemExit(f'expected one ambiguous Connection patch, found {body.count(old)}')
+          body = body.replace(old, new, 1)
+
+          # 2) Module-scope RngCore for internal AEAD nonce/key creation.
+          needle = """use aes_gcm::{Aes256Gcm, Key, Nonce};
+          use secrecy::ExposeSecret;"""
+          replacement = """use aes_gcm::{Aes256Gcm, Key, Nonce};
+          use rand::RngCore;
+          use secrecy::ExposeSecret;"""
+          if body.count(needle) != 1:
+              raise SystemExit(f'expected one vault-process import patch, found {body.count(needle)}')
+          body = body.replace(needle, replacement, 1)
+
+          # 3) Replace stale exact Worker::handle patch with structural insertion.
+          start_marker = """replace_once(
+              'vault-process/src/lib.rs',
+              '''            ClientCommand::Set {"""
+          end_marker = """replace_once(
+              'vault-process/src/lib.rs',
+              '''    fn ensure_live_connection"""
+          start = body.find(start_marker)
+          end = body.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'could not isolate stale ClientCommand::Set patch: start={start} end={end}')
+          structural_handle = """p = Path('vault-process/src/lib.rs')
+          text = p.read_text()
+          handle_start = text.find('    fn handle(&mut self, command: ClientCommand) {')
+          request_start = text.find('\\n    fn request(', handle_start)
+          if handle_start < 0 or request_start < 0:
+              raise SystemExit('could not locate Vault Worker::handle/request boundary')
+          segment = text[handle_start:request_start]
+          if 'ClientCommand::Internal {' in segment:
+              raise SystemExit('Vault Internal command arm already exists unexpectedly')
+          match_close = segment.rfind('\\n        }\\n    }')
+          if match_close < 0:
+              raise SystemExit('could not locate closing match in Vault Worker::handle')
+          insert_at = handle_start + match_close
+          internal_arm = '\\n' + '\\n'.join([
+              '            ClientCommand::Internal {',
+              '                op,',
+              '                namespace,',
+              '                payload,',
+              '                response,',
+              '            } => {',
+              '                self.last_operation = Some(\"internal-oid\");',
+              '                if let Err(err) = self.ensure_live_connection(\"internal-oid\") {',
+              '                    let _ = response.send(Err(err));',
+              '                    return;',
+              '                }',
+              '                let result = self.request_internal(&op, &namespace, payload);',
+              '                let failed = result.is_err();',
+              '                let _ = response.send(result);',
+              '                if failed {',
+              '                    self.recover_if_process_failed(\"internal-oid\");',
+              '                }',
+              '            }',
+          ])
+          text = text[:insert_at] + internal_arm + text[insert_at:]
+          p.write_text(text)
+          """
+          body = body[:start] + structural_handle + body[end:]
+
+          # 4) Replace stale Connection constructor exact patch with structural patch.
+          constructor_start_marker = """replace_once(
+              'vault-process/src/lib.rs',
+              '''        Ok(Connection {"""
+          constructor_end_marker = """replace_once(
+              'vault-process/src/lib.rs',
+              '''    let token = generate_session_token();"""
+          cstart = body.find(constructor_start_marker)
+          cend = body.find(constructor_end_marker, cstart)
+          if cstart < 0 or cend < 0:
+              raise SystemExit(f'could not isolate stale Connection constructor patch: start={cstart} end={cend}')
+          structural_connection = """p = Path('vault-process/src/lib.rs')
+          text = p.read_text()
+          spawn_start = text.find('    fn spawn_connection(&self, force_dbus: bool) -> anyhow::Result<Connection> {')
+          spawn_end = text.find('\\n    fn shutdown_child', spawn_start)
+          if spawn_start < 0 or spawn_end < 0:
+              raise SystemExit('could not locate Vault spawn_connection body')
+          segment = text[spawn_start:spawn_end]
+          ready_anchor = '        Ok(Connection {\\n'
+          if segment.count(ready_anchor) != 1:
+              raise SystemExit(f'expected one Connection constructor, found {segment.count(ready_anchor)}')
+          if 'let ipc_key = parse_ipc_key(&ready.ipc_key)?;' not in segment:
+              segment = segment.replace(ready_anchor, '        let ipc_key = parse_ipc_key(&ready.ipc_key)?;\\n' + ready_anchor, 1)
+          token_anchor = '            token: ready.token,\\n            seq: 1,\\n'
+          if segment.count(token_anchor) != 1:
+              raise SystemExit(f'expected one ready token/seq pair, found {segment.count(token_anchor)}')
+          segment = segment.replace(token_anchor, '            token: ready.token,\\n            ipc_key,\\n            seq: 1,\\n', 1)
+          text = text[:spawn_start] + segment + text[spawn_end:]
+          p.write_text(text)
+          """
+          body = body[:cstart] + structural_connection + body[cend:]
+
+          Path('/tmp/run-oid-vault-v2.sh').write_text(body)
+          PY
+          bash /tmp/run-oid-vault-v2.sh
