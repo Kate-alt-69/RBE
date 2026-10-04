@@ -1,0 +1,56 @@
+name: One-shot Phase 6 Native Bench Validation
+
+on:
+  push:
+    paths:
+      - .github/workflows/one-shot-phase6-bench-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  native-bench:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Check benchmark formatting
+        run: rustfmt --edition 2021 --check crates/route-engine/src/bin/rel-native-bench.rs
+      - name: Check route-engine targets
+        run: cargo check -p route-engine --all-targets --locked
+      - name: Clippy benchmark target
+        run: cargo clippy -p route-engine --bin rel-native-bench --locked -- -D warnings
+      - name: Test benchmark target
+        run: cargo test -p route-engine --bin rel-native-bench --locked
+      - name: Run release benchmark smoke test
+        run: |
+          cargo run -p route-engine --release --bin rel-native-bench --locked -- \
+            --profile ci-smoke \
+            --iterations 3 \
+            --warmup 1 \
+            --output /tmp/rbe-native-bench.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('/tmp/rbe-native-bench.json').read_text())
+          assert report['schema'] == 'RBE-REL-NATIVE-BENCH/1'
+          assert report['profile'] == 'ci-smoke'
+          names = [item['name'] for item in report['metrics']]
+          assert names == [
+              'rel_optimizer',
+              'linked_rel_reachability',
+              'service_bin_assembly',
+              'service_bin_cache_decode',
+          ]
+          assert report['artifacts']['reachableSymbolCount'] == 2
+          assert 'backend_process_startup_latency' in report['unmeasured']
+          print(json.dumps(report, indent=2))
+          PY
