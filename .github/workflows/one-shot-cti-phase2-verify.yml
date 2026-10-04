@@ -38,15 +38,8 @@ jobs:
 
           linked = Path('engine/crates/route-engine/src/relc_linked_image.rs')
           text = linked.read_text()
-          old = '''    let requested = discovery
-        .symbols
-        .len()
-        .checked_add(container_task_count)
-        .unwrap_or(usize::MAX);'''
-          new = '''    let requested = discovery
-        .symbols
-        .len()
-        .saturating_add(container_task_count);'''
+          old = '.checked_add(container_task_count)\n        .unwrap_or(usize::MAX)'
+          new = '.saturating_add(container_task_count)'
           if old not in text:
               raise SystemExit('CTI linked-image capacity anchor missing')
           linked.write_text(text.replace(old, new, 1))
