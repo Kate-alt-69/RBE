@@ -16,9 +16,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Normalize staging doc replacement
+      - name: Normalize staging doc replacements
         run: |
           sed -i 's/doc = doc.replace("`container-library-worker-proxy`", "`container --library-worker-proxy`")/doc = doc.replace("container-library-worker-proxy", "container --library-worker-proxy")/' scripts/one_shot_fold_library_host.py
+          sed -i 's/Library Host does \*\*not\*\* ship a separate `dep\/container-library-worker-proxy` executable\./Library Host does **not** ship a separate proxy sidecar executable./' scripts/one_shot_fold_library_host.py
 
       - name: Apply guarded Library Host refactor
         run: python3 scripts/one_shot_fold_library_host.py
