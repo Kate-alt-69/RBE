@@ -7,9 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ipc_protocol::container_task_image::{
-    cti_sha256, ContainerTaskImage, CtiHeaderV1, CtiSection,
-};
+use ipc_protocol::container_task_image::{cti_sha256, ContainerTaskImage, CtiHeaderV1, CtiSection};
 
 pub const CTI_COMPILER_ABI_VERSION: u16 = 1;
 pub const CONTAINER_TASK_INDEX_MAGIC: [u8; 8] = *b"RBECTIX1";
@@ -250,9 +248,7 @@ impl ContainerTaskIndex {
         })
     }
 
-    pub fn iter(
-        &self,
-    ) -> impl Iterator<Item = (&ContainerTaskIndexKey, &ContainerTaskIndexEntry)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&ContainerTaskIndexKey, &ContainerTaskIndexEntry)> {
         self.entries.iter()
     }
 
@@ -429,10 +425,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "rbe-cti-{label}-{}-{nonce}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("rbe-cti-{label}-{}-{nonce}", std::process::id()))
     }
 
     #[test]
