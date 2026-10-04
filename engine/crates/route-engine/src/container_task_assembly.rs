@@ -12,8 +12,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use container_runtime_core::{
-    ContainerTaskAssembler, ContainerTaskAssemblyInput, ContainerTaskIndex,
-    CTI_COMPILER_ABI_VERSION,
+    ContainerTaskAssembler, ContainerTaskAssemblyInput, CTI_COMPILER_ABI_VERSION,
 };
 use ipc_protocol::container_task_image::{
     cti_sha256, CtiSection, CtiSectionKind, CTI_DEFAULT_ARENA_BYTES, CTI_MAX_SLOTS,
@@ -61,7 +60,10 @@ impl fmt::Display for ContainerTaskAssemblyError {
         match self {
             Self::Oid(error) => write!(formatter, "Container Task OID update failed: {error}"),
             Self::InvalidRuntimeImage(message) => {
-                write!(formatter, "Container Task Runtime Image is invalid: {message}")
+                write!(
+                    formatter,
+                    "Container Task Runtime Image is invalid: {message}"
+                )
             }
             Self::InvalidTask(message) => write!(formatter, "Container Task is invalid: {message}"),
             Self::Cache(message) => write!(formatter, "Container Task cache failed: {message}"),
@@ -223,7 +225,10 @@ fn reconcile_task_oids(
         .filter(|(id, _)| !id.starts_with(TASK_OID_PREFIX))
         .map(|(id, oid)| (id.clone(), *oid))
         .collect::<BTreeMap<_, _>>();
-    let mut occupied = retained_non_tasks.values().copied().collect::<BTreeSet<_>>();
+    let mut occupied = retained_non_tasks
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>();
     occupied.extend(pinned_oids.iter().copied());
 
     let mut task_bindings = BTreeMap::new();
@@ -332,7 +337,10 @@ fn lower_sections(
     Ok(sections)
 }
 
-fn encode_oid_table(task_oid: u16, required_oids: &[u16]) -> Result<Vec<u8>, ContainerTaskAssemblyError> {
+fn encode_oid_table(
+    task_oid: u16,
+    required_oids: &[u16],
+) -> Result<Vec<u8>, ContainerTaskAssemblyError> {
     let mut out = Vec::new();
     push_u16(&mut out, CTI_SECTION_PAYLOAD_VERSION);
     push_u16(&mut out, task_oid);
@@ -565,7 +573,10 @@ fn encode_log_events(task: &ContainerTaskPlan) -> Result<Vec<u8>, ContainerTaskA
 fn encode_source_files(task: &ContainerTaskPlan) -> Result<Vec<u8>, ContainerTaskAssemblyError> {
     let mut files = task.source_files.clone();
     files.sort_by_key(|file| file.file_id);
-    if files.windows(2).any(|pair| pair[0].file_id == pair[1].file_id) {
+    if files
+        .windows(2)
+        .any(|pair| pair[0].file_id == pair[1].file_id)
+    {
         return Err(ContainerTaskAssemblyError::InvalidTask(format!(
             "Task {:?} repeats a source file ID",
             task.canonical_id
@@ -576,9 +587,8 @@ fn encode_source_files(task: &ContainerTaskPlan) -> Result<Vec<u8>, ContainerTas
     push_u16(&mut out, 0);
     push_u32(
         &mut out,
-        u32::try_from(files.len()).map_err(|_| {
-            ContainerTaskAssemblyError::InvalidTask("too many source files".into())
-        })?,
+        u32::try_from(files.len())
+            .map_err(|_| ContainerTaskAssemblyError::InvalidTask("too many source files".into()))?,
     );
     for file in files {
         push_u32(&mut out, file.file_id);
@@ -590,7 +600,10 @@ fn encode_source_files(task: &ContainerTaskPlan) -> Result<Vec<u8>, ContainerTas
 fn encode_source_map(task: &ContainerTaskPlan) -> Result<Vec<u8>, ContainerTaskAssemblyError> {
     let mut sites = task.source_map.clone();
     sites.sort_by_key(|site| site.site_id);
-    if sites.windows(2).any(|pair| pair[0].site_id == pair[1].site_id) {
+    if sites
+        .windows(2)
+        .any(|pair| pair[0].site_id == pair[1].site_id)
+    {
         return Err(ContainerTaskAssemblyError::InvalidTask(format!(
             "Task {:?} repeats a source-map site ID",
             task.canonical_id
@@ -625,9 +638,8 @@ fn encode_error_sites(task: &ContainerTaskPlan) -> Result<Vec<u8>, ContainerTask
     push_u16(&mut out, 0);
     push_u32(
         &mut out,
-        u32::try_from(sites.len()).map_err(|_| {
-            ContainerTaskAssemblyError::InvalidTask("too many error sites".into())
-        })?,
+        u32::try_from(sites.len())
+            .map_err(|_| ContainerTaskAssemblyError::InvalidTask("too many error sites".into()))?,
     );
     for site in sites {
         push_u32(&mut out, site);
@@ -705,7 +717,11 @@ fn encode_debug_names(task: &ContainerTaskPlan) -> Result<Vec<u8>, ContainerTask
 
 fn target_id(target: &OidTarget) -> u32 {
     let digest = Sha256::digest(target.label().as_bytes());
-    u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 prefix is four bytes"))
+    u32::from_be_bytes(
+        digest[..4]
+            .try_into()
+            .expect("SHA-256 prefix is four bytes"),
+    )
 }
 
 fn edge(value: Option<u32>) -> u32 {
