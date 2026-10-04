@@ -157,6 +157,31 @@ jobs:
           """
           body = body[:cstart] + structural_connection + body[cend:]
 
+          # 5) Replace brittle OidError::code multi-line patch with a semantic line edit.
+          code_start_marker = """replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''            Self::UnsupportedTarget(_) => \"RELC3001\","""
+          code_end_marker = """replace_once(
+              'engine/crates/route-engine/src/service_oid.rs',
+              '''            Self::Invariant(message) => {"""
+          estart = body.find(code_start_marker)
+          eend = body.find(code_end_marker, estart)
+          if estart < 0 or eend < 0:
+              raise SystemExit(f'could not isolate stale OidError::code patch: start={estart} end={eend}')
+          structural_error_code = """p = Path('engine/crates/route-engine/src/service_oid.rs')
+          text = p.read_text()
+          anchor = '            Self::Invariant(_) => \"RELC9001\",\\n'
+          if text.count(anchor) != 1:
+              raise SystemExit(f'expected one OidError invariant mapping, found {text.count(anchor)}')
+          text = text.replace(
+              anchor,
+              '            Self::Invariant(_) | Self::Security(_) | Self::Vault(_) | Self::Locked(_) => \"RELC9001\",\\n',
+              1,
+          )
+          p.write_text(text)
+          """
+          body = body[:estart] + structural_error_code + body[eend:]
+
           Path('/tmp/run-oid-vault-v2.sh').write_text(body)
           PY
           bash /tmp/run-oid-vault-v2.sh
