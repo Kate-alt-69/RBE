@@ -23,21 +23,18 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          mod = Path('engine/crates/route-engine/src/relc_linked_image/container_task_plan/mod.rs')
-          text = mod.read_text()
-          old = 'use crate::rel_symbol_discovery::{LinkedRelDiscovery, LinkedRelSymbolSpec};'
-          new = 'use crate::oid_link::LinkedRelSymbolSpec;\nuse crate::rel_symbol_discovery::LinkedRelDiscovery;'
-          if old not in text:
-              raise SystemExit('CTI mod LinkedRelSymbolSpec import anchor missing')
-          mod.write_text(text.replace(old, new, 1))
-
-          graph = Path('engine/crates/route-engine/src/relc_linked_image/container_task_plan/graph.rs')
-          text = graph.read_text()
-          old = 'use crate::rel_symbol_discovery::LinkedRelSymbolSpec;'
-          new = 'use crate::oid_link::LinkedRelSymbolSpec;'
-          if old not in text:
-              raise SystemExit('CTI graph LinkedRelSymbolSpec import anchor missing')
-          graph.write_text(text.replace(old, new, 1))
+          root = Path('engine/crates/route-engine/src/relc_linked_image/container_task_plan')
+          for path in root.glob('*.rs'):
+              text = path.read_text()
+              text = text.replace(
+                  'use crate::rel_symbol_discovery::{LinkedRelDiscovery, LinkedRelSymbolSpec};',
+                  'use crate::oid_link::LinkedRelSymbolSpec;\nuse crate::rel_symbol_discovery::LinkedRelDiscovery;',
+              )
+              text = text.replace(
+                  'use crate::rel_symbol_discovery::LinkedRelSymbolSpec;',
+                  'use crate::oid_link::LinkedRelSymbolSpec;',
+              )
+              path.write_text(text)
           PY
       - name: Format CTI Phase 1-2 surface only
         run: |
