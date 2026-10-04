@@ -1,0 +1,42 @@
+name: One-shot CTI Phase 3 verify
+
+on:
+  push:
+    paths:
+      - '.github/workflows/one-shot-cti-phase3-verify.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: Format Phase 3 surface
+        run: |
+          rustfmt --edition 2021 \
+            engine/crates/route-engine/src/container_task_assembly.rs
+      - name: Check route-engine
+        working-directory: engine
+        run: cargo check -p route-engine --locked
+      - name: Test Phase 3 CTI assembly
+        working-directory: engine
+        run: cargo test -p route-engine container_task_assembly --locked
+      - name: Clippy route-engine
+        working-directory: engine
+        run: cargo clippy -p route-engine --all-targets --locked -- -D warnings
+      - name: Commit verified Phase 3 surface and remove verifier
+        run: |
+          git config user.name 'Kate'
+          git config user.email 'dhwanksh2000@gmail.com'
+          git add engine/crates/route-engine/src/container_task_assembly.rs
+          git rm .github/workflows/one-shot-cti-phase3-verify.yml
+          git commit -m 'FIX | CTI-003 verify Task assembly bridge'
+          git pull --rebase origin main
+          git push origin HEAD:main
