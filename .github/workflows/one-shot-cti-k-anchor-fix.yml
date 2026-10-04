@@ -1,0 +1,74 @@
+name: One-shot CTI K anchor fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/one-shot-cti-k-anchor-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Harden Phase 4 K patch helper
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/one-shot-cti-phase4-k-implement.yml')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              '          from pathlib import Path\n',
+              '          from pathlib import Path\n          import re\n',
+              1,
+          )
+          old = '''          def replace_once(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if old not in text:
+                  raise SystemExit(f'{label}: anchor not found in {path}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+'''
+          new = '''          def replace_once(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if old in text:
+                  p.write_text(text.replace(old, new, 1), encoding='utf-8')
+                  return
+
+              def loose_pattern(block):
+                  lines = block.splitlines()
+                  return r'\\n'.join(
+                      (r'[ \\t]*' + re.escape(line.strip())) if line.strip() else r'[ \\t]*'
+                      for line in lines
+                  )
+
+              match = re.search(loose_pattern(old), text)
+              if match is None:
+                  raise SystemExit(f'{label}: anchor not found in {path}')
+              first = match.group(0).splitlines()[0]
+              indent = first[:len(first) - len(first.lstrip())]
+              replacement = '\\n'.join(
+                  (indent + line.strip()) if line.strip() else ''
+                  for line in new.splitlines()
+              )
+              p.write_text(text[:match.start()] + replacement + text[match.end():], encoding='utf-8')
+'''
+          if old not in text:
+              raise SystemExit('replace_once helper anchor missing')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+      - name: Commit hardened verifier and remove helper
+        run: |
+          git config user.name 'Kate'
+          git config user.email 'dhwanksh2000@gmail.com'
+          git add .github/workflows/one-shot-cti-phase4-k-implement.yml
+          git rm .github/workflows/one-shot-cti-k-anchor-fix.yml
+          git commit -m 'FIX | CTI-005 tolerate verifier indentation drift'
+          git pull --rebase origin main
+          git push origin HEAD:main
