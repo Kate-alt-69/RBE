@@ -22,6 +22,62 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+      - name: Patch benchmark to use public Service parser
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/route-engine/src/bin/rel-native-bench.rs')
+          text = path.read_text()
+          text = text.replace(
+              'discover_linked_rel_symbols, optimize_function, BinaryOp, Expr, FunctionDef, ImportTarget,\n    LinkedRelSourceUnit, ModuleFile, OidTarget, ServiceProgram, Statement,',
+              'discover_linked_rel_symbols, optimize_function, BinaryOp, Expr, FunctionDef,\n    LinkedRelSourceUnit, ModuleFile, OidTarget, ServiceProgram, Statement,',
+          )
+          old = '''    let service = ServiceProgram {
+        imports: vec![
+            ImportTarget::CustomFunction {
+                path: "module/bench.module".into(),
+                function: "live".into(),
+            },
+            ImportTarget::CustomFunction {
+                path: "module/bench.module".into(),
+                function: "dead".into(),
+            },
+        ],
+        functions: vec![FunctionDef {
+            name: "run".into(),
+            params: Vec::new(),
+            body: vec![Statement::If {
+                condition: Expr::Bool(false),
+                then_body: vec![Statement::Return(Expr::Call(
+                    Box::new(Expr::Ident("dead".into())),
+                    Vec::new(),
+                ))],
+                else_body: vec![Statement::Return(Expr::Call(
+                    Box::new(Expr::Ident("live".into())),
+                    Vec::new(),
+                ))],
+            }],
+        }],
+        exports: vec!["run".into()],
+        class_name: None,
+        lifecycle: Vec::new(),
+        classes: Vec::new(),
+    };'''
+          new = '''    let service = route_engine::parse_service_source(
+        r#":import["module/bench.module".live, "module/bench.module".dead]
+:service[name = bench]
+export function run() {
+    if (false) { return dead(); }
+    else { return live(); }
+}
+"#,
+    )
+    .expect("benchmark Service fixture must parse through the public REL frontend");'''
+          if old not in text:
+              raise SystemExit('benchmark Service fixture anchor not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
       - name: Format benchmark harness
         run: rustfmt --edition 2021 crates/route-engine/src/bin/rel-native-bench.rs
       - name: Check benchmark formatting
