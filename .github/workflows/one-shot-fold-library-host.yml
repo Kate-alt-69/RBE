@@ -1,0 +1,80 @@
+name: one-shot fold Library Host proxy into Container
+
+on:
+  push:
+    paths:
+      - '.github/workflows/one-shot-fold-library-host.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fold:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply guarded Library Host refactor
+        run: python3 scripts/one_shot_fold_library_host.py
+
+      - name: Format touched Rust
+        run: |
+          rustfmt --edition 2021 container-runtime/crates/container-bin/src/main.rs
+          rustfmt --edition 2021 container-runtime/crates/container-bin/src/library_worker_mode.rs
+          rustfmt --edition 2021 engine/crates/backend/src/rel_host_executor.rs
+          rustfmt --edition 2021 engine/crates/backend/src/main.rs
+          rustfmt --edition 2021 engine/crates/backend/build.rs
+
+      - name: Validate shell and removed binary contract
+        run: |
+          bash -n build-core.sh
+          ! grep -R --line-number --fixed-strings 'container-library-worker-proxy' \
+            container-runtime/crates/container-bin/Cargo.toml \
+            build-core.sh \
+            engine/crates/backend/build.rs \
+            engine/crates/backend/src/rel_host_executor.rs \
+            doc/library-host.md \
+            doc/library-host-web-build.md \
+            doc/library-worker-launch-preparation.md \
+            doc/README.md
+
+      - name: Check Container package
+        working-directory: container-runtime
+        run: cargo check -p container-bin --all-targets
+
+      - name: Test Container security package
+        working-directory: container-runtime
+        run: cargo test -p container-bin
+
+      - name: Check backend
+        working-directory: engine
+        run: cargo check -p backend --bin backend
+
+      - name: Test backend boot error classification
+        working-directory: engine
+        run: cargo test -p backend --bin backend boot_error_classification_tests
+
+      - name: Commit source and documentation only
+        run: |
+          git config user.name 'Kate'
+          git config user.email 'dhwanksh2000@gmail.com'
+          git add \
+            container-runtime/crates/container-bin/Cargo.toml \
+            container-runtime/crates/container-bin/src/main.rs \
+            container-runtime/crates/container-bin/src/library_worker_mode.rs \
+            container-runtime/crates/container-bin/src/library_worker_proxy_main.rs \
+            engine/crates/backend/src/rel_host_executor.rs \
+            engine/crates/backend/src/main.rs \
+            engine/crates/backend/build.rs \
+            build-core.sh \
+            doc/library-host.md \
+            doc/oid-compiler-cache.md \
+            doc/library-host-web-build.md \
+            doc/library-worker-launch-preparation.md \
+            doc/README.md
+          git diff --cached --check
+          git commit -m 'REFACTOR | LIBHOST-049 fold proxy into Container mode'
+          git pull --rebase origin main
+          git push origin HEAD:main
