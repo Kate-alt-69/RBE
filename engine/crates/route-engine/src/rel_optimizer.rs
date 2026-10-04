@@ -170,10 +170,9 @@ fn fold_expr(
                 Expr::Ident(name.clone())
             }
         }
-        Expr::Member(base, field) => Expr::Member(
-            Box::new(fold_expr(base, constants, stats)),
-            field.clone(),
-        ),
+        Expr::Member(base, field) => {
+            Expr::Member(Box::new(fold_expr(base, constants, stats)), field.clone())
+        }
         Expr::Call(callee, args) => {
             // Never rewrite the callee identity: `foo()` may name a local or
             // imported callable even when a same-named value binding exists.
@@ -491,7 +490,10 @@ mod tests {
         ]);
         let (optimized, stats) = optimize_function(&input);
         assert_eq!(optimized.body.len(), 1);
-        assert!(matches!(optimized.body[0], Statement::Return(Expr::Bool(true))));
+        assert!(matches!(
+            optimized.body[0],
+            Statement::Return(Expr::Bool(true))
+        ));
         assert_eq!(stats.propagated_constants, 1);
         assert_eq!(stats.removed_dead_stores, 1);
     }
@@ -512,7 +514,10 @@ mod tests {
         ]);
         let (optimized, stats) = optimize_function(&input);
         assert_eq!(optimized.body.len(), 1);
-        assert!(matches!(optimized.body[0], Statement::Return(Expr::Bool(true))));
+        assert!(matches!(
+            optimized.body[0],
+            Statement::Return(Expr::Bool(true))
+        ));
         assert_eq!(stats.constant_folds, 1);
         assert_eq!(stats.simplified_branches, 1);
         assert_eq!(stats.removed_unreachable_statements, 1);
@@ -565,7 +570,10 @@ mod tests {
             right: Box::new(call("dangerous")),
         })]);
         let (optimized, stats) = optimize_function(&input);
-        assert!(matches!(optimized.body[0], Statement::Return(Expr::Bool(false))));
+        assert!(matches!(
+            optimized.body[0],
+            Statement::Return(Expr::Bool(false))
+        ));
         assert_eq!(stats.constant_folds, 1);
     }
 
@@ -577,7 +585,10 @@ mod tests {
             right: Box::new(Expr::Number(1.0)),
         })]);
         let (optimized, stats) = optimize_function(&input);
-        assert!(matches!(optimized.body[0], Statement::Return(Expr::Binary { .. })));
+        assert!(matches!(
+            optimized.body[0],
+            Statement::Return(Expr::Binary { .. })
+        ));
         assert_eq!(stats.constant_folds, 0);
     }
 }

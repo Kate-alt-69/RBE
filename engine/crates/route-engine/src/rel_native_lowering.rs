@@ -199,12 +199,9 @@ mod tests {
             ],
         };
 
-        let lowering = lower_linked_rel_function(
-            &symbol(LinkedRelKind::ServiceExport),
-            &function,
-            &target,
-        )
-        .unwrap();
+        let lowering =
+            lower_linked_rel_function(&symbol(LinkedRelKind::ServiceExport), &function, &target)
+                .unwrap();
         let NativeRelLowering::Native(fragment) = lowering else {
             panic!("optimizer-proven Boolean leaf should lower natively");
         };
