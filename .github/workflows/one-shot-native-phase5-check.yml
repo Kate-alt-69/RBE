@@ -54,7 +54,12 @@ jobs:
           replace_once(
               "crates/backend/src/service_boot.rs",
               '#[path = "service_package_catalog.rs"]\nmod service_package_catalog;\n',
-              '#[path = "service_package_catalog.rs"]\nmod service_package_catalog;\n\npub(crate) use service_native_host::{attach_native_service_frames, NativeServiceHostFrame};\n',
+              '#[path = "service_package_catalog.rs"]\nmod service_package_catalog;\n\n#[allow(unused_imports)]\npub(crate) use service_native_host::{attach_native_service_frames, NativeServiceHostFrame};\n',
+          )
+          replace_once(
+              "crates/backend/src/service_native_cutover.rs",
+              "use std::path::Path;\n",
+              "",
           )
           replace_once(
               "crates/backend/src/service_native_cutover.rs",
@@ -65,6 +70,11 @@ jobs:
               "crates/backend/src/service_native_cutover.rs",
               "}\n\n/// Build the native Service generation for one already-compiled Runtime Image.",
               '''}\n\n/// Attach the compiler-owned native bundle to the authenticated Runtime ENV\n/// transport. Calling this even when there is no native generation removes the\n/// reserved internal key, so application Runtime ENV can never spoof a worker\n/// bootstrap frame.\npub fn attach_native_service_cutover(\n    runtime_env: &mut Value,\n    cutover: Option<&NativeServiceCutover>,\n) -> anyhow::Result<()> {\n    match cutover {\n        Some(cutover) => cutover.attach_runtime_env(runtime_env),\n        None => attach_native_service_frames(runtime_env, BTreeMap::new()),\n    }\n}\n\n/// Build the native Service generation for one already-compiled Runtime Image.''',
+          )
+          replace_once(
+              "crates/backend/src/service_native_cutover.rs",
+              '''    #[test]\n    fn fallback_map_requires_explicit_reason_for_every_non_native_service() {\n        let source = SourceId::physical(route_engine::RelSourceKind::Service, "demo").unwrap();\n        let mut image = RuntimeImage::empty_for_tests();\n        image.services.push(source.clone());\n        // `empty_for_tests` intentionally has no manifest; the helper must fail\n        // closed rather than manufacturing a fallback identity/reason.\n        assert!(evaluator_fallback_map(&image, &BTreeSet::new(), &BTreeMap::new()).is_err());\n    }''',
+              '''    #[test]\n    fn no_cutover_strips_spoofed_native_runtime_env_frame() {\n        let mut runtime_env = serde_json::json!({\n            "__rbeNativeServiceWorkerV1": {"spoofed": true},\n            "PUBLIC": "ok"\n        });\n        attach_native_service_cutover(&mut runtime_env, None).unwrap();\n        assert!(runtime_env.get("__rbeNativeServiceWorkerV1").is_none());\n        assert_eq!(runtime_env.get("PUBLIC"), Some(&serde_json::json!("ok")));\n    }''',
           )
 
           replace_once(
