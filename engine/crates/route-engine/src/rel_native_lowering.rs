@@ -10,7 +10,8 @@
 //! - zero parameters;
 //! - no linked-symbol dependencies;
 //! - no host capabilities;
-//! - exactly one `return true;` or `return false;` statement.
+//! - a body that Phase-6 scalar optimization proves equivalent to exactly one
+//!   `return true;` or `return false;` statement.
 //!
 //! OID native ABI v1 returns that Boolean as canonical integer 0/1 in the
 //! platform integer result register. `OID_FLAG_RETURNS_BOOL` makes the result
@@ -19,6 +20,7 @@
 use crate::ast::{Expr, FunctionDef, Statement};
 use crate::oid_link::{LinkedRelKind, LinkedRelSymbolSpec};
 use crate::oid_materialize::NativeOidFragment;
+use crate::rel_optimizer::optimize_function;
 use crate::service_oid::{
     lower_native_bool_return, OidError, OidTarget, OID_FLAG_BASELINE_CPU, OID_FLAG_CALLABLE_LEAF,
     OID_FLAG_RETURNS_BOOL,
@@ -77,11 +79,16 @@ pub fn lower_linked_rel_function(
         ));
     }
 
-    let value = match function.body.as_slice() {
+    // Phase 6 deliberately optimizes a clone. The parsed Runtime Image function
+    // remains untouched for evaluator fallback and diagnostics, while native
+    // lowering gets the smallest provably-equivalent body we currently know how
+    // to emit.
+    let (optimized, _) = optimize_function(function);
+    let value = match optimized.body.as_slice() {
         [Statement::Return(Expr::Bool(value))] => *value,
         _ => {
             return Ok(fallback(
-                "callable is outside the constant-Boolean leaf subset",
+                "callable remains outside the constant-Boolean leaf subset after Phase-6 scalar optimization",
             ))
         }
     };
@@ -109,6 +116,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::ast::BinaryOp;
     use crate::oid_materialize::materialize_rel_records;
     use crate::rel_oid_bridge::reconcile_rel_cache;
     use crate::service_oid::{OidCache, OidRecordKind};
@@ -166,6 +174,47 @@ mod tests {
         );
         assert!(true_fragment.required_oids.is_empty());
         assert!(true_fragment.relocations.is_empty());
+    }
+
+    #[test]
+    fn scalar_optimizer_expands_native_leaf_subset_without_widening_abi() {
+        let target = OidTarget::current();
+        let function = FunctionDef {
+            name: "ready".into(),
+            params: Vec::new(),
+            body: vec![
+                Statement::Const {
+                    name: "enabled".into(),
+                    value: Expr::Bool(true),
+                },
+                Statement::If {
+                    condition: Expr::Binary {
+                        left: Box::new(Expr::Number(2.0)),
+                        op: BinaryOp::Greater,
+                        right: Box::new(Expr::Number(1.0)),
+                    },
+                    then_body: vec![Statement::Return(Expr::Ident("enabled".into()))],
+                    else_body: vec![Statement::Return(Expr::Bool(false))],
+                },
+            ],
+        };
+
+        let lowering = lower_linked_rel_function(
+            &symbol(LinkedRelKind::ServiceExport),
+            &function,
+            &target,
+        )
+        .unwrap();
+        let NativeRelLowering::Native(fragment) = lowering else {
+            panic!("optimizer-proven Boolean leaf should lower natively");
+        };
+        assert!(!fragment.machine_code.is_empty());
+        assert_eq!(
+            fragment.flags,
+            OID_FLAG_CALLABLE_LEAF | OID_FLAG_BASELINE_CPU | OID_FLAG_RETURNS_BOOL
+        );
+        assert!(fragment.required_oids.is_empty());
+        assert!(fragment.relocations.is_empty());
     }
 
     #[test]
