@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
-      - name: Fix CTI compiler imports
+      - name: Fix CTI compiler surface
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -35,6 +35,21 @@ jobs:
                   'use crate::oid_link::LinkedRelSymbolSpec;',
               )
               path.write_text(text)
+
+          linked = Path('engine/crates/route-engine/src/relc_linked_image.rs')
+          text = linked.read_text()
+          old = '''    let requested = discovery
+        .symbols
+        .len()
+        .checked_add(container_task_count)
+        .unwrap_or(usize::MAX);'''
+          new = '''    let requested = discovery
+        .symbols
+        .len()
+        .saturating_add(container_task_count);'''
+          if old not in text:
+              raise SystemExit('CTI linked-image capacity anchor missing')
+          linked.write_text(text.replace(old, new, 1))
           PY
       - name: Format CTI Phase 1-2 surface only
         run: |
