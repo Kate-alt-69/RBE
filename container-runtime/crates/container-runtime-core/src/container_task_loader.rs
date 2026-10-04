@@ -10,13 +10,9 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use ipc_protocol::{
-    cti_sha256, ContainerTaskImage, CAPABILITY_ABI_VERSION,
-};
+use ipc_protocol::{cti_sha256, ContainerTaskImage, CAPABILITY_ABI_VERSION};
 
-use crate::{
-    ContainerTaskAssembler, ContainerTaskIndexEntry, CTI_COMPILER_ABI_VERSION,
-};
+use crate::{ContainerTaskAssembler, ContainerTaskIndexEntry, CTI_COMPILER_ABI_VERSION};
 
 const TASK_SLOT_COUNT: usize = u16::MAX as usize + 1;
 const EMPTY_TASK_SLOT: u32 = u32::MAX;
@@ -41,19 +37,19 @@ impl LoadedTaskImage {
         self.cti_sha256
     }
 
-    pub const fn task_oid(&self) -> u16 {
+    pub fn task_oid(&self) -> u16 {
         self.image.header.task_oid
     }
 
-    pub const fn runtime_image_sha256(&self) -> [u8; 32] {
+    pub fn runtime_image_sha256(&self) -> [u8; 32] {
         self.image.header.runtime_image_sha256
     }
 
-    pub const fn task_semantic_sha256(&self) -> [u8; 32] {
+    pub fn task_semantic_sha256(&self) -> [u8; 32] {
         self.image.header.task_semantic_sha256
     }
 
-    pub const fn target_id(&self) -> u32 {
+    pub fn target_id(&self) -> u32 {
         self.image.header.target_id
     }
 }
@@ -198,13 +194,9 @@ impl ContainerTaskLoader {
         }
 
         let path = assembler.blob_path(&entry.cti_sha256);
-        let bytes = self
-            .io
-            .read(&path)
-            .map_err(|error| ContainerTaskLoadError::Io(format!(
-                "failed to read {}: {error}",
-                path.display()
-            )))?;
+        let bytes = self.io.read(&path).map_err(|error| {
+            ContainerTaskLoadError::Io(format!("failed to read {}: {error}", path.display()))
+        })?;
         let observed_sha256 = cti_sha256(&bytes);
         if observed_sha256 != entry.cti_sha256 {
             return Err(ContainerTaskLoadError::HashMismatch(format!(
@@ -301,10 +293,7 @@ impl RuntimeImageTaskRegistry {
         Ok(self.lookup(&runtime_image_sha256, task_oid))
     }
 
-    pub fn remove(
-        &self,
-        runtime_image_sha256: &[u8; 32],
-    ) -> Option<Arc<RuntimeImageTaskTable>> {
+    pub fn remove(&self, runtime_image_sha256: &[u8; 32]) -> Option<Arc<RuntimeImageTaskTable>> {
         write_unpoisoned(&self.tables).remove(runtime_image_sha256)
     }
 }
@@ -356,15 +345,24 @@ pub enum ContainerTaskLoadError {
 impl fmt::Display for ContainerTaskLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRuntimeImage(message) => write!(formatter, "invalid Runtime Image: {message}"),
-            Self::RuntimeImageNotFound(image) => {
-                write!(formatter, "Runtime Image {image} has no Container Task index entries")
+            Self::InvalidRuntimeImage(message) => {
+                write!(formatter, "invalid Runtime Image: {message}")
             }
-            Self::InvalidIndex(message) => write!(formatter, "invalid Container Task index: {message}"),
+            Self::RuntimeImageNotFound(image) => {
+                write!(
+                    formatter,
+                    "Runtime Image {image} has no Container Task index entries"
+                )
+            }
+            Self::InvalidIndex(message) => {
+                write!(formatter, "invalid Container Task index: {message}")
+            }
             Self::Io(message) => formatter.write_str(message),
             Self::HashMismatch(message) => write!(formatter, "CTI hash mismatch: {message}"),
             Self::MalformedCti(message) => write!(formatter, "malformed CTI: {message}"),
-            Self::IdentityMismatch(message) => write!(formatter, "CTI identity mismatch: {message}"),
+            Self::IdentityMismatch(message) => {
+                write!(formatter, "CTI identity mismatch: {message}")
+            }
             Self::AbiMismatch(message) => write!(formatter, "CTI ABI mismatch: {message}"),
         }
     }
@@ -495,10 +493,7 @@ mod tests {
         let error = ContainerTaskLoader::new(&root)
             .load_runtime_image(runtime_image)
             .unwrap_err();
-        assert!(matches!(
-            error,
-            ContainerTaskLoadError::IdentityMismatch(_)
-        ));
+        assert!(matches!(error, ContainerTaskLoadError::IdentityMismatch(_)));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -535,9 +530,7 @@ mod tests {
         );
         let loader = ContainerTaskLoader::new(&root);
         let registry = RuntimeImageTaskRegistry::new();
-        registry
-            .install_from_cache(&loader, runtime_image)
-            .unwrap();
+        registry.install_from_cache(&loader, runtime_image).unwrap();
         let old_task = registry.lookup(&runtime_image, 31_844).unwrap();
         let old_hash = old_task.cti_sha256();
 
@@ -545,9 +538,7 @@ mod tests {
             &assembler,
             input(runtime_image, 31_844, 6, CAPABILITY_ABI_VERSION),
         );
-        registry
-            .install_from_cache(&loader, runtime_image)
-            .unwrap();
+        registry.install_from_cache(&loader, runtime_image).unwrap();
         let new_task = registry.lookup(&runtime_image, 31_844).unwrap();
 
         assert_ne!(old_hash, new_task.cti_sha256());
