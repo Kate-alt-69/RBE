@@ -40,4 +40,25 @@ if body.count(old_helper) != 1:
     raise SystemExit(f'expected one replace_once helper, found {body.count(old_helper)}')
 body = body.replace('from pathlib import Path\n', 'from pathlib import Path\nimport re\n', 1)
 body = body.replace(old_helper, new_helper, 1)
+
+# The original v2 body used fill_bytes in vault-process but its import patch was
+# lost during earlier staging retries. Ensure the generated source imports the
+# trait before rustfmt/cargo are invoked.
+rustfmt_marker = '\nrustfmt --edition 2021 '
+if rustfmt_marker not in body:
+    raise SystemExit('could not locate rustfmt boundary in v2 staging body')
+ensure_rng = r'''
+python3 - <<'PY'
+from pathlib import Path
+p = Path('vault-process/src/lib.rs')
+text = p.read_text()
+if 'use rand::RngCore;' not in text:
+    anchor = 'use aes_gcm::{Aes256Gcm, Key, Nonce};\n'
+    if anchor not in text:
+        raise SystemExit('vault-process: AES-GCM import anchor missing')
+    text = text.replace(anchor, anchor + 'use rand::RngCore;\n', 1)
+p.write_text(text)
+PY
+'''
+body = body.replace(rustfmt_marker, ensure_rng + rustfmt_marker, 1)
 Path('/tmp/run-oid-vault-v2.sh').write_text(body)
