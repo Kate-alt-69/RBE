@@ -21,8 +21,9 @@ use route_engine::service_native_build::{
 };
 use route_engine::service_native_lifetime::NativeServiceLifetimeRegistry;
 use route_engine::{
-    discover_linked_rel_from_runtime_image, discover_physical_rel_sources, open_service_oid_cache,
-    select_native_services, OidTarget, RuntimeImage, SourceId,
+    discover_linked_rel_from_runtime_image, discover_physical_rel_sources,
+    open_service_oid_cache_with_vault, select_native_services, OidTarget, OidVaultAuthority,
+    RuntimeImage, SourceId,
 };
 
 use super::service_boot::{attach_native_service_frames, NativeServiceHostFrame};
@@ -71,6 +72,7 @@ pub fn attach_native_service_cutover(
 pub fn prepare_native_service_cutover(
     image: &RuntimeImage,
     catalog: Option<&ServiceCatalog>,
+    oid_vault: std::sync::Arc<dyn OidVaultAuthority>,
 ) -> anyhow::Result<Option<NativeServiceCutover>> {
     let Some(catalog) = catalog else {
         return Ok(None);
@@ -145,7 +147,7 @@ pub fn prepare_native_service_cutover(
         });
     }
 
-    let mut cache = open_service_oid_cache(&project_root)
+    let mut cache = open_service_oid_cache_with_vault(&project_root, oid_vault)
         .context("open project OID cache for native Service cutover")?;
     let lifetimes = NativeServiceLifetimeRegistry::new(DynamicOidPinRegistry::default());
     let transaction = lifetimes.begin_link_transaction();

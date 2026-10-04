@@ -22,6 +22,9 @@ mod error_reporter_daemon;
 mod host_bootstrap;
 mod host_capability;
 mod maintenance_notice;
+mod oid_vault;
+#[path = "package_links/approval.rs"]
+mod package_approval;
 mod port_guard;
 mod runtime_image_boot;
 #[allow(dead_code)]
@@ -627,17 +630,6 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     let runtime_image = runtime_image_boot::compile(&config, service_catalog.as_ref())?;
     runtime_image_boot::apply_server_policy(&mut config, &runtime_image.server_policy)?;
     runtime_image_boot::apply_middleware_plan(&mut config, &runtime_image.middleware_plan)?;
-    let native_service_cutover = service_native_cutover::prepare_native_service_cutover(
-        &runtime_image,
-        service_catalog.as_ref(),
-    )?;
-    if let Some(cutover) = native_service_cutover.as_ref() {
-        tracing::info!(
-            image = %runtime_image.image_id,
-            native_services = cutover.native_service_count(),
-            "native Service Runtime Image generation prepared"
-        );
-    }
     let runtime_image = Arc::new(route_engine::RuntimeImageSlot::new(runtime_image));
     let config = Arc::new(config);
     boot_trace(format!(
@@ -709,6 +701,24 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         }
     };
     boot_trace("vault process ready");
+
+    let oid_vault: Arc<dyn route_engine::OidVaultAuthority> = Arc::new(
+        oid_vault::BackendOidVault::new(vault_instance.clone(), &runtime_paths::binary_dir())?,
+    );
+    runtime_image_boot::prepare_core_oid_cache(&runtime_paths::binary_dir(), oid_vault.clone())?;
+    let runtime_image_snapshot = runtime_image.snapshot();
+    let native_service_cutover = service_native_cutover::prepare_native_service_cutover(
+        runtime_image_snapshot.as_ref(),
+        service_catalog.as_ref(),
+        oid_vault,
+    )?;
+    if let Some(cutover) = native_service_cutover.as_ref() {
+        tracing::info!(
+            image = %runtime_image_snapshot.image_id,
+            native_services = cutover.native_service_count(),
+            "Vault-attested native Service Runtime Image generation prepared"
+        );
+    }
 
     let vault_refresh_task = spawn_vault_refresh(
         vault_instance.clone(),

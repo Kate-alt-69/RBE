@@ -11,9 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use atomic_io::AtomicIo;
 use sha2::{Digest, Sha256};
+
+use crate::oid_security::{record_aad, OidSecurity, OidVaultAuthority};
 
 pub const OID_DONE: u16 = 0;
 pub const OID_RBE_CORE_START: u16 = 1;
@@ -56,6 +59,9 @@ pub enum OidError {
     UnsupportedTarget(String),
     Exhausted(&'static str),
     Invariant(String),
+    Security(String),
+    Vault(String),
+    Locked(String),
 }
 
 impl OidError {
@@ -67,7 +73,7 @@ impl OidError {
             | Self::TargetMismatch { .. } => "RELC9001",
             Self::UnsupportedTarget(_) => "RELC3001",
             Self::Exhausted(_) => "RELC2000",
-            Self::Invariant(_) => "RELC9001",
+            Self::Invariant(_) | Self::Security(_) | Self::Vault(_) | Self::Locked(_) => "RELC9001",
         }
     }
 }
@@ -91,6 +97,11 @@ impl fmt::Display for OidError {
             Self::Invariant(message) => {
                 write!(formatter, "OID compiler invariant failed: {message}")
             }
+            Self::Security(message) => {
+                write!(formatter, "OID cache security check failed: {message}")
+            }
+            Self::Vault(message) => write!(formatter, "OID Vault authority failed: {message}"),
+            Self::Locked(message) => write!(formatter, "OID cache lease unavailable: {message}"),
         }
     }
 }
@@ -911,6 +922,7 @@ pub struct OidCache {
     root: PathBuf,
     io: AtomicIo,
     index: OidIndex,
+    security: Option<OidSecurity>,
 }
 
 impl OidCache {
@@ -936,15 +948,82 @@ impl OidCache {
                 return Self::create_fresh(root, io);
             }
             index.validate_structure()?;
-            return Ok(Self { root, io, index });
+            return Ok(Self {
+                root,
+                io,
+                index,
+                security: None,
+            });
         }
 
         Self::create_fresh(root, io)
     }
 
+    pub fn open_or_rebuild_with_vault(
+        project_root: &Path,
+        authority: Arc<dyn OidVaultAuthority>,
+    ) -> Result<Self, OidError> {
+        let io = AtomicIo::new();
+        let security = OidSecurity::acquire(project_root, authority)?;
+        let root = project_root.join(".cache/compiler/oid");
+        let index_path = root.join("index");
+        let current_target = OidTarget::current();
+
+        if index_path.is_file() {
+            let bytes = security.open_index(&root, &io)?;
+            let index = OidIndex::from_bytes(&bytes)?;
+            security.verify_generation(index.generation)?;
+            if index.target != current_target
+                || index.native_abi_version != OID_NATIVE_ABI_VERSION
+                || index.compiler_abi != OID_COMPILER_ABI
+            {
+                if root.exists() {
+                    fs::remove_dir_all(&root)?;
+                }
+                security.reset()?;
+                return Self::create_fresh_secured(root, io, security);
+            }
+            index.validate_structure()?;
+            return Ok(Self {
+                root,
+                io,
+                index,
+                security: Some(security),
+            });
+        }
+
+        if root.exists() {
+            fs::remove_dir_all(&root)?;
+        }
+        security.reset()?;
+        Self::create_fresh_secured(root, io, security)
+    }
+
     fn create_fresh(root: PathBuf, io: AtomicIo) -> Result<Self, OidError> {
         let index = OidIndex::fresh();
-        let cache = Self { root, io, index };
+        let cache = Self {
+            root,
+            io,
+            index,
+            security: None,
+        };
+        cache.persist_index()?;
+        Ok(cache)
+    }
+
+    fn create_fresh_secured(
+        root: PathBuf,
+        io: AtomicIo,
+        security: OidSecurity,
+    ) -> Result<Self, OidError> {
+        fs::create_dir_all(&root)?;
+        let index = OidIndex::fresh();
+        let cache = Self {
+            root,
+            io,
+            index,
+            security: Some(security),
+        };
         cache.persist_index()?;
         Ok(cache)
     }
@@ -963,8 +1042,12 @@ impl OidCache {
 
     pub fn persist_index(&self) -> Result<(), OidError> {
         self.index.validate_structure()?;
-        self.io
-            .write_atomic(&self.root.join("index"), &self.index.to_bytes()?)?;
+        let bytes = self.index.to_bytes()?;
+        if let Some(security) = &self.security {
+            security.write_index(&self.root, &self.io, &bytes, self.index.generation)?;
+        } else {
+            self.io.write_atomic(&self.root.join("index"), &bytes)?;
+        }
         Ok(())
     }
 
@@ -976,9 +1059,14 @@ impl OidCache {
                 observed: next.target.label(),
             });
         }
-        self.io
-            .write_atomic(&self.root.join("index"), &next.to_bytes()?)?;
+        let bytes = next.to_bytes()?;
+        if let Some(security) = &self.security {
+            security.write_index(&self.root, &self.io, &bytes, next.generation)?;
+        } else {
+            self.io.write_atomic(&self.root.join("index"), &bytes)?;
+        }
         self.index = next;
+
         Ok(())
     }
 
@@ -987,6 +1075,9 @@ impl OidCache {
             fs::remove_dir_all(&self.root)?;
         }
         self.index = OidIndex::fresh();
+        if let Some(security) = &self.security {
+            security.reset()?;
+        }
         self.persist_index()
     }
 
@@ -995,7 +1086,12 @@ impl OidCache {
     }
 
     pub fn read_record(&self, oid: u16) -> Result<OidRecord, OidError> {
-        let bytes = self.io.read(&self.record_path(oid))?;
+        let bytes = if let Some(security) = &self.security {
+            let aad = record_aad(oid, &self.index.target.label(), &self.index.compiler_abi);
+            security.open_record(&self.root, &self.io, oid, &aad)?
+        } else {
+            self.io.read(&self.record_path(oid))?
+        };
         let record = OidRecord::from_bytes(&bytes)?;
         if record.oid != oid {
             return Err(OidError::InvalidRecord(format!(
@@ -1022,18 +1118,37 @@ impl OidCache {
         }
         let bytes = record.to_bytes()?;
         let path = self.record_path(record.oid);
-        if path.is_file() {
-            if let Ok(existing) = self.io.read(&path) {
-                if existing == bytes {
-                    return Ok(false);
+        if let Some(security) = &self.security {
+            let aad = record_aad(
+                record.oid,
+                &self.index.target.label(),
+                &self.index.compiler_abi,
+            );
+            if security.record_matches(&self.root, &self.io, record.oid, &aad, &bytes)? {
+                return Ok(false);
+            }
+            security.stage_record_write(&self.root, &self.io, record.oid, &aad, &bytes)?;
+        } else {
+            if path.is_file() {
+                if let Ok(existing) = self.io.read(&path) {
+                    if existing == bytes {
+                        return Ok(false);
+                    }
                 }
             }
+            self.io.write_atomic(&path, &bytes)?;
         }
-        self.io.write_atomic(&path, &bytes)?;
         Ok(true)
     }
 
     pub fn remove_record(&self, oid: u16) -> Result<bool, OidError> {
+        if let Some(security) = &self.security {
+            let changed = security.stage_record_remove(&self.root, oid)?;
+            if changed {
+                self.persist_index()?;
+            }
+            return Ok(changed);
+        }
         let path = self.record_path(oid);
         match fs::remove_file(path) {
             Ok(()) => Ok(true),
@@ -1101,6 +1216,16 @@ pub fn prepare_service_oid_cache(
 ) -> Result<CoreMaterializationReport, OidError> {
     let cache = OidCache::open_or_rebuild(project_root)?;
     materialize_bootstrap_core(&cache)
+}
+
+pub fn prepare_service_oid_cache_with_vault(
+    project_root: &Path,
+    authority: Arc<dyn OidVaultAuthority>,
+) -> Result<CoreMaterializationReport, OidError> {
+    let cache = OidCache::open_or_rebuild_with_vault(project_root, authority)?;
+    let report = materialize_bootstrap_core(&cache)?;
+    cache.persist_index()?;
+    Ok(report)
 }
 
 fn materialize_bootstrap_core(cache: &OidCache) -> Result<CoreMaterializationReport, OidError> {

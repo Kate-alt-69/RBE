@@ -9,10 +9,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::oid_security::OidVaultAuthority;
 use crate::service_oid::{
-    prepare_service_oid_cache as prepare_service_oid_cache_once, CoreMaterializationReport,
-    OidCache, OidError,
+    prepare_service_oid_cache as prepare_service_oid_cache_once,
+    prepare_service_oid_cache_with_vault as prepare_service_oid_cache_with_vault_once,
+    CoreMaterializationReport, OidCache, OidError,
 };
 
 pub fn oid_cache_root(project_root: &Path) -> PathBuf {
@@ -32,12 +35,40 @@ pub fn prepare_service_oid_cache(
     }
 }
 
+pub fn prepare_service_oid_cache_with_vault(
+    project_root: &Path,
+    authority: Arc<dyn OidVaultAuthority>,
+) -> Result<CoreMaterializationReport, OidError> {
+    match prepare_service_oid_cache_with_vault_once(project_root, authority.clone()) {
+        Ok(report) => Ok(report),
+        Err(error) if recoverable_cache_error(&error) => {
+            clear_service_oid_cache(project_root)?;
+            prepare_service_oid_cache_with_vault_once(project_root, authority)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn open_service_oid_cache(project_root: &Path) -> Result<OidCache, OidError> {
     match OidCache::open_or_rebuild(project_root) {
         Ok(cache) => Ok(cache),
         Err(error) if recoverable_cache_error(&error) => {
             clear_service_oid_cache(project_root)?;
             OidCache::open_or_rebuild(project_root)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn open_service_oid_cache_with_vault(
+    project_root: &Path,
+    authority: Arc<dyn OidVaultAuthority>,
+) -> Result<OidCache, OidError> {
+    match OidCache::open_or_rebuild_with_vault(project_root, authority.clone()) {
+        Ok(cache) => Ok(cache),
+        Err(error) if recoverable_cache_error(&error) => {
+            clear_service_oid_cache(project_root)?;
+            OidCache::open_or_rebuild_with_vault(project_root, authority)
         }
         Err(error) => Err(error),
     }
@@ -64,7 +95,10 @@ pub fn clear_service_oid_cache(project_root: &Path) -> Result<(), OidError> {
 fn recoverable_cache_error(error: &OidError) -> bool {
     matches!(
         error,
-        OidError::InvalidIndex(_) | OidError::InvalidRecord(_) | OidError::TargetMismatch { .. }
+        OidError::InvalidIndex(_)
+            | OidError::InvalidRecord(_)
+            | OidError::TargetMismatch { .. }
+            | OidError::Security(_)
     )
 }
 

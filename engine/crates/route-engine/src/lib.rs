@@ -134,6 +134,7 @@ pub mod oid_cache_bootstrap;
 pub mod oid_index_bridge;
 pub mod oid_link;
 pub mod oid_materialize;
+pub mod oid_security;
 pub mod package_native_link;
 pub mod package_native_semantics;
 pub mod rel_image_discovery;
@@ -189,8 +190,11 @@ pub use module_runtime::{
 };
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
 pub use oid_cache_bootstrap::{
-    clear_service_oid_cache, oid_cache_root, open_service_oid_cache, prepare_service_oid_cache,
+    clear_service_oid_cache, oid_cache_root, open_service_oid_cache,
+    open_service_oid_cache_with_vault, prepare_service_oid_cache,
+    prepare_service_oid_cache_with_vault,
 };
+pub use oid_security::OidVaultAuthority;
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
 pub use rel_host_builtins::{

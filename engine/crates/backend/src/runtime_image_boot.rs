@@ -14,8 +14,11 @@ const RUNTIME_IMAGE_COMPILE_HELP: &str =
     "https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5100";
 const PACKAGE_GRAPH_SETTINGS_KEY: &str = "__rbePackageGraphSha256";
 
-fn prepare_core_oid_cache(root: &Path) -> anyhow::Result<route_engine::CoreMaterializationReport> {
-    let report = route_engine::prepare_service_oid_cache(root).map_err(|error| {
+pub fn prepare_core_oid_cache(
+    root: &Path,
+    vault: std::sync::Arc<dyn route_engine::OidVaultAuthority>,
+) -> anyhow::Result<route_engine::CoreMaterializationReport> {
+    let report = route_engine::prepare_service_oid_cache_with_vault(root, vault).map_err(|error| {
         anyhow::anyhow!(
             "RBE5100 Backend could not prepare the project OID compiler cache.\n\nCache:\n  {}\n\nError:\n  {error}\n\nNote:\n  Corrupt/stale disposable OID cache state is rebuilt automatically. This failure is a real target, permission, capacity, or compiler invariant error. Startup stopped before the API listener was bound.\n\nHelp:\n  {RUNTIME_IMAGE_COMPILE_HELP}",
             route_engine::oid_cache_root(root).display()
@@ -35,7 +38,6 @@ fn prepare_core_oid_cache(root: &Path) -> anyhow::Result<route_engine::CoreMater
 
 pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Result<RuntimeImage> {
     let root = runtime_paths::binary_dir();
-    prepare_core_oid_cache(&root)?;
     let server_path = root.join("server.server");
     let server_source = if server_path.is_file() {
         std::fs::read_to_string(&server_path).map_err(|error| {
@@ -903,30 +905,6 @@ mod diagnostic_tests {
     };
 
     use super::*;
-
-    #[test]
-    fn backend_compile_root_prepares_and_reuses_core_oid_cache() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "rbe-backend-oid-bootstrap-{}-{nonce}",
-            std::process::id()
-        ));
-
-        let first = prepare_core_oid_cache(&root).expect("prepare first OID core cache");
-        assert!(first.total > 0);
-        assert_eq!(first.total, first.written + first.reused);
-        assert!(route_engine::oid_cache_root(&root).join("index").is_file());
-
-        let second = prepare_core_oid_cache(&root).expect("reuse OID core cache");
-        assert_eq!(second.total, first.total);
-        assert_eq!(second.written, 0);
-        assert_eq!(second.reused, second.total);
-
-        let _ = std::fs::remove_dir_all(root);
-    }
 
     #[test]
     fn rel_parse_failure_renders_source_frame_note_hint_and_narrow_help_link() {

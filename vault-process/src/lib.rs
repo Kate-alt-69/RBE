@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use rand::RngCore;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +19,8 @@ const RESTART_DELAY: Duration = Duration::from_millis(200);
 const RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const VAULT_STABLE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RESTARTS: u32 = 5;
+const INTERNAL_CALLER: &str = "__rbe.oid-cache";
+const INTERNAL_IPC_PROTOCOL: &str = "RBE-VAULT-INTERNAL-IPC/1";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Request {
@@ -40,6 +45,14 @@ struct Response {
 struct Ready {
     kind: String,
     token: String,
+    ipc_key: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct InternalPayload {
+    aad_hex: Option<String>,
+    data_hex: Option<String>,
+    text: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct NeedsDbus {
@@ -57,6 +70,12 @@ enum ClientCommand {
         value: String,
         caller: String,
         response: Sender<anyhow::Result<()>>,
+    },
+    Internal {
+        op: String,
+        namespace: String,
+        payload: InternalPayload,
+        response: Sender<anyhow::Result<InternalPayload>>,
     },
     Refresh {
         response: Sender<anyhow::Result<()>>,
@@ -167,6 +186,85 @@ impl VaultClient {
             .map_err(|_| anyhow::anyhow!("Vault client worker stopped responding"))?
     }
 
+    pub fn seal_internal(
+        &self,
+        namespace: &str,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let response = self.internal(
+            "oid-seal",
+            namespace,
+            InternalPayload {
+                aad_hex: Some(hex::encode(aad)),
+                data_hex: Some(hex::encode(plaintext)),
+                text: None,
+            },
+        )?;
+        let encoded = response
+            .data_hex
+            .ok_or_else(|| anyhow::anyhow!("Vault seal response omitted data"))?;
+        Ok(hex::decode(encoded)?)
+    }
+
+    pub fn open_internal(
+        &self,
+        namespace: &str,
+        aad: &[u8],
+        sealed: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let response = self.internal(
+            "oid-open",
+            namespace,
+            InternalPayload {
+                aad_hex: Some(hex::encode(aad)),
+                data_hex: Some(hex::encode(sealed)),
+                text: None,
+            },
+        )?;
+        let encoded = response
+            .data_hex
+            .ok_or_else(|| anyhow::anyhow!("Vault open response omitted data"))?;
+        Ok(hex::decode(encoded)?)
+    }
+
+    pub fn internal_head(&self, namespace: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .internal("oid-head-get", namespace, InternalPayload::default())?
+            .text)
+    }
+
+    pub fn set_internal_head(&self, namespace: &str, head: &str) -> anyhow::Result<()> {
+        self.internal(
+            "oid-head-set",
+            namespace,
+            InternalPayload {
+                text: Some(head.to_owned()),
+                ..InternalPayload::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    fn internal(
+        &self,
+        op: &str,
+        namespace: &str,
+        payload: InternalPayload,
+    ) -> anyhow::Result<InternalPayload> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(ClientCommand::Internal {
+                op: op.to_owned(),
+                namespace: namespace.to_owned(),
+                payload,
+                response: tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Vault client worker is unavailable"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("Vault client worker stopped responding"))?
+    }
+
     pub fn refresh_process(&self) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -182,7 +280,9 @@ struct Connection {
     stdin: ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
     token: String,
+    ipc_key: [u8; 32],
     seq: u64,
+
     pid: u32,
     started_at: Instant,
 }
@@ -298,6 +398,24 @@ impl Worker {
                     self.recover_if_process_failed("credential-set");
                 }
             }
+            ClientCommand::Internal {
+                op,
+                namespace,
+                payload,
+                response,
+            } => {
+                self.last_operation = Some("internal-oid");
+                if let Err(err) = self.ensure_live_connection("internal-oid") {
+                    let _ = response.send(Err(err));
+                    return;
+                }
+                let result = self.request_internal(&op, &namespace, payload);
+                let failed = result.is_err();
+                let _ = response.send(result);
+                if failed {
+                    self.recover_if_process_failed("internal-oid");
+                }
+            }
         }
     }
 
@@ -340,6 +458,54 @@ impl Worker {
             ));
         }
         Ok(response.value.unwrap_or_default())
+    }
+
+    fn request_internal(
+        &mut self,
+        op: &str,
+        namespace: &str,
+        payload: InternalPayload,
+    ) -> anyhow::Result<InternalPayload> {
+        let c = self
+            .connection
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Vault connection is unavailable"))?;
+        let seq = c.seq;
+        c.seq = c.seq.saturating_add(1);
+        let request_aad = internal_ipc_aad("request", seq, op, namespace);
+        let plaintext = serde_json::to_vec(&payload)?;
+        let encrypted = encrypt_internal_ipc(&c.ipc_key, &request_aad, &plaintext)?;
+        let request = Request {
+            token: c.token.clone(),
+            seq,
+            op: op.to_owned(),
+            name: namespace.to_owned(),
+            caller: INTERNAL_CALLER.to_owned(),
+            value: Some(encrypted),
+        };
+        writeln!(c.stdin, "{}", serde_json::to_string(&request)?)?;
+        c.stdin.flush()?;
+        let mut line = String::new();
+        c.reader.read_line(&mut line)?;
+        if line.is_empty() {
+            return Err(anyhow::anyhow!("Vault process closed the protocol pipe"));
+        }
+        let response: Response = serde_json::from_str(&line)?;
+        if response.seq != seq {
+            anyhow::bail!("Vault protocol sequence mismatch");
+        }
+        if !response.ok {
+            anyhow::bail!(
+                "Vault request failed: {}",
+                response.error.unwrap_or_else(|| "unknown error".into())
+            );
+        }
+        let encrypted = response
+            .value
+            .ok_or_else(|| anyhow::anyhow!("Vault internal response omitted encrypted payload"))?;
+        let response_aad = internal_ipc_aad("response", seq, op, namespace);
+        let plaintext = decrypt_internal_ipc(&c.ipc_key, &response_aad, &encrypted)?;
+        Ok(serde_json::from_slice(&plaintext)?)
     }
 
     fn ensure_live_connection(&mut self, phase: &'static str) -> anyhow::Result<()> {
@@ -533,17 +699,20 @@ impl Worker {
         }
         let ready: Ready = serde_json::from_str(&line)
             .map_err(|e| anyhow::anyhow!("invalid Vault handshake: {e}"))?;
-        if ready.kind != "ready" || ready.token.is_empty() {
+        if ready.kind != "ready" || ready.token.is_empty() || ready.ipc_key.is_empty() {
             let _ = child.kill();
             let _ = child.wait();
             return Err(anyhow::anyhow!("Vault returned an invalid ready handshake"));
         }
+        let ipc_key = parse_ipc_key(&ready.ipc_key)?;
         Ok(Connection {
             child,
             stdin,
             reader,
             token: ready.token,
+            ipc_key,
             seq: 1,
+
             pid,
             started_at,
         })
@@ -636,9 +805,11 @@ pub fn run_vault_daemon(
 
     let vault = vault::Vault::new(io, service_name, &data_dir)?;
     let token = generate_session_token();
+    let ipc_key = generate_ipc_key();
     let ready = serde_json::to_string(&Ready {
         kind: "ready".into(),
         token: token.clone(),
+        ipc_key: hex::encode(ipc_key),
     })?;
     {
         let stdout = std::io::stdout();
@@ -710,6 +881,9 @@ pub fn run_vault_daemon(
                         error: Some(format!("{error:#}")),
                     },
                 },
+                "oid-seal" | "oid-open" | "oid-head-get" | "oid-head-set" => {
+                    handle_internal_oid_request(&vault, &ipc_key, &request)
+                }
                 "set" => match request.value.as_deref() {
                     Some(value) => {
                         match vault.set_credential(&request.name, value, &request.caller) {
@@ -752,6 +926,152 @@ pub fn run_vault_daemon(
     Ok(())
 }
 
+fn handle_internal_oid_request(
+    vault: &vault::Vault,
+    ipc_key: &[u8; 32],
+    request: &Request,
+) -> Response {
+    let result = (|| -> anyhow::Result<InternalPayload> {
+        if request.caller != INTERNAL_CALLER {
+            anyhow::bail!(
+                "Vault internal OID operation denied for caller {:?}",
+                request.caller
+            );
+        }
+        let encrypted = request
+            .value
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Vault internal request omitted encrypted payload"))?;
+        let aad = internal_ipc_aad("request", request.seq, &request.op, &request.name);
+        let plaintext = decrypt_internal_ipc(ipc_key, &aad, encrypted)?;
+        let payload: InternalPayload = serde_json::from_slice(&plaintext)?;
+        match request.op.as_str() {
+            "oid-seal" => {
+                let aad = hex::decode(payload.aad_hex.as_deref().unwrap_or_default())?;
+                let data = hex::decode(payload.data_hex.as_deref().unwrap_or_default())?;
+                Ok(InternalPayload {
+                    data_hex: Some(hex::encode(vault.seal_internal(
+                        &request.name,
+                        &aad,
+                        &data,
+                    )?)),
+                    ..InternalPayload::default()
+                })
+            }
+            "oid-open" => {
+                let aad = hex::decode(payload.aad_hex.as_deref().unwrap_or_default())?;
+                let data = hex::decode(payload.data_hex.as_deref().unwrap_or_default())?;
+                Ok(InternalPayload {
+                    data_hex: Some(hex::encode(vault.open_internal(
+                        &request.name,
+                        &aad,
+                        &data,
+                    )?)),
+                    ..InternalPayload::default()
+                })
+            }
+            "oid-head-get" => Ok(InternalPayload {
+                text: vault.internal_head(&request.name)?,
+                ..InternalPayload::default()
+            }),
+            "oid-head-set" => {
+                let value = payload
+                    .text
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Vault internal head-set omitted value"))?;
+                vault.set_internal_head(&request.name, value)?;
+                Ok(InternalPayload::default())
+            }
+            _ => anyhow::bail!("unknown Vault internal operation {:?}", request.op),
+        }
+    })();
+
+    match result {
+        Ok(payload) => {
+            let aad = internal_ipc_aad("response", request.seq, &request.op, &request.name);
+            match serde_json::to_vec(&payload)
+                .map_err(anyhow::Error::from)
+                .and_then(|plain| encrypt_internal_ipc(ipc_key, &aad, &plain))
+            {
+                Ok(value) => Response {
+                    kind: "response".into(),
+                    seq: request.seq,
+                    ok: true,
+                    value: Some(value),
+                    error: None,
+                },
+                Err(error) => Response {
+                    kind: "response".into(),
+                    seq: request.seq,
+                    ok: false,
+                    value: None,
+                    error: Some(format!("{error:#}")),
+                },
+            }
+        }
+        Err(error) => Response {
+            kind: "response".into(),
+            seq: request.seq,
+            ok: false,
+            value: None,
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
+fn internal_ipc_aad(direction: &str, seq: u64, op: &str, namespace: &str) -> Vec<u8> {
+    format!("{INTERNAL_IPC_PROTOCOL}|{direction}|{seq}|{op}|{namespace}").into_bytes()
+}
+
+fn encrypt_internal_ipc(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> anyhow::Result<String> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("Vault internal IPC encryption failed: {error}"))?;
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(hex::encode(out))
+}
+
+fn decrypt_internal_ipc(key: &[u8; 32], aad: &[u8], encoded: &str) -> anyhow::Result<Vec<u8>> {
+    let bytes = hex::decode(encoded)?;
+    if bytes.len() < 12 + 16 {
+        anyhow::bail!("Vault internal IPC envelope is truncated");
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(
+            Nonce::from_slice(&bytes[..12]),
+            Payload {
+                msg: &bytes[12..],
+                aad,
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("Vault internal IPC authentication failed: {error}"))
+}
+
+fn parse_ipc_key(value: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = hex::decode(value)?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Vault IPC key has the wrong length"))
+}
+
+fn generate_ipc_key() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes
+}
+
 fn generate_session_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
@@ -781,6 +1101,19 @@ mod recovery_tests {
             recovery_backoff(1, Duration::from_secs(300)),
             RECOVERY_MAX_BACKOFF
         );
+    }
+
+    #[test]
+    fn internal_ipc_round_trip_rejects_wrong_aad() {
+        let key = [7u8; 32];
+        let aad = internal_ipc_aad("request", 4, "oid-seal", "oid-demo");
+        let sealed = encrypt_internal_ipc(&key, &aad, b"secret").unwrap();
+        assert_eq!(
+            decrypt_internal_ipc(&key, &aad, &sealed).unwrap(),
+            b"secret"
+        );
+        let wrong = internal_ipc_aad("request", 5, "oid-seal", "oid-demo");
+        assert!(decrypt_internal_ipc(&key, &wrong, &sealed).is_err());
     }
 
     #[test]
