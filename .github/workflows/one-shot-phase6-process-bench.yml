@@ -24,94 +24,12 @@ jobs:
           workspaces: engine
 
       - name: Wire benchmark into backend
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          main = Path('crates/backend/src/main.rs')
-          text = main.read_text()
-          anchor = 'mod service_mother;\nmod service_native_cutover;'
-          replacement = 'mod service_mother;\nmod service_native_bench;\nmod service_native_cutover;'
-          if anchor not in text:
-              raise SystemExit('main module anchor missing')
-          text = text.replace(anchor, replacement, 1)
-          anchor = '    if has("--maintenance-notice") {'
-          replacement = '\n'.join([
-              '    if has("--native-service-process-bench") {',
-              '        match service_native_bench::run(&args).await {',
-              '            Ok(()) => return ExitCode::SUCCESS,',
-              '            Err(error) => {',
-              '                eprintln!("native Service process benchmark failed: {error:#}");',
-              '                return ExitCode::FAILURE;',
-              '            }',
-              '        }',
-              '    }',
-              '',
-              '    if has("--maintenance-notice") {',
-          ])
-          if anchor not in text:
-              raise SystemExit('main benchmark dispatch anchor missing')
-          text = text.replace(anchor, replacement, 1)
-          main.write_text(text)
-
-          mother = Path('crates/backend/src/service_mother.rs')
-          text = mother.read_text()
-          anchor = 'impl ServiceMotherProcess {\n    pub fn manager(&self) -> ServiceManager {'
-          replacement = '\n'.join([
-              'impl ServiceMotherProcess {',
-              '    pub(crate) fn pid(&self) -> u32 {',
-              '        self.pid',
-              '    }',
-              '',
-              '    pub fn manager(&self) -> ServiceManager {',
-          ])
-          if anchor not in text:
-              raise SystemExit('ServiceMotherProcess impl anchor missing')
-          text = text.replace(anchor, replacement, 1)
-          anchor = 'async fn spawn_process(\n'
-          if anchor not in text:
-              raise SystemExit('spawn_process anchor missing')
-          text = text.replace(anchor, 'pub(crate) async fn spawn_process(\n', 1)
-          mother.write_text(text)
-
-          bench = Path('crates/backend/src/service_native_bench.rs')
-          text = bench.read_text()
-          old = '\n'.join([
-              '        let mother = crate::service_mother::spawn(',
-              '            &fixture.settings_path,',
-              '            &catalog.fingerprint(),',
-              '            runtime_env.clone(),',
-              '            None,',
-              '            crate::service_integrity::EXPECTED_SERVICE_SHA256,',
-              '        )',
-              '        .await?;',
-          ])
-          new = '\n'.join([
-              '        let mother = crate::service_mother::spawn_process(',
-              '            &fixture.settings_path,',
-              '            &catalog.fingerprint(),',
-              '            crate::service_integrity::EXPECTED_SERVICE_SHA256,',
-              '            runtime_env.as_ref(),',
-              '            None,',
-              '            None,',
-              '        )',
-              '        .await?;',
-          ])
-          if old not in text:
-              raise SystemExit('benchmark Mother spawn anchor missing')
-          bench.write_text(text.replace(old, new, 1))
-          PY
+        run: python3 ../.github/scripts/phase6_process_bench_patch.py
 
       - name: Format Phase 6 process benchmark files
         run: |
-          rustfmt --edition 2021 \
-            crates/backend/src/main.rs \
-            crates/backend/src/service_mother.rs \
-            crates/backend/src/service_native_bench.rs
-          rustfmt --edition 2021 --check \
-            crates/backend/src/main.rs \
-            crates/backend/src/service_mother.rs \
-            crates/backend/src/service_native_bench.rs
+          rustfmt --edition 2021 crates/backend/src/main.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs
+          rustfmt --edition 2021 --check crates/backend/src/main.rs crates/backend/src/service_mother.rs crates/backend/src/service_native_bench.rs
 
       - name: Check backend targets
         run: cargo check -p backend --all-targets --locked
@@ -126,45 +44,32 @@ jobs:
         run: cargo build -p backend --release --bin service --locked
 
       - name: Build integrity-bound backend
-        run: |
-          RBE_SERVICE_BIN_PATH="$PWD/target/release/service" \
-            cargo build -p backend --release --bin backend --locked
+        run: RBE_SERVICE_BIN_PATH="$PWD/target/release/service" cargo build -p backend --release --bin backend --locked
 
       - name: Run disposable native process benchmark smoke test
         run: |
           set -euo pipefail
           STAGE="$RUNNER_TEMP/rbe-native-process-bench"
+          REPORT="$RUNNER_TEMP/rbe-native-process-bench.json"
           rm -rf "$STAGE"
           mkdir -p "$STAGE/dep"
           cp target/release/backend "$STAGE/backend"
           cp target/release/service "$STAGE/dep/service"
           touch "$STAGE/.rbe-native-bench-root"
-          REPORT="$RUNNER_TEMP/rbe-native-process-bench.json"
-          (
-            cd "$STAGE"
-            ./backend --native-service-process-bench \
-              --profile ci-process-smoke \
-              --iterations 2 \
-              --warm-calls 3 \
-              --output "$REPORT"
-          )
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          report = json.loads(Path(os.environ['RUNNER_TEMP'], 'rbe-native-process-bench.json').read_text())
-          assert report['schema'] == 'RBE-NATIVE-SERVICE-PROCESS-BENCH/1'
-          assert report['profile'] == 'ci-process-smoke'
-          assert report['iterations'] == 2
-          assert report['warmCallsPerRound'] == 3
-          assert report['nativeServiceCount'] == 1
-          metrics = {item['name']: item for item in report['metrics']}
-          assert metrics['service_mother_startup']['samples'] == 2
-          assert metrics['cold_native_service_call']['samples'] == 2
-          assert metrics['warm_native_service_call']['samples'] == 6
-          assert all(item['minNs'] > 0 for item in metrics.values())
-          assert 'true_peak_process_rss' in report['unmeasured']
-          print(json.dumps(report, indent=2))
-          PY
+          cd "$STAGE"
+          ./backend --native-service-process-bench --profile ci-process-smoke --iterations 2 --warm-calls 3 --output "$REPORT"
+          test "$(jq -r '.schema' "$REPORT")" = "RBE-NATIVE-SERVICE-PROCESS-BENCH/1"
+          test "$(jq -r '.profile' "$REPORT")" = "ci-process-smoke"
+          test "$(jq -r '.iterations' "$REPORT")" = "2"
+          test "$(jq -r '.warmCallsPerRound' "$REPORT")" = "3"
+          test "$(jq -r '.nativeServiceCount' "$REPORT")" = "1"
+          test "$(jq -r '.metrics[] | select(.name == "service_mother_startup") | .samples' "$REPORT")" = "2"
+          test "$(jq -r '.metrics[] | select(.name == "cold_native_service_call") | .samples' "$REPORT")" = "2"
+          test "$(jq -r '.metrics[] | select(.name == "warm_native_service_call") | .samples' "$REPORT")" = "6"
+          jq -e 'all(.metrics[]; .minNs > 0)' "$REPORT" >/dev/null
+          jq -e '.unmeasured | index("true_peak_process_rss") != null' "$REPORT" >/dev/null
+          jq . "$REPORT"
+          cd - >/dev/null
           rm -rf "$STAGE"
 
       - name: Publish validated process benchmark
@@ -173,11 +78,8 @@ jobs:
           set -euo pipefail
           git config user.name "Kate"
           git config user.email "dhwanksh2000@gmail.com"
-          git add \
-            engine/crates/backend/src/main.rs \
-            engine/crates/backend/src/service_mother.rs \
-            engine/crates/backend/src/service_native_bench.rs
-          git rm .github/workflows/one-shot-phase6-process-bench.yml
+          git add engine/crates/backend/src/main.rs engine/crates/backend/src/service_mother.rs engine/crates/backend/src/service_native_bench.rs
+          git rm .github/workflows/one-shot-phase6-process-bench.yml .github/scripts/phase6_process_bench_patch.py
           git commit -m "FEAT | SVC-NATIVE-611 benchmark native Service process path"
           git reset --hard HEAD
           git fetch origin main
