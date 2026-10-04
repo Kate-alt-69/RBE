@@ -1,0 +1,54 @@
+# Temporary formatting-only workflow; remove after the formatting commit lands.
+name: one-shot engine rustfmt cleanup
+
+on:
+  push:
+    paths:
+      - '.github/workflows/one-shot-engine-rustfmt.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format current engine workspace
+        working-directory: engine
+        run: cargo fmt --all
+
+      - name: Verify formatting and formatting-only scope
+        run: |
+          cd engine
+          cargo fmt --all -- --check
+          cd ..
+          git add -u -- '*.rs'
+          if git diff --cached --name-only | grep -Ev '\.rs$'; then
+            echo 'ERROR: formatter staged a non-Rust file' >&2
+            exit 1
+          fi
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo 'No Rust formatting changes were required.'
+            exit 0
+          fi
+
+      - name: Commit formatting-only changes
+        run: |
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name 'Kate'
+          git config user.email 'dhwanksh2000@gmail.com'
+          git commit -m 'CHORE | format Rust workspace for rustfmt 1.99'
+          git reset --hard HEAD
+          git pull --rebase origin main
+          git push origin HEAD:main
