@@ -1,4 +1,13 @@
+// The worker currently publishes source artifacts but keeps the hardened GET path
+// beside PUT for the restore/consumer side of the same transfer contract. Keep
+// that prepared half compiled without forcing a fake call site merely to satisfy
+// workspace-wide `-D warnings`.
+#[allow(dead_code)]
 mod artifact_transfer;
+// Sealed Git helpers intentionally keep authority, destination and byte/time
+// bounds as explicit inputs. Do not hide those security-relevant arguments in a
+// generic bag solely to satisfy Clippy's seven-argument style threshold.
+#[allow(clippy::too_many_arguments)]
 mod git_exec;
 mod publisher;
 mod source;
