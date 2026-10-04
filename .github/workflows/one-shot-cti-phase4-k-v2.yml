@@ -73,11 +73,43 @@ jobs:
           code = 'import re\n' + code[:helper_start] + helper + code[helper_end:]
           exec(compile(code, '<cti-phase4-k>', 'exec'), {})
           PY
+      - name: Resolve Phase 4 clippy gate
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          library_worker = Path('container-runtime/crates/container-bin/src/library_worker_mode.rs')
+          text = library_worker.read_text(encoding='utf-8')
+          replacements = {
+              'return run_library_worker_proxy_live_child(&cgroup_path).map_err(Into::into);':
+                  'return run_library_worker_proxy_live_child(&cgroup_path);',
+              'run_live_library_worker_proxy(bootstrap, cgroup_root).map_err(Into::into)':
+                  'run_live_library_worker_proxy(bootstrap, cgroup_root)',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'library worker clippy anchor missing: {old}')
+              text = text.replace(old, new, 1)
+          library_worker.write_text(text, encoding='utf-8')
+
+          main = Path('container-runtime/crates/container-bin/src/main.rs')
+          text = main.read_text(encoding='utf-8')
+          for function in ('run_control_server', 'handle_connection'):
+              anchor = f'fn {function}('
+              allowed = f'#[allow(clippy::too_many_arguments)]\n{anchor}'
+              if allowed in text:
+                  continue
+              if anchor not in text:
+                  raise SystemExit(f'{function} clippy anchor missing')
+              text = text.replace(anchor, allowed, 1)
+          main.write_text(text, encoding='utf-8')
+          PY
       - name: Format Phase 4 K surface
         run: |
           rustfmt --edition 2021 \
             container-runtime/crates/ipc-protocol/src/lib.rs \
             container-runtime/crates/container-bin/src/main.rs \
+            container-runtime/crates/container-bin/src/library_worker_mode.rs \
             engine/crates/core/src/container_client.rs
       - name: Check Container IPC and Controller
         working-directory: container-runtime
@@ -107,6 +139,7 @@ jobs:
           git add \
             container-runtime/crates/ipc-protocol/src/lib.rs \
             container-runtime/crates/container-bin/src/main.rs \
+            container-runtime/crates/container-bin/src/library_worker_mode.rs \
             engine/crates/core/src/container_client.rs
           git commit -m 'FEAT | CTI-005 add ExecuteTask addressing IPC'
           git pull --rebase origin main
