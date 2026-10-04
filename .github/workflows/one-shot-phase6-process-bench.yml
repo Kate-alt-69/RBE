@@ -24,7 +24,8 @@ jobs:
           workspaces: engine
 
       - name: Wire benchmark into backend
-        run: python3 ../.github/scripts/phase6_process_bench_patch.py
+        working-directory: .
+        run: python3 .github/scripts/phase6_process_bench_patch.py
 
       - name: Format Phase 6 process benchmark files
         run: |
