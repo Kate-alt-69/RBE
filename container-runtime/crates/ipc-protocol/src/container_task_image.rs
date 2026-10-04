@@ -886,7 +886,7 @@ pub fn cti_sha256(input: &[u8]) -> [u8; 32] {
     ];
     let mut state = H0;
     let whole = input.len() / 64 * 64;
-    for chunk in input[..whole].chunks_exact(64) {
+    for chunk in input[..whole].as_chunks::<64>().0 {
         sha256_compress(&mut state, chunk, &K);
     }
     let remainder = &input[whole..];
@@ -895,7 +895,7 @@ pub fn cti_sha256(input: &[u8]) -> [u8; 32] {
     tail[remainder.len()] = 0x80;
     let padded = if remainder.len() < 56 { 64 } else { 128 };
     tail[padded - 8..padded].copy_from_slice(&(input.len() as u64).saturating_mul(8).to_be_bytes());
-    for chunk in tail[..padded].chunks_exact(64) {
+    for chunk in tail[..padded].as_chunks::<64>().0 {
         sha256_compress(&mut state, chunk, &K);
     }
     let mut out = [0u8; 32];
@@ -907,7 +907,7 @@ pub fn cti_sha256(input: &[u8]) -> [u8; 32] {
 
 fn sha256_compress(state: &mut [u32; 8], chunk: &[u8], constants: &[u32; 64]) {
     let mut schedule = [0u32; 64];
-    for (index, word) in chunk.chunks_exact(4).take(16).enumerate() {
+    for (index, word) in chunk.as_chunks::<4>().0.iter().take(16).enumerate() {
         let mut bytes = [0u8; 4];
         bytes.copy_from_slice(word);
         schedule[index] = u32::from_be_bytes(bytes);
