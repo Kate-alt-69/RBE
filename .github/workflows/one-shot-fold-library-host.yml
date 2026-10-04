@@ -95,8 +95,9 @@ jobs:
             doc/README.md
           git diff --cached --check
           git commit -m 'REFACTOR | LIBHOST-049 fold proxy into Container mode'
-          # Normalization intentionally edits this one-shot helper. It is not part
-          # of the product change and must not block the rebase/push.
-          git restore scripts/one_shot_fold_library_host.py
+          # Only the explicitly staged files above belong to LIBHOST-049. Any
+          # remaining changes are one-shot-script edits or rustfmt child-module
+          # collateral and must not enter the product commit.
+          git reset --hard HEAD
           git pull --rebase origin main
           git push origin HEAD:main
