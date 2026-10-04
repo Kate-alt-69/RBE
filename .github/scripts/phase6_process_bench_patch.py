@@ -2,6 +2,14 @@ from pathlib import Path
 
 main = Path("engine/crates/backend/src/main.rs")
 text = main.read_text()
+anchor = "mod port_guard;\nmod runtime_image_boot;"
+replacement = '''mod port_guard;
+#[path = "package_links/approval.rs"]
+mod package_approval;
+mod runtime_image_boot;'''
+if anchor not in text:
+    raise SystemExit("main package approval anchor missing")
+text = text.replace(anchor, replacement, 1)
 anchor = "mod service_mother;\nmod service_native_cutover;"
 replacement = "mod service_mother;\nmod service_native_bench;\nmod service_native_cutover;"
 if anchor not in text:
@@ -23,6 +31,31 @@ if anchor not in text:
     raise SystemExit("main benchmark dispatch anchor missing")
 text = text.replace(anchor, replacement, 1)
 main.write_text(text)
+
+service_main = Path("engine/crates/backend/src/service_main.rs")
+text = service_main.read_text()
+anchor = '''#[path = "error_code_book_core.rs"]
+mod error_code_book;
+mod service_boot;'''
+replacement = '''#[path = "error_code_book_core.rs"]
+mod error_code_book;
+#[path = "package_links/approval.rs"]
+mod package_approval;
+mod service_boot;'''
+if anchor not in text:
+    raise SystemExit("service main package approval anchor missing")
+text = text.replace(anchor, replacement, 1)
+service_main.write_text(text)
+
+package_links = Path("engine/crates/backend/src/package_links.rs")
+text = package_links.read_text()
+old = '''#[path = "package_links/approval.rs"]
+pub(crate) mod approval;'''
+new = "pub(crate) use crate::package_approval as approval;"
+if old not in text:
+    raise SystemExit("package links approval module anchor missing")
+text = text.replace(old, new, 1)
+package_links.write_text(text)
 
 mother = Path("engine/crates/backend/src/service_mother.rs")
 text = mother.read_text()
@@ -65,22 +98,17 @@ new = '''        let mother = crate::service_mother::spawn_process(
 if old not in text:
     raise SystemExit("benchmark Mother spawn anchor missing")
 text = text.replace(old, new, 1)
+old = "let index = ((sorted.len() - 1) * percent + 99) / 100;"
+new = "let index = ((sorted.len() - 1) * percent).div_ceil(100);"
+if old not in text:
+    raise SystemExit("benchmark percentile anchor missing")
+text = text.replace(old, new, 1)
 bench.write_text(text)
 
 catalog = Path("engine/crates/backend/src/service_package_catalog.rs")
 text = catalog.read_text()
-anchor = "use service_runtime::ServiceCatalog;\n\n"
-replacement = '''use service_runtime::ServiceCatalog;
-
-#[path = "package_links/approval.rs"]
-mod package_approval;
-
-'''
-if anchor not in text:
-    raise SystemExit("service package approval import anchor missing")
-text = text.replace(anchor, replacement, 1)
 old = "crate::package_links::approval::approved_runtime_capabilities("
 if old not in text:
     raise SystemExit("service package approval call anchor missing")
-text = text.replace(old, "package_approval::approved_runtime_capabilities(", 1)
+text = text.replace(old, "crate::package_approval::approved_runtime_capabilities(", 1)
 catalog.write_text(text)
