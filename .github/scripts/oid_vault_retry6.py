@@ -45,7 +45,8 @@ body = body.replace(old_helper, new_helper, 1)
 # RngCore trait must be imported at module scope (the old local import is not
 # enough). Also repair the current standalone Service baseline: the package
 # catalog needs only the shared approval reader, not the backend-only Library
-# Host package module.
+# Host package module. Finally make the OID lock OpenOptions explicit: the lock
+# file is persistent coordination state, so opening it must never truncate it.
 rustfmt_marker = '\nrustfmt --edition 2021 '
 if rustfmt_marker not in body:
     raise SystemExit('could not locate rustfmt boundary in v2 staging body')
@@ -75,6 +76,27 @@ text = text.replace(
     'crate::package_links::approval::approved_runtime_capabilities',
     'package_approval::approved_runtime_capabilities',
 )
+p.write_text(text)
+
+p = Path('engine/crates/route-engine/src/oid_security.rs')
+text = p.read_text()
+lock_anchor = '''        let lease = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+'''
+lock_fixed = '''        let lease = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+'''
+if lock_fixed not in text:
+    if lock_anchor not in text:
+        raise SystemExit('oid_security: lock OpenOptions anchor missing')
+    text = text.replace(lock_anchor, lock_fixed, 1)
 p.write_text(text)
 PY
 '''
