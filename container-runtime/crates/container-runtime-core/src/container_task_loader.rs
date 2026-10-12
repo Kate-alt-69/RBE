@@ -243,9 +243,17 @@ impl ContainerTaskLoader {
     }
 }
 
+#[derive(Default)]
+struct RuntimeImageTaskRegistryState {
+    tables: BTreeMap<[u8; 32], Arc<RuntimeImageTaskTable>>,
+    /// Prevent an old ExecuteTask request from lazily resurrecting a generation
+    /// after the backend has explicitly retired it.
+    retired: std::collections::BTreeSet<[u8; 32]>,
+}
+
 #[derive(Clone, Default)]
 pub struct RuntimeImageTaskRegistry {
-    tables: Arc<RwLock<BTreeMap<[u8; 32], Arc<RuntimeImageTaskTable>>>>,
+    state: Arc<RwLock<RuntimeImageTaskRegistryState>>,
 }
 
 impl RuntimeImageTaskRegistry {
@@ -253,9 +261,8 @@ impl RuntimeImageTaskRegistry {
         Self::default()
     }
 
-    /// Build the complete immutable table first, then replace the active table
-    /// in one short write-lock operation. Existing callers retain their Arcs,
-    /// so a hot cutover never invalidates an in-flight old Task image.
+    /// Verify every CTI before the atomic publication lock is taken. Old
+    /// callers retain their loaded Task Arcs through the cutover.
     pub fn install_from_cache(
         &self,
         loader: &ContainerTaskLoader,
@@ -266,12 +273,70 @@ impl RuntimeImageTaskRegistry {
         Ok(table)
     }
 
+    /// Explicit activation/remap from the trusted backend. The entire new
+    /// table is verified before taking the lock; publication and retirement
+    /// happen in one write-lock critical section. A retired RuntimeImage
+    /// cannot be reloaded by a subsequent lazy lookup.
+    pub fn activate_from_cache_and_retire(
+        &self,
+        loader: &ContainerTaskLoader,
+        runtime_image: &str,
+        retire_runtime_images: &[String],
+    ) -> Result<(usize, usize), ContainerTaskLoadError> {
+        let active_id = decode_sha256(runtime_image)?;
+        let mut retiring = std::collections::BTreeSet::new();
+        for retired in retire_runtime_images {
+            let id = decode_sha256(retired)?;
+            if id != active_id {
+                retiring.insert(id);
+            }
+        }
+        let table = loader.load_runtime_image(active_id)?;
+        let task_count = table.len();
+        let mut state = write_unpoisoned(&self.state);
+        let mut retired_images = 0;
+        for id in retiring {
+            state.retired.insert(id);
+            if state.tables.remove(&id).is_some() {
+                retired_images += 1;
+            }
+        }
+        state.retired.remove(&active_id);
+        state.tables.insert(active_id, table);
+        Ok((task_count, retired_images))
+    }
+
     pub fn install_table(
         &self,
         table: Arc<RuntimeImageTaskTable>,
     ) -> Option<Arc<RuntimeImageTaskTable>> {
         let key = table.runtime_image_sha256();
-        write_unpoisoned(&self.tables).insert(key, table)
+        let mut state = write_unpoisoned(&self.state);
+        state.retired.remove(&key);
+        state.tables.insert(key, table)
+    }
+
+    /// Lookup and lazy-install are serialized against explicit activation.
+    /// This prevents a concurrent miss from replacing a freshly remapped table
+    /// with an older snapshot loaded from disk.
+    pub fn lookup_or_install(
+        &self,
+        loader: &ContainerTaskLoader,
+        runtime_image: &str,
+        task_oid: u16,
+    ) -> Result<Option<Arc<LoadedTaskImage>>, ContainerTaskLoadError> {
+        let id = decode_sha256(runtime_image)?;
+        let mut state = write_unpoisoned(&self.state);
+        if state.retired.contains(&id) {
+            return Ok(None);
+        }
+        if let Some(table) = state.tables.get(&id) {
+            return Ok(table.lookup(task_oid));
+        }
+        let table = loader.load_runtime_image(id)?;
+        let task = table.lookup(task_oid);
+        state.tables.insert(id, table);
+        Ok(task)
     }
 
     pub fn lookup(
@@ -279,7 +344,11 @@ impl RuntimeImageTaskRegistry {
         runtime_image_sha256: &[u8; 32],
         task_oid: u16,
     ) -> Option<Arc<LoadedTaskImage>> {
-        read_unpoisoned(&self.tables)
+        let state = read_unpoisoned(&self.state);
+        if state.retired.contains(runtime_image_sha256) {
+            return None;
+        }
+        state.tables
             .get(runtime_image_sha256)
             .and_then(|table| table.lookup(task_oid))
     }
@@ -289,34 +358,34 @@ impl RuntimeImageTaskRegistry {
         runtime_image: &str,
         task_oid: u16,
     ) -> Result<Option<Arc<LoadedTaskImage>>, ContainerTaskLoadError> {
-        let runtime_image_sha256 = decode_sha256(runtime_image)?;
-        Ok(self.lookup(&runtime_image_sha256, task_oid))
+        let id = decode_sha256(runtime_image)?;
+        Ok(self.lookup(&id, task_oid))
     }
 
     pub fn remove(&self, runtime_image_sha256: &[u8; 32]) -> Option<Arc<RuntimeImageTaskTable>> {
-        write_unpoisoned(&self.tables).remove(runtime_image_sha256)
+        write_unpoisoned(&self.state).tables.remove(runtime_image_sha256)
     }
 
-    /// Drop all inactive RuntimeImage tables from the registry in one cutover.
-    ///
-    /// An ExecuteTask lookup clones an Arc<LoadedTaskImage> while holding the
-    /// registry's read lock. Removing the table cannot invalidate an execution
-    /// that has already obtained its Arc; the image stays allocated until its
-    /// final execution reference is dropped.
+    /// Retire every image that is no longer active. In-flight Task Arc
+    /// references survive removal independently of the lookup table.
     pub fn retain_runtime_images(
         &self,
         active_runtime_images: &std::collections::BTreeSet<[u8; 32]>,
     ) -> usize {
-        let mut tables = write_unpoisoned(&self.tables);
-        let before = tables.len();
-        tables.retain(|runtime_image, _| active_runtime_images.contains(runtime_image));
-        before - tables.len()
+        let mut state = write_unpoisoned(&self.state);
+        let removed: Vec<_> = state.tables.keys()
+            .filter(|id| !active_runtime_images.contains(*id))
+            .copied()
+            .collect();
+        for id in &removed {
+            state.tables.remove(id);
+            state.retired.insert(*id);
+        }
+        removed.len()
     }
 
-    /// Return a snapshot of registered RuntimeImage identities, useful for CC
-    /// refresh bookkeeping and explicit retirement decisions.
     pub fn registered_runtime_images(&self) -> Vec<[u8; 32]> {
-        read_unpoisoned(&self.tables).keys().copied().collect()
+        read_unpoisoned(&self.state).tables.keys().copied().collect()
     }
 }
 
