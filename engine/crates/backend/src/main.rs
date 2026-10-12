@@ -632,7 +632,14 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
-    let runtime_image = runtime_image_boot::compile(&config, service_catalog.as_ref())?;
+    // Keep the immutable compiler-owned Container Task plan alongside its
+    // RuntimeImage; CC must never rediscover or compile REL source.
+    let compiled_image = runtime_image_boot::compile_with_tasks(
+        &config,
+        service_catalog.as_ref(),
+    )?;
+    let mut container_tasks = compiled_image.container_tasks;
+    let runtime_image = compiled_image.image;
     runtime_image_boot::apply_server_policy(&mut config, &runtime_image.server_policy)?;
     runtime_image_boot::apply_middleware_plan(&mut config, &runtime_image.middleware_plan)?;
     let runtime_image = Arc::new(route_engine::RuntimeImageSlot::new(runtime_image));
@@ -715,7 +722,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     let native_service_cutover = service_native_cutover::prepare_native_service_cutover(
         runtime_image_snapshot.as_ref(),
         service_catalog.as_ref(),
-        oid_vault,
+        oid_vault.clone(),
     )?;
     if let Some(cutover) = native_service_cutover.as_ref() {
         tracing::info!(
@@ -724,6 +731,32 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
             "Vault-attested native Service Runtime Image generation prepared"
         );
     }
+
+    // Native Service OID linking has finished. Bind Task OIDs into that same
+    // project-local, Vault-attested OID cache and assemble all CTI blobs before
+    // the Controller can accept ExecuteTask requests.
+    let container_task_report = if container_tasks.tasks.is_empty() {
+        None
+    } else {
+        let mut oid_cache = route_engine::open_service_oid_cache_with_vault(
+            &project_root,
+            oid_vault.clone(),
+        )?;
+        let report = route_engine::assemble_container_task_cache(
+            &project_root,
+            runtime_image_snapshot.as_ref(),
+            &mut container_tasks,
+            &mut oid_cache,
+            &std::collections::BTreeSet::new(),
+        )?;
+        tracing::info!(
+            image = %runtime_image_snapshot.image_id,
+            tasks = report.artifacts.len(),
+            oid_generation = report.oid_generation,
+            "RELC compiled Container Task Images into the project cache"
+        );
+        Some(report)
+    };
 
     let vault_refresh_task = spawn_vault_refresh(
         vault_instance.clone(),
@@ -762,6 +795,22 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     boot_trace(format!(
         "verified container process ready pid={pid:?} address={address}"
     ));
+    if let Some(report) = &container_task_report {
+        let (installed, _) = container_client
+            .activate_task_image(&runtime_image_snapshot.image_id, Vec::new())
+            .await?;
+        if installed != report.artifacts.len() {
+            anyhow::bail!(
+                "Controller CTI activation returned {installed} Tasks, RELC produced {}",
+                report.artifacts.len()
+            );
+        }
+        tracing::info!(
+            image = %runtime_image_snapshot.image_id,
+            tasks = installed,
+            "Controller activated the compiled RuntimeImage Task table"
+        );
+    }
     let container_process = Arc::new(tokio::sync::Mutex::new(initial_container));
     let container_supervisor_task = spawn_container_supervisor(
         container_path.clone(),
