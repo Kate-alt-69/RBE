@@ -20,10 +20,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use container_runtime_core::{
-    artifact_sha256_matches, CapabilityBroker, ContainerTaskLoadError, ContainerTaskLoader,
-    EnvironmentId, EnvironmentProfile, EnvironmentRegistry, ExecutionProvenance, LoadedTaskImage,
-    Runtime, RuntimeConfig, RuntimeImageTaskRegistry, WorkCost, CompiledTaskGraph,
-    TaskExecution, TaskExecutionProfileStore, TaskExecutionSample, TaskProfileKey,
+    artifact_sha256_matches, CapabilityBroker, CompiledTaskGraph, ContainerTaskLoadError,
+    ContainerTaskLoader, EnvironmentId, EnvironmentProfile, EnvironmentRegistry,
+    ExecutionProvenance, LoadedTaskImage, Runtime, RuntimeConfig, RuntimeImageTaskRegistry,
+    TaskExecution, TaskExecutionProfileStore, TaskExecutionSample, TaskProfileKey, WorkCost,
 };
 use execution_engine::{CapabilityHost, ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
@@ -45,10 +45,13 @@ const EVENT_LOG_KEEP_BYTES: u64 = 8 * 1024 * 1024;
 const MONITOR_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MONITOR_LOG_KEEP_BYTES: u64 = 4 * 1024 * 1024;
 static EVENT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static CTI_ACTIVE_TASKS: OnceLock<Mutex<std::collections::HashMap<String, (Arc<LoadedTaskImage>, WorkCost, usize)>>> = OnceLock::new();
+static CTI_ACTIVE_TASKS: OnceLock<
+    Mutex<std::collections::HashMap<String, (Arc<LoadedTaskImage>, WorkCost, usize)>>,
+> = OnceLock::new();
 static CTI_PROFILES: OnceLock<TaskExecutionProfileStore> = OnceLock::new();
 
-fn active_task_pins() -> &'static Mutex<std::collections::HashMap<String, (Arc<LoadedTaskImage>, WorkCost, usize)>> {
+fn active_task_pins(
+) -> &'static Mutex<std::collections::HashMap<String, (Arc<LoadedTaskImage>, WorkCost, usize)>> {
     CTI_ACTIVE_TASKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -59,14 +62,18 @@ fn task_profiles() -> &'static TaskExecutionProfileStore {
 /// Drop immutable Task pins only after the actual Environment worker finishes.
 /// This is also the live Phase-6 profile recording point.
 fn reap_completed_cti_executions(runtime: &Runtime) {
-    let ids: Vec<String> = active_task_pins().lock()
+    let ids: Vec<String> = active_task_pins()
+        .lock()
         .expect("CTI execution pin table poisoned")
-        .keys().cloned().collect();
+        .keys()
+        .cloned()
+        .collect();
     for id in ids {
         let Some(outcome) = runtime.wait_for_result(&id, Duration::from_millis(1)) else {
             continue;
         };
-        let removed = active_task_pins().lock()
+        let removed = active_task_pins()
+            .lock()
             .expect("CTI execution pin table poisoned")
             .remove(&id);
         if let Some((task, cost, arena_bytes)) = removed {
@@ -83,7 +90,6 @@ fn reap_completed_cti_executions(runtime: &Runtime) {
         }
     }
 }
-
 
 pub(crate) fn event_log_path() -> PathBuf {
     runtime_paths::binary_dir()
@@ -694,11 +700,8 @@ fn submit_compiled_task(
     broker: &CapabilityBroker,
 ) -> Result<String, (&'static str, String)> {
     let fail = |message: String| ("TASK_EXECUTION_INVALID", message);
-    let compiled = TaskExecution::new(
-        Arc::clone(&task),
-        &request.input,
-        Duration::from_secs(60),
-    ).map_err(fail)?;
+    let compiled = TaskExecution::new(Arc::clone(&task), &request.input, Duration::from_secs(60))
+        .map_err(fail)?;
     if !compiled.is_single_wasm_graph() {
         return Err((
             "TASK_NODE_UNSUPPORTED",
@@ -711,38 +714,59 @@ fn submit_compiled_task(
             "CTI requires privileged capability nodes; Controller will not bypass authority".into(),
         ));
     }
-    let wasm = CompiledTaskGraph::embedded_wasm(&task).map_err(fail)?
-        .ok_or(("TASK_CODE_UNAVAILABLE", "CTI does not embed executable WASM".into()))?;
+    let wasm = CompiledTaskGraph::embedded_wasm(&task)
+        .map_err(fail)?
+        .ok_or((
+            "TASK_CODE_UNAVAILABLE",
+            "CTI does not embed executable WASM".into(),
+        ))?;
     let artifact_hash = hex::encode(ipc_protocol::cti_sha256(&wasm));
     let source_id = CompiledTaskGraph::root_source_id(&task).map_err(fail)?;
     let environment = parse_environment(&request.environment)
         .filter(|id| runtime.has_environment(*id))
-        .ok_or(("INVALID_ENVIRONMENT", "CTI Environment is unavailable".into()))?;
+        .ok_or((
+            "INVALID_ENVIRONMENT",
+            "CTI Environment is unavailable".into(),
+        ))?;
     let generation = runtime.environment_generation(environment);
 
     // Materialization is hash-checked, then bound only to the exact root
     // compiled identity. The empty manifest provides no host authority.
-    runtime.register_artifact(&artifact_hash, wasm)
+    runtime
+        .register_artifact(&artifact_hash, wasm)
         .map_err(|e| ("TASK_CODE_INVALID", e))?;
-    broker.register_artifact_binding(
-        &request.runtime_image, &source_id, CAPABILITY_ABI_VERSION, &artifact_hash,
-    ).map_err(|e| (e.code, e.message))?;
-    broker.register_manifest(
-        &ipc_protocol::RegisterCapabilityManifestRequest {
-            request_id: request.request_id.clone(),
-            auth_token: request.auth_token.clone(),
-            runtime_image: request.runtime_image.clone(),
-            source_id: source_id.clone(),
-            capability_abi: CAPABILITY_ABI_VERSION,
-            environment: request.environment.clone(),
-            grants: Vec::new(),
-        },
-        generation,
-    ).map_err(|e| (e.code, e.message))?;
-    broker.authorize_execution(
-        &request.runtime_image, &source_id, &request.environment,
-        generation, CAPABILITY_ABI_VERSION, &artifact_hash,
-    ).map_err(|e| (e.code, e.message))?;
+    broker
+        .register_artifact_binding(
+            &request.runtime_image,
+            &source_id,
+            CAPABILITY_ABI_VERSION,
+            &artifact_hash,
+        )
+        .map_err(|e| (e.code, e.message))?;
+    broker
+        .register_manifest(
+            &ipc_protocol::RegisterCapabilityManifestRequest {
+                request_id: request.request_id.clone(),
+                auth_token: request.auth_token.clone(),
+                runtime_image: request.runtime_image.clone(),
+                source_id: source_id.clone(),
+                capability_abi: CAPABILITY_ABI_VERSION,
+                environment: request.environment.clone(),
+                grants: Vec::new(),
+            },
+            generation,
+        )
+        .map_err(|e| (e.code, e.message))?;
+    broker
+        .authorize_execution(
+            &request.runtime_image,
+            &source_id,
+            &request.environment,
+            generation,
+            CAPABILITY_ABI_VERSION,
+            &artifact_hash,
+        )
+        .map_err(|e| (e.code, e.message))?;
 
     let default_cost = WorkCost {
         cpu: 100,
@@ -761,17 +785,21 @@ fn submit_compiled_task(
         environment: request.environment.clone(),
         generation,
     };
-    let execution_id = runtime.submit_with_policy(
-        environment,
-        artifact_hash,
-        cost,
-        ResourceLimits::default(),
-        SandboxPolicy::default(),
-        Some(provenance),
-        0,
-        request.input.clone(),
-    ).to_string();
-    active_task_pins().lock().expect("CTI execution pin table poisoned")
+    let execution_id = runtime
+        .submit_with_policy(
+            environment,
+            artifact_hash,
+            cost,
+            ResourceLimits::default(),
+            SandboxPolicy::default(),
+            Some(provenance),
+            0,
+            request.input.clone(),
+        )
+        .to_string();
+    active_task_pins()
+        .lock()
+        .expect("CTI execution pin table poisoned")
         .insert(execution_id.clone(), (task, cost, request.input.len()));
     Ok(execution_id)
 }
@@ -1027,22 +1055,22 @@ fn handle_connection(
                     &request.runtime_image,
                     request.task_oid,
                 ) {
-                    Ok(Some(task)) => match submit_compiled_task(
-                        task, &request, runtime, capability_broker,
-                    ) {
-                        Ok(execution_id) => {
-                            emit_event("task_execution_accepted", &execution_id);
-                            Response::Accepted {
-                                request_id: request.request_id,
-                                execution_id,
+                    Ok(Some(task)) => {
+                        match submit_compiled_task(task, &request, runtime, capability_broker) {
+                            Ok(execution_id) => {
+                                emit_event("task_execution_accepted", &execution_id);
+                                Response::Accepted {
+                                    request_id: request.request_id,
+                                    execution_id,
+                                }
                             }
+                            Err((code, message)) => Response::Error {
+                                request_id: Some(request.request_id),
+                                code: code.into(),
+                                message,
+                            },
                         }
-                        Err((code, message)) => Response::Error {
-                            request_id: Some(request.request_id),
-                            code: code.into(),
-                            message,
-                        },
-                    },
+                    }
                     Ok(None) => Response::Error {
                         request_id: Some(request.request_id),
                         code: "TASK_NOT_FOUND".into(),
