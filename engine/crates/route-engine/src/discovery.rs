@@ -1436,22 +1436,35 @@ async fn execute_precompiled_route_task(
     task_oid: u16,
     input: Vec<u8>,
 ) -> anyhow::Result<Vec<u8>> {
-    let submitted = state.container.execute_task(
-        runtime_image, task_oid, NATIVE_ROUTE_ENVIRONMENT_PROFILE, input,
-    ).await?;
+    let submitted = state
+        .container
+        .execute_task(
+            runtime_image,
+            task_oid,
+            NATIVE_ROUTE_ENVIRONMENT_PROFILE,
+            input,
+        )
+        .await?;
     let started = std::time::Instant::now();
     loop {
         let remaining = match NATIVE_ROUTE_TIMEOUT.checked_sub(started.elapsed()) {
             Some(remaining) if !remaining.is_zero() => remaining,
             _ => {
-                let _ = state.container.cancel_execution(&submitted.execution_id).await;
+                let _ = state
+                    .container
+                    .cancel_execution(&submitted.execution_id)
+                    .await;
                 anyhow::bail!("compiled Route CTI exceeded its execution deadline");
             }
         };
-        match state.container.await_result(
-            &submitted.execution_id,
-            remaining.min(Duration::from_secs(25)),
-        ).await {
+        match state
+            .container
+            .await_result(
+                &submitted.execution_id,
+                remaining.min(Duration::from_secs(25)),
+            )
+            .await
+        {
             Ok(Some(output)) => return Ok(output),
             Ok(None) => continue,
             Err(error) => return Err(error),
@@ -1497,9 +1510,7 @@ async fn execute_native_route(
         }
     };
 
-    let ctitask_oid = if grants.is_empty()
-        && plan.artifact.verb.eq_ignore_ascii_case(verb)
-    {
+    let ctitask_oid = if grants.is_empty() && plan.artifact.verb.eq_ignore_ascii_case(verb) {
         image.route_task_oid(&plan.source_id, verb)
     } else {
         None
@@ -1508,29 +1519,35 @@ async fn execute_native_route(
     // the compiler's capability-free native WASM subset through ExecuteTask.
     // All other routes retain the existing authorized WASM/evaluator path.
     let result = if let Some(task_oid) = ctitask_oid {
-        execute_precompiled_route_task(
-            state, &plan.runtime_image, task_oid, input,
-        ).await
+        execute_precompiled_route_task(state, &plan.runtime_image, task_oid, input).await
     } else {
         let network_cost = u64::from(
-            grants.iter().any(|grant| grant.kind == ContainerCapabilityKind::Network),
+            grants
+                .iter()
+                .any(|grant| grant.kind == ContainerCapabilityKind::Network),
         );
         let identity = ContainerExecutionIdentity {
             runtime_image: &plan.runtime_image,
             source_id: plan.source_id.as_str(),
             environment: NATIVE_ROUTE_ENVIRONMENT_PROFILE,
         };
-        state.container.execute_authorized(ContainerAuthorizedExecution {
-            identity,
-            artifact_hash: &plan.artifact.sha256,
-            wasm: plan.artifact.bytes.clone(),
-            grants,
-            input,
-            declared_cost: ContainerWorkCost {
-                cpu: 1, memory: 1, io: 0, network: network_cost,
-            },
-            timeout: NATIVE_ROUTE_TIMEOUT,
-        }).await
+        state
+            .container
+            .execute_authorized(ContainerAuthorizedExecution {
+                identity,
+                artifact_hash: &plan.artifact.sha256,
+                wasm: plan.artifact.bytes.clone(),
+                grants,
+                input,
+                declared_cost: ContainerWorkCost {
+                    cpu: 1,
+                    memory: 1,
+                    io: 0,
+                    network: network_cost,
+                },
+                timeout: NATIVE_ROUTE_TIMEOUT,
+            })
+            .await
     };
     let output = match result {
         Ok(output) => output,
