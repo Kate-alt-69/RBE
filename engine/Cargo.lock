@@ -428,6 +428,7 @@ dependencies = [
  "rbe-library-resolver",
  "route-engine",
  "runtime-paths",
+ "sdk-package",
  "serde",
  "serde_json",
  "service-runtime",
@@ -3246,6 +3247,16 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "sdk-package"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "toml",
+]
 
 [[package]]
 name = "serde"

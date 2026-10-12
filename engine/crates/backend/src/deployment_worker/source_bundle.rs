@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -20,6 +20,13 @@ pub struct SourceBundle {
     pub path: PathBuf,
     pub sha256: String,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtractedSource {
+    pub file_count: u64,
+    pub total_bytes: u64,
+    pub tree_sha256: String,
 }
 
 #[derive(Debug)]
@@ -251,6 +258,171 @@ fn canonical_path(path: &Path) -> Result<String> {
         anyhow::bail!("source path is outside bundle limits");
     }
     Ok(path)
+}
+
+pub async fn extract_source_bundle(
+    bundle: &Path,
+    destination: &Path,
+    expected_tree_sha256: &str,
+) -> Result<ExtractedSource> {
+    let bundle = bundle.to_path_buf();
+    let destination = destination.to_path_buf();
+    let expected_tree_sha256 = expected_tree_sha256.to_owned();
+    tokio::task::spawn_blocking(move || {
+        extract_source_bundle_sync(&bundle, &destination, &expected_tree_sha256)
+    })
+    .await
+    .context("join source bundle reader")?
+}
+
+fn extract_source_bundle_sync(
+    bundle: &Path,
+    destination: &Path,
+    expected_tree_sha256: &str,
+) -> Result<ExtractedSource> {
+    if !bundle.is_absolute() || !destination.is_absolute() || !valid_sha256(expected_tree_sha256) {
+        anyhow::bail!("invalid durable source bundle restore request");
+    }
+    let metadata = fs::symlink_metadata(bundle)
+        .with_context(|| format!("stat durable source bundle {}", bundle.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_BUNDLE_BYTES
+    {
+        anyhow::bail!("durable source bundle is not a bounded regular file");
+    }
+    if destination.exists() {
+        anyhow::bail!("durable source restore destination must be fresh");
+    }
+    fs::create_dir_all(destination)?;
+
+    let mut input = BufReader::new(
+        File::open(bundle)
+            .with_context(|| format!("open durable source bundle {}", bundle.display()))?,
+    );
+    let mut magic = vec![0_u8; MAGIC.len()];
+    input.read_exact(&mut magic)?;
+    if magic != MAGIC {
+        anyhow::bail!("durable source bundle magic/version is invalid");
+    }
+
+    let file_count = read_u32(&mut input)? as usize;
+    if file_count == 0 || file_count > MAX_FILES {
+        anyhow::bail!("durable source bundle file count is invalid");
+    }
+
+    let mut casefolded = BTreeSet::new();
+    let mut total_bytes = 0_u64;
+    let mut tree_hasher = Sha256::new();
+    tree_hasher.update(b"RBE-SOURCE-TREE-SHA256-V1\0");
+    let mut buffer = vec![0_u8; 64 * 1024];
+
+    for _ in 0..file_count {
+        let path_len = read_u32(&mut input)? as usize;
+        if path_len == 0 || path_len > MAX_PATH_BYTES {
+            anyhow::bail!("durable source bundle path length is invalid");
+        }
+        let mut path_bytes = vec![0_u8; path_len];
+        input.read_exact(&mut path_bytes)?;
+        let path_text =
+            std::str::from_utf8(&path_bytes).context("source bundle path is not UTF-8")?;
+        let path = canonical_path(Path::new(path_text))?;
+        if path != path_text || !casefolded.insert(path.to_ascii_lowercase()) {
+            anyhow::bail!("durable source bundle contains a non-canonical or colliding path");
+        }
+
+        let mut executable_flag = [0_u8; 1];
+        input.read_exact(&mut executable_flag)?;
+        let is_executable = match executable_flag[0] {
+            0 => false,
+            1 => true,
+            _ => anyhow::bail!("durable source bundle executable flag is invalid"),
+        };
+        let size = read_u64(&mut input)?;
+        total_bytes = total_bytes
+            .checked_add(size)
+            .context("durable source restore size accounting overflow")?;
+        if size > MAX_FILE_BYTES || total_bytes > MAX_TOTAL_SOURCE_BYTES {
+            anyhow::bail!("durable source bundle exceeds RBE source limits");
+        }
+
+        let disk_path = destination.join(Path::new(&path));
+        if !disk_path.starts_with(destination) || disk_path == destination {
+            anyhow::bail!("durable source path escaped restore root");
+        }
+        if let Some(parent) = disk_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&disk_path)
+            .with_context(|| format!("create restored source file {}", disk_path.display()))?;
+        let mut remaining = size;
+        let mut file_hasher = Sha256::new();
+        while remaining > 0 {
+            let read_len = usize::try_from(remaining.min(buffer.len() as u64))
+                .context("source bundle chunk size does not fit usize")?;
+            input.read_exact(&mut buffer[..read_len])?;
+            file_hasher.update(&buffer[..read_len]);
+            output.write_all(&buffer[..read_len])?;
+            remaining -= read_len as u64;
+        }
+        output.flush()?;
+        output.sync_all()?;
+        set_executable_if_requested(&disk_path, is_executable)?;
+
+        let file_sha256 = format!("{:x}", file_hasher.finalize());
+        tree_hasher.update((path_bytes.len() as u64).to_be_bytes());
+        tree_hasher.update(&path_bytes);
+        tree_hasher.update(size.to_be_bytes());
+        tree_hasher.update(file_sha256.as_bytes());
+    }
+
+    let mut trailing = [0_u8; 1];
+    if input.read(&mut trailing)? != 0 {
+        anyhow::bail!("durable source bundle contains trailing bytes");
+    }
+
+    let tree_sha256 = format!("{:x}", tree_hasher.finalize());
+    if !tree_sha256.eq_ignore_ascii_case(expected_tree_sha256) {
+        anyhow::bail!("restored source tree does not match durable source metadata");
+    }
+
+    Ok(ExtractedSource {
+        file_count: file_count as u64,
+        total_bytes,
+        tree_sha256,
+    })
+}
+
+fn read_u32(input: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0_u8; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn read_u64(input: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0_u8; 8];
+    input.read_exact(&mut bytes)?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn set_executable_if_requested(path: &Path, is_executable: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if is_executable { 0o755 } else { 0o644 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, is_executable);
+    Ok(())
 }
 
 #[cfg(unix)]

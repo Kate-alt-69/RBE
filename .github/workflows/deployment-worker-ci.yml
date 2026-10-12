@@ -6,6 +6,8 @@ on:
       - 'engine/crates/backend/src/deployment_worker/**'
       - 'engine/crates/backend/src/deployment_worker_main.rs'
       - 'engine/crates/backend/Cargo.toml'
+      - 'engine/crates/sdk-package/**'
+      - 'engine/Cargo.lock'
       - 'install-runtime/src/lib.rs'
       - 'install-executor/src/git_source.rs'
       - '.github/workflows/deployment-worker-ci.yml'
@@ -14,6 +16,8 @@ on:
       - 'engine/crates/backend/src/deployment_worker/**'
       - 'engine/crates/backend/src/deployment_worker_main.rs'
       - 'engine/crates/backend/Cargo.toml'
+      - 'engine/crates/sdk-package/**'
+      - 'engine/Cargo.lock'
       - 'install-runtime/src/lib.rs'
       - 'install-executor/src/git_source.rs'
   workflow_dispatch:
@@ -46,8 +50,11 @@ jobs:
           rustfmt --edition 2021 --check \
             engine/crates/backend/src/deployment_worker_main.rs \
             engine/crates/backend/src/deployment_worker/mod.rs \
+            engine/crates/backend/src/deployment_worker/artifact_transfer.rs \
             engine/crates/backend/src/deployment_worker/publisher.rs \
             engine/crates/backend/src/deployment_worker/source.rs \
+            engine/crates/backend/src/deployment_worker/source_bundle.rs \
+            engine/crates/backend/src/deployment_worker/validation.rs \
             engine/crates/backend/src/deployment_worker/git_exec.rs
       - name: worker clippy
         working-directory: engine

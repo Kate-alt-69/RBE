@@ -8,6 +8,8 @@ pub struct ClaimedDeployment {
     pub deployment_id: String,
     pub repository: String,
     pub git_ref: String,
+    pub package: Option<String>,
+    pub build_root: String,
     pub attempt: u32,
     pub lease_token: String,
 }
@@ -23,6 +25,13 @@ pub struct WorkerUpdate<'a> {
 pub struct SourceArtifactUpload {
     pub url: String,
     pub content_type: String,
+}
+
+pub struct SourceArtifactDownload {
+    pub url: String,
+    pub archive_sha256: String,
+    pub size_bytes: u64,
+    pub source_tree_sha256: String,
 }
 
 pub struct PublisherClient {
@@ -43,40 +52,21 @@ impl PublisherClient {
     }
 
     pub async fn claim_next(&self, worker_id: &str) -> Result<Option<ClaimedDeployment>> {
-        let value = self
-            .post(
-                "v1/developer/deployment/source/claim-next",
-                json!({ "workerId": worker_id }),
-            )
-            .await?;
-        require_ok(&value)?;
-        let Some(deployment) = value.get("deployment") else {
-            anyhow::bail!("deployment claim response is missing deployment field");
-        };
-        if deployment.is_null() {
-            return Ok(None);
-        }
-        let deployment_id = required_string(deployment, "deploymentId")?;
-        if !valid_deployment_id(&deployment_id) {
-            anyhow::bail!("publisher returned an invalid deployment ID");
-        }
-        let attempt = deployment
-            .get("attempt")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .context("publisher returned an invalid deployment attempt")?;
-        let lease_token = required_string(deployment, "leaseToken")?;
-        if lease_token.len() != 64 || !lease_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            anyhow::bail!("publisher returned an invalid deployment lease token");
-        }
-        Ok(Some(ClaimedDeployment {
-            deployment_id,
-            repository: required_string(deployment, "repository")?,
-            git_ref: required_string(deployment, "gitRef")?,
-            attempt,
-            lease_token,
-        }))
+        self.claim_path("v1/developer/deployment/source/claim-next", worker_id)
+            .await
+    }
+
+    pub async fn claim_next_validation(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<ClaimedDeployment>> {
+        self.claim_path("v1/developer/deployment/validation/claim-next", worker_id)
+            .await
+    }
+
+    async fn claim_path(&self, path: &str, worker_id: &str) -> Result<Option<ClaimedDeployment>> {
+        let value = self.post(path, json!({ "workerId": worker_id })).await?;
+        parse_claimed_deployment(&value)
     }
 
     pub async fn seal_source_receipt(
@@ -184,6 +174,84 @@ impl PublisherClient {
         Ok(())
     }
 
+    pub async fn source_artifact(
+        &self,
+        deployment: &ClaimedDeployment,
+    ) -> Result<SourceArtifactDownload> {
+        let value = self
+            .post(
+                "v1/developer/deployment/source/artifact/get",
+                json!({
+                    "deploymentId": deployment.deployment_id,
+                    "leaseToken": deployment.lease_token
+                }),
+            )
+            .await?;
+        require_ok(&value)?;
+        let artifact = value
+            .get("sourceArtifact")
+            .context("publisher source artifact response is missing sourceArtifact")?;
+        if artifact.get("format").and_then(Value::as_str) != Some("rbe-source-bundle-v1") {
+            anyhow::bail!("publisher returned unsupported source artifact format");
+        }
+        let archive_sha256 = required_string(artifact, "archiveSha256")?;
+        let source_tree_sha256 = required_string(artifact, "sourceTreeSha256")?;
+        if !valid_sha256(&archive_sha256) || !valid_sha256(&source_tree_sha256) {
+            anyhow::bail!("publisher returned invalid source artifact hashes");
+        }
+        let size_bytes = artifact
+            .get("sizeBytes")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .context("publisher returned invalid source artifact size")?;
+        let url = required_string(artifact, "downloadUrl")?;
+        if !url.starts_with("https://") {
+            anyhow::bail!("publisher returned a non-HTTPS source artifact download URL");
+        }
+        Ok(SourceArtifactDownload {
+            url,
+            archive_sha256,
+            size_bytes,
+            source_tree_sha256,
+        })
+    }
+
+    pub async fn complete_validation_handoff(
+        &self,
+        deployment: &ClaimedDeployment,
+        message: &str,
+    ) -> Result<()> {
+        let value = self
+            .post(
+                "v1/developer/deployment/validation/complete",
+                json!({
+                    "deploymentId": deployment.deployment_id,
+                    "leaseToken": deployment.lease_token,
+                    "message": message
+                }),
+            )
+            .await?;
+        require_ok(&value)
+    }
+
+    pub async fn release_validation_lease(
+        &self,
+        deployment: &ClaimedDeployment,
+        message: &str,
+    ) -> Result<()> {
+        let value = self
+            .post(
+                "v1/developer/deployment/validation/release",
+                json!({
+                    "deploymentId": deployment.deployment_id,
+                    "leaseToken": deployment.lease_token,
+                    "message": message
+                }),
+            )
+            .await?;
+        require_ok(&value)
+    }
+
     pub async fn complete_source_handoff(
         &self,
         deployment: &ClaimedDeployment,
@@ -264,6 +332,48 @@ impl PublisherClient {
     }
 }
 
+fn parse_claimed_deployment(value: &Value) -> Result<Option<ClaimedDeployment>> {
+    require_ok(value)?;
+    let Some(deployment) = value.get("deployment") else {
+        anyhow::bail!("deployment claim response is missing deployment field");
+    };
+    if deployment.is_null() {
+        return Ok(None);
+    }
+    let deployment_id = required_string(deployment, "deploymentId")?;
+    if !valid_deployment_id(&deployment_id) {
+        anyhow::bail!("publisher returned an invalid deployment ID");
+    }
+    let attempt = deployment
+        .get("attempt")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .context("publisher returned an invalid deployment attempt")?;
+    let lease_token = required_string(deployment, "leaseToken")?;
+    if !valid_sha256(&lease_token) {
+        anyhow::bail!("publisher returned an invalid deployment lease token");
+    }
+    let package = deployment
+        .get("package")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let build = deployment
+        .get("build")
+        .context("publisher deployment claim is missing build settings")?;
+    let build_root = required_string(build, "root")?;
+    Ok(Some(ClaimedDeployment {
+        deployment_id,
+        repository: required_string(deployment, "repository")?,
+        git_ref: required_string(deployment, "gitRef")?,
+        package,
+        build_root,
+        attempt,
+        lease_token,
+    }))
+}
+
 fn required_string(value: &Value, field: &str) -> Result<String> {
     value
         .get(field)
@@ -286,6 +396,10 @@ fn require_ok(value: &Value) -> Result<()> {
 
 pub fn bounded_message(value: &str) -> String {
     value.chars().take(1800).collect()
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn valid_deployment_id(value: &str) -> bool {

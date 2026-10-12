@@ -125,16 +125,16 @@ pub async fn materialize(
         let maximum = materialization.maximum_file_bytes.min(remaining);
         let args = materialization.blob_args(&entry.object_id)?;
         verify_program(&materialization.program, &materialization.program_sha256)?;
-        let digest = stream_blob(
-            &materialization.program,
-            &args,
-            &materialization.working_directory,
-            &materialization.environment,
-            &destination,
-            &entry.path,
-            maximum,
-            Duration::from_secs(plan.limits().timeout_seconds),
-        )
+        let digest = stream_blob(BlobStreamRequest {
+            program: &materialization.program,
+            args: &args,
+            cwd: &materialization.working_directory,
+            environment: &materialization.environment,
+            destination: &destination,
+            source_path: &entry.path,
+            maximum_bytes: maximum,
+            timeout: Duration::from_secs(plan.limits().timeout_seconds),
+        })
         .await
         .with_context(|| format!("materialize Git blob {:?}", entry.path))?;
         total_bytes = total_bytes
@@ -361,16 +361,28 @@ async fn run_stdout(
     }
 }
 
-async fn stream_blob(
-    program: &Path,
-    args: &[String],
-    cwd: &Path,
-    environment: &BTreeMap<String, String>,
-    destination: &Path,
-    source_path: &str,
+struct BlobStreamRequest<'a> {
+    program: &'a Path,
+    args: &'a [String],
+    cwd: &'a Path,
+    environment: &'a BTreeMap<String, String>,
+    destination: &'a Path,
+    source_path: &'a str,
     maximum_bytes: u64,
     timeout: Duration,
-) -> Result<SourceFileDigest> {
+}
+
+async fn stream_blob(request: BlobStreamRequest<'_>) -> Result<SourceFileDigest> {
+    let BlobStreamRequest {
+        program,
+        args,
+        cwd,
+        environment,
+        destination,
+        source_path,
+        maximum_bytes,
+        timeout,
+    } = request;
     let mut command = sealed_command(program, args, cwd, environment);
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     command.kill_on_drop(true);

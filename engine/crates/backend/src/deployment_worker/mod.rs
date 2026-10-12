@@ -1,17 +1,9 @@
-// The worker currently publishes source artifacts but keeps the hardened GET path
-// beside PUT for the restore/consumer side of the same transfer contract. Keep
-// that prepared half compiled without forcing a fake call site merely to satisfy
-// workspace-wide `-D warnings`.
-#[allow(dead_code)]
 mod artifact_transfer;
-// Sealed Git helpers intentionally keep authority, destination and byte/time
-// bounds as explicit inputs. Do not hide those security-relevant arguments in a
-// generic bag solely to satisfy Clippy's seven-argument style threshold.
-#[allow(clippy::too_many_arguments)]
 mod git_exec;
 mod publisher;
 mod source;
 mod source_bundle;
+mod validation;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,8 +11,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use publisher::{bounded_message, ClaimedDeployment, PublisherClient, WorkerUpdate};
 use source::{SourceAuthority, SourceRequest};
-use source_bundle::create_source_bundle;
+use source_bundle::{create_source_bundle, extract_source_bundle};
 use uuid::Uuid;
+use validation::{validate_package, ValidationFailure};
 
 const DEFAULT_RUNTIME_REGISTRY_BASE: &str = "https://kastrick-backend.onrender.com/api/";
 const DEFAULT_POLL_SECONDS: u64 = 3;
@@ -48,13 +41,18 @@ pub async fn run() -> Result<()> {
     );
 
     loop {
+        if let Some(deployment) = publisher.claim_next_validation(&config.worker_id).await? {
+            process_validation_claim(&publisher, &config, &deployment).await;
+            continue;
+        }
+
         let Some(deployment) = publisher.claim_next(&config.worker_id).await? else {
             tokio::time::sleep(config.poll_interval).await;
             continue;
         };
 
         if let Err(error) =
-            process_deployment(&publisher, &source_authority, &config, &deployment).await
+            process_source_deployment(&publisher, &source_authority, &config, &deployment).await
         {
             let message = bounded_message(&format!("source acquisition failed: {error:#}"));
             let terminal = deployment.attempt >= MAX_SOURCE_ATTEMPTS;
@@ -85,7 +83,7 @@ pub async fn run() -> Result<()> {
     }
 }
 
-async fn process_deployment(
+async fn process_source_deployment(
     publisher: &PublisherClient,
     source_authority: &SourceAuthority,
     config: &WorkerConfig,
@@ -159,6 +157,139 @@ async fn process_deployment(
         );
     }
     Ok(())
+}
+
+async fn process_validation_claim(
+    publisher: &PublisherClient,
+    config: &WorkerConfig,
+    deployment: &ClaimedDeployment,
+) {
+    let attempt_root = match attempt_root(
+        &config.work_root,
+        &deployment.deployment_id,
+        deployment.attempt,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            report_validation_infrastructure_failure(publisher, config, deployment, error).await;
+            return;
+        }
+    };
+
+    let result = process_validation(publisher, deployment, &attempt_root).await;
+    match result {
+        Ok(summary) => {
+            let message = bounded_message(&format!(
+                "Validation passed for {}@{} with {} exported component(s) using the shared RPX package checker; handed to build.",
+                summary.package_name, summary.version, summary.component_count
+            ));
+            if let Err(error) = publisher
+                .complete_validation_handoff(deployment, &message)
+                .await
+            {
+                report_validation_infrastructure_failure(publisher, config, deployment, error).await;
+            }
+        }
+        Err(ValidationFailure::Package(message)) => {
+            let message = bounded_message(&format!("package validation failed: {message}"));
+            if let Err(report_error) = publisher
+                .update(
+                    deployment,
+                    WorkerUpdate {
+                        status: "failed",
+                        stage: "failed",
+                        level: "error",
+                        message: &message,
+                        blocked_reason: None,
+                    },
+                )
+                .await
+            {
+                eprintln!(
+                    "failed to report deployment {} package validation failure: {report_error:#}",
+                    deployment.deployment_id
+                );
+            }
+        }
+        Err(ValidationFailure::Infrastructure(error)) => {
+            report_validation_infrastructure_failure(publisher, config, deployment, error).await;
+        }
+    }
+
+    if let Err(error) = tokio::fs::remove_dir_all(&attempt_root).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "deployment {} validation workspace cleanup failed: {error}",
+                deployment.deployment_id
+            );
+        }
+    }
+}
+
+async fn process_validation(
+    publisher: &PublisherClient,
+    deployment: &ClaimedDeployment,
+    attempt_root: &Path,
+) -> std::result::Result<validation::ValidationSummary, ValidationFailure> {
+    let artifact = publisher
+        .source_artifact(deployment)
+        .await
+        .map_err(ValidationFailure::Infrastructure)?;
+    let bundle_path = attempt_root.join("source.rbe-source");
+    artifact_transfer::download_file(
+        &artifact.url,
+        &bundle_path,
+        artifact.size_bytes,
+        &artifact.archive_sha256,
+        SOURCE_ARTIFACT_TRANSFER_TIMEOUT,
+    )
+    .await
+    .map_err(ValidationFailure::Infrastructure)?;
+
+    let source_root = attempt_root.join("source");
+    let restored = extract_source_bundle(
+        &bundle_path,
+        &source_root,
+        &artifact.source_tree_sha256,
+    )
+    .await
+    .map_err(ValidationFailure::Infrastructure)?;
+    if restored.file_count == 0
+        || restored.total_bytes == 0
+        || restored.tree_sha256 != artifact.source_tree_sha256
+    {
+        return Err(ValidationFailure::Infrastructure(anyhow::anyhow!(
+            "restored source receipt is inconsistent with durable metadata"
+        )));
+    }
+
+    validate_package(
+        &source_root,
+        &deployment.build_root,
+        deployment.package.as_deref(),
+    )
+    .await
+}
+
+async fn report_validation_infrastructure_failure(
+    publisher: &PublisherClient,
+    config: &WorkerConfig,
+    deployment: &ClaimedDeployment,
+    error: anyhow::Error,
+) {
+    let message = bounded_message(&format!(
+        "validation executor infrastructure failure: {error:#}"
+    ));
+    if let Err(report_error) = publisher
+        .release_validation_lease(deployment, &message)
+        .await
+    {
+        eprintln!(
+            "failed to release deployment {} validation lease after infrastructure error: {report_error:#}",
+            deployment.deployment_id
+        );
+    }
+    tokio::time::sleep(config.poll_interval).await;
 }
 
 struct WorkerConfig {
