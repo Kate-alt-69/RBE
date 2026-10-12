@@ -122,6 +122,11 @@ impl ContainerTaskAssembler {
     }
 
     pub fn load_index(&self) -> Result<ContainerTaskIndex, String> {
+        // Readers must never observe either half of a CTI/OID generation
+        // while the compiler's durable publication journal is pending.
+        if self.container_cache_dir().join("index.pending-txn").exists() {
+            return Err("Container Task index publication is pending recovery".into());
+        }
         let path = self.index_path();
         if !path.exists() {
             return Ok(ContainerTaskIndex::default());
