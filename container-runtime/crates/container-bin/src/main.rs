@@ -722,12 +722,15 @@ fn submit_compiled_task(
         ))?;
     let artifact_hash = hex::encode(ipc_protocol::cti_sha256(&wasm));
     let source_id = CompiledTaskGraph::root_source_id(&task).map_err(fail)?;
-    let environment = parse_environment(&request.environment)
-        .filter(|id| runtime.has_environment(*id))
-        .ok_or((
-            "INVALID_ENVIRONMENT",
-            "CTI Environment is unavailable".into(),
-        ))?;
+    let environment = match request.environment.as_str() {
+        "general" => runtime.select_environment_profile(EnvironmentProfile::General),
+        "secure" => runtime.select_environment_profile(EnvironmentProfile::Secure),
+        exact => parse_environment(exact).filter(|id| runtime.has_environment(*id)),
+    }.ok_or((
+        "INVALID_ENVIRONMENT",
+        "CTI Environment is unavailable".into(),
+    ))?;
+    let exact_environment = environment.to_string();
     let generation = runtime.environment_generation(environment);
 
     // Materialization is hash-checked, then bound only to the exact root
@@ -751,7 +754,7 @@ fn submit_compiled_task(
                 runtime_image: request.runtime_image.clone(),
                 source_id: source_id.clone(),
                 capability_abi: CAPABILITY_ABI_VERSION,
-                environment: request.environment.clone(),
+                environment: exact_environment.clone(),
                 grants: Vec::new(),
             },
             generation,
@@ -761,7 +764,7 @@ fn submit_compiled_task(
         .authorize_execution(
             &request.runtime_image,
             &source_id,
-            &request.environment,
+            &exact_environment,
             generation,
             CAPABILITY_ABI_VERSION,
             &artifact_hash,
@@ -782,7 +785,7 @@ fn submit_compiled_task(
         runtime_image: request.runtime_image.clone(),
         source_id,
         capability_abi: CAPABILITY_ABI_VERSION,
-        environment: request.environment.clone(),
+        environment: exact_environment.clone(),
         generation,
     };
     let execution_id = runtime
