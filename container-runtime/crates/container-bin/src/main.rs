@@ -726,7 +726,8 @@ fn submit_compiled_task(
         "general" => runtime.select_environment_profile(EnvironmentProfile::General),
         "secure" => runtime.select_environment_profile(EnvironmentProfile::Secure),
         exact => parse_environment(exact).filter(|id| runtime.has_environment(*id)),
-    }.ok_or((
+    }
+    .ok_or((
         "INVALID_ENVIRONMENT",
         "CTI Environment is unavailable".into(),
     ))?;
