@@ -123,6 +123,41 @@ impl CompiledTaskGraph {
         Ok(Self { entry, nodes })
     }
 
+    /// Compiler-assigned root provenance from the immutable optional debug
+    /// section. This is identity, not capability authority.
+    pub fn root_source_id(task: &LoadedTaskImage) -> Result<String, String> {
+        let image = task.image();
+        let section = image.sections.iter()
+            .find(|section| section.kind == CtiSectionKind::DebugNames.code())
+            .ok_or("CTI does not contain root source identity")?;
+        let mut reader = Reader::new(&section.data);
+        if reader.u16()? != CTI_PAYLOAD_VERSION || reader.u16()? != 0 {
+            return Err("CTI DebugNames ABI mismatch".into());
+        }
+        let _canonical = reader.string()?;
+        let _display = reader.string()?;
+        let source = reader.string()?;
+        if source.is_empty() || source.len() > 512 || source.chars().any(char::is_control) {
+            return Err("CTI root SourceId is invalid".into());
+        }
+        Ok(source)
+    }
+
+    /// Do not infer authority from compiled static capabilities. Until the
+    /// trusted capability-node adapters are present, only capability-free
+    /// single WASM Tasks may take the direct isolated-worker path.
+    pub fn has_no_capability_nodes(task: &LoadedTaskImage) -> Result<bool, String> {
+        let image = task.image();
+        let section = image.sections.iter()
+            .find(|section| section.kind == CtiSectionKind::Capabilities.code())
+            .ok_or("CTI does not contain CAPABILITIES")?;
+        let mut reader = Reader::new(&section.data);
+        if reader.u16()? != CTI_PAYLOAD_VERSION {
+            return Err("CTI CAPABILITIES ABI mismatch".into());
+        }
+        Ok(reader.u16()? == 0)
+    }
+
     /// Return the embedded WASM payload only if RELC emitted a real artifact;
     /// a Service-only/no-code Task must never be treated as an empty WASM.
     pub fn embedded_wasm(task: &LoadedTaskImage) -> Result<Option<Vec<u8>>, String> {
@@ -317,6 +352,12 @@ impl<'a> Reader<'a> {
     fn u8(&mut self) -> Result<u8, String> { Ok(self.take(1)?[0]) }
     fn u16(&mut self) -> Result<u16, String> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| "CTI u16 decode")?))
+    }
+    fn string(&mut self) -> Result<String, String> {
+        let len = self.u32()? as usize;
+        if len > 8192 { return Err("CTI string is too long".into()); }
+        let text = self.take(len)?;
+        std::str::from_utf8(text).map(str::to_owned).map_err(|_| "CTI string is not UTF-8".into())
     }
     fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| "CTI u32 decode")?))
