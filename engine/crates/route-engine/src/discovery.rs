@@ -1428,11 +1428,43 @@ fn encode_native_route_input(
     Ok(input)
 }
 
+/// Run the compiler-prepared Task through CC using only the RuntimeImage and
+/// numeric TaskOID. The per-request input stays an opaque binary envelope.
+async fn execute_precompiled_route_task(
+    state: &AppState,
+    runtime_image: &str,
+    task_oid: u16,
+    input: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    let submitted = state.container.execute_task(
+        runtime_image, task_oid, NATIVE_ROUTE_ENVIRONMENT_PROFILE, input,
+    ).await?;
+    let started = std::time::Instant::now();
+    loop {
+        let remaining = match NATIVE_ROUTE_TIMEOUT.checked_sub(started.elapsed()) {
+            Some(remaining) if !remaining.is_zero() => remaining,
+            _ => {
+                let _ = state.container.cancel_execution(&submitted.execution_id).await;
+                anyhow::bail!("compiled Route CTI exceeded its execution deadline");
+            }
+        };
+        match state.container.await_result(
+            &submitted.execution_id,
+            remaining.min(Duration::from_secs(25)),
+        ).await {
+            Ok(Some(output)) => return Ok(output),
+            Ok(None) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 async fn execute_native_route(
     plan: &NativeRoutePlan,
     image: &RuntimeImage,
     state: &AppState,
     path: &str,
+    verb: &str,
     input: Vec<u8>,
 ) -> Response {
     if image.image_id != plan.runtime_image {
@@ -1465,34 +1497,42 @@ async fn execute_native_route(
         }
     };
 
-    let network_cost = u64::from(
-        grants
-            .iter()
-            .any(|grant| grant.kind == ContainerCapabilityKind::Network),
-    );
-    let identity = ContainerExecutionIdentity {
-        runtime_image: &plan.runtime_image,
-        source_id: plan.source_id.as_str(),
-        environment: NATIVE_ROUTE_ENVIRONMENT_PROFILE,
+    let ctitask_oid = if grants.is_empty()
+        && plan.artifact.verb.eq_ignore_ascii_case(verb)
+    {
+        image.route_task_oid(&plan.source_id, verb)
+    } else {
+        None
     };
-    let output = match state
-        .container
-        .execute_authorized(ContainerAuthorizedExecution {
+    // Until service/QuickDB/capability node adapters are complete, route only
+    // the compiler's capability-free native WASM subset through ExecuteTask.
+    // All other routes retain the existing authorized WASM/evaluator path.
+    let result = if let Some(task_oid) = ctitask_oid {
+        execute_precompiled_route_task(
+            state, &plan.runtime_image, task_oid, input,
+        ).await
+    } else {
+        let network_cost = u64::from(
+            grants.iter().any(|grant| grant.kind == ContainerCapabilityKind::Network),
+        );
+        let identity = ContainerExecutionIdentity {
+            runtime_image: &plan.runtime_image,
+            source_id: plan.source_id.as_str(),
+            environment: NATIVE_ROUTE_ENVIRONMENT_PROFILE,
+        };
+        state.container.execute_authorized(ContainerAuthorizedExecution {
             identity,
             artifact_hash: &plan.artifact.sha256,
             wasm: plan.artifact.bytes.clone(),
             grants,
             input,
             declared_cost: ContainerWorkCost {
-                cpu: 1,
-                memory: 1,
-                io: 0,
-                network: network_cost,
+                cpu: 1, memory: 1, io: 0, network: network_cost,
             },
             timeout: NATIVE_ROUTE_TIMEOUT,
-        })
-        .await
-    {
+        }).await
+    };
+    let output = match result {
         Ok(output) => output,
         Err(error) => {
             tracing::error!(
@@ -1500,9 +1540,9 @@ async fn execute_native_route(
                 path = %path,
                 source = %plan.source_id,
                 image = %plan.runtime_image,
-                "native Route-WASM Container execution failed"
+                "native Route/CTI execution failed"
             );
-            append_runtime_error(path, "native Route-WASM Container execution failed");
+            append_runtime_error(path, &error.to_string());
             return request_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "native route execution failed",
@@ -1537,6 +1577,7 @@ struct RouteHandlerPlan {
     field_plan: Arc<FieldRoutePlan>,
     package_exports: Option<Arc<dyn PackageExportCaller>>,
     takes_request: bool,
+    method: String,
 }
 
 async fn execute(
@@ -1553,6 +1594,7 @@ async fn execute(
         field_plan,
         package_exports,
         takes_request,
+        method,
     } = plan;
     let path = request.uri().path().to_string();
     let query = match query_fields(raw_query.as_deref()) {
@@ -1661,7 +1703,7 @@ async fn execute(
                 }
             }
         };
-        return execute_native_route(plan, image.as_ref(), &state, &path, input).await;
+        return execute_native_route(plan, image.as_ref(), &state, &path, &method, input).await;
     }
     let args = if takes_request {
         vec![request_snapshot.take().unwrap_or(Value::Null)]
@@ -1734,6 +1776,7 @@ fn build_method_router(
             field_plan: field_plan.clone(),
             package_exports: package_exports.clone(),
             takes_request: method_def.param_name.is_some(),
+            method: method_def.verb.clone(),
         };
         let verb = method_def.verb.clone();
         let handler = move |State(state): State<AppState>,
