@@ -10,6 +10,8 @@ export const capability = Object.freeze({
   NET_DNS: "net:dns",
   NET_IP: "net:ip",
   NET_TCP: "net:tcp",
+  NET_TCP_LISTEN: "net:tcp-listen",
+  NET_TLS: "net:tls",
   NET_UDP: "net:udp",
   NET_QUIC: "net:quic",
   NET_WEBSOCKET: "net:websocket",
@@ -339,6 +341,94 @@ export class TcpClient extends CapabilityClient {
   }
 }
 
+
+export class TlsClient extends CapabilityClient {
+  constructor(bridge) { super(bridge, capability.NET_TLS); }
+
+  connect(host, port, timeoutMs = null) {
+    return this.call("connect", optionalTimeout({
+      host: assertNonEmptyString(host, "TLS host"),
+      port: assertPort(port)
+    }, timeoutMs));
+  }
+
+  write(handle, data, timeoutMs = null) {
+    return this.call("write", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TLS handle"),
+      data: byteArray(data)
+    }, timeoutMs));
+  }
+
+  read(handle, maxBytes, timeoutMs = null) {
+    return this.call("read", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TLS handle"),
+      max_bytes: assertPositiveInteger(maxBytes, "maxBytes")
+    }, timeoutMs));
+  }
+
+  startTls(handle, timeoutMs = null) {
+    return this.call("start_tls", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TLS handle")
+    }, timeoutMs));
+  }
+
+  close(handle) {
+    return this.call("close", { handle: assertNonEmptyString(handle, "TLS handle") });
+  }
+}
+
+export class TcpListenerClient extends CapabilityClient {
+  constructor(bridge) { super(bridge, capability.NET_TCP_LISTEN); }
+
+  bind(address, port) {
+    return this.call("bind", {
+      address: assertNonEmptyString(address, "TCP listener address"),
+      port: assertPort(port)
+    });
+  }
+
+  accept(handle, timeoutMs = null) {
+    return this.call("accept", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TCP listener handle")
+    }, timeoutMs));
+  }
+
+  write(handle, data, timeoutMs = null) {
+    return this.call("write", optionalTimeout({
+      handle: assertNonEmptyString(handle, "inbound TCP handle"),
+      data: byteArray(data)
+    }, timeoutMs));
+  }
+
+  read(handle, maxBytes, timeoutMs = null) {
+    return this.call("read", optionalTimeout({
+      handle: assertNonEmptyString(handle, "inbound TCP handle"),
+      max_bytes: assertPositiveInteger(maxBytes, "maxBytes")
+    }, timeoutMs));
+  }
+
+  startTls(handle, certChainDer, privateKeyPkcs8Der, timeoutMs = null) {
+    if (!Array.isArray(certChainDer) || certChainDer.length === 0) {
+      throw new TypeError("TLS certificate chain must be a non-empty array");
+    }
+    return this.call("start_tls", optionalTimeout({
+      handle: assertNonEmptyString(handle, "inbound TCP handle"),
+      cert_chain_der: certChainDer.map((certificate) => byteArray(certificate)),
+      private_key_pkcs8_der: byteArray(privateKeyPkcs8Der)
+    }, timeoutMs));
+  }
+
+  closeConnection(handle) {
+    return this.call("close_connection", {
+      handle: assertNonEmptyString(handle, "inbound TCP handle")
+    });
+  }
+
+  close(handle) {
+    return this.call("close", { handle: assertNonEmptyString(handle, "TCP listener handle") });
+  }
+}
+
 export class NetClient {
   constructor(bridge) {
     this.bridge = bridge;
@@ -358,6 +448,8 @@ export class NetClient {
   dns() { return new DnsClient(this.bridge); }
   ip() { return new CapabilityClient(this.bridge, capability.NET_IP); }
   tcp() { return new TcpClient(this.bridge); }
+  tcpListen() { return new TcpListenerClient(this.bridge); }
+  tls() { return new TlsClient(this.bridge); }
   udp() { return new CapabilityClient(this.bridge, capability.NET_UDP); }
   quic() { return new CapabilityClient(this.bridge, capability.NET_QUIC); }
   websocket() { return new CapabilityClient(this.bridge, capability.NET_WEBSOCKET); }

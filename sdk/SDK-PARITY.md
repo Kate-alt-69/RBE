@@ -27,6 +27,8 @@ Typed built-in networking helpers live on `net()` in every SDK:
 - `dns()`
 - `ip()`
 - `tcp()`
+- `tcp_listen()` in Rust/Python or `tcpListen()` in JavaScript/TypeScript
+- `tls()`
 - `udp()`
 - `quic()`
 - `websocket()`
@@ -86,6 +88,8 @@ log.child("smtp")?.debug("Resolving MX records")?;
 
 let dns = sdk.net().dns();
 let tcp = sdk.net().tcp();
+let tls = sdk.net().tls();
+let inbound = sdk.net().tcp_listen();
 ```
 
 ### JavaScript / TypeScript
@@ -97,6 +101,8 @@ await log.child("smtp").debug("Resolving MX records");
 
 const dns = rbe.net().dns();
 const tcp = rbe.net().tcp();
+const tls = rbe.net().tls();
+const inbound = rbe.net().tcpListen();
 ```
 
 ### Python
@@ -108,6 +114,8 @@ log.child("smtp").debug("Resolving MX records")
 
 dns = rbe.net().dns()
 tcp = rbe.net().tcp()
+tls = rbe.net().tls()
+inbound = rbe.net().tcp_listen()
 ```
 
 ## Authority rule

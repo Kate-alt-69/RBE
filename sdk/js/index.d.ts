@@ -49,6 +49,47 @@ export type TcpReadReply = Readonly<{
   eof: boolean;
 }>;
 
+
+export type TlsConnectReply = Readonly<{
+  handle: string;
+  peer: string;
+  tls: boolean;
+}>;
+
+export type TlsReadReply = Readonly<{
+  data: readonly number[];
+  eof: boolean;
+  tls: boolean;
+}>;
+
+export type TlsUpgradeReply = Readonly<{
+  handle: string;
+  tls: true;
+  server_name: string;
+}>;
+
+export type TcpListenBindReply = Readonly<{
+  handle: string;
+  local: string;
+}>;
+
+export type TcpListenAcceptReply = Readonly<{
+  handle: string;
+  peer: string;
+  local: string;
+}>;
+
+export type TcpListenReadReply = Readonly<{
+  data: readonly number[];
+  eof: boolean;
+  tls: boolean;
+}>;
+
+export type TcpListenUpgradeReply = Readonly<{
+  handle: string;
+  tls: true;
+}>;
+
 export interface HostBridge {
   call(request: HostRequest): unknown | Promise<unknown>;
   sessionInfo?(): HostSessionInfo | null;
@@ -135,6 +176,32 @@ export declare class TcpClient extends CapabilityClient {
   close(handle: string): null | Promise<null>;
 }
 
+
+export declare class TlsClient extends CapabilityClient {
+  constructor(bridge: HostBridge);
+  connect(host: string, port: number, timeoutMs?: number | null): TlsConnectReply | Promise<TlsConnectReply>;
+  write(handle: string, data: Uint8Array | readonly number[], timeoutMs?: number | null): TcpWriteReply | Promise<TcpWriteReply>;
+  read(handle: string, maxBytes: number, timeoutMs?: number | null): TlsReadReply | Promise<TlsReadReply>;
+  startTls(handle: string, timeoutMs?: number | null): TlsUpgradeReply | Promise<TlsUpgradeReply>;
+  close(handle: string): null | Promise<null>;
+}
+
+export declare class TcpListenerClient extends CapabilityClient {
+  constructor(bridge: HostBridge);
+  bind(address: string, port: number): TcpListenBindReply | Promise<TcpListenBindReply>;
+  accept(handle: string, timeoutMs?: number | null): TcpListenAcceptReply | Promise<TcpListenAcceptReply>;
+  write(handle: string, data: Uint8Array | readonly number[], timeoutMs?: number | null): TcpWriteReply | Promise<TcpWriteReply>;
+  read(handle: string, maxBytes: number, timeoutMs?: number | null): TcpListenReadReply | Promise<TcpListenReadReply>;
+  startTls(
+    handle: string,
+    certChainDer: readonly (Uint8Array | readonly number[])[],
+    privateKeyPkcs8Der: Uint8Array | readonly number[],
+    timeoutMs?: number | null
+  ): TcpListenUpgradeReply | Promise<TcpListenUpgradeReply>;
+  closeConnection(handle: string): null | Promise<null>;
+  close(handle: string): null | Promise<null>;
+}
+
 export declare class NetClient {
   constructor(bridge: HostBridge);
   sublibrary(name: string): CapabilityClient;
@@ -145,6 +212,8 @@ export declare class NetClient {
   dns(): DnsClient;
   ip(): CapabilityClient;
   tcp(): TcpClient;
+  tcpListen(): TcpListenerClient;
+  tls(): TlsClient;
   udp(): CapabilityClient;
   quic(): CapabilityClient;
   websocket(): CapabilityClient;

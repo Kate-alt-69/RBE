@@ -53,6 +53,8 @@ pub mod capability {
     pub const NET_DNS: &str = "net:dns";
     pub const NET_IP: &str = "net:ip";
     pub const NET_TCP: &str = "net:tcp";
+    pub const NET_TCP_LISTEN: &str = "net:tcp-listen";
+    pub const NET_TLS: &str = "net:tls";
     pub const NET_UDP: &str = "net:udp";
     pub const NET_QUIC: &str = "net:quic";
     pub const NET_WEBSOCKET: &str = "net:websocket";
@@ -579,6 +581,18 @@ impl<'a> Net<'a> {
         }
     }
 
+    pub fn tcp_listen(self) -> TcpListen<'a> {
+        TcpListen {
+            client: self.known(capability::NET_TCP_LISTEN),
+        }
+    }
+
+    pub fn tls(self) -> Tls<'a> {
+        Tls {
+            client: self.known(capability::NET_TLS),
+        }
+    }
+
     pub fn udp(self) -> NetLibrary<'a> {
         self.known(capability::NET_UDP)
     }
@@ -709,6 +723,189 @@ impl<'a> Tcp<'a> {
                 "RBE TCP handle must be non-empty".to_string(),
             ));
         }
+        self.client.call("close", &encode_tcp_close(handle))
+    }
+}
+
+
+/// Typed TLS/STARTTLS client. RBE owns DNS, certificate validation, and socket state.
+pub struct Tls<'a> {
+    client: CapabilityClient<'a>,
+}
+
+impl<'a> Tls<'a> {
+    pub fn raw(&self) -> &CapabilityClient<'a> {
+        &self.client
+    }
+
+    pub fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        if host.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TLS host must be non-empty".to_string(),
+            ));
+        }
+        if port == 0 {
+            return Err(SdkError::InvalidTcpPort(port));
+        }
+        self.client
+            .call("connect", &encode_tcp_connect(host, port, timeout_ms))
+    }
+
+    pub fn write(
+        &self,
+        handle: &str,
+        data: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TLS")?;
+        if data.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TLS write data must be non-empty".to_string(),
+            ));
+        }
+        self.client
+            .call("write", &encode_tcp_write(handle, data, timeout_ms))
+    }
+
+    pub fn read(
+        &self,
+        handle: &str,
+        max_bytes: usize,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TLS")?;
+        if max_bytes == 0 {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TLS max_bytes must be positive".to_string(),
+            ));
+        }
+        self.client
+            .call("read", &encode_tcp_read(handle, max_bytes, timeout_ms))
+    }
+
+    pub fn start_tls(
+        &self,
+        handle: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TLS")?;
+        self.client
+            .call("start_tls", &encode_handle_timeout(handle, timeout_ms))
+    }
+
+    pub fn close(&self, handle: &str) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TLS")?;
+        self.client.call("close", &encode_tcp_close(handle))
+    }
+}
+
+/// Typed inbound TCP listener client. Listener and accepted connection handles stay opaque.
+pub struct TcpListen<'a> {
+    client: CapabilityClient<'a>,
+}
+
+impl<'a> TcpListen<'a> {
+    pub fn raw(&self) -> &CapabilityClient<'a> {
+        &self.client
+    }
+
+    pub fn bind(&self, address: &str, port: u16) -> Result<HostReply, SdkError> {
+        if address.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP listener address must be non-empty".to_string(),
+            ));
+        }
+        if port == 0 {
+            return Err(SdkError::InvalidTcpPort(port));
+        }
+        self.client
+            .call("bind", &encode_tcp_listen_bind(address, port))
+    }
+
+    pub fn accept(
+        &self,
+        handle: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TCP listener")?;
+        self.client
+            .call("accept", &encode_handle_timeout(handle, timeout_ms))
+    }
+
+    pub fn write(
+        &self,
+        handle: &str,
+        data: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "inbound TCP")?;
+        if data.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE inbound TCP write data must be non-empty".to_string(),
+            ));
+        }
+        self.client
+            .call("write", &encode_tcp_write(handle, data, timeout_ms))
+    }
+
+    pub fn read(
+        &self,
+        handle: &str,
+        max_bytes: usize,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "inbound TCP")?;
+        if max_bytes == 0 {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE inbound TCP max_bytes must be positive".to_string(),
+            ));
+        }
+        self.client
+            .call("read", &encode_tcp_read(handle, max_bytes, timeout_ms))
+    }
+
+    pub fn start_tls(
+        &self,
+        handle: &str,
+        cert_chain_der: &[&[u8]],
+        private_key_pkcs8_der: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "inbound TCP")?;
+        if cert_chain_der.is_empty() || cert_chain_der.iter().any(|certificate| certificate.is_empty()) {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE inbound TLS certificate chain must be non-empty".to_string(),
+            ));
+        }
+        if private_key_pkcs8_der.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE inbound TLS PKCS#8 private key must be non-empty".to_string(),
+            ));
+        }
+        self.client.call(
+            "start_tls",
+            &encode_tcp_listen_start_tls(
+                handle,
+                cert_chain_der,
+                private_key_pkcs8_der,
+                timeout_ms,
+            ),
+        )
+    }
+
+    pub fn close_connection(&self, handle: &str) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "inbound TCP")?;
+        self.client
+            .call("close_connection", &encode_tcp_close(handle))
+    }
+
+    pub fn close(&self, handle: &str) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TCP listener")?;
         self.client.call("close", &encode_tcp_close(handle))
     }
 }
@@ -881,6 +1078,67 @@ fn encode_tcp_close(handle: &str) -> Vec<u8> {
     output.into_bytes()
 }
 
+
+fn encode_handle_timeout(handle: &str, timeout_ms: Option<u64>) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_listen_bind(address: &str, port: u16) -> Vec<u8> {
+    let mut output = String::from("{\"address\":");
+    push_json_string(&mut output, address);
+    write!(output, ",\"port\":{port}").expect("writing TCP listener JSON to String cannot fail");
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_listen_start_tls(
+    handle: &str,
+    cert_chain_der: &[&[u8]],
+    private_key_pkcs8_der: &[u8],
+    timeout_ms: Option<u64>,
+) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    output.push_str(",\"cert_chain_der\":[");
+    for (certificate_index, certificate) in cert_chain_der.iter().enumerate() {
+        if certificate_index > 0 {
+            output.push(',');
+        }
+        output.push('[');
+        for (byte_index, byte) in certificate.iter().enumerate() {
+            if byte_index > 0 {
+                output.push(',');
+            }
+            write!(output, "{byte}").expect("writing TLS certificate byte to String cannot fail");
+        }
+        output.push(']');
+    }
+    output.push_str("],\"private_key_pkcs8_der\":[");
+    for (index, byte) in private_key_pkcs8_der.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "{byte}").expect("writing TLS private-key byte to String cannot fail");
+    }
+    output.push(']');
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn validate_non_empty_handle(handle: &str, label: &str) -> Result<(), SdkError> {
+    if handle.is_empty() {
+        return Err(SdkError::InvalidTcpArgument(format!(
+            "RBE {label} handle must be non-empty"
+        )));
+    }
+    Ok(())
+}
+
 fn push_timeout(output: &mut String, timeout_ms: Option<u64>) {
     if let Some(timeout_ms) = timeout_ms {
         write!(output, ",\"timeout_ms\":{timeout_ms}")
@@ -1036,6 +1294,40 @@ mod tests {
         );
         assert_eq!(calls[4].2, "close");
         assert_eq!(calls[4].3, br#"{"handle":"tcp:abc"}"#);
+    }
+
+    #[test]
+    fn typed_tls_and_tcp_listener_clients_encode_live_host_operations() {
+        let bridge = RecordingBridge::default();
+        let sdk = RbeSdk::new(&bridge);
+
+        sdk.net()
+            .tls()
+            .connect("smtp.example.com", 25, Some(2500))
+            .unwrap();
+        sdk.net().tls().start_tls("tls:abc", Some(1000)).unwrap();
+        sdk.net().tcp_listen().bind("0.0.0.0", 2525).unwrap();
+        sdk.net()
+            .tcp_listen()
+            .accept("tcp-listen:abc", Some(5000))
+            .unwrap();
+        sdk.net()
+            .tcp_listen()
+            .start_tls("tcp-in:abc", &[&[1, 2, 3]], &[4, 5, 6], Some(1000))
+            .unwrap();
+
+        let calls = bridge.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0].0, capability::NET_TLS);
+        assert_eq!(calls[0].2, "connect");
+        assert_eq!(calls[1].0, capability::NET_TLS);
+        assert_eq!(calls[1].2, "start_tls");
+        assert_eq!(calls[2].0, capability::NET_TCP_LISTEN);
+        assert_eq!(calls[2].2, "bind");
+        assert_eq!(calls[3].0, capability::NET_TCP_LISTEN);
+        assert_eq!(calls[3].2, "accept");
+        assert_eq!(calls[4].0, capability::NET_TCP_LISTEN);
+        assert_eq!(calls[4].2, "start_tls");
     }
 
     #[test]

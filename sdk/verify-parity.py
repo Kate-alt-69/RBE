@@ -18,6 +18,8 @@ CAPABILITIES = {
     "NET_DNS": "net:dns",
     "NET_IP": "net:ip",
     "NET_TCP": "net:tcp",
+    "NET_TCP_LISTEN": "net:tcp-listen",
+    "NET_TLS": "net:tls",
     "NET_UDP": "net:udp",
     "NET_QUIC": "net:quic",
     "NET_WEBSOCKET": "net:websocket",
@@ -46,6 +48,8 @@ GENERIC_NET_METHODS = (
 
 DNS_METHODS = ("lookup", "ip", "mx")
 TCP_METHODS = ("connect", "write", "read", "close")
+TLS_METHODS = ("connect", "write", "read", "start_tls", "close")
+TCP_LISTEN_METHODS = ("bind", "accept", "write", "read", "start_tls", "close_connection", "close")
 LOG_METHODS = ("debug", "info", "warn", "error", "fatal")
 
 
@@ -77,12 +81,20 @@ for method in GENERIC_NET_METHODS:
 
 require(RUST, "pub fn dns(self) -> Dns", "Rust typed net.dns")
 require(RUST, "pub fn tcp(self) -> Tcp", "Rust typed net.tcp")
+require(RUST, "pub fn tcp_listen(self) -> TcpListen", "Rust typed net.tcp_listen")
+require(RUST, "pub fn tls(self) -> Tls", "Rust typed net.tls")
 require(JS, "dns() { return new DnsClient", "JS typed net.dns")
 require(JS, "tcp() { return new TcpClient", "JS typed net.tcp")
+require(JS, "tcpListen() { return new TcpListenerClient", "JS typed net.tcpListen")
+require(JS, "tls() { return new TlsClient", "JS typed net.tls")
 require(TS, "dns(): DnsClient;", "TypeScript typed net.dns")
 require(TS, "tcp(): TcpClient;", "TypeScript typed net.tcp")
+require(TS, "tcpListen(): TcpListenerClient;", "TypeScript typed net.tcpListen")
+require(TS, "tls(): TlsClient;", "TypeScript typed net.tls")
 require(PY, "def dns(self) -> DnsClient:", "Python typed net.dns")
 require(PY, "def tcp(self) -> TcpClient:", "Python typed net.tcp")
+require(PY, "def tcp_listen(self) -> TcpListenerClient:", "Python typed net.tcp_listen")
+require(PY, "def tls(self) -> TlsClient:", "Python typed net.tls")
 
 rust_dns = class_slice(RUST, "impl<'a> Dns<'a>", "/// Typed stateful TCP client")
 js_dns = class_slice(JS, "export class DnsClient", "export class TcpClient")
@@ -93,14 +105,35 @@ for method in DNS_METHODS:
     require(py_dns, f"def {method}(self, name: str)", f"Python DNS.{method}")
     require(TS, f"{method}(name: string):", f"TypeScript DNS.{method}")
 
-rust_tcp = class_slice(RUST, "impl<'a> Tcp<'a>", "/// Generic reusable client")
-js_tcp = class_slice(JS, "export class TcpClient", "export class NetClient")
-py_tcp = class_slice(PY, "class TcpClient", "class NetClient")
+rust_tcp = class_slice(RUST, "impl<'a> Tcp<'a>", "/// Typed TLS/STARTTLS client")
+js_tcp = class_slice(JS, "export class TcpClient", "export class TlsClient")
+py_tcp = class_slice(PY, "class TcpClient", "class TlsClient")
 for method in TCP_METHODS:
     require(rust_tcp, f"pub fn {method}(", f"Rust TCP.{method}")
     require(js_tcp, f"{method}(", f"JS TCP.{method}")
     require(py_tcp, f"def {method}(", f"Python TCP.{method}")
     require(TS, f"{method}(", f"TypeScript TCP.{method}")
+
+
+rust_tls = class_slice(RUST, "impl<'a> Tls<'a>", "/// Typed inbound TCP listener client")
+js_tls = class_slice(JS, "export class TlsClient", "export class TcpListenerClient")
+py_tls = class_slice(PY, "class TlsClient", "class TcpListenerClient")
+for method in TLS_METHODS:
+    js_name = "startTls" if method == "start_tls" else method
+    require(rust_tls, f"pub fn {method}(", f"Rust TLS.{method}")
+    require(js_tls, f"{js_name}(", f"JS TLS.{js_name}")
+    require(py_tls, f"def {method}(", f"Python TLS.{method}")
+    require(TS, f"{js_name}(", f"TypeScript TLS.{js_name}")
+
+rust_listener = class_slice(RUST, "impl<'a> TcpListen<'a>", "/// Generic reusable client")
+js_listener = class_slice(JS, "export class TcpListenerClient", "export class NetClient")
+py_listener = class_slice(PY, "class TcpListenerClient", "class NetClient")
+for method in TCP_LISTEN_METHODS:
+    js_name = {"start_tls": "startTls", "close_connection": "closeConnection"}.get(method, method)
+    require(rust_listener, f"pub fn {method}(", f"Rust TCP listener.{method}")
+    require(js_listener, f"{js_name}(", f"JS TCP listener.{js_name}")
+    require(py_listener, f"def {method}(", f"Python TCP listener.{method}")
+    require(TS, f"{js_name}(", f"TypeScript TCP listener.{js_name}")
 
 require(RUST, "pub fn raw(&self) -> &CapabilityClient", "Rust typed net raw escape hatch")
 require(JS, "extends CapabilityClient", "JS typed net raw escape hatch")

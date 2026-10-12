@@ -16,6 +16,8 @@ NET_URL = "net:url"
 NET_DNS = "net:dns"
 NET_IP = "net:ip"
 NET_TCP = "net:tcp"
+NET_TCP_LISTEN = "net:tcp-listen"
+NET_TLS = "net:tls"
 NET_UDP = "net:udp"
 NET_QUIC = "net:quic"
 NET_WEBSOCKET = "net:websocket"
@@ -366,6 +368,111 @@ class TcpClient(CapabilityClient):
         return self.call("close", {"handle": _assert_non_empty_string(handle, "TCP handle")})
 
 
+
+class TlsClient(CapabilityClient):
+    def __init__(self, bridge: HostBridge) -> None:
+        super().__init__(bridge, NET_TLS)
+
+    def connect(self, host: str, port: int, timeout_ms: int | None = None) -> Any:
+        if port < 1 or port > 65535:
+            raise ValueError("TLS port must be in 1..=65535")
+        return self.call(
+            "connect",
+            _optional_timeout(
+                {"host": _assert_non_empty_string(host, "TLS host"), "port": port},
+                timeout_ms,
+            ),
+        )
+
+    def write(self, handle: str, data: bytes | bytearray | memoryview | list[int] | tuple[int, ...], timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "write",
+            _optional_timeout(
+                {"handle": _assert_non_empty_string(handle, "TLS handle"), "data": _byte_list(data)},
+                timeout_ms,
+            ),
+        )
+
+    def read(self, handle: str, max_bytes: int, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "read",
+            _optional_timeout(
+                {"handle": _assert_non_empty_string(handle, "TLS handle"), "max_bytes": _assert_positive_int(max_bytes, "max_bytes")},
+                timeout_ms,
+            ),
+        )
+
+    def start_tls(self, handle: str, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "start_tls",
+            _optional_timeout({"handle": _assert_non_empty_string(handle, "TLS handle")}, timeout_ms),
+        )
+
+    def close(self, handle: str) -> Any:
+        return self.call("close", {"handle": _assert_non_empty_string(handle, "TLS handle")})
+
+
+class TcpListenerClient(CapabilityClient):
+    def __init__(self, bridge: HostBridge) -> None:
+        super().__init__(bridge, NET_TCP_LISTEN)
+
+    def bind(self, address: str, port: int) -> Any:
+        if port < 1 or port > 65535:
+            raise ValueError("TCP listener port must be in 1..=65535")
+        return self.call("bind", {"address": _assert_non_empty_string(address, "TCP listener address"), "port": port})
+
+    def accept(self, handle: str, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "accept",
+            _optional_timeout({"handle": _assert_non_empty_string(handle, "TCP listener handle")}, timeout_ms),
+        )
+
+    def write(self, handle: str, data: bytes | bytearray | memoryview | list[int] | tuple[int, ...], timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "write",
+            _optional_timeout(
+                {"handle": _assert_non_empty_string(handle, "inbound TCP handle"), "data": _byte_list(data)},
+                timeout_ms,
+            ),
+        )
+
+    def read(self, handle: str, max_bytes: int, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "read",
+            _optional_timeout(
+                {"handle": _assert_non_empty_string(handle, "inbound TCP handle"), "max_bytes": _assert_positive_int(max_bytes, "max_bytes")},
+                timeout_ms,
+            ),
+        )
+
+    def start_tls(
+        self,
+        handle: str,
+        cert_chain_der: list[bytes | bytearray | memoryview | list[int] | tuple[int, ...]],
+        private_key_pkcs8_der: bytes | bytearray | memoryview | list[int] | tuple[int, ...],
+        timeout_ms: int | None = None,
+    ) -> Any:
+        if not isinstance(cert_chain_der, list) or not cert_chain_der:
+            raise TypeError("TLS certificate chain must be a non-empty list")
+        return self.call(
+            "start_tls",
+            _optional_timeout(
+                {
+                    "handle": _assert_non_empty_string(handle, "inbound TCP handle"),
+                    "cert_chain_der": [_byte_list(certificate) for certificate in cert_chain_der],
+                    "private_key_pkcs8_der": _byte_list(private_key_pkcs8_der),
+                },
+                timeout_ms,
+            ),
+        )
+
+    def close_connection(self, handle: str) -> Any:
+        return self.call("close_connection", {"handle": _assert_non_empty_string(handle, "inbound TCP handle")})
+
+    def close(self, handle: str) -> Any:
+        return self.call("close", {"handle": _assert_non_empty_string(handle, "TCP listener handle")})
+
+
 class NetClient:
     def __init__(self, bridge: HostBridge) -> None:
         self._bridge = bridge
@@ -395,6 +502,12 @@ class NetClient:
 
     def tcp(self) -> TcpClient:
         return TcpClient(self._bridge)
+
+    def tcp_listen(self) -> TcpListenerClient:
+        return TcpListenerClient(self._bridge)
+
+    def tls(self) -> TlsClient:
+        return TlsClient(self._bridge)
 
     def udp(self) -> CapabilityClient:
         return CapabilityClient(self._bridge, NET_UDP)
