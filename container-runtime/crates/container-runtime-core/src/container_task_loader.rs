@@ -313,6 +313,7 @@ impl RuntimeImageTaskRegistry {
             }
         }
         state.retired.remove(&active_id);
+        state.retired_tasks.remove(&active_id);
         state.tables.insert(active_id, table);
         Ok((task_count, retired_images))
     }
@@ -324,6 +325,7 @@ impl RuntimeImageTaskRegistry {
         let key = table.runtime_image_sha256();
         let mut state = write_unpoisoned(&self.state);
         state.retired.remove(&key);
+        state.retired_tasks.remove(&key);
         state.tables.insert(key, table)
     }
 
@@ -442,7 +444,7 @@ impl RuntimeImageTaskRegistry {
             .collect::<std::collections::BTreeSet<_>>();
         let mut removed_blobs = 0;
         for id in &ready {
-            if let Some(tasks) = state.retired_tasks.remove(id) {
+            if let Some(tasks) = state.retired_tasks.get(id).cloned() {
                 for (hash, _) in tasks {
                     if published.contains(&hash) {
                         continue;
@@ -457,6 +459,7 @@ impl RuntimeImageTaskRegistry {
                         )),
                     }
                 }
+                state.retired_tasks.remove(id);
             }
         }
         Ok((ready.len(), removed_blobs))
