@@ -80,17 +80,18 @@ pub fn compile_with_tasks(
     })?;
     let mut settings = effective_settings_json(config);
     let package_graph_sha256 = bind_package_graph_identity(&mut settings, &package_links)?;
-    let compiled = route_engine::relc_linked_image::compile_runtime_image_with_packages_and_linked_rel(
-        &server_source,
-        physical.clone(),
-        &settings,
-        &package_links,
-    )
-    .map_err(|error| {
-        anyhow::anyhow!(
+    let compiled =
+        route_engine::relc_linked_image::compile_runtime_image_with_packages_and_linked_rel(
+            &server_source,
+            physical.clone(),
+            &settings,
+            &package_links,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
             "RBE5100 Backend could not compile RELC Task discovery for the Runtime Image: {error}"
         )
-    })?;
+        })?;
     let image = &compiled.image;
     route_engine::validate_runtime_image_routes(&image)?;
     tracing::info!(
