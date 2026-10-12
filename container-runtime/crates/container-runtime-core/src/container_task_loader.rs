@@ -296,6 +296,28 @@ impl RuntimeImageTaskRegistry {
     pub fn remove(&self, runtime_image_sha256: &[u8; 32]) -> Option<Arc<RuntimeImageTaskTable>> {
         write_unpoisoned(&self.tables).remove(runtime_image_sha256)
     }
+
+    /// Drop all inactive RuntimeImage tables from the registry in one cutover.
+    ///
+    /// An ExecuteTask lookup clones an Arc<LoadedTaskImage> while holding the
+    /// registry's read lock. Removing the table cannot invalidate an execution
+    /// that has already obtained its Arc; the image stays allocated until its
+    /// final execution reference is dropped.
+    pub fn retain_runtime_images(
+        &self,
+        active_runtime_images: &std::collections::BTreeSet<[u8; 32]>,
+    ) -> usize {
+        let mut tables = write_unpoisoned(&self.tables);
+        let before = tables.len();
+        tables.retain(|runtime_image, _| active_runtime_images.contains(runtime_image));
+        before - tables.len()
+    }
+
+    /// Return a snapshot of registered RuntimeImage identities, useful for CC
+    /// refresh bookkeeping and explicit retirement decisions.
+    pub fn registered_runtime_images(&self) -> Vec<[u8; 32]> {
+        read_unpoisoned(&self.tables).keys().copied().collect()
+    }
 }
 
 fn read_unpoisoned<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
