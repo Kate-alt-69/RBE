@@ -13,7 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use container_runtime_core::{
-    ContainerTaskAssembler, ContainerTaskAssemblyInput, ContainerTaskIndex, CTI_COMPILER_ABI_VERSION,
+    ContainerTaskAssembler, ContainerTaskAssemblyInput, ContainerTaskIndex,
+    CTI_COMPILER_ABI_VERSION,
 };
 use ipc_protocol::container_task_image::{
     cti_sha256, CtiSection, CtiSectionKind, CTI_DEFAULT_ARENA_BYTES, CTI_MAX_SLOTS,
@@ -54,12 +55,12 @@ pub fn recover_container_task_publication(
     let old_digest = &bytes[8..40];
     let new_digest = &bytes[40..72];
     let expected_index_digest = &bytes[72..104];
-    let length = u32::from_be_bytes(bytes[104..108].try_into().map_err(|_| {
-        ContainerTaskAssemblyError::Cache("invalid CTI intent length".into())
-    })?) as usize;
-    if length > CTI_PUBLICATION_MAX_BYTES
-        || bytes.len() != CTI_PUBLICATION_HEADER + length
-    {
+    let length = u32::from_be_bytes(
+        bytes[104..108]
+            .try_into()
+            .map_err(|_| ContainerTaskAssemblyError::Cache("invalid CTI intent length".into()))?,
+    ) as usize;
+    if length > CTI_PUBLICATION_MAX_BYTES || bytes.len() != CTI_PUBLICATION_HEADER + length {
         return Err(ContainerTaskAssemblyError::Cache(
             "CTI publication intent length mismatch".into(),
         ));
@@ -72,8 +73,8 @@ pub fn recover_container_task_publication(
     }
     let oid_digest = Sha256::digest(oid_cache.index().to_bytes()?);
     if oid_digest.as_slice() == new_digest {
-        let target = ContainerTaskIndex::decode(index_bytes)
-            .map_err(ContainerTaskAssemblyError::Cache)?;
+        let target =
+            ContainerTaskIndex::decode(index_bytes).map_err(ContainerTaskAssemblyError::Cache)?;
         // An intent is never authority to publish nonexistent/corrupt blobs.
         for (_, entry) in target.iter() {
             let blob_path = assembler.blob_path(&entry.cti_sha256);
@@ -90,10 +91,13 @@ pub fn recover_container_task_publication(
                 )));
             }
         }
-        assembler.replace_index(&target).map_err(ContainerTaskAssemblyError::Cache)?;
+        assembler
+            .replace_index(&target)
+            .map_err(ContainerTaskAssemblyError::Cache)?;
     } else if oid_digest.as_slice() != old_digest {
         return Err(ContainerTaskAssemblyError::Cache(
-            "OID index is neither the staged nor the prior CTI generation; refusing recovery".into(),
+            "OID index is neither the staged nor the prior CTI generation; refusing recovery"
+                .into(),
         ));
     }
     fs::remove_file(&pending).map_err(|error| {
@@ -108,12 +112,15 @@ fn write_container_task_intent(
     new_index: &OidIndex,
     container_index: &ContainerTaskIndex,
 ) -> Result<(), ContainerTaskAssemblyError> {
-    let new_bytes = container_index.encode().map_err(ContainerTaskAssemblyError::Cache)?;
-    let length = u32::try_from(new_bytes.len()).map_err(|_| {
-        ContainerTaskAssemblyError::Cache("CTI index exceeds journal limit".into())
-    })?;
+    let new_bytes = container_index
+        .encode()
+        .map_err(ContainerTaskAssemblyError::Cache)?;
+    let length = u32::try_from(new_bytes.len())
+        .map_err(|_| ContainerTaskAssemblyError::Cache("CTI index exceeds journal limit".into()))?;
     if new_bytes.len() > CTI_PUBLICATION_MAX_BYTES {
-        return Err(ContainerTaskAssemblyError::Cache("CTI index exceeds journal limit".into()));
+        return Err(ContainerTaskAssemblyError::Cache(
+            "CTI index exceeds journal limit".into(),
+        ));
     }
     let mut intent = Vec::with_capacity(CTI_PUBLICATION_HEADER + new_bytes.len());
     intent.extend_from_slice(&CTI_PUBLICATION_MAGIC);
@@ -126,10 +133,13 @@ fn write_container_task_intent(
         ContainerTaskAssemblyError::Cache(format!("create CTI journal directory: {error}"))
     })?;
     atomic_io::AtomicIo::new()
-        .write_atomic(&assembler.container_cache_dir().join("index.pending-txn"), &intent)
-        .map_err(|error| ContainerTaskAssemblyError::Cache(
-            format!("stage CTI/OID publication intent: {error}")
-        ))
+        .write_atomic(
+            &assembler.container_cache_dir().join("index.pending-txn"),
+            &intent,
+        )
+        .map_err(|error| {
+            ContainerTaskAssemblyError::Cache(format!("stage CTI/OID publication intent: {error}"))
+        })
 }
 
 pub const CTI_SECTION_PAYLOAD_VERSION: u16 = 1;
@@ -202,7 +212,8 @@ pub fn assemble_container_task_cache(
     let assembler = ContainerTaskAssembler::new(project_root.join(".cache"));
     // CC retirement and RELC publication share a cross-process lock; the
     // lock covers the journal, CTI index, and old-generation GC boundary.
-    let _publication_lock = assembler.lock_index()
+    let _publication_lock = assembler
+        .lock_index()
         .map_err(ContainerTaskAssemblyError::Cache)?;
     recover_container_task_publication(project_root, oid_cache)?;
     let runtime_image_sha256 = decode_sha256("Runtime Image", &image.image_id)
