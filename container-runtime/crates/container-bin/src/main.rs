@@ -615,13 +615,9 @@ fn resolve_container_task(
     runtime_image: &str,
     task_oid: u16,
 ) -> Result<Option<Arc<LoadedTaskImage>>, ContainerTaskLoadError> {
-    if let Some(task) = task_registry.lookup_hex(runtime_image, task_oid)? {
-        return Ok(Some(task));
-    }
-    let table = task_loader.load_runtime_image_hex(runtime_image)?;
-    let task = table.lookup(task_oid);
-    task_registry.install_table(table);
-    Ok(task)
+    // A lazy cache miss must not reinstall a stale table after an explicit
+    // RuntimeImage refresh. The registry serializes this against activation.
+    task_registry.lookup_or_install(task_loader, runtime_image, task_oid)
 }
 
 fn task_load_error_code(error: &ContainerTaskLoadError) -> &'static str {
@@ -809,6 +805,42 @@ fn handle_connection(
                         request_id: Some(bound_request.request_id),
                         code: error.code.into(),
                         message: error.message,
+                    },
+                }
+            }
+        }
+        Request::ActivateTaskImage(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else {
+                match task_registry.activate_from_cache_and_retire(
+                    task_loader,
+                    &request.runtime_image,
+                    &request.retire_runtime_images,
+                ) {
+                    Ok((task_count, retired_images)) => {
+                        emit_event(
+                            "task_image_activated",
+                            &format!(
+                                "runtime_image={} tasks={} retired={}",
+                                request.runtime_image, task_count, retired_images
+                            ),
+                        );
+                        Response::TaskImageActivated {
+                            request_id: request.request_id,
+                            runtime_image: request.runtime_image,
+                            task_count,
+                            retired_images,
+                        }
+                    }
+                    Err(error) => Response::Error {
+                        request_id: Some(request.request_id),
+                        code: task_load_error_code(&error).into(),
+                        message: error.to_string(),
                     },
                 }
             }
