@@ -727,7 +727,6 @@ impl<'a> Tcp<'a> {
     }
 }
 
-
 /// Typed TLS/STARTTLS client. RBE owns DNS, certificate validation, and socket state.
 pub struct Tls<'a> {
     client: CapabilityClient<'a>,
@@ -788,11 +787,7 @@ impl<'a> Tls<'a> {
             .call("read", &encode_tcp_read(handle, max_bytes, timeout_ms))
     }
 
-    pub fn start_tls(
-        &self,
-        handle: &str,
-        timeout_ms: Option<u64>,
-    ) -> Result<HostReply, SdkError> {
+    pub fn start_tls(&self, handle: &str, timeout_ms: Option<u64>) -> Result<HostReply, SdkError> {
         validate_non_empty_handle(handle, "TLS")?;
         self.client
             .call("start_tls", &encode_handle_timeout(handle, timeout_ms))
@@ -827,11 +822,7 @@ impl<'a> TcpListen<'a> {
             .call("bind", &encode_tcp_listen_bind(address, port))
     }
 
-    pub fn accept(
-        &self,
-        handle: &str,
-        timeout_ms: Option<u64>,
-    ) -> Result<HostReply, SdkError> {
+    pub fn accept(&self, handle: &str, timeout_ms: Option<u64>) -> Result<HostReply, SdkError> {
         validate_non_empty_handle(handle, "TCP listener")?;
         self.client
             .call("accept", &encode_handle_timeout(handle, timeout_ms))
@@ -877,7 +868,11 @@ impl<'a> TcpListen<'a> {
         timeout_ms: Option<u64>,
     ) -> Result<HostReply, SdkError> {
         validate_non_empty_handle(handle, "inbound TCP")?;
-        if cert_chain_der.is_empty() || cert_chain_der.iter().any(|certificate| certificate.is_empty()) {
+        if cert_chain_der.is_empty()
+            || cert_chain_der
+                .iter()
+                .any(|certificate| certificate.is_empty())
+        {
             return Err(SdkError::InvalidTcpArgument(
                 "RBE inbound TLS certificate chain must be non-empty".to_string(),
             ));
@@ -889,12 +884,7 @@ impl<'a> TcpListen<'a> {
         }
         self.client.call(
             "start_tls",
-            &encode_tcp_listen_start_tls(
-                handle,
-                cert_chain_der,
-                private_key_pkcs8_der,
-                timeout_ms,
-            ),
+            &encode_tcp_listen_start_tls(handle, cert_chain_der, private_key_pkcs8_der, timeout_ms),
         )
     }
 
@@ -1077,7 +1067,6 @@ fn encode_tcp_close(handle: &str) -> Vec<u8> {
     output.push('}');
     output.into_bytes()
 }
-
 
 fn encode_handle_timeout(handle: &str, timeout_ms: Option<u64>) -> Vec<u8> {
     let mut output = String::from("{\"handle\":");
