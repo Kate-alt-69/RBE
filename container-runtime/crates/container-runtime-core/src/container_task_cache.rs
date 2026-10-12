@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use fs2::FileExt;
 use std::path::PathBuf;
 
 use ipc_protocol::container_task_image::{cti_sha256, ContainerTaskImage, CtiHeaderV1, CtiSection};
@@ -63,6 +64,16 @@ pub struct ContainerTaskCacheCommit {
     pub index_changed: bool,
 }
 
+/// Cross-process exclusive lock for compiler publication and CC retirement.
+pub struct ContainerTaskIndexLock {
+    file: fs::File,
+}
+impl Drop for ContainerTaskIndexLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
 #[derive(Clone)]
 pub struct ContainerTaskAssembler {
     cache_root: PathBuf,
@@ -79,6 +90,22 @@ impl ContainerTaskAssembler {
 
     pub fn container_cache_dir(&self) -> PathBuf {
         self.cache_root.join("compiler").join("container")
+    }
+
+    /// Serialize compiler publication and Container-side retirement across
+    /// processes. The lock file stays in place; OS locks are released even
+    /// if the owning process crashes.
+    pub fn lock_index(&self) -> Result<ContainerTaskIndexLock, String> {
+        fs::create_dir_all(self.container_cache_dir())
+            .map_err(|error| format!("create CTI index directory: {error}"))?;
+        let path = self.container_cache_dir().join("index.lock");
+        let file = fs::OpenOptions::new()
+            .create(true).read(true).write(true)
+            .open(&path)
+            .map_err(|error| format!("open CTI index lock {}: {error}", path.display()))?;
+        file.lock_exclusive()
+            .map_err(|error| format!("lock CTI index {}: {error}", path.display()))?;
+        Ok(ContainerTaskIndexLock { file })
     }
 
     pub fn index_path(&self) -> PathBuf {
