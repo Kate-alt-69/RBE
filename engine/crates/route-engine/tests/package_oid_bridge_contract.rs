@@ -49,7 +49,9 @@ fn verified_package_context_prepares_single_index_native_transaction() {
     assert_eq!(prepared.delta().previous_generation, base_generation);
     assert_eq!(
         prepared.delta().generation,
-        base_generation.checked_add(1).expect("test generation overflow")
+        base_generation
+            .checked_add(1)
+            .expect("test generation overflow")
     );
     assert_eq!(prepared.materialize_bindings().len(), 1);
     let oid =
