@@ -193,6 +193,17 @@ pub struct HealthRequest {
     pub auth_token: String,
 }
 
+/// Trusted backend announces a fully published compiler-owned CTI generation.
+/// The Controller loads and verifies the new table before touching active ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivateTaskImageRequest {
+    pub request_id: String,
+    pub auth_token: String,
+    pub runtime_image: String,
+    /// Previously active RuntimeImage IDs that should stop accepting new Tasks.
+    pub retire_runtime_images: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrepareRefreshRequest {
     pub request_id: String,
@@ -214,6 +225,7 @@ pub enum Request {
     RegisterCapabilityManifest(RegisterCapabilityManifestRequest),
     Execute(ExecuteRequest),
     ExecuteTask(ExecuteTaskRequest),
+    ActivateTaskImage(ActivateTaskImageRequest),
     AwaitResult(AwaitResultRequest),
     Cancel(CancelRequest),
     Inspect(InspectRequest),
@@ -339,6 +351,12 @@ pub enum Response {
     /// Phase 4 stops after trusted CTI resolution. Phase 5 will turn this
     /// resolved image into a TaskExecution and therefore may later add a
     /// separate execution-accepted response without changing this lookup proof.
+    TaskImageActivated {
+        request_id: String,
+        runtime_image: String,
+        task_count: usize,
+        retired_images: usize,
+    },
     TaskResolved {
         request_id: String,
         runtime_image: String,
