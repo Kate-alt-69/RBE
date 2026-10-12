@@ -38,11 +38,11 @@ pub struct ContainerCapabilityBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContainerResolvedTask {
+pub struct ContainerSubmittedTask {
     pub runtime_image: String,
     pub task_oid: u16,
     pub environment: String,
-    pub cti_sha256: String,
+    pub execution_id: String,
 }
 
 #[derive(Debug)]
@@ -307,22 +307,20 @@ impl ContainerClient {
         }
     }
 
-    /// Resolve one precompiled Task through Controller without sending source,
-    /// artifact, service, or function identity. Phase 4 deliberately returns the
-    /// validated CTI binding rather than pretending the Task DAG has executed.
+    /// Submit a precompiled Task to Controller by RuntimeImage + TaskOID.
+    /// Controller resolves the immutable CTI and returns its execution ID;
+    /// AwaitResult and Cancel use the same existing execution lifecycle.
     pub async fn execute_task(
         &self,
         runtime_image: &str,
         task_oid: u16,
         environment: &str,
         input: Vec<u8>,
-    ) -> anyhow::Result<ContainerResolvedTask> {
+    ) -> anyhow::Result<ContainerSubmittedTask> {
         if input.len() > MAX_EXECUTION_INPUT_BYTES {
             anyhow::bail!("Container Task input exceeds the IPC limit");
         }
-        let endpoint = self
-            .endpoint
-            .read()
+        let endpoint = self.endpoint.read()
             .expect("container endpoint lock poisoned")
             .clone();
         let request_id = next_request_id();
@@ -335,34 +333,19 @@ impl ContainerClient {
             input,
         });
         match call(endpoint, request, Duration::from_secs(5)).await? {
-            Response::TaskResolved {
+            Response::Accepted {
                 request_id: returned_request_id,
-                runtime_image: returned_runtime_image,
-                task_oid: returned_task_oid,
-                environment: returned_environment,
-                cti_sha256,
-            } if returned_request_id == request_id
-                && returned_runtime_image == runtime_image
-                && returned_task_oid == task_oid
-                && returned_environment == environment =>
-            {
-                if cti_sha256.len() != 64
-                    || !cti_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-                {
-                    anyhow::bail!("Container returned an invalid CTI SHA-256 identity");
-                }
-                Ok(ContainerResolvedTask {
-                    runtime_image: returned_runtime_image,
-                    task_oid: returned_task_oid,
-                    environment: returned_environment,
-                    cti_sha256,
+                execution_id,
+            } if returned_request_id == request_id && !execution_id.is_empty() => {
+                Ok(ContainerSubmittedTask {
+                    runtime_image: runtime_image.to_string(),
+                    task_oid,
+                    environment: environment.to_string(),
+                    execution_id,
                 })
             }
-            Response::TaskResolved { .. } => {
-                anyhow::bail!("Container returned a mismatched Task resolution")
-            }
             Response::Error { code, message, .. } => {
-                anyhow::bail!("container Task resolution failed [{code}]: {message}")
+                anyhow::bail!("Container Task submission failed [{code}]: {message}")
             }
             other => anyhow::bail!("unexpected Container ExecuteTask response: {other:?}"),
         }
