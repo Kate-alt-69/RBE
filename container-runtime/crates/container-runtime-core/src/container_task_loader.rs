@@ -301,9 +301,10 @@ impl RuntimeImageTaskRegistry {
             state.retired.insert(id);
             if let Some(table) = state.tables.remove(&id) {
                 state.retired_tasks.entry(id).or_default().extend(
-                    table.images.iter().map(|task| {
-                        (task.cti_sha256(), Arc::downgrade(task))
-                    }),
+                    table
+                        .images
+                        .iter()
+                        .map(|task| (task.cti_sha256(), Arc::downgrade(task))),
                 );
                 retired_images += 1;
             } else {
@@ -361,7 +362,8 @@ impl RuntimeImageTaskRegistry {
         if state.retired.contains(runtime_image_sha256) {
             return None;
         }
-        state.tables
+        state
+            .tables
             .get(runtime_image_sha256)
             .and_then(|table| table.lookup(task_oid))
     }
@@ -376,7 +378,9 @@ impl RuntimeImageTaskRegistry {
     }
 
     pub fn remove(&self, runtime_image_sha256: &[u8; 32]) -> Option<Arc<RuntimeImageTaskTable>> {
-        write_unpoisoned(&self.state).tables.remove(runtime_image_sha256)
+        write_unpoisoned(&self.state)
+            .tables
+            .remove(runtime_image_sha256)
     }
 
     /// Retire every image that is no longer active. In-flight Task Arc
@@ -386,16 +390,19 @@ impl RuntimeImageTaskRegistry {
         active_runtime_images: &std::collections::BTreeSet<[u8; 32]>,
     ) -> usize {
         let mut state = write_unpoisoned(&self.state);
-        let removed: Vec<_> = state.tables.keys()
+        let removed: Vec<_> = state
+            .tables
+            .keys()
             .filter(|id| !active_runtime_images.contains(*id))
             .copied()
             .collect();
         for id in &removed {
             if let Some(table) = state.tables.remove(id) {
                 state.retired_tasks.entry(*id).or_default().extend(
-                    table.images.iter().map(|task| {
-                        (task.cti_sha256(), Arc::downgrade(task))
-                    }),
+                    table
+                        .images
+                        .iter()
+                        .map(|task| (task.cti_sha256(), Arc::downgrade(task))),
                 );
             }
             state.retired.insert(*id);
@@ -412,7 +419,9 @@ impl RuntimeImageTaskRegistry {
         loader: &ContainerTaskLoader,
     ) -> Result<(usize, usize), String> {
         let mut state = write_unpoisoned(&self.state);
-        let ready = state.retired_tasks.iter()
+        let ready = state
+            .retired_tasks
+            .iter()
             .filter(|(_, tasks)| tasks.iter().all(|(_, weak)| weak.strong_count() == 0))
             .map(|(id, _)| *id)
             .collect::<std::collections::BTreeSet<_>>();
@@ -423,16 +432,13 @@ impl RuntimeImageTaskRegistry {
         let assembler = ContainerTaskAssembler::new(&loader.cache_root);
         let _publication_lock = assembler.lock_index()?;
         let mut index = assembler.load_index()?;
-        let old = index.iter()
+        let old = index
+            .iter()
             .filter(|(key, _)| ready.contains(&key.runtime_image_sha256))
             .map(|(key, _)| *key)
             .collect::<Vec<_>>();
         for key in &old {
-            assembler.stage_invalidate(
-                &mut index,
-                key.runtime_image_sha256,
-                key.task_oid,
-            )?;
+            assembler.stage_invalidate(&mut index, key.runtime_image_sha256, key.task_oid)?;
         }
         if !old.is_empty() {
             assembler.replace_index(&index)?;
@@ -440,7 +446,8 @@ impl RuntimeImageTaskRegistry {
 
         // An orphan binary is removed only if no published RuntimeImage still
         // addresses its hash and no retired execution retains a strong Arc.
-        let published = index.iter()
+        let published = index
+            .iter()
             .map(|(_, entry)| entry.cti_sha256)
             .collect::<std::collections::BTreeSet<_>>();
         let mut removed_blobs = 0;
@@ -453,11 +460,13 @@ impl RuntimeImageTaskRegistry {
                     let path = assembler.blob_path(&hash);
                     match std::fs::remove_file(&path) {
                         Ok(()) => removed_blobs += 1,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                        Err(error) => return Err(format!(
-                            "could not garbage collect retired CTI {}: {error}",
-                            path.display()
-                        )),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "could not garbage collect retired CTI {}: {error}",
+                                path.display()
+                            ))
+                        }
                     }
                 }
                 state.retired_tasks.remove(id);
@@ -467,7 +476,11 @@ impl RuntimeImageTaskRegistry {
     }
 
     pub fn registered_runtime_images(&self) -> Vec<[u8; 32]> {
-        read_unpoisoned(&self.state).tables.keys().copied().collect()
+        read_unpoisoned(&self.state)
+            .tables
+            .keys()
+            .copied()
+            .collect()
     }
 }
 
