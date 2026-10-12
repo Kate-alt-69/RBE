@@ -4,9 +4,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ipc_protocol::{
-    decode_response, read_frame, write_frame, AwaitResultRequest, BindArtifactRequest,
-    ActivateTaskImageRequest, CancelRequest, CapabilityGrant, ExecuteRequest, ExecuteTaskRequest, HealthRequest,
-    InspectRequest, PrepareRefreshRequest, RegisterArtifactRequest,
+    decode_response, read_frame, write_frame, ActivateTaskImageRequest, AwaitResultRequest,
+    BindArtifactRequest, CancelRequest, CapabilityGrant, ExecuteRequest, ExecuteTaskRequest,
+    HealthRequest, InspectRequest, PrepareRefreshRequest, RegisterArtifactRequest,
     RegisterCapabilityManifestRequest, Request, Response, ResumeRequest, WorkCost as IpcWorkCost,
     CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES,
     MAX_EXECUTION_OUTPUT_BYTES,
@@ -278,7 +278,9 @@ impl ContainerClient {
         runtime_image: &str,
         retire_runtime_images: Vec<String>,
     ) -> anyhow::Result<(usize, usize)> {
-        let endpoint = self.endpoint.read()
+        let endpoint = self
+            .endpoint
+            .read()
             .expect("container endpoint lock poisoned")
             .clone();
         let request_id = next_request_id();
@@ -320,7 +322,9 @@ impl ContainerClient {
         if input.len() > MAX_EXECUTION_INPUT_BYTES {
             anyhow::bail!("Container Task input exceeds the IPC limit");
         }
-        let endpoint = self.endpoint.read()
+        let endpoint = self
+            .endpoint
+            .read()
             .expect("container endpoint lock poisoned")
             .clone();
         let request_id = next_request_id();
