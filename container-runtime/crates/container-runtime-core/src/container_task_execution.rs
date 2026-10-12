@@ -202,7 +202,7 @@ impl TaskExecution {
         armed.insert(graph.entry);
         Ok(Self {
             task, graph, slots, arena, ready, armed,
-            completed: BTreeSet::new(), output: Vec::new(),
+            completed: BTreeSet::new(), output: input.to_vec(),
             deadline: Instant::now() + timeout,
         })
     }
