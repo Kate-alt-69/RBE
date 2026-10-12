@@ -758,6 +758,31 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         Some(report)
     };
 
+    // Make route->TaskOID addressing an immutable part of the currently active
+    // RuntimeImage before HTTP routing is constructed. RELC has already bound
+    // Task numeric identities; Controller will never infer them from names.
+    if container_task_report.is_some() {
+        let mut activated = runtime_image_snapshot.as_ref().clone();
+        for task in &container_tasks.tasks {
+            if task.kind == route_engine::relc_linked_image::ContainerTaskKind::RouteMethod {
+                let verb = task.root_symbol.name.strip_prefix("Route.")
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "RELC Route Task {:?} has no compiled Route method identity",
+                        task.canonical_id,
+                    ))?;
+                let oid = task.task_oid.ok_or_else(|| anyhow::anyhow!(
+                    "RELC Route Task {:?} is missing its linked Task OID",
+                    task.canonical_id,
+                ))?;
+                activated.task_oids.insert(
+                    (task.source.clone(), verb.to_ascii_lowercase()),
+                    oid,
+                );
+            }
+        }
+        runtime_image.activate(activated);
+    }
+
     let vault_refresh_task = spawn_vault_refresh(
         vault_instance.clone(),
         maintenance.clone(),
