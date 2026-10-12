@@ -3,9 +3,9 @@
 //! This module owns compiler-side cache state only. RELC remains authoritative
 //! for Task/OID meaning and supplies the already-compiled section payloads.
 
+use fs2::FileExt;
 use std::collections::BTreeMap;
 use std::fs;
-use fs2::FileExt;
 use std::path::PathBuf;
 
 use ipc_protocol::container_task_image::{cti_sha256, ContainerTaskImage, CtiHeaderV1, CtiSection};
@@ -100,7 +100,9 @@ impl ContainerTaskAssembler {
             .map_err(|error| format!("create CTI index directory: {error}"))?;
         let path = self.container_cache_dir().join("index.lock");
         let file = fs::OpenOptions::new()
-            .create(true).read(true).write(true)
+            .create(true)
+            .read(true)
+            .write(true)
             .open(&path)
             .map_err(|error| format!("open CTI index lock {}: {error}", path.display()))?;
         file.lock_exclusive()
@@ -151,7 +153,11 @@ impl ContainerTaskAssembler {
     pub fn load_index(&self) -> Result<ContainerTaskIndex, String> {
         // Readers must never observe either half of a CTI/OID generation
         // while the compiler's durable publication journal is pending.
-        if self.container_cache_dir().join("index.pending-txn").exists() {
+        if self
+            .container_cache_dir()
+            .join("index.pending-txn")
+            .exists()
+        {
             return Err("Container Task index publication is pending recovery".into());
         }
         let path = self.index_path();
