@@ -634,10 +634,7 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         .unwrap_or_default();
     // Keep the immutable compiler-owned Container Task plan alongside its
     // RuntimeImage; CC must never rediscover or compile REL source.
-    let compiled_image = runtime_image_boot::compile_with_tasks(
-        &config,
-        service_catalog.as_ref(),
-    )?;
+    let compiled_image = runtime_image_boot::compile_with_tasks(&config, service_catalog.as_ref())?;
     let mut container_tasks = compiled_image.container_tasks;
     let runtime_image = compiled_image.image;
     runtime_image_boot::apply_server_policy(&mut config, &runtime_image.server_policy)?;
@@ -738,10 +735,8 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     let container_task_report = if container_tasks.tasks.is_empty() {
         None
     } else {
-        let mut oid_cache = route_engine::open_service_oid_cache_with_vault(
-            &project_root,
-            oid_vault.clone(),
-        )?;
+        let mut oid_cache =
+            route_engine::open_service_oid_cache_with_vault(&project_root, oid_vault.clone())?;
         let report = route_engine::assemble_container_task_cache(
             &project_root,
             runtime_image_snapshot.as_ref(),
@@ -765,19 +760,25 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         let mut activated = runtime_image_snapshot.as_ref().clone();
         for task in &container_tasks.tasks {
             if task.kind == route_engine::relc_linked_image::ContainerTaskKind::RouteMethod {
-                let verb = task.root_symbol.name.strip_prefix("Route.")
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "RELC Route Task {:?} has no compiled Route method identity",
+                let verb = task
+                    .root_symbol
+                    .name
+                    .strip_prefix("Route.")
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "RELC Route Task {:?} has no compiled Route method identity",
+                            task.canonical_id,
+                        )
+                    })?;
+                let oid = task.task_oid.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "RELC Route Task {:?} is missing its linked Task OID",
                         task.canonical_id,
-                    ))?;
-                let oid = task.task_oid.ok_or_else(|| anyhow::anyhow!(
-                    "RELC Route Task {:?} is missing its linked Task OID",
-                    task.canonical_id,
-                ))?;
-                activated.task_oids.insert(
-                    (task.source.clone(), verb.to_ascii_lowercase()),
-                    oid,
-                );
+                    )
+                })?;
+                activated
+                    .task_oids
+                    .insert((task.source.clone(), verb.to_ascii_lowercase()), oid);
             }
         }
         runtime_image.activate(activated);
