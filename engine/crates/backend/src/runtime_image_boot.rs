@@ -36,7 +36,17 @@ pub fn prepare_core_oid_cache(
     Ok(report)
 }
 
+/// Compatibility entrypoint for callers that need the RuntimeImage alone.
 pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Result<RuntimeImage> {
+    Ok(compile_with_tasks(config, catalog)?.image)
+}
+
+/// Compile once and retain compiler-owned CTI discovery for the real
+/// RuntimeImage activation path. CC does not perform REL discovery.
+pub fn compile_with_tasks(
+    config: &Config,
+    catalog: Option<&ServiceCatalog>,
+) -> anyhow::Result<route_engine::relc_linked_image::RelcLinkedImage> {
     let root = runtime_paths::binary_dir();
     let server_path = root.join("server.server");
     let server_source = if server_path.is_file() {
@@ -65,7 +75,7 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
     })?;
     let mut settings = effective_settings_json(config);
     let package_graph_sha256 = bind_package_graph_identity(&mut settings, &package_links)?;
-    let image = route_engine::relc::compile_runtime_image_with_packages(
+    let compiled = route_engine::relc_linked_image::compile_runtime_image_with_packages_and_linked_rel(
         &server_source,
         physical.clone(),
         &settings,
@@ -73,10 +83,10 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
     )
     .map_err(|error| {
         anyhow::anyhow!(
-            "{}",
-            render_runtime_image_compile_error(&error, &server_source, &physical)
+            "RBE5100 Backend could not compile RELC Task discovery for the Runtime Image: {error}"
         )
     })?;
+    let image = &compiled.image;
     route_engine::validate_runtime_image_routes(&image)?;
     tracing::info!(
         image = %image.image_id,
@@ -90,7 +100,7 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
         status = image.server_policy.status.as_str(),
         "linked immutable Runtime Image"
     );
-    Ok(image)
+    Ok(compiled)
 }
 
 fn bind_package_graph_identity(
