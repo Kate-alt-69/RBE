@@ -9,10 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use container_runtime_core::{
-    ContainerTaskAssembler, ContainerTaskAssemblyInput, CTI_COMPILER_ABI_VERSION,
+    ContainerTaskAssembler, ContainerTaskAssemblyInput, ContainerTaskIndex, CTI_COMPILER_ABI_VERSION,
 };
 use ipc_protocol::container_task_image::{
     cti_sha256, CtiSection, CtiSectionKind, CTI_DEFAULT_ARENA_BYTES, CTI_MAX_SLOTS,
@@ -24,6 +25,112 @@ use crate::relc_linked_image::{
 };
 use crate::runtime_image::{RuntimeCapabilityRequirement, RuntimeImage};
 use crate::service_oid::{OidCache, OidError, OidIndex, OidTarget, OID_REL_END, OID_REL_START};
+
+const CTI_PUBLICATION_MAGIC: [u8; 8] = *b"RBECTXN1";
+const CTI_PUBLICATION_HEADER: usize = 8 + 32 + 32 + 32 + 4;
+const CTI_PUBLICATION_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Complete an interrupted two-index publication before RELC or CC is allowed
+/// to consume the index. If the authoritative OID index was committed, roll
+/// the Container index forward; otherwise discard the uncommitted intent.
+/// Never roll back Vault-attested OID generations.
+pub fn recover_container_task_publication(
+    project_root: &Path,
+    oid_cache: &OidCache,
+) -> Result<bool, ContainerTaskAssemblyError> {
+    let assembler = ContainerTaskAssembler::new(project_root.join(".cache"));
+    let pending = assembler.container_cache_dir().join("index.pending-txn");
+    if !pending.exists() {
+        return Ok(false);
+    }
+    let bytes = fs::read(&pending).map_err(|error| {
+        ContainerTaskAssemblyError::Cache(format!("read CTI publication intent: {error}"))
+    })?;
+    if bytes.len() < CTI_PUBLICATION_HEADER || bytes[..8] != CTI_PUBLICATION_MAGIC {
+        return Err(ContainerTaskAssemblyError::Cache(
+            "invalid or truncated CTI publication intent; refusing partial recovery".into(),
+        ));
+    }
+    let old_digest = &bytes[8..40];
+    let new_digest = &bytes[40..72];
+    let expected_index_digest = &bytes[72..104];
+    let length = u32::from_be_bytes(bytes[104..108].try_into().map_err(|_| {
+        ContainerTaskAssemblyError::Cache("invalid CTI intent length".into())
+    })?) as usize;
+    if length > CTI_PUBLICATION_MAX_BYTES
+        || bytes.len() != CTI_PUBLICATION_HEADER + length
+    {
+        return Err(ContainerTaskAssemblyError::Cache(
+            "CTI publication intent length mismatch".into(),
+        ));
+    }
+    let index_bytes = &bytes[CTI_PUBLICATION_HEADER..];
+    if Sha256::digest(index_bytes).as_slice() != expected_index_digest {
+        return Err(ContainerTaskAssemblyError::Cache(
+            "CTI publication intent checksum mismatch".into(),
+        ));
+    }
+    let oid_digest = Sha256::digest(oid_cache.index().to_bytes()?);
+    if oid_digest.as_slice() == new_digest {
+        let target = ContainerTaskIndex::decode(index_bytes)
+            .map_err(ContainerTaskAssemblyError::Cache)?;
+        // An intent is never authority to publish nonexistent/corrupt blobs.
+        for (_, entry) in target.iter() {
+            let blob_path = assembler.blob_path(&entry.cti_sha256);
+            let blob = fs::read(&blob_path).map_err(|error| {
+                ContainerTaskAssemblyError::Cache(format!(
+                    "CTI transaction blob {} is unavailable: {error}",
+                    blob_path.display()
+                ))
+            })?;
+            if cti_sha256(&blob) != entry.cti_sha256 {
+                return Err(ContainerTaskAssemblyError::Cache(format!(
+                    "CTI transaction blob {} failed integrity verification",
+                    blob_path.display()
+                )));
+            }
+        }
+        assembler.replace_index(&target).map_err(ContainerTaskAssemblyError::Cache)?;
+    } else if oid_digest.as_slice() != old_digest {
+        return Err(ContainerTaskAssemblyError::Cache(
+            "OID index is neither the staged nor the prior CTI generation; refusing recovery".into(),
+        ));
+    }
+    fs::remove_file(&pending).map_err(|error| {
+        ContainerTaskAssemblyError::Cache(format!("clear completed CTI transaction: {error}"))
+    })?;
+    Ok(true)
+}
+
+fn write_container_task_intent(
+    assembler: &ContainerTaskAssembler,
+    old_index: &OidIndex,
+    new_index: &OidIndex,
+    container_index: &ContainerTaskIndex,
+) -> Result<(), ContainerTaskAssemblyError> {
+    let new_bytes = container_index.encode().map_err(ContainerTaskAssemblyError::Cache)?;
+    let length = u32::try_from(new_bytes.len()).map_err(|_| {
+        ContainerTaskAssemblyError::Cache("CTI index exceeds journal limit".into())
+    })?;
+    if new_bytes.len() > CTI_PUBLICATION_MAX_BYTES {
+        return Err(ContainerTaskAssemblyError::Cache("CTI index exceeds journal limit".into()));
+    }
+    let mut intent = Vec::with_capacity(CTI_PUBLICATION_HEADER + new_bytes.len());
+    intent.extend_from_slice(&CTI_PUBLICATION_MAGIC);
+    intent.extend_from_slice(&Sha256::digest(old_index.to_bytes()?));
+    intent.extend_from_slice(&Sha256::digest(new_index.to_bytes()?));
+    intent.extend_from_slice(&Sha256::digest(&new_bytes));
+    intent.extend_from_slice(&length.to_be_bytes());
+    intent.extend_from_slice(&new_bytes);
+    fs::create_dir_all(assembler.container_cache_dir()).map_err(|error| {
+        ContainerTaskAssemblyError::Cache(format!("create CTI journal directory: {error}"))
+    })?;
+    atomic_io::AtomicIo::new()
+        .write_atomic(&assembler.container_cache_dir().join("index.pending-txn"), &intent)
+        .map_err(|error| ContainerTaskAssemblyError::Cache(
+            format!("stage CTI/OID publication intent: {error}")
+        ))
+}
 
 pub const CTI_SECTION_PAYLOAD_VERSION: u16 = 1;
 const TASK_OID_PREFIX: &str = "task_";
@@ -92,6 +199,9 @@ pub fn assemble_container_task_cache(
     oid_cache: &mut OidCache,
     pinned_oids: &BTreeSet<u16>,
 ) -> Result<ContainerTaskAssemblyReport, ContainerTaskAssemblyError> {
+    // Resolve any interrupted publication before computing the next OID
+    // generation or reading the Container index.
+    recover_container_task_publication(project_root, oid_cache)?;
     let runtime_image_sha256 = decode_sha256("Runtime Image", &image.image_id)
         .map_err(ContainerTaskAssemblyError::InvalidRuntimeImage)?;
     let requests = discovery.oid_requests();
@@ -174,19 +284,24 @@ pub fn assemble_container_task_cache(
         });
     }
 
-    // Publish one complete Container index after all CTI blobs have been
-    // committed, never a sequence of partly updated Task mappings.
-    // Cross-file atomicity with the OID index still requires a shared
-    // generation/commit marker; this alone only makes Container publication atomic.
-    if container_index != previous_container_index {
+    // Persist a roll-forward journal first, then the Vault-attested Task OID
+    // generation, then one complete Container index. Recovery is deterministic
+    // after a crash at any point of this sequence.
+    let oid_index_changed = oid_cache.index() != &next_oid_index;
+    if oid_index_changed || container_index != previous_container_index {
+        write_container_task_intent(
+            &assembler,
+            oid_cache.index(),
+            &next_oid_index,
+            &container_index,
+        )?;
+        if oid_index_changed {
+            oid_cache.replace_index(next_oid_index.clone())?;
+        }
         assembler
             .replace_index(&container_index)
             .map_err(ContainerTaskAssemblyError::Cache)?;
-    }
-
-    let oid_index_changed = oid_cache.index() != &next_oid_index;
-    if oid_index_changed {
-        oid_cache.replace_index(next_oid_index.clone())?;
+        recover_container_task_publication(project_root, oid_cache)?;
     }
 
     artifacts.sort_by_key(|artifact| artifact.task_oid);
