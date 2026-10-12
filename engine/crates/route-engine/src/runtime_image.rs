@@ -310,6 +310,9 @@ pub struct RuntimeImage {
     pub route_wasm_artifacts: BTreeMap<SourceId, RouteWasmArtifact>,
     /// Routes outside the current native compiler subset remain explicit.
     pub route_wasm_fallbacks: BTreeMap<SourceId, String>,
+    /// RELC Task OIDs bound during compiler/cache publication. This mapping
+    /// is RuntimeImage-local and is never recalculated by the Controller.
+    pub task_oids: BTreeMap<(SourceId, String), u16>,
     pub executables: BTreeMap<SourceId, RuntimeExecutable>,
 }
 
@@ -344,6 +347,12 @@ impl RuntimeImage {
             Some(requirements) => lower_container_grants(requirements),
             None => Ok(Vec::new()),
         }
+    }
+
+    pub fn route_task_oid(&self, source: &SourceId, verb: &str) -> Option<u16> {
+        self.task_oids
+            .get(&(source.clone(), verb.to_ascii_lowercase()))
+            .copied()
     }
 
     pub fn route_wasm_artifact(&self, id: &SourceId) -> Option<&RouteWasmArtifact> {
