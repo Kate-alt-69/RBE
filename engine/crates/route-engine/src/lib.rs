@@ -175,8 +175,8 @@ pub use ast::{
     FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram, Statement, Value,
 };
 pub use container_task_assembly::{
-    assemble_container_task_cache, recover_container_task_publication, ContainerTaskArtifact, ContainerTaskAssemblyError,
-    ContainerTaskAssemblyReport,
+    assemble_container_task_cache, recover_container_task_publication, ContainerTaskArtifact,
+    ContainerTaskAssemblyError, ContainerTaskAssemblyReport,
 };
 pub use dependency_graph::{SymbolDependencyGraph, SymbolId};
 pub use discovery::RouteCache;
