@@ -18,6 +18,11 @@ pub fn prepare_core_oid_cache(
     root: &Path,
     vault: std::sync::Arc<dyn route_engine::OidVaultAuthority>,
 ) -> anyhow::Result<route_engine::CoreMaterializationReport> {
+    // Finish any cross-index CTI publication before native Service/OID linking.
+    // An interrupted OID commit must never be bypassed by a new generation.
+    let cache = route_engine::open_service_oid_cache_with_vault(root, vault.clone())?;
+    route_engine::recover_container_task_publication(root, &cache)?;
+    drop(cache);
     let report = route_engine::prepare_service_oid_cache_with_vault(root, vault).map_err(|error| {
         anyhow::anyhow!(
             "RBE5100 Backend could not prepare the project OID compiler cache.\n\nCache:\n  {}\n\nError:\n  {error}\n\nNote:\n  Corrupt/stale disposable OID cache state is rebuilt automatically. This failure is a real target, permission, capacity, or compiler invariant error. Startup stopped before the API listener was bound.\n\nHelp:\n  {RUNTIME_IMAGE_COMPILE_HELP}",
