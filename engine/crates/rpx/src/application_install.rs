@@ -473,7 +473,10 @@ fn validate_package_index(
         .get("format")
         .and_then(serde_json::Value::as_u64)
         .context("package index is missing a numeric format")?;
-    if !matches!(format, LEGACY_PACKAGE_INDEX_FORMAT | PHASE3_PACKAGE_INDEX_FORMAT) {
+    if !matches!(
+        format,
+        LEGACY_PACKAGE_INDEX_FORMAT | PHASE3_PACKAGE_INDEX_FORMAT
+    ) {
         bail!("unsupported .rbe/package-index.json format {format}");
     }
     let package = value
