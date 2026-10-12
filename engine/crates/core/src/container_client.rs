@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ipc_protocol::{
     decode_response, read_frame, write_frame, AwaitResultRequest, BindArtifactRequest,
-    CancelRequest, CapabilityGrant, ExecuteRequest, ExecuteTaskRequest, HealthRequest,
+    ActivateTaskImageRequest, CancelRequest, CapabilityGrant, ExecuteRequest, ExecuteTaskRequest, HealthRequest,
     InspectRequest, PrepareRefreshRequest, RegisterArtifactRequest,
     RegisterCapabilityManifestRequest, Request, Response, ResumeRequest, WorkCost as IpcWorkCost,
     CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES,
@@ -266,6 +266,44 @@ impl ContainerClient {
                 anyhow::bail!("container execution submission failed [{code}]: {message}")
             }
             other => anyhow::bail!("unexpected container execute response: {other:?}"),
+        }
+    }
+
+    /// Tell Controller that RELC has published an immutable CTI generation.
+    /// Controller verifies all blobs before atomically swapping its active
+    /// lookup table. New calls use the new generation; in-flight Arc owners
+    /// retain the old image until they finish.
+    pub async fn activate_task_image(
+        &self,
+        runtime_image: &str,
+        retire_runtime_images: Vec<String>,
+    ) -> anyhow::Result<(usize, usize)> {
+        let endpoint = self.endpoint.read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request_id = next_request_id();
+        let request = Request::ActivateTaskImage(ActivateTaskImageRequest {
+            request_id: request_id.clone(),
+            auth_token: endpoint.token.clone(),
+            runtime_image: runtime_image.to_string(),
+            retire_runtime_images,
+        });
+        match call(endpoint, request, Duration::from_secs(15)).await? {
+            Response::TaskImageActivated {
+                request_id: returned_id,
+                runtime_image: returned_image,
+                task_count,
+                retired_images,
+            } if returned_id == request_id && returned_image == runtime_image => {
+                Ok((task_count, retired_images))
+            }
+            Response::TaskImageActivated { .. } => {
+                anyhow::bail!("Container returned mismatched CTI activation provenance")
+            }
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("Container CTI activation failed [{code}]: {message}")
+            }
+            other => anyhow::bail!("unexpected Container CTI activation response: {other:?}"),
         }
     }
 
