@@ -23,6 +23,7 @@ fn project_root(label: &str) -> PathBuf {
 fn verified_package_context_prepares_single_index_native_transaction() {
     let root = project_root("prepare");
     let cache = OidCache::open_or_rebuild(&root).expect("open project OID cache");
+    let base_generation = cache.index().generation;
     let links = PackageLinkContext {
         format: PACKAGE_LINK_FORMAT,
         roots: BTreeMap::from([(
@@ -45,13 +46,18 @@ fn verified_package_context_prepares_single_index_native_transaction() {
         .expect("verified package graph should prepare against the live OID bridge");
 
     assert!(prepared.delta().changed());
+    assert_eq!(prepared.delta().previous_generation, base_generation);
+    assert_eq!(
+        prepared.delta().generation,
+        base_generation.checked_add(1).expect("test generation overflow")
+    );
     assert_eq!(prepared.materialize_bindings().len(), 1);
     let oid =
         prepared.materialize_bindings()[&(String::from("mail"), String::from("lib_mail_send"))];
     assert!((OID_PACKAGE_START..=OID_PACKAGE_END).contains(&oid));
     assert_eq!(
         cache.index().generation,
-        0,
+        base_generation,
         "prepare must not publish the next index"
     );
 
