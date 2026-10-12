@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ipc_protocol::{
-    CtiNodeKind, CtiSectionKind, Slot, SlotTable, SlotType, TaskArena,
-    CTI_MAX_ARENA_BYTES, CTI_MAX_SLOTS,
+    CtiNodeKind, CtiSectionKind, Slot, SlotTable, SlotType, TaskArena, CTI_MAX_ARENA_BYTES,
+    CTI_MAX_SLOTS,
 };
 
 use crate::LoadedTaskImage;
@@ -38,7 +38,9 @@ pub struct CompiledTaskGraph {
 impl CompiledTaskGraph {
     pub fn from_task(task: &LoadedTaskImage) -> Result<Self, String> {
         let image = task.image();
-        let bytes = image.sections.iter()
+        let bytes = image
+            .sections
+            .iter()
             .find(|section| section.kind == CtiSectionKind::Graph.code())
             .ok_or("CTI has no required GRAPH section")?;
         let mut reader = Reader::new(&bytes.data);
@@ -73,9 +75,21 @@ impl CompiledTaskGraph {
                     return Err(format!("node {id} has invalid/duplicate dependencies"));
                 }
             }
-            if nodes.insert(id, TaskGraphNode {
-                id, kind, dependencies, success, failure, timeout, cancelled,
-            }).is_some() {
+            if nodes
+                .insert(
+                    id,
+                    TaskGraphNode {
+                        id,
+                        kind,
+                        dependencies,
+                        success,
+                        failure,
+                        timeout,
+                        cancelled,
+                    },
+                )
+                .is_some()
+            {
                 return Err(format!("duplicate node ID {id}"));
             }
         }
@@ -84,10 +98,11 @@ impl CompiledTaskGraph {
             return Err("CTI GRAPH does not contain its entry".into());
         }
         for node in nodes.values() {
-            for id in node.dependencies.iter().copied()
-                .chain([node.success, node.failure, node.timeout, node.cancelled]
-                    .into_iter().flatten())
-            {
+            for id in node.dependencies.iter().copied().chain(
+                [node.success, node.failure, node.timeout, node.cancelled]
+                    .into_iter()
+                    .flatten(),
+            ) {
                 if !nodes.contains_key(&id) {
                     return Err(format!("node {} references missing node {id}", node.id));
                 }
@@ -101,13 +116,16 @@ impl CompiledTaskGraph {
             visiting: &mut BTreeSet<u32>,
             visited: &mut BTreeSet<u32>,
         ) -> Result<(), String> {
-            if visited.contains(&id) { return Ok(()); }
+            if visited.contains(&id) {
+                return Ok(());
+            }
             if !visiting.insert(id) {
                 return Err(format!("CTI GRAPH contains a cycle at node {id}"));
             }
             let node = &nodes[&id];
             for next in [node.success, node.failure, node.timeout, node.cancelled]
-                .into_iter().flatten()
+                .into_iter()
+                .flatten()
             {
                 visit(next, nodes, visiting, visited)?;
             }
@@ -127,7 +145,9 @@ impl CompiledTaskGraph {
     /// section. This is identity, not capability authority.
     pub fn root_source_id(task: &LoadedTaskImage) -> Result<String, String> {
         let image = task.image();
-        let section = image.sections.iter()
+        let section = image
+            .sections
+            .iter()
             .find(|section| section.kind == CtiSectionKind::DebugNames.code())
             .ok_or("CTI does not contain root source identity")?;
         let mut reader = Reader::new(&section.data);
@@ -148,7 +168,9 @@ impl CompiledTaskGraph {
     /// single WASM Tasks may take the direct isolated-worker path.
     pub fn has_no_capability_nodes(task: &LoadedTaskImage) -> Result<bool, String> {
         let image = task.image();
-        let section = image.sections.iter()
+        let section = image
+            .sections
+            .iter()
             .find(|section| section.kind == CtiSectionKind::Capabilities.code())
             .ok_or("CTI does not contain CAPABILITIES")?;
         let mut reader = Reader::new(&section.data);
@@ -162,7 +184,9 @@ impl CompiledTaskGraph {
     /// a Service-only/no-code Task must never be treated as an empty WASM.
     pub fn embedded_wasm(task: &LoadedTaskImage) -> Result<Option<Vec<u8>>, String> {
         let image = task.image();
-        let section = image.sections.iter()
+        let section = image
+            .sections
+            .iter()
             .find(|section| section.kind == CtiSectionKind::Code.code())
             .ok_or("CTI has no CODE section")?;
         let mut reader = Reader::new(&section.data);
@@ -207,10 +231,16 @@ pub struct TaskExecution {
 }
 
 impl TaskExecution {
-    pub fn new(task: Arc<LoadedTaskImage>, input: &[u8], timeout: Duration) -> Result<Self, String> {
+    pub fn new(
+        task: Arc<LoadedTaskImage>,
+        input: &[u8],
+        timeout: Duration,
+    ) -> Result<Self, String> {
         let graph = CompiledTaskGraph::from_task(&task)?;
         let image = task.image();
-        let layout = image.sections.iter()
+        let layout = image
+            .sections
+            .iter()
             .find(|section| section.kind == CtiSectionKind::SlotLayout.code())
             .ok_or("CTI has no SLOT_LAYOUT section")?;
         let mut layout = Reader::new(&layout.data);
@@ -219,8 +249,10 @@ impl TaskExecution {
         }
         let arena_limit = layout.u32()? as usize;
         let slot_count = layout.u16()? as usize;
-        if layout.u16()? != 0 || arena_limit == 0
-            || arena_limit > CTI_MAX_ARENA_BYTES || slot_count < 2
+        if layout.u16()? != 0
+            || arena_limit == 0
+            || arena_limit > CTI_MAX_ARENA_BYTES
+            || slot_count < 2
             || slot_count > CTI_MAX_SLOTS
         {
             return Err("CTI SLOT_LAYOUT has invalid limits".into());
@@ -229,15 +261,25 @@ impl TaskExecution {
         let mut slots = SlotTable::new(slot_count).map_err(|e| e.to_string())?;
         let mut arena = TaskArena::with_limit(arena_limit).map_err(|e| e.to_string())?;
         let input_ref = arena.push(input).map_err(|e| e.to_string())?;
-        slots.set(0, Slot::arena(SlotType::Bytes, input_ref)
-            .map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        slots
+            .set(
+                0,
+                Slot::arena(SlotType::Bytes, input_ref).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
         let mut ready = VecDeque::new();
         ready.push_back(graph.entry);
         let mut armed = BTreeSet::new();
         armed.insert(graph.entry);
         Ok(Self {
-            task, graph, slots, arena, ready, armed,
-            completed: BTreeSet::new(), output: input.to_vec(),
+            task,
+            graph,
+            slots,
+            arena,
+            ready,
+            armed,
+            completed: BTreeSet::new(),
+            output: input.to_vec(),
             deadline: Instant::now() + timeout,
         })
     }
@@ -254,13 +296,23 @@ impl TaskExecution {
             if self.completed.contains(&id) {
                 return Err(format!("compiled CTI node {id} was scheduled twice"));
             }
-            let node = self.graph.nodes.get(&id)
-                .ok_or_else(|| format!("CTI node {id} disappeared"))?.clone();
-            if !node.dependencies.iter().all(|dep| self.completed.contains(dep)) {
+            let node = self
+                .graph
+                .nodes
+                .get(&id)
+                .ok_or_else(|| format!("CTI node {id} disappeared"))?
+                .clone();
+            if !node
+                .dependencies
+                .iter()
+                .all(|dep| self.completed.contains(dep))
+            {
                 // Dependency may become ready after another armed node.
                 self.ready.push_back(id);
                 if self.ready.iter().all(|candidate| {
-                    self.graph.nodes[candidate].dependencies.iter()
+                    self.graph.nodes[candidate]
+                        .dependencies
+                        .iter()
                         .any(|dep| !self.completed.contains(dep))
                 }) {
                     return Err(format!("CTI graph node {id} has unsatisfied dependencies"));
@@ -282,38 +334,43 @@ impl TaskExecution {
             match node.kind {
                 CtiNodeKind::Return => return Ok(self.output.clone()),
                 CtiNodeKind::Fail => return Err("compiled CTI FAIL node reached".into()),
-                kind => {
-                    match dispatch(kind, &self.task, &self.output) {
-                        Ok(output) => {
-                            if output.len() > ipc_protocol::MAX_EXECUTION_OUTPUT_BYTES {
-                                return Err("Task output exceeds Controller IPC limit".into());
-                            }
-                            self.output = output;
-                            let location = self.arena.push(&self.output)
-                                .map_err(|e| e.to_string())?;
-                            self.slots.set(1, Slot::arena(SlotType::Bytes, location)
-                                .map_err(|e| e.to_string())?)
-                                .map_err(|e| e.to_string())?;
-                            self.completed.insert(id);
-                            if let Some(next) = node.success { self.arm(next); }
+                kind => match dispatch(kind, &self.task, &self.output) {
+                    Ok(output) => {
+                        if output.len() > ipc_protocol::MAX_EXECUTION_OUTPUT_BYTES {
+                            return Err("Task output exceeds Controller IPC limit".into());
                         }
-                        Err(error) => {
-                            self.completed.insert(id);
-                            if let Some(next) = node.failure {
-                                self.arm(next);
-                            } else {
-                                return Err(error);
-                            }
+                        self.output = output;
+                        let location = self.arena.push(&self.output).map_err(|e| e.to_string())?;
+                        self.slots
+                            .set(
+                                1,
+                                Slot::arena(SlotType::Bytes, location)
+                                    .map_err(|e| e.to_string())?,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        self.completed.insert(id);
+                        if let Some(next) = node.success {
+                            self.arm(next);
                         }
                     }
-                }
+                    Err(error) => {
+                        self.completed.insert(id);
+                        if let Some(next) = node.failure {
+                            self.arm(next);
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                },
             }
         }
         Err("compiled CTI execution terminated without RETURN".into())
     }
 
     fn arm(&mut self, id: u32) {
-        if self.armed.insert(id) { self.ready.push_back(id); }
+        if self.armed.insert(id) {
+            self.ready.push_back(id);
+        }
     }
 
     /// Conservative standalone WASM path: exactly one WASM_BLOCK and a
@@ -321,14 +378,21 @@ impl TaskExecution {
     /// Refuse other shapes rather than silently skipping compiler semantics.
     pub fn is_single_wasm_graph(&self) -> bool {
         let root = &self.graph.nodes[&self.graph.entry];
-        if root.kind != CtiNodeKind::WasmBlock { return false; }
-        let Some(success) = root.success else { return false; };
+        if root.kind != CtiNodeKind::WasmBlock {
+            return false;
+        }
+        let Some(success) = root.success else {
+            return false;
+        };
         if self.graph.nodes.get(&success).map(|n| n.kind) != Some(CtiNodeKind::Return) {
             return false;
         }
         let allowed = match root.failure {
-            Some(failure) if self.graph.nodes.get(&failure).map(|n| n.kind)
-                == Some(CtiNodeKind::Fail) => 3,
+            Some(failure)
+                if self.graph.nodes.get(&failure).map(|n| n.kind) == Some(CtiNodeKind::Fail) =>
+            {
+                3
+            }
             None => 2,
             _ => return false,
         };
@@ -337,33 +401,61 @@ impl TaskExecution {
 }
 
 fn edge(value: u32) -> Option<u32> {
-    if value == NO_EDGE { None } else { Some(value) }
+    if value == NO_EDGE {
+        None
+    } else {
+        Some(value)
+    }
 }
 
-struct Reader<'a> { data: &'a [u8], offset: usize }
+struct Reader<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
 impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self { Self { data, offset: 0 } }
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self.offset.checked_add(n).ok_or("CTI section length overflow")?;
-        let bytes = self.data.get(self.offset..end).ok_or("truncated CTI section")?;
+        let end = self
+            .offset
+            .checked_add(n)
+            .ok_or("CTI section length overflow")?;
+        let bytes = self
+            .data
+            .get(self.offset..end)
+            .ok_or("truncated CTI section")?;
         self.offset = end;
         Ok(bytes)
     }
-    fn u8(&mut self) -> Result<u8, String> { Ok(self.take(1)?[0]) }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
     fn u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| "CTI u16 decode")?))
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().map_err(|_| "CTI u16 decode")?,
+        ))
     }
     fn string(&mut self) -> Result<String, String> {
         let len = self.u32()? as usize;
-        if len > 8192 { return Err("CTI string is too long".into()); }
+        if len > 8192 {
+            return Err("CTI string is too long".into());
+        }
         let text = self.take(len)?;
-        std::str::from_utf8(text).map(str::to_owned).map_err(|_| "CTI string is not UTF-8".into())
+        std::str::from_utf8(text)
+            .map(str::to_owned)
+            .map_err(|_| "CTI string is not UTF-8".into())
     }
     fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| "CTI u32 decode")?))
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().map_err(|_| "CTI u32 decode")?,
+        ))
     }
     fn finish(&self) -> Result<(), String> {
-        if self.offset == self.data.len() { Ok(()) }
-        else { Err("CTI section has trailing bytes".into()) }
+        if self.offset == self.data.len() {
+            Ok(())
+        } else {
+            Err("CTI section has trailing bytes".into())
+        }
     }
 }
