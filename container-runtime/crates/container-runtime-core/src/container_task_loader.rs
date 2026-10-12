@@ -249,6 +249,8 @@ struct RuntimeImageTaskRegistryState {
     /// Prevent an old ExecuteTask request from lazily resurrecting a generation
     /// after the backend has explicitly retired it.
     retired: std::collections::BTreeSet<[u8; 32]>,
+    /// Weak references keep retirement accounting without keeping Tasks alive.
+    retired_tasks: BTreeMap<[u8; 32], Vec<([u8; 32], std::sync::Weak<LoadedTaskImage>)>>,
 }
 
 #[derive(Clone, Default)]
@@ -297,8 +299,17 @@ impl RuntimeImageTaskRegistry {
         let mut retired_images = 0;
         for id in retiring {
             state.retired.insert(id);
-            if state.tables.remove(&id).is_some() {
+            if let Some(table) = state.tables.remove(&id) {
+                state.retired_tasks.entry(id).or_default().extend(
+                    table.images.iter().map(|task| {
+                        (task.cti_sha256(), Arc::downgrade(task))
+                    }),
+                );
                 retired_images += 1;
+            } else {
+                // This process never loaded the retired image; no in-process
+                // Task could have been resolved from this registry.
+                state.retired_tasks.entry(id).or_default();
             }
         }
         state.retired.remove(&active_id);
@@ -378,10 +389,77 @@ impl RuntimeImageTaskRegistry {
             .copied()
             .collect();
         for id in &removed {
-            state.tables.remove(id);
+            if let Some(table) = state.tables.remove(id) {
+                state.retired_tasks.entry(*id).or_default().extend(
+                    table.images.iter().map(|task| {
+                        (task.cti_sha256(), Arc::downgrade(task))
+                    }),
+                );
+            }
             state.retired.insert(*id);
         }
         removed.len()
+    }
+
+    /// Reclaim retired CTI cache entries only after every in-flight
+    /// Arc<LoadedTaskImage> for that image has been released. Keep the retired
+    /// identity fence even after disk GC so stale calls cannot resurrect it.
+    /// The compiler's pending-transaction guard blocks GC during publication.
+    pub fn garbage_collect_retired(
+        &self,
+        loader: &ContainerTaskLoader,
+    ) -> Result<(usize, usize), String> {
+        let mut state = write_unpoisoned(&self.state);
+        let ready = state.retired_tasks.iter()
+            .filter(|(_, tasks)| tasks.iter().all(|(_, weak)| weak.strong_count() == 0))
+            .map(|(id, _)| *id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if ready.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let assembler = ContainerTaskAssembler::new(&loader.cache_root);
+        let mut index = assembler.load_index()?;
+        let old = index.iter()
+            .filter(|(key, _)| ready.contains(&key.runtime_image_sha256))
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in &old {
+            assembler.stage_invalidate(
+                &mut index,
+                key.runtime_image_sha256,
+                key.task_oid,
+            )?;
+        }
+        if !old.is_empty() {
+            assembler.replace_index(&index)?;
+        }
+
+        // An orphan binary is removed only if no published RuntimeImage still
+        // addresses its hash and no retired execution retains a strong Arc.
+        let published = index.iter()
+            .map(|(_, entry)| entry.cti_sha256)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut removed_blobs = 0;
+        for id in &ready {
+            if let Some(tasks) = state.retired_tasks.remove(id) {
+                for (hash, _) in tasks {
+                    if published.contains(&hash) {
+                        continue;
+                    }
+                    let path = assembler.blob_path(&hash);
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => removed_blobs += 1,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(error) => return Err(format!(
+                            "could not garbage collect retired CTI {}: {error}",
+                            path.display()
+                        )),
+                    }
+                }
+            }
+        }
+        Ok((ready.len(), removed_blobs))
     }
 
     pub fn registered_runtime_images(&self) -> Vec<[u8; 32]> {
