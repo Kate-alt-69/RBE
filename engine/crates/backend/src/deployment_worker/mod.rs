@@ -187,7 +187,8 @@ async fn process_validation_claim(
                 .complete_validation_handoff(deployment, &message)
                 .await
             {
-                report_validation_infrastructure_failure(publisher, config, deployment, error).await;
+                report_validation_infrastructure_failure(publisher, config, deployment, error)
+                    .await;
             }
         }
         Err(ValidationFailure::Package(message)) => {
@@ -247,13 +248,9 @@ async fn process_validation(
     .map_err(ValidationFailure::Infrastructure)?;
 
     let source_root = attempt_root.join("source");
-    let restored = extract_source_bundle(
-        &bundle_path,
-        &source_root,
-        &artifact.source_tree_sha256,
-    )
-    .await
-    .map_err(ValidationFailure::Infrastructure)?;
+    let restored = extract_source_bundle(&bundle_path, &source_root, &artifact.source_tree_sha256)
+        .await
+        .map_err(ValidationFailure::Infrastructure)?;
     if restored.file_count == 0
         || restored.total_bytes == 0
         || restored.tree_sha256 != artifact.source_tree_sha256
