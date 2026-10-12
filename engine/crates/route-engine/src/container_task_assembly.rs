@@ -199,8 +199,11 @@ pub fn assemble_container_task_cache(
     oid_cache: &mut OidCache,
     pinned_oids: &BTreeSet<u16>,
 ) -> Result<ContainerTaskAssemblyReport, ContainerTaskAssemblyError> {
-    // Resolve any interrupted publication before computing the next OID
-    // generation or reading the Container index.
+    let assembler = ContainerTaskAssembler::new(project_root.join(".cache"));
+    // CC retirement and RELC publication share a cross-process lock; the
+    // lock covers the journal, CTI index, and old-generation GC boundary.
+    let _publication_lock = assembler.lock_index()
+        .map_err(ContainerTaskAssemblyError::Cache)?;
     recover_container_task_publication(project_root, oid_cache)?;
     let runtime_image_sha256 = decode_sha256("Runtime Image", &image.image_id)
         .map_err(ContainerTaskAssemblyError::InvalidRuntimeImage)?;
@@ -214,8 +217,6 @@ pub fn assemble_container_task_cache(
         ));
     }
 
-    let cache_root = project_root.join(".cache");
-    let assembler = ContainerTaskAssembler::new(&cache_root);
     let mut container_index = assembler
         .load_index()
         .map_err(ContainerTaskAssemblyError::Cache)?;
