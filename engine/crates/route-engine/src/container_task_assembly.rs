@@ -109,6 +109,7 @@ pub fn assemble_container_task_cache(
     let mut container_index = assembler
         .load_index()
         .map_err(ContainerTaskAssemblyError::Cache)?;
+    let previous_container_index = container_index.clone();
 
     // Build and validate every CTI in memory before publishing either index.
     // Individual content-addressed blob writes may still leave harmless orphans
@@ -155,14 +156,14 @@ pub fn assemble_container_task_cache(
         .collect::<Vec<_>>();
     for task_oid in stale_oids {
         assembler
-            .invalidate(&mut container_index, runtime_image_sha256, task_oid)
+            .stage_invalidate(&mut container_index, runtime_image_sha256, task_oid)
             .map_err(ContainerTaskAssemblyError::Cache)?;
     }
 
     let mut artifacts = Vec::with_capacity(assembled.len());
     for (canonical_id, semantic_sha256, item) in &assembled {
         let commit = assembler
-            .commit(&mut container_index, item)
+            .stage(&mut container_index, item)
             .map_err(ContainerTaskAssemblyError::Cache)?;
         artifacts.push(ContainerTaskArtifact {
             canonical_id: canonical_id.clone(),
@@ -171,6 +172,16 @@ pub fn assemble_container_task_cache(
             cti_sha256: commit.cti_sha256,
             path: commit.blob_path,
         });
+    }
+
+    // Publish one complete Container index after all CTI blobs have been
+    // committed, never a sequence of partly updated Task mappings.
+    // Cross-file atomicity with the OID index still requires a shared
+    // generation/commit marker; this alone only makes Container publication atomic.
+    if container_index != previous_container_index {
+        assembler
+            .replace_index(&container_index)
+            .map_err(ContainerTaskAssemblyError::Cache)?;
     }
 
     let oid_index_changed = oid_cache.index() != &next_oid_index;
