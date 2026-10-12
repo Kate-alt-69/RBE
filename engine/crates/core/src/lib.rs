@@ -25,7 +25,7 @@ use video_manager::VideoManager;
 
 pub use container_client::{
     ContainerAuthorizedExecution, ContainerCapabilityBinding, ContainerClient,
-    ContainerEndpointSnapshot, ContainerExecutionIdentity,
+    ContainerEndpointSnapshot, ContainerExecutionIdentity, ContainerSubmittedTask,
 };
 pub use dns_broker::{
     call_public_dns, PublicDnsError, PUBLIC_DNS_MAX_QUERY_BYTES, PUBLIC_DNS_MAX_RESULTS,
