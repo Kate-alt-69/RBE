@@ -166,6 +166,23 @@ fn main() -> anyhow::Result<()> {
     };
     let task_loader = Arc::new(ContainerTaskLoader::new(project_root.join(".cache")));
     let task_registry = Arc::new(RuntimeImageTaskRegistry::new());
+    // Reclaim compiler cache entries only when no execution still owns the
+    // retired immutable Task. Errors leave the cache recoverable.
+    let cti_gc_loader = Arc::clone(&task_loader);
+    let cti_gc_registry = Arc::clone(&task_registry);
+    let _cti_gc_thread = thread::Builder::new()
+        .name("container-cti-gc".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_secs(60));
+            match cti_gc_registry.garbage_collect_retired(&cti_gc_loader) {
+                Ok((images, blobs)) if images != 0 || blobs != 0 => {
+                    tracing::info!(images, blobs, "retired Container Task cache reclaimed");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "retired CTI GC deferred"),
+            }
+        })?;
+
     let environment_processes = environment_process::EnvironmentProcessSupervisor::start(
         general_environments,
         debug,
