@@ -421,6 +421,7 @@ impl RuntimeImageTaskRegistry {
         }
 
         let assembler = ContainerTaskAssembler::new(&loader.cache_root);
+        let _publication_lock = assembler.lock_index()?;
         let mut index = assembler.load_index()?;
         let old = index.iter()
             .filter(|(key, _)| ready.contains(&key.runtime_image_sha256))
