@@ -559,7 +559,10 @@ mod tests {
     #[test]
     fn deterministic_export_ids_follow_phase_three_contract() {
         assert_eq!(canonical_export_id("mail", "").unwrap(), "lib_mail");
-        assert_eq!(canonical_export_id("mail", "send").unwrap(), "lib_mail_send");
+        assert_eq!(
+            canonical_export_id("mail", "send").unwrap(),
+            "lib_mail_send"
+        );
         assert_eq!(
             canonical_export_id("my-mail", "client/send-fast").unwrap(),
             "lib_my_mail_client_send_fast"
@@ -603,7 +606,11 @@ mod tests {
         for name in ["send-fast", "send_fast"] {
             let component = root.join(format!("components/{name}"));
             fs::create_dir_all(&component).unwrap();
-            fs::write(component.join(format!("{name}.ts")), "export const x = 1;\n").unwrap();
+            fs::write(
+                component.join(format!("{name}.ts")),
+                "export const x = 1;\n",
+            )
+            .unwrap();
         }
         fs::write(
             root.join(PACKAGE_MANIFEST),
