@@ -725,6 +725,7 @@ dependencies = [
  "atomic-io",
  "environments",
  "execution-engine",
+ "fs2",
  "hex",
  "ipc-protocol",
  "resource-limits",
