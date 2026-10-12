@@ -14,6 +14,7 @@
 mod cache;
 mod container_task_cache;
 mod container_task_diagnostics;
+mod container_task_execution;
 mod container_task_loader;
 mod container_task_profile;
 mod control_plane;
@@ -34,6 +35,7 @@ pub use container_task_cache::{
     CONTAINER_TASK_INDEX_MAGIC, CONTAINER_TASK_INDEX_VERSION, CTI_COMPILER_ABI_VERSION,
 };
 pub use container_task_diagnostics::{TaskDiagnosticError, TaskEventRenderer, TaskSourceLocation};
+pub use container_task_execution::{CompiledTaskGraph, TaskExecution, TaskGraphNode};
 pub use container_task_loader::{
     ContainerTaskLoadError, ContainerTaskLoader, LoadedTaskImage, RuntimeImageTaskRegistry,
     RuntimeImageTaskTable,
