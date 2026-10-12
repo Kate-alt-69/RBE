@@ -138,6 +138,26 @@ impl ContainerTaskAssembler {
         index: &mut ContainerTaskIndex,
         assembled: &AssembledContainerTask,
     ) -> Result<ContainerTaskCacheCommit, String> {
+        self.commit_impl(index, assembled, true)
+    }
+
+    /// Persist a content-addressed CTI blob and stage its index entry in memory.
+    /// The caller must publish the complete index using replace_index only
+    /// after every Task blob is durable.
+    pub fn stage(
+        &self,
+        index: &mut ContainerTaskIndex,
+        assembled: &AssembledContainerTask,
+    ) -> Result<ContainerTaskCacheCommit, String> {
+        self.commit_impl(index, assembled, false)
+    }
+
+    fn commit_impl(
+        &self,
+        index: &mut ContainerTaskIndex,
+        assembled: &AssembledContainerTask,
+        publish: bool,
+    ) -> Result<ContainerTaskCacheCommit, String> {
         fs::create_dir_all(self.container_cache_dir()).map_err(|error| {
             format!(
                 "failed to create {}: {error}",
@@ -171,7 +191,9 @@ impl ContainerTaskAssembler {
         let index_changed = index.entries.get(&key) != Some(&entry);
         if index_changed {
             index.entries.insert(key, entry);
-            self.write_index(index)?;
+            if publish {
+                self.write_index(index)?;
+            }
         }
 
         Ok(ContainerTaskCacheCommit {
@@ -196,6 +218,26 @@ impl ContainerTaskAssembler {
         runtime_image_sha256: [u8; 32],
         task_oid: u16,
     ) -> Result<bool, String> {
+        self.invalidate_impl(index, runtime_image_sha256, task_oid, true)
+    }
+
+    /// Stage an index deletion without making it visible to readers.
+    pub fn stage_invalidate(
+        &self,
+        index: &mut ContainerTaskIndex,
+        runtime_image_sha256: [u8; 32],
+        task_oid: u16,
+    ) -> Result<bool, String> {
+        self.invalidate_impl(index, runtime_image_sha256, task_oid, false)
+    }
+
+    fn invalidate_impl(
+        &self,
+        index: &mut ContainerTaskIndex,
+        runtime_image_sha256: [u8; 32],
+        task_oid: u16,
+        publish: bool,
+    ) -> Result<bool, String> {
         let removed = index
             .entries
             .remove(&ContainerTaskIndexKey {
@@ -203,7 +245,7 @@ impl ContainerTaskAssembler {
                 task_oid,
             })
             .is_some();
-        if removed {
+        if removed && publish {
             self.write_index(index)?;
         }
         Ok(removed)
