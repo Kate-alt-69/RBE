@@ -329,6 +329,57 @@ mod tests {
     use super::*;
     use crate::source_registry::RelSourceKind;
 
+	#[test]
+	fn container_tasks_compile_parameter_and_catch_all_routes_without_identity_collisions() {
+		let names = ["npm/package", "npm/[package]", "npm/[...package]"];
+		let source =
+			":import[response]\nclass Route { get(req) { return response.json({ ok: true }, 200); } }";
+		let compile = || {
+			compile_runtime_image_with_linked_rel(
+				"server Main {}",
+				names
+					.iter()
+					.map(|name| {
+						PhysicalRelSource::new(
+							RelSourceKind::Route,
+							*name,
+							format!("api/{name}.route"),
+							source,
+						)
+					})
+					.collect(),
+				&serde_json::json!({}),
+			)
+			.expect("supported dynamic routes must compile through CTI discovery")
+		};
+		let first = compile();
+		let second = compile();
+		assert_eq!(first.image.routes.len(), names.len());
+		assert_eq!(first.container_tasks.tasks.len(), names.len());
+		let identities = first
+			.container_tasks
+			.tasks
+			.iter()
+			.map(|task| task.canonical_id.clone())
+			.collect::<std::collections::BTreeSet<_>>();
+		assert_eq!(identities.len(), names.len());
+		assert!(identities.contains("task_route_npm_package_get"));
+		assert_eq!(
+			first
+				.container_tasks
+				.tasks
+				.iter()
+				.map(|task| (&task.canonical_id, &task.semantic_sha256))
+				.collect::<Vec<_>>(),
+			second
+				.container_tasks
+				.tasks
+				.iter()
+				.map(|task| (&task.canonical_id, &task.semantic_sha256))
+				.collect::<Vec<_>>(),
+		);
+	}
+
     #[test]
     fn fixed_dynamic_capacities_match_the_frozen_range_map() {
         assert_eq!(oid_capacity(OID_PACKAGE_START, OID_PACKAGE_END), 10_371);
