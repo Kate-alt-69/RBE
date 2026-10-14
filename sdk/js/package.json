@@ -11,13 +11,19 @@
     "./worker": {
       "types": "./worker.d.ts",
       "import": "./worker.js"
-    }
+		},
+		"./ka": {
+			"types": "./ka.d.ts",
+			"import": "./ka.js"
+		}
   },
   "files": [
     "index.js",
     "index.d.ts",
     "worker.js",
-    "worker.d.ts"
+		"worker.d.ts",
+		"ka.js",
+		"ka.d.ts"
   ],
   "engines": {
     "node": ">=20"
