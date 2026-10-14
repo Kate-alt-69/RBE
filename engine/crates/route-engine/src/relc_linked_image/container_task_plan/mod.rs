@@ -243,7 +243,7 @@ pub fn discover_container_tasks(
         };
         for method in &route.methods {
             let root = SymbolId::new(source_id.clone(), format!("Route.{}", method.verb));
-            let canonical_id = canonical(&["task", "route", &manifest.logical_name, &method.verb])?;
+			let canonical_id = route_task_identity(&manifest.logical_name, &method.verb)?;
             let artifact = image
                 .route_wasm_artifact(source_id)
                 .filter(|artifact| artifact.verb.eq_ignore_ascii_case(&method.verb));
@@ -372,6 +372,23 @@ fn build_task(
         source_map,
         semantic_sha256,
     })
+}
+
+/// Route discovery has already validated parameter/catch-all filenames. Encode
+/// their complete logical name under a separate Task prefix so brackets cannot
+/// collide with literal routes or with single-parameter/catch-all variants.
+fn route_task_identity(logical: &str, verb: &str) -> Result<String, ContainerTaskDiscoveryError> {
+	if logical.contains(['[', ']']) {
+		canonical(&[
+			"task",
+			"dynamic",
+			"route",
+			&hex::encode(logical.as_bytes()),
+			verb,
+		])
+	} else {
+		canonical(&["task", "route", logical, verb])
+	}
 }
 
 pub(super) fn canonical(parts: &[&str]) -> Result<String, ContainerTaskDiscoveryError> {
