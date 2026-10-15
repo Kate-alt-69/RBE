@@ -14,7 +14,6 @@ use std::fmt;
 use core_lib::{CtiNodeKind, TaskEventDictionary, CONTAINER_CAPABILITY_ABI_VERSION};
 
 use crate::oid_link::LinkedRelSymbolSpec;
-use crate::rel_symbol_discovery::LinkedRelDiscovery;
 use crate::relc::PhysicalRelSource;
 use crate::runtime_image::{RuntimeCapabilityRequirement, RuntimeExecutable, RuntimeImage};
 use crate::source_registry::SourceId;
@@ -152,6 +151,8 @@ pub struct ContainerTaskPlan {
     pub graph: ContainerTaskGraph,
     pub capability_slots: Vec<ContainerTaskCapabilitySlot>,
     pub boundary_hints: Vec<ContainerTaskBoundaryHint>,
+	/// Only native-lowered dependencies require OID records. Evaluated calls
+	/// retain their reachable symbol hashes and source/capability evidence.
     pub required_oid_symbols: BTreeSet<String>,
     /// Reachable symbol-level semantic hashes drive selective invalidation.
     pub symbol_sha256s: BTreeMap<SymbolId, String>,
@@ -219,16 +220,17 @@ pub(super) fn err(message: impl Into<String>) -> ContainerTaskDiscoveryError {
 
 pub fn discover_container_tasks(
     image: &RuntimeImage,
-    linked_rel: &LinkedRelDiscovery,
+	native_selection: &crate::rel_native_service_select::NativeServiceSelection,
     raw_server_source: &str,
     physical_sources: &[PhysicalRelSource],
 ) -> Result<ContainerTaskDiscovery, ContainerTaskDiscoveryError> {
     let texts = source_texts(raw_server_source, physical_sources)?;
-    let linked = linked_rel
-        .symbols
-        .iter()
-        .map(|symbol| (symbol.canonical_id.clone(), symbol))
-        .collect::<BTreeMap<_, _>>();
+	let linked = native_selection
+		.discovery
+		.symbols
+		.iter()
+		.map(|symbol| (symbol.canonical_id.clone(), symbol))
+		.collect::<BTreeMap<_, _>>();
     let mut tasks = Vec::new();
 
     for source_id in &image.routes {

@@ -110,13 +110,19 @@ pub fn compile_runtime_image_with_packages_and_linked_rel(
         discover_linked_rel_from_runtime_image(&image, raw_server_source, &discovery_sources)
             .map_err(RelcLinkedImageError::LinkedRel)?;
 
+	// Native selection defines which linked symbols will actually have native
+	// OID records. Evaluator-backed module dependencies remain semantic/hash
+	// evidence and must not become requests for nonexistent machine-code records.
+	let native_services = select_native_services(&image, &linked_rel, &OidTarget::current())
+		.map_err(RelcLinkedImageError::NativeSelection)?;
+
     // CTI Task discovery consumes compiler facts only. It does not allocate an
     // OID or assemble a `.bin`; instead it emits canonical Task OID requests,
     // DAG metadata, capability slots, logging dictionaries and source/error maps
     // for the later assembler/index phases.
-    let container_tasks =
-        discover_container_tasks(&image, &linked_rel, raw_server_source, &discovery_sources)
-            .map_err(RelcLinkedImageError::ContainerTask)?;
+	let container_tasks =
+		discover_container_tasks(&image, &native_services, raw_server_source, &discovery_sources)
+			.map_err(RelcLinkedImageError::ContainerTask)?;
 
     // Phase 4 allocates only the post-DCE reachable symbol set plus the Task OID
     // identities emitted above. Capacity must be checked after discovery so
@@ -124,13 +130,6 @@ pub fn compile_runtime_image_with_packages_and_linked_rel(
     // space in the same authoritative REL OID range.
     validate_linked_rel_oid_capacity(&linked_rel, container_tasks.tasks.len())
         .map_err(RelcLinkedImageError::Capacity)?;
-
-    // Phase 2 lowers only whole Services whose complete executable root surface
-    // is supported. Unsupported Services remain explicit evaluator fallbacks and
-    // emit no placeholder fragments. This selection is compiler-owned so later
-    // phases never need to reparse source or recreate symbol meaning.
-    let native_services = select_native_services(&image, &linked_rel, &OidTarget::current())
-        .map_err(RelcLinkedImageError::NativeSelection)?;
 
     Ok(RelcLinkedImage {
         image,
