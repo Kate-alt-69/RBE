@@ -20,7 +20,9 @@ class BuildCacheTests(unittest.TestCase):
 	def setUp(self):
 		self.temporary = tempfile.TemporaryDirectory()
 		self.addCleanup(self.temporary.cleanup)
-		self.root = Path(self.temporary.name)
+		# Windows may return an 8.3 temporary path; Cargo and the resolver use
+		# the canonical long path. Compare the actual directory identity.
+		self.root = Path(self.temporary.name).resolve()
 		for workspace in ("engine", "container-runtime"):
 			path = self.root / workspace
 			path.mkdir()
