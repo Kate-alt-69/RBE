@@ -11,6 +11,7 @@ fn main() {
         "RBE_ADMIN_AUTH_ROUNDS",
         "RBE_ADMIN_AUTH_SALT_HEX",
         "RBE_ADMIN_AUTH_VERIFIER_HEX",
+        "RBE_DENY_ADMIN_SETUP",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
@@ -21,6 +22,14 @@ fn main() {
     let rounds = env::var("RBE_ADMIN_AUTH_ROUNDS").ok();
     let salt = env::var("RBE_ADMIN_AUTH_SALT_HEX").ok();
     let verifier = env::var("RBE_ADMIN_AUTH_VERIFIER_HEX").ok();
+    let deferred = match env::var("RBE_DENY_ADMIN_SETUP").as_deref() {
+        Ok("1") => true,
+        Err(_) | Ok("0") => false,
+        _ => panic!("RBE_DENY_ADMIN_SETUP must be 0 or 1"),
+    };
+    if deferred && (rounds.is_some() || salt.is_some() || verifier.is_some()) {
+        panic!("deferred admin setup must not embed an admin verifier");
+    }
 
     let generated = match (rounds, salt, verifier) {
         (Some(rounds), Some(salt), Some(verifier)) => {
@@ -48,7 +57,7 @@ fn main() {
         }
         (None, None, None) => {
             println!(
-                "cargo:warning=api: admin dashboard password verifier is not configured; authenticated control room will stay locked"
+                "cargo:warning=api: admin dashboard verifier is absent; deferred builds require local first-run initialization, other builds keep the control room locked"
             );
             "pub const ADMIN_PASSWORD_CONFIGURED: bool = false;\n\
              pub const ADMIN_PASSWORD_ROUNDS: u32 = 1;\n\
@@ -59,5 +68,9 @@ fn main() {
         _ => panic!("RBE admin verifier is incomplete; set rounds, salt, and verifier together"),
     };
 
-    fs::write(destination, generated).expect("write dashboard auth constants");
+    fs::write(
+        destination,
+        format!("pub const ADMIN_SETUP_DEFERRED: bool = {deferred};\n{generated}"),
+    )
+    .expect("write dashboard auth constants");
 }

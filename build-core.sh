@@ -12,6 +12,7 @@ BUILD_WIN=false; BUILD_LINUX=false; BUILD_MACOS=false; BUILD_ALL=false; MUSL=fal
 NO_EMBED=false; DEV_CONTENT=false; RELEASE=true; ARCH_X64=false; ARCH_X86=false
 ARCH_ARM64=false; ARCH_ARMV7=false; CUSTOM_TARGET=""; SHOW_HELP=false
 CLOUD_NODE_ONLY=false
+DENY_ADMIN_SETUP=false
 CACHE_REMOVE=false; CACHE_REMOVE_WIN=false; CACHE_REMOVE_LINUX=false; CACHE_REMOVE_ALL=false; DISTRO=""
 
 show_help() {
@@ -39,6 +40,7 @@ Architecture Flags:
 
 Configuration & Profile Flags:
   --musl                Linux targets: build against musl libc instead of glibc
+  --deny-admin-setup    Defer admin password creation to first runtime startup
   --no-embed            Do not embed container-bin into backend
   --dev-content         Copy development api/module content into dist
   --debug               Build with debug profile instead of release
@@ -64,6 +66,7 @@ for arg in "$@"; do
         --build-all) BUILD_ALL=true ;;
         --cloud-node-only|--build-cloud-node) CLOUD_NODE_ONLY=true ;;
         --musl) MUSL=true ;;
+		--deny-admin-setup) DENY_ADMIN_SETUP=true ;;
         --no-embed) NO_EMBED=true ;;
         --dev-content) DEV_CONTENT=true ;;
         --debug) RELEASE=false ;;
@@ -147,6 +150,10 @@ if [ "$CLOUD_NODE_ONLY" = false ]; then
         echo 'For a temporary local key: export RBE_CONTAINER_SIGNING_PRIVATE_KEY="$(openssl rand -hex 32)"' >&2
         exit 1
     fi
+	if [ "$DENY_ADMIN_SETUP" = true ]; then
+		export RBE_DENY_ADMIN_SETUP=1
+		unset RBE_ADMIN_PASSWORD RBE_ADMIN_AUTH_ROUNDS RBE_ADMIN_AUTH_SALT_HEX RBE_ADMIN_AUTH_VERIFIER_HEX
+	else
     if [ -z "${RBE_ADMIN_AUTH_ROUNDS:-}" ] || [ -z "${RBE_ADMIN_AUTH_SALT_HEX:-}" ] || [ -z "${RBE_ADMIN_AUTH_VERIFIER_HEX:-}" ]; then
         echo "ERROR: a complete RBE_ADMIN_AUTH_* verifier is required for packaged builds. Use build.sh for interactive password entry." >&2
         exit 1
@@ -154,6 +161,7 @@ if [ "$CLOUD_NODE_ONLY" = false ]; then
     [[ "$RBE_ADMIN_AUTH_ROUNDS" =~ ^[0-9]+$ ]] && [ "$RBE_ADMIN_AUTH_ROUNDS" -ge 10000 ] || { echo "ERROR: invalid RBE_ADMIN_AUTH_ROUNDS." >&2; exit 1; }
     [[ "$RBE_ADMIN_AUTH_SALT_HEX" =~ ^[0-9a-fA-F]{16}$ ]] || { echo "ERROR: invalid RBE_ADMIN_AUTH_SALT_HEX." >&2; exit 1; }
     [[ "$RBE_ADMIN_AUTH_VERIFIER_HEX" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "ERROR: invalid RBE_ADMIN_AUTH_VERIFIER_HEX." >&2; exit 1; }
+	fi
 fi
 
 DIST_ROOT="$REPO_ROOT/dist"; ENGINE_DIR="$REPO_ROOT/engine"; CONTAINER_DIR="$REPO_ROOT/container-runtime"

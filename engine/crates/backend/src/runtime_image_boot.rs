@@ -52,7 +52,16 @@ pub fn compile_with_tasks(
     config: &Config,
     catalog: Option<&ServiceCatalog>,
 ) -> anyhow::Result<route_engine::relc_linked_image::RelcLinkedImage> {
-    let root = runtime_paths::binary_dir();
+    compile_at_root(config, catalog, &runtime_paths::binary_dir())
+}
+
+/// Candidate updates compile the installed project with the candidate compiler
+/// without copying application data or changing the active binary directory.
+pub fn compile_at_root(
+    config: &Config,
+    catalog: Option<&ServiceCatalog>,
+    root: &Path,
+) -> anyhow::Result<route_engine::relc_linked_image::RelcLinkedImage> {
     let server_path = root.join("server.server");
     let server_source = if server_path.is_file() {
         std::fs::read_to_string(&server_path).map_err(|error| {
@@ -69,11 +78,11 @@ pub fn compile_with_tasks(
         "server Main {}\n".to_string()
     };
     let physical = route_engine::discover_physical_rel_sources(
-        &route_engine::default_api_dir(),
-        &route_engine::default_module_dir(),
+        &root.join("api"),
+        &root.join("module"),
         catalog,
     )?;
-    let package_links = package_links::load(&root).map_err(|error| {
+    let package_links = package_links::load(root).map_err(|error| {
         anyhow::anyhow!(
             "RBE5100 Backend could not load verified package exports for Runtime Image linking.\n\nError:\n  {error:#}\n\nNote:\n  Runtime Image startup refuses unverified or stale package-link metadata. Rehydrate the active package graph and retry.\n\nHelp:\n  {RUNTIME_IMAGE_COMPILE_HELP}"
         )

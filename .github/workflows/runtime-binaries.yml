@@ -1,0 +1,121 @@
+name: Runtime binary snapshots
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['doc/**', '**.md']
+  pull_request:
+    paths-ignore: ['doc/**', '**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-binaries-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      metadata: ${{ steps.plan.outputs.metadata }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate snapshot publisher
+        run: python test-binary-snapshots.py
+      - id: plan
+        name: Assign build version
+        env:
+          BUILD_RUN: ${{ github.run_number }}
+          BUILD_ATTEMPT: ${{ github.run_attempt }}
+        run: python binary-snapshots.py plan --run "$BUILD_RUN" --attempt "$BUILD_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      RBE_BINARY_METADATA: ${{ needs.plan.outputs.metadata }}
+      RBE_BINARY_VERSION: ${{ needs.plan.outputs.version }}
+      RBE_BUILD_ID: ${{ github.sha }}
+      RBE_BINARY_REPOSITORY: ${{ github.repository }}
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/rbe-build/cargo-target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine -> ../.cache/rbe-build/cargo-target
+            container-runtime -> ../.cache/rbe-build/cargo-target
+          cache-on-failure: true
+      - name: Build deferred-admin runtime (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash ./build.sh --deny-admin-setup --target=${{ matrix.target }}
+      - name: Build deferred-admin runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./build.ps1 --deny-admin-setup --target=${{ matrix.target }}
+      - name: Test credentials and update transactions
+        env:
+          RBE_DENY_ADMIN_SETUP: '1'
+        shell: bash
+        run: |
+          cargo test --locked --manifest-path engine/Cargo.toml -p api admin_credentials --lib
+          cargo test --locked --manifest-path engine/Cargo.toml -p backend --bin backend binary_updates::tests
+      - name: Verify native identity and split Git-sized parts
+        run: python binary-snapshots.py snapshot --dist dist/${{ matrix.target }} --target ${{ matrix.target }} --output runtime-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.target }}
+          path: runtime-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [plan, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      RBE_BINARY_METADATA: ${{ needs.plan.outputs.metadata }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          path: runtime-assets
+          merge-multiple: true
+      - name: Publish binary-only immutable tag and atomic latest alias
+        env:
+          BINARY_REPOSITORY: ${{ github.repository }}
+        run: python binary-snapshots.py publish --assets runtime-assets --repository "$BINARY_REPOSITORY"

@@ -1,5 +1,6 @@
 //! Route registration for the Rust backend and its backend-owned control room.
 
+pub mod admin_credentials;
 mod dashboard;
 mod health;
 mod routes;
