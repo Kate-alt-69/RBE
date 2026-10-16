@@ -495,6 +495,9 @@ if ($CacheRemove -or $CacheRemoveWin -or $CacheRemoveLinux -or $CacheRemoveAll) 
     }
 }
 
+. (Join-Path $RepoRoot 'build-cache.ps1')
+Initialize-RbeBuildCache $RepoRoot
+
 foreach ($target in $targets) {
     Write-Host ""
     Write-Host "=== Building for $target ===" -ForegroundColor Green

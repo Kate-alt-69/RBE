@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -91,8 +92,30 @@ class BuildCacheTests(unittest.TestCase):
 		self.assertEqual(build(), {"alpha": True, "beta": True, "app": True})
 		(self.root / "engine/alpha/src/lib.rs").write_text('pub fn value() -> u8 { 2 }\n')
 		self.assertEqual(build(), {"alpha": False, "beta": True, "app": False})
-		result = subprocess.check_output([str(target / "release/app")], text=True)
+		binary = "app.exe" if os.name == "nt" else "app"
+		result = subprocess.check_output([str(target / "release" / binary)], text=True)
 		self.assertEqual(result.strip(), "3")
+
+	@unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"), "PowerShell is not installed")
+	def test_powershell_resolves_and_exports_the_same_target(self):
+		helper = Path(__file__).with_name("build-cache.ps1").resolve()
+		# Exercise the real adapter with a spaced path and a fresh Cargo home.
+		# Its environment export must be available to subsequent Cargo builds.
+		script = self.root / "check-cache.ps1"
+		quote = lambda value: str(value).replace("'", "''")
+		script.write_text(
+			f"$ErrorActionPreference = 'Stop'\n. '{quote(helper)}'\n"
+			f"Initialize-RbeBuildCache '{quote(Path(__file__).parent.resolve())}'\n"
+			"[Console]::WriteLine($env:CARGO_TARGET_DIR)\n",
+		)
+		target = self.root / "shared cache with spaces"
+		result = subprocess.run(
+			[shutil.which("pwsh") or shutil.which("powershell"), "-NoProfile", "-File", str(script)],
+			env={**os.environ, "RBE_BUILD_CACHE_DIR": str(target)},
+			check=True, capture_output=True, text=True,
+		)
+		self.assertEqual(Path(result.stdout.strip()), target / "cargo-target")
+		self.assertTrue((target / "cargo-target").is_dir())
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ on:
       - 'build.sh'
       - 'build-cache.py'
       - 'test-build-cache.py'
+      - 'build-cache.ps1'
+      - 'build*.ps1'
       - 'build-select.sh'
       - 'build-release.sh'
       - 'build-core.sh'
@@ -17,6 +19,8 @@ on:
       - 'build.sh'
       - 'build-cache.py'
       - 'test-build-cache.py'
+      - 'build-cache.ps1'
+      - 'build*.ps1'
       - 'build-select.sh'
       - 'build-release.sh'
       - 'build-core.sh'
@@ -29,6 +33,25 @@ permissions:
   contents: read
 
 jobs:
+  windows-cache:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify PowerShell adapter and per-crate Cargo reuse
+        run: python test-build-cache.py
+      - name: Parse PowerShell builders without running builds
+        shell: pwsh
+        run: |
+          Get-ChildItem build*.ps1 | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { throw ($errors | Out-String) }
+          }
   linux-preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 10
