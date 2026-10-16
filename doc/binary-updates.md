@@ -41,66 +41,114 @@ verifier as a protected PBKDF2 record before switching to a public deferred bina
 It refuses to overwrite a different existing record. Thus the existing password
 continues working after the update.
 
-## Binary tags, not GitHub Releases
+## OS-specific downloads and version tags
 
-`Runtime binary snapshots` builds these native bundles after source changes on
-`main`, with PR builds validating the same matrix before publication:
+Open [the latest GitHub Release](https://github.com/Kate-alt-69/RBE/releases/latest)
+and choose **only your operating system and architecture**. Windows gets a ZIP;
+Linux and macOS get `.tar.gz` archives. You do not need to download every platform
+or reconstruct Git binary parts for a normal installation.
 
-| Rust target | CI host / compatibility baseline |
+| Download | Compatibility baseline |
 | --- | --- |
-| `x86_64-unknown-linux-gnu` | Ubuntu 22.04, glibc 2.35+ |
-| `aarch64-unknown-linux-gnu` | Ubuntu 24.04 ARM, glibc 2.39+ |
-| `x86_64-pc-windows-msvc` | Windows x64, MSVC |
-| `x86_64-apple-darwin` | macOS Intel runner |
-| `aarch64-apple-darwin` | macOS Apple Silicon runner |
+| Windows x64 ZIP | Windows x64, MSVC |
+| Linux x64 archive | Ubuntu 22.04, glibc 2.35+ |
+| Linux ARM64 archive | Ubuntu 24.04 ARM, glibc 2.39+ |
+| macOS Intel archive | macOS Intel runner |
+| macOS Apple Silicon archive | macOS ARM64 runner |
 
-These are development builds, not a promise to support every Linux distribution
-or older macOS version. Public ARM64 Linux bundles require the baseline above;
-compile from source on older systems. macOS bundles are not Apple-notarized.
+Each archive contains its platform's complete matching runtime: `backend`,
+`cloud_node`, `dep/container`, `dep/service` (with `.exe` on Windows), plus
+`build-info.json`. Keep these files together. Settings, application REL files,
+credentials and deployment data are not included. Extract into a new directory;
+preserve existing configuration/data when upgrading. The Release lists SHA-256
+checksums and the exact source commit/build revision.
 
-`VERSION` holds the manually selected base version, initially `0.1.0`. CI adds its
-run number and attempt, such as `0.1.0-dev.42.1`, without editing source or Cargo
-package versions. `backend --version` and `backend --version-json` expose the version,
-source commit and target without opening listeners.
+Compile from source on systems older than the baselines above. macOS bundles are
+not Apple-notarized.
 
-Only after **all five bundles succeed**, CI creates a separate parentless Git commit
-containing `manifest.json` and `binaries/<target>/...`. It attaches an immutable tag,
-for example `rbe-v0.1.0-dev.42.1`, and atomically advances `rbe-binaries-latest`.
-Concurrent publishers use an expected-tip lease; an older run cannot rewind latest.
-Publication never deletes source, changes `main`, or creates a GitHub Release.
-Each tag adds binary Git objects to repository storage. Larger files are split into
-80 MiB parts to stay below GitHub's per-file limit; this does not reduce total storage.
+`VERSION` selects the binary version, initially `0.1.0`. Use canonical
+`major.minor.patch` numbers, such as `1.0.0`; padded components such as `1.00.0`
+are rejected. Binary versions are separate from Cargo package and ABI versions.
+`backend --version` and `backend --version-json` expose the version, source commit
+and target without opening listeners.
 
-Use the downloader to reassemble all four files, checking sizes and SHA-256 hashes:
+| Tag | Behavior |
+| --- | --- |
+| `rbe-bin-v0.1.0` | Moves to the newest successful build of version `0.1.0`; its GitHub Release downloads refresh too |
+| `rbe-bin-latest` | Moves to the newest successfully published build across versions |
+| `rbe-bin-v0.1.0-build.42.1` | Immutable internal revision for run 42, attempt 1; supports verified acquisition and rollback |
+
+Every push to `main` builds the native matrix. If `VERSION` is unchanged, a newer
+source commit refreshes the **existing version's** tag and Release assets. To
+start another numbered version, change `VERSION`, commit it with the intended
+code, and merge or push to `main`. For example:
+
+```sh
+printf '0.1.1\n' > VERSION
+git add VERSION
+git commit -m "Select RBE binary version 0.1.1"
+```
+
+Versions cannot decrease. CI compares the version file before and after the whole
+push, including multi-commit pushes. **Run workflow** can rebuild the current
+source/version without a version bump. PR builds validate the matrix and do not
+publish tags or Releases.
+
+Only after **all five bundles and their checks succeed**, CI creates a separate
+parentless Git commit containing `manifest.json` and `binaries/<target>/...`.
+The immutable build tag points at that commit. Version and latest aliases move
+atomically with expected-tip leases; an older run cannot rewind either alias.
+Source `main` is never rewritten. Binary files over GitHub's per-file limit are
+split into 80 MiB parts inside the Git tree.
+
+Publishing then creates or refreshes the version's GitHub Release with one archive
+per platform and a checksum file. Archives carry their build revision in the name.
+All replacement assets upload and pass checksum verification before the Release's
+download table changes; obsolete managed assets are removed afterward. Manually
+uploaded files are preserved. Publishers are serialized so two builds cannot mix
+Release updates. A failed upload keeps existing download links usable; retry the
+publishing job to finish. Tags may already have advanced when an asset upload fails;
+the updater uses the verified Git manifest independently of Release downloads.
+
+The archives and binary Git history both consume GitHub storage. Planning fetches
+only the source commits needed for the comparison, and publishing uses a shallow
+source checkout; neither downloads accumulated binary tags. New archives do not
+require a new version number when the source commit changes.
+
+For an exact historical build, the Python downloader can reconstruct its verified
+Git bundle without Git installed:
 
 ```sh
 python3 binary-snapshots.py download --target x86_64-unknown-linux-gnu \
-  --tag rbe-binaries-latest --destination ./rbe-runtime
+  --tag rbe-bin-v0.1.0-build.42.1 --destination ./rbe-runtime
 ```
 
-Python 3.9+ and Git are needed for the publisher; downloading needs Python only.
-Download into a **new** directory. It contains `backend`, `cloud_node`,
-`dep/container`, `dep/service` (with `.exe` on Windows), plus `build-info.json`.
-Bring your own `settings.json`, application REL sources and deployment data; these
-are deliberately absent from the binary-only tag. Keep the complete matching bundle.
-Run `python3 binary-snapshots.py -h` or a subcommand's `-h` for supported arguments.
-An exact version tag pins a snapshot. Downloading GitHub's source ZIP for a binary
-tag gives the parts; use this downloader to reconstruct large executables.
+Use `--tag rbe-bin-latest` or `--tag rbe-bin-v0.1.0` to download the current build
+instead. Existing `rbe-v…-dev.…` tags remain accepted by the new downloader and
+updater; they are not renamed or deleted. Older binaries whose updater only knows
+the old prefix require one manual installation of a new bundle before following
+`rbe-bin-latest`. Python 3.9+ is required for the downloader; publishing also uses
+Git. Run a subcommand's `-h` for its arguments.
 
 ## Opt-in self-update
 
 ```sh
 ./backend --update-check
 ./backend --auto-update --settings settings.json
-./backend --auto-update --update-tag rbe-v0.1.0-dev.42.1 --settings settings.json
+./backend --auto-update --update-tag rbe-bin-v0.1.1 --settings settings.json
 ```
 
 Auto-update is off by default. It checks immediately and then every 15 minutes.
-An exact tag pins the process; the default moving alias follows new builds. The
+An immutable build tag pins the process; the default moving alias follows new builds. The
 publisher repository is compiled into the binary (`RBE_BINARY_REPOSITORY`, default
 `Kate-alt-69/RBE`), rather than taken from a remote request. Acquisition uses HTTPS
 from that repository and validates the complete manifest, target, all sizes and
 hashes, the candidate's reported identity, and protocol/credential compatibility.
+Use `--update-tag rbe-bin-latest` (the default) to follow subsequent compatible
+versions, or `--update-tag rbe-bin-v0.1.0` to receive newer commits within version
+`0.1.0`. Use an immutable `-build.<run>.<attempt>` tag to stay on one exact build.
+Rebuilds with the same version and a different source commit still pass through
+the full preflight, maintenance, health-check and rollback path.
 Checksums detect corrupt or mixed downloads; they are **not an independent signature
 against repository compromise**. Only install from a repository you trust.
 

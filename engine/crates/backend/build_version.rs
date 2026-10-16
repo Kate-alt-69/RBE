@@ -1,5 +1,5 @@
-//! Build identity is separate from package/ABI versions. Development snapshots
-//! carry an immutable source SHA and unique build number without editing Cargo.
+//! Binary versions are separate from package/ABI versions. The source SHA
+//! distinguishes successive source builds that keep the same selected VERSION.
 use std::{env, fs, path::Path};
 pub fn emit(source: &str, target: &str) {
     let base_path = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../../VERSION");
@@ -76,8 +76,14 @@ fn valid(base: &str, version: &str) -> bool {
 mod tests {
     #[test]
     fn identities_are_bounded_to_the_base_version() {
+        assert!(super::valid("0.1.0", "0.1.0"));
         assert!(super::valid("0.1.0", "0.1.0-dev.14.1"));
-        for bad in ["9.1.0-dev.14.1", "0.1.0-dev.01.1", "0.1.0-dev.2.1\n"] {
+        for bad in [
+            "9.1.0",
+            "9.1.0-dev.14.1",
+            "0.1.0-dev.01.1",
+            "0.1.0-dev.2.1\n",
+        ] {
             assert!(!super::valid("0.1.0", bad));
         }
     }

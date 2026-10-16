@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 const MAX_FILE: u64 = 1024 * 1024 * 1024;
 const MAX_PART: u64 = 80 * 1024 * 1024;
+pub const LATEST_TAG: &str = "rbe-bin-latest";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Part {
@@ -67,8 +68,9 @@ pub fn identity() -> serde_json::Value {
 		"deferred_admin_setup": api::admin_credentials::deferred()})
 }
 fn safe_tag(tag: &str) -> bool {
-    tag == "rbe-binaries-latest"
-        || (tag.starts_with("rbe-v")
+    tag == LATEST_TAG
+        || tag == "rbe-binaries-latest"
+        || ((tag.starts_with("rbe-bin-v") || tag.starts_with("rbe-v"))
             && tag.len() < 100
             && tag
                 .bytes()
@@ -125,26 +127,34 @@ fn fetch_manifest(reference: &str) -> Result<Manifest> {
     Ok(manifest)
 }
 fn version_matches_sequence(m: &Manifest) -> bool {
-    let Some((base, build)) = m.version.split_once("-dev.") else {
-        return false;
-    };
+    let (base, build) = m
+        .version
+        .split_once("-dev.")
+        .map_or((m.version.as_str(), None), |(base, build)| {
+            (base, Some(build))
+        });
     let parts = base.split('.').collect::<Vec<_>>();
     parts.len() == 3
         && parts.iter().all(|p| {
             !p.is_empty()
                 && (*p == "0" || !p.starts_with('0'))
                 && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u64>().is_ok()
         })
         && m.run > 0
         && m.attempt > 0
-        && build == format!("{}.{}", m.run, m.attempt)
+        && build.is_none_or(|build| build == format!("{}.{}", m.run, m.attempt))
 }
 fn validate(m: &Manifest) -> Result<()> {
     if !version_matches_sequence(m)
         || m.format != 1
         || m.update_protocol != 1
         || m.credential_format != 1
-        || m.tag != format!("rbe-v{}", m.version)
+        || !((!m.version.contains("-dev.")
+            && m.tag == format!("rbe-bin-v{}-build.{}.{}", m.version, m.run, m.attempt))
+            || (m.version.contains("-dev.")
+                && (m.tag == format!("rbe-v{}", m.version)
+                    || m.tag == format!("rbe-bin-v{}", m.version))))
         || !safe_tag(&m.tag)
         || m.source.len() != 40
         || !m.source.bytes().all(|b| b.is_ascii_hexdigit())
@@ -904,8 +914,8 @@ mod tests {
             }
             let manifest = Manifest {
                 format: 1,
-                version: format!("{}-dev.1.1", env!("RBE_BASE_VERSION")),
-                tag: format!("rbe-v{}-dev.1.1", env!("RBE_BASE_VERSION")),
+                version: env!("RBE_BASE_VERSION").into(),
+                tag: format!("rbe-bin-v{}-build.1.1", env!("RBE_BASE_VERSION")),
                 source: "a".repeat(40),
                 run: 1,
                 attempt: 1,
@@ -929,6 +939,41 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn release_and_legacy_tags_preserve_manifest_constraints() {
+        let fixture = Fixture::new();
+        let mut manifest = fixture.prepared.manifest.clone();
+        validate(&manifest).unwrap();
+        manifest.version = format!("{}-dev.1.1", env!("RBE_BASE_VERSION"));
+        manifest.tag = format!("rbe-v{}", manifest.version);
+        validate(&manifest).unwrap();
+        let mut ambiguous = manifest.clone();
+        ambiguous.tag = format!("rbe-bin-v{}-build.1.1", ambiguous.version);
+        assert!(validate(&ambiguous).is_err());
+        manifest.version = env!("RBE_BASE_VERSION").into();
+        manifest.tag = format!("rbe-bin-v{}-build.1.1", manifest.version);
+        validate(&manifest).unwrap();
+        for tag in ["rbe-bin-latest", "rbe-v0.1.0", "rbe-bin-v0.1.0/../../main"] {
+            let mut bad = manifest.clone();
+            bad.tag = tag.into();
+            assert!(validate(&bad).is_err());
+        }
+        for version in [
+            "0.01.0",
+            "0.1.0-dev.2.1",
+            "0.1.0-dev.1.1.extra",
+            "0.1.0-beta.1",
+        ] {
+            let mut bad = manifest.clone();
+            bad.version = version.into();
+            bad.tag = format!("rbe-bin-v{version}-build.1.1");
+            assert!(validate(&bad).is_err());
+        }
+        assert!(safe_tag(LATEST_TAG));
+        assert!(safe_tag("rbe-binaries-latest"));
+        assert!(!safe_tag("refs/tags/rbe-bin-latest"));
     }
 
     #[test]
