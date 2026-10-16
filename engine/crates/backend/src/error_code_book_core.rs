@@ -27,7 +27,7 @@ Commands:
 
 Standalone updates (opt-in):
   --auto-update               Check every 15 minutes; stage, preflight, drain, replace and health-check
-  --update-tag <tag>           Pin an exact binary tag (default: rbe-binaries-latest)
+  --update-tag <tag>           Follow latest/a version, or pin a build (default: rbe-bin-latest)
   --update-check              Inspect the verified manifest without booting
   --update-recover            Restore an interrupted transaction and restart without auto-update
   --version / --version-json  Inspect this executable without booting

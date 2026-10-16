@@ -3,7 +3,6 @@ name: Runtime binary snapshots
 on:
   push:
     branches: [main]
-    paths-ignore: ['doc/**', '**.md']
   pull_request:
     paths-ignore: ['doc/**', '**.md']
   workflow_dispatch:
@@ -23,6 +22,9 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          fetch-tags: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -33,7 +35,17 @@ jobs:
         env:
           BUILD_RUN: ${{ github.run_number }}
           BUILD_ATTEMPT: ${{ github.run_attempt }}
-        run: python binary-snapshots.py plan --run "$BUILD_RUN" --attempt "$BUILD_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          PREVIOUS_SOURCE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: |
+          args=()
+          if [ -n "$PREVIOUS_SOURCE" ]; then
+            [[ "$PREVIOUS_SOURCE" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid previous source SHA'; exit 1; }
+            if [ "$PREVIOUS_SOURCE" != 0000000000000000000000000000000000000000 ] && ! git cat-file -e "$PREVIOUS_SOURCE^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "$PREVIOUS_SOURCE"
+            fi
+            args+=(--previous-source "$PREVIOUS_SOURCE")
+          fi
+          python binary-snapshots.py plan --run "$BUILD_RUN" --attempt "$BUILD_ATTEMPT" "${args[@]}" --github-output "$GITHUB_OUTPUT"
 
   build:
     needs: plan
@@ -99,6 +111,10 @@ jobs:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: [plan, build]
     runs-on: ubuntu-22.04
+    # Tag leases protect refs; serialization also protects multi-step Release asset updates.
+    concurrency:
+      group: runtime-binary-publication
+      cancel-in-progress: false
     permissions:
       contents: write
     env:
@@ -106,7 +122,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -115,7 +132,8 @@ jobs:
           pattern: runtime-*
           path: runtime-assets
           merge-multiple: true
-      - name: Publish binary-only immutable tag and atomic latest alias
+      - name: Refresh version tags and OS-specific Release downloads
         env:
           BINARY_REPOSITORY: ${{ github.repository }}
-        run: python binary-snapshots.py publish --assets runtime-assets --repository "$BINARY_REPOSITORY"
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python binary-snapshots.py publish --assets runtime-assets --repository "$BINARY_REPOSITORY" --github-release

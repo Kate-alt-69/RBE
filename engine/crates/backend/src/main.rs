@@ -1774,5 +1774,5 @@ fn update_tag(args: &[String]) -> String {
     args.windows(2)
         .find(|p| p[0] == "--update-tag")
         .map(|p| p[1].clone())
-        .unwrap_or_else(|| "rbe-binaries-latest".into())
+        .unwrap_or_else(|| binary_updates::LATEST_TAG.into())
 }
