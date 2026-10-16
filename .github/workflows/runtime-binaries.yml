@@ -79,13 +79,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./build.ps1 --deny-admin-setup --target=${{ matrix.target }}
-      - name: Test credentials and update transactions
+      - name: Test credentials, updates, and local archive capabilities
         env:
           RBE_DENY_ADMIN_SETUP: '1'
         shell: bash
         run: |
           cargo test --locked --manifest-path engine/Cargo.toml -p api admin_credentials --lib
-          cargo test --locked --manifest-path engine/Cargo.toml -p backend --bin backend binary_updates::tests
+          cargo test --locked --manifest-path engine/Cargo.toml -p backend --bin backend
+          cargo test --locked --manifest-path engine/Cargo.toml -p rbe-install-runtime workspace_archive --lib
+          cargo test --locked --manifest-path engine/Cargo.toml -p route-engine archive_bridge_tests --lib
       - name: Verify native identity and split Git-sized parts
         run: python binary-snapshots.py snapshot --dist dist/${{ matrix.target }} --target ${{ matrix.target }} --output runtime-assets
       - uses: actions/upload-artifact@v4

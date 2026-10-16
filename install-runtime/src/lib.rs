@@ -72,6 +72,7 @@ mod target;
 mod verified_worker;
 mod worker_launch;
 mod worker_source;
+pub mod workspace_archive;
 
 pub use activation::{
     activate_project_target, recover_project_activation, ActivationRuntimeError,

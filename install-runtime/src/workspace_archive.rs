@@ -8,19 +8,24 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use atomic_io::AtomicIo;
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-pub const MAX_WORKSPACE_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+// These limits are for request-time work in Backend, not bulk publisher jobs.
+pub const MAX_WORKSPACE_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_WORKSPACE_ARCHIVE_ENTRIES: usize = 4_096;
-pub const MAX_WORKSPACE_ARCHIVE_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_WORKSPACE_ARCHIVE_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_WORKSPACE_ARCHIVE_READ_BYTES: u64 = 1024 * 1024;
+pub const MAX_WORKSPACE_ARCHIVE_COMPRESSION_RATIO: u64 = 200;
+const MAX_ENTRY_PATH_BYTES: usize = 1024;
+const MAX_ENTRY_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceArchiveEntry {
@@ -74,6 +79,10 @@ pub enum WorkspaceArchiveError {
     ReplaceDirectory(String),
     #[error("workspace archive output exceeds {maximum} bytes")]
     OutputTooLarge { maximum: usize },
+    #[error("workspace archive entry {0:?} exceeds the compression-ratio limit")]
+    CompressionRatio(String),
+    #[error("workspace archive source changed while reading")]
+    ChangedSource,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -110,8 +119,13 @@ pub fn read_zip_entry(
                 maximum: MAX_WORKSPACE_ARCHIVE_READ_BYTES,
             });
         }
-        let mut data = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut data)?;
+        let size = file.size();
+        let data = read_entry_bounded(
+            &mut file,
+            size,
+            &normalized,
+            MAX_WORKSPACE_ARCHIVE_READ_BYTES,
+        )?;
         if data.len() as u64 != file.size() {
             return Err(WorkspaceArchiveError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -137,8 +151,6 @@ pub fn extract_zip(
         .iter()
         .map(|entry| normalize_entry_path(entry, false))
         .collect::<Result<BTreeSet<_>, _>>()?;
-    prepare_destination_directory(destination)?;
-
     let bytes = read_archive(path)?;
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
     let metadata = inspect_archive(&mut archive)?;
@@ -152,6 +164,8 @@ pub fn extract_zip(
             return Err(WorkspaceArchiveError::MissingEntry(entry.clone()));
         }
     }
+
+    prepare_destination_directory(destination)?;
 
     let mut written = 0_u64;
     let mut extracted = 0_usize;
@@ -170,13 +184,13 @@ pub fn extract_zip(
             create_directory_tree(parent)?;
         }
         ensure_missing_or_regular_file(&target)?;
-        let mut data = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut data)?;
-        written = written
-            .checked_add(data.len() as u64)
-            .ok_or(WorkspaceArchiveError::ExpandedTooLarge {
+        let size = file.size();
+        let data = read_entry_bounded(&mut file, size, &name, MAX_WORKSPACE_ARCHIVE_ENTRY_BYTES)?;
+        written = written.checked_add(data.len() as u64).ok_or(
+            WorkspaceArchiveError::ExpandedTooLarge {
                 maximum: MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES,
-            })?;
+            },
+        )?;
         if written > MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES {
             return Err(WorkspaceArchiveError::ExpandedTooLarge {
                 maximum: MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES,
@@ -195,9 +209,8 @@ pub fn create_zip(
     source: &Path,
     destination: &Path,
 ) -> Result<WorkspaceArchiveWrite, WorkspaceArchiveError> {
-    let source_metadata = fs::symlink_metadata(source).map_err(|_| {
-        WorkspaceArchiveError::InvalidSource(source.display().to_string())
-    })?;
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|_| WorkspaceArchiveError::InvalidSource(source.display().to_string()))?;
     ensure_no_symlink_components(source)?;
     if source_metadata.file_type().is_symlink()
         || (!source_metadata.is_file() && !source_metadata.is_dir())
@@ -231,9 +244,8 @@ pub fn replace_zip_entry(
     source: &Path,
 ) -> Result<WorkspaceArchiveWrite, WorkspaceArchiveError> {
     let wanted = normalize_entry_path(entry, false)?;
-    let source_metadata = fs::symlink_metadata(source).map_err(|_| {
-        WorkspaceArchiveError::InvalidSource(source.display().to_string())
-    })?;
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|_| WorkspaceArchiveError::InvalidSource(source.display().to_string()))?;
     ensure_no_symlink_components(source)?;
     if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
         return Err(WorkspaceArchiveError::InvalidSource(
@@ -280,7 +292,7 @@ fn read_archive(path: &Path) -> Result<Vec<u8>, WorkspaceArchiveError> {
             maximum: MAX_WORKSPACE_ARCHIVE_BYTES,
         });
     }
-    let bytes = AtomicIo::new().read(path)?;
+    let bytes = AtomicIo::new().read_bounded(path, MAX_WORKSPACE_ARCHIVE_BYTES)?;
     if bytes.len() > MAX_WORKSPACE_ARCHIVE_BYTES {
         return Err(WorkspaceArchiveError::ArchiveTooLarge {
             maximum: MAX_WORKSPACE_ARCHIVE_BYTES,
@@ -302,9 +314,19 @@ fn inspect_archive<R: Read + std::io::Seek>(
     let mut entries = Vec::with_capacity(archive.len());
     for index in 0..archive.len() {
         let file = archive.by_index(index)?;
+        if std::str::from_utf8(file.name_raw()).is_err() {
+            return Err(WorkspaceArchiveError::UnsafeEntry(
+                "entry name is not valid UTF-8".into(),
+            ));
+        }
         let name = normalize_entry_path(file.name(), file.is_dir())?;
-        reject_special_entry(&file, &name)?;
-        let collision = name.to_ascii_lowercase();
+        reject_special_entry(
+            file.encrypted(),
+            file.compression(),
+            file.unix_mode(),
+            &name,
+        )?;
+        let collision = collision_key(name.trim_end_matches('/'));
         if !seen.insert(collision) {
             return Err(WorkspaceArchiveError::DuplicateEntry(name));
         }
@@ -314,11 +336,19 @@ fn inspect_archive<R: Read + std::io::Seek>(
                 maximum: MAX_WORKSPACE_ARCHIVE_ENTRY_BYTES,
             });
         }
-        total = total.checked_add(file.size()).ok_or(
-            WorkspaceArchiveError::ExpandedTooLarge {
+        if file.size()
+            > file
+                .compressed_size()
+                .max(1)
+                .saturating_mul(MAX_WORKSPACE_ARCHIVE_COMPRESSION_RATIO)
+        {
+            return Err(WorkspaceArchiveError::CompressionRatio(name));
+        }
+        total = total
+            .checked_add(file.size())
+            .ok_or(WorkspaceArchiveError::ExpandedTooLarge {
                 maximum: MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES,
-            },
-        )?;
+            })?;
         if total > MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES {
             return Err(WorkspaceArchiveError::ExpandedTooLarge {
                 maximum: MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES,
@@ -331,14 +361,48 @@ fn inspect_archive<R: Read + std::io::Seek>(
             compressed_size: file.compressed_size(),
         });
     }
+    let files = entries
+        .iter()
+        .filter(|entry| !entry.directory)
+        .map(|entry| collision_key(&entry.path))
+        .collect::<BTreeSet<_>>();
+    for entry in &entries {
+        let mut prefix = String::new();
+        let parts = entry
+            .path
+            .trim_end_matches('/')
+            .split('/')
+            .collect::<Vec<_>>();
+        for part in parts.iter().take(parts.len().saturating_sub(1)) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(&collision_key(part));
+            if files.contains(&prefix) {
+                return Err(WorkspaceArchiveError::DuplicateEntry(entry.path.clone()));
+            }
+        }
+    }
     Ok(entries)
 }
 
-fn reject_special_entry<R: Read>(
-    file: &zip::read::ZipFile<'_, R>,
+fn reject_special_entry(
+    encrypted: bool,
+    compression: CompressionMethod,
+    unix_mode: Option<u32>,
     name: &str,
 ) -> Result<(), WorkspaceArchiveError> {
-    if let Some(mode) = file.unix_mode() {
+    if encrypted
+        || !matches!(
+            compression,
+            CompressionMethod::Stored | CompressionMethod::Deflated
+        )
+    {
+        return Err(WorkspaceArchiveError::InvalidArchive(
+            "encrypted or unsupported ZIP entry".into(),
+        ));
+    }
+    if let Some(mode) = unix_mode {
         let kind = mode & 0o170000;
         if kind != 0 && kind != 0o100000 && kind != 0o040000 {
             return Err(WorkspaceArchiveError::SpecialEntry(name.to_string()));
@@ -352,7 +416,14 @@ fn collect_source_entries(
     directory: &Path,
     output: &mut Vec<SourceEntry>,
 ) -> Result<(), WorkspaceArchiveError> {
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    let mut entries = fs::read_dir(directory)?
+        .take(MAX_WORKSPACE_ARCHIVE_ENTRIES + 1)
+        .collect::<Result<Vec<_>, _>>()?;
+    if entries.len() > MAX_WORKSPACE_ARCHIVE_ENTRIES {
+        return Err(WorkspaceArchiveError::TooManyEntries {
+            maximum: MAX_WORKSPACE_ARCHIVE_ENTRIES,
+        });
+    }
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         if output.len() >= MAX_WORKSPACE_ARCHIVE_ENTRIES {
@@ -411,39 +482,27 @@ fn write_new_zip(
         });
     }
     let mut total = 0_u64;
-    let cursor = Cursor::new(Vec::new());
-    let mut writer = ZipWriter::new(cursor);
+    let mut writer = ZipWriter::new(BoundedOutput::default());
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     for entry in entries {
         if entry.directory {
             writer.add_directory(&entry.path, options)?;
             continue;
         }
-        total = total.checked_add(entry.size).ok_or(
-            WorkspaceArchiveError::ExpandedTooLarge {
+        total = total
+            .checked_add(entry.size)
+            .ok_or(WorkspaceArchiveError::ExpandedTooLarge {
                 maximum: MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES,
-            },
-        )?;
+            })?;
         if total > MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES {
             return Err(WorkspaceArchiveError::ExpandedTooLarge {
                 maximum: MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES,
             });
         }
         writer.start_file(&entry.path, options)?;
+        ensure_no_symlink_components(&entry.source)?;
         let mut file = fs::File::open(&entry.source)?;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            writer.write_all(&buffer[..read])?;
-            if writer.get_ref().get_ref().len() > MAX_WORKSPACE_ARCHIVE_BYTES {
-                return Err(WorkspaceArchiveError::OutputTooLarge {
-                    maximum: MAX_WORKSPACE_ARCHIVE_BYTES,
-                });
-            }
-        }
+        copy_exact_bounded(&mut file, &mut writer, entry.size)?;
     }
     let bytes = writer.finish()?.into_inner();
     if bytes.len() > MAX_WORKSPACE_ARCHIVE_BYTES {
@@ -451,6 +510,7 @@ fn write_new_zip(
             maximum: MAX_WORKSPACE_ARCHIVE_BYTES,
         });
     }
+    inspect_archive(&mut ZipArchive::new(Cursor::new(&bytes))?)?;
     prepare_output_parent(destination)?;
     AtomicIo::new().write_atomic(destination, &bytes)?;
     Ok(WorkspaceArchiveWrite {
@@ -467,8 +527,8 @@ fn rewrite_zip(
     let bytes = read_archive(archive_path)?;
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
     let _ = inspect_archive(&mut archive)?;
-    let mut output = Cursor::new(Vec::new());
-    let mut writer = ZipWriter::new(&mut output);
+    let mut writer = ZipWriter::new(BoundedOutput::default());
+    let mut total = 0_u64;
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut found = false;
     let mut count = 0_usize;
@@ -488,7 +548,9 @@ fn rewrite_zip(
                 found = true;
                 writer.start_file(wanted, options)?;
                 let mut source_file = fs::File::open(source)?;
-                std::io::copy(&mut source_file, &mut writer)?;
+                let size = source_file.metadata()?.len();
+                add_expanded(&mut total, size)?;
+                copy_exact_bounded(&mut source_file, &mut writer, size)?;
                 count += 1;
                 continue;
             }
@@ -497,27 +559,27 @@ fn rewrite_zip(
             writer.add_directory(&name, options)?;
         } else {
             writer.start_file(&name, options)?;
-            std::io::copy(&mut file, &mut writer)?;
+            let size = file.size();
+            add_expanded(&mut total, size)?;
+            copy_exact_bounded(&mut file, &mut writer, size)?;
         }
         count += 1;
-        if output.get_ref().len() > MAX_WORKSPACE_ARCHIVE_BYTES {
-            return Err(WorkspaceArchiveError::OutputTooLarge {
-                maximum: MAX_WORKSPACE_ARCHIVE_BYTES,
-            });
-        }
     }
 
     if !found {
-        let wanted = replacement.map(|value| value.0).or(remove).unwrap_or_default();
+        let wanted = replacement
+            .map(|value| value.0)
+            .or(remove)
+            .unwrap_or_default();
         return Err(WorkspaceArchiveError::MissingEntry(wanted.to_string()));
     }
-    writer.finish()?;
-    let bytes = output.into_inner();
+    let bytes = writer.finish()?.into_inner();
     if bytes.len() > MAX_WORKSPACE_ARCHIVE_BYTES {
         return Err(WorkspaceArchiveError::OutputTooLarge {
             maximum: MAX_WORKSPACE_ARCHIVE_BYTES,
         });
     }
+    inspect_archive(&mut ZipArchive::new(Cursor::new(&bytes))?)?;
     AtomicIo::new().write_atomic(archive_path, &bytes)?;
     Ok(WorkspaceArchiveWrite {
         archive_bytes: bytes.len() as u64,
@@ -529,12 +591,14 @@ fn normalize_entry_path(value: &str, directory: bool) -> Result<String, Workspac
     let normalized = value.replace('\\', "/");
     let trimmed = normalized.trim_end_matches('/');
     if trimmed.is_empty()
+        || trimmed.len() > MAX_ENTRY_PATH_BYTES
+        || trimmed.split('/').count() > MAX_ENTRY_DEPTH
         || trimmed.starts_with('/')
         || trimmed.contains('\0')
         || trimmed.contains(':')
-        || trimmed
-            .split('/')
-            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        || trimmed.split('/').any(|segment| {
+            segment.is_empty() || matches!(segment, "." | "..") || unsafe_windows_component(segment)
+        })
     {
         return Err(WorkspaceArchiveError::UnsafeEntry(value.to_string()));
     }
@@ -545,11 +609,131 @@ fn normalize_entry_path(value: &str, directory: bool) -> Result<String, Workspac
     }
 }
 
+/// Compare canonical spellings and case without rewriting the visible entry
+/// name. This rejects aliases on case/normalization-insensitive filesystems.
+fn collision_key(path: &str) -> String {
+    path.nfc()
+        .flat_map(char::to_uppercase)
+        .collect::<String>()
+        .nfc()
+        .collect()
+}
+
+fn unsafe_windows_component(segment: &str) -> bool {
+    if segment.ends_with(['.', ' ']) {
+        return true;
+    }
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let device_suffix = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"));
+    let short_alias = stem.rsplit_once('~').is_some_and(|(prefix, digits)| {
+        !prefix.is_empty()
+            && stem.len() <= 8
+            && !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+    });
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || device_suffix.is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+        || short_alias
+}
+
+/// Limit actual decoded bytes rather than trusting central-directory claims.
+/// Accept Read so this helper works with both supported ZIP 2.x file types.
+fn read_entry_bounded(
+    file: &mut impl Read,
+    size: u64,
+    name: &str,
+    limit: u64,
+) -> Result<Vec<u8>, WorkspaceArchiveError> {
+    if size > limit {
+        return Err(WorkspaceArchiveError::ReadTooLarge {
+            path: name.into(),
+            maximum: limit,
+        });
+    }
+    let mut bytes = Vec::new();
+    file.take(size + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != size {
+        return Err(WorkspaceArchiveError::ChangedSource);
+    }
+    Ok(bytes)
+}
+fn copy_exact_bounded(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    size: u64,
+) -> Result<(), WorkspaceArchiveError> {
+    if size > MAX_WORKSPACE_ARCHIVE_ENTRY_BYTES {
+        return Err(WorkspaceArchiveError::ExpandedTooLarge {
+            maximum: MAX_WORKSPACE_ARCHIVE_ENTRY_BYTES,
+        });
+    }
+    let copied = io::copy(&mut reader.take(size + 1), writer)?;
+    if copied != size {
+        return Err(WorkspaceArchiveError::ChangedSource);
+    }
+    Ok(())
+}
+fn add_expanded(total: &mut u64, size: u64) -> Result<(), WorkspaceArchiveError> {
+    *total = total
+        .checked_add(size)
+        .filter(|v| *v <= MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES)
+        .ok_or(WorkspaceArchiveError::ExpandedTooLarge {
+            maximum: MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES,
+        })?;
+    Ok(())
+}
+
+/// Enforce the compressed-output limit during every encoder write/seek, not
+/// after Vec has already grown. AtomicIo only receives a completed safe ZIP.
+#[derive(Default)]
+struct BoundedOutput(Cursor<Vec<u8>>);
+impl BoundedOutput {
+    fn into_inner(self) -> Vec<u8> {
+        self.0.into_inner()
+    }
+}
+impl Write for BoundedOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.0.position().saturating_add(bytes.len() as u64) > MAX_WORKSPACE_ARCHIVE_BYTES as u64
+        {
+            return Err(io::Error::other("ZIP output exceeds its byte limit"));
+        }
+        self.0.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+impl Seek for BoundedOutput {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let previous = self.0.position();
+        let next = self.0.seek(position)?;
+        if next > MAX_WORKSPACE_ARCHIVE_BYTES as u64 {
+            self.0.set_position(previous);
+            return Err(io::Error::other("ZIP output seek exceeds its byte limit"));
+        }
+        Ok(next)
+    }
+}
+
 fn relative_path_string(path: &Path) -> Result<String, WorkspaceArchiveError> {
     let mut parts = Vec::new();
     for component in path.components() {
         let Component::Normal(value) = component else {
-            return Err(WorkspaceArchiveError::UnsafeEntry(path.display().to_string()));
+            return Err(WorkspaceArchiveError::UnsafeEntry(
+                path.display().to_string(),
+            ));
         };
         let value = value
             .to_str()
@@ -576,7 +760,9 @@ fn prepare_destination_directory(path: &Path) -> Result<(), WorkspaceArchiveErro
     create_directory_tree(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(WorkspaceArchiveError::InvalidSource(path.display().to_string()));
+        return Err(WorkspaceArchiveError::InvalidSource(
+            path.display().to_string(),
+        ));
     }
     Ok(())
 }
@@ -611,6 +797,11 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), WorkspaceArchiveError
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // A Windows volume prefix is not an inspectable root until the
+        // following RootDir component has supplied its trailing separator.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&current)?;
         if metadata.file_type().is_symlink() {
             return Err(WorkspaceArchiveError::SymlinkedPath(
@@ -621,12 +812,13 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), WorkspaceArchiveError
     Ok(())
 }
 
-fn ensure_no_symlink_components_allow_missing(
-    path: &Path,
-) -> Result<(), WorkspaceArchiveError> {
+fn ensure_no_symlink_components_allow_missing(path: &Path) -> Result<(), WorkspaceArchiveError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(WorkspaceArchiveError::SymlinkedPath(
@@ -676,17 +868,181 @@ mod tests {
 
         let extracted = temp.path().join("extracted");
         extract_zip(&archive, &["nested/world.txt".into()], &extracted).unwrap();
-        assert_eq!(fs::read(extracted.join("nested/world.txt")).unwrap(), b"world");
+        assert_eq!(
+            fs::read(extracted.join("nested/world.txt")).unwrap(),
+            b"world"
+        );
 
         let replacement = temp.path().join("replacement.txt");
         fs::write(&replacement, b"updated").unwrap();
         replace_zip_entry(&archive, "hello.txt", &replacement).unwrap();
-        assert_eq!(read_zip_entry(&archive, "hello.txt").unwrap().bytes, b"updated");
+        assert_eq!(
+            read_zip_entry(&archive, "hello.txt").unwrap().bytes,
+            b"updated"
+        );
 
         remove_zip_entry(&archive, "nested/world.txt").unwrap();
         assert!(matches!(
             read_zip_entry(&archive, "nested/world.txt"),
             Err(WorkspaceArchiveError::MissingEntry(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+
+    fn raw_zip(path: &Path, names: &[&str], data: &[u8], method: CompressionMethod) {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for name in names {
+            writer
+                .start_file(
+                    *name,
+                    SimpleFileOptions::default().compression_method(method),
+                )
+                .unwrap();
+            writer.write_all(data).unwrap();
+        }
+        fs::write(path, writer.finish().unwrap().into_inner()).unwrap();
+    }
+    #[test]
+    fn unsafe_names_and_file_directory_aliases_fail_before_extraction() {
+        let temp = crate::tempdir().unwrap();
+        let archive = temp.path().join("unsafe.zip");
+        let destination = temp.path().join("output");
+        for names in [
+            vec!["../outside"],
+            vec!["C:/outside"],
+            vec!["/outside"],
+            vec![".. /outside"],
+            vec!["CON.txt"],
+            vec!["COM¹.txt"],
+            vec!["LONGFI~1.TXT"],
+            vec!["file", "FILE"],
+            vec!["é.txt", "e\u{301}.txt"],
+            vec!["σ.txt", "ς.txt"],
+            vec!["file", "file/nested"],
+            vec!["file/nested", "file"],
+            vec!["directory/", "DIRECTORY"],
+        ] {
+            raw_zip(&archive, &names, b"data", CompressionMethod::Stored);
+            assert!(list_zip(&archive).is_err(), "accepted {names:?}");
+            assert!(extract_zip(&archive, &[], &destination).is_err());
+            assert!(!destination.exists());
+        }
+    }
+    #[test]
+    fn high_ratio_and_too_many_entries_are_rejected() {
+        let temp = crate::tempdir().unwrap();
+        let archive = temp.path().join("bomb.zip");
+        raw_zip(
+            &archive,
+            &["zeros"],
+            &vec![0; 256 * 1024],
+            CompressionMethod::Deflated,
+        );
+        assert!(matches!(
+            list_zip(&archive),
+            Err(WorkspaceArchiveError::CompressionRatio(_))
+        ));
+        let names = (0..=MAX_WORKSPACE_ARCHIVE_ENTRIES)
+            .map(|n| format!("{n}.txt"))
+            .collect::<Vec<_>>();
+        raw_zip(
+            &archive,
+            &names.iter().map(String::as_str).collect::<Vec<_>>(),
+            b"",
+            CompressionMethod::Stored,
+        );
+        assert!(matches!(
+            list_zip(&archive),
+            Err(WorkspaceArchiveError::TooManyEntries { .. })
+        ));
+    }
+    #[test]
+    fn malformed_sizes_and_crc_do_not_return_unverified_data() {
+        let temp = crate::tempdir().unwrap();
+        let archive = temp.path().join("corrupt.zip");
+        raw_zip(
+            &archive,
+            &["entry"],
+            b"test payload",
+            CompressionMethod::Stored,
+        );
+        let mut bytes = fs::read(&archive).unwrap();
+        let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&1_u32.to_le_bytes());
+        fs::write(&archive, bytes).unwrap();
+        assert!(read_zip_entry(&archive, "entry").is_err());
+        raw_zip(
+            &archive,
+            &["entry"],
+            b"test payload",
+            CompressionMethod::Stored,
+        );
+        let mut bytes = fs::read(&archive).unwrap();
+        let payload = bytes
+            .windows(12)
+            .position(|w| w == b"test payload")
+            .unwrap();
+        bytes[payload] ^= 1;
+        fs::write(&archive, bytes).unwrap();
+        assert!(read_zip_entry(&archive, "entry").is_err());
+    }
+    #[test]
+    fn read_limits_and_rejected_rewrites_preserve_the_previous_archive() {
+        let temp = crate::tempdir().unwrap();
+        let archive = temp.path().join("bundle.zip");
+        raw_zip(
+            &archive,
+            &["big"],
+            &vec![42; MAX_WORKSPACE_ARCHIVE_READ_BYTES as usize + 1],
+            CompressionMethod::Stored,
+        );
+        assert!(matches!(
+            read_zip_entry(&archive, "big"),
+            Err(WorkspaceArchiveError::ReadTooLarge { .. })
+        ));
+        let previous = fs::read(&archive).unwrap();
+        let oversized = temp.path().join("replacement");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_WORKSPACE_ARCHIVE_ENTRY_BYTES + 1)
+            .unwrap();
+        assert!(replace_zip_entry(&archive, "big", &oversized).is_err());
+        assert_eq!(fs::read(&archive).unwrap(), previous);
+        assert!(remove_zip_entry(&archive, "absent").is_err());
+        assert_eq!(fs::read(&archive).unwrap(), previous);
+        assert!(copy_exact_bounded(&mut Cursor::new(b"longer"), &mut Vec::new(), 2).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn archive_links_and_filesystem_links_cannot_escape_the_destination() {
+        use std::os::unix::fs::symlink;
+        let temp = crate::tempdir().unwrap();
+        let archive = temp.path().join("bundle.zip");
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .add_symlink("link", "../outside", SimpleFileOptions::default())
+            .unwrap();
+        fs::write(&archive, writer.finish().unwrap().into_inner()).unwrap();
+        assert!(matches!(
+            list_zip(&archive),
+            Err(WorkspaceArchiveError::SpecialEntry(_))
+        ));
+        raw_zip(
+            &archive,
+            &["nested/entry"],
+            b"data",
+            CompressionMethod::Stored,
+        );
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let destination = temp.path().join("output");
+        fs::create_dir(&destination).unwrap();
+        symlink(&outside, destination.join("nested")).unwrap();
+        assert!(extract_zip(&archive, &[], &destination).is_err());
+        assert!(!outside.join("entry").exists());
     }
 }

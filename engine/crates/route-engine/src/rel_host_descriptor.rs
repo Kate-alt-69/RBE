@@ -42,13 +42,17 @@ pub(crate) fn deferred_call(
 }
 
 pub(crate) fn temp_request(args: &[Value]) -> Result<RelHostRequest, ModuleEvalError> {
+    run_request(args).map(|request| RelHostRequest::Temp(Box::new(request)))
+}
+/// Materialize a deferred operation against ProjectRoot without allocating a
+/// temporary workspace. Keeping arguments deferred preserves nested temp calls.
+pub(crate) fn run_request(args: &[Value]) -> Result<RelHostRequest, ModuleEvalError> {
     if args.len() != 1 {
         return Err(error(
-            "workspace.temp() expects exactly one deferred host operation",
+            "workspace.run/temp expects exactly one deferred host operation",
         ));
     }
-    let inner = request_from_descriptor(&args[0])?;
-    Ok(RelHostRequest::Temp(Box::new(inner)))
+    request_from_descriptor(&args[0])
 }
 
 fn script_descriptor(function: &str, args: Vec<Value>) -> Result<Value, ModuleEvalError> {

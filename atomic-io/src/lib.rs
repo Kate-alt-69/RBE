@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -214,6 +214,30 @@ impl AtomicIo {
         Ok(bytes)
     }
 
+    /// Read untrusted host input under the normal I/O gate with a byte limit,
+    /// including a one-byte overflow probe if the file grows after stat. Account
+    /// consumed bytes even when the limit or a later I/O error rejects the read.
+    pub fn read_bounded(&self, path: &Path, maximum: usize) -> io::Result<Vec<u8>> {
+        let path_lock = self.lock_for(path);
+        let _guard = lock_recover(&path_lock);
+        let mut bytes = Vec::new();
+        let limit = u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1);
+        let result = fs::File::open(path)?.take(limit).read_to_end(&mut bytes);
+        self.inner
+            .counters
+            .bytes_read
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.inner.counters.read_ops.fetch_add(1, Ordering::Relaxed);
+        result?;
+        if bytes.len() > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file exceeds bounded read limit",
+            ));
+        }
+        Ok(bytes)
+    }
+
     /// Opportunistic cleanup of the lock registry so a long-running
     /// process touching many distinct paths doesn't grow it
     /// unbounded. Call periodically from a supervised task — same
@@ -350,6 +374,24 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn bounded_reads_enforce_the_limit_and_account_for_rejected_bytes() {
+        let dir = temp_dir("bounded-read");
+        let path = dir.join("input.bin");
+        let io = AtomicIo::new();
+        io.write_atomic(&path, b"0123456789").unwrap();
+        assert_eq!(
+            io.read_bounded(&path, 3).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(io.stats().bytes_read, 4);
+        assert_eq!(io.stats().read_ops, 1);
+        assert_eq!(io.read_bounded(&path, 10).unwrap(), b"0123456789");
+        assert_eq!(io.stats().bytes_read, 14);
+        assert_eq!(io.stats().read_ops, 2);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
