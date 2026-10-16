@@ -599,6 +599,11 @@ fn is_json_content_type(value: Option<&str>) -> bool {
 }
 
 fn headers_value(headers: &HeaderMap) -> Result<Value, String> {
+    // A credential identifies one principal; joining repeated field-lines would
+    // invent a credential and disagree with intermediaries that choose one value.
+    for name in [header::AUTHORIZATION, header::PROXY_AUTHORIZATION] {
+        singleton_header_string(headers, name)?;
+    }
     let mut out = HashMap::new();
     for name in headers.keys() {
         let mut values = Vec::new();
@@ -631,6 +636,86 @@ mod header_snapshot_tests {
             values.get("x-rbe-test"),
             Some(Value::String(value)) if value == "one, two"
         ));
+    }
+
+    #[test]
+    fn credential_headers_reject_repeated_field_lines_without_exposing_values() {
+        for name in [header::AUTHORIZATION, header::PROXY_AUTHORIZATION] {
+            for second in ["Bearer private-one", "Bearer private-two"] {
+                let mut headers = HeaderMap::new();
+                headers.append(name.clone(), HeaderValue::from_static("Bearer private-one"));
+                headers.append(name.clone(), HeaderValue::from_static(second));
+
+                let error = headers_value(&headers).unwrap_err();
+                assert!(error.contains(name.as_str()), "{error}");
+                assert!(error.contains("may appear only once"), "{error}");
+                assert!(!error.contains("private-one"), "{error}");
+                assert!(!error.contains("private-two"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn credential_headers_reject_repeated_names_with_different_casing() {
+        for (lower, mixed) in [
+            (header::AUTHORIZATION, "Authorization"),
+            (header::PROXY_AUTHORIZATION, "Proxy-Authorization"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.append(lower.clone(), HeaderValue::from_static("Basic first"));
+            headers.append(
+                HeaderName::from_bytes(mixed.as_bytes()).unwrap(),
+                HeaderValue::from_static("Basic second"),
+            );
+            assert!(headers_value(&headers)
+                .unwrap_err()
+                .contains(lower.as_str()));
+        }
+    }
+
+    #[test]
+    fn credential_headers_preserve_single_values_including_embedded_commas() {
+        // Commas inside one field-line are valid in schemes such as Digest;
+        // singleton validation counts field-lines without parsing credentials.
+        for raw in [
+            "Bearer private-one",
+            "Digest username=example, realm=example",
+        ] {
+            let mut headers = HeaderMap::new();
+            for name in [header::AUTHORIZATION, header::PROXY_AUTHORIZATION] {
+                headers.insert(name, HeaderValue::from_static(raw));
+            }
+            let Value::Object(values) = headers_value(&headers).unwrap() else {
+                panic!("expected header object");
+            };
+            for name in ["authorization", "proxy-authorization"] {
+                assert!(matches!(values.get(name), Some(Value::String(value)) if value == raw));
+            }
+        }
+    }
+
+    #[test]
+    fn credential_headers_reject_non_text_values_without_exposing_values() {
+        for name in [header::AUTHORIZATION, header::PROXY_AUTHORIZATION] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                name.clone(),
+                HeaderValue::from_bytes(b"private-\x80").unwrap(),
+            );
+            let error = headers_value(&headers).unwrap_err();
+            assert!(error.contains(name.as_str()), "{error}");
+            assert!(error.contains("non-text bytes"), "{error}");
+            assert!(!error.contains("private-"), "{error}");
+        }
+    }
+
+    #[test]
+    fn missing_credential_headers_remain_absent() {
+        let Value::Object(values) = headers_value(&HeaderMap::new()).unwrap() else {
+            panic!("expected header object");
+        };
+        assert!(!values.contains_key("authorization"));
+        assert!(!values.contains_key("proxy-authorization"));
     }
 
     #[test]
