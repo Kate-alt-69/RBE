@@ -253,7 +253,7 @@ function Get-TargetsForDistro {
     if ($d -match '^(.*?)[-_](x64|x86|arm64|armv7)$') { $d = $Matches[1]; $arch = $Matches[2] }
 
     switch ($d) {
-        'all-linux' | 'common' {
+		{ $_ -in @('all-linux', 'common') } {
             return @(
                 'x86_64-unknown-linux-gnu','x86_64-unknown-linux-musl',
                 'i686-unknown-linux-gnu','i686-unknown-linux-musl',
@@ -261,23 +261,23 @@ function Get-TargetsForDistro {
                 'armv7-unknown-linux-gnueabihf','armv7-unknown-linux-musleabihf'
             )
         }
-        'ubuntu' | 'debian' | 'linuxmint' | 'kali' | 'pop' | 'elementary' | 'zorin' | 'deepin' {
+		{ $_ -in @('ubuntu', 'debian', 'linuxmint', 'kali', 'pop', 'elementary', 'zorin', 'deepin') } {
             if ($arch) { switch ($arch) { 'x64' { return @('x86_64-unknown-linux-gnu') } 'x86' { return @('i686-unknown-linux-gnu') } 'arm64' { return @('aarch64-unknown-linux-gnu') } 'armv7' { return @('armv7-unknown-linux-gnueabihf') } } }
             return @('x86_64-unknown-linux-gnu','i686-unknown-linux-gnu','aarch64-unknown-linux-gnu','armv7-unknown-linux-gnueabihf')
         }
-        'fedora' | 'centos' | 'rhel' | 'amazonlinux' | 'oraclelinux' | 'almalinux' | 'rocky' | 'rocky-linux' {
+		{ $_ -in @('fedora', 'centos', 'rhel', 'amazonlinux', 'oraclelinux', 'almalinux', 'rocky', 'rocky-linux') } {
             if ($arch) { switch ($arch) { 'x64' { return @('x86_64-unknown-linux-gnu') } 'x86' { return @('i686-unknown-linux-gnu') } 'arm64' { return @('aarch64-unknown-linux-gnu') } 'armv7' { return @('armv7-unknown-linux-gnueabihf') } } }
             return @('x86_64-unknown-linux-gnu','aarch64-unknown-linux-gnu')
         }
-        'arch' | 'manjaro' | 'artix' { if ($arch -eq 'x86') { return @('i686-unknown-linux-gnu') } if ($arch -eq 'arm64') { return @('aarch64-unknown-linux-gnu') } return @('x86_64-unknown-linux-gnu') }
-        'opensuse' | 'suse' | 'tumbleweed' | 'sles' { return @('x86_64-unknown-linux-gnu','aarch64-unknown-linux-gnu') }
-        'alpine' | 'musl' | 'void-musl' { if ($arch) { switch ($arch) { 'x64' { return @('x86_64-unknown-linux-musl') } 'x86' { return @('i686-unknown-linux-musl') } 'arm64' { return @('aarch64-unknown-linux-musl') } 'armv7' { return @('armv7-unknown-linux-musleabihf') } } } return @('x86_64-unknown-linux-musl','aarch64-unknown-linux-musl','i686-unknown-linux-musl','armv7-unknown-linux-musleabihf') }
-        'gentoo' | 'slackware' | 'void' | 'nixos' | 'guix' { return @('x86_64-unknown-linux-gnu','aarch64-unknown-linux-gnu') }
-        'raspbian' | 'raspios' | 'pi' | 'raspberry' { if ($arch -eq 'arm64') { return @('aarch64-unknown-linux-gnu') } return @('armv7-unknown-linux-gnueabihf') }
-        'clear' | 'clearlinux' { return @('x86_64-unknown-linux-gnu') }
-        'wsl' | 'windows-subsystem-for-linux' | 'chromeos' { if ($arch -eq 'arm64') { return @('aarch64-unknown-linux-gnu') } if ($arch -eq 'x86') { return @('i686-unknown-linux-gnu') } return @('x86_64-unknown-linux-gnu') }
+		{ $_ -in @('arch', 'manjaro', 'artix') } { if ($arch -eq 'x86') { return @('i686-unknown-linux-gnu') } if ($arch -eq 'arm64') { return @('aarch64-unknown-linux-gnu') } return @('x86_64-unknown-linux-gnu') }
+		{ $_ -in @('opensuse', 'suse', 'tumbleweed', 'sles') } { return @('x86_64-unknown-linux-gnu','aarch64-unknown-linux-gnu') }
+		{ $_ -in @('alpine', 'musl', 'void-musl') } { if ($arch) { switch ($arch) { 'x64' { return @('x86_64-unknown-linux-musl') } 'x86' { return @('i686-unknown-linux-musl') } 'arm64' { return @('aarch64-unknown-linux-musl') } 'armv7' { return @('armv7-unknown-linux-musleabihf') } } } return @('x86_64-unknown-linux-musl','aarch64-unknown-linux-musl','i686-unknown-linux-musl','armv7-unknown-linux-musleabihf') }
+		{ $_ -in @('gentoo', 'slackware', 'void', 'nixos', 'guix') } { return @('x86_64-unknown-linux-gnu','aarch64-unknown-linux-gnu') }
+		{ $_ -in @('raspbian', 'raspios', 'pi', 'raspberry') } { if ($arch -eq 'arm64') { return @('aarch64-unknown-linux-gnu') } return @('armv7-unknown-linux-gnueabihf') }
+		{ $_ -in @('clear', 'clearlinux') } { return @('x86_64-unknown-linux-gnu') }
+		{ $_ -in @('wsl', 'windows-subsystem-for-linux', 'chromeos') } { if ($arch -eq 'arm64') { return @('aarch64-unknown-linux-gnu') } if ($arch -eq 'x86') { return @('i686-unknown-linux-gnu') } return @('x86_64-unknown-linux-gnu') }
         'openwrt' { Write-Warning "OpenWRT builds are specialized; prefer --target=... or use a dedicated toolchain"; return @() }
-        'android' | 'termux' {
+		{ $_ -in @('android', 'termux') } {
             Write-Warning "Android/Termux targets require the Android NDK; returning Android triples but builds may fail without proper toolchain"
             if ($arch -eq 'arm64') { return @('aarch64-linux-android') }
             if ($arch -eq 'x86') { return @('i686-linux-android') }
