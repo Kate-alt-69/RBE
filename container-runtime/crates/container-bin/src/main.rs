@@ -7,6 +7,7 @@
 
 mod dashboard;
 mod environment_process;
+mod library_worker_mode;
 
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -19,8 +20,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use container_runtime_core::{
-    artifact_sha256_matches, CapabilityBroker, EnvironmentId, EnvironmentProfile,
-    EnvironmentRegistry, ExecutionProvenance, Runtime, RuntimeConfig, WorkCost,
+    artifact_sha256_matches, CapabilityBroker, CompiledTaskGraph, ContainerTaskLoadError,
+    ContainerTaskLoader, EnvironmentId, EnvironmentProfile, EnvironmentRegistry,
+    ExecutionProvenance, LoadedTaskImage, Runtime, RuntimeConfig, RuntimeImageTaskRegistry,
+    TaskExecution, TaskExecutionProfileStore, TaskExecutionSample, TaskProfileKey, WorkCost,
 };
 use execution_engine::{CapabilityHost, ExecutionLimits, WasmExecutor};
 use ipc_protocol::{
@@ -42,6 +45,51 @@ const EVENT_LOG_KEEP_BYTES: u64 = 8 * 1024 * 1024;
 const MONITOR_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MONITOR_LOG_KEEP_BYTES: u64 = 4 * 1024 * 1024;
 static EVENT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CTI_ACTIVE_TASKS: OnceLock<
+    Mutex<std::collections::HashMap<String, (Arc<LoadedTaskImage>, WorkCost, usize)>>,
+> = OnceLock::new();
+static CTI_PROFILES: OnceLock<TaskExecutionProfileStore> = OnceLock::new();
+
+fn active_task_pins(
+) -> &'static Mutex<std::collections::HashMap<String, (Arc<LoadedTaskImage>, WorkCost, usize)>> {
+    CTI_ACTIVE_TASKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn task_profiles() -> &'static TaskExecutionProfileStore {
+    CTI_PROFILES.get_or_init(TaskExecutionProfileStore::default)
+}
+
+/// Drop immutable Task pins only after the actual Environment worker finishes.
+/// This is also the live Phase-6 profile recording point.
+fn reap_completed_cti_executions(runtime: &Runtime) {
+    let ids: Vec<String> = active_task_pins()
+        .lock()
+        .expect("CTI execution pin table poisoned")
+        .keys()
+        .cloned()
+        .collect();
+    for id in ids {
+        let Some(outcome) = runtime.wait_for_result(&id, Duration::from_millis(1)) else {
+            continue;
+        };
+        let removed = active_task_pins()
+            .lock()
+            .expect("CTI execution pin table poisoned")
+            .remove(&id);
+        if let Some((task, cost, arena_bytes)) = removed {
+            task_profiles().record(
+                TaskProfileKey::new(task.runtime_image_sha256(), task.task_oid()),
+                TaskExecutionSample {
+                    elapsed_ms: outcome.elapsed_ms,
+                    succeeded: !outcome.cancelled && outcome.error.is_none(),
+                    resource_high_water: WorkCost::default(),
+                    arena_high_water_bytes: arena_bytes as u64,
+                    declared_cost: cost,
+                },
+            );
+        }
+    }
+}
 
 pub(crate) fn event_log_path() -> PathBuf {
     runtime_paths::binary_dir()
@@ -57,8 +105,19 @@ pub(crate) fn monitor_log_path() -> PathBuf {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
     let args = env::args().skip(1).collect::<Vec<_>>();
+
+    // Library Host execution is a Container mode, not a second packaged binary.
+    // Dispatch before normal Container initialization so stdout remains reserved
+    // for the strict Library Worker protocol frames.
+    if args.iter().any(|arg| arg == "--library-worker-proxy")
+        || args.iter().any(|arg| arg == "--library-worker-exec-child")
+        || args.iter().any(|arg| arg == "--library-worker-live-child")
+    {
+        return library_worker_mode::run(&args);
+    }
+
+    tracing_subscriber::fmt::init();
 
     if args.iter().any(|arg| arg == "--environment-child") {
         return environment_process::run_environment_child();
@@ -151,6 +210,25 @@ fn main() -> anyhow::Result<()> {
             ));
         }
     };
+    let task_loader = Arc::new(ContainerTaskLoader::new(project_root.join(".cache")));
+    let task_registry = Arc::new(RuntimeImageTaskRegistry::new());
+    // Reclaim compiler cache entries only when no execution still owns the
+    // retired immutable Task. Errors leave the cache recoverable.
+    let cti_gc_loader = Arc::clone(&task_loader);
+    let cti_gc_registry = Arc::clone(&task_registry);
+    let _cti_gc_thread = thread::Builder::new()
+        .name("container-cti-gc".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_secs(60));
+            match cti_gc_registry.garbage_collect_retired(&cti_gc_loader) {
+                Ok((images, blobs)) if images != 0 || blobs != 0 => {
+                    tracing::info!(images, blobs, "retired Container Task cache reclaimed");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "retired CTI GC deferred"),
+            }
+        })?;
+
     let environment_processes = environment_process::EnvironmentProcessSupervisor::start(
         general_environments,
         debug,
@@ -169,6 +247,13 @@ fn main() -> anyhow::Result<()> {
         environment_processes.runner(),
         environment_processes.canceller(),
     );
+    let cti_reaper_runtime = Arc::clone(&runtime);
+    let _cti_reaper = thread::Builder::new()
+        .name("container-cti-execution-reaper".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_secs(2));
+            reap_completed_cti_executions(&cti_reaper_runtime);
+        })?;
     let accepting = Arc::new(AtomicBool::new(true));
 
     emit_event(
@@ -216,6 +301,8 @@ fn main() -> anyhow::Result<()> {
             runtime.clone(),
             accepting,
             capability_broker,
+            task_loader,
+            task_registry,
             environment_processes,
         )?;
     } else if !debug {
@@ -544,12 +631,15 @@ fn bounded_worker_error(message: &str) -> String {
     format!("{}…", &message[..end])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_control_server(
     address: &str,
     token: String,
     runtime: Arc<Runtime>,
     accepting: Arc<AtomicBool>,
     capability_broker: Arc<CapabilityBroker>,
+    task_loader: Arc<ContainerTaskLoader>,
+    task_registry: Arc<RuntimeImageTaskRegistry>,
     environment_processes: Arc<environment_process::EnvironmentProcessSupervisor>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address)?;
@@ -565,6 +655,8 @@ fn run_control_server(
                 let runtime = Arc::clone(&runtime);
                 let accepting = Arc::clone(&accepting);
                 let capability_broker = Arc::clone(&capability_broker);
+                let task_loader = Arc::clone(&task_loader);
+                let task_registry = Arc::clone(&task_registry);
                 let environment_processes = Arc::clone(&environment_processes);
                 thread::spawn(move || {
                     if let Err(err) = handle_connection(
@@ -573,6 +665,8 @@ fn run_control_server(
                         &runtime,
                         &accepting,
                         &capability_broker,
+                        &task_loader,
+                        &task_registry,
                         &environment_processes,
                     ) {
                         tracing::warn!(%err, "container control connection closed with error");
@@ -585,12 +679,157 @@ fn run_control_server(
     Ok(())
 }
 
+fn resolve_container_task(
+    task_loader: &ContainerTaskLoader,
+    task_registry: &RuntimeImageTaskRegistry,
+    runtime_image: &str,
+    task_oid: u16,
+) -> Result<Option<Arc<LoadedTaskImage>>, ContainerTaskLoadError> {
+    // A lazy cache miss must not reinstall a stale table after an explicit
+    // RuntimeImage refresh. The registry serializes this against activation.
+    task_registry.lookup_or_install(task_loader, runtime_image, task_oid)
+}
+
+/// Admit the conservative compiler-emitted single-WASM Task through the
+/// existing isolated Environment/Swamp worker lifecycle. No CTI-declared
+/// capability becomes trusted merely because it appeared in a .bin.
+fn submit_compiled_task(
+    task: Arc<LoadedTaskImage>,
+    request: &ipc_protocol::ExecuteTaskRequest,
+    runtime: &Runtime,
+    broker: &CapabilityBroker,
+) -> Result<String, (&'static str, String)> {
+    let fail = |message: String| ("TASK_EXECUTION_INVALID", message);
+    let compiled = TaskExecution::new(Arc::clone(&task), &request.input, Duration::from_secs(60))
+        .map_err(fail)?;
+    if !compiled.is_single_wasm_graph() {
+        return Err((
+            "TASK_NODE_UNSUPPORTED",
+            "CTI contains a graph requiring execution adapters not yet available".into(),
+        ));
+    }
+    if !CompiledTaskGraph::has_no_capability_nodes(&task).map_err(fail)? {
+        return Err((
+            "TASK_CAPABILITY_UNSUPPORTED",
+            "CTI requires privileged capability nodes; Controller will not bypass authority".into(),
+        ));
+    }
+    let wasm = CompiledTaskGraph::embedded_wasm(&task)
+        .map_err(fail)?
+        .ok_or((
+            "TASK_CODE_UNAVAILABLE",
+            "CTI does not embed executable WASM".into(),
+        ))?;
+    let artifact_hash = hex::encode(ipc_protocol::cti_sha256(&wasm));
+    let source_id = CompiledTaskGraph::root_source_id(&task).map_err(fail)?;
+    let environment = match request.environment.as_str() {
+        "general" => runtime.select_environment_profile(EnvironmentProfile::General),
+        "secure" => runtime.select_environment_profile(EnvironmentProfile::Secure),
+        exact => parse_environment(exact).filter(|id| runtime.has_environment(*id)),
+    }
+    .ok_or((
+        "INVALID_ENVIRONMENT",
+        "CTI Environment is unavailable".into(),
+    ))?;
+    let exact_environment = environment.to_string();
+    let generation = runtime.environment_generation(environment);
+
+    // Materialization is hash-checked, then bound only to the exact root
+    // compiled identity. The empty manifest provides no host authority.
+    runtime
+        .register_artifact(&artifact_hash, wasm)
+        .map_err(|e| ("TASK_CODE_INVALID", e))?;
+    broker
+        .register_artifact_binding(
+            &request.runtime_image,
+            &source_id,
+            CAPABILITY_ABI_VERSION,
+            &artifact_hash,
+        )
+        .map_err(|e| (e.code, e.message))?;
+    broker
+        .register_manifest(
+            &ipc_protocol::RegisterCapabilityManifestRequest {
+                request_id: request.request_id.clone(),
+                auth_token: request.auth_token.clone(),
+                runtime_image: request.runtime_image.clone(),
+                source_id: source_id.clone(),
+                capability_abi: CAPABILITY_ABI_VERSION,
+                environment: exact_environment.clone(),
+                grants: Vec::new(),
+            },
+            generation,
+        )
+        .map_err(|e| (e.code, e.message))?;
+    broker
+        .authorize_execution(
+            &request.runtime_image,
+            &source_id,
+            &exact_environment,
+            generation,
+            CAPABILITY_ABI_VERSION,
+            &artifact_hash,
+        )
+        .map_err(|e| (e.code, e.message))?;
+
+    let default_cost = WorkCost {
+        cpu: 100,
+        memory: 64 * 1024 * 1024,
+        io: 0,
+        network: 0,
+    };
+    let cost = task_profiles().scheduler_hint(
+        TaskProfileKey::new(task.runtime_image_sha256(), task.task_oid()),
+        default_cost,
+    );
+    let provenance = ExecutionProvenance {
+        runtime_image: request.runtime_image.clone(),
+        source_id,
+        capability_abi: CAPABILITY_ABI_VERSION,
+        environment: exact_environment.clone(),
+        generation,
+    };
+    let execution_id = runtime
+        .submit_with_policy(
+            environment,
+            artifact_hash,
+            cost,
+            ResourceLimits::default(),
+            SandboxPolicy::default(),
+            Some(provenance),
+            0,
+            request.input.clone(),
+        )
+        .to_string();
+    active_task_pins()
+        .lock()
+        .expect("CTI execution pin table poisoned")
+        .insert(execution_id.clone(), (task, cost, request.input.len()));
+    Ok(execution_id)
+}
+
+fn task_load_error_code(error: &ContainerTaskLoadError) -> &'static str {
+    match error {
+        ContainerTaskLoadError::InvalidRuntimeImage(_) => "INVALID_RUNTIME_IMAGE",
+        ContainerTaskLoadError::RuntimeImageNotFound(_) => "TASK_IMAGE_NOT_FOUND",
+        ContainerTaskLoadError::InvalidIndex(_)
+        | ContainerTaskLoadError::Io(_)
+        | ContainerTaskLoadError::HashMismatch(_)
+        | ContainerTaskLoadError::MalformedCti(_)
+        | ContainerTaskLoadError::IdentityMismatch(_)
+        | ContainerTaskLoadError::AbiMismatch(_) => "TASK_IMAGE_INVALID",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     mut stream: TcpStream,
     token: &str,
     runtime: &Runtime,
     accepting: &AtomicBool,
     capability_broker: &CapabilityBroker,
+    task_loader: &ContainerTaskLoader,
+    task_registry: &RuntimeImageTaskRegistry,
     environment_processes: &environment_process::EnvironmentProcessSupervisor,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -754,6 +993,100 @@ fn handle_connection(
                         request_id: Some(bound_request.request_id),
                         code: error.code.into(),
                         message: error.message,
+                    },
+                }
+            }
+        }
+        Request::ActivateTaskImage(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else {
+                match task_registry.activate_from_cache_and_retire(
+                    task_loader,
+                    &request.runtime_image,
+                    &request.retire_runtime_images,
+                ) {
+                    Ok((task_count, retired_images)) => {
+                        emit_event(
+                            "task_image_activated",
+                            &format!(
+                                "runtime_image={} tasks={} retired={}",
+                                request.runtime_image, task_count, retired_images
+                            ),
+                        );
+                        Response::TaskImageActivated {
+                            request_id: request.request_id,
+                            runtime_image: request.runtime_image,
+                            task_count,
+                            retired_images,
+                        }
+                    }
+                    Err(error) => Response::Error {
+                        request_id: Some(request.request_id),
+                        code: task_load_error_code(&error).into(),
+                        message: error.to_string(),
+                    },
+                }
+            }
+        }
+        Request::ExecuteTask(request) => {
+            if request.auth_token != token {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "AUTH_FAILED".into(),
+                    message: "container control authentication failed".into(),
+                }
+            } else if request.input.len() > MAX_EXECUTION_INPUT_BYTES {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "EXECUTION_INPUT_TOO_LARGE".into(),
+                    message: format!("Task input exceeds {MAX_EXECUTION_INPUT_BYTES} bytes"),
+                }
+            } else if !accepting.load(Ordering::Acquire) {
+                Response::Error {
+                    request_id: Some(request.request_id),
+                    code: "REFRESHING".into(),
+                    message: "Container is draining for supervised refresh".into(),
+                }
+            } else {
+                match resolve_container_task(
+                    task_loader,
+                    task_registry,
+                    &request.runtime_image,
+                    request.task_oid,
+                ) {
+                    Ok(Some(task)) => {
+                        match submit_compiled_task(task, &request, runtime, capability_broker) {
+                            Ok(execution_id) => {
+                                emit_event("task_execution_accepted", &execution_id);
+                                Response::Accepted {
+                                    request_id: request.request_id,
+                                    execution_id,
+                                }
+                            }
+                            Err((code, message)) => Response::Error {
+                                request_id: Some(request.request_id),
+                                code: code.into(),
+                                message,
+                            },
+                        }
+                    }
+                    Ok(None) => Response::Error {
+                        request_id: Some(request.request_id),
+                        code: "TASK_NOT_FOUND".into(),
+                        message: format!(
+                            "TaskOID {} is not present in Runtime Image {}",
+                            request.task_oid, request.runtime_image
+                        ),
+                    },
+                    Err(error) => Response::Error {
+                        request_id: Some(request.request_id),
+                        code: task_load_error_code(&error).into(),
+                        message: error.to_string(),
                     },
                 }
             }
@@ -1347,4 +1680,66 @@ fn value_after(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1].clone())
+}
+
+#[cfg(test)]
+mod execute_task_phase4_tests {
+    use super::*;
+    use container_runtime_core::{ContainerTaskAssembler, ContainerTaskAssemblyInput};
+    use ipc_protocol::{CtiSection, CtiSectionKind, CTI_SECTION_REQUIRED};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rbe-execute-task-{}-{nonce}", std::process::id()))
+    }
+
+    fn required_sections() -> Vec<CtiSection> {
+        CtiSectionKind::REQUIRED
+            .into_iter()
+            .map(|kind| CtiSection {
+                kind: kind.code(),
+                flags: CTI_SECTION_REQUIRED,
+                data: vec![kind.code() as u8],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn execute_task_resolves_cti_by_runtime_image_and_oid() {
+        let root = temp_root();
+        let runtime_image = [0xab; 32];
+        let task_oid = 31_844;
+        let assembler = ContainerTaskAssembler::new(&root);
+        let mut index = assembler.load_index().unwrap();
+        assembler
+            .assemble_and_commit(
+                &mut index,
+                ContainerTaskAssemblyInput {
+                    task_oid,
+                    capability_abi: CAPABILITY_ABI_VERSION,
+                    runtime_image_sha256: runtime_image,
+                    task_semantic_sha256: [0xcd; 32],
+                    entry_node: 0,
+                    target_id: 1,
+                    flags: 0,
+                    sections: required_sections(),
+                },
+            )
+            .unwrap();
+
+        let loader = ContainerTaskLoader::new(&root);
+        let registry = RuntimeImageTaskRegistry::new();
+        let resolved =
+            resolve_container_task(&loader, &registry, &hex::encode(runtime_image), task_oid)
+                .unwrap()
+                .expect("Task must resolve");
+        assert_eq!(resolved.task_oid(), task_oid);
+        assert_eq!(resolved.runtime_image_sha256(), runtime_image);
+        assert!(registry.lookup(&runtime_image, task_oid).is_some());
+        let _ = fs::remove_dir_all(root);
+    }
 }

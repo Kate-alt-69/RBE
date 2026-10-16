@@ -184,6 +184,17 @@ This is distinct from SVC5001: SVC5003 means Backend could not obtain a trustwor
 
 **Action:** replace the binary with one produced by the same RBE build and verify it can execute on the host platform.
 
+<a id="svc5004"></a>
+### SVC5004 — Service Mother process could not be spawned
+
+**Status:** Emitted.
+
+Backend verified the standalone Service binary and compatibility protocol, but the operating system refused to create the Service Mother process. The diagnostic identifies the Service binary, settings path, application root, host OS/architecture, raw OS error number and original OS error text.
+
+On Linux, `raw_os_error = 11` is `EAGAIN`: process creation failed before any Service code executed. Common causes include a container/cgroup PID limit (`pids.max`), the user's process limit (`ulimit -u`), or insufficient memory/resources to create another process.
+
+**Action:** fix the host process-spawn/resource condition and retry. If SVC5004 is emitted, no individual `.service` worker was launched yet.
+
 <a id="svc5099"></a>
 ### SVC5099 — Service Mother startup failed with an unclassified error
 
@@ -223,6 +234,17 @@ The control command was valid, but RBE could not persist/queue the restart reque
 `service(.exe)` was started without exactly one internal Mother/worker role.
 
 **Action:** launch the Service runtime through `backend(.exe)` rather than manually reproducing internal process arguments.
+
+<a id="svc5103"></a>
+### SVC5103 — named Service worker process could not be spawned
+
+**Status:** Emitted.
+
+The Service Mother was already running, selected a specific `.service` program, and the operating system refused to create that worker process. Unlike the old generic startup error, this diagnostic includes the exact logical service name/title, `.service` source path, canonical Service executable path, mode, restart policy, host OS/architecture, raw OS error number, and original OS error text.
+
+On Linux, `raw_os_error = 11` is `EAGAIN`. The named worker did not execute. Check the container/cgroup PID limit (`pids.max`), user process limit (`ulimit -u`), and available memory/resources.
+
+**Action:** use the named service/file in the diagnostic to distinguish a host-wide process limit from a single Service configuration problem, fix the process-spawn condition, and retry.
 
 <a id="svc5199"></a>
 ### SVC5199 — Service worker startup failed with an unclassified error

@@ -4,10 +4,13 @@
 //! backend/container/service/video state without owning those runtimes.
 
 mod container_client;
+mod dns_broker;
 mod library_host;
 mod library_session;
+mod library_wire;
 mod metrics;
 mod network_broker;
+mod public_https;
 mod video_language;
 
 use std::path::Path;
@@ -22,17 +25,24 @@ use video_manager::VideoManager;
 
 pub use container_client::{
     ContainerAuthorizedExecution, ContainerCapabilityBinding, ContainerClient,
-    ContainerEndpointSnapshot, ContainerExecutionIdentity,
+    ContainerEndpointSnapshot, ContainerExecutionIdentity, ContainerSubmittedTask,
+};
+pub use dns_broker::{
+    call_public_dns, PublicDnsError, PUBLIC_DNS_MAX_QUERY_BYTES, PUBLIC_DNS_MAX_RESULTS,
+    PUBLIC_DNS_TARGET,
 };
 pub use ipc_protocol::{
     CapabilityGrant as ContainerCapabilityGrant, CapabilityKind as ContainerCapabilityKind,
-    WorkCost as ContainerWorkCost,
+    CtiEventClass, CtiLogLevel, CtiNodeKind, SlotType as ContainerTaskSlotType, TaskEvent,
+    TaskEventDescriptor, TaskEventDictionary, TaskEventError, WorkCost as ContainerWorkCost,
+    CAPABILITY_ABI_VERSION as CONTAINER_CAPABILITY_ABI_VERSION, CTI_GRAPH_ABI_VERSION,
+    CTI_LOG_ABI_VERSION, CTI_SLOT_ABI_VERSION,
     MAX_CAPABILITY_GRANTS_PER_MANIFEST as CONTAINER_MAX_CAPABILITY_GRANTS_PER_MANIFEST,
     MAX_CAPABILITY_OPERATIONS_PER_GRANT as CONTAINER_MAX_CAPABILITY_OPERATIONS_PER_GRANT,
     MAX_CAPABILITY_OPERATION_BYTES as CONTAINER_MAX_CAPABILITY_OPERATION_BYTES,
     MAX_CAPABILITY_PAYLOAD_BYTES as CONTAINER_MAX_CAPABILITY_PAYLOAD_BYTES,
     MAX_CAPABILITY_TARGET_BYTES as CONTAINER_MAX_CAPABILITY_TARGET_BYTES,
-    MAX_EXECUTION_INPUT_BYTES as CONTAINER_MAX_EXECUTION_INPUT_BYTES,
+    MAX_EXECUTION_INPUT_BYTES as CONTAINER_MAX_EXECUTION_INPUT_BYTES, TASK_EVENT_PACKET_BYTES,
 };
 pub use library_host::{
     read_json_message as read_library_message, write_json_message as write_library_message,
@@ -46,6 +56,17 @@ pub use library_host::{
 pub use library_session::{
     AcceptedLibrarySessionInfo, LibrarySessionBinding, LIBRARY_HOST_CALL_FEATURE,
 };
+pub use library_wire::{
+    decode_worker_message as decode_library_worker_message,
+    package_invocation_value as library_package_invocation_value,
+    read_worker_message as read_library_worker_message, reject_value as library_reject_value,
+    write_accept as write_library_accept, write_host_reply as write_library_host_reply,
+    write_package_invocation as write_library_package_invocation,
+    write_reject as write_library_reject, LibraryHostCallReply, LibraryWorkerMessage,
+    HOST_CALL_TYPE as LIBRARY_HOST_CALL_TYPE, HOST_REPLY_TYPE as LIBRARY_HOST_REPLY_TYPE,
+    LIBRARY_ACCEPT_TYPE, LIBRARY_HELLO_TYPE, LIBRARY_INVOKE_TYPE, LIBRARY_REJECT_TYPE,
+    LIBRARY_REPLY_TYPE,
+};
 pub use metrics::{
     BackendMetrics, BackendMetricsSnapshot, MaintenanceMetrics, MaintenanceSnapshot,
 };
@@ -53,6 +74,7 @@ pub use network_broker::{
     call_public_http, PublicHttpError, PUBLIC_HTTP_MAX_TIMEOUT_MS, PUBLIC_HTTP_REQUEST_MAX_BYTES,
     PUBLIC_HTTP_RESPONSE_MAX_BYTES, PUBLIC_HTTP_TARGET,
 };
+pub use public_https::{resolve_public_https_target, ResolvedPublicHttpsTarget};
 pub use video_language::{
     video_language_operation_allowed, VideoLanguage, VideoLanguageError,
     VIDEO_CAPABILITY_TARGET_PREFIX, VIDEO_LANGUAGE_OPERATIONS,

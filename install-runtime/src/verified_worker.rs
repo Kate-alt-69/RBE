@@ -27,6 +27,56 @@ pub struct VerifiedPackageWorkerIdentity {
     pub runtime_managed: bool,
 }
 
+impl VerifiedPackageWorkerIdentity {
+    /// Re-read runtime capability requests from this worker's SHA-pinned package
+    /// artifact and reject any identity drift before returning them.
+    ///
+    /// The returned strings are verified requests, not grants. Backend remains
+    /// responsible for mapping only implemented capabilities into host grants.
+    pub fn read_requested_capabilities(
+        &self,
+        project_root: &Path,
+    ) -> Result<Vec<String>, InstallRuntimeError> {
+        let layout = ProjectCacheLayout::new(project_root);
+        let lock_path = layout.lock_path();
+        if !lock_path.try_exists()? {
+            return Err(InstallRuntimeError::VerifiedRootMissing(
+                self.package.clone(),
+            ));
+        }
+        let lock = ProjectPackageLock::parse_yaml(&std::fs::read_to_string(&lock_path)?)?;
+        let locked = lock
+            .packages
+            .get(&self.package)
+            .ok_or_else(|| InstallRuntimeError::VerifiedRootMissing(self.package.clone()))?;
+
+        let artifact_dir = layout.library_artifact_dir(&locked.artifact_sha256)?;
+        let artifact_path = artifact_dir.join("artifact.rbe");
+        verify_locked_artifact(&artifact_path, &locked.artifact_sha256)?;
+        let policy = ArchivePolicy::default();
+        let inspected = inspect_zip(File::open(&artifact_path)?, policy)?;
+        let manifest_sha256 = hash_manifest(&artifact_path, policy.max_manifest_bytes)?;
+        let reconstructed =
+            identity_from_manifest(&self.package, locked, &inspected.manifest, &manifest_sha256)?;
+        if reconstructed != *self {
+            return Err(InstallRuntimeError::VerifiedPackageMetadataMismatch {
+                package: self.package.clone(),
+                field: "worker identity",
+                locked: format!("{self:?}"),
+                artifact: format!("{reconstructed:?}"),
+            });
+        }
+
+        Ok(inspected
+            .manifest
+            .capabilities
+            .iter()
+            .filter(|(_, enabled)| **enabled)
+            .map(|(capability, _)| capability.clone())
+            .collect())
+    }
+}
+
 /// Reconstruct the executable identity of every explicit project root from the
 /// SHA-pinned artifact and the resolved project lock.
 ///

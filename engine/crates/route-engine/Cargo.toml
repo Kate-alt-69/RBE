@@ -8,6 +8,8 @@ publish.workspace = true
 core-lib = { path = "../core" }
 service-runtime = { path = "../service-runtime" }
 atomic-io = { path = "../../../atomic-io" }
+container-runtime-core = { path = "../../../container-runtime/crates/container-runtime-core" }
+ipc-protocol = { path = "../../../container-runtime/crates/ipc-protocol" }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -19,6 +21,7 @@ hmac = "0.12"
 argon2 = "0.5"
 rand = "0.8"
 subtle = "2"
+fs2 = "0.4"
 hex = "0.4"
 regex = "1"
 fancy-regex = "=0.16.2"

@@ -106,8 +106,7 @@ impl LibrarySessionBinding {
         reply: &PackageReply,
         maximum_response_bytes: usize,
     ) -> Result<(), LibraryHostError> {
-        self.session
-            .validate_reply(reply, maximum_response_bytes)
+        self.session.validate_reply(reply, maximum_response_bytes)
     }
 
     pub fn close(&mut self) {
@@ -131,9 +130,7 @@ fn validate_capability_identity(value: &str) -> Result<(), LibraryHostError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::library_host::{
-        PackageIdentity, RuntimeIdentity, SdkIdentity, LIBRARY_ABI_VERSION,
-    };
+    use crate::library_host::{PackageIdentity, RuntimeIdentity, SdkIdentity, LIBRARY_ABI_VERSION};
 
     fn expected() -> ExpectedWorkerIdentity {
         ExpectedWorkerIdentity {
@@ -170,14 +167,8 @@ mod tests {
     #[test]
     fn accepted_metadata_is_derived_from_the_enforced_grants() {
         let grants = [
-            CapabilityGrant::new(
-                "net:http",
-                "net:http",
-                ["request".to_string()],
-                1024,
-                4096,
-            )
-            .unwrap(),
+            CapabilityGrant::new("net:http", "net:http", ["request".to_string()], 1024, 4096)
+                .unwrap(),
             CapabilityGrant::new(
                 "storage",
                 "storage:project",

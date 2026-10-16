@@ -10,14 +10,8 @@
 //! `server.server` front-end. Final ServerPolicy/Runtime Image lowering remains
 //! a later RELC pass.
 
-// The route cache and direct parser helpers are retained as internal building
-// blocks for the AOT/diagnostic pipeline even when a particular build path does
-// not currently call them directly.
 #![allow(dead_code)]
 
-// `discovery` only needs the parser half of application/x-www-form-urlencoded.
-// Keep that tiny surface in-tree so request decoding does not add another direct
-// dependency edge to Route Engine's locked workspace graph.
 extern crate self as form_urlencoded;
 
 mod form_urlencoded_compat {
@@ -124,27 +118,65 @@ mod module_runtime;
 mod modules;
 mod parser;
 mod paths;
+mod rel_host_builtins;
+mod rel_host_descriptor;
+mod rel_host_runtime;
 mod route_collision;
+mod runtime_roots;
 mod service_eval;
+mod temp_path;
 mod terminal;
 
+pub mod archive;
 pub mod cache;
+pub mod container_task_assembly;
 pub mod middleware_plan;
+pub mod oid_cache_bootstrap;
+pub mod oid_index_bridge;
+pub mod oid_link;
+pub mod oid_materialize;
+pub mod oid_security;
+pub mod package_native_link;
+pub mod package_native_semantics;
+pub mod rel_image_discovery;
+pub mod rel_native_link;
+pub mod rel_native_lowering;
+pub mod rel_native_semantics;
+pub mod rel_native_service_select;
+pub mod rel_oid_bridge;
+pub mod rel_optimizer;
+pub mod rel_symbol_discovery;
 pub mod relc;
+pub mod relc_linked_image;
 pub mod runtime_env;
 pub mod runtime_image;
+pub mod script;
 pub mod server_policy;
 pub mod server_rel;
+pub mod service_bin;
+pub mod service_cache_invalidation;
+pub mod service_native;
+pub mod service_native_build;
+pub mod service_native_lifetime;
+pub mod service_native_worker;
+pub mod service_oid;
+pub mod service_oid_adapter;
 pub mod source_registry;
 pub mod transpiled_support;
 pub mod transpiler;
 mod video_host;
 pub mod wasm_compiler;
+pub mod workspace;
 
 pub use analyzer::{analyze, Diagnostic, Severity};
+pub use archive::{ArchiveFormat, ArchivePath, ArchivePlan, ArchivePlanError, ArchiveWarmingKey};
 pub use ast::{
     BinaryOp, Expr, FieldBinding, FieldBindingMode, FieldDirective, FieldFile, FieldValueType,
     FunctionDef, ImportTarget, MethodDef, ModuleFile, RouteFile, ServiceProgram, Statement, Value,
+};
+pub use container_task_assembly::{
+    assemble_container_task_cache, recover_container_task_publication, ContainerTaskArtifact,
+    ContainerTaskAssemblyError, ContainerTaskAssemblyReport,
 };
 pub use dependency_graph::{SymbolDependencyGraph, SymbolId};
 pub use discovery::RouteCache;
@@ -162,13 +194,39 @@ pub use module_runtime::{
     ModuleCompileError, ModuleCompileErrors, ModuleProgram, ServiceInterfaces,
 };
 pub use modules::{binding_name, route_capability_allowed, ModuleError, ModuleRegistry};
+pub use oid_cache_bootstrap::{
+    clear_service_oid_cache, oid_cache_root, open_service_oid_cache,
+    open_service_oid_cache_with_vault, prepare_service_oid_cache,
+    prepare_service_oid_cache_with_vault,
+};
+pub use oid_security::OidVaultAuthority;
 pub use parser::ParseError;
 pub use paths::{binary_dir, default_api_dir, default_module_dir, resolve_custom_import};
+pub use rel_host_builtins::{
+    allowed_for_role as host_builtin_allowed_for_role,
+    function_exists as host_builtin_function_exists, is_host_builtin, ARCHIVE_BUILTIN,
+    SCRIPT_BUILTIN, WORKSPACE_BUILTIN,
+};
+pub use rel_host_runtime::{
+    RelHostExecutionFuture, RelHostExecutor, RelHostOutput, RelHostRequest,
+};
+pub use rel_image_discovery::{discover_linked_rel_from_runtime_image, RuntimeImageLinkedRelError};
+pub use rel_native_lowering::{lower_linked_rel_function, NativeRelLowering};
+pub use rel_native_service_select::{
+    select_native_services, NativeServiceSelection, NativeServiceSelectionError,
+};
+pub use rel_optimizer::{optimize_function, RelOptimizationStats};
+pub use rel_symbol_discovery::{
+    discover_linked_rel_symbols, linked_source_sha256, LinkedRelDiscovery, LinkedRelDiscoveryError,
+    LinkedRelSourceRef, LinkedRelSourceUnit,
+};
 pub use relc::{
     compile_runtime_image, discover_physical_rel_sources, PhysicalRelSource, RelcError,
 };
 pub use runtime_env::{RuntimeEnv, RuntimeEnvError, RuntimeEnvOrigin};
 pub use runtime_image::{RuntimeExecutable, RuntimeImage, RuntimeImageSlot, RuntimeSourceManifest};
+pub use runtime_roots::RuntimeRootAuthority;
+pub use script::{ScriptLanguage, ScriptPath, ScriptPlan, ScriptPlanError};
 pub use server_policy::{
     PolicyOrigin, RecursionPolicy, ResolvedPolicyValue, ServerPolicy, ServerPolicyError,
     ServerStatus,
@@ -178,12 +236,26 @@ pub use server_rel::{
     ServerSettingBody, ServerValue,
 };
 pub use service_eval::ServiceProgramExecutor;
+pub use service_native_worker::{
+    verify_native_service_worker_bootstrap, NativeServiceWorkerBootstrapError,
+    VerifiedNativeServiceWorkerBootstrap, VerifiedNativeServiceWorkerEntry,
+};
+pub use service_oid::{
+    CoreMaterializationReport, OidCache, OidDiagnostic, OidDiagnosticSeverity, OidError, OidIndex,
+    OidRecord, OidRecordKind, OidRelocation, OidRelocationKind, OidSlotClass, OidTarget,
+    PackageOidOwner, OID_DONE, OID_END_PACKAGE, OID_NATIVE_ABI_VERSION, OID_PACKAGE_END,
+    OID_PACKAGE_START, OID_RBE_CORE_END, OID_RBE_CORE_START, OID_REL_END, OID_REL_START,
+};
 pub use source_registry::{
     RelSource, RelSourceKind, RelSourceRegistry, SourceId, SourceOrigin, SourceRegistryError,
 };
+pub use temp_path::{is_project_path, is_temp_path, validate_symbolic_path};
 pub use wasm_compiler::{
     compile_route as compile_route_wasm, RouteWasmArtifact, RouteWasmCompilation,
     ROUTE_WASM_ABI_VERSION, ROUTE_WASM_COMPILER_VERSION,
+};
+pub use workspace::{
+    WorkspaceOperation, WorkspacePath, WorkspacePlan, WorkspacePlanError, WorkspaceRoot,
 };
 
 pub fn parse_service_source(source: &str) -> Result<ServiceProgram, ParseError> {
@@ -212,15 +284,22 @@ pub fn build_routes_from_image(
     discovery::build_routes_from_image(image, service_interfaces)
 }
 
-/// Validate the immutable Runtime Image against native API namespaces and
-/// route/method collisions before backend boot launches any child processes.
+pub fn build_routes_from_image_with_package_exports(
+    image: &RuntimeImage,
+    service_interfaces: &ServiceInterfaces,
+    package_exports: std::sync::Arc<dyn PackageExportCaller>,
+) -> anyhow::Result<axum::Router<core_lib::AppState>> {
+    discovery::build_routes_from_image_with_package_exports(
+        image,
+        service_interfaces,
+        Some(package_exports),
+    )
+}
+
 pub fn validate_runtime_image_routes(image: &RuntimeImage) -> anyhow::Result<()> {
     route_collision::validate_image(image)
 }
 
-/// Reserve one additional runtime-configured native namespace before the HTTP
-/// router is assembled. This is used by optional control-plane surfaces whose
-/// path is not known when RELC performs its static native-route validation.
 pub fn validate_runtime_image_reserved_namespace(
     image: &RuntimeImage,
     prefix: &str,

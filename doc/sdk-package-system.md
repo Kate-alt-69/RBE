@@ -53,11 +53,58 @@ rpx compile ./components/request
 rpx compile.package
 rpx compile.package .
 rpx info
+
+rpx login
+rpx whoami
+rpx publish .
+rpx status advancenet
+rpx yank advancenet 1.0.0 --reason "broken release"
+rpx logout
 ```
 
 `rpx check` validates the package/component graph without invoking a language compiler.
 
 `rpx compile` validates the graph, performs real language syntax/type/compiler checks and writes a canonical package index under `.cache/rbe/build/`. `rpx compile.package` performs the same compiler checks before creating the `.rbe.zip` distributable and embedding the canonical package index.
+
+### Registry authoring and release management
+
+RPX uses a browser/device authorization flow for interactive publisher login. `rpx login` never asks for or stores a UAC password, UAC private ID, package owner key, or registry-internal identity. The registry returns a scoped RPX bearer credential, stored per registry under `~/.rbe/rpx/auth.json` by default. On Unix the credential file is restricted to the current user; RPX does not change permissions on an already-existing external parent directory selected through `RPX_AUTH_FILE`.
+
+The publisher commands are:
+
+```text
+rpx login [--registry <url>]
+rpx whoami [--registry <url>]
+rpx publish [path] [--registry <url>] [--allow-host-toolchain]
+rpx status <package> [--registry <url>]
+rpx yank <package> <version> [--reason <text>] [--registry <url>]
+rpx logout [--registry <url>]
+```
+
+`rpx publish` first runs the canonical package compile/archive path. The client then asks the registry for a short-lived signed upload slot, uploads the `.rbe.zip` directly to the trusted object store, and finalizes publication through the authenticated publisher endpoint. The package version comes from `package.rbe.toml` and is also sent through the frozen `?version=` upload contract; the client verifies that the final registry response identifies the exact package and version it built.
+
+`rpx status` is public and does not require login. It reads the package status endpoint and displays latest stable release, aggregate download count, last download time, release counts, every version's active/yanked state, artifact and manifest SHA-256 identities, and complete publish/yank history. RPX validates the returned package identity, SemVer version set, hashes and release statistics before displaying them.
+
+`rpx yank` requires the `package.yank` publisher scope. Yanking does not delete or replace an immutable release: it hides that version from new resolution while preserving its artifact, metadata, analytics and registry history. An optional reason may be attached to the yank history event.
+
+`rpx whoami` validates the active token against the publisher service and lists packages currently owned by that publisher. `rpx logout` revokes the server-side credential when possible and removes the locally stored registry credential. Credentials supplied through `RPX_TOKEN` are never persisted; CI is expected to unset or rotate that environment value itself.
+
+The built-in RPX/DI registry default is:
+
+```text
+https://kastrick-backend.onrender.com
+```
+
+An explicit CLI/configuration override still wins. Environment overrides are:
+
+```text
+RPX_REGISTRY_URL=https://registry.example
+RBE_PACKAGE_REGISTRY=https://registry.example
+RPX_AUTH_FILE=/private/path/rpx-auth.json
+RPX_TOKEN=<scoped-token>
+```
+
+Production registry URLs require HTTPS. Loopback HTTP remains available for local authoring and contract tests.
 
 ### Managed compiler authority
 
@@ -113,14 +160,72 @@ That flag is an explicit authoring escape hatch, not the production/default comp
 
 ## SDK bootstrap
 
-The SDK-specific backend is intentionally separate from the production backend. It installs only into a project:
+RBE uses one **generic rolling SDK channel**. `sdk` and `sdk.latest` both mean "install the current verified SDK development build from `main`".
+
+The production RBE `backend` and the project-local SDK backend have separate jobs:
+
+1. The normal production `backend` recognizes `install sdk` and `install sdk.latest`, downloads the fixed Kastrick HTTPS bootstrap script, and invokes it with argument-safe process arguments.
+2. RBE's `SDK Toolchain` workflow builds the current SDK for supported platforms whenever relevant SDK/toolchain code changes on `main`.
+3. After all platform bundles and their checksum files are validated, the workflow publishes a historical development prerelease and atomically replaces the deterministic moving alias `sdk-v0.0.0-dev.latest`.
+4. The bootstrap resolves that exact moving alias, downloads the platform archive and `.sha256`, verifies the archive before extraction, and rejects missing/incomplete release metadata.
+5. The verified SDK archive contains the dedicated SDK backend, RPX, and the Rust/JavaScript/TypeScript/Python SDK bindings.
+6. That SDK backend installs the selected language binding(s) into the project under `.rbe/`, writes `sdk.lock.json`, generates the project-local activation file, and owns later SDK status/toolchain operations.
+
+The rolling alias is intentionally a prerelease rather than a stable semantic SDK version. Historical development releases keep unique `sdk-v0.0.0-dev.<run>.<attempt>` tags for traceability. A pinned stable `sdk.<version>` distribution contract is not currently provided; requests for a specific SDK version fail closed until RBE deliberately adds a stable SDK channel.
+
+Public install examples:
 
 ```text
+backend install sdk -path=. -language=typescript
 backend install sdk.latest -path=. -language=typescript
+```
+
+On Windows PowerShell, a bootstrap `backend.exe` that only exists in the current directory must initially be invoked explicitly:
+
+```powershell
+.\backend.exe install sdk -path=. -language=typescript
+```
+
+After installation, the project-local tools are under:
+
+```text
+.rbe/bin/backend[.exe]
+.rbe/bin/rpx[.exe]
+.rbe/sdk/<language>/
+.rbe/sdk.lock.json
+```
+
+### Project-local command activation
+
+SDK installation does **not** write to the User PATH or Machine PATH. Each project owns its own command binaries and activation file.
+
+On PowerShell:
+
+```powershell
+& .\.rbe\activate.ps1
+backend sdk status -path=.
+rpx check .
+```
+
+On POSIX shells:
+
+```sh
+. ./.rbe/activate.sh
+backend sdk status -path=.
+rpx check .
+```
+
+Activation affects only the current shell process. The activated `backend` and `rpx` commands are bound to that project's `.rbe/bin` and fail closed when the current working directory is outside the owning project tree. This prevents one project's SDK/RPX binaries from silently becoming another project's toolchain. A fresh terminal must activate the project again.
+
+The installed project-local SDK backend also supports:
+
+```text
+backend sdk status -path=.
 backend sdk repair -path=.
 backend sdk update -path=.
-backend sdk status -path=.
 ```
+
+`repair` and `update` deliberately re-enter the verified bootstrap path rather than keeping a second complete SDK payload inside the project-local backend.
 
 A `global` SDK install explicitly installs all language bindings; mixed-language packages are only valid when `language = "global"` is deliberately selected in `package.rbe.toml`.
 

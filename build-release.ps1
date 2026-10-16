@@ -204,6 +204,9 @@ try {
     }
     if ($ShowHelp) { Get-Help $MyInvocation.MyCommand.Path -Full; exit 0 }
 
+	. (Join-Path $RepoRoot 'build-cache.ps1')
+	Initialize-RbeBuildCache $RepoRoot
+
     $hostOs = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
     $hostArch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
         'X64' { 'x64' }; 'X86' { 'x86' }; 'Arm64' { 'arm64' }; 'Arm' { 'armv7' }; default { 'x64' }

@@ -8,6 +8,7 @@ from typing import Any, Protocol
 LIBRARY_ABI_VERSION = 1
 SDK_VERSION = "0.1.0"
 
+LOG = "log"
 NET_HTTP = "net:http"
 NET_COOKIES = "net:cookies"
 NET_HEADERS = "net:headers"
@@ -15,6 +16,8 @@ NET_URL = "net:url"
 NET_DNS = "net:dns"
 NET_IP = "net:ip"
 NET_TCP = "net:tcp"
+NET_TCP_LISTEN = "net:tcp-listen"
+NET_TLS = "net:tls"
 NET_UDP = "net:udp"
 NET_QUIC = "net:quic"
 NET_WEBSOCKET = "net:websocket"
@@ -33,6 +36,41 @@ def _valid_component(value: str) -> bool:
     return all(char.isalnum() or char in "-_" for char in value)
 
 
+def _assert_library_name(value: str) -> str:
+    if not _valid_component(value):
+        raise ValueError(f"invalid RBE library name {value!r}")
+    return value
+
+
+def _assert_non_empty_string(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    return value
+
+
+def _assert_positive_int(value: int, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _optional_timeout(payload: dict[str, Any], timeout_ms: int | None) -> dict[str, Any]:
+    if timeout_ms is not None:
+        payload["timeout_ms"] = _assert_positive_int(timeout_ms, "timeout_ms")
+    return payload
+
+
+def _byte_list(data: bytes | bytearray | memoryview | list[int] | tuple[int, ...]) -> list[int]:
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return list(bytes(data))
+    if isinstance(data, (list, tuple)) and all(
+        isinstance(byte, int) and not isinstance(byte, bool) and 0 <= byte <= 255
+        for byte in data
+    ):
+        return list(data)
+    raise TypeError("TCP write data must be bytes-like or a sequence of byte values")
+
+
 @dataclass(frozen=True, slots=True)
 class LibraryDescriptor:
     name: str
@@ -41,8 +79,7 @@ class LibraryDescriptor:
     abi_max: int = LIBRARY_ABI_VERSION
 
     def validate(self) -> "LibraryDescriptor":
-        if not _valid_component(self.name):
-            raise ValueError(f"invalid RBE library name {self.name!r}")
+        _assert_library_name(self.name)
         if self.abi_min < 1 or self.abi_min > self.abi_max:
             raise ValueError(f"invalid RBE ABI range {self.abi_min}..={self.abi_max}")
         return self
@@ -225,6 +262,217 @@ class CapabilityClient:
         )
 
 
+class LoggerClient:
+    def __init__(
+        self,
+        bridge: HostBridge,
+        library_name: str,
+        scope: tuple[str, ...] = (),
+    ) -> None:
+        self._bridge = bridge
+        self.library_name = _assert_library_name(library_name)
+        self.scope = scope
+
+    @property
+    def target(self) -> str:
+        return f"lib/{self.library_name}"
+
+    def child(self, name: str) -> "LoggerClient":
+        if not _valid_component(name):
+            raise ValueError(f"invalid RBE logger child scope {name!r}")
+        return LoggerClient(self._bridge, self.library_name, (*self.scope, name))
+
+    def emit(self, level: str, message: Any) -> Any:
+        if level not in {"debug", "info", "warn", "error", "fatal"}:
+            raise ValueError(f"invalid RBE log level {level!r}")
+        return CapabilityClient(self._bridge, LOG, self.target).call(
+            level,
+            {"scope": list(self.scope), "message": str(message)},
+        )
+
+    def debug(self, message: Any) -> Any:
+        return self.emit("debug", message)
+
+    def info(self, message: Any) -> Any:
+        return self.emit("info", message)
+
+    def warn(self, message: Any) -> Any:
+        return self.emit("warn", message)
+
+    def error(self, message: Any) -> Any:
+        return self.emit("error", message)
+
+    def fatal(self, message: Any) -> Any:
+        return self.emit("fatal", message)
+
+
+class DnsClient(CapabilityClient):
+    def __init__(self, bridge: HostBridge) -> None:
+        super().__init__(bridge, NET_DNS)
+
+    def lookup(self, name: str) -> Any:
+        return self.call("lookup", {"name": _assert_non_empty_string(name, "DNS name")})
+
+    def ip(self, name: str) -> Any:
+        return self.call("ip", {"name": _assert_non_empty_string(name, "DNS name")})
+
+    def mx(self, name: str) -> Any:
+        return self.call("mx", {"name": _assert_non_empty_string(name, "DNS name")})
+
+
+class TcpClient(CapabilityClient):
+    def __init__(self, bridge: HostBridge) -> None:
+        super().__init__(bridge, NET_TCP)
+
+    def connect(self, host: str, port: int, timeout_ms: int | None = None) -> Any:
+        if port < 1 or port > 65535:
+            raise ValueError("TCP port must be in 1..=65535")
+        return self.call(
+            "connect",
+            _optional_timeout(
+                {"host": _assert_non_empty_string(host, "TCP host"), "port": port},
+                timeout_ms,
+            ),
+        )
+
+    def write(
+        self,
+        handle: str,
+        data: bytes | bytearray | memoryview | list[int] | tuple[int, ...],
+        timeout_ms: int | None = None,
+    ) -> Any:
+        return self.call(
+            "write",
+            _optional_timeout(
+                {
+                    "handle": _assert_non_empty_string(handle, "TCP handle"),
+                    "data": _byte_list(data),
+                },
+                timeout_ms,
+            ),
+        )
+
+    def read(self, handle: str, max_bytes: int, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "read",
+            _optional_timeout(
+                {
+                    "handle": _assert_non_empty_string(handle, "TCP handle"),
+                    "max_bytes": _assert_positive_int(max_bytes, "max_bytes"),
+                },
+                timeout_ms,
+            ),
+        )
+
+    def close(self, handle: str) -> Any:
+        return self.call("close", {"handle": _assert_non_empty_string(handle, "TCP handle")})
+
+
+
+class TlsClient(CapabilityClient):
+    def __init__(self, bridge: HostBridge) -> None:
+        super().__init__(bridge, NET_TLS)
+
+    def connect(self, host: str, port: int, timeout_ms: int | None = None) -> Any:
+        if port < 1 or port > 65535:
+            raise ValueError("TLS port must be in 1..=65535")
+        return self.call(
+            "connect",
+            _optional_timeout(
+                {"host": _assert_non_empty_string(host, "TLS host"), "port": port},
+                timeout_ms,
+            ),
+        )
+
+    def write(self, handle: str, data: bytes | bytearray | memoryview | list[int] | tuple[int, ...], timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "write",
+            _optional_timeout(
+                {"handle": _assert_non_empty_string(handle, "TLS handle"), "data": _byte_list(data)},
+                timeout_ms,
+            ),
+        )
+
+    def read(self, handle: str, max_bytes: int, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "read",
+            _optional_timeout(
+                {"handle": _assert_non_empty_string(handle, "TLS handle"), "max_bytes": _assert_positive_int(max_bytes, "max_bytes")},
+                timeout_ms,
+            ),
+        )
+
+    def start_tls(self, handle: str, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "start_tls",
+            _optional_timeout({"handle": _assert_non_empty_string(handle, "TLS handle")}, timeout_ms),
+        )
+
+    def close(self, handle: str) -> Any:
+        return self.call("close", {"handle": _assert_non_empty_string(handle, "TLS handle")})
+
+
+class TcpListenerClient(CapabilityClient):
+    def __init__(self, bridge: HostBridge) -> None:
+        super().__init__(bridge, NET_TCP_LISTEN)
+
+    def bind(self, address: str, port: int) -> Any:
+        if port < 1 or port > 65535:
+            raise ValueError("TCP listener port must be in 1..=65535")
+        return self.call("bind", {"address": _assert_non_empty_string(address, "TCP listener address"), "port": port})
+
+    def accept(self, handle: str, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "accept",
+            _optional_timeout({"handle": _assert_non_empty_string(handle, "TCP listener handle")}, timeout_ms),
+        )
+
+    def write(self, handle: str, data: bytes | bytearray | memoryview | list[int] | tuple[int, ...], timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "write",
+            _optional_timeout(
+                {"handle": _assert_non_empty_string(handle, "inbound TCP handle"), "data": _byte_list(data)},
+                timeout_ms,
+            ),
+        )
+
+    def read(self, handle: str, max_bytes: int, timeout_ms: int | None = None) -> Any:
+        return self.call(
+            "read",
+            _optional_timeout(
+                {"handle": _assert_non_empty_string(handle, "inbound TCP handle"), "max_bytes": _assert_positive_int(max_bytes, "max_bytes")},
+                timeout_ms,
+            ),
+        )
+
+    def start_tls(
+        self,
+        handle: str,
+        cert_chain_der: list[bytes | bytearray | memoryview | list[int] | tuple[int, ...]],
+        private_key_pkcs8_der: bytes | bytearray | memoryview | list[int] | tuple[int, ...],
+        timeout_ms: int | None = None,
+    ) -> Any:
+        if not isinstance(cert_chain_der, list) or not cert_chain_der:
+            raise TypeError("TLS certificate chain must be a non-empty list")
+        return self.call(
+            "start_tls",
+            _optional_timeout(
+                {
+                    "handle": _assert_non_empty_string(handle, "inbound TCP handle"),
+                    "cert_chain_der": [_byte_list(certificate) for certificate in cert_chain_der],
+                    "private_key_pkcs8_der": _byte_list(private_key_pkcs8_der),
+                },
+                timeout_ms,
+            ),
+        )
+
+    def close_connection(self, handle: str) -> Any:
+        return self.call("close_connection", {"handle": _assert_non_empty_string(handle, "inbound TCP handle")})
+
+    def close(self, handle: str) -> Any:
+        return self.call("close", {"handle": _assert_non_empty_string(handle, "TCP listener handle")})
+
+
 class NetClient:
     def __init__(self, bridge: HostBridge) -> None:
         self._bridge = bridge
@@ -236,6 +484,42 @@ class NetClient:
 
     def http(self) -> CapabilityClient:
         return CapabilityClient(self._bridge, NET_HTTP)
+
+    def cookies(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_COOKIES)
+
+    def headers(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_HEADERS)
+
+    def url(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_URL)
+
+    def dns(self) -> DnsClient:
+        return DnsClient(self._bridge)
+
+    def ip(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_IP)
+
+    def tcp(self) -> TcpClient:
+        return TcpClient(self._bridge)
+
+    def tcp_listen(self) -> TcpListenerClient:
+        return TcpListenerClient(self._bridge)
+
+    def tls(self) -> TlsClient:
+        return TlsClient(self._bridge)
+
+    def udp(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_UDP)
+
+    def quic(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_QUIC)
+
+    def websocket(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_WEBSOCKET)
+
+    def webtransport(self) -> CapabilityClient:
+        return CapabilityClient(self._bridge, NET_WEBTRANSPORT)
 
     def p2p(self) -> CapabilityClient:
         return CapabilityClient(self._bridge, NET_P2P)
@@ -294,10 +578,16 @@ class AdvancedClient:
 
 
 class RbeSdk:
-    def __init__(self, bridge: HostBridge) -> None:
+    def __init__(self, bridge: HostBridge, library_name: str | None = None) -> None:
         if not callable(getattr(bridge, "call", None)):
             raise TypeError("RBE HostBridge must provide call(request)")
+        if library_name is not None:
+            _assert_library_name(library_name)
         self._bridge = bridge
+        self._library_name = library_name
+
+    def log(self, library_name: str) -> LoggerClient:
+        return LoggerClient(self._bridge, _assert_library_name(library_name))
 
     def net(self) -> NetClient:
         return NetClient(self._bridge)
@@ -321,7 +611,10 @@ class RbeSdk:
         return AdvancedClient(self._bridge)
 
     def intercept(self, *interceptors: HostInterceptor) -> "RbeSdk":
-        return RbeSdk(InterceptedBridge(self._bridge, tuple(interceptors)))
+        return RbeSdk(
+            InterceptedBridge(self._bridge, tuple(interceptors)),
+            self._library_name,
+        )
 
     def host_bridge(self) -> HostBridge:
         return self._bridge

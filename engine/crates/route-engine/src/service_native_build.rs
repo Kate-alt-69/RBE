@@ -1,0 +1,866 @@
+//! Phase 5 compiler-side native Service build transaction.
+//!
+//! This module joins the Phase-4 OID adapter/assembler with Phase-5 Runtime
+//! Image pinning. A successful build always means the exact same verified OID
+//! cache snapshot produced the Service plan, native `.bin`, immutable pin, and
+//! source-level Service Fabric/lifecycle dispatch metadata. No worker execution
+//! policy lives here.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use serde::{Deserialize, Serialize};
+
+use crate::rel_native_link::{
+    prepare_rel_native_link, PreparedRelNativeLink, RelNativeLinkError, RelNativeLinkReport,
+};
+use crate::rel_symbol_discovery::LinkedRelDiscovery;
+use crate::runtime_image::RuntimeImage;
+use crate::service_bin::{AssembledServiceBin, AssemblyRecordKind};
+use crate::service_native::{
+    load_pinned_service_bin, DynamicOidPinRegistry, NativeRuntimeImagePins,
+    NativeServiceArtifactPin, PackageArtifactPin, ServiceBinCacheLookup, ServiceNativeError,
+};
+use crate::service_native_lifetime::{NativeServiceLifetimeLease, NativeServiceLifetimeRegistry};
+use crate::service_oid::OidCache;
+use crate::service_oid_adapter::{
+    assemble_service_from_oid_cache, build_service_plan_from_oid_cache, write_service_plan_atomic,
+    ServiceOidAdapterError,
+};
+use crate::source_registry::{RelSourceKind, SourceId};
+
+pub const NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL: &str = "RBE-SERVICE-NATIVE-LAUNCH/2";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeServiceBuildSpec {
+    pub source_id: SourceId,
+    pub service_source_sha256: String,
+    /// All executable Service roots: public exports plus lifecycle hooks.
+    pub entry_oids: Vec<u16>,
+    /// Public Service Fabric call name -> ServiceExport OID. Lifecycle hooks are
+    /// deliberately excluded even though they are present in `entry_oids`.
+    pub exports: BTreeMap<String, u16>,
+    /// Source-level lifecycle verb -> Function OID. These entry roots are kept
+    /// separate from public Service Fabric dispatch for the entire native path.
+    pub lifecycle: BTreeMap<String, u16>,
+    pub service_data: Vec<u8>,
+    pub dependency_hashes: BTreeMap<String, String>,
+    pub compile_options: BTreeMap<String, String>,
+    pub packages: Vec<PackageArtifactPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeServiceLaunchEntry {
+    pub oid: u16,
+    /// Offset into the exact assembled `.bin` payload selected by
+    /// `NativeServiceLaunch::assembly_hash`.
+    pub entry_offset: usize,
+}
+
+/// Immutable launch metadata paired with one exact native Service assembly.
+///
+/// The worker must dispatch by these compiler-owned tables instead of reparsing
+/// REL or guessing canonical symbol names. `plan_hash` + `assembly_hash` bind
+/// every offset to the exact content-addressed payload that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeServiceLaunch {
+    pub source_id: SourceId,
+    pub plan_hash: String,
+    pub assembly_hash: String,
+    pub target_fingerprint: String,
+    pub exports: BTreeMap<String, NativeServiceLaunchEntry>,
+    pub lifecycle: BTreeMap<String, NativeServiceLaunchEntry>,
+}
+
+impl NativeServiceLaunch {
+    pub fn export(&self, name: &str) -> Option<&NativeServiceLaunchEntry> {
+        self.exports.get(name)
+    }
+
+    pub fn lifecycle(&self, verb: &str) -> Option<&NativeServiceLaunchEntry> {
+        self.lifecycle.get(verb)
+    }
+}
+
+/// Stable cross-process representation of one native Service entry.
+///
+/// `entry_offset` is deliberately `u64` rather than `usize`: the bootstrap is a
+/// serialized process boundary and therefore must not inherit the parent
+/// process's pointer width. The worker will later validate conversion to its
+/// local address size before native execution is enabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeServiceWorkerBootstrapEntry {
+    pub oid: u16,
+    pub entry_offset: u64,
+}
+
+/// Immutable metadata a Service worker will eventually consume before entering
+/// the native execution path. This contract contains no evaluator/source input;
+/// it identifies one exact already-validated Runtime Image assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeServiceWorkerBootstrap {
+    pub protocol: String,
+    pub runtime_image_id: String,
+    pub source_id: String,
+    pub oid_index_generation: u64,
+    pub plan_hash: String,
+    pub assembly_hash: String,
+    pub target_fingerprint: String,
+    pub bin_path: PathBuf,
+    pub exports: BTreeMap<String, NativeServiceWorkerBootstrapEntry>,
+    pub lifecycle: BTreeMap<String, NativeServiceWorkerBootstrapEntry>,
+}
+
+impl NativeServiceWorkerBootstrap {
+    pub fn export(&self, name: &str) -> Option<&NativeServiceWorkerBootstrapEntry> {
+        self.exports.get(name)
+    }
+
+    pub fn lifecycle(&self, verb: &str) -> Option<&NativeServiceWorkerBootstrapEntry> {
+        self.lifecycle.get(verb)
+    }
+}
+
+/// Parent-side ownership token for one worker bootstrap. The serializable frame
+/// is intentionally not returned on its own by the activation API: this lease
+/// retains the exact Service OIDs and content-addressed artifacts from spawn
+/// through final worker teardown.
+#[derive(Debug)]
+pub struct NativeServiceWorkerBootstrapLease {
+    bootstrap: NativeServiceWorkerBootstrap,
+    _lifetime: NativeServiceLifetimeLease,
+}
+
+impl NativeServiceWorkerBootstrapLease {
+    pub fn bootstrap(&self) -> &NativeServiceWorkerBootstrap {
+        &self.bootstrap
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltNativeService {
+    pub pin: NativeServiceArtifactPin,
+    pub launch: NativeServiceLaunch,
+    pub plan_path: PathBuf,
+    pub bin_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRuntimeImageBuild {
+    pub pins: NativeRuntimeImagePins,
+    pub services: BTreeMap<SourceId, BuiltNativeService>,
+}
+
+/// One fully validated Runtime Image/native-Service generation with a lifetime
+/// lease already acquired. The private lease keeps all dynamic OID meanings and
+/// content-addressed Service plan/bin artifacts alive until the last `Arc` to
+/// this activation is dropped.
+#[derive(Debug)]
+pub struct NativeRuntimeImageActivation {
+    image: Arc<RuntimeImage>,
+    build: Arc<NativeRuntimeImageBuild>,
+    lifetimes: NativeServiceLifetimeRegistry,
+    _lifetime: NativeServiceLifetimeLease,
+}
+
+impl NativeRuntimeImageActivation {
+    pub fn image(&self) -> &Arc<RuntimeImage> {
+        &self.image
+    }
+
+    pub fn build(&self) -> &Arc<NativeRuntimeImageBuild> {
+        &self.build
+    }
+
+    pub fn pins(&self) -> &NativeRuntimeImagePins {
+        &self.build.pins
+    }
+
+    pub fn launch(&self, source_id: &SourceId) -> Option<&NativeServiceLaunch> {
+        self.build
+            .services
+            .get(source_id)
+            .map(|service| &service.launch)
+    }
+
+    /// Acquire worker-level liveness before exposing the serialized bootstrap.
+    /// The returned lease is intended to live inside the supervised worker
+    /// process record; dropping it after teardown releases only this worker's
+    /// Service-level OID/artifact hold.
+    pub fn worker_bootstrap_lease(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<NativeServiceWorkerBootstrapLease, NativeServiceBuildError> {
+        let built = self.build.services.get(source_id).ok_or_else(|| {
+            NativeServiceBuildError::InvalidService(format!(
+                "Runtime Image {} has no built native Service {source_id}",
+                self.image.image_id
+            ))
+        })?;
+        let lifetime = self
+            .lifetimes
+            .pin_service(&built.pin)
+            .map_err(NativeServiceBuildError::Native)?;
+        let bootstrap = self.worker_bootstrap_frame(source_id)?;
+        Ok(NativeServiceWorkerBootstrapLease {
+            bootstrap,
+            _lifetime: lifetime,
+        })
+    }
+
+    fn worker_bootstrap_frame(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<NativeServiceWorkerBootstrap, NativeServiceBuildError> {
+        let built = self.build.services.get(source_id).ok_or_else(|| {
+            NativeServiceBuildError::InvalidService(format!(
+                "Runtime Image {} has no built native Service {source_id}",
+                self.image.image_id
+            ))
+        })?;
+
+        let bin_path = std::fs::canonicalize(&built.bin_path).map_err(|error| {
+            NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} bin {} cannot be canonicalized for worker bootstrap: {error}",
+                self.image.image_id,
+                built.bin_path.display()
+            ))
+        })?;
+        if !bin_path.is_file() {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} worker bootstrap bin {} is not a file",
+                self.image.image_id,
+                bin_path.display()
+            )));
+        }
+
+        let exports = worker_bootstrap_entries(source_id, "export", &built.launch.exports)?;
+        let lifecycle = worker_bootstrap_entries(source_id, "lifecycle", &built.launch.lifecycle)?;
+
+        Ok(NativeServiceWorkerBootstrap {
+            protocol: NATIVE_SERVICE_WORKER_BOOTSTRAP_PROTOCOL.to_string(),
+            runtime_image_id: self.image.image_id.clone(),
+            source_id: source_id.as_str().to_string(),
+            oid_index_generation: built.pin.oid_index_generation,
+            plan_hash: built.launch.plan_hash.clone(),
+            assembly_hash: built.launch.assembly_hash.clone(),
+            target_fingerprint: built.launch.target_fingerprint.clone(),
+            bin_path,
+            exports,
+            lifecycle,
+        })
+    }
+}
+
+fn worker_bootstrap_entries(
+    source_id: &SourceId,
+    label: &str,
+    entries: &BTreeMap<String, NativeServiceLaunchEntry>,
+) -> Result<BTreeMap<String, NativeServiceWorkerBootstrapEntry>, NativeServiceBuildError> {
+    entries
+        .iter()
+        .map(|(name, entry)| {
+            let entry_offset = u64::try_from(entry.entry_offset).map_err(|_| {
+                NativeServiceBuildError::InvalidDispatch(format!(
+                    "Service {source_id} {label} {name:?} entry offset {} cannot cross the worker bootstrap boundary",
+                    entry.entry_offset
+                ))
+            })?;
+            Ok((
+                name.clone(),
+                NativeServiceWorkerBootstrapEntry {
+                    oid: entry.oid,
+                    entry_offset,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Atomic A -> B holder for fully built native Runtime Image generations.
+///
+/// Acquiring B's lifetime lease happens before callers can place it in this slot.
+/// Swapping therefore never invalidates A: the returned/borrowed `Arc` keeps A's
+/// lifetime lease until every draining owner releases the old activation.
+pub struct NativeRuntimeImageActivationSlot {
+    current: RwLock<Arc<NativeRuntimeImageActivation>>,
+}
+
+impl NativeRuntimeImageActivationSlot {
+    pub fn new(initial: NativeRuntimeImageActivation) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(initial)),
+        }
+    }
+
+    pub fn snapshot(&self) -> Arc<NativeRuntimeImageActivation> {
+        self.current
+            .read()
+            .expect("native Runtime Image activation slot poisoned")
+            .clone()
+    }
+
+    pub fn activate(
+        &self,
+        next: NativeRuntimeImageActivation,
+    ) -> Arc<NativeRuntimeImageActivation> {
+        let next = Arc::new(next);
+        let mut current = self
+            .current
+            .write()
+            .expect("native Runtime Image activation slot poisoned");
+        std::mem::replace(&mut *current, next)
+    }
+
+    /// Snapshot the active generation, acquire a Service-level worker lifetime,
+    /// then let the generation snapshot fall away. The returned lease is enough
+    /// to keep the worker's exact native dependencies alive across a later A->B
+    /// activation swap.
+    pub fn worker_bootstrap_lease(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<NativeServiceWorkerBootstrapLease, NativeServiceBuildError> {
+        let active = self.snapshot();
+        active.worker_bootstrap_lease(source_id)
+    }
+}
+
+/// Turn a completely built Image B into an activation candidate. This validates
+/// the build/pin/launch relationship first and only then acquires its Phase-5
+/// lifetime lease. No active slot is mutated here, so failure always leaves A
+/// untouched.
+pub fn prepare_native_runtime_image_activation(
+    image: RuntimeImage,
+    build: NativeRuntimeImageBuild,
+    lifetimes: &NativeServiceLifetimeRegistry,
+) -> Result<NativeRuntimeImageActivation, NativeServiceBuildError> {
+    validate_activation_build(&image, &build)?;
+    let lifetime = lifetimes
+        .pin_image(&build.pins)
+        .map_err(NativeServiceBuildError::Native)?;
+    Ok(NativeRuntimeImageActivation {
+        image: Arc::new(image),
+        build: Arc::new(build),
+        lifetimes: lifetimes.clone(),
+        _lifetime: lifetime,
+    })
+}
+
+fn validate_activation_build(
+    image: &RuntimeImage,
+    build: &NativeRuntimeImageBuild,
+) -> Result<(), NativeServiceBuildError> {
+    build
+        .pins
+        .validate_for_image(image)
+        .map_err(NativeServiceBuildError::Native)?;
+
+    let pin_services = build.pins.services.keys().cloned().collect::<BTreeSet<_>>();
+    let built_services = build.services.keys().cloned().collect::<BTreeSet<_>>();
+    if pin_services != built_services {
+        return Err(NativeServiceBuildError::ArtifactDrift(format!(
+            "Runtime Image {} native build contains Service artifacts {:?}, but immutable pins contain {:?}",
+            image.image_id, built_services, pin_services
+        )));
+    }
+
+    for (source_id, built) in &build.services {
+        let pin = build.pins.services.get(source_id).ok_or_else(|| {
+            NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} has no immutable pin",
+                image.image_id
+            ))
+        })?;
+        if &built.pin != pin {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} build pin differs from the activation pin set",
+                image.image_id
+            )));
+        }
+        if built.launch.source_id != *source_id
+            || built.launch.plan_hash != pin.plan_hash
+            || built.launch.assembly_hash != pin.assembly_hash
+            || built.launch.target_fingerprint != pin.plan.target_fingerprint
+        {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "Runtime Image {} native Service {source_id} launch metadata does not match its immutable artifact pin",
+                image.image_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Prepare Image B's linked-REL generation using the exact dynamic OIDs still
+/// pinned by active/draining Runtime Images and Service workers. This prevents
+/// callers from accidentally preparing a new generation with an empty pin set.
+pub fn prepare_rel_native_link_for_image_b(
+    cache: &OidCache,
+    discovery: &LinkedRelDiscovery,
+    active_pins: &DynamicOidPinRegistry,
+) -> Result<PreparedRelNativeLink, RelNativeLinkError> {
+    let pinned_oids = active_pins.rel_allocator_pins();
+    prepare_rel_native_link(cache, discovery, &pinned_oids)
+}
+
+/// Consume the exact Phase-4 handoff after its OID index/materialization commit.
+/// The report must describe the same index generation that is currently open;
+/// otherwise the Service plans would be assembled against a different numeric
+/// meaning than the one Phase 4 selected.
+pub fn build_native_runtime_image_from_rel_link(
+    project_root: &Path,
+    cache: &OidCache,
+    image: &RuntimeImage,
+    report: &RelNativeLinkReport,
+    evaluator_fallbacks: BTreeMap<SourceId, String>,
+) -> Result<NativeRuntimeImageBuild, NativeServiceBuildError> {
+    let expected_generation = report.reconcile.delta.generation;
+    let observed_generation = cache.index().generation;
+    if observed_generation != expected_generation {
+        return Err(NativeServiceBuildError::ArtifactDrift(format!(
+            "linked REL handoff targets OID index generation {expected_generation}, current cache is generation {observed_generation}"
+        )));
+    }
+
+    for (source_id, spec) in &report.service_specs {
+        if source_id != &spec.source_id {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "linked REL handoff key {source_id} does not match Service build spec {}",
+                spec.source_id
+            )));
+        }
+    }
+
+    build_native_runtime_image_pins(
+        project_root,
+        cache,
+        image,
+        report.service_specs.values().cloned().collect(),
+        evaluator_fallbacks,
+    )
+}
+
+/// Build one native Service artifact against one immutable in-memory OID cache
+/// snapshot. The generated plan and `.bin` are disposable cache artifacts; the
+/// returned pin + launch descriptor are the exact authority prepared for Runtime
+/// Image activation.
+pub fn build_native_service_artifact(
+    project_root: &Path,
+    cache: &OidCache,
+    image: &RuntimeImage,
+    spec: NativeServiceBuildSpec,
+) -> Result<BuiltNativeService, NativeServiceBuildError> {
+    validate_service_target(image, &spec.source_id)?;
+
+    let exports = spec.exports.clone();
+    let lifecycle = spec.lifecycle.clone();
+    let dependency_hashes =
+        bind_package_dependencies(spec.dependency_hashes, &spec.packages, &spec.source_id)?;
+
+    let plan = build_service_plan_from_oid_cache(
+        cache,
+        spec.source_id.as_str(),
+        spec.service_source_sha256,
+        spec.entry_oids,
+        spec.service_data,
+        dependency_hashes,
+        spec.compile_options,
+    )
+    .map_err(NativeServiceBuildError::Adapter)?;
+
+    let (plan_hash, plan_path) =
+        write_service_plan_atomic(project_root, &plan).map_err(NativeServiceBuildError::Adapter)?;
+    let (bin, bin_path) = assemble_service_from_oid_cache(project_root, cache, &plan)
+        .map_err(NativeServiceBuildError::Adapter)?;
+
+    let pin = NativeServiceArtifactPin::from_assembled(
+        spec.source_id.clone(),
+        cache.index().generation,
+        plan,
+        &bin,
+        spec.packages,
+    )
+    .map_err(NativeServiceBuildError::Native)?;
+
+    if pin.plan_hash != plan_hash {
+        return Err(NativeServiceBuildError::ArtifactDrift(format!(
+            "Service {} plan cache wrote hash {plan_hash}, pin resolved {}",
+            spec.source_id, pin.plan_hash
+        )));
+    }
+
+    let launch = build_native_service_launch(&pin, &bin, exports, lifecycle)?;
+
+    let compiler_cache_root = project_root.join(".cache/compiler");
+    let expected_bin_path = pin
+        .cache_path(&compiler_cache_root)
+        .map_err(NativeServiceBuildError::Native)?;
+    if bin_path != expected_bin_path {
+        return Err(NativeServiceBuildError::ArtifactDrift(format!(
+            "Service {} assembler wrote {}, pin resolves {}",
+            spec.source_id,
+            bin_path.display(),
+            expected_bin_path.display()
+        )));
+    }
+
+    match load_pinned_service_bin(&compiler_cache_root, &pin)
+        .map_err(NativeServiceBuildError::Native)?
+    {
+        ServiceBinCacheLookup::Hit(_) => {}
+        ServiceBinCacheLookup::Miss => {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "Service {} native bin disappeared immediately after atomic assembly",
+                spec.source_id
+            )))
+        }
+        ServiceBinCacheLookup::CorruptEvicted { reason, .. } => {
+            return Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "Service {} native bin failed post-write verification: {reason}",
+                spec.source_id
+            )))
+        }
+    }
+
+    Ok(BuiltNativeService {
+        pin,
+        launch,
+        plan_path,
+        bin_path,
+    })
+}
+
+fn build_native_service_launch(
+    pin: &NativeServiceArtifactPin,
+    bin: &AssembledServiceBin,
+    exports: BTreeMap<String, u16>,
+    lifecycle: BTreeMap<String, u16>,
+) -> Result<NativeServiceLaunch, NativeServiceBuildError> {
+    if bin.plan_hash != pin.plan_hash || bin.assembly_hash != pin.assembly_hash {
+        return Err(NativeServiceBuildError::ArtifactDrift(format!(
+            "Service {} launch metadata was built from an assembly that does not match its immutable pin",
+            pin.source_id
+        )));
+    }
+
+    let required = pin
+        .plan
+        .required_oids
+        .iter()
+        .map(|item| (item.oid, item.kind))
+        .collect::<BTreeMap<_, _>>();
+    let entry_set = pin.plan.entry_oids.iter().copied().collect::<BTreeSet<_>>();
+    let expected_public_entries = pin
+        .plan
+        .entry_oids
+        .iter()
+        .copied()
+        .filter(|oid| required.get(oid) == Some(&AssemblyRecordKind::ServiceExport))
+        .collect::<BTreeSet<_>>();
+    let expected_lifecycle_entries = pin
+        .plan
+        .entry_oids
+        .iter()
+        .copied()
+        .filter(|oid| required.get(oid) == Some(&AssemblyRecordKind::Function))
+        .collect::<BTreeSet<_>>();
+
+    let (launch_exports, observed_public_entries) = build_named_launch_entries(
+        pin,
+        bin,
+        &required,
+        &entry_set,
+        exports,
+        AssemblyRecordKind::ServiceExport,
+        "export",
+    )?;
+    if observed_public_entries != expected_public_entries {
+        return Err(NativeServiceBuildError::InvalidDispatch(format!(
+            "Service {} native dispatch covers OIDs {:?}, but its ServiceExport entry roots are {:?}",
+            pin.source_id, observed_public_entries, expected_public_entries
+        )));
+    }
+
+    let (launch_lifecycle, observed_lifecycle_entries) = build_named_launch_entries(
+        pin,
+        bin,
+        &required,
+        &entry_set,
+        lifecycle,
+        AssemblyRecordKind::Function,
+        "lifecycle",
+    )?;
+    if observed_lifecycle_entries != expected_lifecycle_entries {
+        return Err(NativeServiceBuildError::InvalidDispatch(format!(
+            "Service {} native lifecycle covers OIDs {:?}, but its lifecycle Function entry roots are {:?}",
+            pin.source_id, observed_lifecycle_entries, expected_lifecycle_entries
+        )));
+    }
+    if !observed_public_entries.is_disjoint(&observed_lifecycle_entries) {
+        return Err(NativeServiceBuildError::InvalidDispatch(format!(
+            "Service {} native public-export and lifecycle entry tables overlap",
+            pin.source_id
+        )));
+    }
+
+    Ok(NativeServiceLaunch {
+        source_id: pin.source_id.clone(),
+        plan_hash: pin.plan_hash.clone(),
+        assembly_hash: pin.assembly_hash.clone(),
+        target_fingerprint: pin.plan.target_fingerprint.clone(),
+        exports: launch_exports,
+        lifecycle: launch_lifecycle,
+    })
+}
+
+fn build_named_launch_entries(
+    pin: &NativeServiceArtifactPin,
+    bin: &AssembledServiceBin,
+    required: &BTreeMap<u16, AssemblyRecordKind>,
+    entry_set: &BTreeSet<u16>,
+    entries: BTreeMap<String, u16>,
+    expected_kind: AssemblyRecordKind,
+    label: &str,
+) -> Result<(BTreeMap<String, NativeServiceLaunchEntry>, BTreeSet<u16>), NativeServiceBuildError> {
+    let mut observed = BTreeSet::new();
+    let mut launch = BTreeMap::new();
+    for (name, oid) in entries {
+        if name.trim().is_empty() || name.chars().any(char::is_control) {
+            return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} has invalid native {label} name {name:?}",
+                pin.source_id
+            )));
+        }
+        if !entry_set.contains(&oid) {
+            return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} {label} {name:?} targets OID {oid}, which is not an entry root",
+                pin.source_id
+            )));
+        }
+        match required.get(&oid) {
+            Some(kind) if *kind == expected_kind => {}
+            Some(kind) => {
+                return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                    "Service {} {label} {name:?} targets OID {oid} with kind {kind:?}, expected {expected_kind:?}",
+                    pin.source_id
+                )))
+            }
+            None => {
+                return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                    "Service {} {label} {name:?} targets unpinned OID {oid}",
+                    pin.source_id
+                )))
+            }
+        }
+        if !observed.insert(oid) {
+            return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} maps multiple native {label} names to OID {oid}; aliases are unsupported",
+                pin.source_id
+            )));
+        }
+        let placement = bin.placements.get(&oid).ok_or_else(|| {
+            NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} {label} {name:?} OID {oid} has no assembled placement",
+                pin.source_id
+            ))
+        })?;
+        if placement.entry >= bin.payload.len() {
+            return Err(NativeServiceBuildError::InvalidDispatch(format!(
+                "Service {} {label} {name:?} entry offset {} is outside assembled payload length {}",
+                pin.source_id,
+                placement.entry,
+                bin.payload.len()
+            )));
+        }
+        launch.insert(
+            name,
+            NativeServiceLaunchEntry {
+                oid,
+                entry_offset: placement.entry,
+            },
+        );
+    }
+    Ok((launch, observed))
+}
+
+/// Re-open the exact Service `.bin` selected by a pin. A missing/corrupt cache
+/// entry is rebuilt once from the already-pinned plan plus exact OID records.
+/// If the current OID index no longer matches that plan, rebuilding fails closed
+/// instead of silently assembling against a newer meaning.
+pub fn ensure_pinned_service_bin(
+    project_root: &Path,
+    cache: &OidCache,
+    pin: &NativeServiceArtifactPin,
+) -> Result<PathBuf, NativeServiceBuildError> {
+    let compiler_cache_root = project_root.join(".cache/compiler");
+    match load_pinned_service_bin(&compiler_cache_root, pin)
+        .map_err(NativeServiceBuildError::Native)?
+    {
+        ServiceBinCacheLookup::Hit(_) => {
+            return pin
+                .cache_path(&compiler_cache_root)
+                .map_err(NativeServiceBuildError::Native)
+        }
+        ServiceBinCacheLookup::Miss | ServiceBinCacheLookup::CorruptEvicted { .. } => {}
+    }
+
+    let (rebuilt, path) = assemble_service_from_oid_cache(project_root, cache, &pin.plan)
+        .map_err(NativeServiceBuildError::Adapter)?;
+    if rebuilt.assembly_hash != pin.assembly_hash {
+        return Err(NativeServiceBuildError::ArtifactDrift(format!(
+            "Service {} rebuild produced assembly {} instead of pinned {}",
+            pin.source_id, rebuilt.assembly_hash, pin.assembly_hash
+        )));
+    }
+
+    match load_pinned_service_bin(&compiler_cache_root, pin)
+        .map_err(NativeServiceBuildError::Native)?
+    {
+        ServiceBinCacheLookup::Hit(_) => Ok(path),
+        ServiceBinCacheLookup::Miss => Err(NativeServiceBuildError::ArtifactDrift(format!(
+            "Service {} rebuilt native bin is still missing",
+            pin.source_id
+        ))),
+        ServiceBinCacheLookup::CorruptEvicted { reason, .. } => {
+            Err(NativeServiceBuildError::ArtifactDrift(format!(
+                "Service {} rebuilt native bin is still invalid: {reason}",
+                pin.source_id
+            )))
+        }
+    }
+}
+
+/// Build every native Service selected for Image B before activation. Missing
+/// native specs are allowed only when the caller supplies an explicit evaluator
+/// fallback reason. This preserves the A-running/B-compiling transaction: this
+/// function never mutates the active Runtime Image slot.
+pub fn build_native_runtime_image_pins(
+    project_root: &Path,
+    cache: &OidCache,
+    image: &RuntimeImage,
+    specs: Vec<NativeServiceBuildSpec>,
+    evaluator_fallbacks: BTreeMap<SourceId, String>,
+) -> Result<NativeRuntimeImageBuild, NativeServiceBuildError> {
+    let mut seen = BTreeSet::new();
+    let mut services = BTreeMap::new();
+    let mut pins = BTreeMap::new();
+
+    for spec in specs {
+        if !seen.insert(spec.source_id.clone()) {
+            return Err(NativeServiceBuildError::DuplicateService(spec.source_id));
+        }
+        let built = build_native_service_artifact(project_root, cache, image, spec)?;
+        let source_id = built.pin.source_id.clone();
+        pins.insert(source_id.clone(), built.pin.clone());
+        services.insert(source_id, built);
+    }
+
+    let image_pins = NativeRuntimeImagePins {
+        runtime_image_id: image.image_id.clone(),
+        services: pins,
+        evaluator_fallbacks,
+    };
+    image_pins
+        .validate_for_image(image)
+        .map_err(NativeServiceBuildError::Native)?;
+
+    Ok(NativeRuntimeImageBuild {
+        pins: image_pins,
+        services,
+    })
+}
+
+fn validate_service_target(
+    image: &RuntimeImage,
+    source_id: &SourceId,
+) -> Result<(), NativeServiceBuildError> {
+    let source = image.source(source_id).ok_or_else(|| {
+        NativeServiceBuildError::InvalidService(format!(
+            "Service {source_id} is not present in Runtime Image {}",
+            image.image_id
+        ))
+    })?;
+    if source.kind != RelSourceKind::Service {
+        return Err(NativeServiceBuildError::InvalidService(format!(
+            "native Service build target {source_id} is {}",
+            source.kind
+        )));
+    }
+    if !image.services.contains(source_id) {
+        return Err(NativeServiceBuildError::InvalidService(format!(
+            "Service {source_id} is not in the Runtime Image service set"
+        )));
+    }
+    Ok(())
+}
+
+fn bind_package_dependencies(
+    mut dependencies: BTreeMap<String, String>,
+    packages: &[PackageArtifactPin],
+    source_id: &SourceId,
+) -> Result<BTreeMap<String, String>, NativeServiceBuildError> {
+    let mut seen = BTreeSet::new();
+    for package in packages {
+        let key = package.dependency_key();
+        if !seen.insert(key.clone()) {
+            return Err(NativeServiceBuildError::DependencyConflict(format!(
+                "Service {source_id} repeats package dependency {key}"
+            )));
+        }
+        match dependencies.get(&key) {
+            Some(existing) if existing != &package.artifact_sha256 => {
+                return Err(NativeServiceBuildError::DependencyConflict(format!(
+                    "Service {source_id} dependency {key} already pins {existing}, package pin requests {}",
+                    package.artifact_sha256
+                )))
+            }
+            _ => {
+                dependencies.insert(key, package.artifact_sha256.clone());
+            }
+        }
+    }
+    Ok(dependencies)
+}
+
+#[derive(Debug)]
+pub enum NativeServiceBuildError {
+    Adapter(ServiceOidAdapterError),
+    Native(ServiceNativeError),
+    DuplicateService(SourceId),
+    InvalidService(String),
+    InvalidDispatch(String),
+    DependencyConflict(String),
+    ArtifactDrift(String),
+}
+
+impl fmt::Display for NativeServiceBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Adapter(error) => {
+                write!(formatter, "native Service compiler adapter failed: {error}")
+            }
+            Self::Native(error) => {
+                write!(
+                    formatter,
+                    "native Service pin/cache validation failed: {error}"
+                )
+            }
+            Self::DuplicateService(source) => {
+                write!(
+                    formatter,
+                    "native Runtime Image build repeats Service {source}"
+                )
+            }
+            Self::InvalidService(message)
+            | Self::InvalidDispatch(message)
+            | Self::DependencyConflict(message)
+            | Self::ArtifactDrift(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for NativeServiceBuildError {}

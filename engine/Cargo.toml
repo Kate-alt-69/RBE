@@ -19,10 +19,10 @@ members = [
 # doc comment for why (the container runtime's payment environment
 # needs it too, and a separate Cargo workspace can't share a member
 # crate directly).
-# The SDK authoring toolchain is deliberately standalone as well. Keeping
-# sdk-package/RPX/sdk-backend outside the production engine workspace means
-# `cargo --locked` for backend releases never needs to change merely because
-# package-author tooling changed, and `--build-sdk` can compile a trimmed tree.
+# RPX and sdk-backend remain standalone authoring binaries. sdk-package stays
+# excluded as a workspace member, but the deployment-worker consumes it as a
+# narrow path dependency so hosted validation and local RPX share exactly one
+# manifest/component checker without importing the RPX CLI/toolchain stack.
 # The container runtime is intentionally its own separate Cargo workspace
 # (container-runtime/), not a member of this one. See the migration plan
 # §3 "non-negotiable exception" — it stays a fully separate executable,

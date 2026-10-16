@@ -1,0 +1,301 @@
+//! User-facing RPX publisher workflows built on the frozen Kastrick contract.
+
+use crate::auth_store::{CredentialSource, CredentialStore, ResolvedCredential};
+use crate::publisher_client::{DevicePoll, PublishResponse, PublisherClient};
+use crate::publisher_management::{
+    package_status as request_status, yank_package as request_yank, PackageStatusResponse,
+    YankResponse,
+};
+use anyhow::{bail, Context, Result};
+use std::path::Path;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+
+pub fn login(registry_override: Option<&str>) -> Result<()> {
+    let client = PublisherClient::from_override_or_env(registry_override)?;
+    let store = CredentialStore::discover()?;
+    let device = client.start_device()?;
+
+    println!("RPX LOGIN");
+    println!("  registry: {}", client.base_url());
+    println!("  code: {}", device.user_code);
+    println!("  authorize: {}", device.verification_uri);
+
+    if open_browser(&device.verification_uri) {
+        println!("  browser: opened authorization page");
+    } else {
+        println!("  browser: open the authorization URL above");
+    }
+
+    let interval = device.interval_seconds.clamp(1, 30);
+    loop {
+        if unix_now() >= device.expires_at {
+            bail!("RPX device authorization expired before approval; run `rpx login` again");
+        }
+        match client.poll_device(&device.device_code)? {
+            DevicePoll::Pending => thread::sleep(Duration::from_secs(interval)),
+            DevicePoll::Authorized(token) => {
+                store.save(&client.registry_key(), &token)?;
+                println!("RPX LOGIN OK");
+                println!("  credential: {}", store.path().display());
+                println!("  expires: {}", token.expires_at);
+                println!("  scopes: {}", scope_text(&token.scopes));
+                return Ok(());
+            }
+        }
+    }
+}
+
+pub fn whoami(registry_override: Option<&str>) -> Result<()> {
+    let client = PublisherClient::from_override_or_env(registry_override)?;
+    let store = CredentialStore::discover()?;
+    let credential = require_credential(&store, &client.registry_key())?;
+    let packages = client.publisher_packages(&credential.authorization)?;
+
+    println!("RPX AUTHENTICATED");
+    println!("  registry: {}", client.base_url());
+    println!(
+        "  credential: {}",
+        match credential.source {
+            CredentialSource::Environment => "RPX_TOKEN environment",
+            CredentialSource::Store => "local RPX credential store",
+        }
+    );
+    if let Some(expires_at) = credential.expires_at {
+        println!("  expires: {expires_at}");
+    }
+    if !credential.scopes.is_empty() {
+        println!("  scopes: {}", scope_text(&credential.scopes));
+    }
+    println!("  owned packages: {}", packages.packages.len());
+    for package in packages.packages {
+        println!(
+            "    {}  latest={}  versions={}",
+            package.name,
+            package.latest_stable.as_deref().unwrap_or("none"),
+            package.versions.len()
+        );
+    }
+    Ok(())
+}
+
+pub fn logout(registry_override: Option<&str>) -> Result<()> {
+    let client = PublisherClient::from_override_or_env(registry_override)?;
+    let store = CredentialStore::discover()?;
+    let Some(credential) = store.resolve(&client.registry_key())? else {
+        println!("RPX LOGOUT OK");
+        println!("  no active credential for {}", client.base_url());
+        return Ok(());
+    };
+
+    let revoke = client.revoke(&credential.authorization);
+    match credential.source {
+        CredentialSource::Store => {
+            store.remove(&client.registry_key())?;
+            println!("RPX LOGOUT OK");
+            println!("  local credential removed");
+        }
+        CredentialSource::Environment => {
+            println!("RPX LOGOUT");
+            println!("  credential came from RPX_TOKEN; unset that environment variable locally");
+        }
+    }
+    revoke.context(
+        "local logout completed, but the registry credential could not be revoked remotely",
+    )?;
+    Ok(())
+}
+
+pub fn publish_archive(
+    registry_override: Option<&str>,
+    package: &str,
+    version: &str,
+    archive: &Path,
+) -> Result<PublishResponse> {
+    let client = PublisherClient::from_override_or_env(registry_override)?;
+    let store = CredentialStore::discover()?;
+    let credential = require_credential(&store, &client.registry_key())?;
+    require_scope(&credential, "package.publish")?;
+
+    println!("RPX PUBLISH");
+    println!("  registry: {}", client.base_url());
+    println!("  package: {package}@{version}");
+    println!("  artifact: {}", archive.display());
+
+    let prepared = client.prepare_upload(&credential.authorization, version)?;
+    client.upload_archive(&prepared, archive)?;
+    let published =
+        client.finalize_publish(&credential.authorization, version, &prepared.upload_id)?;
+    if published.release.package != package || published.release.version != version {
+        bail!(
+            "RPX publisher returned a different package identity: expected {package}@{version}, got {}@{}",
+            published.release.package,
+            published.release.version
+        );
+    }
+
+    println!("RPX PUBLISH OK");
+    println!(
+        "  name: {}",
+        if published.claimed_name {
+            "claimed on first publish"
+        } else {
+            "existing owned package"
+        }
+    );
+    println!("  revision: {}", published.revision);
+    println!("  sha256: {}", published.release.archive_sha256);
+    println!("  manifest sha256: {}", published.release.manifest_sha256);
+    println!("  bytes: {}", published.release.size_bytes);
+    Ok(published)
+}
+
+pub fn status(registry_override: Option<&str>, package: &str) -> Result<PackageStatusResponse> {
+    let client = PublisherClient::from_override_or_env(registry_override)?;
+    let response = request_status(&client, package)?;
+
+    println!("RPX PACKAGE STATUS");
+    println!("  registry: {}", client.base_url());
+    println!("  package: {}", response.package.name);
+    println!("  revision: {}", response.revision);
+    println!(
+        "  latest stable: {}",
+        response.package.latest_stable.as_deref().unwrap_or("none")
+    );
+    if let Some(description) = response.package.description.as_deref() {
+        println!("  description: {description}");
+    }
+    println!("  downloads: {}", response.analytics.downloads_total);
+    if let Some(last_download) = response.analytics.downloads_last_at {
+        println!("  last download: {last_download}");
+    }
+    println!(
+        "  releases: published={} active={} yanked={} stable-active={}",
+        response.release_stats.published,
+        response.release_stats.active,
+        response.release_stats.yanked,
+        response.release_stats.stable_active
+    );
+    println!(
+        "  history totals: publishes={} yanks={}",
+        response.release_stats.publishes_total, response.release_stats.yanks_total
+    );
+
+    println!("  versions:");
+    for version in &response.versions {
+        println!(
+            "    {}  state={}  downloads={}  bytes={}  published={}",
+            version.version,
+            if version.yanked { "yanked" } else { "active" },
+            version.downloads,
+            version.size_bytes,
+            version.published_at
+        );
+        if let Some(yanked_at) = version.yanked_at {
+            println!("      yanked-at: {yanked_at}");
+        }
+        println!("      archive-sha256: {}", version.archive_sha256);
+        println!("      manifest-sha256: {}", version.manifest_sha256);
+    }
+
+    println!("  history:");
+    if response.history.is_empty() {
+        println!("    none");
+    } else {
+        for event in &response.history {
+            match event.reason.as_deref() {
+                Some(reason) => println!(
+                    "    {}  {} {}  reason={}",
+                    event.at, event.action, event.version, reason
+                ),
+                None => println!("    {}  {} {}", event.at, event.action, event.version),
+            }
+        }
+    }
+    Ok(response)
+}
+
+pub fn yank(
+    registry_override: Option<&str>,
+    package: &str,
+    version: &str,
+    reason: Option<&str>,
+) -> Result<YankResponse> {
+    let client = PublisherClient::from_override_or_env(registry_override)?;
+    let store = CredentialStore::discover()?;
+    let credential = require_credential(&store, &client.registry_key())?;
+    require_scope(&credential, "package.yank")?;
+
+    println!("RPX YANK");
+    println!("  registry: {}", client.base_url());
+    println!("  package: {package}@{version}");
+    if let Some(reason) = reason {
+        println!("  reason: {}", reason.trim());
+    }
+
+    let response = request_yank(&client, &credential.authorization, package, version, reason)?;
+    println!("RPX YANK OK");
+    println!("  revision: {}", response.revision);
+    println!("  yanked: {}@{}", response.package, response.version);
+    Ok(response)
+}
+
+fn require_credential(store: &CredentialStore, registry_key: &str) -> Result<ResolvedCredential> {
+    store
+        .resolve(registry_key)?
+        .context("RPX is not logged in for this registry; run `rpx login`")
+}
+
+fn require_scope(credential: &ResolvedCredential, required: &str) -> Result<()> {
+    if credential.source == CredentialSource::Environment || credential.scopes.is_empty() {
+        return Ok(());
+    }
+    if !credential.scopes.iter().any(|scope| scope == required) {
+        bail!("stored RPX credential does not grant {required}; run `rpx login` again");
+    }
+    Ok(())
+}
+
+fn scope_text(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "server-managed".to_owned()
+    } else {
+        scopes.join(", ")
+    }
+}
+
+fn open_browser(url: &str) -> bool {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("explorer.exe");
+        command.arg(url);
+        command
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    #[cfg(not(any(windows, unix)))]
+    return false;
+
+    command.spawn().is_ok()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}

@@ -2,6 +2,7 @@ export const LIBRARY_ABI_VERSION = 1;
 export const SDK_VERSION = "0.1.0";
 
 export const capability = Object.freeze({
+  LOG: "log",
   NET_HTTP: "net:http",
   NET_COOKIES: "net:cookies",
   NET_HEADERS: "net:headers",
@@ -9,6 +10,8 @@ export const capability = Object.freeze({
   NET_DNS: "net:dns",
   NET_IP: "net:ip",
   NET_TCP: "net:tcp",
+  NET_TCP_LISTEN: "net:tcp-listen",
+  NET_TLS: "net:tls",
   NET_UDP: "net:udp",
   NET_QUIC: "net:quic",
   NET_WEBSOCKET: "net:websocket",
@@ -29,6 +32,49 @@ function assertBridge(bridge) {
 
 function validComponent(value) {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value);
+}
+
+function assertLibraryName(value) {
+  if (!validComponent(value)) {
+    throw new TypeError(`invalid RBE library name ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+function assertNonEmptyString(value, label) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function assertPort(value) {
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new RangeError("TCP port must be an integer in 1..=65535");
+  }
+  return value;
+}
+
+function assertPositiveInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function optionalTimeout(payload, timeoutMs) {
+  if (timeoutMs !== null && timeoutMs !== undefined) {
+    payload.timeout_ms = assertPositiveInteger(timeoutMs, "timeoutMs");
+  }
+  return payload;
+}
+
+function byteArray(data) {
+  if (data instanceof Uint8Array) return Array.from(data);
+  if (Array.isArray(data) && data.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+    return [...data];
+  }
+  throw new TypeError("TCP write data must be Uint8Array or an array of byte values");
 }
 
 function isPromiseLike(value) {
@@ -84,9 +130,7 @@ function bridgeSessionInfo(bridge) {
 }
 
 export function libraryDescriptor({ name, version, abiMin = 1, abiMax = abiMin }) {
-  if (!validComponent(name)) {
-    throw new TypeError(`invalid RBE library name ${JSON.stringify(name)}`);
-  }
+  assertLibraryName(name);
   if (!Number.isInteger(abiMin) || !Number.isInteger(abiMax) || abiMin < 1 || abiMin > abiMax) {
     throw new TypeError(`invalid RBE ABI range ${abiMin}..=${abiMax}`);
   }
@@ -223,7 +267,169 @@ export class CapabilityClient {
   }
 }
 
-class NetClient {
+export class LoggerClient {
+  constructor(bridge, libraryName, scope = []) {
+    assertBridge(bridge);
+    this.bridge = bridge;
+    this.libraryName = assertLibraryName(libraryName);
+    this.scope = Object.freeze([...scope]);
+  }
+
+  target() {
+    return `lib/${this.libraryName}`;
+  }
+
+  child(name) {
+    if (!validComponent(name)) {
+      throw new TypeError(`invalid RBE logger child scope ${JSON.stringify(name)}`);
+    }
+    return new LoggerClient(this.bridge, this.libraryName, [...this.scope, name]);
+  }
+
+  emit(level, message) {
+    return new CapabilityClient(this.bridge, capability.LOG, this.target()).call(level, {
+      scope: this.scope,
+      message: String(message)
+    });
+  }
+
+  debug(message) { return this.emit("debug", message); }
+  info(message) { return this.emit("info", message); }
+  warn(message) { return this.emit("warn", message); }
+  error(message) { return this.emit("error", message); }
+  fatal(message) { return this.emit("fatal", message); }
+}
+
+export class DnsClient extends CapabilityClient {
+  constructor(bridge) {
+    super(bridge, capability.NET_DNS);
+  }
+
+  lookup(name) { return this.call("lookup", { name: assertNonEmptyString(name, "DNS name") }); }
+  ip(name) { return this.call("ip", { name: assertNonEmptyString(name, "DNS name") }); }
+  mx(name) { return this.call("mx", { name: assertNonEmptyString(name, "DNS name") }); }
+}
+
+export class TcpClient extends CapabilityClient {
+  constructor(bridge) {
+    super(bridge, capability.NET_TCP);
+  }
+
+  connect(host, port, timeoutMs = null) {
+    return this.call("connect", optionalTimeout({
+      host: assertNonEmptyString(host, "TCP host"),
+      port: assertPort(port)
+    }, timeoutMs));
+  }
+
+  write(handle, data, timeoutMs = null) {
+    return this.call("write", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TCP handle"),
+      data: byteArray(data)
+    }, timeoutMs));
+  }
+
+  read(handle, maxBytes, timeoutMs = null) {
+    return this.call("read", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TCP handle"),
+      max_bytes: assertPositiveInteger(maxBytes, "maxBytes")
+    }, timeoutMs));
+  }
+
+  close(handle) {
+    return this.call("close", { handle: assertNonEmptyString(handle, "TCP handle") });
+  }
+}
+
+
+export class TlsClient extends CapabilityClient {
+  constructor(bridge) { super(bridge, capability.NET_TLS); }
+
+  connect(host, port, timeoutMs = null) {
+    return this.call("connect", optionalTimeout({
+      host: assertNonEmptyString(host, "TLS host"),
+      port: assertPort(port)
+    }, timeoutMs));
+  }
+
+  write(handle, data, timeoutMs = null) {
+    return this.call("write", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TLS handle"),
+      data: byteArray(data)
+    }, timeoutMs));
+  }
+
+  read(handle, maxBytes, timeoutMs = null) {
+    return this.call("read", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TLS handle"),
+      max_bytes: assertPositiveInteger(maxBytes, "maxBytes")
+    }, timeoutMs));
+  }
+
+  startTls(handle, timeoutMs = null) {
+    return this.call("start_tls", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TLS handle")
+    }, timeoutMs));
+  }
+
+  close(handle) {
+    return this.call("close", { handle: assertNonEmptyString(handle, "TLS handle") });
+  }
+}
+
+export class TcpListenerClient extends CapabilityClient {
+  constructor(bridge) { super(bridge, capability.NET_TCP_LISTEN); }
+
+  bind(address, port) {
+    return this.call("bind", {
+      address: assertNonEmptyString(address, "TCP listener address"),
+      port: assertPort(port)
+    });
+  }
+
+  accept(handle, timeoutMs = null) {
+    return this.call("accept", optionalTimeout({
+      handle: assertNonEmptyString(handle, "TCP listener handle")
+    }, timeoutMs));
+  }
+
+  write(handle, data, timeoutMs = null) {
+    return this.call("write", optionalTimeout({
+      handle: assertNonEmptyString(handle, "inbound TCP handle"),
+      data: byteArray(data)
+    }, timeoutMs));
+  }
+
+  read(handle, maxBytes, timeoutMs = null) {
+    return this.call("read", optionalTimeout({
+      handle: assertNonEmptyString(handle, "inbound TCP handle"),
+      max_bytes: assertPositiveInteger(maxBytes, "maxBytes")
+    }, timeoutMs));
+  }
+
+  startTls(handle, certChainDer, privateKeyPkcs8Der, timeoutMs = null) {
+    if (!Array.isArray(certChainDer) || certChainDer.length === 0) {
+      throw new TypeError("TLS certificate chain must be a non-empty array");
+    }
+    return this.call("start_tls", optionalTimeout({
+      handle: assertNonEmptyString(handle, "inbound TCP handle"),
+      cert_chain_der: certChainDer.map((certificate) => byteArray(certificate)),
+      private_key_pkcs8_der: byteArray(privateKeyPkcs8Der)
+    }, timeoutMs));
+  }
+
+  closeConnection(handle) {
+    return this.call("close_connection", {
+      handle: assertNonEmptyString(handle, "inbound TCP handle")
+    });
+  }
+
+  close(handle) {
+    return this.call("close", { handle: assertNonEmptyString(handle, "TCP listener handle") });
+  }
+}
+
+export class NetClient {
   constructor(bridge) {
     this.bridge = bridge;
   }
@@ -236,6 +442,18 @@ class NetClient {
   }
 
   http() { return new CapabilityClient(this.bridge, capability.NET_HTTP); }
+  cookies() { return new CapabilityClient(this.bridge, capability.NET_COOKIES); }
+  headers() { return new CapabilityClient(this.bridge, capability.NET_HEADERS); }
+  url() { return new CapabilityClient(this.bridge, capability.NET_URL); }
+  dns() { return new DnsClient(this.bridge); }
+  ip() { return new CapabilityClient(this.bridge, capability.NET_IP); }
+  tcp() { return new TcpClient(this.bridge); }
+  tcpListen() { return new TcpListenerClient(this.bridge); }
+  tls() { return new TlsClient(this.bridge); }
+  udp() { return new CapabilityClient(this.bridge, capability.NET_UDP); }
+  quic() { return new CapabilityClient(this.bridge, capability.NET_QUIC); }
+  websocket() { return new CapabilityClient(this.bridge, capability.NET_WEBSOCKET); }
+  webtransport() { return new CapabilityClient(this.bridge, capability.NET_WEBTRANSPORT); }
   p2p() { return new CapabilityClient(this.bridge, capability.NET_P2P); }
   mask() { return new CapabilityClient(this.bridge, capability.NET_MASK); }
 }
@@ -296,9 +514,15 @@ export class AdvancedClient {
 }
 
 export class RbeSdk {
-  constructor(bridge) {
+  constructor(bridge, libraryName = null) {
     assertBridge(bridge);
+    if (libraryName !== null) assertLibraryName(libraryName);
     this.bridge = bridge;
+    this.libraryName = libraryName;
+  }
+
+  log(libraryName) {
+    return new LoggerClient(this.bridge, assertLibraryName(libraryName));
   }
 
   net() { return new NetClient(this.bridge); }
@@ -316,7 +540,7 @@ export class RbeSdk {
   }
 
   intercept(...interceptors) {
-    return new RbeSdk(new InterceptedBridge(this.bridge, interceptors));
+    return new RbeSdk(new InterceptedBridge(this.bridge, interceptors), this.libraryName);
   }
 
   hostBridge() {

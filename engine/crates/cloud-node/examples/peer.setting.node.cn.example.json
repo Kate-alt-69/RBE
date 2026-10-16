@@ -1,0 +1,26 @@
+{
+  "formatVersion": 1,
+  "node": {
+    "id": "edge-primary",
+    "mode": "primary",
+    "storageRoot": "./.rbe-cloud-node",
+    "backupVersions": 5,
+    "preserveOriginal": true,
+    "videoChunkBytes": 4194304
+  },
+  "upstream": {
+    "url": "https://cloud-node.example.com",
+    "nodeId": "archive-node",
+    "publicKey": "REPLACE_WITH_64_HEX_ED25519_PUBLIC_KEY",
+    "autoReconnect": true,
+    "syncOnConnect": true,
+    "reconnectDelayMs": 2000,
+    "maxReconnectDelayMs": 60000,
+    "pollIntervalMs": 30000
+  },
+  "replication": {
+    "requireBootRecovery": false,
+    "bootRecoveryTimeoutMs": 60000,
+    "targets": []
+  }
+}

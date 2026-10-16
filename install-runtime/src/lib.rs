@@ -62,12 +62,16 @@ mod cache;
 mod graph;
 mod http;
 mod package;
+mod package_service;
 mod prepare;
 mod promotion;
 mod registry;
 mod snapshot;
+mod system_runtime;
 mod target;
 mod verified_worker;
+mod worker_launch;
+mod worker_source;
 
 pub use activation::{
     activate_project_target, recover_project_activation, ActivationRuntimeError,
@@ -76,16 +80,24 @@ pub use activation::{
 pub use artifact::ArtifactStage;
 pub use build_plan::{prepare_managed_build_plans, ManagedBuildPlanError, ManagedPackageBuildPlan};
 pub use cache::stage_artifact_cached as stage_artifact;
-pub use graph::{stage_resolved_root, VerifiedRootGraph};
+pub use graph::{stage_resolved_root, VerifiedCapabilityInventory, VerifiedRootGraph};
 pub use package::{
     inspect_registry_stage, read_verified_rpx_root_indexes, registry_artifact_plan,
     stage_registry_package, VerifiedRegistryPackage, VerifiedRpxRootIndex,
     MAX_RPX_PACKAGE_INDEX_BYTES, RPX_PACKAGE_INDEX,
 };
+pub use package_service::{
+    read_verified_package_services, PackageServiceError, VerifiedPackageServiceSource,
+    MAX_PACKAGE_SERVICES, MAX_PACKAGE_SERVICE_BYTES, PACKAGE_SERVICE_CAPABILITY,
+};
 pub use prepare::{prepare_prebuilt_activation_proofs, PrebuiltPreparationError};
 pub use promotion::{
     promote_artifact, promote_verified_graph, ArtifactPromotionResult, ArtifactPromotionState,
     RootGraphPromotion,
+};
+pub use rbe_install_executor::{
+    library_worker_proxy_bootstrap, GitSourceAcquisitionPlan, GitSourceReceipt,
+    PinnedManagedToolchain, SourceFileDigest, VerifiedWorkerInvocation, WorkerProxyBridgeError,
 };
 pub use registry::{
     RegistryClient, DEFAULT_MAX_REGISTRY_GRAPH_PACKAGES, DEFAULT_MAX_REGISTRY_INDEX_BYTES,
@@ -94,10 +106,22 @@ pub use registry::{
 pub use snapshot::{
     read_verified_rpx_root_snapshots, VerifiedRootSnapshotError, VerifiedRpxRootSnapshot,
 };
+pub use system_runtime::{
+    current_system_runtime_host, load_admitted_system_runtime, AdmittedSystemRuntime,
+    SystemRuntimeAdmissionError, SYSTEM_RUNTIME_ADMISSION_FILE, SYSTEM_RUNTIME_ADMISSION_FORMAT,
+};
 pub use target::{
     load_named_install_target, merge_named_install_target, InstallTargetError, NamedInstallTarget,
 };
 pub use verified_worker::{read_verified_root_worker_identities, VerifiedPackageWorkerIdentity};
+pub use worker_launch::{
+    prepare_verified_library_worker_launch, LibraryWorkerLaunchPreparationError,
+    PreparedLibraryWorkerLaunch,
+};
+pub use worker_source::{
+    prepare_verified_worker_source, MaterializedWorkerSource, VerifiedWorkerSourcePlan,
+    WorkerSourceError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallRuntimeError {
@@ -121,7 +145,9 @@ pub enum InstallRuntimeError {
         #[source]
         source: url::ParseError,
     },
-    #[error("install-runtime network URL must be credential-free HTTPS without a fragment: {0:?}")]
+    #[error(
+        "install-runtime network URL must use credential-free HTTPS without a fragment: {0:?}"
+    )]
     UnsafeUrl(String),
     #[error("install-runtime destination is not publicly routable: {0}")]
     NonPublicDestination(String),

@@ -11,13 +11,25 @@ mod crypto;
 mod durable;
 mod format;
 mod ingest;
+mod local_sync;
 mod protocol;
 #[cfg(feature = "client")]
 mod provider;
 #[cfg(feature = "client")]
+mod provider_diagnostics;
+#[cfg(feature = "client")]
+#[path = "provider_sync_checked.rs"]
 mod provider_sync;
+#[cfg(feature = "client")]
+#[path = "provider_sync_guard.rs"]
+mod provider_sync_guard;
+#[cfg(feature = "client")]
+#[path = "provider_sync.rs"]
+mod provider_sync_raw;
 mod recovery;
+mod registry_ingest;
 mod server;
+mod settings_path;
 mod store;
 mod sync;
 mod transfer;
@@ -39,7 +51,7 @@ pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 pub use config::{
     CloudNodeSettings, NodeMode, NodeSettings, ProviderAuthMode, ProviderAuthSettings,
     ProviderConflictPolicy, ProviderKind, ProviderSettings, ReplicationSettings, ReplicationTarget,
-    UpstreamSettings, SETTINGS_FILE_NAME,
+    UpstreamSettings,
 };
 pub use crypto::{
     load_signing_key_from_env, public_key_hex, sign_challenge, verify_challenge,
@@ -47,6 +59,10 @@ pub use crypto::{
 };
 pub use format::{
     BlobKind, BlobManifest, ByteRangeChange, ChunkRef, FolderEntry, BLOB_FORMAT_VERSION,
+};
+pub use local_sync::{
+    load_local_sync_settings, LocalDirectoryRestoreResult, LocalDirectoryStatus,
+    LocalDirectorySyncResult, LocalSyncSettings,
 };
 pub use protocol::{Frame, FrameKind, CN_PROTOCOL, MAX_FRAME_BYTES};
 #[cfg(feature = "client")]
@@ -57,9 +73,16 @@ pub use provider_sync::{
     ProviderSyncResult, ProviderSyncStatus,
 };
 pub use recovery::{CloudNodeRecoveryReceiver, RecoveryReceipt};
+pub use registry_ingest::{ingest_registry_export, RegistryIngestResult, RegistryStoredObject};
+#[cfg(feature = "client")]
+pub use registry_ingest::{synchronize_registry_export, RegistrySyncResult};
 pub use server::{
     AcceptedKnock, AuthenticatedSession, CloudNodeAuthenticator, DEFAULT_SESSION_TTL_MS,
     MAX_AUTH_PROOF_BYTES,
+};
+pub use settings_path::{
+    discover_settings_path, LEGACY_SETTINGS_FILE_NAME, PREFERRED_SETTINGS_FILE_NAME,
+    PREFERRED_SETTINGS_FILE_NAME as SETTINGS_FILE_NAME,
 };
 pub use store::{CloudNodeStore, StoreSummary, StoredObject};
 pub use sync::{SyncObject, SyncPlan, SyncPlanHeader};

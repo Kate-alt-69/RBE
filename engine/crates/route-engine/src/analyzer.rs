@@ -659,6 +659,7 @@ mod tests {
             imports: vec![target],
             field_bindings: Vec::new(),
             functions: Vec::new(),
+            exports: Vec::new(),
             class_name: "Route".into(),
             methods: vec![MethodDef {
                 verb: "get".into(),

@@ -47,6 +47,9 @@ if ($ShowHelp) {
 }
 if (-not $BuildSdk -and -not $OnlyBinary) { throw 'Selective builder requires --build-sdk and/or --only-<binary>.' }
 
+. (Join-Path $RepoRoot 'build-cache.ps1')
+Initialize-RbeBuildCache $RepoRoot
+
 $hostOs = if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) { 'windows' } elseif ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) { 'macos' } else { 'linux' }
 $hostArch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) { 'X64' {'x64'} 'X86' {'x86'} 'Arm64' {'arm64'} 'Arm' {'armv7'} default {'x64'} }
 
@@ -60,7 +63,11 @@ function Resolve-Target([string]$Os, [string]$Arch, [bool]$UseMusl) {
 }
 function Get-TargetOs([string]$Target) { if ($Target -like '*windows*') { 'windows' } elseif ($Target -like '*darwin*') { 'macos' } else { 'linux' } }
 function Install-Target([string]$Target) { $installed = & rustup target list --installed 2>$null; if ($installed -notcontains $Target) { & rustup target add $Target; if ($LASTEXITCODE -ne 0) { throw "rustup target add $Target failed" } } }
-function Get-BinaryPath([string]$Workspace, [string]$Binary, [string]$Target) { $profile = if ($Release) {'release'} else {'debug'}; $name = if ((Get-TargetOs $Target) -eq 'windows') { "$Binary.exe" } else { $Binary }; return Join-Path (Join-Path (Join-Path $Workspace 'target') $Target) (Join-Path $profile $name) }
+function Get-BinaryPath([string]$Workspace, [string]$Binary, [string]$Target) {
+	$profile = if ($Release) { 'release' } else { 'debug' }
+	$name = if ((Get-TargetOs $Target) -eq 'windows') { "$Binary.exe" } else { $Binary }
+	return [System.IO.Path]::Combine($env:CARGO_TARGET_DIR, $Target, $profile, $name)
+}
 
 $arches = @(); if ($ArchX64) {$arches += 'x64'}; if ($ArchX86) {$arches += 'x86'}; if ($ArchArm64) {$arches += 'arm64'}; if ($ArchArmv7) {$arches += 'armv7'}; if ($arches.Count -eq 0) {$arches = @($hostArch)}
 $targets = New-Object System.Collections.Generic.List[string]

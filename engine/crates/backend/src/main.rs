@@ -22,6 +22,9 @@ mod error_reporter_daemon;
 mod host_bootstrap;
 mod host_capability;
 mod maintenance_notice;
+mod oid_vault;
+#[path = "package_links/approval.rs"]
+mod package_approval;
 mod port_guard;
 mod runtime_image_boot;
 #[allow(dead_code)]
@@ -30,6 +33,7 @@ mod service_boot;
 mod service_control;
 #[allow(dead_code, clippy::too_many_arguments)]
 mod service_mother;
+mod service_native_cutover;
 mod vault_recovery;
 
 mod service_integrity {
@@ -38,20 +42,25 @@ mod service_integrity {
 
 static BACKEND_LOGGING_READY: AtomicBool = AtomicBool::new(false);
 
-fn has_rbe_error_code(details: &str) -> bool {
-    details.lines().any(|line| {
-        let Some(token) = line.split_whitespace().next() else {
-            return false;
-        };
-        token.len() == 7
-            && token.starts_with("RBE")
-            && token.as_bytes()[3..].iter().all(u8::is_ascii_digit)
-    })
+fn is_error_book_code(raw: &str) -> bool {
+    let token = raw.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    let digit_start = token
+        .find(|ch: char| ch.is_ascii_digit())
+        .unwrap_or(token.len());
+    let (namespace, digits) = token.split_at(digit_start);
+    (2..=8).contains(&namespace.len())
+        && namespace.chars().all(|ch| ch.is_ascii_uppercase())
+        && digits.len() == 4
+        && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn has_error_book_code(details: &str) -> bool {
+    details.split_whitespace().any(is_error_book_code)
 }
 
 fn render_backend_boot_fatal(error: &anyhow::Error) -> String {
     let details = format!("{error:#}");
-    if has_rbe_error_code(&details) {
+    if has_error_book_code(&details) {
         details
     } else {
         format!(
@@ -623,7 +632,11 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
-    let runtime_image = runtime_image_boot::compile(&config, service_catalog.as_ref())?;
+    // Keep the immutable compiler-owned Container Task plan alongside its
+    // RuntimeImage; CC must never rediscover or compile REL source.
+    let compiled_image = runtime_image_boot::compile_with_tasks(&config, service_catalog.as_ref())?;
+    let mut container_tasks = compiled_image.container_tasks;
+    let runtime_image = compiled_image.image;
     runtime_image_boot::apply_server_policy(&mut config, &runtime_image.server_policy)?;
     runtime_image_boot::apply_middleware_plan(&mut config, &runtime_image.middleware_plan)?;
     let runtime_image = Arc::new(route_engine::RuntimeImageSlot::new(runtime_image));
@@ -698,6 +711,79 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     };
     boot_trace("vault process ready");
 
+    let oid_vault: Arc<dyn route_engine::OidVaultAuthority> = Arc::new(
+        oid_vault::BackendOidVault::new(vault_instance.clone(), &runtime_paths::binary_dir())?,
+    );
+    runtime_image_boot::prepare_core_oid_cache(&runtime_paths::binary_dir(), oid_vault.clone())?;
+    let runtime_image_snapshot = runtime_image.snapshot();
+    let native_service_cutover = service_native_cutover::prepare_native_service_cutover(
+        runtime_image_snapshot.as_ref(),
+        service_catalog.as_ref(),
+        oid_vault.clone(),
+    )?;
+    if let Some(cutover) = native_service_cutover.as_ref() {
+        tracing::info!(
+            image = %runtime_image_snapshot.image_id,
+            native_services = cutover.native_service_count(),
+            "Vault-attested native Service Runtime Image generation prepared"
+        );
+    }
+
+    // Native Service OID linking has finished. Bind Task OIDs into that same
+    // project-local, Vault-attested OID cache and assemble all CTI blobs before
+    // the Controller can accept ExecuteTask requests.
+    let container_task_report = if container_tasks.tasks.is_empty() {
+        None
+    } else {
+        let mut oid_cache =
+            route_engine::open_service_oid_cache_with_vault(&project_root, oid_vault.clone())?;
+        let report = route_engine::assemble_container_task_cache(
+            &project_root,
+            runtime_image_snapshot.as_ref(),
+            &mut container_tasks,
+            &mut oid_cache,
+            &std::collections::BTreeSet::new(),
+        )?;
+        tracing::info!(
+            image = %runtime_image_snapshot.image_id,
+            tasks = report.artifacts.len(),
+            oid_generation = report.oid_generation,
+            "RELC compiled Container Task Images into the project cache"
+        );
+        Some(report)
+    };
+
+    // Make route->TaskOID addressing an immutable part of the currently active
+    // RuntimeImage before HTTP routing is constructed. RELC has already bound
+    // Task numeric identities; Controller will never infer them from names.
+    if container_task_report.is_some() {
+        let mut activated = runtime_image_snapshot.as_ref().clone();
+        for task in &container_tasks.tasks {
+            if task.kind == route_engine::relc_linked_image::ContainerTaskKind::RouteMethod {
+                let verb = task
+                    .root_symbol
+                    .name
+                    .strip_prefix("Route.")
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "RELC Route Task {:?} has no compiled Route method identity",
+                            task.canonical_id,
+                        )
+                    })?;
+                let oid = task.task_oid.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "RELC Route Task {:?} is missing its linked Task OID",
+                        task.canonical_id,
+                    )
+                })?;
+                activated
+                    .task_oids
+                    .insert((task.source.clone(), verb.to_ascii_lowercase()), oid);
+            }
+        }
+        runtime_image.activate(activated);
+    }
+
     let vault_refresh_task = spawn_vault_refresh(
         vault_instance.clone(),
         maintenance.clone(),
@@ -735,6 +821,22 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     boot_trace(format!(
         "verified container process ready pid={pid:?} address={address}"
     ));
+    if let Some(report) = &container_task_report {
+        let (installed, _) = container_client
+            .activate_task_image(&runtime_image_snapshot.image_id, Vec::new())
+            .await?;
+        if installed != report.artifacts.len() {
+            anyhow::bail!(
+                "Controller CTI activation returned {installed} Tasks, RELC produced {}",
+                report.artifacts.len()
+            );
+        }
+        tracing::info!(
+            image = %runtime_image_snapshot.image_id,
+            tasks = installed,
+            "Controller activated the compiled RuntimeImage Task table"
+        );
+    }
     let container_process = Arc::new(tokio::sync::Mutex::new(initial_container));
     let container_supervisor_task = spawn_container_supervisor(
         container_path.clone(),
@@ -750,7 +852,12 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
         },
     );
 
-    let service_runtime_env = Arc::new(runtime_image.snapshot().environment.to_json());
+    let mut service_runtime_env = runtime_image.snapshot().environment.to_json();
+    service_native_cutover::attach_native_service_cutover(
+        &mut service_runtime_env,
+        native_service_cutover.as_ref(),
+    )?;
+    let service_runtime_env = Arc::new(service_runtime_env);
     let service_mother = match service_catalog.as_ref() {
         Some(catalog) => Some(
             service_mother::spawn(
@@ -1480,7 +1587,7 @@ mod critical_process_supervision_tests {
 
 #[cfg(test)]
 mod backend_boot_diagnostic_tests {
-    use super::{has_rbe_error_code, render_backend_boot_fatal};
+    use super::{has_error_book_code, render_backend_boot_fatal};
 
     #[test]
     fn backend_boot_fatal_preserves_specific_rbe_codes() {
@@ -1490,7 +1597,7 @@ mod backend_boot_diagnostic_tests {
         let rendered = render_backend_boot_fatal(&error);
         assert!(rendered.starts_with("RBE5001 "));
         assert!(!rendered.contains("RBE5099"));
-        assert!(has_rbe_error_code(&rendered));
+        assert!(has_error_book_code(&rendered));
     }
 
     #[test]
@@ -1501,5 +1608,24 @@ mod backend_boot_diagnostic_tests {
         assert!(rendered.contains("synthetic backend startup failure"));
         assert!(rendered
             .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5099"));
+    }
+}
+
+#[cfg(test)]
+mod boot_error_classification_tests {
+    use super::*;
+
+    #[test]
+    fn classified_rel_boot_error_is_not_wrapped_as_rbe5099() {
+        let error = anyhow::anyhow!("REL2216 trusted REL host executor could not be installed");
+        let rendered = render_backend_boot_fatal(&error);
+        assert!(rendered.starts_with("REL2216 "));
+        assert!(!rendered.contains("RBE5099"));
+    }
+
+    #[test]
+    fn unknown_boot_error_still_gets_rbe5099() {
+        let error = anyhow::anyhow!("synthetic unknown boot failure");
+        assert!(render_backend_boot_fatal(&error).starts_with("RBE5099 "));
     }
 }

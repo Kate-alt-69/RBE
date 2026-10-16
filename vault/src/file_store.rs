@@ -47,11 +47,13 @@ impl FileStore {
     }
 
     pub fn get(&self, name: &str) -> anyhow::Result<String> {
+        self.get_optional(name)?
+            .ok_or_else(|| anyhow::anyhow!("credential {name:?} not found in fallback store"))
+    }
+
+    pub fn get_optional(&self, name: &str) -> anyhow::Result<Option<String>> {
         let map = self.load_map()?;
-        let entry = map
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("credential {name:?} not found in fallback store"))?;
-        self.decrypt(entry)
+        map.get(name).map(|entry| self.decrypt(entry)).transpose()
     }
 
     pub fn set(&self, name: &str, value: &str) -> anyhow::Result<()> {

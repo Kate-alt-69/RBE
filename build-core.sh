@@ -2,6 +2,7 @@
 # RBE secure release builder.
 # Builds container-bin first, binds its exact bytes to backend.exe at build time,
 # and packages the same artifact as dist/<target>/dep/container(.exe).
+# Library Host execution is an internal mode of that same attested Container binary.
 # Packaged builds require RBE_CONTAINER_SIGNING_PRIVATE_KEY plus a derived
 # RBE_ADMIN_AUTH_* verifier. Prefer build.sh for interactive password entry.
 set -e
@@ -39,7 +40,7 @@ Architecture Flags:
 Configuration & Profile Flags:
   --musl                Linux targets: build against musl libc instead of glibc
   --no-embed            Do not embed container-bin into backend
-  --dev-content         Copy development api/module directories into dist
+  --dev-content         Copy development api/module content into dist
   --debug               Build with debug profile instead of release
   --target=<triple>     Specify an explicit Rust target triple
   --distro=<alias>      Specify target selection by Linux distribution alias
@@ -85,6 +86,15 @@ if [ "$SHOW_HELP" = true ]; then
     show_help
     exit 0
 fi
+
+# Direct release/core entrypoints must select the same cache as build.sh.
+case "${CARGO_TARGET_DIR:-}" in
+	/*) ;;
+	*)
+		CARGO_TARGET_DIR="$(python3 "$REPO_ROOT/build-cache.py" "$REPO_ROOT")"
+		export CARGO_TARGET_DIR
+		;;
+esac
 
 HOST_OS=$(case "$(uname -s)" in Linux*) echo linux;; Darwin*) echo macos;; MINGW*|MSYS*) echo windows;; *) echo unknown;; esac)
 HOST_ARCH=$(case "$(uname -m)" in x86_64|amd64) echo x64;; i386|i686) echo x86;; aarch64|arm64) echo arm64;; armv7*|armv7l) echo armv7;; *) echo x64;; esac)

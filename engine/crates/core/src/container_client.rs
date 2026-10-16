@@ -4,11 +4,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ipc_protocol::{
-    decode_response, read_frame, write_frame, AwaitResultRequest, BindArtifactRequest,
-    CancelRequest, CapabilityGrant, ExecuteRequest, HealthRequest, InspectRequest,
-    PrepareRefreshRequest, RegisterArtifactRequest, RegisterCapabilityManifestRequest, Request,
-    Response, ResumeRequest, WorkCost as IpcWorkCost, CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES,
-    MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES, MAX_EXECUTION_OUTPUT_BYTES,
+    decode_response, read_frame, write_frame, ActivateTaskImageRequest, AwaitResultRequest,
+    BindArtifactRequest, CancelRequest, CapabilityGrant, ExecuteRequest, ExecuteTaskRequest,
+    HealthRequest, InspectRequest, PrepareRefreshRequest, RegisterArtifactRequest,
+    RegisterCapabilityManifestRequest, Request, Response, ResumeRequest, WorkCost as IpcWorkCost,
+    CAPABILITY_ABI_VERSION, MAX_ARTIFACT_BYTES, MAX_AWAIT_RESULT_MS, MAX_EXECUTION_INPUT_BYTES,
+    MAX_EXECUTION_OUTPUT_BYTES,
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -34,6 +35,14 @@ pub struct ContainerExecutionIdentity<'a> {
 pub struct ContainerCapabilityBinding {
     pub environment: String,
     pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerSubmittedTask {
+    pub runtime_image: String,
+    pub task_oid: u16,
+    pub environment: String,
+    pub execution_id: String,
 }
 
 #[derive(Debug)]
@@ -257,6 +266,92 @@ impl ContainerClient {
                 anyhow::bail!("container execution submission failed [{code}]: {message}")
             }
             other => anyhow::bail!("unexpected container execute response: {other:?}"),
+        }
+    }
+
+    /// Tell Controller that RELC has published an immutable CTI generation.
+    /// Controller verifies all blobs before atomically swapping its active
+    /// lookup table. New calls use the new generation; in-flight Arc owners
+    /// retain the old image until they finish.
+    pub async fn activate_task_image(
+        &self,
+        runtime_image: &str,
+        retire_runtime_images: Vec<String>,
+    ) -> anyhow::Result<(usize, usize)> {
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request_id = next_request_id();
+        let request = Request::ActivateTaskImage(ActivateTaskImageRequest {
+            request_id: request_id.clone(),
+            auth_token: endpoint.token.clone(),
+            runtime_image: runtime_image.to_string(),
+            retire_runtime_images,
+        });
+        match call(endpoint, request, Duration::from_secs(15)).await? {
+            Response::TaskImageActivated {
+                request_id: returned_id,
+                runtime_image: returned_image,
+                task_count,
+                retired_images,
+            } if returned_id == request_id && returned_image == runtime_image => {
+                Ok((task_count, retired_images))
+            }
+            Response::TaskImageActivated { .. } => {
+                anyhow::bail!("Container returned mismatched CTI activation provenance")
+            }
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("Container CTI activation failed [{code}]: {message}")
+            }
+            other => anyhow::bail!("unexpected Container CTI activation response: {other:?}"),
+        }
+    }
+
+    /// Submit a precompiled Task to Controller by RuntimeImage + TaskOID.
+    /// Controller resolves the immutable CTI and returns its execution ID;
+    /// AwaitResult and Cancel use the same existing execution lifecycle.
+    pub async fn execute_task(
+        &self,
+        runtime_image: &str,
+        task_oid: u16,
+        environment: &str,
+        input: Vec<u8>,
+    ) -> anyhow::Result<ContainerSubmittedTask> {
+        if input.len() > MAX_EXECUTION_INPUT_BYTES {
+            anyhow::bail!("Container Task input exceeds the IPC limit");
+        }
+        let endpoint = self
+            .endpoint
+            .read()
+            .expect("container endpoint lock poisoned")
+            .clone();
+        let request_id = next_request_id();
+        let request = Request::ExecuteTask(ExecuteTaskRequest {
+            request_id: request_id.clone(),
+            auth_token: endpoint.token.clone(),
+            runtime_image: runtime_image.to_string(),
+            task_oid,
+            environment: environment.to_string(),
+            input,
+        });
+        match call(endpoint, request, Duration::from_secs(5)).await? {
+            Response::Accepted {
+                request_id: returned_request_id,
+                execution_id,
+            } if returned_request_id == request_id && !execution_id.is_empty() => {
+                Ok(ContainerSubmittedTask {
+                    runtime_image: runtime_image.to_string(),
+                    task_oid,
+                    environment: environment.to_string(),
+                    execution_id,
+                })
+            }
+            Response::Error { code, message, .. } => {
+                anyhow::bail!("Container Task submission failed [{code}]: {message}")
+            }
+            other => anyhow::bail!("unexpected Container ExecuteTask response: {other:?}"),
         }
     }
 
@@ -752,6 +847,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output, b"done");
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod execute_task_phase4_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn execute_task_sends_only_task_addressing_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "test-container-token".to_string();
+        let expected_token = token.clone();
+        let runtime_image = "ab".repeat(32);
+        let expected_runtime_image = runtime_image.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let frame = read_frame(&mut stream).unwrap();
+            let request: Request = serde_json::from_slice(&frame).unwrap();
+            let Request::ExecuteTask(request) = request else {
+                panic!("expected ExecuteTask request");
+            };
+            assert_eq!(request.auth_token, expected_token);
+            assert_eq!(request.runtime_image, expected_runtime_image);
+            assert_eq!(request.task_oid, 31_844);
+            assert_eq!(request.environment, "general-1");
+            assert_eq!(request.input, b"input");
+            write_frame(
+                &mut stream,
+                &Response::TaskResolved {
+                    request_id: request.request_id,
+                    runtime_image: request.runtime_image,
+                    task_oid: request.task_oid,
+                    environment: request.environment,
+                    cti_sha256: "cd".repeat(32),
+                },
+            )
+            .unwrap();
+        });
+
+        let client = ContainerClient::new(address, token, None);
+        let resolved = client
+            .execute_task(&runtime_image, 31_844, "general-1", b"input".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(resolved.runtime_image, runtime_image);
+        assert_eq!(resolved.task_oid, 31_844);
+        assert_eq!(resolved.environment, "general-1");
+        assert_eq!(resolved.cti_sha256, "cd".repeat(32));
         server.join().unwrap();
     }
 }

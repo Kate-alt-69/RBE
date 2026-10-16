@@ -475,6 +475,7 @@ pub fn compile_runtime_image_with_packages(
         capabilities,
         route_wasm_artifacts,
         route_wasm_fallbacks,
+        task_oids: BTreeMap::new(),
         executables,
     })
 }

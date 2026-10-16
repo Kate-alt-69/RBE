@@ -182,6 +182,9 @@ impl TransferChunk {
         if self.data.len() > MAX_TRANSFER_DATA_BYTES {
             anyhow::bail!("Cloud Node transfer chunk exceeds {MAX_TRANSFER_DATA_BYTES} bytes");
         }
+        if self.total_size > 0 && self.data.is_empty() {
+            anyhow::bail!("Cloud Node non-empty transfer resource chunk must make byte progress");
+        }
         let data_len = u64::try_from(self.data.len())
             .map_err(|_| anyhow::anyhow!("Cloud Node transfer chunk size exceeds u64"))?;
         let end = self
@@ -316,5 +319,34 @@ mod tests {
         .unwrap();
         chunk.final_chunk = true;
         assert!(chunk.validate().is_err());
+    }
+
+    #[test]
+    fn non_empty_resources_reject_zero_progress_chunks() {
+        assert!(TransferChunk::new(
+            BlobKind::File,
+            TransferResource::FilePayload,
+            [1u8; 32],
+            [2u8; 32],
+            [2u8; 32],
+            0,
+            4,
+            Vec::new(),
+        )
+        .is_err());
+
+        let empty_hash: [u8; 32] = Sha256::digest([]).into();
+        let empty = TransferChunk::new(
+            BlobKind::File,
+            TransferResource::FilePayload,
+            [1u8; 32],
+            empty_hash,
+            empty_hash,
+            0,
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(empty.final_chunk);
     }
 }

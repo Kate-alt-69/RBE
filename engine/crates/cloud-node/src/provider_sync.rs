@@ -399,24 +399,12 @@ pub async fn synchronize_provider(
     let plan = store.sync_plan()?;
     let local_root = plan.root_hex();
     let history = LocalHistory::open(store, &provider.namespace)?;
-    let existing_head = history.head()?;
+    let mut existing_head = history.head()?;
 
     if let Some(remote_head) = remote.as_ref() {
         if should_adopt_matching_remote_history(existing_head.as_ref(), &local_root, remote_head) {
             import_remote_history(&history, &client, remote_head, &mut remote_cache).await?;
-            let before = ProviderSyncStatus {
-                relation: ProviderSyncRelation::InSync,
-                local_head: remote_head.id.clone(),
-                remote_head: Some(remote_head.id.clone()),
-                local_root: local_root.clone(),
-                remote_root: Some(remote_head.snapshot_root.clone()),
-            };
-            return Ok(ProviderSyncResult {
-                action: ProviderSyncAction::None,
-                final_root: local_root,
-                final_head: remote_head.id.clone(),
-                before,
-            });
+            existing_head = Some(remote_head.clone());
         }
     }
 
@@ -461,12 +449,46 @@ pub async fn synchronize_provider(
     .await?;
 
     match before.relation {
-        ProviderSyncRelation::InSync => Ok(ProviderSyncResult {
-            action: ProviderSyncAction::None,
-            final_root: before.local_root.clone(),
-            final_head: before.local_head.clone(),
-            before,
-        }),
+        ProviderSyncRelation::InSync => {
+            let remote_head = remote.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Cloud Node provider in-sync state has no remote HEAD")
+            })?;
+            if let Err(local_error) = store.verify() {
+                pull_provider_state(
+                    &client,
+                    &history,
+                    store,
+                    remote_head,
+                    &recovery_owner,
+                    &mut remote_cache,
+                )
+                .await
+                .map_err(|remote_error| {
+                    anyhow::anyhow!(
+                        "Cloud Node provider history matches the local root, but the local snapshot failed integrity verification ({local_error}) and same-root provider recovery also failed: {remote_error}"
+                    )
+                })?;
+                return Ok(ProviderSyncResult {
+                    action: ProviderSyncAction::Pull,
+                    final_root: remote_head.snapshot_root.clone(),
+                    final_head: remote_head.id.clone(),
+                    before,
+                });
+            }
+
+            // History equality alone is not proof that lifecycle rules or a
+            // manual provider edit did not remove immutable snapshot objects.
+            // Re-run snapshot validation/repair while keeping HEAD unchanged.
+            let cache_owner = provider_cache_owner(client.namespace());
+            upload_snapshot(&client, store, &plan, &cache_owner).await?;
+            cleanup_outbound_cache(store, &cache_owner).await?;
+            Ok(ProviderSyncResult {
+                action: ProviderSyncAction::None,
+                final_root: before.local_root.clone(),
+                final_head: before.local_head.clone(),
+                before,
+            })
+        }
         ProviderSyncRelation::EmptyRemote | ProviderSyncRelation::LocalAhead => {
             push_provider_state(
                 &client,
@@ -510,14 +532,14 @@ pub async fn synchronize_provider(
             ),
             ProviderConflictPolicy::PreferLocal => {
                 push_provider_state(
-                &client,
-                &history,
-                store,
-                &plan,
-                &local_head,
-                remote.as_ref(),
-            )
-            .await?;
+                    &client,
+                    &history,
+                    store,
+                    &plan,
+                    &local_head,
+                    remote.as_ref(),
+                )
+                .await?;
                 Ok(ProviderSyncResult {
                     action: ProviderSyncAction::ForcedPush,
                     final_root: local_head.snapshot_root.clone(),
@@ -528,14 +550,14 @@ pub async fn synchronize_provider(
             ProviderConflictPolicy::PreferRemote => {
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("Cloud Node provider remote head disappeared"))?;
                 pull_provider_state(
-                &client,
-                &history,
-                store,
-                &remote,
-                &recovery_owner,
-                &mut remote_cache,
-            )
-            .await?;
+                    &client,
+                    &history,
+                    store,
+                    &remote,
+                    &recovery_owner,
+                    &mut remote_cache,
+                )
+                .await?;
                 Ok(ProviderSyncResult {
                     action: ProviderSyncAction::ForcedPull,
                     final_root: remote.snapshot_root.clone(),
@@ -612,6 +634,7 @@ async fn push_provider_state(
     local_head: &HistoryCommit,
     expected_remote: Option<&HistoryCommit>,
 ) -> anyhow::Result<()> {
+    verify_provider_push_source(store)?;
     let cache_owner = provider_cache_owner(client.namespace());
     upload_snapshot(client, store, plan, &cache_owner).await?;
     let commits = history.chain_to_ancestor(
@@ -644,6 +667,12 @@ async fn push_provider_state(
     )
     .await?;
     cleanup_outbound_cache(store, &cache_owner).await
+}
+
+fn verify_provider_push_source(store: &CloudNodeStore) -> anyhow::Result<()> {
+    store.verify().map(|_| ()).map_err(|error| {
+        anyhow::anyhow!("Cloud Node provider push refused corrupted local snapshot: {error}")
+    })
 }
 
 async fn pull_provider_state(
@@ -829,7 +858,7 @@ async fn upload_head(
         format_version: HISTORY_VERSION,
         commit: commit.id.clone(),
     };
-    client
+    let atomic = client
         .put_if_unchanged(
             "history/HEAD.json",
             serde_json::to_vec(&pointer)?,
@@ -837,8 +866,38 @@ async fn upload_head(
             expected_version,
             expected_exists,
         )
-        .await
-        .map(|_| ())
+        .await?;
+    if atomic {
+        return Ok(());
+    }
+
+    // Supabase's native object API and the generic HTTP provider do not expose
+    // a portable compare-and-swap primitive through this provider interface.
+    // Their publication is therefore guarded before the write and verified
+    // immediately afterwards. This cannot provide CAS against a writer that
+    // races after the readback, but it prevents Cloud Node from reporting a
+    // publication as successful when the just-written HEAD was already lost.
+    let observed = remote_head_state(client).await?;
+    verify_non_atomic_head_readback(commit, observed.as_ref().map(|state| &state.commit))
+}
+
+fn verify_non_atomic_head_readback(
+    expected: &HistoryCommit,
+    observed: Option<&HistoryCommit>,
+) -> anyhow::Result<()> {
+    let Some(observed) = observed else {
+        anyhow::bail!(
+            "Cloud Node non-atomic provider HEAD disappeared immediately after publication; retry synchronization"
+        );
+    };
+    if observed != expected {
+        anyhow::bail!(
+            "Cloud Node non-atomic provider HEAD changed immediately after publication: expected {} but found {}; retry synchronization",
+            expected.id,
+            observed.id
+        );
+    }
+    Ok(())
 }
 
 async fn upload_snapshot(
@@ -860,7 +919,14 @@ async fn upload_snapshot(
                 "Cloud Node provider snapshot index for root {root} does not match the local sync plan"
             );
         }
-        return Ok(());
+        if !snapshot_manifest_metadata_matches_plan(&snapshot, plan).await? {
+            anyhow::bail!(
+                "Cloud Node provider snapshot index for root {root} has manifest metadata that does not match the local sync plan"
+            );
+        }
+        if snapshot_resources_available(client, &snapshot).await? {
+            return Ok(());
+        }
     }
 
     let cache_root = prepare_outbound_cache(store, cache_owner, plan).await?;
@@ -1008,6 +1074,105 @@ async fn upload_snapshot(
         );
     }
     Ok(())
+}
+
+async fn snapshot_manifest_metadata_matches_plan(
+    snapshot: &ProviderSnapshot,
+    plan: &SyncPlan,
+) -> anyhow::Result<bool> {
+    let root = plan.root_hex();
+    for object in plan.ordered() {
+        let object_hex = hex::encode(object.object_key);
+        let content_hex = hex::encode(object.content_sha256);
+        let key = format!(
+            "snapshots/{root}/objects/{object_hex}/{content_hex}/{}",
+            object.kind.manifest_name()
+        );
+        let Some(resource) = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.key == key)
+        else {
+            return Ok(false);
+        };
+        let (sha256, size) = hash_and_size(&object.manifest_path).await?;
+        if resource.resource_sha256 != hex::encode(sha256) || resource.size != size {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn snapshot_resources_available(
+    client: &ProviderClient,
+    snapshot: &ProviderSnapshot,
+) -> anyhow::Result<bool> {
+    for resource in &snapshot.resources {
+        if !provider_resource_available(client, resource).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn provider_resource_available(
+    client: &ProviderClient,
+    resource: &ProviderResource,
+) -> anyhow::Result<bool> {
+    let start = resource.size.saturating_sub(1);
+    let Some(mut response) = client.open_download(&resource.key, start).await? else {
+        return Ok(false);
+    };
+
+    if resource.size == 0 {
+        return match response.content_length() {
+            Some(0) => Ok(true),
+            Some(_) => Ok(false),
+            None => Ok(response
+                .chunk()
+                .await
+                .map_err(provider_transport_error)?
+                .is_none()),
+        };
+    }
+
+    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cloud Node provider resource range probe omitted Content-Range for {:?}",
+                    resource.key
+                )
+            })?;
+        let total = content_range_total(content_range).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cloud Node provider resource range probe returned malformed Content-Range {content_range:?} for {:?}",
+                resource.key
+            )
+        })?;
+        return Ok(total == resource.size);
+    }
+
+    if let Some(length) = response.content_length() {
+        return Ok(length == resource.size);
+    }
+
+    // If an origin ignores Range and omits Content-Length, a tiny existence
+    // probe cannot prove the immutable object's exact size. Treat that response
+    // as ambiguous so upload_snapshot falls through to create/collision handling,
+    // where the existing object is fully size/hash verified before publication.
+    Ok(false)
+}
+
+fn content_range_total(value: &str) -> Option<u64> {
+    let (_, total) = value.rsplit_once('/')?;
+    if total == "*" {
+        return None;
+    }
+    total.parse().ok()
 }
 
 async fn hash_and_size(path: &Path) -> anyhow::Result<([u8; 32], u64)> {
@@ -1650,6 +1815,37 @@ mod tests {
         assert!(!snapshot_matches_plan(&poisoned, &plan).unwrap());
     }
 
+    #[tokio::test]
+    async fn existing_provider_snapshot_manifest_metadata_must_match_local_manifest() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("file.blob.cn");
+        fs::write(&manifest, b"authoritative-manifest").unwrap();
+        let mut plan = matching_file_sync_plan();
+        plan.files[0].manifest_path = manifest.clone();
+
+        let (manifest_sha, manifest_size) = hash_and_size(&manifest).await.unwrap();
+        let mut snapshot = valid_file_provider_snapshot();
+        snapshot.resources[0].resource_sha256 = hex::encode(manifest_sha);
+        snapshot.resources[0].size = manifest_size;
+        assert!(snapshot_manifest_metadata_matches_plan(&snapshot, &plan)
+            .await
+            .unwrap());
+
+        snapshot.resources[0].resource_sha256 = "55".repeat(32);
+        assert!(!snapshot_manifest_metadata_matches_plan(&snapshot, &plan)
+            .await
+            .unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_range_probe_reads_declared_total_size() {
+        assert_eq!(content_range_total("bytes 4-4/5"), Some(5));
+        assert_eq!(content_range_total("bytes 0-0/*"), None);
+        assert_eq!(content_range_total("not-a-range"), None);
+    }
+
     #[test]
     fn provider_snapshot_file_payload_hash_matches_content() {
         let mut snapshot = valid_file_provider_snapshot();
@@ -1678,6 +1874,51 @@ mod tests {
         let mut missing = valid_file_provider_snapshot();
         missing.resources.pop();
         assert!(validate_snapshot(&missing).is_err());
+    }
+
+    #[test]
+    fn provider_push_rejects_corrupted_local_snapshot() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node": {
+                "id": "node-a",
+                "storageRoot": root,
+                "backupVersions": 5,
+                "preserveOriginal": true,
+                "videoChunkBytes": 1048576
+            }
+        }))
+        .unwrap();
+        let source = root.join("users.db");
+        fs::write(&source, b"provider-authoritative-bytes").unwrap();
+        let store = CloudNodeStore::open(&settings).unwrap();
+        let stored = store.store_file(&source, "db/users.db").unwrap();
+        verify_provider_push_source(&store).unwrap();
+
+        let payload = store
+            .summary()
+            .storage
+            .join(&stored.object_key)
+            .join("versions")
+            .join(&stored.content_sha256)
+            .join("payload");
+        fs::write(&payload, b"corrupt").unwrap();
+        let error = verify_provider_push_source(&store).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider push refused corrupted local snapshot"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_atomic_head_publish_requires_exact_readback() {
+        let expected = new_commit("local-node", None, &"11".repeat(32)).unwrap();
+        let other = new_commit("remote-node", None, &"22".repeat(32)).unwrap();
+
+        verify_non_atomic_head_readback(&expected, Some(&expected)).unwrap();
+        assert!(verify_non_atomic_head_readback(&expected, None).is_err());
+        assert!(verify_non_atomic_head_readback(&expected, Some(&other)).is_err());
     }
 
     #[tokio::test]

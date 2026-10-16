@@ -24,7 +24,7 @@ pub const SESSION_PROOF_HEADER: &str = "x-rbe-cn-proof";
 const MAX_PROOF_RESPONSE_BYTES: usize = 1024;
 const MAX_SYNC_RESPONSE_BYTES: usize = 4096;
 const MAX_TRANSFER_RESPONSE_BYTES: usize = 4096;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedPeer {
@@ -64,14 +64,12 @@ pub async fn probe_upstream(settings: &CloudNodeSettings) -> anyhow::Result<Auth
     if response.status() != reqwest::StatusCode::OK {
         anyhow::bail!("Cloud Node upstream did not accept authentication");
     }
-    let advertised = response.content_length().unwrap_or(0);
-    if advertised > MAX_PROOF_RESPONSE_BYTES as u64 {
-        anyhow::bail!("Cloud Node upstream authentication response is oversized");
-    }
-    let body = response.bytes().await?;
-    if body.len() > MAX_PROOF_RESPONSE_BYTES {
-        anyhow::bail!("Cloud Node upstream authentication response is oversized");
-    }
+    let body = read_limited_response(
+        response,
+        MAX_PROOF_RESPONSE_BYTES,
+        "Cloud Node upstream authentication response",
+    )
+    .await?;
     let accept = NodeProof::decode(&body)?;
     accept.verify_accepts(&knock)?;
     accept.verify_freshness(now_ms()?, DEFAULT_AUTH_SKEW_MS)?;
@@ -245,8 +243,9 @@ pub async fn synchronize_upstream(
         );
     }
 
-    // Only remove the durable spool after REMOTE proves the exact root
-    // was committed. Network/protocol failures return earlier and keep it.
+    // REMOTE has already proved the exact root was committed. Outbound cache
+    // removal is post-commit garbage collection and must not turn a successful
+    // synchronization into a reported failure.
     cleanup_outbound_cache(store, &peer.node_id).await?;
     Ok(SyncNegotiation { local, remote })
 }
@@ -453,7 +452,13 @@ pub(crate) async fn cleanup_outbound_cache(
     match durable::remove_dir_all_async(root).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Err(_error) => {
+            // Once a peer has proved activation, or a provider HEAD has been
+            // published, this cache is only disposable local garbage. Leave it
+            // in place for a later matching-root cleanup instead of changing the
+            // already-committed synchronization result into a failure.
+            Ok(())
+        }
     }
 }
 
@@ -599,18 +604,58 @@ async fn post_authenticated_frame(
             response.status()
         );
     }
-    if response.content_length().unwrap_or(0) > maximum_response_bytes as u64 {
-        anyhow::bail!("Cloud Node authenticated response is oversized");
-    }
-    let body = response.bytes().await?;
-    if body.len() > maximum_response_bytes {
-        anyhow::bail!("Cloud Node authenticated response is oversized");
-    }
+    let body = read_limited_response(
+        response,
+        maximum_response_bytes,
+        "Cloud Node authenticated response",
+    )
+    .await?;
     let response = Frame::decode(&body)?;
     if response.session != peer.session {
         anyhow::bail!("Cloud Node upstream response uses a different authenticated session");
     }
     Ok(response)
+}
+
+async fn read_limited_response(
+    mut response: reqwest::Response,
+    maximum_bytes: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let maximum_u64 = u64::try_from(maximum_bytes).unwrap_or(u64::MAX);
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum_u64)
+    {
+        anyhow::bail!("{label} is oversized");
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(maximum_bytes);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        append_limited_response_chunk(&mut body, &chunk, maximum_bytes, label)?;
+    }
+    Ok(body)
+}
+
+fn append_limited_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    maximum_bytes: usize,
+    label: &str,
+) -> anyhow::Result<()> {
+    let next_len = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| anyhow::anyhow!("{label} size overflow"))?;
+    if next_len > maximum_bytes {
+        anyhow::bail!("{label} is oversized");
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn ensure_expected_peer(
@@ -629,8 +674,9 @@ fn ensure_expected_peer(
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(REQUEST_TIMEOUT)
+        .read_timeout(REQUEST_READ_TIMEOUT)
         .build()?)
 }
 
@@ -727,6 +773,61 @@ mod tests {
         cleanup_outbound_cache(&store, "remote-test").await.unwrap();
         assert!(!outbound_peer_cache_root(&store, "remote-test").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_cache_cleanup_failure_is_non_fatal() {
+        let root = cache_test_root("cleanup-non-fatal");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = CloudNodeStore::open(&cache_test_settings(&root)).unwrap();
+        let peer_root = outbound_peer_cache_root(&store, "remote-test");
+        std::fs::create_dir_all(peer_root.parent().unwrap()).unwrap();
+        std::fs::write(&peer_root, b"not-a-directory").unwrap();
+
+        cleanup_outbound_cache(&store, "remote-test").await.unwrap();
+        assert!(peer_root.is_file());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_http_client_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let response = http_client()
+            .unwrap()
+            .get(format!("http://{address}/start"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_response_accumulator_rejects_oversize_before_append() {
+        let mut body = vec![1u8; 4];
+        append_limited_response_chunk(&mut body, &[2u8; 2], 6, "test response").unwrap();
+        assert_eq!(body.len(), 6);
+
+        let error = append_limited_response_chunk(&mut body, &[3], 6, "test response").unwrap_err();
+        assert!(error.to_string().contains("oversized"));
+        assert_eq!(body.len(), 6);
     }
 
     #[test]

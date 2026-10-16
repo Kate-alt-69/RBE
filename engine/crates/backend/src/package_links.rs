@@ -1,16 +1,88 @@
+pub(crate) use crate::package_approval as approval;
+#[path = "package_links/crypto.rs"]
+pub(crate) mod crypto;
+#[path = "package_links/host.rs"]
 pub(crate) mod host;
+#[path = "package_links/storage.rs"]
+pub(crate) mod storage;
+#[path = "package_links/tcp.rs"]
+pub(crate) mod tcp;
+#[path = "package_links/tls.rs"]
+pub(crate) mod tls;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context};
-use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex};
+use core_lib::{
+    LibraryCapabilityGrant, LibraryHostCall, LibraryHostCallReply, LibrarySessionBinding,
+};
+use rbe_install_runtime::{ProjectInstallRecovery, VerifiedRpxRootIndex, VerifiedRpxRootSnapshot};
+use route_engine::oid_link::canonical_package_export_id;
 use route_engine::relc::{
     PackageExportLink, PackageLinkContext, PackageRootLink, PACKAGE_LINK_FORMAT,
 };
 use serde::Deserialize;
 
-const RPX_PACKAGE_INDEX_FORMAT: u32 = 1;
+const LEGACY_RPX_PACKAGE_INDEX_FORMAT: u32 = 1;
+const RPX_PACKAGE_INDEX_FORMAT: u32 = 2;
+
+type LibraryHostDispatchFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<LibraryHostCallReply>> + 'a>>;
+type LibraryHostDispatcher = for<'a> fn(
+    &'a str,
+    &'a LibrarySessionBinding,
+    &'a LibraryHostCall,
+) -> LibraryHostDispatchFuture<'a>;
+
+fn dispatch_verified_host_call<'a>(
+    package: &'a str,
+    binding: &'a LibrarySessionBinding,
+    call: &'a LibraryHostCall,
+) -> LibraryHostDispatchFuture<'a> {
+    if call.capability == tcp::CAPABILITY {
+        Box::pin(tcp::dispatch_authorized_call(package, binding, call))
+    } else if call.capability == tls::CAPABILITY {
+        Box::pin(async move {
+            let grant = binding
+                .authorize_host_call(call)
+                .context("authorize package TLS call against accepted Library Host session")?;
+            let payload = tls::dispatch_authorized_call(package, binding, call).await?;
+            if payload.len() > grant.max_response_bytes {
+                bail!(
+                    "package TLS response exceeded admitted capability limit: limit={}, observed={}",
+                    grant.max_response_bytes,
+                    payload.len()
+                );
+            }
+            LibraryHostCallReply::success(call.call_id, payload)
+                .context("encode successful package TLS host-call reply")
+        })
+    } else if call.capability == storage::CAPABILITY {
+        Box::pin(async move { storage::dispatch_authorized_call(package, binding, call) })
+    } else if call.capability == crypto::CAPABILITY {
+        Box::pin(async move { crypto::dispatch_authorized_call(binding, call) })
+    } else {
+        Box::pin(host::dispatch_authorized_host_call(package, binding, call))
+    }
+}
+
+struct LibraryHostSessionEntry {
+    binding: LibrarySessionBinding,
+    dispatcher: LibraryHostDispatcher,
+}
+
+static LIBRARY_HOST_SESSIONS: OnceLock<Mutex<BTreeMap<String, LibraryHostSessionEntry>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct LoadedPackageRoots {
+    pub links: PackageLinkContext,
+    pub roots: BTreeMap<String, VerifiedRpxRootSnapshot>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,18 +106,21 @@ struct RpxPackageIdentity {
 #[serde(deny_unknown_fields)]
 struct RpxPackageExport {
     name: String,
+    /// Format 2 requires this stable RPX identity. It remains optional only so
+    /// already-installed format-1 artifacts can be linked during migration.
+    #[serde(default)]
+    export_id: Option<String>,
     source: String,
     language: String,
 }
 
-/// Build RELC's package namespace from SHA-verified explicit package roots.
-///
-/// `read_verified_rpx_root_snapshots` joins each public RPX export index with
-/// the independently verified worker identity for the same active package
-/// graph. This boundary then maps only public `exports` into RELC;
-/// `private_dependencies` is parsed only to validate index shape and never
-/// creates a namespace.
 pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
+    let loaded = load_with_workers(project_root)?;
+    install_verified_host_sessions(project_root, &loaded.roots)?;
+    Ok(loaded.links)
+}
+
+pub fn load_with_workers(project_root: &Path) -> anyhow::Result<LoadedPackageRoots> {
     let recovery = rbe_install_runtime::recover_project_activation(project_root)
         .context("recover interrupted project package activation before package linking")?;
     if recovery != ProjectInstallRecovery::Clean {
@@ -57,16 +132,142 @@ pub fn load(project_root: &Path) -> anyhow::Result<PackageLinkContext> {
 
     let snapshots = rbe_install_runtime::read_verified_rpx_root_snapshots(project_root)
         .context("load verified RPX package root snapshots")?;
+    from_verified_snapshots(snapshots)
+}
+
+fn build_host_sessions<F>(
+    roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
+    mut grants_for: F,
+) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>>
+where
+    F: FnMut(&str, &VerifiedRpxRootSnapshot) -> anyhow::Result<Vec<LibraryCapabilityGrant>>,
+{
+    let mut sessions = BTreeMap::new();
+    for (package, snapshot) in roots {
+        let grants = grants_for(package, snapshot)?;
+        let binding = host::bind_session(snapshot, grants)
+            .with_context(|| format!("bind Library Host session for verified root {package:?}"))?;
+        let entry = LibraryHostSessionEntry {
+            binding,
+            dispatcher: dispatch_verified_host_call,
+        };
+        if sessions.insert(package.clone(), entry).is_some() {
+            bail!("duplicate Library Host session for verified root {package:?}");
+        }
+    }
+    Ok(sessions)
+}
+
+fn build_approved_host_sessions(
+    project_root: &Path,
+    roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
+) -> anyhow::Result<BTreeMap<String, LibraryHostSessionEntry>> {
+    build_host_sessions(roots, |package, snapshot| {
+        let approved = approval::approved_runtime_capabilities(project_root, snapshot)
+            .with_context(|| format!("load approved RBE privileges for root {package:?}"))?;
+        let mut grants = host::grants_for_verified_requests(&approved)
+            .with_context(|| format!("materialize approved RBE privileges for root {package:?}"))?;
+        if approved
+            .iter()
+            .any(|capability| capability == tcp::CAPABILITY)
+        {
+            grants.push(tcp::grant().with_context(|| {
+                format!("materialize approved TCP privilege for root {package:?}")
+            })?);
+        }
+        if approved
+            .iter()
+            .any(|capability| capability == tls::CAPABILITY)
+        {
+            grants.push(tls::grant().with_context(|| {
+                format!("materialize approved TLS privilege for root {package:?}")
+            })?);
+        }
+        if approved
+            .iter()
+            .any(|capability| capability == storage::CAPABILITY)
+        {
+            grants.push(storage::grant().with_context(|| {
+                format!("materialize approved storage privilege for root {package:?}")
+            })?);
+        }
+        if approved
+            .iter()
+            .any(|capability| capability == crypto::CAPABILITY)
+        {
+            grants.push(crypto::grant().with_context(|| {
+                format!("materialize approved crypto privilege for root {package:?}")
+            })?);
+        }
+        Ok(grants)
+    })
+}
+
+fn install_verified_host_sessions(
+    project_root: &Path,
+    roots: &BTreeMap<String, VerifiedRpxRootSnapshot>,
+) -> anyhow::Result<()> {
+    storage::configure_project_root(project_root)
+        .context("configure project-scoped package storage authority")?;
+    let sessions = build_approved_host_sessions(project_root, roots)?;
+    let registry = LIBRARY_HOST_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut active = registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Library Host session registry lock is poisoned"))?;
+
+    tcp::clear_all();
+    tls::clear_all();
+    for session in active.values_mut() {
+        session.binding.close();
+    }
+    *active = sessions;
+
+    let trusted_dispatchers = active
+        .values()
+        .filter(|session| {
+            std::ptr::fn_addr_eq(
+                session.dispatcher,
+                dispatch_verified_host_call as LibraryHostDispatcher,
+            )
+        })
+        .count();
+    if trusted_dispatchers != active.len() {
+        bail!(
+            "Library Host session registry contains an untrusted dispatcher: expected {}, verified {}",
+            active.len(),
+            trusted_dispatchers
+        );
+    }
+
+    tracing::info!(
+        package_sessions = active.len(),
+        trusted_dispatchers,
+        "prepared verified Library Host sessions from project-local approved privileges"
+    );
+    Ok(())
+}
+
+fn from_verified_snapshots(
+    snapshots: Vec<VerifiedRpxRootSnapshot>,
+) -> anyhow::Result<LoadedPackageRoots> {
     let indexes = snapshots
-        .into_iter()
+        .iter()
         .map(|snapshot| VerifiedRpxRootIndex {
-            package: snapshot.package,
-            version: snapshot.version,
-            artifact_sha256: snapshot.artifact_sha256,
-            index_json: snapshot.index_json,
+            package: snapshot.package.clone(),
+            version: snapshot.version.clone(),
+            artifact_sha256: snapshot.artifact_sha256.clone(),
+            index_json: snapshot.index_json.clone(),
         })
         .collect();
-    from_verified_indexes(indexes)
+    let links = from_verified_indexes(indexes)?;
+    let mut roots = BTreeMap::new();
+    for snapshot in snapshots {
+        let package = snapshot.package.clone();
+        if roots.insert(package.clone(), snapshot).is_some() {
+            bail!("duplicate verified RPX root package {package:?}");
+        }
+    }
+    Ok(LoadedPackageRoots { links, roots })
 }
 
 fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<PackageLinkContext> {
@@ -80,11 +281,15 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
                     verified.package
                 )
             })?;
+        let index_format = index.format;
 
-        if index.format != RPX_PACKAGE_INDEX_FORMAT {
+        if !matches!(
+            index_format,
+            LEGACY_RPX_PACKAGE_INDEX_FORMAT | RPX_PACKAGE_INDEX_FORMAT
+        ) {
             bail!(
                 "unsupported RPX package index format {} for explicit root {:?}",
-                index.format,
+                index_format,
                 verified.package
             );
         }
@@ -114,12 +319,10 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
             );
         }
 
-        // Parsed deliberately, never linked. This keeps malformed indexes from
-        // slipping through while making the visibility rule impossible to
-        // accidentally widen through iteration over transitive dependency data.
         let _private_dependency_names = index.private_dependencies.keys().collect::<BTreeSet<_>>();
 
         let mut exports = BTreeMap::new();
+        let mut verified_export_ids = BTreeSet::new();
         for export in index.exports {
             if export.language == "global" {
                 bail!(
@@ -139,6 +342,43 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
                     verified.package
                 );
             }
+
+            let expected_export_id = canonical_package_export_id(&verified.package, &export.name)
+                .with_context(|| {
+                format!(
+                    "derive deterministic RPX export identity for {:?} from {:?}",
+                    export.name, verified.package
+                )
+            })?;
+            match export.export_id.as_deref() {
+                Some(observed_export_id) => {
+                    if observed_export_id != expected_export_id {
+                        bail!(
+                            "RPX export ID mismatch for {:?} from {:?}: expected {:?}, observed {:?}",
+                            export.name,
+                            verified.package,
+                            expected_export_id,
+                            observed_export_id
+                        );
+                    }
+                    if !verified_export_ids.insert(observed_export_id.to_string()) {
+                        bail!(
+                            "duplicate deterministic RPX export ID {:?} in explicit root {:?}",
+                            observed_export_id,
+                            verified.package
+                        );
+                    }
+                }
+                None if index_format == RPX_PACKAGE_INDEX_FORMAT => {
+                    bail!(
+                        "format-2 RPX export {:?} from {:?} is missing export_id",
+                        export.name,
+                        verified.package
+                    )
+                }
+                None => {}
+            }
+
             let name = export.name;
             if exports
                 .insert(
@@ -186,6 +426,8 @@ fn from_verified_indexes(indexes: Vec<VerifiedRpxRootIndex>) -> anyhow::Result<P
 
 #[cfg(test)]
 mod tests {
+    use rbe_install_runtime::VerifiedPackageWorkerIdentity;
+
     use super::*;
 
     fn verified(index_json: &str) -> VerifiedRpxRootIndex {
@@ -194,6 +436,29 @@ mod tests {
             version: "2.0.0".into(),
             artifact_sha256: "a".repeat(64),
             index_json: index_json.into(),
+        }
+    }
+
+    fn snapshot(index_json: &str) -> VerifiedRpxRootSnapshot {
+        VerifiedRpxRootSnapshot {
+            package: "advancenet".into(),
+            version: "2.0.0".into(),
+            artifact_sha256: "a".repeat(64),
+            index_json: index_json.into(),
+            worker: VerifiedPackageWorkerIdentity {
+                package: "advancenet".into(),
+                version: "2.0.0".into(),
+                artifact_sha256: "a".repeat(64),
+                rbe_abi_min: 1,
+                rbe_abi_max: 1,
+                sdk_language: "bun".into(),
+                sdk_name: "@rbe/sdk".into(),
+                sdk_version: "0.1.9".into(),
+                runtime_kind: "bun".into(),
+                runtime_version: "1.3.7".into(),
+                runtime_entry: "src/index.js".into(),
+                runtime_managed: true,
+            },
         }
     }
 
@@ -223,6 +488,73 @@ mod tests {
         assert_eq!(request.entry, "components/request/request.ts");
         assert_eq!(request.language, "typescript");
         assert!(links.root("secret-parser").is_none());
+    }
+
+    #[test]
+    fn deterministic_export_id_is_verified_when_present() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","export_id":"lib_advancenet_request","source":"components/request/request.ts","language":"typescript"}]"#,
+        );
+        assert!(from_verified_indexes(vec![verified(&input)]).is_ok());
+    }
+
+    #[test]
+    fn format_two_requires_deterministic_export_id() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","source":"components/request/request.ts","language":"typescript"}]"#,
+        )
+        .replacen("\"format\": 1", "\"format\": 2", 1);
+        let error = from_verified_indexes(vec![verified(&input)]).unwrap_err();
+        assert!(error.to_string().contains("missing export_id"));
+    }
+
+    #[test]
+    fn format_two_accepts_verified_export_id() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","export_id":"lib_advancenet_request","source":"components/request/request.ts","language":"typescript"}]"#,
+        )
+        .replacen("\"format\": 1", "\"format\": 2", 1);
+        assert!(from_verified_indexes(vec![verified(&input)]).is_ok());
+    }
+
+    #[test]
+    fn forged_export_id_is_rejected() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","export_id":"lib_other_request","source":"components/request/request.ts","language":"typescript"}]"#,
+        );
+        let error = from_verified_indexes(vec![verified(&input)]).unwrap_err();
+        assert!(error.to_string().contains("export ID mismatch"));
+    }
+
+    #[test]
+    fn verified_snapshot_is_retained_beside_relc_links() {
+        let input = index(
+            "{}",
+            r#"[{"name":"request","source":"components/request/request.ts","language":"typescript"}]"#,
+        );
+        let loaded = from_verified_snapshots(vec![snapshot(&input)]).unwrap();
+        assert_eq!(loaded.links.roots.len(), 1);
+        let retained = loaded.roots.get("advancenet").unwrap();
+        assert_eq!(retained.worker.runtime_kind, "bun");
+        assert_eq!(retained.worker.runtime_version, "1.3.7");
+        assert_eq!(retained.artifact_sha256, "a".repeat(64));
+
+        let sessions =
+            build_host_sessions(&loaded.roots, |_package, _snapshot| Ok(Vec::new())).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = sessions.get("advancenet").unwrap();
+        assert_eq!(
+            session.binding.state(),
+            core_lib::LibrarySessionState::AwaitHello
+        );
+        assert!(std::ptr::fn_addr_eq(
+            session.dispatcher,
+            dispatch_verified_host_call as LibraryHostDispatcher,
+        ));
     }
 
     #[test]

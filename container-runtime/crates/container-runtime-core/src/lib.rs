@@ -12,6 +12,11 @@
 //! RBE capabilities.
 
 mod cache;
+mod container_task_cache;
+mod container_task_diagnostics;
+mod container_task_execution;
+mod container_task_loader;
+mod container_task_profile;
 mod control_plane;
 mod debug_replay;
 mod debug_replay_cursor;
@@ -24,6 +29,21 @@ mod swamp;
 mod worker;
 
 pub use cache::{artifact_sha256_matches, ArtifactCache, ExecutionProfile};
+pub use container_task_cache::{
+    AssembledContainerTask, ContainerTaskAssembler, ContainerTaskAssemblyInput,
+    ContainerTaskCacheCommit, ContainerTaskIndex, ContainerTaskIndexEntry, ContainerTaskIndexKey,
+    CONTAINER_TASK_INDEX_MAGIC, CONTAINER_TASK_INDEX_VERSION, CTI_COMPILER_ABI_VERSION,
+};
+pub use container_task_diagnostics::{TaskDiagnosticError, TaskEventRenderer, TaskSourceLocation};
+pub use container_task_execution::{CompiledTaskGraph, TaskExecution, TaskGraphNode};
+pub use container_task_loader::{
+    ContainerTaskLoadError, ContainerTaskLoader, LoadedTaskImage, RuntimeImageTaskRegistry,
+    RuntimeImageTaskTable,
+};
+pub use container_task_profile::{
+    TaskExecutionProfile, TaskExecutionProfileStore, TaskExecutionSample, TaskProfileKey,
+    TASK_PROFILE_VERSION,
+};
 pub use control_plane::{AuthorizedCapability, CapabilityBroker, CapabilityCall, CapabilityError};
 pub use debug_replay::{
     DebugReplayCapabilityEvent, DebugReplayCapabilityResult, DebugReplayError, DebugReplayRecorder,

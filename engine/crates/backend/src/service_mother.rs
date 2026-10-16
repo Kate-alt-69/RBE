@@ -386,6 +386,40 @@ fn service_compat_protocol_error(path: &Path, reason: impl std::fmt::Display) ->
     )
 }
 
+fn linux_spawn_hint(error: &std::io::Error) -> &'static str {
+    if cfg!(target_os = "linux") && error.raw_os_error() == Some(11) {
+        "Linux returned EAGAIN (OS error 11) while creating the Service process. This happens before Service code runs. Check the host/container PID limit (pids.max), process limit (ulimit -u), and available memory, then retry."
+    } else {
+        "Inspect the raw OS error below and verify the Service binary is executable on this host."
+    }
+}
+
+fn service_mother_spawn_error(
+    service: &Path,
+    settings: &Path,
+    application_root: &Path,
+    error: std::io::Error,
+) -> anyhow::Error {
+    let raw_os_error = error
+        .raw_os_error()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let reason = error.to_string();
+    let hint = linux_spawn_hint(&error);
+    let context = format!(
+        "SVC5004 Service Mother process could not be spawned.\n\n  component:\n    service-mother\n\n  service_binary:\n    {}\n\n  settings:\n    {}\n\n  application_root:\n    {}\n\n  host:\n    {}/{}\n\n  raw_os_error:\n    {}\n\n  reason:\n    {}\n\n  hint:\n    {}\n\n  action:\n    Fix the host process-spawn condition and retry. The Service Mother did not start, so no individual .service worker was launched yet.\n\n  help:\n    https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5004",
+        service.display(),
+        settings.display(),
+        application_root.display(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        raw_os_error,
+        reason,
+        hint,
+    );
+    anyhow::Error::new(error).context(context)
+}
+
 fn ensure_canonical_service_executable(
     backend: &Path,
     parent: &Path,
@@ -637,7 +671,12 @@ async fn spawn_process(
     {
         Ok(child) => child,
         Err(error) => {
-            return Err(error.into());
+            return Err(service_mother_spawn_error(
+                &service_exe,
+                &settings_path,
+                parent,
+                error,
+            ));
         }
     };
 
@@ -807,7 +846,10 @@ pub async fn spawn(
         Ok(initial) => initial,
         Err(error) => {
             let details = format!("{error:#}");
-            if details.contains("SVC5001") || details.contains("SVC5003") {
+            if details.contains("SVC5001")
+                || details.contains("SVC5003")
+                || details.contains("SVC5004")
+            {
                 logging::Logger::new("SERVICE")
                     .child("MOTHER")
                     .fatal(details);
@@ -1232,6 +1274,26 @@ mod tests {
         assert!(rendered.contains("runtime ABI"));
         assert!(rendered
             .contains("https://kastrick.vercel.app/project/rbe/doc/error-codes/service#svc5001"));
+    }
+
+    #[test]
+    fn mother_spawn_diagnostic_identifies_process_and_os_error() {
+        let error = service_mother_spawn_error(
+            Path::new("dep/service"),
+            Path::new("settings.json"),
+            Path::new("/srv/rbe"),
+            std::io::Error::from_raw_os_error(11),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("SVC5004"));
+        assert!(rendered.contains("service-mother"));
+        assert!(rendered.contains("dep/service"));
+        assert!(rendered.contains("raw_os_error:\n    11"));
+        assert!(rendered.contains("OS error 11"));
+        if cfg!(target_os = "linux") {
+            assert!(rendered.contains("EAGAIN"));
+            assert!(rendered.contains("pids.max"));
+        }
     }
 
     #[tokio::test]

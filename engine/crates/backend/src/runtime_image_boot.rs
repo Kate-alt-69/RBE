@@ -14,7 +14,44 @@ const RUNTIME_IMAGE_COMPILE_HELP: &str =
     "https://kastrick.vercel.app/project/rbe/doc/error-codes/runtime#rbe5100";
 const PACKAGE_GRAPH_SETTINGS_KEY: &str = "__rbePackageGraphSha256";
 
+pub fn prepare_core_oid_cache(
+    root: &Path,
+    vault: std::sync::Arc<dyn route_engine::OidVaultAuthority>,
+) -> anyhow::Result<route_engine::CoreMaterializationReport> {
+    // Finish any cross-index CTI publication before native Service/OID linking.
+    // An interrupted OID commit must never be bypassed by a new generation.
+    let cache = route_engine::open_service_oid_cache_with_vault(root, vault.clone())?;
+    route_engine::recover_container_task_publication(root, &cache)?;
+    drop(cache);
+    let report = route_engine::prepare_service_oid_cache_with_vault(root, vault).map_err(|error| {
+        anyhow::anyhow!(
+            "RBE5100 Backend could not prepare the project OID compiler cache.\n\nCache:\n  {}\n\nError:\n  {error}\n\nNote:\n  Corrupt/stale disposable OID cache state is rebuilt automatically. This failure is a real target, permission, capacity, or compiler invariant error. Startup stopped before the API listener was bound.\n\nHelp:\n  {RUNTIME_IMAGE_COMPILE_HELP}",
+            route_engine::oid_cache_root(root).display()
+        )
+    })?;
+    tracing::debug!(
+        target = %report.target.label(),
+        generation = report.index_generation,
+        total = report.total,
+        written = report.written,
+        reused = report.reused,
+        cache = %route_engine::oid_cache_root(root).display(),
+        "prepared project OID compiler cache"
+    );
+    Ok(report)
+}
+
+/// Compatibility entrypoint for callers that need the RuntimeImage alone.
 pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Result<RuntimeImage> {
+    Ok(compile_with_tasks(config, catalog)?.image)
+}
+
+/// Compile once and retain compiler-owned CTI discovery for the real
+/// RuntimeImage activation path. CC does not perform REL discovery.
+pub fn compile_with_tasks(
+    config: &Config,
+    catalog: Option<&ServiceCatalog>,
+) -> anyhow::Result<route_engine::relc_linked_image::RelcLinkedImage> {
     let root = runtime_paths::binary_dir();
     let server_path = root.join("server.server");
     let server_source = if server_path.is_file() {
@@ -43,18 +80,19 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
     })?;
     let mut settings = effective_settings_json(config);
     let package_graph_sha256 = bind_package_graph_identity(&mut settings, &package_links)?;
-    let image = route_engine::relc::compile_runtime_image_with_packages(
-        &server_source,
-        physical.clone(),
-        &settings,
-        &package_links,
-    )
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "{}",
-            render_runtime_image_compile_error(&error, &server_source, &physical)
+    let compiled =
+        route_engine::relc_linked_image::compile_runtime_image_with_packages_and_linked_rel(
+            &server_source,
+            physical.clone(),
+            &settings,
+            &package_links,
         )
-    })?;
+        .map_err(|error| {
+            anyhow::anyhow!(
+            "RBE5100 Backend could not compile RELC Task discovery for the Runtime Image: {error}"
+        )
+        })?;
+    let image = &compiled.image;
     route_engine::validate_runtime_image_routes(&image)?;
     tracing::info!(
         image = %image.image_id,
@@ -68,7 +106,7 @@ pub fn compile(config: &Config, catalog: Option<&ServiceCatalog>) -> anyhow::Res
         status = image.server_policy.status.as_str(),
         "linked immutable Runtime Image"
     );
-    Ok(image)
+    Ok(compiled)
 }
 
 fn bind_package_graph_identity(

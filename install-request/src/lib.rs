@@ -16,9 +16,11 @@ pub use request::*;
 pub use system_runtime::*;
 
 pub const RBE_SYSTEM_PYTHON: &str = "rbe.sys.python";
+pub const RBE_SYSTEM_PYPY: &str = "rbe.sys.pypy";
 pub const RBE_SYSTEM_NODEJS: &str = "rbe.sys.nodejs";
 pub const RBE_SYSTEM_BUNJS: &str = "rbe.sys.bunjs";
 pub const RBE_SYSTEM_RUST: &str = "rbe.sys.rust";
+pub const RBE_SYSTEM_GIT: &str = "rbe.sys.git";
 pub const SYSTEM_PYTHON_SCRAPER_ID: &str = "index-discovery-v1";
 pub const RBE_WELL_KNOWN_INDEX: &str = "/.well-known/rbe/index.json";
 pub const RBE_ROOT_INDEX: &str = "/rbe-index.json";
@@ -39,6 +41,12 @@ pub enum InstallRequestError {
     InvalidVersion(String),
     #[error("version was specified more than once")]
     DuplicateVersionFlag,
+    #[error("install flag -{0} was specified more than once")]
+    DuplicateFlag(&'static str),
+    #[error(
+        "unsupported SDK language {0:?}; expected rust, javascript, typescript, python, or global"
+    )]
+    InvalidSdkLanguage(String),
     #[error("version {inline:?} conflicts with -version={flag}")]
     ConflictingVersion { inline: String, flag: String },
     #[error("flag -{0} requires a value")]

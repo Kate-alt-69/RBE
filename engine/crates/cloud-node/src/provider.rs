@@ -196,6 +196,7 @@ impl ProviderClient {
         };
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
+            crate::provider_diagnostics::record_http(&response, "download", true);
             return Ok(None);
         }
         if !status.is_success() {
@@ -620,12 +621,9 @@ impl ProviderClient {
         let mut digest = Sha256::new();
         let mut size = 0u64;
         while let Some(chunk) = response.chunk().await.map_err(provider_transport_error)? {
+            let next_size = checked_verification_size(size, chunk.len(), expected_size)?;
             digest.update(&chunk);
-            size = size
-                .checked_add(u64::try_from(chunk.len()).map_err(|_| {
-                    anyhow::anyhow!("Cloud Node provider verification chunk exceeds u64")
-                })?)
-                .ok_or_else(|| anyhow::anyhow!("Cloud Node provider verification size overflow"))?;
+            size = next_size;
         }
         let actual_sha256: [u8; 32] = digest.finalize().into();
         if size != expected_size || actual_sha256 != expected_sha256 {
@@ -1099,6 +1097,7 @@ impl ProviderClient {
 }
 
 pub(crate) fn provider_transport_error(error: reqwest::Error) -> anyhow::Error {
+    crate::provider_diagnostics::record_transport(&error);
     anyhow::anyhow!(
         "Cloud Node provider request failed: {}",
         error.without_url()
@@ -1239,6 +1238,7 @@ async fn checked_download_response(
 ) -> anyhow::Result<Option<reqwest::Response>> {
     let status = response.status();
     if status == StatusCode::NOT_FOUND {
+        crate::provider_diagnostics::record_http(&response, "download", true);
         return Ok(None);
     }
     if !status.is_success() {
@@ -1293,6 +1293,7 @@ async fn response_bytes_limited(
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let status = response.status();
     if allow_not_found && status == StatusCode::NOT_FOUND {
+        crate::provider_diagnostics::record_http(&response, operation, true);
         return Ok(None);
     }
     if !status.is_success() {
@@ -1339,6 +1340,20 @@ fn append_bounded_bytes(
     Ok(())
 }
 
+fn checked_verification_size(current: u64, chunk_len: usize, expected: u64) -> anyhow::Result<u64> {
+    let chunk_len = u64::try_from(chunk_len)
+        .map_err(|_| anyhow::anyhow!("Cloud Node provider verification chunk exceeds u64"))?;
+    let next = current
+        .checked_add(chunk_len)
+        .ok_or_else(|| anyhow::anyhow!("Cloud Node provider verification size overflow"))?;
+    if next > expected {
+        anyhow::bail!(
+            "Cloud Node immutable provider object exceeds expected size {expected} bytes"
+        );
+    }
+    Ok(next)
+}
+
 async fn provider_error_parts(mut response: reqwest::Response) -> (StatusCode, Vec<u8>) {
     let status = response.status();
     let mut detail = Vec::new();
@@ -1359,14 +1374,15 @@ async fn provider_error_parts(mut response: reqwest::Response) -> (StatusCode, V
 
 fn provider_http_error_from_parts(
     status: StatusCode,
-    detail: &[u8],
+    _detail: &[u8],
     operation: &str,
 ) -> anyhow::Error {
-    let detail = String::from_utf8_lossy(detail);
-    anyhow::anyhow!("Cloud Node provider {operation} failed with HTTP {status}: {detail}")
+    // Error bodies are untrusted and may echo signed URLs or credentials.
+    anyhow::anyhow!("Cloud Node provider {operation} failed with HTTP {status}")
 }
 
 async fn provider_http_error(response: reqwest::Response, operation: &str) -> anyhow::Error {
+    crate::provider_diagnostics::record_http(&response, operation, false);
     let (status, detail) = provider_error_parts(response).await;
     provider_http_error_from_parts(status, &detail, operation)
 }
@@ -1445,6 +1461,18 @@ fn resolve_secret_value(name: &str, value: &str) -> anyhow::Result<Option<String
             path.display()
         )
     })?;
+    let metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to inspect opened Cloud Node provider credential file {} from {name}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "Cloud Node provider credential source {} from {name} must resolve to a regular file",
+            path.display()
+        );
+    }
     let mut bytes = Vec::new();
     file.take(MAX_PROVIDER_SECRET_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1578,6 +1606,18 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_errors_do_not_echo_untrusted_response_bodies() {
+        let error = super::provider_http_error_from_parts(
+            reqwest::StatusCode::FORBIDDEN,
+            b"https://storage.example/private?X-Amz-Signature=secret",
+            "download",
+        );
+        assert!(error.to_string().contains("403"));
+        assert!(!error.to_string().contains("secret"));
+        assert!(!error.to_string().contains("storage.example"));
+    }
+
     use super::*;
 
     #[test]
@@ -1695,8 +1735,10 @@ mod tests {
     }
 
     #[test]
-    fn credential_file_reference_requires_absolute_path() {
+    fn credential_file_reference_requires_absolute_regular_file() {
         assert!(resolve_secret_value("RBE_TEST_SECRET", "file:relative/token").is_err());
+        let directory = format!("file:{}", std::env::temp_dir().display());
+        assert!(resolve_secret_value("RBE_TEST_SECRET", &directory).is_err());
     }
 
     #[test]
@@ -1807,6 +1849,12 @@ mod tests {
         assert_eq!(bytes, b"1234");
         assert!(append_bounded_bytes(&mut bytes, b"56", 5, "test metadata").is_err());
         assert_eq!(bytes, b"1234");
+    }
+
+    #[test]
+    fn provider_verification_size_rejects_oversize_stream_before_eof() {
+        assert_eq!(checked_verification_size(3, 2, 5).unwrap(), 5);
+        assert!(checked_verification_size(3, 3, 5).is_err());
     }
 
     #[test]

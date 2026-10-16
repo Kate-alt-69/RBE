@@ -1,11 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use rbe_install_orchestrator::system_toolchain_for_manifest;
 use rbe_install_request::RegistryPackageIndex;
-use rbe_library_resolver::Resolution;
+use rbe_library_resolver::{version_satisfies_requirement, Resolution};
 use rbe_project_package::{ProjectCacheLayout, ProjectPackageLock};
 
-use crate::{stage_registry_package, InstallRuntimeError, VerifiedRegistryPackage};
+use crate::{
+    current_system_runtime_host, stage_registry_package, AdmittedSystemRuntime,
+    InstallRuntimeError, VerifiedRegistryPackage,
+};
 
 #[derive(Debug)]
 pub struct VerifiedRootGraph {
@@ -13,6 +17,131 @@ pub struct VerifiedRootGraph {
     pub install_order: Vec<String>,
     pub lock: ProjectPackageLock,
     pub packages: BTreeMap<String, VerifiedRegistryPackage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VerifiedCapabilityInventory {
+    pub runtime: BTreeMap<String, Vec<String>>,
+    pub build: BTreeMap<String, Vec<String>>,
+}
+
+impl VerifiedRootGraph {
+    /// Return enabled capability requests from every SHA-verified package
+    /// manifest in this staged root graph.
+    ///
+    /// This is disclosure/admission evidence only. Capability names remain
+    /// open-ended and this function intentionally does not decide which names
+    /// map to RBE-owned host privileges or whether the user approved them.
+    pub fn capability_inventory(&self) -> VerifiedCapabilityInventory {
+        let mut inventory = VerifiedCapabilityInventory::default();
+        for (package, verified) in &self.packages {
+            let runtime = enabled_capabilities(&verified.manifest.capabilities);
+            if !runtime.is_empty() {
+                inventory.runtime.insert(package.clone(), runtime);
+            }
+            let build = enabled_capabilities(&verified.manifest.build_capabilities);
+            if !build.is_empty() {
+                inventory.build.insert(package.clone(), build);
+            }
+        }
+        inventory
+    }
+
+    /// Hydrate every managed `rbe.sys.*` runtime requested by the verified
+    /// package manifests in this root graph before activation.
+    ///
+    /// One exact runtime version is frozen per runtime kind for the complete
+    /// graph. Later packages may reuse that admitted runtime only when their
+    /// semver requirement accepts the exact version. This prevents registry
+    /// drift halfway through one install and rejects graphs whose packages
+    /// require incompatible versions of the same managed runtime.
+    pub async fn hydrate_system_runtimes(
+        &self,
+        project_root: &Path,
+        registry: &str,
+    ) -> Result<BTreeMap<String, AdmittedSystemRuntime>, String> {
+        let host = current_system_runtime_host();
+        let mut admitted = BTreeMap::<String, AdmittedSystemRuntime>::new();
+
+        for package in &self.install_order {
+            let verified = self.packages.get(package).ok_or_else(|| {
+                format!(
+                    "verified root graph {:?} is missing package {:?} while hydrating managed runtimes",
+                    self.root, package
+                )
+            })?;
+            let need = system_toolchain_for_manifest(
+                &verified.manifest,
+                project_root,
+                registry,
+                &host,
+            )
+            .map_err(|error| {
+                format!(
+                    "derive managed runtime for package {package:?} from verified library.toml: {error}"
+                )
+            })?;
+            let Some(need) = need else {
+                continue;
+            };
+            let runtime_key = need.runtime.key().to_string();
+
+            if let Some(existing) = admitted.get(&runtime_key) {
+                require_runtime_version(
+                    package,
+                    &runtime_key,
+                    &need.version_requirement,
+                    &existing.version,
+                )?;
+                continue;
+            }
+
+            let (runtime, _) = AdmittedSystemRuntime::hydrate_from_registry(
+                &need.manifest_request,
+                &need.cache_root,
+            )
+            .await
+            .map_err(|error| {
+                format!("hydrate managed runtime {runtime_key:?} for package {package:?}: {error}")
+            })?;
+            require_runtime_version(
+                package,
+                &runtime_key,
+                &need.version_requirement,
+                &runtime.version,
+            )?;
+            admitted.insert(runtime_key, runtime);
+        }
+
+        Ok(admitted)
+    }
+}
+
+fn require_runtime_version(
+    package: &str,
+    runtime: &str,
+    requirement: &str,
+    resolved: &str,
+) -> Result<(), String> {
+    let compatible = version_satisfies_requirement(requirement, resolved).map_err(|error| {
+        format!(
+            "validate managed runtime {runtime:?} version {resolved:?} against package {package:?} requirement {requirement:?}: {error}"
+        )
+    })?;
+    if !compatible {
+        return Err(format!(
+            "package {package:?} requires managed runtime {runtime:?} {requirement:?}, but this install graph already froze version {resolved:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn enabled_capabilities(values: &BTreeMap<String, bool>) -> Vec<String> {
+    values
+        .iter()
+        .filter(|(_, enabled)| **enabled)
+        .map(|(capability, _)| capability.clone())
+        .collect()
 }
 
 /// Execute the registry-artifact trust boundary for one resolver root graph.
@@ -232,6 +361,25 @@ entry = "src/index.js"
         std::fs::write(plan.partial_path, bytes).unwrap();
     }
 
+    #[test]
+    fn enabled_capability_inventory_preserves_open_ended_names() {
+        let values = BTreeMap::from([
+            ("mail:smtp".to_string(), true),
+            ("net:http".to_string(), true),
+            ("mail:disabled".to_string(), false),
+        ]);
+        assert_eq!(
+            enabled_capabilities(&values),
+            vec!["mail:smtp".to_string(), "net:http".to_string()]
+        );
+    }
+
+    #[test]
+    fn frozen_runtime_version_must_satisfy_every_package_requirement() {
+        assert!(require_runtime_version("a", "rbe.sys.python", "^3.12", "3.13.2").is_ok());
+        assert!(require_runtime_version("b", "rbe.sys.python", "^3.12", "4.0.0").is_err());
+    }
+
     #[tokio::test]
     async fn verified_graph_keeps_transitives_private_to_root() {
         let dependency_map = BTreeMap::from([("rbe-core".into(), "^1".into())]);
@@ -286,6 +434,10 @@ entry = "src/index.js"
             .contains_key("rbe-core"));
         assert!(graph.lock.root_graph_complete("advancenet"));
         assert_eq!(graph.packages.len(), 2);
+        assert_eq!(
+            graph.capability_inventory(),
+            VerifiedCapabilityInventory::default()
+        );
     }
 
     #[tokio::test]

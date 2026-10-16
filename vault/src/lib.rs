@@ -10,7 +10,10 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 use logging::Logger;
+use rand::RngCore;
 use secrecy::SecretString;
 use zeroize::Zeroizing;
 
@@ -18,6 +21,8 @@ use acl::Acl;
 use file_store::FileStore;
 
 const FALLBACK_MASTER_KEY_ENV: &str = "RBE_VAULT_FALLBACK_MASTER_KEY";
+const INTERNAL_PREFIX: &str = "__rbe.internal.";
+const INTERNAL_SEAL_MAGIC: &[u8; 8] = b"RBEVSL01";
 
 enum Backend {
     Keyring { service_name: String },
@@ -40,9 +45,9 @@ impl Vault {
         let log = Logger::new("VAULT");
         let acl = Acl::load(data_dir)?;
 
-        let backend = if cfg!(any(target_os = "windows", target_os = "macos")) {
-            Backend::Keyring { service_name }
-        } else if probe_keyring(&service_name) {
+        let backend = if cfg!(any(target_os = "windows", target_os = "macos"))
+            || probe_keyring(&service_name)
+        {
             Backend::Keyring { service_name }
         } else {
             let master_key = Zeroizing::new(std::env::var(FALLBACK_MASTER_KEY_ENV).map_err(|_| {
@@ -62,6 +67,7 @@ impl Vault {
     }
 
     pub fn credential(&self, name: &str, caller: &str) -> anyhow::Result<SecretString> {
+        reject_reserved_credential_name(name)?;
         if !self.acl.is_allowed(name, caller) {
             self.log.warn(format!(
                 "ACL DENY: {caller} attempted to read credential {name:?}"
@@ -86,6 +92,7 @@ impl Vault {
     }
 
     pub fn set_credential(&self, name: &str, value: &str, caller: &str) -> anyhow::Result<()> {
+        reject_reserved_credential_name(name)?;
         if !self.acl.is_allowed(name, caller) {
             self.log.warn(format!(
                 "ACL DENY: {caller} attempted to write credential {name:?}"
@@ -106,6 +113,144 @@ impl Vault {
 
         Ok(())
     }
+
+    pub fn seal_internal(
+        &self,
+        namespace: &str,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        validate_internal_namespace(namespace)?;
+        let key = self.internal_key(namespace, true)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .map_err(|error| anyhow::anyhow!("Vault internal seal failed: {error}"))?;
+        let mut out = Vec::with_capacity(INTERNAL_SEAL_MAGIC.len() + 12 + ciphertext.len());
+        out.extend_from_slice(INTERNAL_SEAL_MAGIC);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    pub fn open_internal(
+        &self,
+        namespace: &str,
+        aad: &[u8],
+        sealed: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        validate_internal_namespace(namespace)?;
+        if sealed.len() < INTERNAL_SEAL_MAGIC.len() + 12 + 16
+            || &sealed[..INTERNAL_SEAL_MAGIC.len()] != INTERNAL_SEAL_MAGIC
+        {
+            anyhow::bail!("Vault internal sealed object has an invalid envelope");
+        }
+        let key = self.internal_key(namespace, false)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
+        let nonce_start = INTERNAL_SEAL_MAGIC.len();
+        let nonce_end = nonce_start + 12;
+        cipher
+            .decrypt(
+                Nonce::from_slice(&sealed[nonce_start..nonce_end]),
+                Payload {
+                    msg: &sealed[nonce_end..],
+                    aad,
+                },
+            )
+            .map_err(|error| anyhow::anyhow!(
+                "Vault internal object authentication failed (wrong key, AAD, or tampering): {error}"
+            ))
+    }
+
+    pub fn internal_head(&self, namespace: &str) -> anyhow::Result<Option<String>> {
+        validate_internal_namespace(namespace)?;
+        self.backend_get_optional(&internal_name(namespace, "head"))
+    }
+
+    pub fn set_internal_head(&self, namespace: &str, value: &str) -> anyhow::Result<()> {
+        validate_internal_namespace(namespace)?;
+        self.backend_set(&internal_name(namespace, "head"), value)
+    }
+
+    fn internal_key(&self, namespace: &str, create: bool) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+        let name = internal_name(namespace, "seal-key");
+        if let Some(value) = self.backend_get_optional(&name)? {
+            return parse_internal_key(&value);
+        }
+        if !create {
+            anyhow::bail!("Vault internal sealing key for {namespace:?} is unavailable");
+        }
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        self.backend_set(&name, &hex::encode(key))?;
+        Ok(Zeroizing::new(key))
+    }
+
+    fn backend_get_optional(&self, name: &str) -> anyhow::Result<Option<String>> {
+        match &self.backend {
+            Backend::Keyring { service_name } => {
+                let entry = keyring::Entry::new(service_name, name)?;
+                match entry.get_password() {
+                    Ok(value) => Ok(Some(value)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Backend::File { store } => store.get_optional(name),
+        }
+    }
+
+    fn backend_set(&self, name: &str, value: &str) -> anyhow::Result<()> {
+        match &self.backend {
+            Backend::Keyring { service_name } => {
+                keyring::Entry::new(service_name, name)?.set_password(value)?;
+                Ok(())
+            }
+            Backend::File { store } => store.set(name, value),
+        }
+    }
+}
+
+fn reject_reserved_credential_name(name: &str) -> anyhow::Result<()> {
+    if name.starts_with(INTERNAL_PREFIX) {
+        anyhow::bail!(
+            "reserved Vault internal credential namespace is not available to normal callers"
+        );
+    }
+    Ok(())
+}
+
+fn validate_internal_namespace(namespace: &str) -> anyhow::Result<()> {
+    if namespace.is_empty()
+        || namespace.len() > 160
+        || !namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        anyhow::bail!("invalid Vault internal namespace {namespace:?}");
+    }
+    Ok(())
+}
+
+fn internal_name(namespace: &str, suffix: &str) -> String {
+    format!("{INTERNAL_PREFIX}{namespace}.{suffix}")
+}
+
+fn parse_internal_key(value: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+    let decoded = Zeroizing::new(hex::decode(value.trim())?);
+    let key: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Vault internal sealing key has the wrong length"))?;
+    Ok(Zeroizing::new(key))
 }
 
 fn probe_keyring(service_name: &str) -> bool {

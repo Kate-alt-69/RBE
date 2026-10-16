@@ -435,7 +435,7 @@ fn json_result(value: serde_json::Result<Value>) -> Result<Value, VideoLanguageE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db(name: &str) -> PathBuf {
@@ -443,10 +443,19 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "rbe-video-language-{name}-{}-{nonce}.db",
+        let root = std::env::temp_dir().join(format!(
+            "rbe-video-language-{name}-{}-{nonce}",
             std::process::id()
-        ))
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root.join("video.db")
+    }
+
+    fn cleanup_temp_db(path: &Path) {
+        let Some(root) = path.parent() else {
+            return;
+        };
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -490,7 +499,8 @@ mod tests {
             .call("another.module", "get", &[Value::String(asset_id)])
             .unwrap_err();
         assert_eq!(error.code, "VID3003");
-        let _ = std::fs::remove_file(path);
+        drop(language);
+        cleanup_temp_db(&path);
     }
 
     #[test]
@@ -511,7 +521,8 @@ mod tests {
             .unwrap();
         assert_eq!(queued["asset"]["state"], "quarantined");
         assert_eq!(queued["job"]["state"], "queued");
-        let _ = std::fs::remove_file(path);
+        drop(language);
+        cleanup_temp_db(&path);
     }
 
     #[test]
@@ -558,7 +569,8 @@ mod tests {
             .call("other.module", "variants", &[Value::String(asset_id)])
             .unwrap_err();
         assert_eq!(error.code, "VID3003");
-        let _ = std::fs::remove_file(path);
+        drop(language);
+        cleanup_temp_db(&path);
     }
 
     #[test]
@@ -606,7 +618,8 @@ mod tests {
             .call("other.module", "job", &[Value::String(job_id)])
             .unwrap_err();
         assert_eq!(error.code, "VID3003");
-        let _ = std::fs::remove_file(path);
+        drop(language);
+        cleanup_temp_db(&path);
     }
 
     #[test]
@@ -654,7 +667,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, video_manager::VideoLiveSessionState::Ended);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        drop(language);
+        drop(manager);
+        cleanup_temp_db(&path);
     }
 
     #[test]
@@ -669,7 +684,8 @@ mod tests {
         assert!(health.get("kind").is_some());
         assert!(health.get("detail").is_none());
         assert!(!health.to_string().contains(path.to_string_lossy().as_ref()));
-        let _ = std::fs::remove_file(path);
+        drop(language);
+        cleanup_temp_db(&path);
     }
 
     #[test]
@@ -709,6 +725,7 @@ mod tests {
             .unwrap();
         assert!(loaded.get("sourceUri").is_none());
         assert!(!loaded.to_string().contains(secret_source));
-        let _ = std::fs::remove_file(path);
+        drop(language);
+        cleanup_temp_db(&path);
     }
 }

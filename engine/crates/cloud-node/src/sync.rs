@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::format::{BlobBody, BlobKind, BlobManifest};
+use crate::registry_ingest::ensure_registry_ingest_committed;
 use crate::store::CloudNodeStore;
 
 const SYNC_HEADER_MAGIC: &[u8; 8] = b"RBECNSY1";
@@ -43,6 +44,8 @@ pub struct SyncPlanHeader {
 
 impl SyncPlan {
     pub fn scan(store: &CloudNodeStore) -> anyhow::Result<Self> {
+        ensure_registry_ingest_committed(store)?;
+
         let storage = store.summary().storage;
         let mut plan = Self::scan_storage(&storage)?;
         for object in &mut plan.folders {
@@ -114,6 +117,14 @@ impl SyncPlan {
         videos.sort_by(sort);
         files.sort_by(sort);
 
+        validate_windows_logical_paths(
+            folders
+                .iter()
+                .chain(&videos)
+                .chain(&files)
+                .map(|object| object.logical_path.as_str()),
+        )?;
+
         let root_sha256 = sync_root(&folders, &videos, &files);
         Ok(Self {
             root_sha256,
@@ -134,8 +145,6 @@ impl SyncPlan {
             .saturating_add(self.files.len())
     }
 
-    /// Canonical LOCAL -> REMOTE recovery order. Folder topology always goes
-    /// first, then large video objects/chunks, then regular file generations.
     pub fn ordered(&self) -> impl Iterator<Item = &SyncObject> {
         self.folders
             .iter()
@@ -143,10 +152,6 @@ impl SyncPlan {
             .chain(self.files.iter())
     }
 
-    /// Outbound replication order. Required topology phases remain
-    /// folder -> video -> file, while Data-Level 1 precedes 2 and 3 inside
-    /// each phase. `storage.write` objects are files, so their levels order
-    /// directly against one another without changing canonical snapshot identity.
     pub fn priority_ordered(&self) -> impl Iterator<Item = &SyncObject> {
         let mut folders = self.folders.iter().collect::<Vec<_>>();
         folders.sort_by(|left, right| {
@@ -239,7 +244,10 @@ fn sync_object(
 ) -> anyhow::Result<SyncObject> {
     let content_hex = hex::encode(manifest.content_sha256);
     let (payload_path, chunk_paths) = match &manifest.body {
-        BlobBody::Folder { .. } => (None, Vec::new()),
+        BlobBody::Folder { entries } => {
+            validate_windows_logical_paths(entries.iter().map(|entry| entry.path.as_str()))?;
+            (None, Vec::new())
+        }
         BlobBody::File { .. } => {
             let payload = object_dir
                 .join("versions")
@@ -291,6 +299,75 @@ fn sync_object(
     })
 }
 
+fn windows_reserved_name(segment: &str) -> bool {
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or(segment)
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CLOCK$"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    ) {
+        return true;
+    }
+    stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && matches!(stem.as_bytes()[3], b'1'..=b'9')
+}
+
+fn windows_logical_path_key(path: &str) -> anyhow::Result<String> {
+    let mut folded = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty()
+            || segment.ends_with(' ')
+            || segment.ends_with('.')
+            || segment.encode_utf16().count() > 255
+            || segment
+                .chars()
+                .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            anyhow::bail!(
+                "Cloud Node logical path {path:?} contains a component that cannot be materialized safely on Windows"
+            );
+        }
+        if windows_reserved_name(segment) {
+            anyhow::bail!(
+                "Cloud Node logical path {path:?} uses reserved Windows device component {segment:?}"
+            );
+        }
+        folded.push(segment.to_uppercase());
+    }
+    Ok(folded.join("/"))
+}
+
+fn validate_windows_logical_paths<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashMap::<String, &'a str>::new();
+    for path in paths {
+        let folded = windows_logical_path_key(path)?;
+        if let Some(existing) = seen.insert(folded, path) {
+            anyhow::bail!(
+                "Cloud Node logical paths {existing:?} and {path:?} collide on a case-insensitive Windows checkout"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn sync_root(folders: &[SyncObject], videos: &[SyncObject], files: &[SyncObject]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(SYNC_ROOT_DOMAIN);
@@ -339,9 +416,110 @@ mod tests {
     }
 
     #[test]
+    fn windows_logical_path_guard_rejects_case_collisions() {
+        assert!(validate_windows_logical_paths(["local/Foo.txt", "local/foo.txt"]).is_err());
+        assert!(validate_windows_logical_paths(["local/Foo.txt", "local/bar.txt"]).is_ok());
+    }
+
+    #[test]
+    fn windows_logical_path_guard_rejects_unicode_case_collisions() {
+        assert!(validate_windows_logical_paths(["local/σ.txt", "local/ς.txt"]).is_err());
+        assert!(validate_windows_logical_paths(["local/ſ.txt", "local/s.txt"]).is_err());
+    }
+
+    #[test]
+    fn windows_logical_path_guard_rejects_unstable_components() {
+        for path in [
+            "local/file.",
+            "local/file ",
+            "local/cache:state.json",
+            "local/a?.json",
+            "local/a*.json",
+            "local/a|b.json",
+            "local/a\"b.json",
+            "local/a<b.json",
+            "local/a>b.json",
+        ] {
+            assert!(validate_windows_logical_paths([path]).is_err());
+        }
+        assert!(validate_windows_logical_paths(["local/file.txt"]).is_ok());
+    }
+
+    #[test]
+    fn windows_logical_path_guard_rejects_device_names() {
+        for path in [
+            "local/NUL",
+            "local/nul.txt",
+            "local/CON",
+            "local/PRN.log",
+            "local/AUX",
+            "local/CLOCK$",
+            "local/CONIN$",
+            "local/CONOUT$",
+            "local/COM1.json",
+            "local/com9",
+            "local/LPT1.txt",
+            "local/lpt9",
+            "local/COM¹.txt",
+            "local/COM²",
+            "local/COM³.log",
+            "local/LPT¹.txt",
+            "local/LPT²",
+            "local/LPT³.log",
+        ] {
+            assert!(validate_windows_logical_paths([path]).is_err());
+        }
+        assert!(validate_windows_logical_paths([
+            "local/COM10.json",
+            "local/LPT10.txt",
+            "local/NULLED.txt"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn windows_device_guard_handles_non_ascii_four_byte_stems() {
+        assert!(!windows_reserved_name("ABé"));
+        assert!(!windows_reserved_name("éAB"));
+    }
+
+    #[test]
+    fn windows_logical_path_guard_bounds_component_length() {
+        let accepted = format!("local/{}", "a".repeat(255));
+        let rejected = format!("local/{}", "a".repeat(256));
+        assert!(validate_windows_logical_paths([accepted.as_str()]).is_ok());
+        assert!(validate_windows_logical_paths([rejected.as_str()]).is_err());
+    }
+
+    #[test]
+    fn sync_plan_rejects_nonportable_folder_entries() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
+            "node": {
+                "id": "folder-portability-test",
+                "storageRoot": root,
+                "videoChunkBytes": 1048576
+            }
+        }))
+        .unwrap();
+        let store = CloudNodeStore::open(&settings).unwrap();
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(
+            tree.join("NUL.txt"),
+            b"portable on Linux, reserved on Windows",
+        )
+        .unwrap();
+        store.snapshot_folder(&tree, "root").unwrap();
+        assert!(store.sync_plan().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn data_level_orders_files_without_changing_sync_root() {
         let root = test_root();
-        let settings: crate::CloudNodeSettings = serde_json::from_value(serde_json::json!({
+        let settings: CloudNodeSettings = serde_json::from_value(serde_json::json!({
             "formatVersion": 1,
             "node": {
                 "id": "priority-test",

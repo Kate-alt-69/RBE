@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use ed25519_dalek::SigningKey;
@@ -9,6 +9,10 @@ use crate::crypto::load_signing_key_from_env;
 
 pub const MAX_AUTH_PROOF_BYTES: usize = 1024;
 pub const DEFAULT_SESSION_TTL_MS: u64 = 5 * 60_000;
+const MAX_ACTIVE_SESSIONS: usize = 4096;
+const MAX_ACTIVE_SESSIONS_PER_PEER: usize = 256;
+const MAX_REPLAY_ENTRIES: usize = 65_536;
+const MAX_REPLAY_ENTRIES_PER_PEER: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedSession {
@@ -56,12 +60,38 @@ impl CloudNodeAuthenticator {
 
     pub fn new(settings: &CloudNodeSettings, signing: SigningKey) -> anyhow::Result<Self> {
         settings.validate()?;
-        let trusted_peers = settings
-            .replication
-            .targets
-            .iter()
-            .map(|target| (target.node_id.clone(), target.public_key.clone()))
-            .collect::<HashMap<_, _>>();
+        let local_public_key = hex::encode(signing.verifying_key().to_bytes());
+        let mut trusted_peers = HashMap::with_capacity(settings.replication.targets.len());
+        let mut trusted_keys = HashSet::with_capacity(settings.replication.targets.len());
+        for target in &settings.replication.targets {
+            if target.node_id == settings.node.id {
+                anyhow::bail!(
+                    "Cloud Node replication target {:?} reuses the local node id; trusted peer identities must be distinct from the local node",
+                    target.node_id
+                );
+            }
+            let normalized_key = target.public_key.to_ascii_lowercase();
+            if normalized_key == local_public_key {
+                anyhow::bail!(
+                    "Cloud Node replication target {:?} reuses the local node signing key under a trusted peer identity",
+                    target.node_id
+                );
+            }
+            if !trusted_keys.insert(normalized_key) {
+                anyhow::bail!(
+                    "Cloud Node replication targets reuse one trusted public key across multiple node ids; each trusted node identity must have its own key"
+                );
+            }
+            if trusted_peers
+                .insert(target.node_id.clone(), target.public_key.clone())
+                .is_some()
+            {
+                anyhow::bail!(
+                    "Cloud Node replication targets contain duplicate trusted node id {:?}",
+                    target.node_id
+                );
+            }
+        }
         Ok(Self {
             node_id: settings.node.id.clone(),
             signing,
@@ -98,6 +128,12 @@ impl CloudNodeAuthenticator {
         if state.replays.contains_key(&replay_key) {
             anyhow::bail!("Cloud Node authentication replay rejected");
         }
+        if state.sessions.contains_key(&knock.session) {
+            anyhow::bail!(
+                "Cloud Node authentication session id is already active; peer must create a fresh session"
+            );
+        }
+        ensure_auth_capacity(&state, &knock.node_id, true)?;
 
         let (_, local_nonce) = random_session_and_nonce();
         let accept = NodeProof::accept(
@@ -165,6 +201,7 @@ impl CloudNodeAuthenticator {
         if proof.peer_nonce != session.local_nonce {
             anyhow::bail!("Cloud Node session proof is not bound to this authenticated peer");
         }
+        ensure_auth_capacity(&state, &proof.node_id, false)?;
         state.replays.insert(
             replay_key,
             proof.timestamp_ms.saturating_add(self.max_skew_ms),
@@ -207,6 +244,60 @@ fn prune_state(state: &mut AuthState, now_ms: u64) {
     state
         .sessions
         .retain(|_, session| session.expires_at_ms >= now_ms);
+}
+
+fn ensure_auth_capacity(
+    state: &AuthState,
+    node_id: &str,
+    adding_session: bool,
+) -> anyhow::Result<()> {
+    let peer_sessions = state
+        .sessions
+        .values()
+        .filter(|session| session.node_id == node_id)
+        .count();
+    let peer_replays = state
+        .replays
+        .keys()
+        .filter(|replay| replay.node_id == node_id)
+        .count();
+    ensure_auth_capacity_counts(
+        state.sessions.len(),
+        state.replays.len(),
+        peer_sessions,
+        peer_replays,
+        adding_session,
+    )
+}
+
+fn ensure_auth_capacity_counts(
+    active_sessions: usize,
+    replay_entries: usize,
+    peer_active_sessions: usize,
+    peer_replay_entries: usize,
+    adding_session: bool,
+) -> anyhow::Result<()> {
+    if replay_entries >= MAX_REPLAY_ENTRIES {
+        anyhow::bail!(
+            "Cloud Node authentication replay cache reached its bounded capacity; retry after the freshness window advances"
+        );
+    }
+    if peer_replay_entries >= MAX_REPLAY_ENTRIES_PER_PEER {
+        anyhow::bail!(
+            "Cloud Node trusted peer reached its bounded replay-cache quota; retry after the freshness window advances"
+        );
+    }
+    if adding_session && active_sessions >= MAX_ACTIVE_SESSIONS {
+        anyhow::bail!(
+            "Cloud Node authenticated session table reached its bounded capacity; retry after an active session expires"
+        );
+    }
+    if adding_session && peer_active_sessions >= MAX_ACTIVE_SESSIONS_PER_PEER {
+        anyhow::bail!(
+            "Cloud Node trusted peer reached its bounded active-session quota; retry after an active session expires"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -258,6 +349,107 @@ mod tests {
             session
         );
         assert!(auth.accept_knock(&encoded, 50_300).is_err());
+    }
+
+    #[test]
+    fn active_session_id_cannot_be_replaced_by_fresh_knock() {
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        let client = SigningKey::from_bytes(&[7u8; 32]);
+        let settings = settings(&client);
+        let auth = CloudNodeAuthenticator::new(&settings, server).unwrap();
+        let session = [3u8; 16];
+        let first = NodeProof::knock(&client, "nas-main", 50_000, session, [5u8; 32])
+            .unwrap()
+            .encode()
+            .unwrap();
+        auth.accept_knock(&first, 50_100).unwrap();
+
+        let replacement = NodeProof::knock(&client, "nas-main", 50_200, session, [6u8; 32])
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert!(auth.accept_knock(&replacement, 50_300).is_err());
+        let active = auth.session("nas-main", &session, 50_400).unwrap().unwrap();
+        assert_eq!(active.peer_nonce, [5u8; 32]);
+    }
+
+    #[test]
+    fn duplicate_trusted_node_ids_are_rejected() {
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        let client = SigningKey::from_bytes(&[7u8; 32]);
+        let mut settings = settings(&client);
+        settings
+            .replication
+            .targets
+            .push(settings.replication.targets[0].clone());
+        assert!(CloudNodeAuthenticator::new(&settings, server).is_err());
+    }
+
+    #[test]
+    fn duplicate_trusted_public_keys_are_rejected() {
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        let client = SigningKey::from_bytes(&[7u8; 32]);
+        let mut settings = settings(&client);
+        let mut alias = settings.replication.targets[0].clone();
+        alias.node_id = "nas-alias".into();
+        alias.url = "https://nas-alias.invalid".into();
+        alias.public_key = alias.public_key.to_ascii_uppercase();
+        settings.replication.targets.push(alias);
+        assert!(CloudNodeAuthenticator::new(&settings, server).is_err());
+    }
+
+    #[test]
+    fn local_node_identity_cannot_be_trusted_as_replication_target() {
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        let client = SigningKey::from_bytes(&[7u8; 32]);
+
+        let mut same_id = settings(&client);
+        same_id.replication.targets[0].node_id = same_id.node.id.clone();
+        assert!(CloudNodeAuthenticator::new(&same_id, server.clone()).is_err());
+
+        let mut same_key = settings(&client);
+        same_key.replication.targets[0].node_id = "render-alias".into();
+        same_key.replication.targets[0].public_key = public_key_hex(&server);
+        assert!(CloudNodeAuthenticator::new(&same_key, server).is_err());
+    }
+
+    #[test]
+    fn authentication_state_capacity_is_bounded_and_peer_isolated() {
+        assert!(ensure_auth_capacity_counts(0, 0, 0, 0, true).is_ok());
+        assert!(ensure_auth_capacity_counts(
+            MAX_ACTIVE_SESSIONS - 1,
+            0,
+            MAX_ACTIVE_SESSIONS_PER_PEER - 1,
+            0,
+            true
+        )
+        .is_ok());
+        assert!(ensure_auth_capacity_counts(MAX_ACTIVE_SESSIONS, 0, 0, 0, true).is_err());
+        assert!(ensure_auth_capacity_counts(
+            MAX_ACTIVE_SESSIONS_PER_PEER,
+            0,
+            MAX_ACTIVE_SESSIONS_PER_PEER,
+            0,
+            true
+        )
+        .is_err());
+        assert!(ensure_auth_capacity_counts(
+            0,
+            MAX_REPLAY_ENTRIES - 1,
+            0,
+            MAX_REPLAY_ENTRIES_PER_PEER - 1,
+            false
+        )
+        .is_ok());
+        assert!(ensure_auth_capacity_counts(0, MAX_REPLAY_ENTRIES, 0, 0, false).is_err());
+        assert!(ensure_auth_capacity_counts(
+            0,
+            MAX_REPLAY_ENTRIES_PER_PEER,
+            0,
+            MAX_REPLAY_ENTRIES_PER_PEER,
+            false
+        )
+        .is_err());
     }
 
     #[test]

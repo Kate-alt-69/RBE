@@ -47,8 +47,7 @@
   },
   "storage": {
     "driver": "sqlite",
-    "sqlitePath": "./data/app.db",
-    "supabaseSyncEnabled": false
+    "sqlitePath": "./data/app.db"
   },
   "streaming": {
     "rtmpPort": 1935,

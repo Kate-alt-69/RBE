@@ -7,7 +7,20 @@
 
 #[allow(dead_code)]
 mod er_recovery;
+// Service only needs the embedded diagnostic/check compatibility router. The
+// backend-only facade also wires package/install authoring commands and imports
+// Library Host approval state, which must never enter service.exe merely because
+// both binaries share this crate.
+#[path = "error_code_book_core.rs"]
 mod error_code_book;
+#[path = "package_links/approval.rs"]
+pub(crate) mod package_approval;
+mod package_links {
+    // backend.exe shared diagnostics use this facade; service.exe does not
+    // perform package approval decisions itself.
+    #[allow(unused_imports)]
+    pub(crate) use crate::package_approval as approval;
+}
 mod service_boot;
 mod service_control;
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -18,7 +31,7 @@ mod service_integrity {
     include!(concat!(env!("OUT_DIR"), "/service_integrity.rs"));
 }
 
-// `error_code_book` is shared with backend.exe and therefore contains the
+// `error_code_book_core` is shared with backend.exe and therefore contains the
 // public `backend check` routing path. The Service executable must never gain
 // backend Runtime Image compilation authority just to compile that shared
 // source. This fail-closed shim satisfies the shared type surface while making

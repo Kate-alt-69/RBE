@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "service"
 path = "src/service_main.rs"
 
+[[bin]]
+name = "deployment-worker"
+path = "src/deployment_worker_main.rs"
+
 [dependencies]
 api = { path = "../api" }
 core-lib = { path = "../core" }
@@ -30,6 +34,7 @@ rbe-install-request = { path = "../../../install-request" }
 rbe-install-runtime = { path = "../../../install-runtime" }
 rbe-library-resolver = { path = "../../../library-resolver" }
 route-engine = { path = "../route-engine" }
+sdk-package = { path = "../sdk-package" }
 ipc-protocol = { path = "../../../container-runtime/crates/ipc-protocol" }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -45,6 +50,8 @@ hex = "0.4"
 rand = "0.8"
 keyring = "2"
 ed25519-dalek = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
 
 [build-dependencies]
 sha2 = "0.10"

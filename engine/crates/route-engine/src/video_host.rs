@@ -7,12 +7,16 @@ use core_lib::{call_public_http, AppState, VideoLanguage};
 use crate::ast::Value;
 use crate::field_manager::FieldRuntimeContext;
 use crate::module_eval::{HostCapabilityCaller, HostCapabilityFuture, ModuleEvalError};
+use crate::rel_host_builtins::is_host_builtin;
+use crate::rel_host_descriptor::{deferred_call, temp_request};
+use crate::rel_host_runtime::{installed_rel_host_executor, RelHostExecutor};
 use crate::runtime_image::RuntimeImage;
 
 pub struct RuntimeHostCapabilities {
     video: VideoLanguage,
     image: Arc<RuntimeImage>,
     fields: Option<Arc<FieldRuntimeContext>>,
+    rel_host_executor: Option<Arc<dyn RelHostExecutor>>,
 }
 
 impl RuntimeHostCapabilities {
@@ -21,6 +25,7 @@ impl RuntimeHostCapabilities {
             video: VideoLanguage::new(state.video_manager.clone()),
             image,
             fields: None,
+            rel_host_executor: installed_rel_host_executor(),
         }
     }
 
@@ -33,7 +38,16 @@ impl RuntimeHostCapabilities {
             video: VideoLanguage::new(state.video_manager.clone()),
             image,
             fields: Some(fields),
+            rel_host_executor: installed_rel_host_executor(),
         }
+    }
+
+    /// Attach a trusted Backend/Container executor explicitly. The normal
+    /// Backend path installs one process-wide executor once at boot; this
+    /// override remains useful for isolated tests and embedded Route Engine use.
+    pub fn with_rel_host_executor(mut self, executor: Arc<dyn RelHostExecutor>) -> Self {
+        self.rel_host_executor = Some(executor);
+        self
     }
 }
 
@@ -46,6 +60,25 @@ impl HostCapabilityCaller for RuntimeHostCapabilities {
         args: Vec<Value>,
     ) -> HostCapabilityFuture<'a> {
         Box::pin(async move {
+            if is_host_builtin(module) {
+                if module == "workspace" && function == "temp" {
+                    let request = temp_request(&args)?;
+                    let executor = self.rel_host_executor.as_ref().ok_or_else(|| ModuleEvalError {
+                        code: "REL2201",
+                        message: "workspace.temp() requires the trusted Backend/Container host executor; no unsafe PATH/process fallback is permitted".into(),
+                    })?;
+                    return executor.execute(request).await.map(Some);
+                }
+                if let Some(value) = deferred_call(module, function, args)? {
+                    return Ok(Some(value));
+                }
+                return Err(ModuleEvalError {
+                    code: "REL2200",
+                    message: format!(
+                        "{module}.{function}() is not yet materializable through the host capability bridge"
+                    ),
+                });
+            }
             if module == "field" {
                 let fields = self.fields.as_ref().ok_or_else(|| ModuleEvalError {
                     code: "FLD4000",

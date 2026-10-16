@@ -1,0 +1,48 @@
+name: TLS lock refresh once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tls-lock-refresh-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Refresh engine lock
+        working-directory: engine
+        run: cargo generate-lockfile
+
+      - name: Format Backend
+        working-directory: engine
+        run: cargo fmt -p backend -- --check
+
+      - name: Check Backend TLS integration
+        working-directory: engine
+        run: cargo check -p backend --all-targets --locked
+
+      - name: Commit refreshed lock
+        shell: bash
+        run: |
+          if git diff --quiet -- engine/Cargo.lock; then
+            echo "engine/Cargo.lock already current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/Cargo.lock
+          git commit -m "BUILD | SDK-CAP-240 refresh TLS dependency lock"
+          git push origin HEAD:main

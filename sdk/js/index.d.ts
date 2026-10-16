@@ -20,6 +20,76 @@ export type HostSessionInfo = Readonly<{
   features: readonly string[];
 }>;
 
+export type DnsAddressReply = Readonly<{
+  name: string;
+  addresses: readonly string[];
+}>;
+
+export type DnsMxRecord = Readonly<{
+  preference: number;
+  exchange: string;
+}>;
+
+export type DnsMxReply = Readonly<{
+  name: string;
+  records: readonly DnsMxRecord[];
+}>;
+
+export type TcpConnectReply = Readonly<{
+  handle: string;
+  peer: string;
+}>;
+
+export type TcpWriteReply = Readonly<{
+  written: number;
+}>;
+
+export type TcpReadReply = Readonly<{
+  data: readonly number[];
+  eof: boolean;
+}>;
+
+
+export type TlsConnectReply = Readonly<{
+  handle: string;
+  peer: string;
+  tls: boolean;
+}>;
+
+export type TlsReadReply = Readonly<{
+  data: readonly number[];
+  eof: boolean;
+  tls: boolean;
+}>;
+
+export type TlsUpgradeReply = Readonly<{
+  handle: string;
+  tls: true;
+  server_name: string;
+}>;
+
+export type TcpListenBindReply = Readonly<{
+  handle: string;
+  local: string;
+}>;
+
+export type TcpListenAcceptReply = Readonly<{
+  handle: string;
+  peer: string;
+  local: string;
+}>;
+
+export type TcpListenReadReply = Readonly<{
+  data: readonly number[];
+  eof: boolean;
+  tls: boolean;
+}>;
+
+export type TcpListenUpgradeReply = Readonly<{
+  handle: string;
+  tls: true;
+}>;
+
 export interface HostBridge {
   call(request: HostRequest): unknown | Promise<unknown>;
   sessionInfo?(): HostSessionInfo | null;
@@ -76,6 +146,82 @@ export declare class CapabilityClient {
   intercept(...interceptors: HostInterceptor[]): CapabilityClient;
 }
 
+export declare class LoggerClient {
+  constructor(bridge: HostBridge, libraryName: string, scope?: readonly string[]);
+  readonly bridge: HostBridge;
+  readonly libraryName: string;
+  readonly scope: readonly string[];
+  target(): string;
+  child(name: string): LoggerClient;
+  emit(level: "debug" | "info" | "warn" | "error" | "fatal", message: unknown): unknown | Promise<unknown>;
+  debug(message: unknown): unknown | Promise<unknown>;
+  info(message: unknown): unknown | Promise<unknown>;
+  warn(message: unknown): unknown | Promise<unknown>;
+  error(message: unknown): unknown | Promise<unknown>;
+  fatal(message: unknown): unknown | Promise<unknown>;
+}
+
+export declare class DnsClient extends CapabilityClient {
+  constructor(bridge: HostBridge);
+  lookup(name: string): DnsAddressReply | Promise<DnsAddressReply>;
+  ip(name: string): DnsAddressReply | Promise<DnsAddressReply>;
+  mx(name: string): DnsMxReply | Promise<DnsMxReply>;
+}
+
+export declare class TcpClient extends CapabilityClient {
+  constructor(bridge: HostBridge);
+  connect(host: string, port: number, timeoutMs?: number | null): TcpConnectReply | Promise<TcpConnectReply>;
+  write(handle: string, data: Uint8Array | readonly number[], timeoutMs?: number | null): TcpWriteReply | Promise<TcpWriteReply>;
+  read(handle: string, maxBytes: number, timeoutMs?: number | null): TcpReadReply | Promise<TcpReadReply>;
+  close(handle: string): null | Promise<null>;
+}
+
+
+export declare class TlsClient extends CapabilityClient {
+  constructor(bridge: HostBridge);
+  connect(host: string, port: number, timeoutMs?: number | null): TlsConnectReply | Promise<TlsConnectReply>;
+  write(handle: string, data: Uint8Array | readonly number[], timeoutMs?: number | null): TcpWriteReply | Promise<TcpWriteReply>;
+  read(handle: string, maxBytes: number, timeoutMs?: number | null): TlsReadReply | Promise<TlsReadReply>;
+  startTls(handle: string, timeoutMs?: number | null): TlsUpgradeReply | Promise<TlsUpgradeReply>;
+  close(handle: string): null | Promise<null>;
+}
+
+export declare class TcpListenerClient extends CapabilityClient {
+  constructor(bridge: HostBridge);
+  bind(address: string, port: number): TcpListenBindReply | Promise<TcpListenBindReply>;
+  accept(handle: string, timeoutMs?: number | null): TcpListenAcceptReply | Promise<TcpListenAcceptReply>;
+  write(handle: string, data: Uint8Array | readonly number[], timeoutMs?: number | null): TcpWriteReply | Promise<TcpWriteReply>;
+  read(handle: string, maxBytes: number, timeoutMs?: number | null): TcpListenReadReply | Promise<TcpListenReadReply>;
+  startTls(
+    handle: string,
+    certChainDer: readonly (Uint8Array | readonly number[])[],
+    privateKeyPkcs8Der: Uint8Array | readonly number[],
+    timeoutMs?: number | null
+  ): TcpListenUpgradeReply | Promise<TcpListenUpgradeReply>;
+  closeConnection(handle: string): null | Promise<null>;
+  close(handle: string): null | Promise<null>;
+}
+
+export declare class NetClient {
+  constructor(bridge: HostBridge);
+  sublibrary(name: string): CapabilityClient;
+  http(): CapabilityClient;
+  cookies(): CapabilityClient;
+  headers(): CapabilityClient;
+  url(): CapabilityClient;
+  dns(): DnsClient;
+  ip(): CapabilityClient;
+  tcp(): TcpClient;
+  tcpListen(): TcpListenerClient;
+  tls(): TlsClient;
+  udp(): CapabilityClient;
+  quic(): CapabilityClient;
+  websocket(): CapabilityClient;
+  webtransport(): CapabilityClient;
+  p2p(): CapabilityClient;
+  mask(): CapabilityClient;
+}
+
 export declare class AdvancedClient {
   constructor(bridge: HostBridge);
   capability(capabilityId: string, target?: string): CapabilityClient;
@@ -88,19 +234,15 @@ export declare class AdvancedClient {
 }
 
 export declare class RbeSdk {
-  constructor(bridge: HostBridge);
+  constructor(bridge: HostBridge, libraryName?: string | null);
   call(request: HostRequest): unknown | Promise<unknown>;
   capability(capabilityId: string, target?: string): CapabilityClient;
   advanced(): AdvancedClient;
+  log(libraryName: string): LoggerClient;
   host(): HostClient;
   intercept(...interceptors: HostInterceptor[]): RbeSdk;
   hostBridge(): HostBridge;
-  net(): {
-    sublibrary(name: string): CapabilityClient;
-    http(): CapabilityClient;
-    p2p(): CapabilityClient;
-    mask(): CapabilityClient;
-  };
+  net(): NetClient;
   router(): {
     inspect(operation: string, payload?: unknown): unknown | Promise<unknown>;
     register(operation: string, payload?: unknown): unknown | Promise<unknown>;

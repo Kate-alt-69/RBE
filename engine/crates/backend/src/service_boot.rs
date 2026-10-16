@@ -4,6 +4,14 @@ use std::sync::Arc;
 
 use service_runtime::{ServiceCatalog, ServiceDefaults, ServiceMemory};
 
+#[path = "service_native_host.rs"]
+mod service_native_host;
+#[path = "service_package_catalog.rs"]
+mod service_package_catalog;
+
+#[allow(unused_imports)]
+pub(crate) use service_native_host::{attach_native_service_frames, NativeServiceHostFrame};
+
 pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let value = |flag: &str| {
         args.windows(2)
@@ -13,6 +21,13 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     let service_file = value("--service-file")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("service --service-host requires --service-file <path>"))?;
+    let service_name = value("--service-name").unwrap_or_else(|| {
+        service_file
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    });
     let mother_managed = args.iter().any(|arg| arg == "--service-mother-address");
     let application_root = value("--application-root").map(PathBuf::from);
     if mother_managed && application_root.is_none() {
@@ -61,15 +76,20 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
 
     // Service children load the same typed settings as the mother process so
     // configurable defaults stay consistent even when the .service file omits
-    // memoryLimitMb/startupTimeoutMs.
+    // memoryLimitMb/startupTimeoutMs. The native compiler transport is removed
+    // before RuntimeEnv sees the snapshot, so internal OID/bin metadata cannot
+    // become an application environment variable.
     let settings_path = value("--settings").unwrap_or_else(|| "settings.json".into());
     let config = config::Config::load(&settings_path)
         .map_err(|error| anyhow::anyhow!("service host failed to load {settings_path}: {error}"))?;
+    let mut runtime_env_snapshot = match runtime_env_frame {
+        Some(value) => value,
+        None => serde_json::to_value(&config.runtime_env)?,
+    };
+    let native_frame =
+        service_native_host::take_native_service_frame(&mut runtime_env_snapshot, &service_name)?;
     let runtime_env = Arc::new(route_engine::RuntimeEnv::from_snapshot(
-        match runtime_env_frame {
-            Some(value) => value,
-            None => serde_json::to_value(&config.runtime_env)?,
-        },
+        runtime_env_snapshot,
     )?);
     let defaults = ServiceDefaults {
         memory_limit_mb: config.services.default_memory_limit_mb,
@@ -78,6 +98,22 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         monitor_interval_ms: config.services.monitor_interval_ms,
         max_restart_backoff_ms: config.services.max_restart_backoff_ms,
     };
+
+    if let Some(native_frame) = native_frame {
+        // All inherited pipe frames have been consumed at this point. Native
+        // execution starts from the verified pinned `.bin`; source text and
+        // ModuleProgram are deliberately never opened in this branch.
+        prefer_kernel_parent_liveness_on_linux()?;
+        tracing::info!(
+            service = %service_name,
+            image = %native_frame.runtime_image_id,
+            assembly = %native_frame.bootstrap.assembly_hash,
+            "starting Service worker from pinned native assembly"
+        );
+        return service_native_host::run_native_service_host(native_frame, &service_name, token)
+            .await;
+    }
+
     let source = std::fs::read_to_string(&service_file).map_err(|error| {
         anyhow::anyhow!(
             "service host failed to read executable body {}: {error}",
@@ -96,6 +132,7 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
             );
         }
     }
+    prefer_kernel_parent_liveness_on_linux()?;
     let program = route_engine::parse_service_source(&source).map_err(|error| {
         anyhow::anyhow!(
             "service host failed to parse {}:{}:{}: {}",
@@ -111,8 +148,7 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
     }
     .map_err(|errors| {
         anyhow::anyhow!(
-            "service host module compilation failed:
-{}",
+            "service host module compilation failed:\n{}",
             errors.render()
         )
     })?;
@@ -132,6 +168,53 @@ pub async fn run_host(args: &[String]) -> anyhow::Result<()> {
         Arc::new(executor),
     )
     .await
+}
+
+#[cfg(target_os = "linux")]
+fn prefer_kernel_parent_liveness_on_linux() -> anyhow::Result<()> {
+    if std::env::var_os("RBE_PARENT_LIVENESS_PIPE").is_none() {
+        return Ok(());
+    }
+
+    use std::os::raw::{c_int, c_ulong};
+
+    const PR_SET_PDEATHSIG: c_int = 1;
+    const SIGTERM: c_ulong = 15;
+
+    unsafe extern "C" {
+        fn getppid() -> c_int;
+        fn prctl(option: c_int, ...) -> c_int;
+    }
+
+    let parent_pid = unsafe { getppid() };
+    if parent_pid <= 1 {
+        anyhow::bail!("service parent disappeared before Linux parent-death guard could be armed");
+    }
+
+    let armed = unsafe { prctl(PR_SET_PDEATHSIG, SIGTERM) };
+    if armed != 0 {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(
+            error = %error,
+            "failed to arm Linux parent-death signal; retaining pipe watcher fallback"
+        );
+        return Ok(());
+    }
+
+    if unsafe { getppid() } != parent_pid {
+        anyhow::bail!("service parent exited while Linux parent-death guard was being armed");
+    }
+
+    // All inherited bootstrap frames have already been consumed and verified.
+    // From here Linux relies on PR_SET_PDEATHSIG instead of allocating one
+    // dedicated blocking thread per service merely to wait for stdin EOF.
+    std::env::remove_var("RBE_PARENT_LIVENESS_PIPE");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prefer_kernel_parent_liveness_on_linux() -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn canonical_runtime_root(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
@@ -191,8 +274,10 @@ pub fn compile(
     settings: &config::ServicesConfig,
     io: &atomic_io::AtomicIo,
 ) -> anyhow::Result<Option<ServiceCatalog>> {
-    let directory = resolve_runtime_path(&settings.directory);
-    compile_resolved(settings, io, &directory)
+    let application_root = std::env::current_dir().map_err(|error| {
+        anyhow::anyhow!("could not resolve application root for Service compilation: {error}")
+    })?;
+    compile_from_root(settings, io, &application_root)
 }
 
 pub fn compile_from_root(
@@ -201,7 +286,32 @@ pub fn compile_from_root(
     application_root: &Path,
 ) -> anyhow::Result<Option<ServiceCatalog>> {
     let directory = resolve_runtime_path_from(application_root, &settings.directory);
-    compile_resolved(settings, io, &directory)
+    if !settings.enabled {
+        return compile_resolved(settings, io, &directory);
+    }
+
+    let staged = service_package_catalog::stage_if_needed(application_root, &directory, io)?;
+    let compile_root = staged
+        .as_ref()
+        .map(service_package_catalog::StagedServiceCatalog::root)
+        .unwrap_or(directory.as_path());
+    let catalog = compile_resolved(settings, io, compile_root)?;
+
+    if let (Some(catalog), Some(staged)) = (catalog.as_ref(), staged.as_ref()) {
+        if let Err(rendered) = staged.validate_namespaces(catalog) {
+            report_compile_failure(&rendered, io);
+            return Err(anyhow::anyhow!(
+                "package-owned .service namespace validation failed"
+            ));
+        }
+        tracing::info!(
+            package_services = staged.package_service_count(),
+            total_services = catalog.services().len(),
+            "compiled application and approved package-owned .service programs into one catalog"
+        );
+    }
+
+    Ok(catalog)
 }
 
 fn compile_resolved(

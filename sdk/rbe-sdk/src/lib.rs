@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 
 use std::error::Error;
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 /// First public RBE native-library ABI.
 pub const LIBRARY_ABI_VERSION: u32 = 1;
@@ -45,6 +45,7 @@ pub const SUPPORTED_ABI: AbiRange = AbiRange::exact(LIBRARY_ABI_VERSION);
 
 /// Canonical capability IDs understood by the RBE library host.
 pub mod capability {
+    pub const LOG: &str = "log";
     pub const NET_HTTP: &str = "net:http";
     pub const NET_COOKIES: &str = "net:cookies";
     pub const NET_HEADERS: &str = "net:headers";
@@ -52,6 +53,8 @@ pub mod capability {
     pub const NET_DNS: &str = "net:dns";
     pub const NET_IP: &str = "net:ip";
     pub const NET_TCP: &str = "net:tcp";
+    pub const NET_TCP_LISTEN: &str = "net:tcp-listen";
+    pub const NET_TLS: &str = "net:tls";
     pub const NET_UDP: &str = "net:udp";
     pub const NET_QUIC: &str = "net:quic";
     pub const NET_WEBSOCKET: &str = "net:websocket";
@@ -208,7 +211,11 @@ pub trait HostBridge: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SdkError {
     InvalidLibraryName(String),
+    InvalidLogScope(String),
+    InvalidLogLevel(String),
     InvalidNetSublibrary(String),
+    InvalidTcpPort(u16),
+    InvalidTcpArgument(String),
     InvalidAbiRange(AbiRange),
     Host(HostError),
 }
@@ -219,9 +226,19 @@ impl fmt::Display for SdkError {
             Self::InvalidLibraryName(name) => {
                 write!(formatter, "invalid RBE library name {name:?}")
             }
+            Self::InvalidLogScope(scope) => {
+                write!(formatter, "invalid RBE logger child scope {scope:?}")
+            }
+            Self::InvalidLogLevel(level) => {
+                write!(formatter, "invalid RBE log level {level:?}")
+            }
             Self::InvalidNetSublibrary(name) => {
                 write!(formatter, "invalid net sub-library name {name:?}")
             }
+            Self::InvalidTcpPort(port) => {
+                write!(formatter, "invalid RBE TCP port {port}; expected 1..=65535")
+            }
+            Self::InvalidTcpArgument(message) => formatter.write_str(message),
             Self::InvalidAbiRange(range) => {
                 write!(
                     formatter,
@@ -268,10 +285,10 @@ impl<'a> LibraryDescriptor<'a> {
 
 /// Entry point exposed to library code.
 ///
-/// Common helpers (`net`, `router`, `storage`, `crypto`) are the easy path. The
-/// generic `capability` and `advanced` surfaces intentionally remain open-ended
-/// so advanced packages can compose RBE features without the SDK policing their
-/// application design.
+/// Common helpers (`log`, `net`, `router`, `storage`, `crypto`) are the easy
+/// path. The generic `capability` and `advanced` surfaces intentionally remain
+/// open-ended so advanced packages can compose RBE features without the SDK
+/// policing their application design.
 #[derive(Clone, Copy)]
 pub struct RbeSdk<'a> {
     bridge: &'a dyn HostBridge,
@@ -280,6 +297,10 @@ pub struct RbeSdk<'a> {
 impl<'a> RbeSdk<'a> {
     pub const fn new(bridge: &'a dyn HostBridge) -> Self {
         Self { bridge }
+    }
+
+    pub fn log(self, library_name: &str) -> Result<Logger<'a>, SdkError> {
+        Logger::new(self.bridge, library_name)
     }
 
     pub const fn net(self) -> Net<'a> {
@@ -444,6 +465,73 @@ impl Host<'_> {
     }
 }
 
+pub struct Logger<'a> {
+    bridge: &'a dyn HostBridge,
+    library_name: String,
+    scope: Vec<String>,
+}
+
+impl<'a> Logger<'a> {
+    fn new(bridge: &'a dyn HostBridge, library_name: &str) -> Result<Self, SdkError> {
+        if !valid_component(library_name) {
+            return Err(SdkError::InvalidLibraryName(library_name.to_string()));
+        }
+        Ok(Self {
+            bridge,
+            library_name: library_name.to_string(),
+            scope: Vec::new(),
+        })
+    }
+
+    pub fn target(&self) -> String {
+        format!("lib/{}", self.library_name)
+    }
+
+    pub fn child(&self, name: &str) -> Result<Self, SdkError> {
+        if !valid_component(name) {
+            return Err(SdkError::InvalidLogScope(name.to_string()));
+        }
+        let mut scope = self.scope.clone();
+        scope.push(name.to_string());
+        Ok(Self {
+            bridge: self.bridge,
+            library_name: self.library_name.clone(),
+            scope,
+        })
+    }
+
+    pub fn emit(&self, level: &str, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        if !matches!(level, "debug" | "info" | "warn" | "error" | "fatal") {
+            return Err(SdkError::InvalidLogLevel(level.to_string()));
+        }
+        let payload = encode_log_record(&self.scope, &message.to_string());
+        let target = self.target();
+        self.bridge
+            .call(HostCall::new(capability::LOG, &target, level, &payload))
+            .map_err(Into::into)
+    }
+
+    pub fn debug(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("debug", message)
+    }
+
+    pub fn info(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("info", message)
+    }
+
+    pub fn warn(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("warn", message)
+    }
+
+    pub fn error(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("error", message)
+    }
+
+    pub fn fatal(&self, message: impl fmt::Display) -> Result<HostReply, SdkError> {
+        self.emit("fatal", message)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Net<'a> {
     bridge: &'a dyn HostBridge,
@@ -465,6 +553,62 @@ impl<'a> Net<'a> {
         self.known(capability::NET_HTTP)
     }
 
+    pub fn cookies(self) -> NetLibrary<'a> {
+        self.known(capability::NET_COOKIES)
+    }
+
+    pub fn headers(self) -> NetLibrary<'a> {
+        self.known(capability::NET_HEADERS)
+    }
+
+    pub fn url(self) -> NetLibrary<'a> {
+        self.known(capability::NET_URL)
+    }
+
+    pub fn dns(self) -> Dns<'a> {
+        Dns {
+            client: self.known(capability::NET_DNS),
+        }
+    }
+
+    pub fn ip(self) -> NetLibrary<'a> {
+        self.known(capability::NET_IP)
+    }
+
+    pub fn tcp(self) -> Tcp<'a> {
+        Tcp {
+            client: self.known(capability::NET_TCP),
+        }
+    }
+
+    pub fn tcp_listen(self) -> TcpListen<'a> {
+        TcpListen {
+            client: self.known(capability::NET_TCP_LISTEN),
+        }
+    }
+
+    pub fn tls(self) -> Tls<'a> {
+        Tls {
+            client: self.known(capability::NET_TLS),
+        }
+    }
+
+    pub fn udp(self) -> NetLibrary<'a> {
+        self.known(capability::NET_UDP)
+    }
+
+    pub fn quic(self) -> NetLibrary<'a> {
+        self.known(capability::NET_QUIC)
+    }
+
+    pub fn websocket(self) -> NetLibrary<'a> {
+        self.known(capability::NET_WEBSOCKET)
+    }
+
+    pub fn webtransport(self) -> NetLibrary<'a> {
+        self.known(capability::NET_WEBTRANSPORT)
+    }
+
     pub fn p2p(self) -> NetLibrary<'a> {
         self.known(capability::NET_P2P)
     }
@@ -479,6 +623,280 @@ impl<'a> Net<'a> {
             capability: target.to_string(),
             target: target.to_string(),
         }
+    }
+}
+
+/// Typed public DNS client. RBE still owns resolution policy and authority.
+pub struct Dns<'a> {
+    client: CapabilityClient<'a>,
+}
+
+impl<'a> Dns<'a> {
+    pub fn raw(&self) -> &CapabilityClient<'a> {
+        &self.client
+    }
+
+    pub fn lookup(&self, name: &str) -> Result<HostReply, SdkError> {
+        self.client.call("lookup", name.as_bytes())
+    }
+
+    pub fn ip(&self, name: &str) -> Result<HostReply, SdkError> {
+        self.client.call("ip", name.as_bytes())
+    }
+
+    pub fn mx(&self, name: &str) -> Result<HostReply, SdkError> {
+        self.client.call("mx", name.as_bytes())
+    }
+}
+
+/// Typed stateful TCP client. Handles remain opaque and session-scoped in RBE.
+pub struct Tcp<'a> {
+    client: CapabilityClient<'a>,
+}
+
+impl<'a> Tcp<'a> {
+    pub fn raw(&self) -> &CapabilityClient<'a> {
+        &self.client
+    }
+
+    pub fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        if host.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP host must be non-empty".to_string(),
+            ));
+        }
+        if port == 0 {
+            return Err(SdkError::InvalidTcpPort(port));
+        }
+        self.client
+            .call("connect", &encode_tcp_connect(host, port, timeout_ms))
+    }
+
+    pub fn write(
+        &self,
+        handle: &str,
+        data: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        if handle.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP handle must be non-empty".to_string(),
+            ));
+        }
+        if data.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP write data must be non-empty".to_string(),
+            ));
+        }
+        self.client
+            .call("write", &encode_tcp_write(handle, data, timeout_ms))
+    }
+
+    pub fn read(
+        &self,
+        handle: &str,
+        max_bytes: usize,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        if handle.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP handle must be non-empty".to_string(),
+            ));
+        }
+        if max_bytes == 0 {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP max_bytes must be positive".to_string(),
+            ));
+        }
+        self.client
+            .call("read", &encode_tcp_read(handle, max_bytes, timeout_ms))
+    }
+
+    pub fn close(&self, handle: &str) -> Result<HostReply, SdkError> {
+        if handle.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP handle must be non-empty".to_string(),
+            ));
+        }
+        self.client.call("close", &encode_tcp_close(handle))
+    }
+}
+
+/// Typed TLS/STARTTLS client. RBE owns DNS, certificate validation, and socket state.
+pub struct Tls<'a> {
+    client: CapabilityClient<'a>,
+}
+
+impl<'a> Tls<'a> {
+    pub fn raw(&self) -> &CapabilityClient<'a> {
+        &self.client
+    }
+
+    pub fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        if host.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TLS host must be non-empty".to_string(),
+            ));
+        }
+        if port == 0 {
+            return Err(SdkError::InvalidTcpPort(port));
+        }
+        self.client
+            .call("connect", &encode_tcp_connect(host, port, timeout_ms))
+    }
+
+    pub fn write(
+        &self,
+        handle: &str,
+        data: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TLS")?;
+        if data.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TLS write data must be non-empty".to_string(),
+            ));
+        }
+        self.client
+            .call("write", &encode_tcp_write(handle, data, timeout_ms))
+    }
+
+    pub fn read(
+        &self,
+        handle: &str,
+        max_bytes: usize,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TLS")?;
+        if max_bytes == 0 {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TLS max_bytes must be positive".to_string(),
+            ));
+        }
+        self.client
+            .call("read", &encode_tcp_read(handle, max_bytes, timeout_ms))
+    }
+
+    pub fn start_tls(&self, handle: &str, timeout_ms: Option<u64>) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TLS")?;
+        self.client
+            .call("start_tls", &encode_handle_timeout(handle, timeout_ms))
+    }
+
+    pub fn close(&self, handle: &str) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TLS")?;
+        self.client.call("close", &encode_tcp_close(handle))
+    }
+}
+
+/// Typed inbound TCP listener client. Listener and accepted connection handles stay opaque.
+pub struct TcpListen<'a> {
+    client: CapabilityClient<'a>,
+}
+
+impl<'a> TcpListen<'a> {
+    pub fn raw(&self) -> &CapabilityClient<'a> {
+        &self.client
+    }
+
+    pub fn bind(&self, address: &str, port: u16) -> Result<HostReply, SdkError> {
+        if address.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE TCP listener address must be non-empty".to_string(),
+            ));
+        }
+        if port == 0 {
+            return Err(SdkError::InvalidTcpPort(port));
+        }
+        self.client
+            .call("bind", &encode_tcp_listen_bind(address, port))
+    }
+
+    pub fn accept(&self, handle: &str, timeout_ms: Option<u64>) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TCP listener")?;
+        self.client
+            .call("accept", &encode_handle_timeout(handle, timeout_ms))
+    }
+
+    pub fn write(
+        &self,
+        handle: &str,
+        data: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "inbound TCP")?;
+        if data.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE inbound TCP write data must be non-empty".to_string(),
+            ));
+        }
+        self.client
+            .call("write", &encode_tcp_write(handle, data, timeout_ms))
+    }
+
+    pub fn read(
+        &self,
+        handle: &str,
+        max_bytes: usize,
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "inbound TCP")?;
+        if max_bytes == 0 {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE inbound TCP max_bytes must be positive".to_string(),
+            ));
+        }
+        self.client
+            .call("read", &encode_tcp_read(handle, max_bytes, timeout_ms))
+    }
+
+    pub fn start_tls(
+        &self,
+        handle: &str,
+        cert_chain_der: &[&[u8]],
+        private_key_pkcs8_der: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "inbound TCP")?;
+        if cert_chain_der.is_empty()
+            || cert_chain_der
+                .iter()
+                .any(|certificate| certificate.is_empty())
+        {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE inbound TLS certificate chain must be non-empty".to_string(),
+            ));
+        }
+        if private_key_pkcs8_der.is_empty() {
+            return Err(SdkError::InvalidTcpArgument(
+                "RBE inbound TLS PKCS#8 private key must be non-empty".to_string(),
+            ));
+        }
+        self.client.call(
+            "start_tls",
+            &encode_tcp_listen_start_tls(handle, cert_chain_der, private_key_pkcs8_der, timeout_ms),
+        )
+    }
+
+    pub fn close_connection(&self, handle: &str) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "inbound TCP")?;
+        self.client
+            .call("close_connection", &encode_tcp_close(handle))
+    }
+
+    pub fn close(&self, handle: &str) -> Result<HostReply, SdkError> {
+        validate_non_empty_handle(handle, "TCP listener")?;
+        self.client.call("close", &encode_tcp_close(handle))
     }
 }
 
@@ -595,6 +1013,149 @@ impl Crypto<'_> {
     }
 }
 
+fn encode_log_record(scope: &[String], message: &str) -> Vec<u8> {
+    let mut output = String::from("{\"scope\":[");
+    for (index, component) in scope.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        push_json_string(&mut output, component);
+    }
+    output.push_str("],\"message\":");
+    push_json_string(&mut output, message);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_connect(host: &str, port: u16, timeout_ms: Option<u64>) -> Vec<u8> {
+    let mut output = String::from("{\"host\":");
+    push_json_string(&mut output, host);
+    write!(output, ",\"port\":{port}").expect("writing TCP JSON to String cannot fail");
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_write(handle: &str, data: &[u8], timeout_ms: Option<u64>) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    output.push_str(",\"data\":[");
+    for (index, byte) in data.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "{byte}").expect("writing TCP byte to String cannot fail");
+    }
+    output.push(']');
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_read(handle: &str, max_bytes: usize, timeout_ms: Option<u64>) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    write!(output, ",\"max_bytes\":{max_bytes}").expect("writing TCP JSON to String cannot fail");
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_close(handle: &str) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_handle_timeout(handle: &str, timeout_ms: Option<u64>) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_listen_bind(address: &str, port: u16) -> Vec<u8> {
+    let mut output = String::from("{\"address\":");
+    push_json_string(&mut output, address);
+    write!(output, ",\"port\":{port}").expect("writing TCP listener JSON to String cannot fail");
+    output.push('}');
+    output.into_bytes()
+}
+
+fn encode_tcp_listen_start_tls(
+    handle: &str,
+    cert_chain_der: &[&[u8]],
+    private_key_pkcs8_der: &[u8],
+    timeout_ms: Option<u64>,
+) -> Vec<u8> {
+    let mut output = String::from("{\"handle\":");
+    push_json_string(&mut output, handle);
+    output.push_str(",\"cert_chain_der\":[");
+    for (certificate_index, certificate) in cert_chain_der.iter().enumerate() {
+        if certificate_index > 0 {
+            output.push(',');
+        }
+        output.push('[');
+        for (byte_index, byte) in certificate.iter().enumerate() {
+            if byte_index > 0 {
+                output.push(',');
+            }
+            write!(output, "{byte}").expect("writing TLS certificate byte to String cannot fail");
+        }
+        output.push(']');
+    }
+    output.push_str("],\"private_key_pkcs8_der\":[");
+    for (index, byte) in private_key_pkcs8_der.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "{byte}").expect("writing TLS private-key byte to String cannot fail");
+    }
+    output.push(']');
+    push_timeout(&mut output, timeout_ms);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn validate_non_empty_handle(handle: &str, label: &str) -> Result<(), SdkError> {
+    if handle.is_empty() {
+        return Err(SdkError::InvalidTcpArgument(format!(
+            "RBE {label} handle must be non-empty"
+        )));
+    }
+    Ok(())
+}
+
+fn push_timeout(output: &mut String, timeout_ms: Option<u64>) {
+    if let Some(timeout_ms) = timeout_ms {
+        write!(output, ",\"timeout_ms\":{timeout_ms}")
+            .expect("writing TCP timeout to String cannot fail");
+    }
+}
+
+fn push_json_string(output: &mut String, value: &str) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            character if character <= '\u{1f}' => {
+                write!(output, "\\u{:04x}", character as u32)
+                    .expect("writing JSON escape to String cannot fail");
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+}
+
 fn valid_component(value: &str) -> bool {
     let mut bytes = value.bytes();
     let Some(first) = bytes.next() else {
@@ -661,6 +1222,104 @@ mod tests {
     }
 
     #[test]
+    fn logger_uses_explicit_library_authority_and_structured_child_scope() {
+        let bridge = RecordingBridge::default();
+        let sdk = RbeSdk::new(&bridge);
+        sdk.log("mail")
+            .unwrap()
+            .child("smtp")
+            .unwrap()
+            .info("Listening on port 25")
+            .unwrap();
+
+        let calls = bridge.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, capability::LOG);
+        assert_eq!(calls[0].1, "lib/mail");
+        assert_eq!(calls[0].2, "info");
+        assert_eq!(
+            calls[0].3,
+            br#"{"scope":["smtp"],"message":"Listening on port 25"}"#
+        );
+    }
+
+    #[test]
+    fn typed_dns_and_tcp_clients_encode_live_host_operations() {
+        let bridge = RecordingBridge::default();
+        let sdk = RbeSdk::new(&bridge);
+
+        sdk.net().dns().mx("gmail.com").unwrap();
+        sdk.net()
+            .tcp()
+            .connect("gmail-smtp-in.l.google.com", 25, Some(2500))
+            .unwrap();
+        sdk.net()
+            .tcp()
+            .write("tcp:abc", b"EHLO example.com\r\n", None)
+            .unwrap();
+        sdk.net().tcp().read("tcp:abc", 1024, Some(1000)).unwrap();
+        sdk.net().tcp().close("tcp:abc").unwrap();
+
+        let calls = bridge.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0].0, capability::NET_DNS);
+        assert_eq!(calls[0].2, "mx");
+        assert_eq!(calls[0].3, b"gmail.com");
+        assert_eq!(calls[1].0, capability::NET_TCP);
+        assert_eq!(calls[1].2, "connect");
+        assert_eq!(
+            calls[1].3,
+            br#"{"host":"gmail-smtp-in.l.google.com","port":25,"timeout_ms":2500}"#
+        );
+        assert_eq!(calls[2].2, "write");
+        assert_eq!(
+            calls[2].3,
+            br#"{"handle":"tcp:abc","data":[69,72,76,79,32,101,120,97,109,112,108,101,46,99,111,109,13,10]}"#
+        );
+        assert_eq!(calls[3].2, "read");
+        assert_eq!(
+            calls[3].3,
+            br#"{"handle":"tcp:abc","max_bytes":1024,"timeout_ms":1000}"#
+        );
+        assert_eq!(calls[4].2, "close");
+        assert_eq!(calls[4].3, br#"{"handle":"tcp:abc"}"#);
+    }
+
+    #[test]
+    fn typed_tls_and_tcp_listener_clients_encode_live_host_operations() {
+        let bridge = RecordingBridge::default();
+        let sdk = RbeSdk::new(&bridge);
+
+        sdk.net()
+            .tls()
+            .connect("smtp.example.com", 25, Some(2500))
+            .unwrap();
+        sdk.net().tls().start_tls("tls:abc", Some(1000)).unwrap();
+        sdk.net().tcp_listen().bind("0.0.0.0", 2525).unwrap();
+        sdk.net()
+            .tcp_listen()
+            .accept("tcp-listen:abc", Some(5000))
+            .unwrap();
+        sdk.net()
+            .tcp_listen()
+            .start_tls("tcp-in:abc", &[&[1, 2, 3]], &[4, 5, 6], Some(1000))
+            .unwrap();
+
+        let calls = bridge.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0].0, capability::NET_TLS);
+        assert_eq!(calls[0].2, "connect");
+        assert_eq!(calls[1].0, capability::NET_TLS);
+        assert_eq!(calls[1].2, "start_tls");
+        assert_eq!(calls[2].0, capability::NET_TCP_LISTEN);
+        assert_eq!(calls[2].2, "bind");
+        assert_eq!(calls[3].0, capability::NET_TCP_LISTEN);
+        assert_eq!(calls[3].2, "accept");
+        assert_eq!(calls[4].0, capability::NET_TCP_LISTEN);
+        assert_eq!(calls[4].2, "start_tls");
+    }
+
+    #[test]
     fn higher_level_library_can_call_builtin_net_through_host_bridge() {
         let bridge = RecordingBridge::default();
         let sdk = RbeSdk::new(&bridge);
@@ -671,11 +1330,20 @@ mod tests {
             .unwrap();
         assert_eq!(reply.payload, b"ok");
 
+        sdk.net().dns().raw().call("mx", b"gmail.com").unwrap();
+        sdk.net()
+            .tcp()
+            .raw()
+            .call("connect", br#"{"host":"mail.example","port":25}"#)
+            .unwrap();
+
         let calls = bridge.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].0, capability::NET_HTTP);
         assert_eq!(calls[0].1, capability::NET_HTTP);
         assert_eq!(calls[0].2, "request");
+        assert_eq!(calls[1].0, capability::NET_DNS);
+        assert_eq!(calls[2].0, capability::NET_TCP);
     }
 
     #[test]
