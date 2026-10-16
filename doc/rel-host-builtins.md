@@ -12,7 +12,8 @@ They are host capabilities rather than pure evaluator functions.
 
 ## workspace
 
-- `workspace.temp(operation)`
+- `workspace.run(operation)` — materialize one deferred operation against ProjectRoot
+- `workspace.temp(operation)` — materialize one operation with a temporary `??/` root
 - `workspace.construct()`
 - `workspace.fetch(options)`
 - `workspace.copy(source, destination)`
@@ -36,3 +37,7 @@ They are host capabilities rather than pure evaluator functions.
 Host-backed builtins are unavailable to pure `.field` sources. Module, Service and Route
 execution may use them after RELC and the host authority grant them. Server REL may declare
 imports through the shared grammar; actual helper execution remains gated by the Server host bridge.
+
+Native ZIP operations now execute within Backend. See
+[`request-time-capabilities.md`](request-time-capabilities.md) for limits and result
+shapes; archive calls remain deferred until `workspace.run` or `workspace.temp`.

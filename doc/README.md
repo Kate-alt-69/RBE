@@ -21,6 +21,7 @@ This directory is the authoritative user-facing documentation for the current RB
 - [`source-security.md`](source-security.md) — source integrity, Runtime ENV hardening, process/capability boundaries, and sealed deployment.
 - [`compatibility.md`](compatibility.md) — current cross-file capability/runtime matrix.
 - [`quickdb.md`](quickdb.md) — Service-only probabilistic membership/indexing through `quickDB`.
+- [`request-time-capabilities.md`](request-time-capabilities.md) — bounded local ZIP operations, `workspace.run`, and the remaining signer/CAS migration boundary.
 - [`storage.md`](storage.md) — Environment Storage, unified `storage.write(...)`, frozen `$$/` ProjectRoot semantics, encoding, and Data-Level status.
 - [`field-manager.md`](field-manager.md) — first-class `.field` sources, typed query-field IR, deterministic helpers, and current runtime boundary.
 - [`video-manager.md`](video-manager.md) — Video Manager media pipeline, hardware normalization, and live-session control.
