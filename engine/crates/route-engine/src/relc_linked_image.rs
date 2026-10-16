@@ -110,19 +110,23 @@ pub fn compile_runtime_image_with_packages_and_linked_rel(
         discover_linked_rel_from_runtime_image(&image, raw_server_source, &discovery_sources)
             .map_err(RelcLinkedImageError::LinkedRel)?;
 
-	// Native selection defines which linked symbols will actually have native
-	// OID records. Evaluator-backed module dependencies remain semantic/hash
-	// evidence and must not become requests for nonexistent machine-code records.
-	let native_services = select_native_services(&image, &linked_rel, &OidTarget::current())
-		.map_err(RelcLinkedImageError::NativeSelection)?;
+    // Native selection defines which linked symbols will actually have native
+    // OID records. Evaluator-backed module dependencies remain semantic/hash
+    // evidence and must not become requests for nonexistent machine-code records.
+    let native_services = select_native_services(&image, &linked_rel, &OidTarget::current())
+        .map_err(RelcLinkedImageError::NativeSelection)?;
 
     // CTI Task discovery consumes compiler facts only. It does not allocate an
     // OID or assemble a `.bin`; instead it emits canonical Task OID requests,
     // DAG metadata, capability slots, logging dictionaries and source/error maps
     // for the later assembler/index phases.
-	let container_tasks =
-		discover_container_tasks(&image, &native_services, raw_server_source, &discovery_sources)
-			.map_err(RelcLinkedImageError::ContainerTask)?;
+    let container_tasks = discover_container_tasks(
+        &image,
+        &native_services,
+        raw_server_source,
+        &discovery_sources,
+    )
+    .map_err(RelcLinkedImageError::ContainerTask)?;
 
     // Phase 4 allocates only the post-DCE reachable symbol set plus the Task OID
     // identities emitted above. Capacity must be checked after discovery so
@@ -328,56 +332,56 @@ mod tests {
     use super::*;
     use crate::source_registry::RelSourceKind;
 
-	#[test]
-	fn container_tasks_compile_parameter_and_catch_all_routes_without_identity_collisions() {
-		let names = ["npm/package", "npm/[package]", "npm/[...package]"];
-		let source =
+    #[test]
+    fn container_tasks_compile_parameter_and_catch_all_routes_without_identity_collisions() {
+        let names = ["npm/package", "npm/[package]", "npm/[...package]"];
+        let source =
 			":import[response]\nclass Route { get(req) { return response.json({ ok: true }, 200); } }";
-		let compile = || {
-			compile_runtime_image_with_linked_rel(
-				"server Main {}",
-				names
-					.iter()
-					.map(|name| {
-						PhysicalRelSource::new(
-							RelSourceKind::Route,
-							*name,
-							format!("api/{name}.route"),
-							source,
-						)
-					})
-					.collect(),
-				&serde_json::json!({}),
-			)
-			.expect("supported dynamic routes must compile through CTI discovery")
-		};
-		let first = compile();
-		let second = compile();
-		assert_eq!(first.image.routes.len(), names.len());
-		assert_eq!(first.container_tasks.tasks.len(), names.len());
-		let identities = first
-			.container_tasks
-			.tasks
-			.iter()
-			.map(|task| task.canonical_id.clone())
-			.collect::<std::collections::BTreeSet<_>>();
-		assert_eq!(identities.len(), names.len());
-		assert!(identities.contains("task_route_npm_package_get"));
-		assert_eq!(
-			first
-				.container_tasks
-				.tasks
-				.iter()
-				.map(|task| (&task.canonical_id, &task.semantic_sha256))
-				.collect::<Vec<_>>(),
-			second
-				.container_tasks
-				.tasks
-				.iter()
-				.map(|task| (&task.canonical_id, &task.semantic_sha256))
-				.collect::<Vec<_>>(),
-		);
-	}
+        let compile = || {
+            compile_runtime_image_with_linked_rel(
+                "server Main {}",
+                names
+                    .iter()
+                    .map(|name| {
+                        PhysicalRelSource::new(
+                            RelSourceKind::Route,
+                            *name,
+                            format!("api/{name}.route"),
+                            source,
+                        )
+                    })
+                    .collect(),
+                &serde_json::json!({}),
+            )
+            .expect("supported dynamic routes must compile through CTI discovery")
+        };
+        let first = compile();
+        let second = compile();
+        assert_eq!(first.image.routes.len(), names.len());
+        assert_eq!(first.container_tasks.tasks.len(), names.len());
+        let identities = first
+            .container_tasks
+            .tasks
+            .iter()
+            .map(|task| task.canonical_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities.len(), names.len());
+        assert!(identities.contains("task_route_npm_package_get"));
+        assert_eq!(
+            first
+                .container_tasks
+                .tasks
+                .iter()
+                .map(|task| (&task.canonical_id, &task.semantic_sha256))
+                .collect::<Vec<_>>(),
+            second
+                .container_tasks
+                .tasks
+                .iter()
+                .map(|task| (&task.canonical_id, &task.semantic_sha256))
+                .collect::<Vec<_>>(),
+        );
+    }
 
     #[test]
     fn fixed_dynamic_capacities_match_the_frozen_range_map() {

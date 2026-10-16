@@ -6,6 +6,7 @@ on:
       - 'build.sh'
       - 'build-cache.py'
       - 'test-build-cache.py'
+      - 'test-build-shell.py'
       - 'build-cache.ps1'
       - 'build*.ps1'
       - 'build-select.sh'
@@ -19,6 +20,7 @@ on:
       - 'build.sh'
       - 'build-cache.py'
       - 'test-build-cache.py'
+      - 'test-build-shell.py'
       - 'build-cache.ps1'
       - 'build*.ps1'
       - 'build-select.sh'
@@ -33,6 +35,18 @@ permissions:
   contents: read
 
 jobs:
+  macos-shell:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify builders with system Bash 3.2
+        env:
+          RBE_TEST_BASH: /bin/bash
+        run: python3 test-build-shell.py
   windows-cache:
     runs-on: windows-latest
     timeout-minutes: 10
@@ -68,7 +82,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Validate shell builder syntax
-        run: bash -n build.sh build-select.sh build-release.sh build-core.sh
+        run: python3 test-build-shell.py
       - name: Verify Linux build prerequisites
         run: ./build.sh --check-tools --build-linux --arch-x64
       - name: Verify cache discovery and real per-crate Cargo reuse

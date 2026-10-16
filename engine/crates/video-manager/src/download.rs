@@ -337,11 +337,11 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
         return false;
     }
 
-    !matches!(
+    !(matches!(
         (segments[0], segments[1]),
         (0x2001, 0x0000) | (0x2001, 0x0002) | (0x2001, 0x0db8) | (0x2002, _)
-    ) && !(segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020))
-        && !(segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
+    ) || (segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020))
+        || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0))
 }
 
 #[cfg(test)]

@@ -119,7 +119,13 @@ pub fn read_zip_entry(
                 maximum: MAX_WORKSPACE_ARCHIVE_READ_BYTES,
             });
         }
-        let data = read_entry_bounded(&mut file, MAX_WORKSPACE_ARCHIVE_READ_BYTES)?;
+        let size = file.size();
+        let data = read_entry_bounded(
+            &mut file,
+            size,
+            &normalized,
+            MAX_WORKSPACE_ARCHIVE_READ_BYTES,
+        )?;
         if data.len() as u64 != file.size() {
             return Err(WorkspaceArchiveError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -178,7 +184,8 @@ pub fn extract_zip(
             create_directory_tree(parent)?;
         }
         ensure_missing_or_regular_file(&target)?;
-        let data = read_entry_bounded(&mut file, MAX_WORKSPACE_ARCHIVE_ENTRY_BYTES)?;
+        let size = file.size();
+        let data = read_entry_bounded(&mut file, size, &name, MAX_WORKSPACE_ARCHIVE_ENTRY_BYTES)?;
         written = written.checked_add(data.len() as u64).ok_or(
             WorkspaceArchiveError::ExpandedTooLarge {
                 maximum: MAX_WORKSPACE_ARCHIVE_UNCOMPRESSED_BYTES,
@@ -313,7 +320,12 @@ fn inspect_archive<R: Read + std::io::Seek>(
             ));
         }
         let name = normalize_entry_path(file.name(), file.is_dir())?;
-        reject_special_entry(&file, &name)?;
+        reject_special_entry(
+            file.encrypted(),
+            file.compression(),
+            file.unix_mode(),
+            &name,
+        )?;
         let collision = collision_key(name.trim_end_matches('/'));
         if !seen.insert(collision) {
             return Err(WorkspaceArchiveError::DuplicateEntry(name));
@@ -375,12 +387,14 @@ fn inspect_archive<R: Read + std::io::Seek>(
 }
 
 fn reject_special_entry(
-    file: &zip::read::ZipFile<'_>,
+    encrypted: bool,
+    compression: CompressionMethod,
+    unix_mode: Option<u32>,
     name: &str,
 ) -> Result<(), WorkspaceArchiveError> {
-    if file.encrypted()
+    if encrypted
         || !matches!(
-            file.compression(),
+            compression,
             CompressionMethod::Stored | CompressionMethod::Deflated
         )
     {
@@ -388,7 +402,7 @@ fn reject_special_entry(
             "encrypted or unsupported ZIP entry".into(),
         ));
     }
-    if let Some(mode) = file.unix_mode() {
+    if let Some(mode) = unix_mode {
         let kind = mode & 0o170000;
         if kind != 0 && kind != 0o100000 && kind != 0o040000 {
             return Err(WorkspaceArchiveError::SpecialEntry(name.to_string()));
@@ -634,14 +648,16 @@ fn unsafe_windows_component(segment: &str) -> bool {
 }
 
 /// Limit actual decoded bytes rather than trusting central-directory claims.
+/// Accept Read so this helper works with both supported ZIP 2.x file types.
 fn read_entry_bounded(
-    file: &mut zip::read::ZipFile<'_>,
+    file: &mut impl Read,
+    size: u64,
+    name: &str,
     limit: u64,
 ) -> Result<Vec<u8>, WorkspaceArchiveError> {
-    let size = file.size();
     if size > limit {
         return Err(WorkspaceArchiveError::ReadTooLarge {
-            path: file.name().into(),
+            path: name.into(),
             maximum: limit,
         });
     }

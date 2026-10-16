@@ -99,8 +99,20 @@ case "${CARGO_TARGET_DIR:-}" in
 		;;
 esac
 
-HOST_OS=$(case "$(uname -s)" in Linux*) echo linux;; Darwin*) echo macos;; MINGW*|MSYS*) echo windows;; *) echo unknown;; esac)
-HOST_ARCH=$(case "$(uname -m)" in x86_64|amd64) echo x64;; i386|i686) echo x86;; aarch64|arm64) echo arm64;; armv7*|armv7l) echo armv7;; *) echo x64;; esac)
+# Keep case expressions outside command substitutions for macOS Bash 3.2.
+case "$(uname -s)" in
+	Linux*) HOST_OS=linux ;;
+	Darwin*) HOST_OS=macos ;;
+	MINGW*|MSYS*) HOST_OS=windows ;;
+	*) HOST_OS=unknown ;;
+esac
+case "$(uname -m)" in
+	x86_64|amd64) HOST_ARCH=x64 ;;
+	i386|i686) HOST_ARCH=x86 ;;
+	aarch64|arm64) HOST_ARCH=arm64 ;;
+	armv7*|armv7l) HOST_ARCH=armv7 ;;
+	*) HOST_ARCH=x64 ;;
+esac
 
 resolve_target() {
     local os="$1" arch="$2" musl="$3"
