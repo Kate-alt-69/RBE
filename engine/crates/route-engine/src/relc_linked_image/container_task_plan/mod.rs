@@ -151,8 +151,8 @@ pub struct ContainerTaskPlan {
     pub graph: ContainerTaskGraph,
     pub capability_slots: Vec<ContainerTaskCapabilitySlot>,
     pub boundary_hints: Vec<ContainerTaskBoundaryHint>,
-	/// Only native-lowered dependencies require OID records. Evaluated calls
-	/// retain their reachable symbol hashes and source/capability evidence.
+    /// Only native-lowered dependencies require OID records. Evaluated calls
+    /// retain their reachable symbol hashes and source/capability evidence.
     pub required_oid_symbols: BTreeSet<String>,
     /// Reachable symbol-level semantic hashes drive selective invalidation.
     pub symbol_sha256s: BTreeMap<SymbolId, String>,
@@ -220,17 +220,17 @@ pub(super) fn err(message: impl Into<String>) -> ContainerTaskDiscoveryError {
 
 pub fn discover_container_tasks(
     image: &RuntimeImage,
-	native_selection: &crate::rel_native_service_select::NativeServiceSelection,
+    native_selection: &crate::rel_native_service_select::NativeServiceSelection,
     raw_server_source: &str,
     physical_sources: &[PhysicalRelSource],
 ) -> Result<ContainerTaskDiscovery, ContainerTaskDiscoveryError> {
     let texts = source_texts(raw_server_source, physical_sources)?;
-	let linked = native_selection
-		.discovery
-		.symbols
-		.iter()
-		.map(|symbol| (symbol.canonical_id.clone(), symbol))
-		.collect::<BTreeMap<_, _>>();
+    let linked = native_selection
+        .discovery
+        .symbols
+        .iter()
+        .map(|symbol| (symbol.canonical_id.clone(), symbol))
+        .collect::<BTreeMap<_, _>>();
     let mut tasks = Vec::new();
 
     for source_id in &image.routes {
@@ -245,7 +245,7 @@ pub fn discover_container_tasks(
         };
         for method in &route.methods {
             let root = SymbolId::new(source_id.clone(), format!("Route.{}", method.verb));
-			let canonical_id = route_task_identity(&manifest.logical_name, &method.verb)?;
+            let canonical_id = route_task_identity(&manifest.logical_name, &method.verb)?;
             let artifact = image
                 .route_wasm_artifact(source_id)
                 .filter(|artifact| artifact.verb.eq_ignore_ascii_case(&method.verb));
@@ -380,17 +380,17 @@ fn build_task(
 /// their complete logical name under a separate Task prefix so brackets cannot
 /// collide with literal routes or with single-parameter/catch-all variants.
 fn route_task_identity(logical: &str, verb: &str) -> Result<String, ContainerTaskDiscoveryError> {
-	if logical.contains(['[', ']']) {
-		canonical(&[
-			"task",
-			"dynamic",
-			"route",
-			&hex::encode(logical.as_bytes()),
-			verb,
-		])
-	} else {
-		canonical(&["task", "route", logical, verb])
-	}
+    if logical.contains(['[', ']']) {
+        canonical(&[
+            "task",
+            "dynamic",
+            "route",
+            &hex::encode(logical.as_bytes()),
+            verb,
+        ])
+    } else {
+        canonical(&["task", "route", logical, verb])
+    }
 }
 
 pub(super) fn canonical(parts: &[&str]) -> Result<String, ContainerTaskDiscoveryError> {

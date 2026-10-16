@@ -97,12 +97,14 @@ pub fn compile_at_root(
             &package_links,
         )
         .map_err(|error| {
-            anyhow::anyhow!(
-            "RBE5100 Backend could not compile RELC Task discovery for the Runtime Image: {error}"
-        )
+            anyhow::anyhow!(render_linked_runtime_image_compile_error(
+                &error,
+                &server_source,
+                &physical
+            ))
         })?;
     let image = &compiled.image;
-    route_engine::validate_runtime_image_routes(&image)?;
+    route_engine::validate_runtime_image_routes(image)?;
     tracing::info!(
         image = %image.image_id,
         source_hash = %image.source_hash,
@@ -133,6 +135,22 @@ fn bind_package_graph_identity(
         serde_json::Value::String(identity.clone()),
     );
     Ok(identity)
+}
+
+/// Preserve source frames when linked compilation wraps a REL parse error.
+fn render_linked_runtime_image_compile_error(
+    error: &route_engine::relc_linked_image::RelcLinkedImageError,
+    server_source: &str,
+    physical: &[PhysicalRelSource],
+) -> String {
+    match error {
+        route_engine::relc_linked_image::RelcLinkedImageError::Compile(error) => {
+            render_runtime_image_compile_error(error, server_source, physical)
+        }
+        error => format!(
+            "RBE5100 Backend could not compile RELC Task discovery for the Runtime Image: {error}"
+        ),
+    }
 }
 
 fn render_runtime_image_compile_error(
@@ -953,7 +971,9 @@ mod diagnostic_tests {
         )
         .expect_err("invalid REL must fail");
 
-        let rendered = render_runtime_image_compile_error(&error, "server Main {}", &sources);
+        let error = route_engine::relc_linked_image::RelcLinkedImageError::Compile(error);
+        let rendered =
+            render_linked_runtime_image_compile_error(&error, "server Main {}", &sources);
         assert!(rendered.starts_with("RBE5100 "));
         assert!(rendered.contains("error[REL1104]:"));
         assert!(rendered.contains("module/broken.module:2:"));

@@ -925,14 +925,14 @@ mod tests {
     use super::*;
     use crate::service_oid::{OidIndex, OID_REL_START};
 
-	#[test]
-	fn interpreted_module_calls_assemble_without_native_oid_records() {
-		use crate::relc::PhysicalRelSource;
-		use crate::source_registry::RelSourceKind;
-		let compile = |value| {
-			crate::relc_linked_image::compile_runtime_image_with_linked_rel(
-				"server Main {}",
-				vec![
+    #[test]
+    fn interpreted_module_calls_assemble_without_native_oid_records() {
+        use crate::relc::PhysicalRelSource;
+        use crate::source_registry::RelSourceKind;
+        let compile = |value| {
+            crate::relc_linked_image::compile_runtime_image_with_linked_rel(
+                "server Main {}",
+                vec![
 					PhysicalRelSource::new(
 						RelSourceKind::Route,
 						"npm/[...package]",
@@ -948,87 +948,87 @@ class Route { get(req) { return response.json(package_registry.npmMetadata("mail
 						format!("export function npmMetadata(name) {{ return {{ name: name, version: {value} }}; }}"),
 					),
 				],
-				&serde_json::json!({}),
-			)
-			.unwrap()
-		};
-		let mut compiled = compile(1);
-		assert!(compiled.native_services.native_services.is_empty());
-		assert!(compiled
-			.linked_rel
-			.symbols
-			.iter()
-			.any(|symbol| symbol.canonical_id == "module_package_registry_npmMetadata"));
-		let original_hash = compiled.container_tasks.tasks[0].semantic_sha256.clone();
-		assert_ne!(
-			original_hash,
-			compile(2).container_tasks.tasks[0].semantic_sha256,
-			"interpreted dependencies must retain their semantic invalidation evidence"
-		);
-		let root = std::env::temp_dir().join(format!(
-			"rbe-task-module-{}-{}",
-			std::process::id(),
-			std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap()
-				.as_nanos()
-		));
-		let mut cache = OidCache::open_or_rebuild(&root).unwrap();
-		let report = assemble_container_task_cache(
-			&root,
-			&compiled.image,
-			&mut compiled.container_tasks,
-			&mut cache,
-			&BTreeSet::new(),
-		)
-		.expect("evaluator module calls must not require nonexistent native records");
-		assert_eq!(report.artifacts.len(), 1);
-		assert!(compiled.container_tasks.all_oids_bound());
-		assert!(!cache
-			.index()
-			.rel_bindings
-			.contains_key("module_package_registry_npmMetadata"));
-		std::fs::remove_dir_all(root).unwrap();
-	}
+                &serde_json::json!({}),
+            )
+            .unwrap()
+        };
+        let mut compiled = compile(1);
+        assert!(compiled.native_services.native_services.is_empty());
+        assert!(compiled
+            .linked_rel
+            .symbols
+            .iter()
+            .any(|symbol| symbol.canonical_id == "module_package_registry_npmMetadata"));
+        let original_hash = compiled.container_tasks.tasks[0].semantic_sha256.clone();
+        assert_ne!(
+            original_hash,
+            compile(2).container_tasks.tasks[0].semantic_sha256,
+            "interpreted dependencies must retain their semantic invalidation evidence"
+        );
+        let root = std::env::temp_dir().join(format!(
+            "rbe-task-module-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut cache = OidCache::open_or_rebuild(&root).unwrap();
+        let report = assemble_container_task_cache(
+            &root,
+            &compiled.image,
+            &mut compiled.container_tasks,
+            &mut cache,
+            &BTreeSet::new(),
+        )
+        .expect("evaluator module calls must not require nonexistent native records");
+        assert_eq!(report.artifacts.len(), 1);
+        assert!(compiled.container_tasks.all_oids_bound());
+        assert!(!cache
+            .index()
+            .rel_bindings
+            .contains_key("module_package_registry_npmMetadata"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
-	#[test]
-	fn genuinely_native_dependencies_still_require_bound_oids() {
-		let mut compiled = crate::relc_linked_image::compile_runtime_image_with_linked_rel(
-			"server Main {}",
-			vec![crate::relc::PhysicalRelSource::new(
-				crate::source_registry::RelSourceKind::Service,
-				"ready",
-				"service/ready.service",
-				":service[name = ready]\nexport function check() { return true; }",
-			)],
-			&serde_json::json!({}),
-		)
-		.unwrap();
-		assert!(compiled.native_services.native_services.contains("ready"));
-		let root = std::env::temp_dir().join(format!(
-			"rbe-task-native-{}-{}",
-			std::process::id(),
-			std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap()
-				.as_nanos()
-		));
-		let mut cache = OidCache::open_or_rebuild(&root).unwrap();
-		let error = assemble_container_task_cache(
-			&root,
-			&compiled.image,
-			&mut compiled.container_tasks,
-			&mut cache,
-			&BTreeSet::new(),
-		)
-		.expect_err("an absent native export must still fail closed");
-		assert!(error.to_string().contains("requires unbound OID symbol"));
-		assert!(
-			cache.index().rel_bindings.is_empty(),
-			"failed assembly must not publish a partial index"
-		);
-		std::fs::remove_dir_all(root).unwrap();
-	}
+    #[test]
+    fn genuinely_native_dependencies_still_require_bound_oids() {
+        let mut compiled = crate::relc_linked_image::compile_runtime_image_with_linked_rel(
+            "server Main {}",
+            vec![crate::relc::PhysicalRelSource::new(
+                crate::source_registry::RelSourceKind::Service,
+                "ready",
+                "service/ready.service",
+                ":service[name = ready]\nexport function check() { return true; }",
+            )],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert!(compiled.native_services.native_services.contains("ready"));
+        let root = std::env::temp_dir().join(format!(
+            "rbe-task-native-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut cache = OidCache::open_or_rebuild(&root).unwrap();
+        let error = assemble_container_task_cache(
+            &root,
+            &compiled.image,
+            &mut compiled.container_tasks,
+            &mut cache,
+            &BTreeSet::new(),
+        )
+        .expect_err("an absent native export must still fail closed");
+        assert!(error.to_string().contains("requires unbound OID symbol"));
+        assert!(
+            cache.index().rel_bindings.is_empty(),
+            "failed assembly must not publish a partial index"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn request(id: &str) -> ContainerTaskOidRequest {
         ContainerTaskOidRequest {
