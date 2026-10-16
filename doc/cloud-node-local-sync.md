@@ -223,3 +223,24 @@ provider bucket      = remote immutable snapshots/history
 ```
 
 That separation lets a fresh process rebuild local Cloud Node state from the provider, then safely rebuild or resume the watched directory from the verified local CAS.
+
+## Provider diagnostics
+
+Cloud Node emits JSON diagnostics to stderr for provider HTTP failures,
+transport failures, and optional missing-object reads. The host log collector
+(for example Render) can display them alongside existing CLI/daemon output.
+HTTP events include `component`, `event`, `level`, `operation`, `status`,
+`pathSha256`, `timestampUnixMs`, and `suppressed`. Transport events report only
+the safe category `timeout`, `connect`, or `transfer`.
+
+Paths are hashed because object names can contain personal data. Signed URLs,
+query strings, credentials, request headers, and response bodies are never part
+of these events; provider HTTP error strings also omit untrusted response bodies.
+Missing optional objects return the same `None` result and emit an informational
+event, rather than becoming a failed sync. HTTP errors retain their status.
+
+Repeated events for the same operation/path/status are emitted at most once per
+minute per process, with a count of suppressed repeats on the next emission.
+The deduplication table holds at most 256 event identities. This bounds application
+log volume; it does not change provider retries, integrity checks, or Supabase's
+own hosted log retention/quota. One-shot processes have separate limits.

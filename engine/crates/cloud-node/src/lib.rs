@@ -16,6 +16,8 @@ mod protocol;
 #[cfg(feature = "client")]
 mod provider;
 #[cfg(feature = "client")]
+mod provider_diagnostics;
+#[cfg(feature = "client")]
 #[path = "provider_sync_checked.rs"]
 mod provider_sync;
 #[cfg(feature = "client")]
