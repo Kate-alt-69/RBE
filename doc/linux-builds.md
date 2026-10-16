@@ -17,6 +17,7 @@ On Linux the preflight verifies that:
 - the selected `cargo` actually executes;
 - rustup can read the selected toolchain's installed target metadata;
 - a C compiler/linker driver is available as `cc`;
+- Python 3.9+ is available to read Cargo metadata using the standard library;
 - full release builds also have `git` and `openssl`.
 
 A typical Debian/Ubuntu host therefore needs:
@@ -26,6 +27,7 @@ build-essential
 git
 openssl
 rustup
+python3
 ```
 
 The check prints the selected Rust toolchain plus the actual `rustc`, `cargo`, `rustup`, and compiler versions so CI/deployment logs identify the build environment precisely.
@@ -84,9 +86,35 @@ RBE uses one shared Cargo target directory for release, selective, SDK, Engine, 
 The cache location is selected in this order:
 
 1. an explicit `CARGO_TARGET_DIR` supplied by the caller;
-2. `<RBE_BUILD_CACHE_DIR>/cargo-target` when `RBE_BUILD_CACHE_DIR` is set;
-3. `<XDG_CACHE_HOME>/rbe-build/cargo-target` when `XDG_CACHE_HOME` is available;
-4. `<RBE>/.cache/rbe-build/cargo-target` as the local fallback.
+2. an explicit `CARGO_BUILD_TARGET_DIR`;
+3. `<RBE_BUILD_CACHE_DIR>/cargo-target` when `RBE_BUILD_CACHE_DIR` is set;
+4. the target resolved by Cargo configuration in the Engine workspace, then
+   Container (including ancestor and `CARGO_HOME` configuration);
+5. `<XDG_CACHE_HOME>/rbe-build/cargo-target` when `XDG_CACHE_HOME` is available;
+6. an existing Cargo target at the shared fallback, Engine, Container, or root;
+7. `<RBE>/.cache/rbe-build/cargo-target` as the local fallback.
+
+`build.sh` and direct `build-select.sh` invocations share this resolver. Explicit
+relative environment paths are resolved against the RBE repository root. Cargo
+resolves paths from its own configuration, including directories containing
+spaces. Cache discovery uses offline `cargo metadata --no-deps`; it does not
+download dependencies, change lockfiles, or install packages.
+
+Cargo decides what is reusable. A no-change build reports unchanged crates as
+fresh; changing crate X rebuilds X and affected dependents, while independent
+crates remain fresh. Compiler, profile, target, feature, flags and build-script
+input changes can also require recompilation. No crate artifacts are copied
+between unrelated cache directories, and source timestamps are not rewritten.
+`python3 test-build-cache.py` checks this with real release builds of a small
+three-crate fixture, including an unchanged rebuild and a one-crate edit.
+
+Preserve source checkouts as well as target directories on deployment hosts.
+Deleting and re-cloning unchanged Rust sources can make Cargo consider them
+newer than cached artifacts. Explicit cache-clean flags still clear caches;
+normal builds do not. Secure packaged builds still regenerate their ephemeral
+signing material and admin verifier unless supplied externally, so affected
+security-dependent crates may rebuild even when ordinary Rust sources have not
+changed. Those credentials are never written into a new cache by this resolver.
 
 For example, to place the reusable cache somewhere explicit:
 
