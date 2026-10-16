@@ -9,29 +9,8 @@ BUILD_SDK=false; ONLY=""; RELEASE=true; BUILD_WIN=false; BUILD_LINUX=false; BUIL
 ARCHES=()
 
 ensure_shared_cargo_target() {
-  local cache_root=""
-  if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-    case "$CARGO_TARGET_DIR" in
-      /*) ;;
-      *) CARGO_TARGET_DIR="$REPO_ROOT/$CARGO_TARGET_DIR" ;;
-    esac
-  else
-    if [ -n "${RBE_BUILD_CACHE_DIR:-}" ]; then
-      cache_root="$RBE_BUILD_CACHE_DIR"
-    elif [ -n "${XDG_CACHE_HOME:-}" ]; then
-      cache_root="$XDG_CACHE_HOME/rbe-build"
-    else
-      cache_root="$REPO_ROOT/.cache/rbe-build"
-    fi
-    case "$cache_root" in
-      /*) ;;
-      *) cache_root="$REPO_ROOT/$cache_root" ;;
-    esac
-    export RBE_BUILD_CACHE_DIR="$cache_root"
-    CARGO_TARGET_DIR="$cache_root/cargo-target"
-  fi
-  mkdir -p "$CARGO_TARGET_DIR"
-  export CARGO_TARGET_DIR
+	CARGO_TARGET_DIR="$(python3 "$REPO_ROOT/build-cache.py" "$REPO_ROOT")"
+	export CARGO_TARGET_DIR
 }
 
 for arg in "$@"; do

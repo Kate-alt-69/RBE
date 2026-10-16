@@ -87,6 +87,15 @@ if [ "$SHOW_HELP" = true ]; then
     exit 0
 fi
 
+# Direct release/core entrypoints must select the same cache as build.sh.
+case "${CARGO_TARGET_DIR:-}" in
+	/*) ;;
+	*)
+		CARGO_TARGET_DIR="$(python3 "$REPO_ROOT/build-cache.py" "$REPO_ROOT")"
+		export CARGO_TARGET_DIR
+		;;
+esac
+
 HOST_OS=$(case "$(uname -s)" in Linux*) echo linux;; Darwin*) echo macos;; MINGW*|MSYS*) echo windows;; *) echo unknown;; esac)
 HOST_ARCH=$(case "$(uname -m)" in x86_64|amd64) echo x64;; i386|i686) echo x86;; aarch64|arm64) echo arm64;; armv7*|armv7l) echo armv7;; *) echo x64;; esac)
 

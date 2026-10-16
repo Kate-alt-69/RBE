@@ -33,9 +33,16 @@ Linux prerequisite preflight:
 
   Shared Cargo cache precedence:
     1. CARGO_TARGET_DIR
-    2. RBE_BUILD_CACHE_DIR/cargo-target
-    3. XDG_CACHE_HOME/rbe-build/cargo-target
-    4. <RBE>/.cache/rbe-build/cargo-target
+    2. CARGO_BUILD_TARGET_DIR
+    3. RBE_BUILD_CACHE_DIR/cargo-target
+    4. Cargo-configured target directory (Engine, then Container)
+    5. XDG_CACHE_HOME/rbe-build/cargo-target
+    6. Existing shared/Engine/Container/root Cargo target
+    7. <RBE>/.cache/rbe-build/cargo-target
+
+  Bash and PowerShell builds use Python 3.9+ (standard library only) to read Cargo's metadata
+  JSON. This respects ancestor/workspace/CARGO_HOME Cargo configuration and
+  paths with spaces instead of replacing a configured cache with a new one.
 
   RBE uses one shared Cargo target directory across Container, Engine, service,
   cloud_node, backend, RPX, and SDK builds. This lets Cargo reuse unchanged
@@ -43,12 +50,17 @@ Linux prerequisite preflight:
   same dependencies for each sub-build. Cargo remains responsible for all
   fingerprint/target/profile/feature validity checks.
 
+  Repeating a build reuses unchanged crates. Editing crate X rebuilds X and
+  dependent crates; unrelated crates remain Fresh. Compiler/feature/profile
+  changes and release signing/password inputs can legitimately rebuild crates.
+  No artifact is reused solely because a binary file already exists.
+
   On Render, XDG_CACHE_HOME is persisted between builds, so the shared Cargo
   target directory is restored on later deploys unless the Render build cache
   is explicitly cleared.
 
   Debian/Ubuntu hosts normally need:
-    build-essential git openssl rustup
+    build-essential git openssl rustup python3
 
 Selective builds:
   ./build.ps1 --only-<component> [platform/arch flags]

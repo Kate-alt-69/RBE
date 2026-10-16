@@ -4,6 +4,10 @@ on:
   push:
     paths:
       - 'build.sh'
+      - 'build-cache.py'
+      - 'test-build-cache.py'
+      - 'build-cache.ps1'
+      - 'build*.ps1'
       - 'build-select.sh'
       - 'build-release.sh'
       - 'build-core.sh'
@@ -13,6 +17,10 @@ on:
   pull_request:
     paths:
       - 'build.sh'
+      - 'build-cache.py'
+      - 'test-build-cache.py'
+      - 'build-cache.ps1'
+      - 'build*.ps1'
       - 'build-select.sh'
       - 'build-release.sh'
       - 'build-core.sh'
@@ -25,6 +33,34 @@ permissions:
   contents: read
 
 jobs:
+  windows-cache:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify PowerShell adapter and per-crate Cargo reuse
+        run: python test-build-cache.py
+      - name: Parse PowerShell builders without running builds
+        shell: pwsh
+        run: |
+          Get-ChildItem build*.ps1 | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { throw ($errors | Out-String) }
+          }
+      - name: Verify PS5 distro selector without executing a build
+        shell: pwsh
+        run: |
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PWD/build-ps5-release.ps1", [ref]$null, [ref]$null)
+          $selector = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-TargetsForDistro' }, $true)
+          Invoke-Expression $selector.Extent.Text
+          if ((Get-TargetsForDistro 'ubuntu-arm64') -ne 'aarch64-unknown-linux-gnu') { throw 'Ubuntu ARM64 target mismatch' }
+          if (@(Get-TargetsForDistro 'common').Count -ne 8) { throw 'Common target matrix mismatch' }
+          if ((Get-TargetsForDistro 'wsl-arm64') -ne 'aarch64-unknown-linux-gnu') { throw 'WSL ARM64 target mismatch' }
   linux-preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -35,6 +71,8 @@ jobs:
         run: bash -n build.sh build-select.sh build-release.sh build-core.sh
       - name: Verify Linux build prerequisites
         run: ./build.sh --check-tools --build-linux --arch-x64
+      - name: Verify cache discovery and real per-crate Cargo reuse
+        run: python3 test-build-cache.py
       - name: Verify shared Cargo cache selection
         shell: bash
         run: |
@@ -121,6 +159,7 @@ jobs:
           PATH="$fake_bin:$PATH" \
           RBE_FAKE_RUST_STATE="$state" \
           RBE_RUST_TOOLCHAIN=stable \
+          CARGO_TARGET_DIR="$RUNNER_TEMP/rbe-fake-cargo-cache" \
           ./build.sh --check-tools --build-linux --arch-x64
 
           test -f "$state"

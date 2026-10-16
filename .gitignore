@@ -1,5 +1,6 @@
 **.exe
 **/target/**
+__pycache__/
 **.log
 **/error-reporter-status.json
 **/*.key

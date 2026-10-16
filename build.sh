@@ -5,43 +5,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELP_PATH="$REPO_ROOT/build-help.txt"
 
 configure_cargo_build_cache() {
-    local cache_root="" cache_source=""
-
-    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-        case "$CARGO_TARGET_DIR" in
-            /*) ;;
-            *) CARGO_TARGET_DIR="$REPO_ROOT/$CARGO_TARGET_DIR" ;;
-        esac
-        cache_source="CARGO_TARGET_DIR override"
-    else
-        if [ -n "${RBE_BUILD_CACHE_DIR:-}" ]; then
-            cache_root="$RBE_BUILD_CACHE_DIR"
-            cache_source="RBE_BUILD_CACHE_DIR"
-        elif [ -n "${XDG_CACHE_HOME:-}" ]; then
-            cache_root="$XDG_CACHE_HOME/rbe-build"
-            cache_source="XDG_CACHE_HOME"
-        else
-            cache_root="$REPO_ROOT/.cache/rbe-build"
-            cache_source="RBE local cache"
-        fi
-
-        case "$cache_root" in
-            /*) ;;
-            *) cache_root="$REPO_ROOT/$cache_root" ;;
-        esac
-        export RBE_BUILD_CACHE_DIR="$cache_root"
-        CARGO_TARGET_DIR="$cache_root/cargo-target"
-    fi
-
-    mkdir -p "$CARGO_TARGET_DIR"
-    export CARGO_TARGET_DIR
-
-    echo "RBE shared Cargo artifact cache:" >&2
-    echo "  target-dir: $CARGO_TARGET_DIR" >&2
-    echo "  source: $cache_source" >&2
-    if [ -n "${RENDER:-}" ] && [ -n "${XDG_CACHE_HOME:-}" ] && [[ "$CARGO_TARGET_DIR" == "$XDG_CACHE_HOME/"* ]]; then
-        echo "  persistence: Render build cache" >&2
-    fi
+	# Use Cargo's resolved configuration and existing targets instead of
+	# redirecting every invocation to a new RBE-only cache.
+	CARGO_TARGET_DIR="$(python3 "$REPO_ROOT/build-cache.py" "$REPO_ROOT")"
+	export CARGO_TARGET_DIR
 }
 
 normalize_only_component() {
@@ -132,6 +99,7 @@ ensure_linux_build_tools() {
     command -v rustc >/dev/null 2>&1 || linux_build_tool_error "rustc is missing after Rust toolchain setup."
     command -v cargo >/dev/null 2>&1 || linux_build_tool_error "cargo is missing after Rust toolchain setup."
     command -v cc >/dev/null 2>&1 || linux_build_tool_error "a C compiler/linker driver (cc) is required."
+	command -v python3 >/dev/null 2>&1 || linux_build_tool_error "Python 3.9+ is required to read Cargo's cache configuration."
 
     if [ "$mode" = release ]; then
         command -v git >/dev/null 2>&1 || linux_build_tool_error "git is required for reproducible release build identity."
