@@ -28,6 +28,10 @@ for arg in "$@"; do
     --arch-arm|--arch-arm64) ARCHES+=(arm64) ;;
     --arch-armv7) ARCHES+=(armv7) ;;
     --target=*) CUSTOM_TARGET="${arg#--target=}" ;;
+	--deny-admin-setup)
+		export RBE_DENY_ADMIN_SETUP=1
+		unset RBE_ADMIN_PASSWORD RBE_ADMIN_AUTH_ROUNDS RBE_ADMIN_AUTH_SALT_HEX RBE_ADMIN_AUTH_VERIFIER_HEX
+		;;
     --no-embed|--dev-content) ;;
     --help|-help|-h|-?) cat <<'EOF'
 RBE selective/SDK builder

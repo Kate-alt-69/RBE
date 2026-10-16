@@ -18,13 +18,8 @@ use core_lib::AppState;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-mod admin_hash {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/admin_hash.rs"));
-}
-
-mod build_auth {
-    include!(concat!(env!("OUT_DIR"), "/dashboard_auth.rs"));
-}
+use crate::admin_credentials;
+use crate::admin_credentials::legacy as admin_hash;
 
 pub const DASHBOARD_PORT: u16 = 5799;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
@@ -132,7 +127,7 @@ fn require_auth(peer: SocketAddr, headers: &HeaderMap) -> AdminAuthResult {
     if let Some(response) = local_only(peer) {
         return Err(Box::new(response));
     }
-    if !build_auth::ADMIN_PASSWORD_CONFIGURED {
+    if !admin_credentials::configured() {
         return Err(Box::new(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             json!({
@@ -165,17 +160,7 @@ fn require_mutation_auth(peer: SocketAddr, headers: &HeaderMap) -> AdminAuthResu
 }
 
 fn verify_password(password: &str) -> bool {
-    if !build_auth::ADMIN_PASSWORD_CONFIGURED || password.len() > 1024 {
-        return false;
-    }
-    let Some(salt) = admin_hash::hex_decode(build_auth::ADMIN_PASSWORD_SALT_HEX) else {
-        return false;
-    };
-    let Some(expected) = admin_hash::hex_decode(build_auth::ADMIN_PASSWORD_VERIFIER_HEX) else {
-        return false;
-    };
-    let actual = admin_hash::derive(password, &salt, build_auth::ADMIN_PASSWORD_ROUNDS);
-    admin_hash::constant_time_eq(&actual, &expected)
+    admin_credentials::verify_password(password)
 }
 
 #[derive(Deserialize)]
@@ -194,7 +179,7 @@ async fn session_status(
     json_response(
         StatusCode::OK,
         json!({
-            "configured": build_auth::ADMIN_PASSWORD_CONFIGURED,
+            "configured": admin_credentials::configured(),
             "authenticated": session.is_some(),
             "expiresAtMs": session.as_ref().map(|value| value.expires_at_ms)
         }),
@@ -208,11 +193,11 @@ async fn login(
     if let Some(response) = local_only(peer) {
         return response;
     }
-    if !build_auth::ADMIN_PASSWORD_CONFIGURED {
+    if !admin_credentials::configured() {
         return json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             json!({
-                "error": "This backend was built without an admin password. Rebuild with build.ps1/build.sh.",
+                "error": "Admin password is not configured. Run backend --init-admin locally, or initialize a deferred build with RBE_ADMIN_PASSWORD.",
                 "code": "ADMIN_PASSWORD_UNCONFIGURED"
             }),
         );
@@ -826,10 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_verifier_is_well_formed_when_configured() {
-        if build_auth::ADMIN_PASSWORD_CONFIGURED {
-            assert_eq!(build_auth::ADMIN_PASSWORD_SALT_HEX.len(), 16);
-            assert_eq!(build_auth::ADMIN_PASSWORD_VERIFIER_HEX.len(), 64);
-        }
+    fn empty_password_is_rejected() {
+        assert!(!verify_password(""));
     }
 }

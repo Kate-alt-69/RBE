@@ -20,9 +20,17 @@ Usage:
   backend install <target> [options]
 
 Commands:
+  --init-admin                Initialize a deferred build locally; never replaces an existing password
   check [--settings <file>]    Compile/link the application package and exit
   install <target> [options]   Install an RBE package, runtime, SDK, URL, or local archive
   help [command]               Show help for backend or a command
+
+Standalone updates (opt-in):
+  --auto-update               Check every 15 minutes; stage, preflight, drain, replace and health-check
+  --update-tag <tag>           Pin an exact binary tag (default: rbe-binaries-latest)
+  --update-check              Inspect the verified manifest without booting
+  --update-recover            Restore an interrupted transaction and restart without auto-update
+  --version / --version-json  Inspect this executable without booting
 
 Diagnostics:
   --explain <CODE>             Explain an RBE error code

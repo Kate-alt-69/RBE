@@ -41,6 +41,7 @@
         --dev-content       copy this repo's dev api/module content into
                                                  dist\<target>\ instead of empty scaffolding
                                                  folders (see build.ps1's matching flag)
+        --deny-admin-setup  skip compilation-time credentials; initialize on first run
         --debug             debug profile instead of release (default)
         --target=<triple>   bypass the OS/arch flags entirely and build
                                                  for an exact Rust target triple ("or other")
@@ -116,6 +117,11 @@ foreach ($arg in $args) {
         '^--build-macos$'       { $BuildMacos = $true; continue }
         '^--build-all$'         { $BuildAll = $true; continue }
         '^--musl$'              { $Musl = $true; continue }
+		'^--deny-admin-setup$' {
+			$env:RBE_DENY_ADMIN_SETUP = '1'
+			'RBE_ADMIN_PASSWORD','RBE_ADMIN_AUTH_ROUNDS','RBE_ADMIN_AUTH_SALT_HEX','RBE_ADMIN_AUTH_VERIFIER_HEX' | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+			continue
+		}
         '^--no-embed$'          { $NoEmbed = $true; continue }
         '^--dev-content$'       { $DevContent = $true; continue }
         '^--debug$'             { $Release = $false; continue }
@@ -129,7 +135,7 @@ foreach ($arg in $args) {
         '^--cache-remove-win-cache$' { $CacheRemoveWin = $true; continue }
         '^--cache-remove-linux-cache$' { $CacheRemoveLinux = $true; continue }
         '^--cache-remove-all-cache$' { $CacheRemoveAll = $true; continue }
-        '^(--help|-h|-\?)$'     { $ShowHelp = $true; continue }
+        '^(--help|-help|-h|-\?)$'     { $ShowHelp = $true; continue }
         default {
             Write-Warning "build.ps1: unrecognized argument '$arg' — ignoring (run with --help for usage)"
         }

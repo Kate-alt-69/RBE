@@ -29,6 +29,7 @@
     --arch-armv7          Target armv7
 
   Configuration & Options:
+    --deny-admin-setup    Skip compile-time admin setup; initialize on first run
     --musl                Linux targets: link against musl libc
     --no-embed            Do not embed container-bin into backend
     --dev-content         Copy development api/module folders to dist
@@ -171,7 +172,13 @@ try {
     $CloudNodeOnlyRequested = $args -contains '--cloud-node-only' -or $args -contains '--build-cloud-node' -or $args -contains '-CloudNodeOnly'
     $HelpRequested = $args -contains '--help' -or $args -contains '-help' -or $args -contains '-h' -or $args -contains '-?'
     if (-not $HelpRequested -and -not $CloudNodeOnlyRequested) {
-        Initialize-AdminPasswordVerifier
+		if ($args -contains '--deny-admin-setup') {
+			$env:RBE_DENY_ADMIN_SETUP = '1'
+			'RBE_ADMIN_PASSWORD','RBE_ADMIN_AUTH_ROUNDS','RBE_ADMIN_AUTH_SALT_HEX','RBE_ADMIN_AUTH_VERIFIER_HEX' | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+		} else {
+			Remove-Item Env:RBE_DENY_ADMIN_SETUP -ErrorAction SilentlyContinue
+			Initialize-AdminPasswordVerifier
+		}
         Initialize-ContainerSigningKey
     }
 
@@ -190,6 +197,7 @@ try {
             '^--build-all$' { $BuildAll = $true; continue }
             '^(--cloud-node-only|--build-cloud-node|-CloudNodeOnly)$' { $CloudNodeOnly = $true; continue }
             '^--musl$' { $Musl = $true; continue }
+			'^--deny-admin-setup$' { continue }
             '^--no-embed$' { $NoEmbed = $true; continue }
             '^--dev-content$' { $DevContent = $true; continue }
             '^--debug$' { $Release = $false; continue }
@@ -335,6 +343,7 @@ try {
 
     Write-Host ""; Write-Host "Done. Output in $DistRoot" -ForegroundColor Green
 } finally {
+	Remove-Item Env:RBE_DENY_ADMIN_SETUP -ErrorAction SilentlyContinue
     if ($script:GeneratedAdminVerifier) {
         Remove-Item Env:RBE_ADMIN_AUTH_ROUNDS -ErrorAction SilentlyContinue
         Remove-Item Env:RBE_ADMIN_AUTH_SALT_HEX -ErrorAction SilentlyContinue

@@ -9,6 +9,7 @@ This directory is the authoritative user-facing documentation for the current RB
 - [`runtime-image.md`](runtime-image.md) — the Runtime Image data contract, cryptographic identity, capability binding, and atomic activation model.
 - [`rel.md`](rel.md) — REL (Runtime Engine Language), shared grammar, capabilities, ENV, embedded sources, and recursion rules.
 - [`relc.md`](relc.md) — the implemented RELC compilation/link pipeline and Runtime Image format.
+- [`binary-updates.md`](binary-updates.md) — first-run admin setup, binary-only version tags, verified downloads and opt-in standalone updates.
 - [`linux-builds.md`](linux-builds.md) — Linux build prerequisites, `--check-tools`, corrupt rustup cache detection/recovery, deployment-host guidance, and the build-tool CI contract.
 - [`library-system.md`](library-system.md) — external libraries and the current project package/install architecture, including `package.rbe.yaml`, lockfile activation, managed `rbe.sys.*` tools, package attestation, durable install sessions, and controlled dependency hydration.
 - [`library-host.md`](library-host.md) — Library Host purpose, trust boundary, and the internal `container --library-worker-proxy` execution mode.

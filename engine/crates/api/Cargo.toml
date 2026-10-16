@@ -18,3 +18,9 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+argon2 = "0.5"
+rand = "0.8"
+runtime-paths = { path = "../../../runtime-paths" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

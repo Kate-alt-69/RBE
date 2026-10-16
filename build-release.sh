@@ -130,7 +130,13 @@ case " $* " in
     *" --help "*|*" -help "*|*" -h "*|*" -? "*) ;;
     *)
         if [ "$CLOUD_NODE_ONLY" = false ]; then
-            ensure_admin_verifier
+            if [[ " $* " == *" --deny-admin-setup "* ]]; then
+				export RBE_DENY_ADMIN_SETUP=1
+				unset RBE_ADMIN_PASSWORD RBE_ADMIN_AUTH_ROUNDS RBE_ADMIN_AUTH_SALT_HEX RBE_ADMIN_AUTH_VERIFIER_HEX
+			else
+				unset RBE_DENY_ADMIN_SETUP
+				ensure_admin_verifier
+			fi
             ensure_container_signing_key
         fi
         ;;

@@ -25,6 +25,11 @@ foreach ($arg in $args) {
         '^--build-macos$' { $BuildMacos = $true; continue }
         '^--build-all$' { $BuildAll = $true; continue }
         '^--musl$' { $Musl = $true; continue }
+		'^--deny-admin-setup$' {
+			$env:RBE_DENY_ADMIN_SETUP = '1'
+			'RBE_ADMIN_PASSWORD','RBE_ADMIN_AUTH_ROUNDS','RBE_ADMIN_AUTH_SALT_HEX','RBE_ADMIN_AUTH_VERIFIER_HEX' | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+			continue
+		}
         '^--debug$' { $Release = $false; continue }
         '^--arch-?x64$|^--achitect-?x64$|^--architect-?x64$' { $ArchX64 = $true; continue }
         '^--arch-?x86$|^--achitext-?x86$|^--architect-?x86$' { $ArchX86 = $true; continue }

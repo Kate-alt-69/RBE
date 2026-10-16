@@ -14,6 +14,8 @@ use std::time::Duration;
 use core_lib::{AppState, ContainerClient, MaintenanceMetrics};
 use supervisor::{BackendState, RestartPolicy, Supervisor};
 
+mod admin_setup;
+mod binary_updates;
 mod container_process;
 #[allow(dead_code)]
 mod er_recovery;
@@ -73,6 +75,79 @@ fn render_backend_boot_fatal(error: &anyhow::Error) -> String {
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
+
+    if args.len() == 1 && (has("--version") || has("-V") || has("--version-json")) {
+        if has("--version-json") {
+            println!("{}", binary_updates::identity());
+        } else {
+            println!(
+                "RBE {} ({}; {})",
+                env!("RBE_VERSION"),
+                env!("RBE_SOURCE_COMMIT"),
+                env!("RBE_TARGET")
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+    if has("--recover-installation") {
+        let recovery = args
+            .windows(2)
+            .find(|p| p[0] == "--recover-installation")
+            .ok_or_else(|| {
+                anyhow::anyhow!("--recover-installation requires the installation directory")
+            })
+            .and_then(|p| binary_updates::recovery_at(std::path::Path::new(&p[1])))
+            .and_then(|p| binary_updates::handoff(p, true));
+        return match recovery {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Update recovery failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if has("--update-worker") || has("--update-rollback-worker") {
+        return match binary_updates::worker(has("--update-rollback-worker")).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Updater failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if has("--update-preflight") {
+        let root = args
+            .windows(2)
+            .find(|p| p[0] == "--update-preflight")
+            .map(|p| PathBuf::from(&p[1]));
+        return match root
+            .ok_or_else(|| anyhow::anyhow!("--update-preflight requires the installation root"))
+            .and_then(|root| {
+                binary_updates::preflight(&root, &PathBuf::from(resolve_settings_path()))
+            }) {
+            Ok(result) => {
+                println!("{result}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Update preflight failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if has("--update-check") {
+        let tag = update_tag(&args);
+        return match tokio::task::spawn_blocking(move || binary_updates::check(&tag)).await {
+            Ok(Ok(manifest)) => {
+                println!("{}", serde_json::to_string(&manifest).unwrap());
+                ExitCode::SUCCESS
+            }
+            result => {
+                eprintln!("Update check failed: {result:?}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     if let Some(explanation) = error_code_book::requested(&args) {
         match explanation {
@@ -159,6 +234,34 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         return ExitCode::SUCCESS;
+    }
+
+    if let Err(error) = admin_setup::initialize(has("--init-admin")) {
+        eprintln!("Administrator initialization failed: {error:#}");
+        return ExitCode::FAILURE;
+    }
+    if has("--init-admin") {
+        return ExitCode::SUCCESS;
+    }
+
+    if has("--update-recover") {
+        return match binary_updates::recovery().and_then(|p| binary_updates::handoff(p, true)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Update recovery failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if binary_updates::interrupted() && !has("--update-ready") {
+        eprintln!("An interrupted update requires backend --update-recover before normal startup.");
+        return ExitCode::FAILURE;
+    }
+    if has("--auto-update") {
+        if let Err(error) = api::admin_credentials::prepare_for_update() {
+            eprintln!("Automatic update initialization failed: {error:#}");
+            return ExitCode::FAILURE;
+        }
     }
 
     println!("Evaluating..");
@@ -1025,17 +1128,51 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     maybe_open_dashboard(&config);
     lifecycle.set(BackendState::Running);
 
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    binary_updates::mark_ready(&arguments)?;
+    let (update_tx, update_rx) = tokio::sync::oneshot::channel();
+    let auto_update = arguments.iter().any(|a| a == "--auto-update");
+    let update_task = auto_update.then(|| {
+		tokio::spawn(async move {
+			let mut interval = tokio::time::interval(Duration::from_secs(900));
+			loop {
+				interval.tick().await;
+				let root = runtime_paths::binary_dir();
+				let tag = update_tag(&arguments);
+				let args = arguments.clone();
+				match tokio::task::spawn_blocking(move || binary_updates::stage(&root, &tag, args)).await {
+					Ok(Ok(Some(prepared))) => {
+						let _ = update_tx.send(prepared);
+						return;
+					}
+					Ok(Ok(None)) => {},
+					result => tracing::warn!(error = ?result, "automatic update was not admitted; retaining the running version"),
+				}
+			}
+		})
+	});
+    let prepared_update = Arc::new(std::sync::Mutex::new(None));
+    let update_slot = prepared_update.clone();
     let shutdown_lifecycle = lifecycle.clone();
     let result = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        shutdown_signal().await;
+        tokio::select! {
+            _ = shutdown_signal() => {},
+            _ = binary_updates::parent_lease_closed() => {},
+            prepared = update_rx, if auto_update => {
+                if let Ok(prepared) = prepared { *update_slot.lock().unwrap() = Some(prepared); }
+            },
+        }
         shutdown_lifecycle.set(BackendState::ShutdownRequested);
     })
     .await;
 
+    if let Some(task) = update_task {
+        task.abort();
+    }
     lifecycle.set(BackendState::Stopping);
     let shutdown_budget = Duration::from_millis(config.runtime.graceful_shutdown_timeout_ms.max(1));
     if let Some(mother) = service_mother {
@@ -1057,6 +1194,9 @@ async fn boot_and_run(host_ready: host_bootstrap::HostBootstrapReady) -> anyhow:
     lifecycle.set(BackendState::Stopped);
 
     result.map_err(|error| anyhow::anyhow!("server error: {error}"))?;
+    if let Some(prepared) = prepared_update.lock().unwrap().take() {
+        binary_updates::handoff_after_drain(prepared)?;
+    }
     Ok(())
 }
 
@@ -1628,4 +1768,11 @@ mod boot_error_classification_tests {
         let error = anyhow::anyhow!("synthetic unknown boot failure");
         assert!(render_backend_boot_fatal(&error).starts_with("RBE5099 "));
     }
+}
+
+fn update_tag(args: &[String]) -> String {
+    args.windows(2)
+        .find(|p| p[0] == "--update-tag")
+        .map(|p| p[1].clone())
+        .unwrap_or_else(|| "rbe-binaries-latest".into())
 }

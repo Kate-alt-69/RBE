@@ -129,3 +129,15 @@ Examples:
 
 Without --build-sdk or --only-<component>, the normal secure release builder is
 used and may build/package container, service, cloud_node, and backend together.
+
+Public binary / first-run admin setup:
+  --deny-admin-setup    Skip the compilation-time password prompt and embed no
+                        admin verifier. First interactive run creates a local
+                        password; headless first boots use RBE_ADMIN_PASSWORD.
+                        Admin access stays locked until initialization succeeds.
+  Existing builds without this flag retain compile-time password setup.
+  This flag does not disable Container signing or integrity verification.
+
+Versioned runtime snapshots and standalone update/recovery details:
+  doc/binary-updates.md
+  python3 binary-snapshots.py -h

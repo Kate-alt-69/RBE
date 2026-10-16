@@ -18,6 +18,8 @@ use std::process::Command;
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 
+mod build_version;
+
 fn main() {
     println!("cargo:rerun-if-env-changed=RBE_CONTAINER_BIN_PATH");
     println!("cargo:rerun-if-env-changed=RBE_SERVICE_BIN_PATH");
@@ -37,6 +39,7 @@ fn main() {
         .map(PathBuf::from);
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
     let build_id = build_id();
+    build_version::emit(&build_id, &target);
     if build_id.chars().any(char::is_control) {
         panic!("backend/build.rs: RBE build ID contains control characters");
     }
