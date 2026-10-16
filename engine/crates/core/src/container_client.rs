@@ -878,12 +878,9 @@ mod execute_task_phase4_tests {
             assert_eq!(request.input, b"input");
             write_frame(
                 &mut stream,
-                &Response::TaskResolved {
+                &Response::Accepted {
                     request_id: request.request_id,
-                    runtime_image: request.runtime_image,
-                    task_oid: request.task_oid,
-                    environment: request.environment,
-                    cti_sha256: "cd".repeat(32),
+                    execution_id: "task-execution".to_string(),
                 },
             )
             .unwrap();
@@ -897,7 +894,7 @@ mod execute_task_phase4_tests {
         assert_eq!(resolved.runtime_image, runtime_image);
         assert_eq!(resolved.task_oid, 31_844);
         assert_eq!(resolved.environment, "general-1");
-        assert_eq!(resolved.cti_sha256, "cd".repeat(32));
+        assert_eq!(resolved.execution_id, "task-execution");
         server.join().unwrap();
     }
 }
