@@ -130,6 +130,23 @@ The diagnostic includes the file and source location from the underlying REL par
 
 **Action:** fix the reported REL problem. If the underlying error becomes a numbered `RELxxxx`/`RELCxxxx` diagnostic, follow that code for the detailed explanation.
 
+## Service memory admission
+
+<a id="svc4202"></a>
+### SVC4202 — Service memory admission failed
+
+**Status:** Emitted.
+
+An application memory write exceeded its key, nesting, per-entry, entry-count or
+aggregate byte budget, or could not acquire an intact memory lock. REL and both
+Service IPC hosts report the failure rather than acknowledging a discarded write.
+The previous value and accounting remain unchanged after admission failure.
+
+**Action:** bound stored state, delete data that is no longer needed, or adjust
+explicit embedder limits after measuring the host budget. See
+[bounded built-ins](../rel-builtins.md). Do not retry the same oversized value in
+an unbounded loop or silently evict unrelated application state.
+
 ## Standalone Service compatibility
 
 <a id="svc5001"></a>

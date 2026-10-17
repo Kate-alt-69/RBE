@@ -2,6 +2,7 @@
 //! host-capability dispatch. The broker owns network policy; callers provide
 //! logical operations and JSON arguments, never sockets or resolver handles.
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -108,22 +109,26 @@ async fn resolve_public_destination(
         return Ok(None);
     }
 
-    let mut resolved = tokio::net::lookup_host((host, port))
+    let addresses = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|error| http_error(format!("HTTP DNS resolution failed: {error}")))?
-        .collect::<Vec<_>>();
+        .map_err(|_| http_error("HTTP DNS resolution failed"))?;
+    let mut resolved = Vec::new();
+    for address in addresses {
+        if forbidden_ip(address.ip()) {
+            return Err(http_error("HTTP hostname resolves to a non-public address"));
+        }
+        if !resolved.contains(&address) {
+            if resolved.len() == PUBLIC_HTTP_MAX_RESOLVED_ADDRESSES {
+                return Err(http_error(
+                    "HTTP DNS resolution returned too many addresses",
+                ));
+            }
+            resolved.push(address);
+        }
+    }
     resolved.sort_unstable();
-    resolved.dedup();
     if resolved.is_empty() {
         return Err(http_error("HTTP DNS resolution returned no addresses"));
-    }
-    if resolved.len() > PUBLIC_HTTP_MAX_RESOLVED_ADDRESSES {
-        return Err(http_error(
-            "HTTP DNS resolution returned too many addresses",
-        ));
-    }
-    if resolved.iter().any(|address| forbidden_ip(address.ip())) {
-        return Err(http_error("HTTP hostname resolves to a non-public address"));
     }
     Ok(resolved.into_iter().next())
 }
@@ -284,7 +289,31 @@ pub async fn call_public_http(operation: &str, args: &[Value]) -> Result<Value, 
         ));
     }
     let call = parse_http_call(operation, args)?;
-    let pinned = resolve_public_destination(&call.url).await?;
+    execute_http_call(
+        call,
+        |url| async move { resolve_public_destination(&url).await },
+    )
+    .await
+}
+
+/// The same deadline owns DNS, connection and the entire response body. Keep the
+/// resolver injectable for deadline tests without weakening destination admission.
+async fn execute_http_call<R, F>(call: HttpCall, resolve: R) -> Result<Value, PublicHttpError>
+where
+    R: FnOnce(reqwest::Url) -> F,
+    F: Future<Output = Result<Option<SocketAddr>, PublicHttpError>>,
+{
+    tokio::time::timeout(call.timeout, perform_http_call(call, resolve))
+        .await
+        .map_err(|_| http_error("HTTP operation deadline exceeded"))?
+}
+
+async fn perform_http_call<R, F>(call: HttpCall, resolve: R) -> Result<Value, PublicHttpError>
+where
+    R: FnOnce(reqwest::Url) -> F,
+    F: Future<Output = Result<Option<SocketAddr>, PublicHttpError>>,
+{
+    let pinned = resolve(call.url.clone()).await?;
     let host = call.url.host_str().map(str::to_string);
 
     let mut builder = reqwest::Client::builder()
@@ -309,7 +338,7 @@ pub async fn call_public_http(operation: &str, args: &[Value]) -> Result<Value, 
     let mut response = request
         .send()
         .await
-        .map_err(|error| http_error(format!("HTTP request failed: {error}")))?;
+        .map_err(|error| public_request_error("HTTP request failed", &error))?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -329,7 +358,7 @@ pub async fn call_public_http(operation: &str, args: &[Value]) -> Result<Value, 
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| http_error(format!("read HTTP response: {error}")))?
+        .map_err(|error| public_request_error("read HTTP response failed", &error))?
     {
         if body.len().saturating_add(chunk.len()) > PUBLIC_HTTP_RESPONSE_MAX_BYTES {
             return Err(http_error("HTTP response exceeds 2 MiB"));
@@ -358,9 +387,89 @@ pub async fn call_public_http(operation: &str, args: &[Value]) -> Result<Value, 
     Ok(value)
 }
 
+/// Transport errors may carry signed URL queries. Expose a useful category, never
+/// the request URL or the underlying error chain that may repeat those values.
+fn public_request_error(operation: &str, error: &reqwest::Error) -> PublicHttpError {
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_body() {
+        "body"
+    } else {
+        "transport"
+    };
+    http_error(format!("{operation}: {category} error"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deadline_includes_dns_and_cancels_the_resolver() {
+        struct ResolverGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ResolverGuard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = ResolverGuard(dropped.clone());
+        let call = parse_http_call(
+            "request",
+            &[serde_json::json!({"url":"https://example.test/", "timeoutMs":10})],
+        )
+        .unwrap();
+        let error = execute_http_call(call, |_| async move {
+            let _guard = guard;
+            std::future::pending().await
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.message, "HTTP operation deadline exceeded");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn deadline_includes_response_body_and_transport_errors_hide_signed_urls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let call = parse_http_call("request", &[serde_json::json!({"url":"http://example.test/?signature=private-token", "timeoutMs":50})]).unwrap();
+        // Only the test resolver admits loopback; production retains public-IP policy.
+        let error = execute_http_call(call, |_| async move { Ok(Some(address)) })
+            .await
+            .unwrap_err();
+        assert!(!error.message.contains("private-token"));
+        assert!(!error.message.contains("example.test"));
+        assert!(error.message.contains("deadline") || error.message.contains("timeout"));
+        server.abort();
+        let _ = server.await;
+
+        let url = reqwest::Url::parse("http://127.0.0.1:0/?signature=private-token").unwrap();
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!public_request_error("HTTP request failed", &error)
+            .message
+            .contains("private-token"));
+    }
 
     #[test]
     fn rejects_private_and_special_network_destinations() {

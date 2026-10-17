@@ -102,7 +102,9 @@ impl ServiceHostCapabilities {
                 expect_arity(module, function, args, 2)?;
                 let key = expect_string(module, function, &args[0], 0)?.to_string();
                 let value = value_to_json(args[1].clone())?;
-                self.memory.set(key, value);
+                self.memory
+                    .set(key, value)
+                    .map_err(|error| eval_error("SVC4202", error.to_string()))?;
                 Ok(Value::Bool(true))
             }
             "delete" => {
@@ -836,6 +838,30 @@ mod tests {
         .expect("service execution failed");
         assert_eq!(value, serde_json::json!(42.0));
         assert_eq!(observer.get("answer"), Some(serde_json::json!(42.0)));
+    }
+
+    #[test]
+    fn rel_memory_quota_failure_preserves_existing_value() {
+        let program = crate::parse_service_source(":import[memory]\n:service[name = bounded]\nexport function remember(value) { memory.set(\"key\", value); return true; }").unwrap();
+        let memory = ServiceMemory::with_limits(service_runtime::ServiceMemoryLimits {
+            max_entries: 1,
+            max_bytes: 200,
+            max_entry_bytes: 100,
+        });
+        memory
+            .set("key".into(), serde_json::json!("original"))
+            .unwrap();
+        let observer = memory.clone();
+        let executor =
+            ServiceProgramExecutor::new(program, modules_for_test("bounded-memory"), memory);
+        let error = block_on_ready(ServiceExecutor::call(
+            &executor,
+            "remember",
+            vec![serde_json::json!("x".repeat(200))],
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, "SVC4202");
+        assert_eq!(observer.get("key"), Some(serde_json::json!("original")));
     }
 
     #[test]
