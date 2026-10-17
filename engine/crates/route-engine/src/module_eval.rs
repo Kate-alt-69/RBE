@@ -743,9 +743,9 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                                 .await;
                         }
                         if self.modules.is_direct_function(name) {
-                            return self.modules.call_direct(name, &args).map_err(|error| {
-                                ModuleEvalError::new("MOD3200", error.to_string())
-                            });
+                            return self.modules.call_direct_async(name, &args).await.map_err(
+                                |error| ModuleEvalError::new("MOD3200", error.to_string()),
+                            );
                         }
                     }
 
@@ -800,7 +800,8 @@ impl<'exec, 'program> Frame<'exec, 'program> {
                             if self.is_import_binding(module_name) {
                                 return self
                                     .modules
-                                    .call(module_name, function_name, &args)
+                                    .call_async(module_name, function_name, &args)
+                                    .await
                                     .map_err(|error| {
                                         ModuleEvalError::new("MOD3200", error.to_string())
                                     });
@@ -1063,6 +1064,34 @@ mod tests {
         let program = ModuleProgram::load(&root.join("module")).unwrap();
         let error = block_on_ready(program.call("./module/a", "run", Vec::new())).unwrap_err();
         assert_eq!(error.code, "MOD3004");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn password_calls_use_async_workers_through_aliased_module_imports() {
+        let root = root();
+        fs::write(root.join("module/password.module"),
+			r#":import[argon from crypto as passwords]
+			export async function hash(password) { return passwords.hash(password); }
+			export async function verify(password, encoded) { return passwords.verify(password, encoded); }"#).unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let encoded = program
+            .call(
+                "./module/password",
+                "hash",
+                vec![Value::String("test password".into())],
+            )
+            .await
+            .unwrap();
+        let value = program
+            .call(
+                "./module/password",
+                "verify",
+                vec![Value::String("test password".into()), encoded],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(value, Value::Bool(true)));
         let _ = fs::remove_dir_all(root);
     }
 

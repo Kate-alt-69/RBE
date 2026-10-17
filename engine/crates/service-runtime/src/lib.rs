@@ -6,7 +6,7 @@ use std::io::{BufRead, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -837,43 +837,8 @@ fn unquote(input: &str) -> String {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct ServiceMemory {
-    values: Arc<RwLock<HashMap<String, Value>>>,
-}
-
-impl ServiceMemory {
-    pub fn get(&self, key: &str) -> Option<Value> {
-        self.values.read().ok()?.get(key).cloned()
-    }
-
-    pub fn set(&self, key: String, value: Value) {
-        if let Ok(mut map) = self.values.write() {
-            map.insert(key, value);
-        }
-    }
-
-    pub fn delete(&self, key: &str) -> bool {
-        self.values
-            .write()
-            .map(|mut map| map.remove(key).is_some())
-            .unwrap_or(false)
-    }
-
-    pub fn clear(&self) {
-        if let Ok(mut map) = self.values.write() {
-            map.clear();
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.values.read().map(|map| map.len()).unwrap_or(0)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
+mod memory;
+pub use memory::{ServiceMemory, ServiceMemoryError, ServiceMemoryLimits};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceReady {
@@ -1234,10 +1199,16 @@ async fn dispatch(
             }
         }
         ServiceRequest::MemoryGet { key, .. } => ok(memory.get(&key).unwrap_or(Value::Null)),
-        ServiceRequest::MemorySet { key, value, .. } => {
-            memory.set(key, value);
-            ok(Value::Bool(true))
-        }
+        ServiceRequest::MemorySet { key, value, .. } => match memory.set(key, value) {
+            Ok(()) => ok(Value::Bool(true)),
+            Err(error) => (
+                ServiceResponse::Error {
+                    code: "SVC4202".into(),
+                    message: error.to_string(),
+                },
+                false,
+            ),
+        },
         ServiceRequest::MemoryDelete { key, .. } => ok(Value::Bool(memory.delete(&key))),
         ServiceRequest::MemoryClear { .. } => {
             memory.clear();
@@ -1698,8 +1669,41 @@ mod tests {
     #[test]
     fn memory_round_trip() {
         let memory = ServiceMemory::default();
-        memory.set("x".into(), serde_json::json!(7));
+        memory.set("x".into(), serde_json::json!(7)).unwrap();
         assert_eq!(memory.get("x"), Some(serde_json::json!(7)));
+    }
+
+    #[tokio::test]
+    async fn memory_ipc_reports_quota_failures_instead_of_success() {
+        let path = test_service_path("memory-quota");
+        std::fs::write(
+            &path,
+            ":service[name = memory-quota]\nexport function run() {}",
+        )
+        .unwrap();
+        let file = parse_service(&path, ServiceDefaults::default()).unwrap();
+        let memory = ServiceMemory::with_limits(ServiceMemoryLimits {
+            max_entries: 1,
+            max_bytes: 100,
+            max_entry_bytes: 100,
+        });
+        memory.set("key".into(), Value::Bool(true)).unwrap();
+        let (response, shutdown) = dispatch(
+            ServiceRequest::MemorySet {
+                token: "test-token".into(),
+                key: "key".into(),
+                value: Value::String("x".repeat(200)),
+            },
+            &file,
+            "test-token",
+            &memory,
+            &AddressableOnlyExecutor,
+        )
+        .await;
+        assert!(!shutdown);
+        assert!(matches!(response, ServiceResponse::Error { code, .. } if code == "SVC4202"));
+        assert_eq!(memory.get("key"), Some(Value::Bool(true)));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

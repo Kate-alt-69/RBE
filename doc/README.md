@@ -8,6 +8,7 @@ This directory is the authoritative user-facing documentation for the current RB
 - [`runtime.md`](runtime.md) — process boundaries, Runtime Image ownership, Service/Container/Vault supervision, CONTROL ER, and the Control Room.
 - [`runtime-image.md`](runtime-image.md) — the Runtime Image data contract, cryptographic identity, capability binding, and atomic activation model.
 - [`rel.md`](rel.md) — REL (Runtime Engine Language), shared grammar, capabilities, ENV, embedded sources, and recursion rules.
+- [`rel-builtins.md`](rel-builtins.md) — bounded password work, structured logging, complete HTTP deadlines, and Service memory/filter allocation limits.
 - [`relc.md`](relc.md) — the implemented RELC compilation/link pipeline and Runtime Image format.
 - [`binary-updates.md`](binary-updates.md) — first-run admin setup, binary-only version tags, verified downloads and opt-in standalone updates.
 - [`linux-builds.md`](linux-builds.md) — Linux build prerequisites, `--check-tools`, corrupt rustup cache detection/recovery, deployment-host guidance, and the build-tool CI contract.
