@@ -43,8 +43,8 @@ jobs:
           if [[ ! -x "$backend" ]]; then echo "Backend isn't executable at $backend" >&2; exit 1; fi
           # The official binary archive currently omits settings.json and route sources.
           # Stage the settings from the exact commit embedded in this release's identity.
-          curl --fail --location --retry 3 --retry-all-errors \\
-            'https://raw.githubusercontent.com/Kate-alt-69/RBE/2dcca67cc96bb69fc92c8e52da79b505fc0c4690/engine/settings.json' \\
+          curl --fail --location --retry 3 --retry-all-errors \
+            'https://raw.githubusercontent.com/Kate-alt-69/RBE/2dcca67cc96bb69fc92c8e52da79b505fc0c4690/engine/settings.json' \
             --output settings.json
           mkdir -p api
           cat > api/release-smoke.route <<'ROUTE'
