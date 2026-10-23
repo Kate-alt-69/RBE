@@ -26,6 +26,10 @@ This directory is the authoritative user-facing documentation for the current RB
 - [`field-manager.md`](field-manager.md) — first-class `.field` sources, typed query-field IR, deterministic helpers, and current runtime boundary.
 - [`video-manager.md`](video-manager.md) — Video Manager media pipeline, hardware normalization, and live-session control.
 
+## Proposed language evolution
+
+- [`rel-roadmap.md`](rel-roadmap.md) — standalone REL feature/use-case table, implementation stages and design decisions, with linked syntax, async, built-in security, small-backend and SDK/versioning proposals. These documents distinguish current foundations from features that still need implementation.
+
 ## File-type documentation
 
 - [`server.server/`](server.server/) — Server REL: root composition, policy, Runtime ENV defaults/FORCE values, middleware, and embedded REL files.
