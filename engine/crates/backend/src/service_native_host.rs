@@ -399,10 +399,16 @@ async fn dispatch(
             }
         }
         ServiceRequest::MemoryGet { key, .. } => ok(memory.get(&key).unwrap_or(Value::Null)),
-        ServiceRequest::MemorySet { key, value, .. } => {
-            memory.set(key, value);
-            ok(Value::Bool(true))
-        }
+        ServiceRequest::MemorySet { key, value, .. } => match memory.set(key, value) {
+            Ok(()) => ok(Value::Bool(true)),
+            Err(error) => (
+                ServiceResponse::Error {
+                    code: "SVC4202".into(),
+                    message: error.to_string(),
+                },
+                false,
+            ),
+        },
         ServiceRequest::MemoryDelete { key, .. } => ok(Value::Bool(memory.delete(&key))),
         ServiceRequest::MemoryClear { .. } => {
             memory.clear();
@@ -684,6 +690,42 @@ fn apply_native_memory_limit(memory_limit_mb: u64) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use route_engine::service_native_build::NativeServiceWorkerBootstrapEntry;
+
+    #[tokio::test]
+    async fn native_memory_ipc_reports_quota_failures_instead_of_success() {
+        struct UnusedExecutor;
+        impl ServiceExecutor for UnusedExecutor {
+            fn call<'a>(
+                &'a self,
+                _: &'a str,
+                _: Vec<Value>,
+            ) -> service_runtime::ServiceExecutionFuture<'a> {
+                Box::pin(async { panic!("MemorySet must not invoke a service export") })
+            }
+        }
+        let memory = ServiceMemory::with_limits(service_runtime::ServiceMemoryLimits {
+            max_entries: 1,
+            max_bytes: 100,
+            max_entry_bytes: 100,
+        });
+        memory.set("key".into(), Value::Bool(true)).unwrap();
+        let (response, shutdown) = dispatch(
+            ServiceRequest::MemorySet {
+                token: "test-token".into(),
+                key: "key".into(),
+                value: Value::String("x".repeat(200)),
+            },
+            "test-service",
+            ServiceMode::Resident,
+            "test-token",
+            &memory,
+            &UnusedExecutor,
+        )
+        .await;
+        assert!(!shutdown);
+        assert!(matches!(response, ServiceResponse::Error { code, .. } if code == "SVC4202"));
+        assert_eq!(memory.get("key"), Some(Value::Bool(true)));
+    }
 
     #[test]
     fn native_transport_is_removed_before_runtime_env_exposure() {

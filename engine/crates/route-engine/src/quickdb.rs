@@ -6,6 +6,11 @@ const LN_2: f64 = std::f64::consts::LN_2;
 const DEFAULT_GROWTH_FACTOR: usize = 2;
 const DEFAULT_TIGHTENING_RATIO: f64 = 0.5;
 const MAX_HASH_FUNCTIONS: u32 = 32;
+// Each Service owns one registry. Bound payload memory and registry/layer
+// metadata independently, before allocating a new filter or growth layer.
+const MAX_FILTERS: usize = 64;
+const MAX_FILTER_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LAYERS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterKind {
@@ -114,6 +119,19 @@ impl QuickDb {
             )));
         }
 
+        if filters.len() >= MAX_FILTERS {
+            return Err(QuickDbError::new("quickDB filter count budget exhausted"));
+        }
+        let rate = if config.kind == FilterKind::ScalableBloom {
+            config.false_positive_rate * (1.0 - DEFAULT_TIGHTENING_RATIO)
+        } else {
+            config.false_positive_rate
+        };
+        let bytes = allocation_bytes(config.kind, config.capacity, rate)?;
+        if registry_bytes(&filters).saturating_add(bytes) > MAX_FILTER_BYTES {
+            return Err(QuickDbError::new("quickDB registry byte budget exhausted"));
+        }
+
         let filter = match config.kind {
             FilterKind::Bloom => Filter::Bloom(BloomFilter::new(
                 config.capacity,
@@ -145,8 +163,9 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
+        let byte_limit = remaining_filter_budget(&filters, name)?;
         let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
-        if let Err(error) = managed.filter.add(value.as_bytes()) {
+        if let Err(error) = managed.filter.add(value.as_bytes(), byte_limit) {
             managed.ready = false;
             managed.poisoned = true;
             return Err(error);
@@ -163,10 +182,11 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
+        let byte_limit = remaining_filter_budget(&filters, name)?;
         let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         let mut added = 0usize;
         for value in values {
-            if let Err(error) = managed.filter.add(value.as_bytes()) {
+            if let Err(error) = managed.filter.add(value.as_bytes(), byte_limit) {
                 managed.ready = false;
                 managed.poisoned = true;
                 return Err(error);
@@ -185,6 +205,7 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
+        let byte_limit = remaining_filter_budget(&filters, name)?;
         let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         if managed.ready {
             return Err(QuickDbError::new(
@@ -199,7 +220,7 @@ impl QuickDb {
 
         let mut added = 0usize;
         for value in values {
-            if let Err(error) = managed.filter.add(value.as_bytes()) {
+            if let Err(error) = managed.filter.add(value.as_bytes(), byte_limit) {
                 managed.ready = false;
                 managed.poisoned = true;
                 return Err(error);
@@ -219,6 +240,7 @@ impl QuickDb {
             .filters
             .write()
             .map_err(|_| QuickDbError::new("quickDB registry lock is poisoned"))?;
+        let byte_limit = remaining_filter_budget(&filters, name)?;
         let managed = filters.get_mut(name).ok_or_else(|| missing_filter(name))?;
         managed.filter.clear();
         managed.ready = false;
@@ -226,7 +248,7 @@ impl QuickDb {
 
         let mut added = 0usize;
         for value in values {
-            if let Err(error) = managed.filter.add(value.as_bytes()) {
+            if let Err(error) = managed.filter.add(value.as_bytes(), byte_limit) {
                 managed.ready = false;
                 managed.poisoned = true;
                 return Err(error);
@@ -322,6 +344,39 @@ impl QuickDb {
     }
 }
 
+/// Include only allocated filter payload here; filter names and metadata are
+/// bounded separately by MAX_FILTERS, MAX_LAYERS and validate_name().
+fn registry_bytes(filters: &HashMap<String, ManagedFilter>) -> usize {
+    filters
+        .values()
+        .map(|filter| filter.filter.stats().allocated_bytes)
+        .sum()
+}
+
+fn remaining_filter_budget(
+    filters: &HashMap<String, ManagedFilter>,
+    name: &str,
+) -> Result<usize, QuickDbError> {
+    let current = filters
+        .get(name)
+        .ok_or_else(|| missing_filter(name))?
+        .filter
+        .stats()
+        .allocated_bytes;
+    Ok(MAX_FILTER_BYTES.saturating_sub(registry_bytes(filters).saturating_sub(current)))
+}
+
+fn allocation_bytes(kind: FilterKind, capacity: usize, rate: f64) -> Result<usize, QuickDbError> {
+    let (slots, _) = bloom_shape(capacity, rate)?;
+    Ok(if kind == FilterKind::CountingBloom {
+        slots.div_ceil(2)
+    } else {
+        slots
+            .div_ceil(64)
+            .saturating_mul(std::mem::size_of::<u64>())
+    })
+}
+
 fn validate_name(name: &str) -> Result<(), QuickDbError> {
     if name.trim().is_empty() {
         Err(QuickDbError::new("quickDB filter name cannot be empty"))
@@ -363,14 +418,14 @@ enum Filter {
 }
 
 impl Filter {
-    fn add(&mut self, value: &[u8]) -> Result<(), QuickDbError> {
+    fn add(&mut self, value: &[u8], byte_limit: usize) -> Result<(), QuickDbError> {
         match self {
             Self::Bloom(filter) => {
                 filter.add(value);
                 Ok(())
             }
             Self::CountingBloom(filter) => filter.add(value),
-            Self::ScalableBloom(filter) => filter.add(value),
+            Self::ScalableBloom(filter) => filter.add_bounded(value, byte_limit),
         }
     }
 
@@ -421,6 +476,9 @@ impl BloomFilter {
     fn new(capacity: usize, false_positive_rate: f64) -> Result<Self, QuickDbError> {
         let (bit_len, hash_functions) = bloom_shape(capacity, false_positive_rate)?;
         let word_len = bit_len.div_ceil(64);
+        if word_len > MAX_FILTER_BYTES / std::mem::size_of::<u64>() {
+            return Err(QuickDbError::new("quickDB filter byte budget exhausted"));
+        }
         let mut words = Vec::new();
         words
             .try_reserve_exact(word_len)
@@ -487,6 +545,9 @@ impl CountingBloomFilter {
     fn new(capacity: usize, false_positive_rate: f64) -> Result<Self, QuickDbError> {
         let (slot_len, hash_functions) = bloom_shape(capacity, false_positive_rate)?;
         let counter_len = slot_len.div_ceil(2);
+        if counter_len > MAX_FILTER_BYTES {
+            return Err(QuickDbError::new("quickDB filter byte budget exhausted"));
+        }
         let mut counters = Vec::new();
         counters
             .try_reserve_exact(counter_len)
@@ -602,7 +663,7 @@ impl ScalableBloomFilter {
         })
     }
 
-    fn add(&mut self, value: &[u8]) -> Result<(), QuickDbError> {
+    fn add_bounded(&mut self, value: &[u8], byte_limit: usize) -> Result<(), QuickDbError> {
         let needs_layer = self
             .layers
             .last()
@@ -622,6 +683,14 @@ impl ScalableBloomFilter {
             let rate = self.target_false_positive_rate
                 * (1.0 - DEFAULT_TIGHTENING_RATIO)
                 * DEFAULT_TIGHTENING_RATIO.powi(index as i32);
+            let next_bytes = allocation_bytes(FilterKind::Bloom, capacity, rate)?;
+            if self.layers.len() >= MAX_LAYERS
+                || self.stats().allocated_bytes.saturating_add(next_bytes) > byte_limit
+            {
+                return Err(QuickDbError::new(
+                    "quickDB growth exceeds registry allocation budget",
+                ));
+            }
             self.layers.push(BloomFilter::new(capacity, rate)?);
         }
 
@@ -744,6 +813,52 @@ fn avalanche(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocations_are_rejected_before_creating_a_filter() {
+        let db = QuickDb::default();
+        for kind in [
+            FilterKind::Bloom,
+            FilterKind::CountingBloom,
+            FilterKind::ScalableBloom,
+        ] {
+            assert!(db.create("oversized", config(kind, usize::MAX)).is_err());
+            assert_eq!(db.len().unwrap(), 0);
+        }
+        for index in 0..MAX_FILTERS {
+            db.create(&index.to_string(), config(FilterKind::Bloom, 1))
+                .unwrap();
+        }
+        assert!(db.create("extra", config(FilterKind::Bloom, 1)).is_err());
+        assert!(db.drop_filter("0").unwrap());
+        db.create("replacement", config(FilterKind::Bloom, 1))
+            .unwrap();
+    }
+
+    #[test]
+    fn aggregate_admission_and_growth_are_bounded_under_one_lock() {
+        let db = QuickDb::default();
+        // Two individually valid filters cannot overcommit the registry together.
+        db.create("large", config(FilterKind::Bloom, 4_000_000))
+            .unwrap();
+        assert!(db
+            .create("other", config(FilterKind::Bloom, 4_000_000))
+            .is_err());
+        db.drop_filter("large").unwrap();
+        db.create("other", config(FilterKind::Bloom, 4_000_000))
+            .unwrap();
+        db.drop_filter("other").unwrap();
+
+        // Fill the first layer, then prove that rejected growth neither allocates
+        // a second layer nor corrupts the existing membership bits.
+        let mut filter = ScalableBloomFilter::new(1, 0.01).unwrap();
+        let bytes = filter.stats().allocated_bytes;
+        filter.add_bounded(b"first", bytes).unwrap();
+        assert!(filter.add_bounded(b"second", bytes).is_err());
+        assert_eq!(filter.stats().allocated_bytes, bytes);
+        assert_eq!(filter.layers.len(), 1);
+        assert!(filter.might_contain(b"first"));
+    }
 
     fn config(kind: FilterKind, capacity: usize) -> FilterConfig {
         FilterConfig {

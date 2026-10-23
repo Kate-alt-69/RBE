@@ -2889,7 +2889,7 @@ mod tests {
                 metadata: serde_json::Value::Null,
             })
             .unwrap();
-        let _second = manager
+        let second = manager
             .queue_download(QueueDownloadRequest {
                 database: None,
                 namespace_kind: "module".into(),
@@ -2900,9 +2900,37 @@ mod tests {
                 metadata: serde_json::Value::Null,
             })
             .unwrap();
+        // Enqueue operations can share the same millisecond. Specify fixture
+        // timestamps rather than depending on scheduler/database timing.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        for (job, timestamp) in [(&first.job.id, 1_i64), (&second.job.id, 2_i64)] {
+            connection
+                .execute(
+                    "UPDATE video_jobs SET created_at_ms = ?1, updated_at_ms = ?1 WHERE id = ?2",
+                    rusqlite::params![timestamp, job],
+                )
+                .unwrap();
+        }
         let discovered = manager.next_queued_download(None).unwrap().unwrap();
         assert_eq!(discovered.job.id, first.job.id);
         assert_eq!(discovered.asset.id, first.asset.id);
+        // Equal timestamps deliberately use the stable ID tie-break, not
+        // insertion order. Test it explicitly without replacing the oldest check.
+        connection
+            .execute(
+                "UPDATE video_jobs SET created_at_ms = 2, updated_at_ms = 2 WHERE id = ?1",
+                rusqlite::params![&first.job.id],
+            )
+            .unwrap();
+        let discovered = manager.next_queued_download(None).unwrap().unwrap();
+        let expected = if first.job.id < second.job.id {
+            &first
+        } else {
+            &second
+        };
+        assert_eq!(discovered.job.id, expected.job.id);
+        assert_eq!(discovered.asset.id, expected.asset.id);
+        drop(connection);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

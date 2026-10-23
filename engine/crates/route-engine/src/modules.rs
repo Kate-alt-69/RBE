@@ -9,6 +9,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ast::{ImportTarget, Value};
 
+#[path = "password_crypto.rs"]
+mod password_crypto;
+#[path = "rel_logging.rs"]
+mod rel_logging;
+
 #[derive(Debug)]
 pub struct ModuleError {
     pub message: String,
@@ -97,7 +102,7 @@ pub fn builtin_function_exists(module: &str, function: &str) -> bool {
         "private" => matches!(function, "health"),
         "json" => matches!(function, "parse" | "stringify"),
         "time" => matches!(function, "now"),
-        "log" => matches!(function, "info" | "warn"),
+        "log" => matches!(function, "info" | "warn" | "error" | "debug"),
         "crypto" => matches!(
             function,
             "hash"
@@ -334,6 +339,35 @@ impl ModuleRegistry {
             });
         };
         self.call(module, function, args)
+    }
+
+    /// Async VM calls isolate expensive password work from executor threads.
+    pub async fn call_async(
+        &self,
+        module: &str,
+        function: &str,
+        args: &[Value],
+    ) -> Result<Value, ModuleError> {
+        if matches!(
+            self.modules.get(module),
+            Some(ModuleKind::Builtin(BuiltinModule::CryptoArgon))
+        ) {
+            return password_crypto::call_async(function, args).await;
+        }
+        self.call(module, function, args)
+    }
+
+    pub async fn call_direct_async(
+        &self,
+        binding: &str,
+        args: &[Value],
+    ) -> Result<Value, ModuleError> {
+        let Some((module, function)) = self.direct_functions.get(binding) else {
+            return Err(ModuleError {
+                message: format!("{binding} was not imported as a direct function"),
+            });
+        };
+        self.call_async(module, function, args).await
     }
 
     pub fn is_direct_function(&self, binding: &str) -> bool {
@@ -1179,23 +1213,7 @@ fn call_time(function_name: &str, _args: &[Value]) -> Result<Value, ModuleError>
 }
 
 fn call_log(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
-    let message = args
-        .first()
-        .map(|value| format!("{value:?}"))
-        .unwrap_or_default();
-    match function_name {
-        "info" => {
-            tracing::info!(message = %message, "route log");
-            Ok(Value::Null)
-        }
-        "warn" => {
-            tracing::warn!(message = %message, "route log");
-            Ok(Value::Null)
-        }
-        other => Err(ModuleError {
-            message: format!("log.{other}() does not exist"),
-        }),
-    }
+    rel_logging::call(function_name, args)
 }
 
 const CRYPTO_MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -1352,67 +1370,7 @@ fn call_crypto(function_name: &str, args: &[Value]) -> Result<Value, ModuleError
 }
 
 fn call_crypto_argon(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
-    use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-    use argon2::Argon2;
-
-    match function_name {
-        "hash" | "hashPassword" | "hash_password" => {
-            crypto_expect_arity(function_name, args, 1)?;
-            let password = crypto_string(
-                function_name,
-                args,
-                0,
-                "password",
-                CRYPTO_MAX_PASSWORD_BYTES,
-            )?;
-            let salt = SaltString::generate(&mut rand::rngs::OsRng);
-            let encoded = Argon2::default()
-                .hash_password(password.as_bytes(), &salt)
-                .map_err(|error| {
-                    crypto_error(
-                        "CRY4001",
-                        format!("Argon2id password hashing failed: {error}"),
-                    )
-                })?
-                .to_string();
-            Ok(Value::String(encoded))
-        }
-        "verify" | "verifyPassword" | "verify_password" => {
-            crypto_expect_arity(function_name, args, 2)?;
-            let password = crypto_string(
-                function_name,
-                args,
-                0,
-                "password",
-                CRYPTO_MAX_PASSWORD_BYTES,
-            )?;
-            let encoded = crypto_string(
-                function_name,
-                args,
-                1,
-                "encoded hash",
-                CRYPTO_MAX_PASSWORD_HASH_BYTES,
-            )?;
-            let parsed = PasswordHash::new(encoded).map_err(|error| {
-                crypto_error("CRY1001", format!("argon encoded hash is invalid: {error}"))
-            })?;
-            if parsed.algorithm.as_str() != "argon2id" {
-                return Err(crypto_error(
-                    "CRY1001",
-                    "argon.verifyPassword() accepts Argon2id hashes only",
-                ));
-            }
-            Ok(Value::Bool(
-                Argon2::default()
-                    .verify_password(password.as_bytes(), &parsed)
-                    .is_ok(),
-            ))
-        }
-        other => Err(crypto_error(
-            "CRY1002",
-            format!("crypto sub-library argon.{other}() does not exist"),
-        )),
-    }
+    password_crypto::call(function_name, args)
 }
 
 fn call_env(function_name: &str, args: &[Value]) -> Result<Value, ModuleError> {
