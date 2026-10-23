@@ -8,7 +8,7 @@ use crate::ast::Value;
 use crate::field_manager::FieldRuntimeContext;
 use crate::module_eval::{HostCapabilityCaller, HostCapabilityFuture, ModuleEvalError};
 use crate::rel_host_builtins::is_host_builtin;
-use crate::rel_host_descriptor::{deferred_call, temp_request};
+use crate::rel_host_descriptor::{deferred_call, run_request, temp_request};
 use crate::rel_host_runtime::{installed_rel_host_executor, RelHostExecutor};
 use crate::runtime_image::RuntimeImage;
 
@@ -61,11 +61,15 @@ impl HostCapabilityCaller for RuntimeHostCapabilities {
     ) -> HostCapabilityFuture<'a> {
         Box::pin(async move {
             if is_host_builtin(module) {
-                if module == "workspace" && function == "temp" {
-                    let request = temp_request(&args)?;
+                if module == "workspace" && matches!(function, "temp" | "run") {
+                    let request = if function == "temp" {
+                        temp_request(&args)?
+                    } else {
+                        run_request(&args)?
+                    };
                     let executor = self.rel_host_executor.as_ref().ok_or_else(|| ModuleEvalError {
                         code: "REL2201",
-                        message: "workspace.temp() requires the trusted Backend/Container host executor; no unsafe PATH/process fallback is permitted".into(),
+                        message: "workspace.run/temp requires the trusted Backend/Container host executor; no unsafe PATH/process fallback is permitted".into(),
                     })?;
                     return executor.execute(request).await.map(Some);
                 }
@@ -174,5 +178,104 @@ fn value_from_json(value: serde_json::Value) -> Result<Value, ModuleEvalError> {
             }
             Ok(Value::Object(out))
         }
+    }
+}
+
+#[cfg(test)]
+mod archive_bridge_tests {
+    use super::*;
+    use crate::{
+        ArchivePlan, ModuleExecutor, ModuleProgram, RelHostExecutionFuture, RelHostRequest,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Executor(Arc<AtomicUsize>);
+    impl RelHostExecutor for Executor {
+        fn execute<'a>(&'a self, request: RelHostRequest) -> RelHostExecutionFuture<'a> {
+            Box::pin(async move {
+                let name = match request {
+                    RelHostRequest::Archive(ArchivePlan::List { archive, .. })
+                        if archive.symbolic() == "$$/release.zip" =>
+                    {
+                        "listed"
+                    }
+                    RelHostRequest::Temp(inner)
+                        if matches!(*inner, RelHostRequest::Archive(ArchivePlan::Read { .. })) =>
+                    {
+                        "read-in-temp"
+                    }
+                    _ => panic!("unexpected archive request"),
+                };
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::String(name.into()))
+            })
+        }
+    }
+    #[tokio::test]
+    async fn rel_module_materializes_deferred_archives_through_run_and_temp() {
+        let root = std::env::temp_dir().join(format!(
+            "rbe-rel-archive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("module")).unwrap();
+        std::fs::write(
+            root.join("module/inspection.module"),
+            r#"
+:import[workspace, archive]
+export function inspect() {
+	const listed = workspace.run(archive.list("$$/release.zip"));
+	const manifest = workspace.temp(archive.read("$$/release.zip", "package.rbe.yaml"));
+	return { listed: listed, manifest: manifest };
+}
+"#,
+        )
+        .unwrap();
+        let program = ModuleProgram::load(&root.join("module")).unwrap();
+        let image = Arc::new(
+            crate::relc::compile_runtime_image("server Main {}", vec![], &serde_json::json!({}))
+                .unwrap(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let capabilities = RuntimeHostCapabilities {
+            video: VideoLanguage::new(None),
+            image: image.clone(),
+            fields: None,
+            rel_host_executor: Some(Arc::new(Executor(calls.clone()))),
+        };
+        let evaluator = ModuleExecutor::with_host_capabilities(&program, Arc::new(capabilities));
+        let Value::Object(result) = evaluator
+            .call("./module/inspection", "inspect", vec![])
+            .await
+            .unwrap()
+        else {
+            panic!("expected results");
+        };
+        assert!(matches!(&result["listed"], Value::String(value) if value == "listed"));
+        assert!(matches!(&result["manifest"], Value::String(value) if value == "read-in-temp"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "deferred arguments must not execute early"
+        );
+        let unavailable = RuntimeHostCapabilities {
+            video: VideoLanguage::new(None),
+            image,
+            fields: None,
+            rel_host_executor: None,
+        };
+        let evaluator = ModuleExecutor::with_host_capabilities(&program, Arc::new(unavailable));
+        assert_eq!(
+            evaluator
+                .call("./module/inspection", "inspect", vec![])
+                .await
+                .unwrap_err()
+                .code,
+            "REL2201"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -18,6 +18,13 @@ Both roots are symbolic capability paths, not raw host filesystem paths.
 :import[workspace]
 ```
 
+`workspace.run(operation)` executes one deferred operation against ProjectRoot
+without allocating a temporary directory. For example:
+
+```rel
+return workspace.run(archive.list("$$/data/package.zip"));
+```
+
 The short form creates one temporary workspace, evaluates an operation in it,
 and schedules cleanup after completion:
 
@@ -145,3 +152,11 @@ Module-to-module linking is already supported by RELC. Route-to-route linking
 is a separate same-role linking feature; adding it must not remove the existing
 ability of `.service`, `.server`, or other roles to import their normal builtins,
 modules, services, packages, and environment capabilities.
+
+## Current native execution
+
+Backend now executes all six ZIP operations locally through `workspace.run` or
+`workspace.temp`. ZIP inputs/outputs are limited to 16 MiB; entry reads are limited
+to 1 MiB. See [`request-time-capabilities.md`](request-time-capabilities.md) for
+results, concurrency, safety boundaries, and the remaining publisher migration.
+Other formats and constructed workspace graphs remain fail-closed.

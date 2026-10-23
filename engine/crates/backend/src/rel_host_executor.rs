@@ -23,6 +23,9 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+#[path = "rel_host_archive.rs"]
+mod archive_execution;
+
 const MAX_SCRIPT_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SCRIPT_SOURCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const LIBRARY_HOST_GRACE_SECONDS: u64 = 5;
@@ -79,10 +82,10 @@ impl BackendRelHostExecutor {
                     RelHostRequest::Script(plan) => {
                         self.execute_script(plan, Some(workspace.path())).await
                     }
-                    RelHostRequest::Archive(_) => Err(rel_error(
-                        "REL2200",
-                        "archive materialization inside workspace.temp() is not wired yet",
-                    )),
+                    RelHostRequest::Archive(plan) => {
+                        archive_execution::execute(self.project_root.clone(), plan, Some(workspace))
+                            .await
+                    }
                     RelHostRequest::Workspace(_) => Err(rel_error(
                         "REL2200",
                         "nested workspace plans are not materializable yet",
@@ -93,10 +96,9 @@ impl BackendRelHostExecutor {
                     )),
                 }
             }
-            RelHostRequest::Archive(_) => Err(rel_error(
-                "REL2200",
-                "archive materialization is not wired to the trusted host executor yet",
-            )),
+            RelHostRequest::Archive(plan) => {
+                archive_execution::execute(self.project_root.clone(), plan, None).await
+            }
             RelHostRequest::Workspace(_) => Err(rel_error(
                 "REL2200",
                 "workspace.construct() execution is not wired to the trusted host executor yet",
@@ -625,6 +627,11 @@ fn ensure_no_symlink_components(path: &Path) -> anyhow::Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // A Windows volume prefix is not an inspectable root until the
+        // following RootDir component has supplied its trailing separator.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&current)?;
         if metadata.file_type().is_symlink() {
             anyhow::bail!("path traverses a symbolic link: {}", current.display());
@@ -637,6 +644,9 @@ fn ensure_no_symlink_components_allow_missing(path: &Path) -> anyhow::Result<()>
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 anyhow::bail!("path traverses a symbolic link: {}", current.display());

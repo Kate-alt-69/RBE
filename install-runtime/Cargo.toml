@@ -22,4 +22,5 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
 url = "2"
+unicode-normalization = "0.1"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }

@@ -1278,19 +1278,23 @@ mod tests {
 
     #[test]
     fn mother_spawn_diagnostic_identifies_process_and_os_error() {
+        // Error 11 has different meanings across hosts; preserve each native reason.
+        let native_error = std::io::Error::from_raw_os_error(11);
+        let expected_reason = native_error.to_string();
         let error = service_mother_spawn_error(
             Path::new("dep/service"),
             Path::new("settings.json"),
             Path::new("/srv/rbe"),
-            std::io::Error::from_raw_os_error(11),
+            native_error,
         );
         let rendered = format!("{error:#}");
         assert!(rendered.contains("SVC5004"));
         assert!(rendered.contains("service-mother"));
         assert!(rendered.contains("dep/service"));
         assert!(rendered.contains("raw_os_error:\n    11"));
-        assert!(rendered.contains("OS error 11"));
+        assert!(rendered.contains(&expected_reason));
         if cfg!(target_os = "linux") {
+            assert!(rendered.contains("OS error 11"));
             assert!(rendered.contains("EAGAIN"));
             assert!(rendered.contains("pids.max"));
         }
