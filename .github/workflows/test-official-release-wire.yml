@@ -1,0 +1,94 @@
+name: Official RBE release runtime smoke (temporary)
+on:
+  push:
+    branches:
+      - test/official-rbe-release-smoke
+permissions:
+  contents: read
+jobs:
+  release-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Download and verify the official Linux x64 release
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/Kate-alt-69/RBE/releases/download/rbe-bin-v0.1.0/rbe-0.1.0-linux-x64-build.11.1.tar.gz'
+          expected='348109201b5d0cb61f7d706e7f793e689b746b60e548b3c434ccce8ce084bc78'
+          curl --fail --location --retry 3 --retry-all-errors "$url" --output "$RUNNER_TEMP/rbe-release.tar.gz"
+          echo "$expected  $RUNNER_TEMP/rbe-release.tar.gz" | sha256sum --check -
+          root="$RUNNER_TEMP/rbe-release"
+          mkdir -p "$root"
+          tar --no-same-owner --no-same-permissions -xzf "$RUNNER_TEMP/rbe-release.tar.gz" -C "$root"
+          echo '--- release file layout ---'
+          find "$root" -maxdepth 3 -type f -printf '%P\n' | sort | head -200
+          backend="$(find "$root" -type f -name backend -print -quit)"
+          if [[ -z "$backend" ]]; then echo 'No backend binary found in the release archive' >&2; exit 1; fi
+          chmod u+x "$backend"
+          runtime_dir="$(dirname "$backend")"
+          echo "--- official binary version ---"
+          "$backend" --version
+          "$backend" --version-json
+          echo "runtime_dir=$runtime_dir" >> "$GITHUB_OUTPUT"
+      - name: Start the official runtime and probe HTTP routes
+        shell: bash
+        env:
+          RUNTIME_DIR: ${{ steps.package.outputs.runtime_dir }}
+        run: |
+          set -euo pipefail
+          cd "$RUNTIME_DIR"
+          backend="$RUNTIME_DIR/backend"
+          if [[ ! -x "$backend" ]]; then echo "Backend isn't executable at $backend" >&2; exit 1; fi
+          mkdir -p api
+          cat > api/release-smoke.route <<'ROUTE'
+          class Route {
+              async get(req) {
+                  return { ok: true, method: req.method, path: req.path };
+              }
+          }
+          ROUTE
+          cat > api/mcp-probe.route <<'ROUTE'
+          class Route {
+              async post(req) {
+                  return { probe: true, method: req.method, path: req.path, body: req.body };
+              }
+          }
+          ROUTE
+          export RBE_VAULT_FALLBACK_MASTER_KEY="$(openssl rand -hex 32)"
+          "$backend" > "$RUNNER_TEMP/rbe-backend.log" 2>&1 &
+          pid=$!
+          cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+          ready=0
+          for attempt in $(seq 1 35); do
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
+            if curl --silent --show-error --max-time 1 http://127.0.0.1:8080/health -o "$RUNNER_TEMP/rbe-health.json" 2>/dev/null; then ready=1; break; fi
+            sleep 1
+          done
+          if [[ "$ready" != 1 ]]; then echo 'Backend failed to become healthy; startup log follows:'; cat "$RUNNER_TEMP/rbe-backend.log"; exit 1; fi
+          echo '--- /health ---'
+          cat "$RUNNER_TEMP/rbe-health.json"
+          echo
+          echo '--- custom Route smoke ---'
+          curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/api/release-smoke | tee "$RUNNER_TEMP/rbe-route.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("ok") is True, d; assert d.get("method") == "GET", d; assert d.get("path") == "/api/release-smoke", d; print("Route smoke passed:", d)' "$RUNNER_TEMP/rbe-route.json"
+          echo
+          echo '--- JSON-RPC/MCP request-body probe (diagnostic, not assumed to pass) ---'
+          status="$(curl --silent --show-error --max-time 5 -o "$RUNNER_TEMP/rbe-mcp-probe.json" -w '%{http_code}' -X POST http://127.0.0.1:8080/api/mcp-probe -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2025-11-25' --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"rbe-release-smoke","version":"1.0"}}}')"
+          echo "HTTP status: $status"
+          cat "$RUNNER_TEMP/rbe-mcp-probe.json" || true
+          echo
+          if [[ "$status" == 200 ]] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("body",{}).get("method") == "initialize", d' "$RUNNER_TEMP/rbe-mcp-probe.json"; then
+            echo 'MCP probe: request body is exposed to the Route; protocol method dispatch and conformance still require separate tests.'
+          else
+            echo 'MCP probe: this release does not pass the JSON-RPC request-body probe; see response and backend logs.'
+          fi
+          echo
+          echo '--- request at /mcp ---'
+          root_status="$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/mcp || true)"
+          echo "GET /mcp -> HTTP $root_status"
+          echo '--- backend log tail ---'
+          tail -120 "$RUNNER_TEMP/rbe-backend.log"
+        
